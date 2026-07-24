@@ -1,9 +1,10 @@
 # SGLang — 上游痛点与 lake 对照
 
 > 源码:`3rdparty/sglang`(submodule)。本文整理 **上游 GitHub issue / roadmap** 暴露的尚未解决痛点,并区分「可修工程债 / 架构债 / 物理或职责边界上难消掉的点」,供 lake 设计取舍。  
-> HiCache 机制本身见 [overview.md](overview.md) / [hicache.md](hicache.md);block 何时释放/彻底放弃见 [block-lifecycle.md](block-lifecycle.md);PD 控制机制见 [../pd-disaggregation.md](../pd-disaggregation.md);thinking 能力缺口见 [thinking-control.md](thinking-control.md)。
+> HiCache 机制本身见 [overview.md](overview.md) / [hicache.md](hicache.md);block 何时释放/彻底放弃见 [block-lifecycle.md](block-lifecycle.md);PD 控制机制见 [../pd-disaggregation.md](../pd-disaggregation.md);thinking 能力缺口见 [thinking-control.md](thinking-control.md)。  
+> **#21846 端到端设计专文**（Q2/Q3 地图、增量 PD、Host 直传、agent hint、与 lake 对照）见 [agentic-kv-roadmap.md](agentic-kv-roadmap.md)。
 >
-> **调研快照**:2026-07-17 · submodule `37f94cb7a0`(`origin/main`) · 议题以当时 open 状态为准,编号可漂移,以 GitHub 为准。
+> **调研快照**:2026-07-17 · submodule `37f94cb7a0`(`origin/main`) · 议题以当时 open 状态为准,编号可漂移,以 GitHub 为准。#21846 专文另有 2026-07-24 核对。
 
 ## 一句话
 
@@ -31,7 +32,7 @@ SGLang 在 **新模型(hybrid/DSA/Mamba) × HiCache × PD × 投机/稀疏** 四
 
 **关键读数**:KV/分层/PD/router 这条**战略线在 711 条里是绝对少数**(采样中合计约 20%),SGLang 人力主要被模型/硬件矩阵吃掉 → 分布式 KV 系统进展偏慢;而 `[Bug]` 集中在**组合叠加**(HiCache×EAGLE、MTP×Mooncake、PD×异构 TP),印证组合正确性是长期债。
 
-主战场 roadmap:[#21846](https://github.com/sgl-project/sglang/issues/21846) *Distributed KVCache System For Agentic Workload*(high priority)。战略主线的六大簇见第 1 节。
+主战场 roadmap:[#21846](https://github.com/sgl-project/sglang/issues/21846) *Distributed KVCache System For Agentic Workload*(high priority)。**整图设计**见 [agentic-kv-roadmap.md](agentic-kv-roadmap.md)。战略主线的六大簇见第 1 节。
 
 ---
 

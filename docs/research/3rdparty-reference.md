@@ -2,7 +2,7 @@
 
 本仓库在 `3rdparty/` 以 git submodule 引入项目源码,作为设计与实现的直接参考。本文是**汇总对比**;各项目的深度分析见分目录:
 
-- [`sglang/`](sglang/) — SGLang HiCache:[总览](sglang/overview.md) · [分层机制](sglang/hicache.md) · [存储后端](sglang/storage-backends.md) · [block 生命周期](sglang/block-lifecycle.md) · [thinking 控制](sglang/thinking-control.md) · [上游痛点](sglang/pain-points.md)
+- [`sglang/`](sglang/) — SGLang HiCache:[总览](sglang/overview.md) · [分层机制](sglang/hicache.md) · [存储后端](sglang/storage-backends.md) · [block 生命周期](sglang/block-lifecycle.md) · [thinking 控制](sglang/thinking-control.md) · [上游痛点](sglang/pain-points.md) · [Agentic KV 路线图 #21846](sglang/agentic-kv-roadmap.md)
 - [`lmcache/`](lmcache/) — LMCache:[总览](lmcache/overview.md) · [跨实例复用与后端](lmcache/sharing-and-backends.md)
 - [`mooncake/`](mooncake/) — Mooncake:[总览](mooncake/overview.md) · [传输引擎](mooncake/transfer-engine.md) · [KV 存储与池化](mooncake/kv-store.md)
 - [`vllm/`](vllm/) — vLLM:[总览](vllm/overview.md) · [计算层抽象与存算分离接入点](vllm/compute.md) · [block 生命周期](vllm/block-lifecycle.md) · [上游痛点与 lake 对照](vllm/pain-points.md)
@@ -33,7 +33,8 @@
 
 源码入口:`3rdparty/sglang/docs/advanced_features/hicache_design.md`、`python/sglang/srt/mem_cache/`。
 
-> SGLang **同时是计算层参考**:spec decode(drafter 共置串行、DSPARK/DFLASH/MTP/EAGLE、`PoolName.DRAFT`)、DP/TP/PP 控制面(每 GPU 一 Scheduler + 请求广播 / PP proxy;对照 vLLM 一 Scheduler + Executor 扇出)。research 专文见 [`sglang/model-runner.md`](sglang/model-runner.md);lake 落点见 [`../architecture/compute-layer.md`](../architecture/compute-layer.md) "投机解码"。
+> SGLang **同时是计算层参考**:spec decode(drafter 共置串行、DSPARK/DFLASH/MTP/EAGLE、`PoolName.DRAFT`)、DP/TP/PP 控制面(每 GPU 一 Scheduler + 请求广播 / PP proxy;对照 vLLM 一 Scheduler + Executor 扇出)。research 专文见 [`sglang/model-runner.md`](sglang/model-runner.md);lake 落点见 [`../architecture/compute-layer.md`](../architecture/compute-layer.md) "投机解码"。  
+> **Agentic 分布式 KV 总路线**([#21846](https://github.com/sgl-project/sglang/issues/21846)：增量 PD、Host 直传、UnifiedRadix、router hint)见 [`sglang/agentic-kv-roadmap.md`](sglang/agentic-kv-roadmap.md)。
 
 ### 借鉴点
 

@@ -98,6 +98,7 @@ docs/
    - **计算层(SGLang)**:Worker→ModelRunner + drafter 适配 + 与 vLLM 对照(V2/dummy、DP/TP/PP 控制面) → `docs/research/sglang/model-runner.md`
    - block 生命周期(何时释放/降层/彻底放弃,现状 vs 未来) → `docs/research/sglang/block-lifecycle.md`
    - 上游 issue/roadmap 痛点与 lake 对照 → `docs/research/sglang/pain-points.md`
+   - **Agentic 分布式 KV 总设计**(SGLang #21846：增量 PD、Host 直传、UnifiedRadix、agent hint) → `docs/research/sglang/agentic-kv-roadmap.md`
    - **Guided / structured decoding**(xgrammar 库边界、overlap/async 同步、spec+grammar) → `docs/research/guided-decoding.md`
    - **Sampling 参数对照**(SGLang × vLLM;`n`≠beam;spec 兼容;penalty 空泡;状态归属与前缀共享) → `docs/research/sampling-params.md`
    - **Scheduler→Worker 字段**(vLLM `SchedulerOutput` × SGLang `ScheduleBatch`/`ForwardBatch`、架构根因) → `docs/research/scheduler-worker-interface.md`

@@ -6,8 +6,8 @@
 
 项目源码已引入 `3rdparty/`(submodule),各有分目录的深度分析文档:
 
-- **SGLang HiCache** → [`sglang/`](sglang/):[总览](sglang/overview.md) · [分层机制](sglang/hicache.md) · [存储后端](sglang/storage-backends.md) · [block 生命周期](sglang/block-lifecycle.md) · [thinking 控制](sglang/thinking-control.md) · [上游痛点](sglang/pain-points.md)
-  - L1/L2/L3 三层(L1/L2 私有、L3 共享)、HiRadixTree、prefetch/write-back 策略;block 何时释放/彻底放弃见 block-lifecycle;issue/roadmap 痛点与 lake 对照见 pain-points。
+- **SGLang HiCache** → [`sglang/`](sglang/):[总览](sglang/overview.md) · [分层机制](sglang/hicache.md) · [存储后端](sglang/storage-backends.md) · [block 生命周期](sglang/block-lifecycle.md) · [thinking 控制](sglang/thinking-control.md) · [上游痛点](sglang/pain-points.md) · [Agentic KV 路线图 #21846](sglang/agentic-kv-roadmap.md)
+  - L1/L2/L3 三层(L1/L2 私有、L3 共享)、HiRadixTree、prefetch/write-back 策略;block 何时释放/彻底放弃见 block-lifecycle;issue/roadmap 痛点与 lake 对照见 pain-points;Agentic/PD 增量传输与 hint 总设计见 agentic-kv-roadmap。
 - **LMCache** → [`lmcache/`](lmcache/):[总览](lmcache/overview.md) · [跨实例复用与后端](lmcache/sharing-and-backends.md)
   - 跨实例 KV 复用、内容寻址去重、多存储后端、Rust 裸设备 I/O。
 - **Mooncake** → [`mooncake/`](mooncake/):[总览](mooncake/overview.md) · [传输引擎](mooncake/transfer-engine.md) · [KV 存储与池化](mooncake/kv-store.md)
