@@ -12,9 +12,9 @@
   - 跨实例 KV 复用、内容寻址去重、多存储后端、Rust 裸设备 I/O。
 - **Mooncake** → [`mooncake/`](mooncake/):[总览](mooncake/overview.md) · [传输引擎](mooncake/transfer-engine.md) · [KV 存储与池化](mooncake/kv-store.md)
   - RDMA 零拷贝传输引擎、对象级 KV 池、PD 分离。
-- **vLLM** → [`vllm/`](vllm/):[总览](vllm/overview.md) · [计算层抽象与存算分离接入点](vllm/compute.md) · [block 生命周期](vllm/block-lifecycle.md) · [上游痛点与 lake 对照](vllm/pain-points.md)
+- **vLLM** → [`vllm/`](vllm/):[总览](vllm/overview.md) · [计算层抽象与存算分离接入点](vllm/compute.md) · [block 生命周期](vllm/block-lifecycle.md) · [上游痛点与 lake 对照](vllm/pain-points.md) · [Q3 KV/Session 调度](vllm/kv-session-roadmap.md)
   - **计算层参考**:PagedAttention、worker/model runner、`KVConnectorBase_V1` 接口、spec decode。
-  - **KV 大规模管理演进**(Q3 2026 roadmap):原生多层 KV offload(`vllm/v1/kv_offload/`)+ KV Events 已落地;`session_id`/`continuation_id`、layerwise offload 仍是 RFC。
+  - **KV 大规模管理演进**(Q3 2026 roadmap #48168):原生多层 KV offload + KV Events 已落地;session 坐标编排见 #48501 / [kv-session-roadmap.md](vllm/kv-session-roadmap.md)。
 - **Dynamo** → [`dynamo/`](dynamo/):[总览](dynamo/overview.md)
   - **编排层/控制面参考**(NVIDIA,Rust):推理引擎之上的编排层,KV-aware router + KVBM(GPU→CPU→SSD→远端 三层 offload)+ 多后端通信(etcd/nats/tcp/zmq)。Rust 写控制面/编排,是 lake Rust 存储控制面的直接参照系。
 - **TileRT** → [`tilert/`](tilert/):[总览](tilert/overview.md) · [vLLM PD 插件](tilert/pd-vllm.md) · [痛点与 lake 对照](tilert/pain-points.md)

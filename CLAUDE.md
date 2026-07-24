@@ -105,6 +105,7 @@ docs/
    - 跨实例复用 + 多存储后端 + 内容寻址 + 控制器元数据 + Rust 裸设备 I/O → `docs/research/lmcache/{overview,sharing-and-backends}.md`
    - RDMA 零拷贝传输 + 多 NIC 聚合 + 对象级 KV store + 分配策略 + HA → `docs/research/mooncake/{overview,transfer-engine,kv-store}.md`
    - **计算层(vLLM)**:PagedAttention/worker/model runner + KV connector 接口(worker↔存储池接入点) + spec decode + 权重加载 → `docs/research/vllm/{overview,compute}.md`
+   - **vLLM Q3 KV/Session 调度**(#48168 agent prefix · #48501 `session_id`/`continuation_id` · retention) → `docs/research/vllm/kv-session-roadmap.md`
    - **编排层/控制面**:KV-aware router(overlap 量化) + KVBM logical/physical/engine 三层 offload + Placement/StorageTier(介质非位置) + 链式 block 哈希 + 多后端通信(etcd/nats/tcp/zmq) → `docs/research/dynamo/overview.md`
    - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）
    - 跨项目逐层对应与借鉴顺序 → `docs/research/3rdparty-reference.md`

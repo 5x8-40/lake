@@ -1,6 +1,7 @@
 # vLLM — 总览
 
-> 源码:`3rdparty/vllm`(submodule,HEAD ab132ee98)。SOSP'23 PagedAttention 的实现,工业级 LLM 推理引擎。本系统**计算层(Python + Triton)**的直接参考。
+> 源码:`3rdparty/vllm`(submodule,HEAD ab132ee98 / 调研时另见 `f3e9497e9`)。SOSP'23 PagedAttention 的实现,工业级 LLM 推理引擎。本系统**计算层(Python + Triton)**的直接参考。  
+> **Q3 KV/Session 调度专文**（[#48168](https://github.com/vllm-project/vllm/issues/48168) · [#48501](https://github.com/vllm-project/vllm/issues/48501)）见 [kv-session-roadmap.md](kv-session-roadmap.md)。
 
 ## 一句话定位
 
