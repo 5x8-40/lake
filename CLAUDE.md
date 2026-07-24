@@ -67,7 +67,7 @@ docs/
 
 ## 3rdparty 参考源码（submodule）
 
-`3rdparty/` 以 git submodule 引入五个项目源码,作为设计与实现的直接参考:
+`3rdparty/` 以 git submodule 引入项目源码,作为设计与实现的直接参考:
 
 | 路径 | 来源 | 主要参考点 |
 |------|------|-----------|
@@ -76,13 +76,14 @@ docs/
 | `3rdparty/lmcache` | LMCache/LMCache | 跨请求/跨实例 KV 复用、多存储后端、`rust/` 工程模式 |
 | `3rdparty/vllm` | vllm-project/vllm | **计算层**:PagedAttention、worker/`GPUModelRunner`、`KVConnectorBase_V1` 接口(存算分离接入点)、spec decode |
 | `3rdparty/dynamo` | ai-dynamo/dynamo | **编排层/控制面**:KV-aware router、KVBM(GPU→CPU→SSD→远端 三层 offload)逻辑/物理/引擎三层、Rust 编排、多后端通信(etcd/nats/tcp/zmq) |
+| `3rdparty/tilert` | tile-ai/TileRT | **超低延迟 decode**(tile runtime,核闭源) + **vLLM PD 插件**(`TileRTConnector`/`pd_vllm`,NIXL/Mooncake)→ 见 [`docs/research/tilert/`](docs/research/tilert/) |
 
-逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析(设计/架构/技术栈/优劣)见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo}/`。
+逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert}/`。
 
 约定:
 - `3rdparty/` **只读**,不修改 submodule 内代码。要改造先 fork 换 URL。
-- 五个 submodule 各带自己的 `.claude/` 规则——那是改它们自身代码的约束,与本项目无关,**忽略**。
-- clone 本仓库需 `git submodule update --init --recursive`。submodule 体积较大(SGLang/Mooncake/vLLM/Dynamo 各数百 MB),磁盘紧张或 CI 提速用浅克隆:`git clone --recurse-submodules --depth 1 --shallow-submodules <repo>`(注意浅克隆后无法在此 submodule 内 `git checkout` 切换 ref,升级需先 `git submodule deinit -f <path>` 再重新 init 深克隆)。
+- submodule 自带 `.claude/` 规则——改它们自身代码的约束,与本项目无关,**忽略**。
+- clone 本仓库需 `git submodule update --init --recursive`。submodule 体积较大(SGLang/Mooncake/vLLM/Dynamo 各数百 MB;TileRT 公开树较小),磁盘紧张或 CI 提速用浅克隆:`git clone --recurse-submodules --depth 1 --shallow-submodules <repo>`(注意浅克隆后无法在此 submodule 内 `git checkout` 切换 ref,升级需先 `git submodule deinit -f <path>` 再重新 init 深克隆)。
 - 设计/实现遇到分层、传输、复用、放置等问题,先查对应 submodule 源码再动手。
 
 ## reference 强制查阅规则（硬性，每次都做）
@@ -104,6 +105,7 @@ docs/
    - RDMA 零拷贝传输 + 多 NIC 聚合 + 对象级 KV store + 分配策略 + HA → `docs/research/mooncake/{overview,transfer-engine,kv-store}.md`
    - **计算层(vLLM)**:PagedAttention/worker/model runner + KV connector 接口(worker↔存储池接入点) + spec decode + 权重加载 → `docs/research/vllm/{overview,compute}.md`
    - **编排层/控制面**:KV-aware router(overlap 量化) + KVBM logical/physical/engine 三层 offload + Placement/StorageTier(介质非位置) + 链式 block 哈希 + 多后端通信(etcd/nats/tcp/zmq) → `docs/research/dynamo/overview.md`
+   - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）
    - 跨项目逐层对应与借鉴顺序 → `docs/research/3rdparty-reference.md`
 3. **沿代码回溯**：每个参考文档末尾都有「代码索引」节，把概念/机制映射到 `文件:符号`。符号名是稳定锚点（行号会漂移，找不到时 `grep -n "符号名" 3rdparty/<repo>/<文件路径>`）。需要确认实现细节时，直接读对应符号的源码。
 

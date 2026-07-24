@@ -1,12 +1,13 @@
 # 3rdparty 源码参考
 
-本仓库在 `3rdparty/` 以 git submodule 引入五个项目源码,作为设计与实现的直接参考。本文是**汇总对比**;各项目的深度分析见分目录:
+本仓库在 `3rdparty/` 以 git submodule 引入项目源码,作为设计与实现的直接参考。本文是**汇总对比**;各项目的深度分析见分目录:
 
 - [`sglang/`](sglang/) — SGLang HiCache:[总览](sglang/overview.md) · [分层机制](sglang/hicache.md) · [存储后端](sglang/storage-backends.md) · [block 生命周期](sglang/block-lifecycle.md) · [thinking 控制](sglang/thinking-control.md) · [上游痛点](sglang/pain-points.md)
 - [`lmcache/`](lmcache/) — LMCache:[总览](lmcache/overview.md) · [跨实例复用与后端](lmcache/sharing-and-backends.md)
 - [`mooncake/`](mooncake/) — Mooncake:[总览](mooncake/overview.md) · [传输引擎](mooncake/transfer-engine.md) · [KV 存储与池化](mooncake/kv-store.md)
 - [`vllm/`](vllm/) — vLLM:[总览](vllm/overview.md) · [计算层抽象与存算分离接入点](vllm/compute.md) · [block 生命周期](vllm/block-lifecycle.md) · [上游痛点与 lake 对照](vllm/pain-points.md)
 - [`dynamo/`](dynamo/) — Dynamo(NVIDIA):[总览](dynamo/overview.md) · 数据中心级推理编排(KV-aware router + KVBM 三层 + Rust 控制面)
+- [`tilert/`](tilert/) — TileRT:[总览](tilert/overview.md) · [vLLM PD 插件](tilert/pd-vllm.md) · [痛点与 lake 对照](tilert/pain-points.md)
 - [guided-decoding.md](guided-decoding.md) — **Guided / structured decoding**(SGLang × vLLM):xgrammar/llguidance 库边界、overlap/async 下能否消同步、spec+grammar 硬缺口
 - [sampling-params.md](sampling-params.md) — **Sampling 参数对照**(SGLang × vLLM):核心/独有字段、`n`≠beam、spec 禁 min_p/logit_bias；penalty 空泡与 V2；采样状态归属 / Spec 兼容矩阵 / `n` 与前缀 KV 共享
 - [scheduler-worker-interface.md](scheduler-worker-interface.md) — **Scheduler→Worker 字段全集**(SGLang × vLLM):`SchedulerOutput` vs `ScheduleBatch`/`ForwardBatch`、差异表、架构根因、对 lake D1 含义
@@ -22,8 +23,9 @@
 | `3rdparty/mooncake` | [kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake) | main HEAD | 传输引擎 + 对象级 KV 池 |
 | `3rdparty/vllm` | [vllm-project/vllm](https://github.com/vllm-project/vllm) | main HEAD (ab132ee98) | **计算层**(PagedAttention/worker/connector/spec decode) |
 | `3rdparty/dynamo` | [ai-dynamo/dynamo](https://github.com/ai-dynamo/dynamo) | main HEAD | **编排层/控制面**:KV-aware router + KVBM 三层 offload + Rust 编排 + 多后端通信 |
+| `3rdparty/tilert` | [tile-ai/TileRT](https://github.com/tile-ai/TileRT) | main HEAD (`a8368a6`, v0.1.5) | **超低延迟 decode** + **vLLM PD 插件**(`TileRTConnector`);见 [tilert/](tilert/) |
 
-> 五者本就生态相连:vLLM 是计算引擎,其 `KVConnectorBase_V1` 接口被 LMCache/Mooncake/NIXL/FlexKV 实现为 connector;SGLang HiCache 把 Mooncake 作为 L3 后端之一;Dynamo 把 vLLM/SGLang 作为可插拔 worker,在其上做 KV-aware 编排。vLLM 提供计算面,SGLang/LMCache/Mooncake 提供存储/传输面,Dynamo 提供编排面——我们站在五者之上做更彻底的存算分离:把 vLLM 的状态面(KV/调度/元数据)剥离给存储池与控制面,把 connector 接口从可选插件升为存储池必经路径。
+> 生态相连:vLLM 是计算引擎,其 `KVConnectorBase_V1` 被 LMCache/Mooncake/NIXL/FlexKV/**TileRT** 实现为 connector;SGLang HiCache 把 Mooncake 作为 L3 后端之一;Dynamo 把 vLLM/SGLang 作为可插拔 worker;TileRT 把 vLLM 当 prefill、自身当低延迟 decode。我们站在其上做更彻底的存算分离:把引擎状态面剥离给存储池与控制面,把 connector 从可选插件升为存储池必经路径。
 
 ---
 
@@ -166,6 +168,26 @@ vLLM 是本系统**计算层(Python + Triton)**的直接参考。前三个项目
 | 执行模式 | DistServe/Splitwise + HiCache PD | 三模式逐请求选路 + D-direct(本地命中直跳) |
 | 放置/调度边界 | (我们的方案 Z,原创) | 存储池主动放置 + 调度器单向消费 |
 | **编排层/控制面** | **Dynamo**(KVBM logical/physical/engine + KV-aware router) | 位置视图权威在存储控制面进程内存、etcd 降频 checkpoint(Dynamo 走 NATS 事件流);HBM 归池而非 engine offload;Rust 存储控制面 + Go 调度控制面分工(Dynamo 单一 Rust 编排) |
+| **超低延迟 decode / PD 胶水** | **TileRT**(`TileRTConnector` + NIXL/Mooncake;核闭源) | 借鉴 connector claim、MTP-aware 传 KV、双传输;拒绝单槽/bs=1/引擎私有 HBM。详见 [tilert/](tilert/) |
+
+## 6. TileRT → 超低延迟 decode + vLLM PD 插件样板
+
+源码入口:`3rdparty/tilert/tilert/`、`tilert/pd_vllm/`。深度文档:[tilert/overview.md](tilert/overview.md) · [pd-vllm.md](tilert/pd-vllm.md) · [pain-points.md](tilert/pain-points.md)。
+
+### 借鉴点
+
+| TileRT 设计 | 我们对应 | 说明 |
+|-------------|---------|------|
+| `TileRTConnector` 选择性 claim + `MultiConnector` 共存 | worker↔池 / 多执行模式旁路 | 见 [pd-vllm.md](tilert/pd-vllm.md);对照 [`vllm/compute.md`](vllm/compute.md) |
+| 控制 TCP/HTTP × RDMA 数据面拆分 | Transfer Bus + agent 控制 RPC | 与 Mooncake TE 正交 |
+| MTP draft 层 KV 一等传输 | `pool_kind=DRAFT` + PD 写回 | prefill 必须物化 draft KV 的约束可借鉴 |
+| 模型 profile 缝(extract/convert/握手版本) | 池不解释布局、按不透明块 + 注册元数据 | 布局版本化可借鉴;身份仍用内容寻址 |
+
+### 关键差异
+
+- TileRT **核闭源**、钉 8×B200、公开树无 radix/分层池/`bs>1`——**不是**存储面或通用计算层蓝图。
+- PD 是 **vLLM block_id → 单槽 inject**；lake 是池权威 + 混合执行（含 D-direct）。
+- 过载 429 在小路由器内；lake 过载归 gateway。
 
 ## 代码级复用策略（按模块，互不替代）
 
@@ -205,6 +227,7 @@ P4(KV Pool 原型,Rust)时按此顺序；**1 与「Dynamo KVBM」分属上表 A/
 5. **SGLang HiCache prefetch/write-back 策略**：迁移触发与写回频率 → 冷热迁移 + decode 写回 N。
 6. **LMCache rust/ + 跨实例复用**：Rust 存储层工程模式 + 复用场景验证。
 7. **vLLM `KVConnectorBase_V1` + `GPUModelRunner`**（偏 P5）：worker ↔ 存储池 client 形态 + layer-wise 流水线。
+8. **TileRT `pd_vllm`**（偏 P5 PD 胶水对照）：`TileRTConnector` claim / MTP-aware 传 KV / NIXL·Mooncake；**不**复用闭源 `.so`。
 
 ### Dynamo 参考补充(编排层/控制面,跨阶段)
 

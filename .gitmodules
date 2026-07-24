@@ -13,3 +13,6 @@
 [submodule "3rdparty/dynamo"]
 	path = 3rdparty/dynamo
 	url = https://github.com/ai-dynamo/dynamo
+[submodule "3rdparty/tilert"]
+	path = 3rdparty/tilert
+	url = https://github.com/tile-ai/TileRT.git

@@ -4,7 +4,7 @@
 
 ## 源码深度参考(3rdparty submodule)
 
-五个项目源码已引入 `3rdparty/`(submodule),各有分目录的深度分析文档:
+项目源码已引入 `3rdparty/`(submodule),各有分目录的深度分析文档:
 
 - **SGLang HiCache** → [`sglang/`](sglang/):[总览](sglang/overview.md) · [分层机制](sglang/hicache.md) · [存储后端](sglang/storage-backends.md) · [block 生命周期](sglang/block-lifecycle.md) · [thinking 控制](sglang/thinking-control.md) · [上游痛点](sglang/pain-points.md)
   - L1/L2/L3 三层(L1/L2 私有、L3 共享)、HiRadixTree、prefetch/write-back 策略;block 何时释放/彻底放弃见 block-lifecycle;issue/roadmap 痛点与 lake 对照见 pain-points。
@@ -17,6 +17,8 @@
   - **KV 大规模管理演进**(Q3 2026 roadmap):原生多层 KV offload(`vllm/v1/kv_offload/`)+ KV Events 已落地;`session_id`/`continuation_id`、layerwise offload 仍是 RFC。
 - **Dynamo** → [`dynamo/`](dynamo/):[总览](dynamo/overview.md)
   - **编排层/控制面参考**(NVIDIA,Rust):推理引擎之上的编排层,KV-aware router + KVBM(GPU→CPU→SSD→远端 三层 offload)+ 多后端通信(etcd/nats/tcp/zmq)。Rust 写控制面/编排,是 lake Rust 存储控制面的直接参照系。
+- **TileRT** → [`tilert/`](tilert/):[总览](tilert/overview.md) · [vLLM PD 插件](tilert/pd-vllm.md) · [痛点与 lake 对照](tilert/pain-points.md)
+  - **超低延迟 decode**(tile runtime,核在闭源 `.so`)+ **vLLM prefill→TileRT decode**(`TileRTConnector`、NIXL/Mooncake、MTP-aware 传 KV)。不作存储池/radix 参考。
 - **Guided / structured decoding** → [`guided-decoding.md`](guided-decoding.md)
   - SGLang × vLLM:xgrammar/llguidance 仅 GPU apply、FSM 仍在 CPU;overlap/async 近零 vs spec+grammar / pending token 的同步气泡;与 lake 重叠契约及抢占时 FSM 游标交接。
 - **Sampling 参数** → [`sampling-params.md`](sampling-params.md)
@@ -24,13 +26,14 @@
 - **Scheduler→Worker 接口** → [`scheduler-worker-interface.md`](scheduler-worker-interface.md)
   - vLLM `SchedulerOutput` 与 SGLang `ScheduleBatch`/`ForwardBatch` 字段全集、差异与架构根因;供 lake `SchedulerOutput` D1 对照。
 
-五者与本系统逐层对应、借鉴点、关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
+与本系统逐层对应、借鉴点、关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
 
 ---
 
 ## 存算分离 / Disaggregated Serving
 
 - **Mooncake** (Moonshot AI): KVCache-centric disaggregated architecture，把 KV cache 作为独立分离资源池。本仓库 KV Pool 的直接灵感来源。**源码已作为 submodule 引入** `3rdparty/mooncake`,逐层对应见 [`3rdparty-reference.md`](3rdparty-reference.md)。
+- **TileRT** (Tile-AI): 超低延迟 tile runtime + **vLLM prefill → TileRT decode** PD 插件。**源码 submodule** `3rdparty/tilert`,见 [`tilert/`](tilert/)。
 - **DistServe** (OSDI'24): Disaggregating prefill and decoding，物理隔离 Prefill/Decode 以分别优化吞吐与延迟。
 - **Splitwise** (ISCA'24): Efficient generative LLM inference with phase-based disaggregation，按 phase 分离并建模资源。
 
