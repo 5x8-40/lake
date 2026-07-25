@@ -31,7 +31,7 @@
 | 现象 | 证据 | lake |
 |------|------|------|
 | MemFabric / 昇腾路径一等 | 嵌套 `memfabric_hybrid`；protocol 枚举 | Transfer Bus 抽象多 backend；默认 NVIDIA 路径仍 Mooncake TE |
-| 浅克隆不见传输源码 | submodule 未 init | 深研 OneCopy 时再拉 MemFabric；本调研以 MemCache API/元数据为准 |
+| 非 recursive 时不见传输源码 | 嵌套 submodule 未 init | 审计 OneCopy 前确认 `memfabric_hybrid` 已 init；本调研以 MemCache API/元数据为准 |
 
 ## 5. 多模型 / 配额
 

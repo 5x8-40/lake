@@ -1,7 +1,7 @@
 # Ascend MemCache — 总览
 
 > 源码:`3rdparty/memcache`(submodule,HEAD `14b4e35`,2026-06-02)。上游 [Ascend/memcache](https://github.com/Ascend/memcache)（镜像常在 gitcode.com/Ascend/memcache）。PyPI：`memcache-hybrid`。许可：**Mulan PSL v2**。  
-> 传输底座 [MemFabric Hybrid](https://gitcode.com/Ascend/memfabric_hybrid) 为**嵌套 submodule**（`3rdparty/memfabric_hybrid`），默认浅克隆未 init；审计 OneCopy 内部需另行拉取。  
+> 传输底座 [MemFabric Hybrid](https://gitcode.com/Ascend/memfabric_hybrid) 为**嵌套 submodule**（在 memcache 树内）。文档推荐的 `git clone --recurse-submodules` / `git submodule update --init --recursive` **会**拉嵌套；仅非 recursive 初始化时才不拉。审计 OneCopy 内部需确认 `memfabric_hybrid` 已 init。  
 > 分层/淘汰/元数据细节见 [architecture.md](architecture.md)；与 lake / Mooncake / LMCache 对照见 [pain-points.md](pain-points.md)。
 
 ## 一句话定位
@@ -87,7 +87,7 @@ MemCache 是面向 **LLM / GR 推理** 的**高性能分布式 KVCache 对象存
 2. **无 lake 式 `(model_id, revision)` 命名空间与池内配额模型**（公开文档未一等建模）。  
 3. **HA 自承尽力而为** — 非 etcd 强一致位置视图。  
 4. **昇腾/MemFabric 绑定** — 传输栈不可直接当 NVIDIA 集群默认。  
-5. **嵌套 MemFabric 需另拉** — 浅克隆本仓看不到传输实现细节。
+5. **嵌套 MemFabric 依赖 init 策略** — 非 recursive 时看不到传输实现；审计 OneCopy 前确认 `memfabric_hybrid` 已 init。
 
 ## 与本系统的关键对比
 

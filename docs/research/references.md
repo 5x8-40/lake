@@ -21,6 +21,8 @@
   - **超低延迟 decode**(tile runtime,核在闭源 `.so`)+ **vLLM prefill→TileRT decode**(`TileRTConnector`、NIXL/Mooncake、MTP-aware 传 KV)。不作存储池/radix 参考。
 - **Ascend MemCache** → [`memcache/`](memcache/):[总览](memcache/overview.md) · [架构](memcache/architecture.md) · [痛点与 lake 对照](memcache/pain-points.md)
   - 昇腾分布式 KVCache **对象池**(MetaService/LocalService、HBM/DRAM/SSD、MemFabric OneCopy);与 Mooncake store 同层对照,非 radix 控制面。
+- **UCM** → [`ucm/`](ucm/):[总览](ucm/overview.md) · [架构](ucm/architecture.md) · [痛点与 lake 对照](ucm/pain-points.md)
+  - ModelEngine 统一缓存框架:可插拔 KVStore、vLLM connector、稀疏插件、**PD-via-pool**；与 LMCache 同属引擎插件层。
 - **Guided / structured decoding** → [`guided-decoding.md`](guided-decoding.md)
   - SGLang × vLLM:xgrammar/llguidance 仅 GPU apply、FSM 仍在 CPU;overlap/async 近零 vs spec+grammar / pending token 的同步气泡;与 lake 重叠契约及抢占时 FSM 游标交接。
 - **Sampling 参数** → [`sampling-params.md`](sampling-params.md)
@@ -42,6 +44,7 @@
 ## KV Cache 复用与传输
 
 - **Ascend MemCache**: 昇腾分布式 KVCache 对象池（Meta/Local + MemFabric OneCopy）。**源码已引入** `3rdparty/memcache`，见 [`memcache/`](memcache/)。
+- **UCM** (ModelEngine): 统一缓存管理——可插拔 KVStore、vLLM connector、PD-via-pool。**源码已引入** `3rdparty/ucm`，见 [`ucm/`](ucm/)。
 - **vLLM / PagedAttention** (SOSP'23): 块状 KV 内存管理，本系统 block 粒度的原型。
 - **CacheGen** / **CacheBlend**: KV cache 的压缩与复用。
 - **AttentionStore** (Meta): 把 KV cache 当作可复用的缓存层。
@@ -62,4 +65,4 @@
 
 - **DeepSpeed-Inference**, **TensorRT-LLM**, **Orca** (continuous batching): 推理引擎基线，本系统在其上做存算分离的解耦。
 
-> 注：以上为方向性参考。SGLang/Mooncake/LMCache/vLLM/Dynamo/TileRT/MemCache 等源码已引入 `3rdparty/`(submodule),与本项目设计的逐层对应、借鉴点与关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
+> 注：以上为方向性参考。SGLang/Mooncake/LMCache/vLLM/Dynamo/TileRT/MemCache/UCM 等源码已引入 `3rdparty/`(submodule),与本项目设计的逐层对应、借鉴点与关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。

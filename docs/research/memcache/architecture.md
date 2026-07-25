@@ -55,7 +55,7 @@ Python：`pymmc.cpp` + `doc/memcache_python_api.md`。
 
 ## 传输（MemFabric）
 
-本仓**不内嵌**传输实现细节（嵌套 submodule 未默认检出）。产品文档声称路径包括：
+本仓调研**不展开**传输实现细节（以 MemCache API/元数据为准）。嵌套 `memfabric_hybrid` 在 recursive init 下会检出；非 recursive 时需另行确认已 init。产品文档声称路径包括：
 
 | 协议（配置名） | 场景（文档） |
 |----------------|--------------|

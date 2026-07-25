@@ -19,3 +19,6 @@
 [submodule "3rdparty/memcache"]
 	path = 3rdparty/memcache
 	url = https://github.com/Ascend/memcache.git
+[submodule "3rdparty/ucm"]
+	path = 3rdparty/ucm
+	url = https://github.com/modelengine-group/unified-cache-management.git
