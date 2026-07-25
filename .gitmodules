@@ -16,3 +16,6 @@
 [submodule "3rdparty/tilert"]
 	path = 3rdparty/tilert
 	url = https://github.com/tile-ai/TileRT.git
+[submodule "3rdparty/memcache"]
+	path = 3rdparty/memcache
+	url = https://github.com/Ascend/memcache.git

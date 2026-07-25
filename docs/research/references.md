@@ -4,7 +4,7 @@
 
 ## 源码深度参考(3rdparty submodule)
 
-项目源码已引入 `3rdparty/`(submodule),各有分目录的深度分析文档:
+下列项目源码已引入 `3rdparty/`(submodule),各有分目录的深度分析文档:
 
 - **SGLang HiCache** → [`sglang/`](sglang/):[总览](sglang/overview.md) · [分层机制](sglang/hicache.md) · [存储后端](sglang/storage-backends.md) · [block 生命周期](sglang/block-lifecycle.md) · [thinking 控制](sglang/thinking-control.md) · [上游痛点](sglang/pain-points.md) · [Agentic KV 路线图 #21846](sglang/agentic-kv-roadmap.md)
   - L1/L2/L3 三层(L1/L2 私有、L3 共享)、HiRadixTree、prefetch/write-back 策略;block 何时释放/彻底放弃见 block-lifecycle;issue/roadmap 痛点与 lake 对照见 pain-points;Agentic/PD 增量传输与 hint 总设计见 agentic-kv-roadmap。
@@ -19,6 +19,8 @@
   - **编排层/控制面参考**(NVIDIA,Rust):推理引擎之上的编排层,KV-aware router + KVBM(GPU→CPU→SSD→远端 三层 offload)+ 多后端通信(etcd/nats/tcp/zmq)。Rust 写控制面/编排,是 lake Rust 存储控制面的直接参照系。
 - **TileRT** → [`tilert/`](tilert/):[总览](tilert/overview.md) · [vLLM PD 插件](tilert/pd-vllm.md) · [痛点与 lake 对照](tilert/pain-points.md)
   - **超低延迟 decode**(tile runtime,核在闭源 `.so`)+ **vLLM prefill→TileRT decode**(`TileRTConnector`、NIXL/Mooncake、MTP-aware 传 KV)。不作存储池/radix 参考。
+- **Ascend MemCache** → [`memcache/`](memcache/):[总览](memcache/overview.md) · [架构](memcache/architecture.md) · [痛点与 lake 对照](memcache/pain-points.md)
+  - 昇腾分布式 KVCache **对象池**(MetaService/LocalService、HBM/DRAM/SSD、MemFabric OneCopy);与 Mooncake store 同层对照,非 radix 控制面。
 - **Guided / structured decoding** → [`guided-decoding.md`](guided-decoding.md)
   - SGLang × vLLM:xgrammar/llguidance 仅 GPU apply、FSM 仍在 CPU;overlap/async 近零 vs spec+grammar / pending token 的同步气泡;与 lake 重叠契约及抢占时 FSM 游标交接。
 - **Sampling 参数** → [`sampling-params.md`](sampling-params.md)
@@ -39,6 +41,7 @@
 
 ## KV Cache 复用与传输
 
+- **Ascend MemCache**: 昇腾分布式 KVCache 对象池（Meta/Local + MemFabric OneCopy）。**源码已引入** `3rdparty/memcache`，见 [`memcache/`](memcache/)。
 - **vLLM / PagedAttention** (SOSP'23): 块状 KV 内存管理，本系统 block 粒度的原型。
 - **CacheGen** / **CacheBlend**: KV cache 的压缩与复用。
 - **AttentionStore** (Meta): 把 KV cache 当作可复用的缓存层。
@@ -59,4 +62,4 @@
 
 - **DeepSpeed-Inference**, **TensorRT-LLM**, **Orca** (continuous batching): 推理引擎基线，本系统在其上做存算分离的解耦。
 
-> 注：以上为方向性参考。SGLang/Mooncake/LMCache/vLLM/Dynamo 五者源码已引入 `3rdparty/`(submodule),与本项目设计的逐层对应、借鉴点与关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
+> 注：以上为方向性参考。SGLang/Mooncake/LMCache/vLLM/Dynamo/TileRT/MemCache 等源码已引入 `3rdparty/`(submodule),与本项目设计的逐层对应、借鉴点与关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
