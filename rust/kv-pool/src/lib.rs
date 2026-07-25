@@ -1,7 +1,9 @@
-//! KV Pool P3:SkeletonKv 内存字节存储。
+//! KV Pool:SkeletonKv 内存字节存储（dumb 后端）。
 //!
-//! 生产字节走 RDMA;此处用 gRPC 传不透明 bytes 验证跨语言流转。
-//! 参考:LMCache MemoryObj 存取形态;Mooncake store Put/Get 对象级 API。
+//! P4.2:索引 / radix / ref 归 controlplane；本 crate 只按
+//! `(model_id, pool_kind, block_hash) → bytes` 存取，无 lookup 职责。
+//! 生产字节走 RDMA；此处 gRPC 传不透明 bytes。
+//! 参考:LMCache MemoryObj；Mooncake store Put/Get。
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};

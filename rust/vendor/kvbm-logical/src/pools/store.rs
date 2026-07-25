@@ -51,7 +51,7 @@ use super::SeqHashMap;
 
 /// Index trait for inactive-pool eviction backends. T-free: backends only
 /// need `(SequenceHash, BlockId)` pairs.
-pub(crate) trait InactiveIndex: Send + Sync {
+pub trait InactiveIndex: Send + Sync {
     /// Find blocks for the given hashes in order, stopping on first miss.
     /// Removes matched entries from the index.
     fn find_matches(

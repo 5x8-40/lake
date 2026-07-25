@@ -23,6 +23,7 @@ const (
 	ControlPlaneService_LookupPrefix_FullMethodName   = "/lake.ControlPlaneService/LookupPrefix"
 	ControlPlaneService_Locate_FullMethodName         = "/lake.ControlPlaneService/Locate"
 	ControlPlaneService_RegisterBlocks_FullMethodName = "/lake.ControlPlaneService/RegisterBlocks"
+	ControlPlaneService_ReportRef_FullMethodName      = "/lake.ControlPlaneService/ReportRef"
 	ControlPlaneService_RequestBarrier_FullMethodName = "/lake.ControlPlaneService/RequestBarrier"
 	ControlPlaneService_Lease_FullMethodName          = "/lake.ControlPlaneService/Lease"
 )
@@ -55,7 +56,15 @@ type ControlPlaneServiceClient interface {
 	//	PutStart 不进控制面(agent 本地记账即可),防半块被读。仿 Mooncake PutEnd 的控制面侧。
 	//	release 一致,写控制面内存,不进 etcd。
 	//	与 Publish 的区别:Publish(可多次、逐层 slice)只更新位置视图;RegisterBlocks(满块 + L2 durable)才进 radix + 置 l3_present/L2。
+	//	P4.2:须带 prefix_hashes 全链以便控制面建 PositionalLineageHash;`blocks` 可为 miss 后缀。
 	RegisterBlocks(ctx context.Context, in *RegisterBlocksRequest, opts ...grpc.CallOption) (*Ack, error)
+	// P4.2:**控制面合账骨架**（非完整两级 ref）。
+	//
+	//	本切片：累加 delta → global_refs；**忽略 RefKind**；agent **未**维护本地一级、也未调用本 RPC。
+	//	完整两级（agent 本地 REQUEST/IN_FLIGHT/WRITEBACK + 控制面分 kind）→ 后续切片。
+	//	流式：先收齐再 **全有或全无** apply（任一条未知 block → 整批不改，可安全重试）。
+	//	不进 ViewEvent(B1)。
+	ReportRef(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[RefDelta, Ack], error)
 	// 请求结束屏障:release → flush L2 + ack → 控制面更新目录(见 consistency.md §3)。
 	RequestBarrier(ctx context.Context, in *RequestBarrierRequest, opts ...grpc.CallOption) (*Ack, error)
 	// lease:节点 mount/unmount segment + 续命(仿 Mooncake MountSegment/UnmountSegment + client_live_ttl_sec)。
@@ -119,6 +128,19 @@ func (c *controlPlaneServiceClient) RegisterBlocks(ctx context.Context, in *Regi
 	return out, nil
 }
 
+func (c *controlPlaneServiceClient) ReportRef(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[RefDelta, Ack], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ControlPlaneService_ServiceDesc.Streams[1], ControlPlaneService_ReportRef_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[RefDelta, Ack]{ClientStream: stream}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControlPlaneService_ReportRefClient = grpc.ClientStreamingClient[RefDelta, Ack]
+
 func (c *controlPlaneServiceClient) RequestBarrier(ctx context.Context, in *RequestBarrierRequest, opts ...grpc.CallOption) (*Ack, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Ack)
@@ -131,7 +153,7 @@ func (c *controlPlaneServiceClient) RequestBarrier(ctx context.Context, in *Requ
 
 func (c *controlPlaneServiceClient) Lease(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LeaseHeartbeat, LeaseAck], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &ControlPlaneService_ServiceDesc.Streams[1], ControlPlaneService_Lease_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &ControlPlaneService_ServiceDesc.Streams[2], ControlPlaneService_Lease_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -170,7 +192,15 @@ type ControlPlaneServiceServer interface {
 	//	PutStart 不进控制面(agent 本地记账即可),防半块被读。仿 Mooncake PutEnd 的控制面侧。
 	//	release 一致,写控制面内存,不进 etcd。
 	//	与 Publish 的区别:Publish(可多次、逐层 slice)只更新位置视图;RegisterBlocks(满块 + L2 durable)才进 radix + 置 l3_present/L2。
+	//	P4.2:须带 prefix_hashes 全链以便控制面建 PositionalLineageHash;`blocks` 可为 miss 后缀。
 	RegisterBlocks(context.Context, *RegisterBlocksRequest) (*Ack, error)
+	// P4.2:**控制面合账骨架**（非完整两级 ref）。
+	//
+	//	本切片：累加 delta → global_refs；**忽略 RefKind**；agent **未**维护本地一级、也未调用本 RPC。
+	//	完整两级（agent 本地 REQUEST/IN_FLIGHT/WRITEBACK + 控制面分 kind）→ 后续切片。
+	//	流式：先收齐再 **全有或全无** apply（任一条未知 block → 整批不改，可安全重试）。
+	//	不进 ViewEvent(B1)。
+	ReportRef(grpc.ClientStreamingServer[RefDelta, Ack]) error
 	// 请求结束屏障:release → flush L2 + ack → 控制面更新目录(见 consistency.md §3)。
 	RequestBarrier(context.Context, *RequestBarrierRequest) (*Ack, error)
 	// lease:节点 mount/unmount segment + 续命(仿 Mooncake MountSegment/UnmountSegment + client_live_ttl_sec)。
@@ -196,6 +226,9 @@ func (UnimplementedControlPlaneServiceServer) Locate(context.Context, *LocateReq
 }
 func (UnimplementedControlPlaneServiceServer) RegisterBlocks(context.Context, *RegisterBlocksRequest) (*Ack, error) {
 	return nil, status.Error(codes.Unimplemented, "method RegisterBlocks not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) ReportRef(grpc.ClientStreamingServer[RefDelta, Ack]) error {
+	return status.Error(codes.Unimplemented, "method ReportRef not implemented")
 }
 func (UnimplementedControlPlaneServiceServer) RequestBarrier(context.Context, *RequestBarrierRequest) (*Ack, error) {
 	return nil, status.Error(codes.Unimplemented, "method RequestBarrier not implemented")
@@ -289,6 +322,13 @@ func _ControlPlaneService_RegisterBlocks_Handler(srv interface{}, ctx context.Co
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlaneService_ReportRef_Handler(srv interface{}, stream grpc.ServerStream) error {
+	return srv.(ControlPlaneServiceServer).ReportRef(&grpc.GenericServerStream[RefDelta, Ack]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ControlPlaneService_ReportRefServer = grpc.ClientStreamingServer[RefDelta, Ack]
+
 func _ControlPlaneService_RequestBarrier_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RequestBarrierRequest)
 	if err := dec(in); err != nil {
@@ -343,6 +383,11 @@ var ControlPlaneService_ServiceDesc = grpc.ServiceDesc{
 			StreamName:    "SubscribeView",
 			Handler:       _ControlPlaneService_SubscribeView_Handler,
 			ServerStreams: true,
+		},
+		{
+			StreamName:    "ReportRef",
+			Handler:       _ControlPlaneService_ReportRef_Handler,
+			ClientStreams: true,
 		},
 		{
 			StreamName:    "Lease",

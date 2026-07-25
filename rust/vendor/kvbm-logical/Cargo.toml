@@ -3,11 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # 许可全文见本目录 LICENSE；上游 pin 见 ../UPSTREAM.md。
 #
-# P4.1 仅构建接入(业务源码未改):
-#   - workspace = true 填实版本(lake 不嵌套 dynamo workspace)
-#   - dynamo-tokens 改 path 依赖指向同 vendor 目录
-#   - edition = "2024"(上游 let chains)
-# 源码改造(InactiveIndex pub / 拆 EventsManager / G1-G4→L0-L3 等)见 #20 后续切片。
+# P4.1 构建接入 + P4.2 最小源码改造(见 ../UPSTREAM.md 偏差表):
+#   - InactiveIndex / backends / mark_present|absent 提 pub(lake 薄驱动)
+#   - LogicalLayoutHandle G1–G4 → L0–L3
+#   - EventsManager 仍保留但不由 lake 接线
 
 [package]
 name = "kvbm-logical"

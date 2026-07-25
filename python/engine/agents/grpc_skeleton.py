@@ -205,7 +205,14 @@ class GrpcSkeletonAgent:
                 )
                 for bid in miss_ids
             ]
-            reg = self._cp.RegisterBlocks(lake_pb2.RegisterBlocksRequest(node_id=req.node_id, blocks=metas))
+            # P4.2: prefix_hashes = 完整有序链;blocks 仍可为 miss 后缀。
+            reg = self._cp.RegisterBlocks(
+                lake_pb2.RegisterBlocksRequest(
+                    node_id=req.node_id,
+                    blocks=metas,
+                    prefix_hashes=hashes,
+                )
+            )
             if not reg.ok:
                 raise RuntimeError(reg.err or "RegisterBlocks failed")
 

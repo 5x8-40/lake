@@ -6,7 +6,7 @@
 //! - [`BlockStore<T>`]: unified single-mutex owner of reset and inactive
 //!   pool state.
 //! - [`InactiveIndex`]: pluggable T-free eviction-order trait for the
-//!   inactive pool (crate-private).
+//!   inactive pool (pub for lake controlplane thin drivers — P4.2).
 //! - Type-safe RAII guards (`MutableBlock`, `CompleteBlock`,
 //!   `ImmutableBlock`, `WeakBlock`) live in `crate::blocks` and return to
 //!   the store on drop.
@@ -20,8 +20,16 @@ pub mod tests;
 #[cfg(test)]
 mod block_proptest;
 
-pub(crate) use inactive::backends;
-pub(crate) use store::{BlockStore, InactiveIndex};
+/// Eviction backends. Public: lake needs (`MultiLru` + `Lineage`). Rest `pub(crate)`.
+pub mod backends {
+    pub(crate) use super::inactive::backends::{
+        FifoReusePolicy, HashMapBackend, LeafPolicy, LruBackend,
+    };
+    pub use super::inactive::backends::{LineageBackend, MultiLruBackend};
+}
+
+pub(crate) use store::BlockStore;
+pub use store::InactiveIndex;
 
 pub(crate) use crate::SequenceHash;
 use crate::blocks::BlockId;

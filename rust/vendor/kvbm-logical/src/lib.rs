@@ -39,11 +39,19 @@ pub use integrations::{
     SchedulableSequenceBuilder, ScheduleError, SequenceDelegate, SequenceEvent, SequenceState,
 };
 pub use manager::BlockManager;
+// lake P4.2: pub only what controlplane drives (InactiveIndex + MultiLru + Lineage).
+pub use pools::{
+    InactiveIndex,
+    backends::{LineageBackend, MultiLruBackend},
+};
 pub use registry::BlockRegistry;
 pub use sequence::{
     BlockSequence, BlockSequenceError, ExternalBlockAssignments, LogicalBlockAssignmentError,
     LogicalBlockAssignments, zip_assigned, zip_assigned_pending,
 };
+pub use tinylfu::{FrequencyTracker, TinyLFUTracker};
+// Re-export manager helpers used to build trackers for MultiLruBackend.
+pub use manager::FrequencyTrackingCapacity;
 
 pub type BlockId = usize;
 pub type SequenceHash = dynamo_tokens::PositionalLineageHash;
@@ -88,16 +96,16 @@ impl KvbmSequenceHashProvider for dynamo_tokens::TokenBlock {
 
 /// Logical layout handle type encoding the layout ID.
 ///
-/// KVBM manages G1, G2 and G3 layouts directly. G4 is managed by an external service.
+/// lake P4.2 rename: upstream Dynamo used G1–G4; lake layers are L0–L3
+/// (medium tiers; see docs/architecture/kv-cache-pool.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Encode, Decode, Serialize, Deserialize)]
 pub enum LogicalLayoutHandle {
-    /// Representation of GPU / Device Memory
-    G1,
-    /// Representation of CPU / Host Memory
-    G2,
-    /// Representation of Disk Storage
-    G3,
-    /// Representation of Blocks held in an external service
-    /// outside the control of the KVBM system.
-    G4,
+    /// GPU / Device Memory (HBM) — lake L0
+    L0,
+    /// CPU / Host Memory — lake L1
+    L1,
+    /// Disk / NVMe — lake L2
+    L2,
+    /// External object store — lake L3
+    L3,
 }

@@ -73,6 +73,11 @@ class ControlPlaneServiceStub:
                 request_serializer=lake__pb2.RegisterBlocksRequest.SerializeToString,
                 response_deserializer=lake__pb2.Ack.FromString,
                 _registered_method=True)
+        self.ReportRef = channel.stream_unary(
+                '/lake.ControlPlaneService/ReportRef',
+                request_serializer=lake__pb2.RefDelta.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
         self.RequestBarrier = channel.unary_unary(
                 '/lake.ControlPlaneService/RequestBarrier',
                 request_serializer=lake__pb2.RequestBarrierRequest.SerializeToString,
@@ -139,6 +144,18 @@ class ControlPlaneServiceServicer:
         PutStart 不进控制面(agent 本地记账即可),防半块被读。仿 Mooncake PutEnd 的控制面侧。
         release 一致,写控制面内存,不进 etcd。
         与 Publish 的区别:Publish(可多次、逐层 slice)只更新位置视图;RegisterBlocks(满块 + L2 durable)才进 radix + 置 l3_present/L2。
+        P4.2:须带 prefix_hashes 全链以便控制面建 PositionalLineageHash;`blocks` 可为 miss 后缀。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReportRef(self, request_iterator, context):
+        """P4.2:**控制面合账骨架**（非完整两级 ref）。
+        本切片：累加 delta → global_refs；**忽略 RefKind**；agent **未**维护本地一级、也未调用本 RPC。
+        完整两级（agent 本地 REQUEST/IN_FLIGHT/WRITEBACK + 控制面分 kind）→ 后续切片。
+        流式：先收齐再 **全有或全无** apply（任一条未知 block → 整批不改，可安全重试）。
+        不进 ViewEvent(B1)。
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -179,6 +196,11 @@ def add_ControlPlaneServiceServicer_to_server(servicer, server):
             'RegisterBlocks': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterBlocks,
                     request_deserializer=lake__pb2.RegisterBlocksRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
+            'ReportRef': grpc.stream_unary_rpc_method_handler(
+                    servicer.ReportRef,
+                    request_deserializer=lake__pb2.RefDelta.FromString,
                     response_serializer=lake__pb2.Ack.SerializeToString,
             ),
             'RequestBarrier': grpc.unary_unary_rpc_method_handler(
@@ -318,6 +340,33 @@ class ControlPlaneService:
             target,
             '/lake.ControlPlaneService/RegisterBlocks',
             lake__pb2.RegisterBlocksRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReportRef(request_iterator,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.stream_unary(
+            request_iterator,
+            target,
+            '/lake.ControlPlaneService/ReportRef',
+            lake__pb2.RefDelta.SerializeToString,
             lake__pb2.Ack.FromString,
             options,
             channel_credentials,

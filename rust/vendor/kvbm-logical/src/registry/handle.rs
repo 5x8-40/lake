@@ -125,7 +125,7 @@ impl BlockRegistrationHandle {
     /// Increment the refcounted presence marker for tier `T`. Each
     /// presence-bearing slot transition (`Staged → Primary`,
     /// `Staged → Duplicate`) calls this exactly once.
-    pub(crate) fn mark_present<T: BlockMetadata>(&self) {
+    pub fn mark_present<T: BlockMetadata>(&self) {
         let type_id = TypeId::of::<T>();
         let mut attachments = self.inner.attachments.lock();
         *attachments.presence_markers.entry(type_id).or_insert(0) += 1;
@@ -135,7 +135,7 @@ impl BlockRegistrationHandle {
     /// presence-removing slot transition (`Inactive → Mutable` via
     /// eviction, `Duplicate → Reset` via last-duplicate drop) calls this
     /// exactly once. The entry is removed on reaching zero.
-    pub(crate) fn mark_absent<T: BlockMetadata>(&self) {
+    pub fn mark_absent<T: BlockMetadata>(&self) {
         let type_id = TypeId::of::<T>();
         let mut attachments = self.inner.attachments.lock();
         match attachments.presence_markers.get_mut(&type_id) {

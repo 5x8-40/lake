@@ -149,26 +149,15 @@ impl BlockRegistry {
     ///
     /// # Consistency model
     ///
-    /// This view is a **refcounted shadow** of the authoritative
-    /// `BlockStore<T>` state, *not* a linearizable snapshot. The store is
-    /// the single source of truth for slot state and is updated under its
-    /// own mutex; the registry-side presence count is then incremented
-    /// (`mark_present`) or decremented (`mark_absent`) in a separate
-    /// critical section that runs *after* the store mutex has been
-    /// released — see `pools/store.rs::register_completed_block`,
-    /// `allocate_atomic`, `release_duplicate`, and `drain_inactive_to_mutable`.
+    /// Upstream Dynamo: this view is a **refcounted shadow** of
+    /// `BlockStore<T>` (updated after the store mutex is released), so it
+    /// is not linearizable against in-flight store mutations.
     ///
-    /// In steady state and after every operation has fully completed, the
-    /// shadow count agrees with the authoritative state because the
-    /// per-slot increments and decrements commute (refcounted). However,
-    /// while a registration, eviction, or duplicate drop is mid-flight,
-    /// `check_presence` can briefly report the pre-update value. Callers
-    /// who need the exact current state must instead acquire a strong
-    /// reference via `BlockManager::match_blocks` /
-    /// `BlockManager::scan_matches` (which consult the store directly) or
-    /// otherwise serialize against the mutating operation.
-    ///
-    /// Does NOT trigger frequency tracking.
+    /// lake P4.2: controlplane holds strong handles and calls
+    /// `mark_present` / `mark_absent` under the same `Authority` mutex as
+    /// `LookupPrefix` / `RegisterBlocks`, so presence agrees with the
+    /// process-local location view for lake callers. Does NOT trigger
+    /// frequency tracking.
     pub fn check_presence<T: crate::blocks::BlockMetadata>(
         &self,
         seq_hashes: &[SequenceHash],

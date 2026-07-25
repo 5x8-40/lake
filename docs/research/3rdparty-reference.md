@@ -262,7 +262,7 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 - Dynamo `kvbm-physical::TransferManager` 是**抽象**，生产数据面仍优先接 A（Mooncake TE），避免两套传输栈。
 - 其余（SGLang HiCache 策略、LMCache 后端思路、vLLM `KVConnectorBase_V1`、Dynamo kv-router 选路公式）继续以**借鉴/对照**为主，默认不链进依赖树；计算层（P5）再评估 vLLM/SGLang 引擎经 connector 接入。
 
-**现状（P4.1 / [PR #21](https://github.com/chengda-wu/lake/pull/21)）**：复用 **B** 已 in-tree vendor 入 `rust/vendor/{kvbm-logical,dynamo-tokens}/`（pin 与 re-vendor 见 `rust/vendor/UPSTREAM.md`）；**lake 业务 crate（controlplane / kv-pool / …）尚未链依赖**，仍是 P3 自研联通骨架。复用 **A**（Mooncake TE）仍待 P4 传输切片。`3rdparty/` 继续只读参考；vendor 改造不回写 submodule（见下「submodule 使用约定」）。
+**现状（P4.2）**：复用 **B** 已 in-tree vendor（[PR #21](https://github.com/chengda-wu/lake/pull/21) / `rust/vendor/UPSTREAM.md`）；**`lake-controlplane` 已链依赖** `kvbm-logical` + `dynamo-tokens`，用 `BlockRegistry`/`PositionalLineageHash`/`InactiveIndex`；驱逐主路径为 **`LineageBackend::with_frequency`**（只驱叶子≈前缀亲和 + `LeafPolicy::Frequency` TinyLFU≈LFU-Aging；上游 MultiLru/Lineage 互斥，lake 走 LeafPolicy 第三臂组合）。无 `BlockStore` 固定槽 → Authority 人工 cap：`report_ref` 满容 **skip insert**（对齐 Dynamo insert≠allocate）；压力驱逐只走 `evict_n`；`FrequencyPolicy` 超容 `debug_assert`（禁静默丢 leaf）。`MultiLruBackend` 仍 pub 对照；纯 `Lru`/`Fifo`/`HashMap` 不提 pub。**不用** `BlockManager`/`BlockStore`；`EventsManager` 断耦不接线。`kv-pool` 仍 dumb 字节。驱逐正确性靠 Authority 单测；生产 `ReportRef` 喂数后续。复用 **A**（Mooncake TE）仍待 P4 传输切片。`3rdparty/` 继续只读参考；vendor 改造不回写 submodule（见下「submodule 使用约定」）。
 
 锚点（复用时回溯）：
 
@@ -295,7 +295,7 @@ Dynamo 跨 **P4(存储)** 与 **控制面(选路/通信)**,不进上面"抄源�
 | 强一致位置视图 | `presence_markers: HashMap<TypeId,u32>` + `mark_present/absent/has_block/has_any_block` | `lib/kvbm-logical/src/registry/handle.rs:128-188` | `T` 换 L0–L3;补 L0 跟踪(Dynamo G1 不进) |
 | 每层一个池 | `BlockManager<T>` + `BlockStore<T>`(单 mutex + `SlotState` 状态机) | `lib/kvbm-logical/src/manager/mod.rs:31`、`pools/store.rs:110` | L0 也实例化(Dynamo 不实例化 G1) |
 | radix 索引 | `BlockRegistry` + `PositionalRadixTree<Weak>` | `lib/kvbm-logical/src/registry/mod.rs:110` | 几乎直接用 |
-| 驱逐策略可插拔 | `InactiveIndex` trait + backends(`LruBackend`/`LineageBackend`≈前缀亲和) | `lib/kvbm-logical/src/pools/store.rs:54` | 实现 LFU-Aging + 前缀亲和 |
+| 驱逐策略可插拔 | `InactiveIndex` + backends | `lib/kvbm-logical/src/pools/store.rs:54` | lake Authority：`LineageBackend::with_frequency`（叶子+TinyLFU）；`MultiLruBackend` 对照；不照搬纯 `Lru`/`Fifo`（见 `rust/vendor/UPSTREAM.md`） |
 | 冷热迁移策略链 | `OffloadPolicy<T>` + `Either<Ready,BoxFuture>`(零分配;`PresenceAndLFUFilter`≈LFU) | `lib/kvbm-engine/src/offload/policy.rs:219,47` | 加 promote 方向(Dynamo demote-only) |
 | demote pipeline | `Pipeline<Src,Dst>` 5 段 + `auto_chain` | `lib/kvbm-engine/src/offload/pipeline.rs:65`、`engine.rs:537` | 镜像出 promote pipeline |
 | L3 对象存储 SSOT | `ObjectBlockOps` + `ObjectLockManager`(`.meta`/`.lock` 分布式锁) + `KeyFormatter` | `lib/kvbm-engine/src/object/mod.rs:152,280,39` | 直接用 |

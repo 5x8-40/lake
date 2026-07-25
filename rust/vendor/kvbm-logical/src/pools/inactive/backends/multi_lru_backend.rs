@@ -17,7 +17,7 @@ use crate::pools::IdBuildHasher;
 use crate::pools::store::InactiveIndex;
 use crate::tinylfu::FrequencyTracker;
 
-pub(crate) struct MultiLruBackend {
+pub struct MultiLruBackend {
     /// Identity-hashed: `SequenceHash` is already a content hash.
     priority_pools: [LruCache<SequenceHash, BlockId, IdBuildHasher>; 4],
     frequency_tracker: Arc<dyn FrequencyTracker<u128>>,
@@ -27,7 +27,7 @@ pub(crate) struct MultiLruBackend {
 impl MultiLruBackend {
     /// Create with custom frequency thresholds. The 4 levels are fixed; only
     /// the boundaries between them are configurable.
-    pub(crate) fn new_with_thresholds(
+    pub fn new_with_thresholds(
         block_count: NonZeroUsize,
         thresholds: &[u8; 3],
         frequency_tracker: Arc<dyn FrequencyTracker<u128>>,

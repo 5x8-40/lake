@@ -29,15 +29,49 @@
 - **vendor 排除 `-D warnings`**：本树约定业务源码不改；滚动 lint / 新 stable 若 deny 进 vendor，会逼改 fork 或堆 `allow`。排除后 lint 洁净度与「我们的 CI」解耦；vendor 正确性靠下方单测门禁。
 - **vendor 单测**：`cargo test -p dynamo-tokens -p kvbm-logical`（约 500，含 proptest）在 P4.1 起作为**每 PR** rust job 门禁，锁「业务源码未改 + 构建接入仍绿」。P4.2 链业务依赖后若嫌慢，可改 label / `schedule` 触发，勿静默删门禁。
 
-## 本树相对上游的改动（P4.1 / GitHub PR #21）
+## 本树相对上游的改动
 
-**业务源码未改**（`src/` / tests / benches 与 `3rdparty/dynamo` 对应路径 `diff` 应为空）。  
-`Cargo.toml` 是**构建接入层**：去 workspace 继承、填实版本、改 path——其中若干约束相对上游有意偏离，见下节，勿读成「Cargo.toml 也字节级一致」。
+### P4.1（构建接入）
 
-- `edition = "2024"`（上游 let chains 需要）。
-- `dynamo-tokens` → `path = "../dynamo-tokens"`。
+`Cargo.toml`：去 workspace 继承、填实版本、改 path；`edition = "2024"`；`dynamo-tokens` → `path = "../dynamo-tokens"`。见下节偏差表。
 
-源码级改造（`InactiveIndex` 提 `pub`、拆 `EventsManager`、tier G1–G4→L0–L3、`check_presence` 线性一致等）**不在本 pin**，随 #20 后续切片（P4.2+）按需改。
+### P4.2（最小源码改造，#20）
+
+| 项 | 上游 | vendor | 说明 |
+|----|------|--------|------|
+| `InactiveIndex` + `MultiLruBackend` + `LineageBackend` | `pub(crate)` | `pub` + crate root re-export | **仅** lake controlplane 所需（见下「为何不 pub Lru/Fifo」） |
+| `LeafPolicy::Frequency` + `LineageBackend::with_frequency` | 注释中的 planned third arm | **已实现** | TinyLFU 分档驱叶子；Authority 主路径 |
+| `on_node_inserted(idx, seq_hash)` | 仅 `idx` | 增 `SequenceHash` | Frequency 需要；Fifo/Tick 忽略 |
+| `mark_present` / `mark_absent` | `pub(crate)` | `pub` | 无 BlockStore 时由 CP 标 presence |
+| `LogicalLayoutHandle` | `G1..G4` | `L0..L3` | lake 统一编址；vendor 内原无引用 |
+| `EventsManager` | 可选挂 registry | **仍保留模块**；lake **不接线** | 物理删除字段留后续小 PR |
+| `check_presence` 注释 | store-shadow | 注明 lake 同锁线性 | 实现未改 |
+
+其余 `src/` 业务逻辑与上游 pin 一致（除上表）。
+
+#### Authority 驱逐主路径（组合，非互斥二选一）
+
+上游 `InactiveBackendConfig` 里 MultiLru **与** Lineage 互斥（单槽 `Box<dyn InactiveIndex>`）。lake 要 `ref>0` 冻结 + LFU-Aging + 前缀亲和，故走上游预留扩展点：
+
+- **主路径**：`LineageBackend::with_frequency` = 只驱叶子（≈前缀亲和强形式）+ `LeafPolicy::Frequency`（TinyLFU 冷叶优先 ≈ LFU-Aging）
+- **`MultiLruBackend`**：仍 **pub**，作对照/单测；Authority **不再单独挂**它
+- 加权软亲和（非叶子也可驱但权重极高）defer；P4.2 用结构约束近似
+- **inactive 上界（对齐 Dynamo 路径拆分）**：上游 `release_primary` → `inactive.insert` 与 `allocate_atomic` → `inactive.allocate` **分离**；固定槽使 insert 不会顶破 MultiLru cap。lake 无 `BlockStore` → Authority 人工 `INACTIVE_CAP`：`report_ref` 满容 **只 skip insert、不摘视图**；压力驱逐只走显式 `evict_n`（及后续生产 allocate）。`FrequencyPolicy::on_leaf_added` 仍对齐 MultiLru 超容 `debug_assert`（禁静默踢 leaf → 视图僵尸）
+- **TinyLFU 分档时机**：与上游 MultiLru 一致——leaf 进入 inactive 时按当时 count 入档，**存续期间不随 Lookup touch 重分桶**；升温只影响「尚未入 inactive / 再次 0→正→0 再入」的路径
+
+#### 为何不 pub `LruBackend` / `FifoReusePolicy` / `HashMapBackend`
+
+lake 冷热策略已定（见 `docs/architecture/kv-cache-pool.md`）：`ref>0` 冻结 + **LFU-Aging** + **前缀亲和**。
+
+| vendor backend | 语义 | lake P4.2 |
+|----------------|------|-----------|
+| `LineageBackend` + `Frequency` | 叶子约束 + TinyLFU 分档 | **主路径**（`with_frequency`） |
+| `MultiLruBackend` | TinyLFU 分档 + 档内 LRU（无树约束） | **pub**，对照；非 Authority 默认 |
+| `LineageBackend` + Tick/Fifo | 只驱叶子 + 简单序 | BlockManager 默认仍 Tick |
+| `LruBackend` | 纯 LRU | 保持 `pub(crate)` |
+| `FifoReusePolicy` / `HashMapBackend` | FIFO + HashMap 槽位复用 | 保持 `pub(crate)`——绑 `BlockStore`；lake 薄驱动不用 |
+
+不是 LRU/FIFO「没用」，而是当前策略不需要它们当一等公民；crate 内仍供 Dynamo `BlockManager` 使用。以后若另开策略再按需提 `pub`。连带少改动，也避开 `InactiveBlock` 等经 public API 泄漏触发的 `private_interfaces`（CI `-D warnings`）。
 
 ## Cargo.toml 相对上游的版本/feature 偏差
 

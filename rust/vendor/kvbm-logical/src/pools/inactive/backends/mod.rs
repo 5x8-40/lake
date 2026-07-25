@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Backend storage strategies for the inactive index.
+//!
+//! lake P4.2: pub only what controlplane needs (`MultiLru` + `Lineage`).
+//! Other backends stay `pub(crate)` (BlockManager / avoid private_interfaces).
 
 use super::*;
 
@@ -17,7 +20,8 @@ mod tests;
 
 pub(crate) use fifo::FifoReusePolicy;
 pub(crate) use hashmap_backend::HashMapBackend;
-pub(crate) use lineage::{LeafPolicy, LineageBackend};
+pub(crate) use lineage::LeafPolicy;
+pub use lineage::LineageBackend;
 pub(crate) use lru_backend::LruBackend;
-pub(crate) use multi_lru_backend::MultiLruBackend;
-pub(crate) use reuse_policy::ReusePolicy;
+pub use multi_lru_backend::MultiLruBackend;
+pub(crate) use reuse_policy::ReusePolicy; // hashmap_backend: `use super::ReusePolicy`

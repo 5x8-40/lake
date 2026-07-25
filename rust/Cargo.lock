@@ -898,11 +898,14 @@ dependencies = [
 name = "lake-controlplane"
 version = "0.0.0"
 dependencies = [
+ "dynamo-tokens",
+ "kvbm-logical",
  "lake-proto",
  "prost",
  "tokio",
  "tokio-stream",
  "tonic",
+ "xxhash-rust",
 ]
 
 [[package]]
