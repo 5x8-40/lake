@@ -34,6 +34,8 @@ class InMemoryAgent:
         self.pull_cost_ms: int = 0
         self.prepare_calls = 0
         self.done_calls = 0
+        # D10：自上次 commit 以来的 prepare 次数；>1 说明有更新的 prepare，禁止 shrink
+        self._prepares_since_commit: Dict[str, int] = {}
 
     def seed_local_prefix(self, req_id: str, token_end: int) -> None:
         """测试/预放置：把 [0, token_end) 标为已在本机 L0（D-direct）。"""
@@ -52,13 +54,18 @@ class InMemoryAgent:
     def commit_write_extent(self, req_id: str, token_end: int) -> None:
         """将 L0 写高水位收到实际 token_end（回收未接受的 verify 预留槽）。
 
-        D10 mock 债：``min(current, token_end)`` 在 overlap 下会砍掉后续 prepare
-        已抬高的预留（DECODE / TARGET_VERIFY 皆然）。单测请 ``enable_overlap=False``，
-        或待 device 会计落地后改掉本实现。
+        D10：对齐 vLLM V2 device 侧接受长度会计——host ``min`` 不得压后续 prepare
+        已抬高的预留。若自上次 commit 后又发生过更新的 prepare，则跳过 shrink
+        （残留高水位最多保留到 ``on_request_finished``）。
         """
+        end = max(0, token_end)
+        n = self._prepares_since_commit.get(req_id, 0)
+        if n > 1:
+            self._prepares_since_commit[req_id] = n - 1
+            return
         if req_id in self.l0_token_end:
-            self.l0_token_end[req_id] = min(self.l0_token_end[req_id], max(0, token_end))
-
+            self.l0_token_end[req_id] = min(self.l0_token_end[req_id], end)
+        self._prepares_since_commit[req_id] = 0
     def prepare_step(self, plan: PreparePlan) -> ReadyHandle:
         self.prepare_calls += 1
         if self._ready_step is not None:
@@ -99,6 +106,7 @@ class InMemoryAgent:
             if io.req_id not in {x.req_id for x in eff_write}:
                 continue
             self.l0_token_end[io.req_id] = max(self.l0_token_end.get(io.req_id, 0), io.token_end)
+            self._prepares_since_commit[io.req_id] = self._prepares_since_commit.get(io.req_id, 0) + 1
             self._frozen_reqs.add(io.req_id)
             st = stats.setdefault(io.req_id, StepStats())
             if io.token_start == 0 and io.token_end > 0:
@@ -120,7 +128,6 @@ class InMemoryAgent:
         # step 结束解冻（简化：清空本步冻结；生产按 block ref）
         self._frozen_reqs.clear()
         self._flush_deferred_finish()
-
     def on_request_finished(self, finish: FinishRequest) -> None:
         if finish.req_id in self._frozen_reqs or self._ready_step is not None:
             # overlap：本步还在用 / 下一 ready 未完成 → 延迟归还
@@ -139,4 +146,5 @@ class InMemoryAgent:
 
     def _apply_finish(self, finish: FinishRequest) -> None:
         self.l0_token_end.pop(finish.req_id, None)
+        self._prepares_since_commit.pop(finish.req_id, None)
         self.finished.append(finish.req_id)

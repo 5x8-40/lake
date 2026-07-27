@@ -1,9 +1,4 @@
-"""计算层 runtime:WorkerService + node_scheduler（Host Req 权威）。"""
+"""计算层 runtime:WorkerEngine + node_scheduler（Host Req 权威）+ WorkerService。
 
-from lake_pb import lake_pb2_grpc
-
-_ = lake_pb2_grpc.ControlPlaneServiceStub
-_ = lake_pb2_grpc.AgentServiceStub
-_ = lake_pb2_grpc.TransferServiceStub
-_ = lake_pb2_grpc.WorkerServiceStub
-_ = lake_pb2_grpc.SkeletonKvServiceStub
+gRPC stub 校验延后到 `worker` / `serve` 路径，避免无 grpc 环境下单测无法 import。
+"""

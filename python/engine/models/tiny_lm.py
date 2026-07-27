@@ -78,20 +78,40 @@ class TinyLM:
             rows.append(list(self.embed[tid]))
         return rows
 
+    def forward_query_logits(
+        self, token_ids: Sequence[int], q_start: int, q_end: int
+    ) -> List[List[float]]:
+        """返回 query 区间 `[q_start, q_end)` 各位置的 vocab logits（C8 残差路径）。
+
+        无本地 KV cache：每次物化 K/V 前缀 `[0, q_end)`（生产由池 L0 + block table 承接）。
+        Q 只算残差段，对齐「只算 `[computed, computed+n)`」。
+        """
+        if not token_ids or q_end <= q_start:
+            return []
+        q_start = max(0, q_start)
+        q_end = min(len(token_ids), q_end)
+        if q_end <= q_start:
+            return []
+        prefix = token_ids[:q_end]
+        x = self._embed_tokens(prefix)
+        k = [_matvec(self.wk, h) for h in x]
+        v = [_matvec(self.wv, h) for h in x]
+        q_rows = [_matvec(self.wq, x[i]) for i in range(q_start, q_end)]
+        attn_out = self._attn.forward_queries(q_rows, k, v, q_start)
+        logits_list: List[List[float]] = []
+        for off, i in enumerate(range(q_start, q_end)):
+            h = _layernorm(_add(x[i], _matvec(self.wo, attn_out[off])))
+            logits_list.append(
+                [sum(row[j] * h[j] for j in range(self.d_model)) for row in self.w_out]
+            )
+        return logits_list
+
     def forward_logits(self, token_ids: Sequence[int]) -> List[float]:
         """返回最后位置的 vocab logits。"""
         if not token_ids:
             return [0.0] * self.vocab_size
-        x = self._embed_tokens(token_ids)
-        # 单层 MHA
-        q = [_matvec(self.wq, h) for h in x]
-        k = [_matvec(self.wk, h) for h in x]
-        v = [_matvec(self.wv, h) for h in x]
-        # 多头：拼回简化为整宽一次 attn（经 AttentionBackend，非直接 import kernel）
-        attn_out = self._attn.forward(q, k, v)
-        y = [_layernorm(_add(h, _matvec(self.wo, a))) for h, a in zip(x, attn_out)]
-        last = y[-1]
-        return [sum(row[j] * last[j] for j in range(self.d_model)) for row in self.w_out]
+        rows = self.forward_query_logits(token_ids, len(token_ids) - 1, len(token_ids))
+        return rows[-1] if rows else [0.0] * self.vocab_size
 
     def greedy_token(self, token_ids: Sequence[int]) -> int:
         logits = self.forward_logits(token_ids)

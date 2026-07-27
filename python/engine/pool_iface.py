@@ -9,7 +9,6 @@ import logging
 from typing import Dict, Optional
 
 from engine.agent import StorageAgent
-from engine.agents.grpc_skeleton import GrpcSkeletonAgent, chain_block_hashes, mock_kv_bytes
 from engine.agents.memory import InMemoryAgent
 from engine.pool_types import FinishRequest, PreparePlan, ReadyHandle, StepStats
 from runtime.prefix_hint import PrefixHint
@@ -18,7 +17,7 @@ from runtime.scheduler_output import SchedulerOutput
 
 LOG = logging.getLogger("lake.pool_iface")
 
-# 兼容旧 import
+# 兼容旧 import（chain_block_hashes / mock_kv_bytes 惰性，避免无 grpc 时 import 炸）
 __all__ = [
     "PoolIface",
     "ReadyHandle",
@@ -26,6 +25,20 @@ __all__ = [
     "chain_block_hashes",
     "mock_kv_bytes",
 ]
+
+
+def __getattr__(name: str):
+    if name in ("chain_block_hashes", "mock_kv_bytes"):
+        from engine.agents.grpc_skeleton import chain_block_hashes, mock_kv_bytes
+
+        return chain_block_hashes if name == "chain_block_hashes" else mock_kv_bytes
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _grpc_agent_type():
+    from engine.agents.grpc_skeleton import GrpcSkeletonAgent
+
+    return GrpcSkeletonAgent
 
 
 class PoolIface:
@@ -43,12 +56,10 @@ class PoolIface:
 
     @classmethod
     def from_grpc(cls, cp, kv, **kwargs) -> "PoolIface":
-        return cls(GrpcSkeletonAgent(cp, kv), **kwargs)
+        return cls(_grpc_agent_type()(cp, kv), **kwargs)
 
     def probe_prefix(self, req: Req) -> PrefixHint:
         """方案 Z：只读命中视图 / Lookup；不放置。"""
-        if isinstance(self._agent, GrpcSkeletonAgent):
-            return self._agent.probe_prefix(req)
         if isinstance(self._agent, InMemoryAgent):
             computed, full = self._agent.probe_local(req.req_id, len(req.prompt_token_ids))
             blocks = computed // 8
@@ -59,6 +70,8 @@ class PoolIface:
                 local_hit=computed > 0,
                 prebuilt=full,
             )
+        if hasattr(self._agent, "probe_prefix"):
+            return self._agent.probe_prefix(req)  # type: ignore[attr-defined]
         return PrefixHint()
 
     def prepare_step(self, output: SchedulerOutput, reqs: Dict[str, Req]) -> ReadyHandle:
@@ -71,8 +84,9 @@ class PoolIface:
             pull_budget_ms=self.pull_budget_ms,
             allow_partial_hit=self.allow_partial_hit,
         )
-        if isinstance(self._agent, GrpcSkeletonAgent):
-            self._agent.bind_host_reqs(reqs)
+        bind = getattr(self._agent, "bind_host_reqs", None)
+        if callable(bind):
+            bind(reqs)
         handle = self._agent.prepare_step(plan)
         self._last_ready = handle
         return handle
@@ -89,8 +103,8 @@ class PoolIface:
     def commit_write_extent(self, req_id: str, token_end: int) -> None:
         """回收写槽高水位（verify 未接受 / 实际产出短于预留）。
 
-        D10：仅 InMemory 实现；绝对值 min 与默认 overlap 不兼容（见 compute-layer D10）。
-        生产应对齐 vLLM V2 device 侧会计；GrpcSkeleton 为 no-op。
+        D10：InMemory 已用 prepare 代数防 overlap 误 shrink（见 compute-layer D10）；
+        生产仍应对齐 vLLM V2 device 侧会计；GrpcSkeleton 为 no-op。
         """
         if isinstance(self._agent, InMemoryAgent):
             self._agent.commit_write_extent(req_id, token_end)

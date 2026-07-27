@@ -241,6 +241,12 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 - [x] **C3**：TinyLM + attn/sample 最小路径（零强制 torch；P3 默认仍 `model_backend=mock`）
 - [x] **C4**：共置 TinyMTP（post/pre_forward）+ TARGET_VERIFY + chain reject
 - [x] **C5**：vLLM 调度几何（`num_computed` + 本步 token）+ 三模式选路骨架（`PrefixHint`/`mode_select`）；整段本地命中→`computed=prompt_len`（无 PREBUILT 分相）；Go Router 权威联调后续
+- [x] **C6–C10** 填充 scheduler/worker/runner（vLLM 为主）：详见 [`architecture/compute-layer.md`](architecture/compute-layer.md)「C6–C10 填充计划」
+  - [x] **C6**：Worker 长期单环（一份 scheduler；Generate 入队；step 前 drain）
+  - [x] **C7**：token_budget + chunked extend
+  - [x] **C8**：InputBatch + AttentionMetadata（D4）+ TinyLM 批路径
+  - [x] **C9**：D10 overlap×agent + D6 dummy_run
+  - [x] **C10**：Warm/容量信号骨架（生命周期 + CapacitySignal；Router/真 pin 联调后置）
 - [ ] 同步工程基建：CI 以 `engine`/`runtime`/`kernels` 为主（旧三包仅兼容 import）
 - [ ] Prefill→Decode 的 KV 迁移流水线（计算与传输重叠）
 - [ ] 故障注入：杀 Decode 节点 → 从 KV Pool 续推

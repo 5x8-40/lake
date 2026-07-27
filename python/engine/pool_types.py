@@ -39,6 +39,7 @@ class ReadyHandle:
     """ready fence 完成信号。
 
     C2：无 device 指针；生产由 agent 填固定地址 block table 后只回 step_id + 统计。
+    C8/D4：`block_table_by_req` 为逻辑 slot 表占位（引擎只读，不组装）。
     """
 
     step_id: int
@@ -48,6 +49,8 @@ class ReadyHandle:
     # 非 None 时为缩批后的实际集合（默认与 plan 相同）。
     effective_read_set: Optional[List[ReqIoSet]] = None
     effective_write_set: Optional[List[ReqIoSet]] = None
+    # D4：agent 出表；key=req_id → block slot 索引列表（逻辑，非物理指针）
+    block_table_by_req: Dict[str, List[int]] = field(default_factory=dict)
 
 
 @dataclass

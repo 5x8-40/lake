@@ -43,10 +43,10 @@ Go Router                         # 模式选择 + 副本选路
         │ Dispatch / Generate
         ▼
 python/runtime/                   # 进程边界
-  worker.py                       # Warm→Ready→Serving→Drain;角色配置入口
+  worker.py                       # WorkerService gRPC 门面;Warm→Ready→Serving→Drain
+  worker_engine.py                # ★ C6 长期单环（入队 + step 线程;无 gRPC 依赖）
   node_scheduler.py               # ★ Req 权威 + continuous batching + overlap 主循环
                                   #   → SchedulerOutput;请求结束 → agent.on_request_finished
-  service.py                      # WorkerService 等 RPC
         │ SchedulerOutput（无长期 Req）
         ▼
 python/engine/                    # ★ 对齐 vLLM gpu/ 形态(唯一实现树;无 RequestState 表)
@@ -574,8 +574,29 @@ Python 落点：`runtime/scheduler_output.py`（dataclass）← `node_scheduler`
 | **C3** | TinyLM（纯 Python）+ `kernels/attn_*`（triton 可选回退 ref）+ `sample/greedy`；`model_backend=tiny_lm`；旧三包废止为实现树（保留空壳兼容） | **done 2026-07-22** |
 | **C4** | `drafter/TinyMTPDrafter` post/pre_forward；`TARGET_VERIFY` + chain reject；`DRAFT_EXTEND` 骨架 | **done 2026-07-22** |
 | **C5** | vLLM 调度几何 + `mode_select`/`PrefixHint`（D-direct/混部/PD）；整段本地命中→computed=prompt_len；Generate 回填 `exec_mode`；Go Router 权威选路仍后续 | **done 2026-07-22** |
+| **C6** | **Worker 长期单环**：一份 `NodeScheduler`+`ModelRunner`；`Generate` 只入队等待；step 环独立线程；每 step 前 drain 入队以真正 continuous batching；`RoleConfig.from_env`（D3 最小） | **done 2026-07-24** |
+| **C7** | Scheduler 补齐 vLLM 几何：`token_budget` / chunked extend / running 优先；admission 守 `max_model_length` | **done 2026-07-24** |
+| **C8** | Runner：`InputBatch` + `AttentionMetadata`（D4）+ TinyLM 批路径；残差只算 `[computed, computed+n)`；`sample_tokens` 接口预留拆分 | **done 2026-07-24** |
+| **C9** | D10 overlap×agent 槽位会计 + D6 `_dummy_run` 复用生产入口 | **done 2026-07-24** |
+| **C10** | Warm/容量信号骨架（生命周期状态机 + `CapacitySignal` 上报；真权重 pin / Router 联调仍后置） | **done 2026-07-24** |
 
 硬约束不变：引擎零分层 / 零引擎驱动 intra-step `wait_event`；失败→F4；过载 shedding 不进 worker。
+
+### C6–C10 填充计划（vLLM 为主）
+
+> 对照：[`../research/vllm/compute.md`](../research/vllm/compute.md)、[`../research/scheduler-worker-interface.md`](../research/scheduler-worker-interface.md)。  
+> **参考**：vLLM `Scheduler.schedule` / `SchedulerOutput` / `GPUModelRunner.execute_model` / EngineCore 单环；overlap/Req 权威仍借 SGLang Scheduler 层。  
+> **关键差异**：无 runner 内 `RequestState`/`BlockPool`；KV 经 `pool_iface` 必经 fence；不设 PREBUILT 分相。
+
+| 序 | 里程碑 | 主改 | 阻塞设计 | 验收 |
+|----|--------|------|----------|------|
+| 1 | **C6** Worker 单环 ✅ | `runtime/worker_engine.py` + `worker.py`、`node_scheduler.py`（`has_work` / `before_schedule` / `on_req_finished`）、`role.py` | 无 | 两并发 submit 同 scheduler；同 step 多 `req_id`；单测绿 |
+| 2 | **C7** budget/chunk ✅ | `node_scheduler.py`、`role.py` | 无 | chunked extend + budget + decode 优先 + admission 单测 |
+| 3 | **C8** InputBatch/attn ✅ | `input_batch.py`、`model_runner.py`、`attn/metadata.py`、`kernels/attn_ref.py` | D4 初版已钉 | tiny_lm 同批两请求；`forward_query_logits` 残差 |
+| 4 | **C9** D10+D6 ✅ | `agents/memory.py`（prepare 代数防 shrink）、`model_runner.dummy_run` | D10 | 新 prepare 后旧 commit 不压 HWM；dummy 不触 pool |
+| 5 | **C10** 联调骨架 ✅ | `runtime/lifecycle.py` + `WorkerEngine.capacity_signal` | 真 pin/Router 后置 | Serving 态上报 waiting/running；Drain 拒新请求 |
+
+**本轮不做**：runner 内 BlockPool / `finished_req_ids` 清态；SGLang 分相状态机；TP `collective_rpc`（D8）；真 CUDA graph / 真权重；gateway shedding。
 
 ## D2 — `pool_iface` / StorageAgent FFI 草签（已定 2026-07-22）
 
@@ -653,15 +674,15 @@ process_batch_result → finished? → on_request_finished
 | D1 | **`SchedulerOutput` / `NodeScheduleOutput` 字段草图** | **已定**（见上节「D1」） | 本节；代码 `runtime/scheduler_output.py` |
 | D2 | **`pool_iface` FFI 契约** | **已定**（见上节「D2」）；代码 `engine/agent.py` + `pool_types.py` | 本节；FFI 不进 proto |
 | D3 | **角色配置 schema** | `role=prefill\|decode\|hybrid` 已定方向;未定完整启动配置(模型、TP、是否挂 drafter、arena 尺寸、上报指标标签)；C0 仅最小 `RoleConfig` | `runtime` 配置节;与冷启动 Warm 对齐 |
-| D4 | **Attention 后端与 metadata 边界** | C3：`engine/attn/backend.py` + `kernels/attn_{ref,triton}` 就位；`AttentionMetadata`/block table 挂载仍待（agent 出表） | 对照 vLLM `AttentionMetadataBuilder` |
+| D4 | **Attention 后端与 metadata 边界** | **C8 初版已定**：`attn/metadata.py::AttentionMetadata` + `ReadyHandle.block_table_by_req`（agent 出表、runner 只读）；`forward_queries` 残差路径；真固定地址 tensor / paged kernel 仍待生产 | 对照 vLLM `AttentionMetadataBuilder` |
 | D5 | **节点级 scheduler 与 agent 的交互序** | **已定**（见上节「D5」）：schedule→prepare(预算)→ready→execute→done；默认 all-or-nothing；overlap 延迟 free | 本节 + [`scheduling.md`](scheduling.md) §3 |
 
 ### 可与骨架并行(不阻塞空壳,阻塞真模型)
 
 | # | 缺口 | 说明 |
 |---|------|------|
-| D6 | **Dummy / CUDA graph capture 路径** | overlap 默认已定;dummy/graph 偏 V2 `_dummy_run` 复用生产入口,还是 SGLang 另造 batch——需二选一并写清 skip 分支(勿污染 serving / overlap 语义) |
-| D10 | **FutureMap 等价物 + overlap×agent 时序** | C1：`runtime/future_map.py` host 占位（`stash`/`publish`/`resolve`）；生产 GPU buf + 上批 `on_request_finished`∩本批 `prepare` 槽位冻结仍待（并入 D5）。**已知 mock 债**：`InMemoryAgent.commit_write_extent` 用绝对值 `min` 收 L0 高水位——在默认 overlap 下，`process(N-1)` 会回缩掉 `prepare(N)` 已抬高的预留（普通 DECODE 与 TARGET_VERIFY 皆然）；`GrpcSkeletonAgent` 上 commit 为 no-op，故 P3 不触发。生产应对齐 vLLM V2 **device 侧**接受长度会计（类 `free_group`），host `min` 不得压后续 prepare；在此之前勿把 InMemory+overlap 当正确槽位语义。 | 对齐 SGLang `FutureMap` + free_group；vLLM V2 device accounting |
+| D6 | **Dummy / CUDA graph capture 路径** | **C9 已选 V2**：`ModelRunner.dummy_run` 造假 `SchedulerOutput` + `execute_model(..., dummy_run=True)`（跳过 pool.done）；真 CUDA graph capture 仍后置 |
+| D10 | **FutureMap 等价物 + overlap×agent 时序** | C1：`runtime/future_map.py` host 占位；**C9**：`InMemoryAgent` 用 `_prepares_since_commit` 防止旧 commit 压新 prepare HWM（mock 级 device accounting）。生产仍需 GPU buf FutureMap + 真 free_group；`GrpcSkeletonAgent` commit 仍为 no-op。 | 对齐 SGLang `FutureMap` + free_group；vLLM V2 device accounting |
 | D7 | **Sampling / structured output 挂载点** | 状态归属已有 research;engine 内 `sample/` 与 grammar bitmask 的 step 序(相对 `execute_model`/`sample_tokens`)未钉 | 见 [`../research/sampling-params.md`](../research/sampling-params.md)、[`../research/guided-decoding.md`](../research/guided-decoding.md) |
 | D8 | **TP 扇出在 runtime 的形态** | 已定"一份调度 + 多卡执行"、单卡先行;未定 Executor/collective_rpc 等价物是否自研还是薄封装 | 对照 vLLM `MultiprocExecutor.collective_rpc` |
 | D9 | **权重加载回调进 runner** | 冷启动流式 load + pin 已定;未定 `load_model` 与 arena 绑定、layer-ready 后如何开始接请求 | 与 Warm→Ready 状态机对齐 |
