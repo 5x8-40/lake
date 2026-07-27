@@ -175,9 +175,9 @@ KV Pool 的远端物理载体由一组 KV Node 组成:每个贡献 DRAM + NVMe(L
         │ L0 (HBM) │ L1 (DRAM) │ L2 (NVMe) │ L3 │
         │   [B]    │           │           │    │   B 只在 L0;命中只能从 L0 读
 
-    t1  B 填满 → 算哈希 → 注册 radix → 写回 L2 (durable)
+    t1  B 填满 → 算哈希 → 写回 L2 (durable) → 注册 radix
         │ L0  │ L1 │  L2   │ L3 │
-        │ [B] │    │ [B]✓  │    │   写回只落 L2,不写 L1;B 有了持久后盾
+        │ [B] │    │ [B]✓  │    │   写回只落 L2,不写 L1;durable-first:落稳后才注册 radix,发布时后盾已落实
 
     t2  decode 继续,L0 满,B 被驱逐(demotion 到 L1)
         │ L0  │  L1   │  L2   │ L3 │

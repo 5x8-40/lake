@@ -8,4 +8,11 @@ publish = false
 lake-proto.workspace = true
 tonic.workspace = true
 
-# 空壳:L0–L3 分层缓存引擎。P2 仅验证 proto 生成 + 编译。
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "tier_access"
+harness = false
+
+# P4.3: L0–L3 Memory 站位 + BandwidthPool + TierPipeline + HitStats。

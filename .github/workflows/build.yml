@@ -37,7 +37,9 @@ jobs:
       # 见 rust/vendor/UPSTREAM.md「CI / clippy」。
       - run: cargo clippy --workspace --all-targets --exclude kvbm-logical --exclude dynamo-tokens -- -D warnings
       # P4.1 正确性门禁(故意每 PR 跑;嫌慢可改 label/定时,见 UPSTREAM.md)。
-      - run: cargo test -p dynamo-tokens -p kvbm-logical
+      # --workspace:vendor fork(dynamo-tokens/kvbm-logical)+ lake 自有 crate
+      # (controlplane/tiered-store/storage-agent …)单测全门禁,防 lake 侧回归漏网。
+      - run: cargo test --workspace
 
   go:
     runs-on: ubuntu-latest

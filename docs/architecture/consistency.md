@@ -22,7 +22,7 @@
 KV cache 是**写一次读多次**的数据：
 
 - **单个 token range 的 KV 不可变**：某 token 位置的 KV 一经 prefill/decode 产出写入 block，永不被原地改写。后续 token 的 KV 是**新 block**，不存在多写者并发改同一字节。
-- **写者单一**：满块路（block 填满 → 池算哈希 → 注册 radix → 写回 L2，NVMe F4 恢复点）与尾块路（请求结束写一次、整块覆盖）都由池单写者执行，只需**单写者屏障**，无需多写者并发控制。对齐 vLLM `ExternalBlockHash`（只对完整 block 算哈希）。注册 radix 与 L2 写回非原子——注册后到 L2 durable 之间靠 writeback ref 防 block 被驱逐（见 §3），避免 radix 指向"已驱逐但未落盘"的悬空态。
+- **写者单一**：满块路（block 填满 → 池算哈希 → 写回 L2 durable → 注册 radix，NVMe F4 恢复点）与尾块路（请求结束写一次、整块覆盖）都由池单写者执行，只需**单写者屏障**，无需多写者并发控制。对齐 vLLM `ExternalBlockHash`（只对完整 block 算哈希）。**durable-first**：L2 写回完成后才注册 radix 发布视图（对齐 Mooncake `PutEnd` COMPLETE 前字节已落稳、Dynamo transfer settled 后才 register presence；SGLang 反向 register-先靠 `host_value`+`BlockRemoved` 补偿，代价更高）。radix 发布时后盾已落实，无需防"radix 有、durable 无"悬空；register 后到请求结束屏障之间靠 writeback ref 冻结驱逐（见 §3）。
 - **读者多个**：同一 block 可被多节点同时读——本地命中复用、跨节点直传源（D→P / PD 正向）、回填。读不阻塞写回、不阻塞驱逐（驱逐前先确认无在途 ref 且 L2 已 durable，见 §3）。
 
 > **参考对照**：Mooncake `PutStart`→`PutEnd` 两阶段写 + `Get` 只读 `COMPLETE` 状态副本（`master_service.cpp`），对象写后 immutable、`Get` "not necessarily the latest"。lake 的"写一次读多次"是其 immutable 语义的更彻底版：block 一旦注册 radix 即永久可读，无"latest"歧义（radix 命中的是确定的前缀链哈希）。
@@ -37,7 +37,7 @@ ref 是"正确性地基"——决定 step 期间冻结、可驱逐性、GC 真�
 
 - **请求引用**：block 进入某请求 read set 时 +1。减点只在**请求结束且无续推引用**时（attention 每步读全部 KV，前缀 block 全程 in-flight，不能中途早减）。F4 续推时 ref 不归零而是**转移到新请求**，避免被淘汰。
 - **在途传输引用**：跨实例传输发起时源 block +1（源端冻结，防 RDMA 半传被覆写致损坏）；完成 -1。D→P 子情况 A 的 L0→L0 直传同样有在途 ref（不因"零存储读取"豁免，见 [`data-flow.md`](data-flow.md) §3.4）。
-- **写回引用（writeback ref，防悬空 radix）**：满块注册 radix 后到 L2 写回 durable 之间，block 持 writeback ref，**不可驱逐**（驱逐前必先确认 L2 已 durable）。这保证 radix 已发布的 block 恒有后盾——要么 L0 活着（请求/在途 ref 钉住），要么已落 L2，不存在"radix 有、durable 无"的悬空态。**请求结束是写回屏障**：释放请求引用前，flush+ack 该请求所有已注册 block 的 L2 写回，writeback ref 随 durable ack 归零。
+- **写回引用（writeback ref，请求进行中冻结驱逐）**：满块 L2 写回 durable 后注册 radix（§2 durable-first），register 后到请求结束屏障之间 block 持 writeback ref，**不可驱逐**。因 radix 发布时 L2 后盾已落实，writeback ref 防的不是"radix 有、durable 无"悬空（durable-first 已消除该窗口），而是**请求进行中、barrier 未完成前**的驱逐保护——保证 radix 已发布的 block 在 barrier 落定前不被驱逐，对齐 Mooncake COMPLETE 后 lease、SGLang `lock_ref`。**请求结束是写回屏障**：flush+ack 该请求所有已注册 block 的 L2 写回，writeback ref 随屏障完成归零（解冻晚于 barrier）。
   - **参考对照**：SGLang `write_back` 模式驱逐即回写（`hiradix_cache.py::_evict_write_back`），TreeNode 的 `host_value` 即"evicted 但 backuped"——节点驱逐时先备份到 L2 再摘 L1，恒带 durable 后盾。lake 因 HBM 归池、ref 跨请求/跨节点，驱逐不再是唯一回写点（写回频率 N 可提前批写），改用 **writeback ref + 请求结束屏障**实现等价不变量。
   - **与 F4 风险窗口的关系**：writeback ref 只阻**正常路径驱逐**；F4（worker 崩溃）是节点销毁不是驱逐，L0 随故障丢失，未 durable 的 block 仍按"丢最后一次写回 L2 之后的少量 token"重算（见 §4）。即未 durable 的 block 只能经 F4 路径丢失，正常路径不会让它在 radix 里裸奔。
 - **ref 归 0 ≠ 删内存，而是"可驱逐候选"**：对齐 vLLM `free_block_queue` / sglang `evictable_size_`——归 0 后 block 还在 HBM，可被前缀命中复用、可作传输源。真正释放 slot 只在 L0 容量不足**驱逐覆写**时。
@@ -50,7 +50,7 @@ ref 是"正确性地基"——决定 step 期间冻结、可驱逐性、GC 真�
 
 ### 为什么驱逐不是问题
 
-L0/L1 是**副本**（见 [`storage-layer.md`](storage-layer.md) "层间副本 vs 移动"）：驱逐 L0 只丢自己这份缓存，别的节点读自己的副本不受影响，L2/L3 还在可回填。故不需要"谁还在用"来阻止驱逐——**全局 ref 只用于 tier/GC，不用于阻止 L0 副本驱逐**。这是与"每层强一致计数"的根本差异：副本可随便丢，权威不可丢。唯一例外是上面 §3 的 **writeback ref**：它是本地 ref（非全局 ref），且只在"L2 未 durable"时拦驱逐——拦的正是此处"L2/L3 还在可回填"前提尚未成立的那一刻；L2 一旦 durable，驱逐即恢复自由。故 writeback ref 与"全局 ref 不阻驱逐"不冲突。
+L0/L1 是**副本**（见 [`storage-layer.md`](storage-layer.md) "层间副本 vs 移动"）：驱逐 L0 只丢自己这份缓存，别的节点读自己的副本不受影响，L2/L3 还在可回填。故不需要"谁还在用"来阻止驱逐——**全局 ref 只用于 tier/GC，不用于阻止 L0 副本驱逐**。这是与"每层强一致计数"的根本差异：副本可随便丢，权威不可丢。§3 的 **writeback ref**（durable-first 下）拦的是 **register→barrier 窗口**内的驱逐，不是"L2 未落稳"（落稳已在 register 前完成）；与"全局 ref 不阻 L0 副本驱逐"不冲突。
 
 > **参考对照**：Mooncake per-object lease（TTL 5s，lease 期内免 Remove/Evict）是其"引用保护"机制，过期即失效（`ObjectMetadata::GrantLease`/`IsLeaseExpired`）。lake 用显式两级 ref 替代 lease：本地 ref 精确到请求级而非定时，无需续约、无过期误删风险；全局 ref 用于 GC 而非阻塞驱逐。
 
@@ -184,7 +184,7 @@ MESI 状态机可借分类（不照搬协议）映射到 lake block 位置状态
 
 **Release consistency（DSM 经典，TreadMarks/Munin）**：普通读写可松，**只在同步点（release/acquire）保证一致**——进入/离开临界区才 flush。
 
-lake 直接对应：§3 的 **writeback ref + 请求结束屏障**就是 release 一致。满块注册（请求执行中）可松——晚几毫秒被 Router 看见无所谓；**请求结束那刻 = release**：flush 该请求全部已注册 block 的 L2 写回 + ack，writeback ref 随 durable ack 归零，保证此后该请求的 KV 对全局可见、可被引用、GC 可管。
+lake 直接对应：§3 的 **writeback ref + 请求结束屏障**就是 release 一致。满块 L2 durable 后注册 radix（请求执行中）可松——晚几毫秒被 Router 看见无所谓；**请求结束那刻 = release**：flush 该请求全部已注册 block 的 L2 写回 + ack + writeback ref 归零（解冻晚于 barrier），保证此后该请求的 KV 对全局可见、可被引用、GC 可管。
 
 ```
 R 执行中（prefill 产出 block B1..Bn）:

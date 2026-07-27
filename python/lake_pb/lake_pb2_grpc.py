@@ -151,9 +151,10 @@ class ControlPlaneServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def ReportRef(self, request_iterator, context):
-        """P4.2:**控制面合账骨架**（非完整两级 ref）。
-        本切片：累加 delta → global_refs；**忽略 RefKind**；agent **未**维护本地一级、也未调用本 RPC。
-        完整两级（agent 本地 REQUEST/IN_FLIGHT/WRITEBACK + 控制面分 kind）→ 后续切片。
+        """P4.2–P4.3:**控制面合账骨架**（非完整两级 ref）。
+        累加 delta → global_refs；**忽略 RefKind**（不按 kind 分账）。
+        P4.3:agent `PutEndSession` 对 WRITEBACK 调本 RPC（+1 注册后 / -1 屏障前）；
+        本地一级 REQUEST/IN_FLIGHT 与 CP 分 kind → 后续。
         流式：先收齐再 **全有或全无** apply（任一条未知 block → 整批不改，可安全重试）。
         不进 ViewEvent(B1)。
         """
@@ -162,7 +163,8 @@ class ControlPlaneServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def RequestBarrier(self, request, context):
-        """请求结束屏障:release → flush L2 + ack → 控制面更新目录(见 consistency.md §3)。
+        """请求结束屏障(consistency.md §3):agent 已 flush L2 + ReportRef(WRITEBACK,-1) 后调用；
+        CP 记录完成（目录/checkpoint 后续）。
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

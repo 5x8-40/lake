@@ -102,12 +102,18 @@ impl ControlPlaneService for ControlPlane {
 
     async fn request_barrier(
         &self,
-        _request: Request<RequestBarrierRequest>,
+        request: Request<RequestBarrierRequest>,
     ) -> Result<Response<Ack>, Status> {
-        Ok(Response::new(Ack {
-            ok: true,
-            err: String::new(),
-        }))
+        let req = request.into_inner();
+        let mut auth = self.inner.lock().unwrap();
+        // P4.3: agent must flush L2 + ReportRef(WRITEBACK,-1) before this call.
+        match auth.complete_barrier(&req.request_id, &req.node_id) {
+            Ok(()) => Ok(Response::new(Ack {
+                ok: true,
+                err: String::new(),
+            })),
+            Err(e) => Ok(Response::new(Ack { ok: false, err: e })),
+        }
     }
 
     type LeaseStream =
@@ -146,7 +152,13 @@ mod tests {
                 scope: "public".into(),
             }),
             block_kind: BlockKind::TType as i32,
-            locations: vec![],
+            // Explicit L2 — register no longer invents COMPLETE locations.
+            locations: vec![Location {
+                tier: Tier::L2 as i32,
+                node_id: "n0".into(),
+                segment_id: 1,
+                offset: 0,
+            }],
             l3_present: false,
             ref_count: 1,
         }
@@ -524,5 +536,73 @@ mod tests {
         assert_eq!(auth.inactive_len("m"), 0);
         let (_, cand_hit, _) = auth.lookup_prefix("m", &cand, "n0");
         assert_eq!(cand_hit, 1, "peer must not be pressure-evicted mid-batch");
+    }
+
+    /// WRITEBACK ±1 on CP `global_refs` freezes eviction (P4.2 skeleton ignores
+    /// `RefKind`; agent-local writeback sub-counter still future work).
+    /// `RequestBarrier` only records completion — unfreeze is WRITEBACK −1.
+    /// Ref: consistency.md §3; SGLang `_evict_write_back`.
+    #[test]
+    fn writeback_ref_blocks_evict_until_cleared() {
+        let mut auth = Authority::default();
+        let full = prefix(&[b"wb0"]);
+        auth.register("n0", &full, vec![meta("m", b"wb0")]).unwrap();
+        let plus = RefDelta {
+            id: Some(KvBlockId {
+                model_id: "m".into(),
+                block_hash: b"wb0".to_vec(),
+                pool_kind: PoolKind::Target as i32,
+                scope: "public".into(),
+            }),
+            kind: RefKind::Writeback as i32,
+            delta: 1,
+            node_id: "n0".into(),
+        };
+        auth.report_ref(&plus).unwrap();
+        assert_eq!(auth.global_ref("m", b"wb0"), 1);
+        assert_eq!(auth.evict_n("m", 10), 0, "writeback must freeze");
+
+        let mut minus = plus.clone();
+        minus.delta = -1;
+        // WRITEBACK −1 解冻（commit_through 里此 -1 在 barrier 之后；此处直测 CP 侧）。
+        auth.report_ref(&minus).unwrap();
+        auth.complete_barrier("req-wb", "n0").unwrap();
+        assert!(auth.barrier_completed("req-wb"));
+        // 0→正→0 entered inactive; now evictable.
+        assert_eq!(auth.evict_n("m", 1), 1);
+        let (_, hit, _) = auth.lookup_prefix("m", &full, "n0");
+        assert_eq!(hit, 0);
+    }
+
+    #[test]
+    fn request_barrier_requires_ids() {
+        let mut auth = Authority::default();
+        assert!(auth.complete_barrier("", "n0").is_err());
+        assert!(auth.complete_barrier("r", "").is_err());
+    }
+
+    #[test]
+    fn register_rejects_invented_l2() {
+        let mut auth = Authority::default();
+        let full = prefix(&[b"bare"]);
+        let mut m = meta("m", b"bare");
+        m.locations.clear();
+        assert!(auth.register("n0", &full, vec![m]).is_err());
+    }
+
+    #[test]
+    fn publish_l0_enables_local_hit() {
+        let mut auth = Authority::default();
+        let full = prefix(&[b"loc"]);
+        auth.register("n0", &full, vec![meta("m", b"loc")]).unwrap();
+        auth.publish_location("m", b"loc", Tier::L0, "n0", true)
+            .unwrap();
+        assert!(auth.has_l0_on("m", b"loc", "n0"));
+        let (_, _, all_local) = auth.lookup_prefix("m", &full, "n0");
+        assert!(all_local);
+        auth.publish_location("m", b"loc", Tier::L0, "n0", false)
+            .unwrap();
+        let (_, _, all_local) = auth.lookup_prefix("m", &full, "n0");
+        assert!(!all_local);
     }
 }

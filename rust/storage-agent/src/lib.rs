@@ -1,8 +1,11 @@
-//! 存储池 agent(P3:边10 Dispatch 占位服务)。
+//! 存储池 agent。
 //!
-//! 生产:Dispatch → 组 batch → FFI 引擎;本进程只 ack,真实执行仍在 Python WorkerService。
-//! 单 crate 双角色 feature:计算侧 / KV Node(见 kv-cache-pool.md)。
-//! 参考:SGLang agent_hints / Dispatch 骨架;边6 FFI 留 P4+。
+//! P3:Dispatch 占位。P4.3:PutEnd COMPLETE + `TierPipeline`/`apply_location_events`。
+//! 参考:Mooncake PutEnd;`hiradix_cache.py::_evict_write_back`/`lock_ref`;
+//! Dynamo `offload/pipeline.rs` settlement→presence。
+
+mod cp_port;
+mod putend;
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +14,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+pub use cp_port::{apply_location_events, AuthorityPort, ControlPlanePort};
 pub use lake_proto::lake::*;
+pub use putend::{PendingBlock, PutEndSession};
 
 use agent_service_server::AgentService;
 

@@ -279,10 +279,10 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 
 ```
 引擎产出(在 L0 slot)
-  → [满了] 池算哈希 → 注册 radix → 写回 L2(NVMe,F4 恢复点,抗 worker 失败)
-  → [注册后 L2 durable 前,block 持 writeback ref 不可驱逐]
+  → [满了] 池算哈希 → 写回 L2 durable(NVMe,F4 恢复点,抗 worker 失败)→ 注册 radix
+  → [register 后到请求结束屏障之间,block 持 writeback ref 不可驱逐(请求进行中冻结)]
   → 请求结束(node_scheduler 判定) → agent.on_request_finished
-       = 写回屏障(flush+ack 所有已注册 block 的 L2 写回,再释放本地 ref)
+       = 写回屏障(flush+ack 所有已注册 block 的 L2 写回 + writeback ref 归零,解冻晚于 barrier)
        + 尾块写回(未满,纯容错,不进 radix)
   → KV 续存(供复用/续推) 或 按 TTL/冷热淘汰
 ```
@@ -291,7 +291,7 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 
 两条写回路分开(满块结构性,尾块容错性):
 
-- **满块路**:block 填满 → 池算哈希 → 注册 radix → 写回 L2(NVMe)。这是自然边界,radix 注册本就要等满块(vLLM `ExternalBlockHash` 也只对完整 block 算哈希),写回顺带做。decode 跨 block 边界即产生满块,请求进行中就可能触发。注册 radix 与 L2 写回非原子:注册后到 L2 durable 之间 block 持 **writeback ref 不可驱逐**,请求结束是**写回屏障**(flush+ack 后才释放 ref),保证 radix 已发布的 block 恒有 L2 后盾、不悬空(参考 SGLang `write_back` 驱逐即回写,见 [`consistency.md`](consistency.md) §3)。满块写回的频率(满一个就写 vs 攒几个一起写)即"写回频率 N",留 P7 校准。
+- **满块路**:block 填满 → 池算哈希 → 写回 L2 durable(NVMe)→ 注册 radix。这是自然边界,radix 注册本就要等满块(vLLM `ExternalBlockHash` 也只对完整 block 算哈希)。decode 跨 block 边界即产生满块,请求进行中就可能触发。**durable-first**:L2 写回完成后才注册 radix 发布视图(radix 发布时后盾已落实,对齐 Mooncake COMPLETE 前字节已落稳、Dynamo settled 后才 register presence;SGLang 反向 register-先靠 `host_value`+`BlockRemoved` 补偿)。register 后到请求结束屏障之间 block 持 **writeback ref 不可驱逐**(请求进行中冻结,非防悬空——durable-first 已消除"radix 有、durable 无"窗口;参考 SGLang `write_back` 驱逐即回写,见 [`consistency.md`](consistency.md) §3)。请求结束是**写回屏障**(flush+ack + writeback ref 归零,解冻晚于 barrier)。满块写回的频率(满一个就写 vs 攒几个一起写)即"写回频率 N",留 P7 校准。
 - **尾块路**:请求结束时仍未填满的 block(尾块)→ 请求结束点写回一次,写"当前尾 block 的全部已填 token",重放时整块覆盖。纯容错,不进 radix(哈希未定,或带 partial 标记)。因尾块只在请求结束写一次,无增量式。
 
 引擎不感知 block 满不满(Q2.1:block 对引擎纯寻址单位)——满块判断、哈希、radix 注册、写回全归池。容错点 = "KV 落 L2(NVMe)"的时刻;满块越频繁写回(N 小)→ 崩溃丢的越少、写放大越大,反之亦然。decode 增量写回同时服务容错 + 前缀生长(见 [`execution-modes.md`](execution-modes.md) 时序二反向)。

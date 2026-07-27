@@ -931,7 +931,9 @@ dependencies = [
 name = "lake-storage-agent"
 version = "0.0.0"
 dependencies = [
+ "lake-controlplane",
  "lake-proto",
+ "lake-tiered-store",
  "prost",
  "tokio",
  "tokio-stream",
@@ -942,6 +944,7 @@ dependencies = [
 name = "lake-tiered-store"
 version = "0.0.0"
 dependencies = [
+ "criterion",
  "lake-proto",
  "tonic",
 ]

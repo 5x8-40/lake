@@ -239,7 +239,7 @@ HBM 也归存储池后(见 [`overview.md`](overview.md) / [`kv-cache-pool.md`](k
 **(1) block 对引擎纯寻址单位**。引擎的 KV 操作只剩三原语:读 ready block / 写 token 进 slot / publish 产出。block table 的索引填充都归池(本地 agent),引擎只 replay 读。引擎连"block 满没满"都不感知,只感知"写第 i 个 token 进某 slot"——满块判断、哈希、radix 注册全归池。block 是引擎的寻址单位,不是管理单位。
 
 **(2) 写回:满块路 + 尾块路**(详见 [`kv-cache-pool.md`](kv-cache-pool.md) "写回与生命周期"):
-- 满块路:block 填满 → 池算哈希 → 注册 radix → 写回 L2(NVMe,F4 恢复点,抗 worker 失败)。请求进行中就可能触发。注册后 L2 durable 前持 writeback ref 不可驱逐、请求结束是写回屏障(见 [`consistency.md`](consistency.md) §3)。
+- 满块路:block 填满 → 池算哈希 → 写回 L2 durable(NVMe,F4 恢复点,抗 worker 失败)→ 注册 radix。请求进行中就可能触发。durable-first:落稳后才注册 radix;register 后到请求结束屏障之间持 writeback ref 不可驱逐(请求进行中冻结)、请求结束是写回屏障(见 [`consistency.md`](consistency.md) §3)。
 - 尾块路:请求结束时未满的尾块,在请求结束点写回一次(写全部已填 token,重放整块覆盖),纯容错不进 radix。
 - 满块写回频率 N(满一个就写 vs 攒几个)留 P7。尾块只在请求结束写一次,无增量式。
 

@@ -262,7 +262,7 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 - Dynamo `kvbm-physical::TransferManager` 是**抽象**，生产数据面仍优先接 A（Mooncake TE），避免两套传输栈。
 - 其余（SGLang HiCache 策略、LMCache 后端思路、vLLM `KVConnectorBase_V1`、Dynamo kv-router 选路公式）继续以**借鉴/对照**为主，默认不链进依赖树；计算层（P5）再评估 vLLM/SGLang 引擎经 connector 接入。
 
-**现状（P4.2）**：复用 **B** 已 in-tree vendor（[PR #21](https://github.com/chengda-wu/lake/pull/21) / `rust/vendor/UPSTREAM.md`）；**`lake-controlplane` 已链依赖** `kvbm-logical` + `dynamo-tokens`，用 `BlockRegistry`/`PositionalLineageHash`/`InactiveIndex`；驱逐主路径为 **`LineageBackend::with_frequency`**（只驱叶子≈前缀亲和 + `LeafPolicy::Frequency` TinyLFU≈LFU-Aging；上游 MultiLru/Lineage 互斥，lake 走 LeafPolicy 第三臂组合）。无 `BlockStore` 固定槽 → Authority 人工 cap：`report_ref` 满容 **skip insert**（对齐 Dynamo insert≠allocate）；压力驱逐只走 `evict_n`；`FrequencyPolicy` 超容 `debug_assert`（禁静默丢 leaf）。`MultiLruBackend` 仍 pub 对照；纯 `Lru`/`Fifo`/`HashMap` 不提 pub。**不用** `BlockManager`/`BlockStore`；`EventsManager` 断耦不接线。`kv-pool` 仍 dumb 字节。驱逐正确性靠 Authority 单测；生产 `ReportRef` 喂数后续。复用 **A**（Mooncake TE）仍待 P4 传输切片。`3rdparty/` 继续只读参考；vendor 改造不回写 submodule（见下「submodule 使用约定」）。
+**现状（P4.2 合入 / P4.3）**：复用 **B** vendor + controlplane radix/驱逐。**P4.3**：`LocalTierEngine`（写回**只 L2**；L3 仅 demote/cap XOR；`pin`≈`lock_ref`；`TierSideEffects`）+ `TierPipeline` + `apply_location_events`；PutEnd=Mooncake COMPLETE。对齐 `storage-layer.md` 写回路径与 SGLang demotion-only L1。真 NVMe/跨机 defer P5；满块顺便写 L1 留 P7。
 
 锚点（复用时回溯）：
 

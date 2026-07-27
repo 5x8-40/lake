@@ -58,14 +58,17 @@ type ControlPlaneServiceClient interface {
 	//	与 Publish 的区别:Publish(可多次、逐层 slice)只更新位置视图;RegisterBlocks(满块 + L2 durable)才进 radix + 置 l3_present/L2。
 	//	P4.2:须带 prefix_hashes 全链以便控制面建 PositionalLineageHash;`blocks` 可为 miss 后缀。
 	RegisterBlocks(ctx context.Context, in *RegisterBlocksRequest, opts ...grpc.CallOption) (*Ack, error)
-	// P4.2:**控制面合账骨架**（非完整两级 ref）。
+	// P4.2–P4.3:**控制面合账骨架**（非完整两级 ref）。
 	//
-	//	本切片：累加 delta → global_refs；**忽略 RefKind**；agent **未**维护本地一级、也未调用本 RPC。
-	//	完整两级（agent 本地 REQUEST/IN_FLIGHT/WRITEBACK + 控制面分 kind）→ 后续切片。
+	//	累加 delta → global_refs；**忽略 RefKind**（不按 kind 分账）。
+	//	P4.3:agent `PutEndSession` 对 WRITEBACK 调本 RPC（+1 注册后 / -1 屏障前）；
+	//	本地一级 REQUEST/IN_FLIGHT 与 CP 分 kind → 后续。
 	//	流式：先收齐再 **全有或全无** apply（任一条未知 block → 整批不改，可安全重试）。
 	//	不进 ViewEvent(B1)。
 	ReportRef(ctx context.Context, opts ...grpc.CallOption) (grpc.ClientStreamingClient[RefDelta, Ack], error)
-	// 请求结束屏障:release → flush L2 + ack → 控制面更新目录(见 consistency.md §3)。
+	// 请求结束屏障(consistency.md §3):agent 已 flush L2 + ReportRef(WRITEBACK,-1) 后调用；
+	//
+	//	CP 记录完成（目录/checkpoint 后续）。
 	RequestBarrier(ctx context.Context, in *RequestBarrierRequest, opts ...grpc.CallOption) (*Ack, error)
 	// lease:节点 mount/unmount segment + 续命(仿 Mooncake MountSegment/UnmountSegment + client_live_ttl_sec)。
 	Lease(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LeaseHeartbeat, LeaseAck], error)
@@ -194,14 +197,17 @@ type ControlPlaneServiceServer interface {
 	//	与 Publish 的区别:Publish(可多次、逐层 slice)只更新位置视图;RegisterBlocks(满块 + L2 durable)才进 radix + 置 l3_present/L2。
 	//	P4.2:须带 prefix_hashes 全链以便控制面建 PositionalLineageHash;`blocks` 可为 miss 后缀。
 	RegisterBlocks(context.Context, *RegisterBlocksRequest) (*Ack, error)
-	// P4.2:**控制面合账骨架**（非完整两级 ref）。
+	// P4.2–P4.3:**控制面合账骨架**（非完整两级 ref）。
 	//
-	//	本切片：累加 delta → global_refs；**忽略 RefKind**；agent **未**维护本地一级、也未调用本 RPC。
-	//	完整两级（agent 本地 REQUEST/IN_FLIGHT/WRITEBACK + 控制面分 kind）→ 后续切片。
+	//	累加 delta → global_refs；**忽略 RefKind**（不按 kind 分账）。
+	//	P4.3:agent `PutEndSession` 对 WRITEBACK 调本 RPC（+1 注册后 / -1 屏障前）；
+	//	本地一级 REQUEST/IN_FLIGHT 与 CP 分 kind → 后续。
 	//	流式：先收齐再 **全有或全无** apply（任一条未知 block → 整批不改，可安全重试）。
 	//	不进 ViewEvent(B1)。
 	ReportRef(grpc.ClientStreamingServer[RefDelta, Ack]) error
-	// 请求结束屏障:release → flush L2 + ack → 控制面更新目录(见 consistency.md §3)。
+	// 请求结束屏障(consistency.md §3):agent 已 flush L2 + ReportRef(WRITEBACK,-1) 后调用；
+	//
+	//	CP 记录完成（目录/checkpoint 后续）。
 	RequestBarrier(context.Context, *RequestBarrierRequest) (*Ack, error)
 	// lease:节点 mount/unmount segment + 续命(仿 Mooncake MountSegment/UnmountSegment + client_live_ttl_sec)。
 	Lease(grpc.BidiStreamingServer[LeaseHeartbeat, LeaseAck]) error

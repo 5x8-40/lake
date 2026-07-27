@@ -16,7 +16,7 @@
         ↓
 ④ 执行(按模式分支,见 §3;统一 ready/done 双 fence 一步契约)
         ↓
-⑤ 产出写回池:满块→注册 radix+写回 L2(NVMe,F4 恢复点);尾块→请求结束写一次(见 §4)
+⑤ 产出写回池:满块→写回 L2 durable(NVMe,F4 恢复点)→注册 radix;尾块→请求结束写一次(见 §4)
         ↓
 ⑥ decode 延伸前缀? → 触发时序二反向回传(radix 生长,服务未来请求) + D→P(§3.4,延伸 KV 喂下一轮 prefill)
         ↓
@@ -148,7 +148,7 @@ agent 多轮场景：第 N 轮 decode 产出的延伸 KV 是**第 N+1 轮 prefil
 
 一次请求的 KV 从产生到消亡（详见 [`kv-cache-pool.md`](kv-cache-pool.md) "写回与生命周期"）：
 
-- **满块路**：block 填满 → 池算哈希 → 注册 radix → 写回 L2（NVMe，F4 恢复点）。请求进行中就可能触发（decode 跨 block 边界）。注册后到 L2 durable 之间持 writeback ref 不可驱逐，请求结束是写回屏障（见 [`consistency.md`](consistency.md) §3）。满块写回频率 N 留 P7。
+- **满块路**：block 填满 → 池算哈希 → 写回 L2 durable（NVMe，F4 恢复点）→ 注册 radix。请求进行中就可能触发（decode 跨 block 边界）。durable-first：落稳后才注册 radix；register 后到请求结束屏障之间持 writeback ref 不可驱逐（请求进行中冻结），请求结束是写回屏障（见 [`consistency.md`](consistency.md) §3）。满块写回频率 N 留 P7。
 - **尾块路**：请求结束时未满的尾块 → 请求结束点写一次（写全部已填 token，重放整块覆盖），纯容错，不进 radix。
 
 引擎不感知 block 满不满（block 对引擎纯寻址单位）——满块判断、哈希、radix 注册、写回全归池。

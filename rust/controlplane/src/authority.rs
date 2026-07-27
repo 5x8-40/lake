@@ -16,7 +16,7 @@ use kvbm_logical::{
 };
 
 use crate::hash_chain::lineage_from_prefix;
-use crate::tier::TierL2;
+use crate::tier::{TierL0, TierL1, TierL2};
 use lake_proto::lake::*;
 
 const INACTIVE_CAP: usize = 4096;
@@ -102,6 +102,10 @@ impl Namespace {
 pub struct Authority {
     namespaces: HashMap<String, Namespace>,
     inactive_cap: usize,
+    /// Completed request barriers: `(request_id, node_id)`.
+    /// P4.3: agent flushes L2 + `ReportRef(WRITEBACK,-1)` **before** this RPC;
+    /// CP records completion for observability / future directory updates.
+    completed_barriers: HashMap<String, String>,
 }
 
 impl Default for Authority {
@@ -116,6 +120,7 @@ impl Authority {
         Self {
             namespaces: HashMap::new(),
             inactive_cap: inactive_cap.max(1),
+            completed_barriers: HashMap::new(),
         }
     }
 
@@ -198,17 +203,29 @@ impl Authority {
             let pos = *index_of.get(flat.as_slice()).expect("checked");
             let seq = lineage[pos];
 
-            if meta.locations.is_empty() {
-                meta.locations.push(Location {
-                    tier: Tier::L2 as i32,
-                    node_id: node_id.to_string(),
-                    segment_id: 1,
-                    offset: 0,
-                });
+            // Refuse invented COMPLETE (Mooncake Get-only-COMPLETE): no empty
+            // locations unless l3_present. Callers must pass settle-accurate metas.
+            if meta.locations.is_empty() && !meta.l3_present {
+                return Err(
+                    "RegisterBlocks: need L2 location or l3_present (durable first)".into(),
+                );
+            }
+            for loc in &mut meta.locations {
+                if loc.node_id.is_empty() {
+                    loc.node_id = node_id.to_string();
+                }
             }
 
             let handle = ns.registry.register_sequence_hash(seq);
-            handle.mark_present::<TierL2>();
+            for loc in &meta.locations {
+                if loc.tier == Tier::L0 as i32 {
+                    handle.mark_present::<TierL0>();
+                } else if loc.tier == Tier::L1 as i32 {
+                    handle.mark_present::<TierL1>();
+                } else if loc.tier == Tier::L2 as i32 {
+                    handle.mark_present::<TierL2>();
+                }
+            }
             ns.handles.insert(seq, handle);
 
             let block_id = if let Some(prev) = ns.by_flat.get(&flat) {
@@ -232,6 +249,13 @@ impl Authority {
         Ok(())
     }
 
+    /// Prefix lookup + soft touch. `&mut self` because of **lazy handle repair**
+    /// (`handles.insert` when a flat is in `by_flat` but missing from the registry
+    /// index) and TinyLFU `match_sequence_hash(..., touch=true)`.
+    ///
+    /// P4.3: fine under a single `Mutex<Authority>`. P6 HA / 读写分锁时：懒修复
+    /// 应挪到 register 路径，lookup 热路径只读 + 可选无锁 touch，避免永远写锁
+    ///（#20；PR #31 review §4.6）。
     pub fn lookup_prefix(
         &mut self,
         model_id: &str,
@@ -261,16 +285,25 @@ impl Authority {
                 all_local = false;
                 break;
             }
-            // Ensure radix + presence (lazy repair if handle was lost).
+            // Lazy repair: presence markers **only** from meta.locations —
+            // never invent TierL2 for L3-only blocks.
+            let meta = entry.meta.clone();
             if !ns.handles.contains_key(&seq) {
                 let handle = ns.registry.register_sequence_hash(seq);
-                handle.mark_present::<TierL2>();
+                for loc in &meta.locations {
+                    if loc.tier == Tier::L0 as i32 {
+                        handle.mark_present::<TierL0>();
+                    } else if loc.tier == Tier::L1 as i32 {
+                        handle.mark_present::<TierL1>();
+                    } else if loc.tier == Tier::L2 as i32 {
+                        handle.mark_present::<TierL2>();
+                    }
+                }
                 ns.handles.insert(seq, handle);
             } else {
                 let _ = ns.registry.match_sequence_hash(seq, true);
             }
 
-            let meta = entry.meta.clone();
             let local = meta
                 .locations
                 .iter()
@@ -398,5 +431,114 @@ impl Authority {
             return 0;
         };
         ns.global_refs.get(&entry.seq_hash).copied().unwrap_or(0)
+    }
+
+    /// Record a completed request-end barrier (`consistency.md` §3).
+    ///
+    /// Agent contract: durable flush + `ReportRef(WRITEBACK,-1)` already applied
+    /// so radix blocks are no longer writeback-frozen. Idempotent per request_id.
+    pub fn complete_barrier(&mut self, request_id: &str, node_id: &str) -> Result<(), String> {
+        if request_id.is_empty() {
+            return Err("RequestBarrier: request_id required".into());
+        }
+        if node_id.is_empty() {
+            return Err("RequestBarrier: node_id required".into());
+        }
+        self.completed_barriers
+            .insert(request_id.to_string(), node_id.to_string());
+        Ok(())
+    }
+
+    pub fn barrier_completed(&self, request_id: &str) -> bool {
+        self.completed_barriers.contains_key(request_id)
+    }
+
+    /// Publish / revoke a tier location on the view + presence markers.
+    ///
+    /// P4.3: agent promote/demote calls this after local byte moves.
+    pub fn publish_location(
+        &mut self,
+        model_id: &str,
+        flat: &[u8],
+        tier: Tier,
+        node_id: &str,
+        present: bool,
+    ) -> Result<(), String> {
+        let ns = self
+            .namespaces
+            .get_mut(model_id)
+            .ok_or_else(|| format!("unknown model_id {model_id}"))?;
+        let entry = ns
+            .by_flat
+            .get_mut(flat)
+            .ok_or_else(|| "publish_location: unknown block".to_string())?;
+        let handle = ns
+            .handles
+            .get(&entry.seq_hash)
+            .ok_or_else(|| "publish_location: missing handle".to_string())?;
+
+        let tier_i = tier as i32;
+        let had = entry
+            .meta
+            .locations
+            .iter()
+            .any(|l| l.tier == tier_i && l.node_id == node_id);
+
+        if present && !had {
+            entry.meta.locations.push(Location {
+                tier: tier_i,
+                node_id: node_id.to_string(),
+                segment_id: 1,
+                offset: 0,
+            });
+            match tier {
+                Tier::L0 => handle.mark_present::<TierL0>(),
+                Tier::L1 => handle.mark_present::<TierL1>(),
+                Tier::L2 => handle.mark_present::<TierL2>(),
+                _ => {}
+            }
+        } else if !present && had {
+            entry
+                .meta
+                .locations
+                .retain(|l| !(l.tier == tier_i && l.node_id == node_id));
+            match tier {
+                Tier::L0 => handle.mark_absent::<TierL0>(),
+                Tier::L1 => handle.mark_absent::<TierL1>(),
+                Tier::L2 => handle.mark_absent::<TierL2>(),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    pub fn set_l3_present(
+        &mut self,
+        model_id: &str,
+        flat: &[u8],
+        present: bool,
+    ) -> Result<(), String> {
+        let ns = self
+            .namespaces
+            .get_mut(model_id)
+            .ok_or_else(|| format!("unknown model_id {model_id}"))?;
+        let entry = ns
+            .by_flat
+            .get_mut(flat)
+            .ok_or_else(|| "set_l3_present: unknown block".to_string())?;
+        entry.meta.l3_present = present;
+        Ok(())
+    }
+
+    pub fn has_l0_on(&self, model_id: &str, flat: &[u8], node_id: &str) -> bool {
+        self.ns(model_id)
+            .and_then(|n| n.by_flat.get(flat))
+            .map(|e| {
+                e.meta
+                    .locations
+                    .iter()
+                    .any(|l| l.tier == Tier::L0 as i32 && l.node_id == node_id)
+            })
+            .unwrap_or(false)
     }
 }

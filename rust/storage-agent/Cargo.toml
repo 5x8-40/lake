@@ -10,6 +10,8 @@ path = "src/main.rs"
 
 [dependencies]
 lake-proto.workspace = true
+lake-tiered-store = { path = "../tiered-store" }
+lake-controlplane = { path = "../controlplane" }
 tonic.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true }
@@ -24,5 +26,4 @@ default = ["compute", "kvnode"]
 compute = []
 kvnode  = []
 
-# P3:AgentService.Dispatch 占位(边10);PlaceBlocks ack;ReportLoad 空流。
-# 生产再叠 FFI / TransferService / feature 分角色落地。
+# P3:AgentService.Dispatch 占位。P4.3:PutEndSession + LocalTierEngine + ControlPlanePort。

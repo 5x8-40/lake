@@ -70,7 +70,7 @@ P7  性能建模与验证   → 量化各假设，回填设计
 - **decode 增量写回双重目的**：容错 + 前缀生长。频率 N 策略留开放。
 - **HBM 池化下的入图与 KV 管理（Q1/Q2，本轮定）**：
   - **Q1 入图**：固定基址 KV arena（不上 VA，分配给模型后不扩缩容/不跨模型回收物理页）；入图三约束（静态输入 buffer / 固定 KV 基址 / 固定地址 block table）；decode 走 graph、prefill 走 eager；block table 由**本地 agent（in-process，持本地视图镜像）组装**，非全局池每步 RPC 推表（守 5ms）；**ready/done 双 fence 一步契约**（池发 ready→引擎 replay→引擎发 done→池解冻/写回/注册 radix/驱逐），引擎零分层逻辑；正确性地基 = in-flight 跨层冻结（ref>0 的 block step 期间物理映射冻结）。详见 [`architecture/compute-layer.md`](architecture/compute-layer.md) "HBM 池化下的入图与 KV 管理"。
-  - **Q2 KV 管理**：block 对引擎**纯寻址单位**（连 block table 索引填充都归池，引擎只 replay 读，不感知满块）；写回两路——**满块路**（填满→池算哈希→注册 radix→写回 L2，NVMe F4 恢复点）+ **尾块路**（请求结束时未满尾块写一次，纯容错不进 radix）；**ref 池权威维护**（多引擎共享前缀 block 的分布式一致性，引擎不持计数），请求结束且无续推引用才减（F4 续推 ref 转移），含在途传输引用（源端冻结）。
+  - **Q2 KV 管理**：block 对引擎**纯寻址单位**（连 block table 索引填充都归池，引擎只 replay 读，不感知满块）；写回两路——**满块路**（填满→池算哈希→写回 L2 durable→注册 radix，NVMe F4 恢复点）+ **尾块路**（请求结束时未满尾块写一次，纯容错不进 radix）；**ref 池权威维护**（多引擎共享前缀 block 的分布式一致性，引擎不持计数），请求结束且无续推引用才减（F4 续推 ref 转移），含在途传输引用（源端冻结）。
   - **跨实例/PD 传输**：engine-to-engine 控制链**切断**，池的本地 agent 发起传输，引擎降到 `publish`/`pull`+fence、不知地址、不组装 block table；数据线仍直连 RDMA（wire 效率不变）。默认**直传**（A→B L0，PD 时序重叠主场景）+ **Drain 推 L2**（节点下线前把还被远端引用的 block 落 L2 NVMe）。详见 [`architecture/kv-cache-pool.md`](architecture/kv-cache-pool.md) "跨实例 KV 传输"。
   - **重叠语义**：拒绝**引擎驱动** intra-step 重叠（SGLang `get_key_buffer` 每层 `wait_event`，绑死引擎、破坏 graph）；保留**池驱动**异步重叠——消费侧 step 间重叠 + 生产侧 prefill 层级重叠（`page_first_direct` 子块传输/"分块流水线"，支撑 PD 分离 TTFT）。引擎无感、graph 安全。
   - **持久语义**：层=介质，L0/L1 易失缓存、L2(NVMe)= F4 恢复点（NVMe 持久 + NPU 故障不烧 NVMe，恢复能力与位置无关，worker 崩溃后从 L2 续推）、L3(对象存储)= SSOT 永久权威（抗整机级/池级失败，L3 缺失才视为 block 不存在）。风险窗口分两级：NPU/进程级故障（常见）丢"最后一次写回 L2 之后的少量 token"；整机级故障（罕见）退 L3 SSOT，丢"自上次冷下沉 L3 之后的增量"。
@@ -219,12 +219,12 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 
 - [x] 内容寻址 block 存储 + 引用计数 + LFU-Aging / 前缀亲和驱逐（复用 B 起步；P4.2：`ReportRef` **合账骨架**——只累加 `global_refs`、忽略 `RefKind`，agent 本地一级/分 kind 后续；驱逐主路径 `LineageBackend::with_frequency`＝叶子约束≈前缀亲和 + TinyLFU 冷叶≈LFU-Aging；`MultiLruBackend` 仍 pub 对照；不 pub 纯 Lru/Fifo，见 `rust/vendor/UPSTREAM.md`。**驱逐正确性 = Authority 单测**（含 inactive 上界：满容 skip insert；压力 `allocate` 仅 `evict_n`）；生产 `ReportRef` 喂数与压力 `allocate` → 后续切片）
 - [x] radix tree 前缀索引（前缀复用查询）（复用 B；P4.2：`RegisterBlocks.prefix_hashes` + `LookupPrefix`）
-- [ ] 分层缓存引擎（RAM/NVMe，对象存储回填）
+- [x] 分层缓存引擎（RAM/NVMe，对象存储回填）（P4.3：写回只 L2；L3=demote/cap XOR；L1=demotion；`TierPipeline`/`BandwidthPool`/PutEnd COMPLETE；真 NVMe/跨机 defer P5；满块顺便写 L1 留 P7。[PR #31](https://github.com/chengda-wu/lake/pull/31)）
 - [ ] gRPC 接口 + RDMA 数据平面（先 TCP 后 RDMA）（传输面复用 A）
 - [ ] 一致性哈希分片 + KV Node 扩缩时的 block 重分布
 - [ ] **多模型生命周期**：模型注册/下线级联删、revision 失效（F11）
 - [ ] **按模型配额与空间分配**（软/硬配额 + 借用 + 背压信号）
-- [ ] **GC**：冷块/孤儿块回收 + 崩溃 reconcile
+- [ ] **GC**：冷块/孤儿块回收 + 崩溃 reconcile（P4.3 review 遗留详见 [#20](https://github.com/chengda-wu/lake/issues/20) P4.7 + 评论「PR #31 review 遗留」：barrier 失败 inactive 窗口、WRITEBACK−1 失败永久冻结、`apply_location_events` 非原子等）
 - [ ] **碎片整理**：逻辑共置 + 物理压实，后台节流可暂停
 
 **完成判据**：前缀复用命中率、驱逐正确性有单测；吞吐 micro-benchmark；多模型隔离/配额/GC/碎片整理各有验证用例。
@@ -257,7 +257,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 
 ## P6 — 弹性与调度（Go）
 
-- [ ] 无状态 router + 本地命中视图镜像（权威在 Rust 存储控制面进程内存,etcd 只 checkpoint;Go Router 零 RPC 读镜像）
+- [ ] 无状态 router + 本地命中视图镜像（权威在 Rust 存储控制面进程内存,etcd 只 checkpoint;Go Router 零 RPC 读镜像；读写分锁时：P4.3 `lookup_prefix` 因懒修复/`touch` 走写锁，懒修复应挪 register 路径——见 `authority.rs`）
 - [ ] 池间调度 + 反压
 - [ ] 基于指标的弹性扩缩容（队列长度/TTFT/ITL/命中率）
 - [ ] 冷启动压缩（权重预加载、layer-async serve、KV prefetch）
@@ -269,7 +269,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 ## P7 — 性能建模与验证
 
 - [ ] 成本模型：KV 传输带宽 vs prefill/decode 计算时间
-- [ ] 分层缓存的命中率/成本曲线
+- [ ] 分层缓存的命中率/成本曲线（P4.3 仅有 `HitStats` 计数骨架 + criterion micro-bench；`estimate_promote_cost` = `nbytes × hops`，hops∈{0..3} 对齐 L0/L1/L2/L3→L0 跳数，见 `LocalTierEngine::estimate_promote_cost`；真 workload 曲线与带宽校准本项）
 - [ ] 弹性冷启动时延分解
 - [ ] 回填到 `docs/` 与 SLO，修正非目标与设计假设
 

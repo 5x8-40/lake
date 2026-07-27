@@ -5,12 +5,10 @@
 //! `BlockMetadata` 在 kvbm-logical 上有 blanket impl（Clone+Send+Sync+'static）。
 
 /// HBM / device (L0).
-#[allow(dead_code)] // presence marker for future L0 publish path
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TierL0;
 
 /// Host DRAM (L1).
-#[allow(dead_code)] // presence marker for future L1 publish path
 #[derive(Clone, Copy, Debug, Default)]
 pub struct TierL1;
 
