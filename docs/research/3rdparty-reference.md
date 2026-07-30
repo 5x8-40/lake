@@ -248,7 +248,7 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 
 | # | 复用来源 | 落点（lake 模块） | 复用什么 | 不复用 / 自建 |
 |---|----------|-------------------|----------|---------------|
-| A | **Mooncake transfer-engine**（[+ 可选 mooncake-store 作介质后端]） | `rust/transfer`（Transfer Bus）；字节后端可挂 `rust/kv-pool` / `tiered-store` | RDMA/多 NIC 零拷贝传输骨架；store 仅作 L2/L3 **不透明字节**载体 | 内容寻址、radix、L0 归属、位置视图权威 |
+| A | **Mooncake transfer-engine**（[+ 可选 mooncake-store 作介质后端]） | `rust/transfer`（P4.4:`Transport`+`TcpTransport`+`TransferServer`；`TcpDataService` 正名自 SkeletonKv）；字节后端可挂 `rust/kv-pool` / `tiered-store`；真 RDMA→P5 | RDMA/多 NIC 零拷贝传输骨架；store 仅作 L2/L3 **不透明字节**载体 | 内容寻址、radix、L0 归属、位置视图权威；P4 不接 Mooncake FFI |
 | B | **Dynamo KVBM logical**（`BlockRegistry` / `PositionalRadixTree` / `BlockManager` 等；宜 fork 抽 crate） | `rust/kv-pool` + `rust/controlplane`（池内索引、分层块管理、presence） | 前缀 radix、每层 block 池、presence markers、可插拔驱逐索引 | G1「引擎外拥 HBM」、demote-only offload、NATS 弱一致事件；lake 补 **L0 归池** + **promote**；**位置视图权威在控制面进程内存，etcd 降频 checkpoint** |
 
 关系（正交）：

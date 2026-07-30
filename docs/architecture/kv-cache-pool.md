@@ -18,15 +18,15 @@ KV Cache Pool 把 KV cache 从"附属于产生它的 GPU"提升为全局可寻�
 
 ```proto
 message KVBlockID { string model_id; bytes block_hash;
-                    PoolKind pool_kind; string scope; }   // pool_kind=TARGET|DRAFT, scope 多租户预留(默认 public)
+                    PoolKind pool_kind; string scope; string revision; }  // revision=P4.5; scope 多租户预留
 message Location  { Tier tier; string node_id; uint64 segment_id; uint64 offset; }  // 仅 L0/L1/L2(tier∈{L0,L1,L2} 硬约束)
 message BlockMeta { KVBlockID id; BlockKind block_kind; repeated Location locations;
                     bool l3_present; uint32 ref_count; }
 ```
 > 完整 schema 见 [`../../proto/schema.proto`](../../proto/schema.proto),RPC 边界见 [`../../proto/lake.proto`](../../proto/lake.proto)。
-- **block = page(128 token × 全部层)**,身份按 token 段而非按层:`KVBlockID = (model_id, block_hash, pool_kind, scope)`,**不含 `layer_idx`**。`block_hash` 本就 layer-agnostic(链式哈希只吃 token),layer_idx 只在 `LayerSlice`(子块传输切片)里出现。对齐 SGLang radix(每页一 hash 当 L3 key)、vLLM prefix caching(token-based hash 跨层共享),也与下文 page-first「整块所有层连续、传引擎单条 `(ptr,len)`」一致。
-- `block_hash` = 前缀链式哈希 `hash(parent_block_hash || 本块 token ids)`,序列起点块 parent = ⊥(空)。相同前缀 → 相同链式 hash → 命中同一 KV。**算法可插拔**(BLAKE3-128 / SHA-256-128 / SHA-256-256),由模型注册元数据声明,proto 只规定 ≥128-bit + 链式;不同 `model_id` 可用不同算法。
-- `locations` 只含 L0/L1/L2 段式位置(`node_id + segment_id + offset`,仿 Mooncake SegmentID),`tier∈{L0,L1,L2}` 为硬约束(L3 永不进 Location);**L3 不进 Location**,用 `l3_present` bool,object key = `s3://lake/kv/{model_id}/{block_hash}` 现场拼(仿 SGLang L3 用链式 hash 当 key、不记位置实时查后端)。`l3_present=false` 且 `locations` 全空 → block 不存在;`l3_present=true` → 即使缓存副本全空仍存在(从 L3 回填)。层间不变量:L0/L1 缓存副本可各一份;L2/L3 稳态二选一(XOR,允许迁移窗口短暂双有);L2 同层不冗余(见 [`storage-layer.md`](storage-layer.md)「层间副本 vs 移动」)。
+- **block = page(128 token × 全部层)**,身份按 token 段而非按层:`KVBlockID = (model_id, revision, block_hash, pool_kind, scope)`,**不含 `layer_idx`**。`block_hash` 本就 layer-agnostic(链式哈希只吃 token),layer_idx 只在 `LayerSlice`(子块传输切片)里出现。对齐 SGLang radix(每页一 hash 当 L3 key)、vLLM prefix caching(token-based hash 跨层共享),也与下文 page-first「整块所有层连续、传引擎单条 `(ptr,len)`」一致。
+- `block_hash` = 前缀链式哈希 `hash(parent_block_hash || 本块 token ids)`,序列起点块 parent = ⊥(空)。相同前缀 → 相同链式 hash → 命中同一 KV。**算法可插拔**(BLAKE3-128 / SHA-256-128 / SHA-256-256),由模型注册元数据(`ModelDescriptor.hash_algo`)声明,proto 只规定 ≥128-bit + 链式;不同 `(model_id, revision)` 可用不同算法。
+- `locations` 只含 L0/L1/L2 段式位置(`node_id + segment_id + offset`,仿 Mooncake SegmentID),`tier∈{L0,L1,L2}` 为硬约束(L3 永不进 Location);**L3 不进 Location**,用 `l3_present` bool,object key = `s3://lake/kv/{model_id}/{revision}/{block_hash}` 现场拼(仿 SGLang L3 用链式 hash 当 key、不记位置实时查后端)。`l3_present=false` 且 `locations` 全空 → block 不存在;`l3_present=true` → 即使缓存副本全空仍存在(从 L3 回填)。层间不变量:L0/L1 缓存副本可各一份;L2/L3 稳态二选一(XOR,允许迁移窗口短暂双有);L2 同层不冗余(见 [`storage-layer.md`](storage-layer.md)「层间副本 vs 移动」)。
 - `rkey/lkey` 不进 schema——MR 注册时 per-NIC 动态产生,传输时 agent 查本地 MR 表得 lkey、查 peer BufferDesc 得 rkey(仿 Mooncake)。
 
 内容寻址使前缀复用天然成立:相同**前缀** → 相同 block hash → 命中同一 KV。
@@ -35,11 +35,11 @@ message BlockMeta { KVBlockID id; BlockKind block_kind; repeated Location locati
 
 **block 粒度 = 128 token**:缓存命中 / 复用 / 传输 / 写回的最小单位。128 为初版默认,待 P7 校准(与 SGLang `--page-size`、vLLM `block_size` 同量级)。L1–L3 统一按 128-token block、page-first 组织(两类复用条件一致、不区分类型,见 [`storage-layer.md`](storage-layer.md) "KV 类型"节)。HBM(L0)的 t-type block 同取 128,便于 L0↔L1 整块零拷贝;r-type 在 L0 不按 block 而按紧凑状态槽,落 L1+ 时再按 block 切(trailing pages 或 state checkpoint)。
 
-**模型无关**:`model_id` 是寻址命名空间,Pool 不解释张量布局(层数、头维、dtype),按不透明字节块存取。接入新模型只需注册 `model_id`,无需新建池。
+**模型无关**:池内命名空间是 `(model_id, revision)`(P4.5 显式 `RegisterModel`),Pool 不解释张量布局(层数、头维、dtype),按不透明字节块存取。接入新模型/revision 只需注册命名空间,无需新建池。`BlockSpec` 挂 `ModelDescriptor`,不进 `KVBlockID`。
 
 **drafter / r-type 不物理分池**:`pool_kind`(TARGET|DRAFT)与 `block_kind`(T_TYPE|R_TYPE_STATE|R_TYPE_TRAILING)是 `BlockMeta` 元数据字段,区分命名空间与 block 内布局,不改物理池结构——L1–L3 统一按 block 不透明存(参考 SGLang `PoolName.DRAFT` 命名区分但 lake 不分物理池、vLLM `kv_cache_spec_kind`)。block 内装逐 token KV 还是紧凑 state 快照由 `block_kind` 声明,Pool 不解释。
 
-**多租户预留(不实现)**:`KVBlockID.scope` 字段已在 schema,**当前不入寻址**——默认 `"public"`,寻址/分片仍按 `hash(model_id, block_hash, pool_kind)`(**忽略 scope**),同一 `model_id` 内 KV 全局共享复用,不做租户间私有隔离(多租户归外部控制面,见 [`../features/features.md`](../features/features.md) F8)。未来 F8 启用时把 `scope` 纳入 hash + 寻址过滤,**不改 KVBlockID 结构**(字段已在),只改寻址语义——向后兼容。
+**多租户预留(不实现)**:`KVBlockID.scope` 字段已在 schema,**当前不入寻址**——默认 `"public"`,寻址/分片仍按 `(model_id, revision, block_hash, pool_kind)`(**忽略 scope**),同一命名空间内 KV 全局共享复用,不做租户间私有隔离(多租户归外部控制面,见 [`../features/features.md`](../features/features.md) F8)。未来 F8 启用时把 `scope` 纳入 hash + 寻址过滤,**不改 KVBlockID 结构**(字段已在),只改寻址语义——向后兼容。
 
 ### t-type / r-type:复用条件一致,区别在 HBM 存储形态
 
@@ -67,9 +67,9 @@ message BlockMeta { KVBlockID id; BlockKind block_kind; repeated Location locati
 
 ### 前缀树索引
 
-radix tree 归存储池,按 `model_id` 分命名空间。节点 = block hash,路径 = token 序列;给定 prompt 沿树匹配最长公共前缀,确定可复用 KV block 范围。
+radix tree 归存储池,按 `(model_id, revision)` 分命名空间(每命名空间一个 `BlockRegistry` / 一棵 radix)。节点 = block hash,路径 = token 序列;给定 prompt 沿树匹配最长公共前缀,确定可复用 KV block 范围。下线级联删 = drop 整个命名空间(强句柄释放 → radix Weak 失效)。
 
-**权威与镜像**：radix tree 的**权威**在存储控制面进程内存（位置视图权威的一部分,见 [`control-plane.md`](control-plane.md)「位置视图权威的归属」）。Router 与各 agent 各持一份**只读镜像**（控制面 gRPC stream 推送的副本,见 [`control-plane.md`](control-plane.md)「Router 持位置视图镜像」）——它们只读、不写、不拥有;满块注册写权威（控制面内存,release 一致,不进 etcd）,不写任何本地索引。
+**权威、镜像与本地 overlay**：radix tree 的**全局提交态权威**在存储控制面进程内存（位置视图权威的一部分,见 [`control-plane.md`](control-plane.md)「位置视图权威的归属」）。Router 与各 agent 各持一份**只读 global view mirror**（控制面 gRPC stream 推送的副本,见 [`control-plane.md`](control-plane.md)「Router 持位置视图镜像」）。这不等于 agent 没有可写本地状态：每个 agent 还维护自己的 **local overlay**（本机 L0/L1/L2 状态、slot/free-list、local ref、writeback/in-flight 状态）,热路径先写本地 overlay,再把满块注册、位置变化、ref 汇总、barrier 等事件批量/异步提交给 CP。换言之:mirror 只读;local overlay 可写;CP 只接收全局可见的提交态事件。
 
 **两类查询走不同的树**（别混）：
 
@@ -101,30 +101,64 @@ node_id = hash(KVBlockID) % N
 - 写:产出节点的 agent 通过传输引擎 RDMA write 推到目标 KV Node。
 - 读:消费节点的 agent 通过传输引擎 RDMA read 拉取(跨实例传输机制见上节)。
 
-### KV Node 上的 agent
-
-**KV Node = 存储池的远端物理载体节点**:贡献 DRAM(L1)+ NVMe(L2),无 HBM、无计算、无 worker。计算节点本机的 HBM/DRAM/NVMe 也是池的载体,但**远端**那部分就是 KV Node。每个有介质的节点上都跑一个 agent（池伸到该机的本地手）。
+### KV Pool 模块图
 
 ```mermaid
 flowchart TB
-    subgraph CN["计算节点 (Python worker + Rust agent, 同进程)"]
-        HBM["HBM (L0)"]
-        DRAM_CN["DRAM (L1, 本机载体)"]
-        NVMe_CN["NVMe (L2, 本机载体)"]
-        AGENT_CN["agent (Rust .so, FFI 接 worker)<br/>+ view mirror + block table 组装<br/>+ NVMe serve (本机 L2)"]
+    subgraph cp["Rust 存储控制面"]
+        authority["Authority\nradix + global locations + ref summary"]
+        quotaGc["quota / GC / defrag / shard"]
+        checkpoint["CheckpointStore\n内存 mock / etcd 后续"]
+        authority --- quotaGc
+        authority --> checkpoint
     end
-    subgraph KVN["KV Node (远端, 无 HBM/无计算)"]
-        DRAM_KV["DRAM (L1, 远端载体)"]
-        NVMe_KV["NVMe (L2, 远端载体)"]
-        AGENT_KV["agent (Rust, 无 FFI/无镜像)<br/>+ NVMe serve"]
+
+    subgraph computeNode["计算节点"]
+        worker["Python Worker\nscheduler + ModelRunner"]
+        computeAgent["storage-agent\nFFI + mirror + block table"]
+        computeOverlay["local overlay\nslot/free-list + local ref\nwriteback + in-flight"]
+        l0["L0 HBM\n池放置的计算载体"]
+        l1Local["L1 DRAM\n本机池化载体"]
+        l2Local["L2 NVMe\n本机池化载体"]
+        worker <--> computeAgent
+        computeAgent <--> computeOverlay
+        computeOverlay --- l0
+        computeOverlay --- l1Local
+        computeOverlay --- l2Local
     end
-    subgraph CP["存储控制面 (Rust, 独立进程)"]
-        AUTH["位置视图权威 (进程内存)<br/>radix + 位置 + ref + 配额 + GC"]
+
+    subgraph kvNode["KV Node"]
+        kvAgent["KV Node agent\nTransfer core + NVMe serve"]
+        kvOverlay["local overlay\nL1 MR + L2 segment arena"]
+        l1Remote["L1 DRAM\nRDMA donor"]
+        l2Remote["L2 NVMe\nbounce serve"]
+        kvAgent <--> kvOverlay
+        kvOverlay --- l1Remote
+        kvOverlay --- l2Remote
     end
-    AGENT_CN -->|"gRPC 上报/回查 + stream 订阅"| AUTH
-    AGENT_KV -->|"gRPC lease + stream"| AUTH
-    AGENT_CN -->|"RDMA 传/读写 (L0-L0 / L0-远端L1L2)"| AGENT_KV
+
+    l3[("L3 Object Store\nSSOT")]
+
+    computeAgent -->|"async events\nRegister / LocationEvent / RefSummary"| authority
+    computeAgent <-->|"Locate confirm / Barrier"| authority
+    kvAgent -->|"lease / location events"| authority
+    computeAgent <-->|"TransferService\nRDMA / TCP fallback"| kvAgent
+    authority -->|"l3_present / lifecycle"| l3
 ```
+
+上图区分三层状态:agent 的 `local overlay` 是本机热路径可写状态;`Authority` 是全局提交态权威;Router/agent 的 mirror 是从 `Authority` 派生的只读副本。计算节点和 KV Node 的 agent 是池伸到各节点的本地执行手,负责本地介质操作与传输端点;CP 不进每 token/step 热路径。L3 不进 `Location`,由 `l3_present` 与对象 key 规则表示。
+
+**当前实现对齐(P4 原型)**：
+
+- `rust/tiered-store::LocalTierEngine` 是 agent local overlay 的进程内骨架:维护 L0/L1/L2/L3 字节映射、L2 `SegmentArena`、本地 `pin`（≈ local ref / writeback / in-flight 冻结）与本地 promotion/demotion/compaction。
+- `rust/storage-agent::PutEndSession` 体现“本地先落介质、再提交全局”的边界:满块先做 quota preflight,再写 L2 durable,随后 `RegisterBlocks` / `ReportRefs` / `RequestBarrier` 提交给 CP。
+- `rust/transfer::TransferServer` / `TcpTransport` 体现数据面本地状态:pull handle、publish stream、segment/batch 生命周期都在 transfer/agent 侧,不进 CP。
+- `rust/controlplane::Authority` 维护全局提交态 radix / locations / ref summary / quota / GC / defrag / shard。
+- 仍未真实化的部分:跨进程 agent event stream、真 RDMA、真 NVMe/object store、生产级 local overlay 持久化/恢复。P4 用 in-process trait、HashMap 字节后端和 TCP 站位验证职责边界;P5/P7 再替换介质与传输实现。
+
+### KV Node 上的 agent
+
+**KV Node = 存储池的远端物理载体节点**:贡献 DRAM(L1)+ NVMe(L2),无 HBM、无计算、无 worker。计算节点本机的 HBM/DRAM/NVMe 也是池的载体,但**远端**那部分就是 KV Node。每个有介质的节点上都跑一个 agent（池伸到该机的本地手）。
 
 两类 agent 共用一个 Rust crate `lake-storage-agent`，**共用传输 core**（传输引擎 + lease/段挂摘），再**按角色 feature 出两套能力**：计算侧独有 FFI / mirror / block table / fence / slot；KV Node 侧独有 NVMe serve（bounce）。**不是**"谁是谁的真子集"——两者共用 core，各自叠加对方没有的能力。
 
@@ -309,23 +343,33 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 
 总容量 = 各 KV Node 的 DRAM+NVMe 之和,按**配额**在模型间分配:
 
-- 每模型设软配额(常态上限)与硬配额(绝对上限)。
-  - 软配额内自由写入;超软配额按该模型 LRU 淘汰冷块腾位。
-  - 闲时借用池全局空闲空间(best-effort,遇压力可回收)。
-  - 触硬配额 → 返回写入背压信号向上传播(请求级 shedding 仍归 gateway,见 [`../features/slo.md`](../features/slo.md))。
+- 每 `(model_id, revision)` 设软配额(常态上限)与硬配额(绝对上限)(P4.6:`SetModelQuota`/`GetModelQuota`;亦可随 `RegisterModel` 登记)。
+  - 软配额内自由写入;超软配额按该模型冷块(inactive/`LineageBackend`)淘汰腾位。
+  - 闲时借用池全局空闲空间(best-effort,遇压力可从超软借用方回收)。
+  - **写前准入(方案 A)**：公开 RPC `AdmitRegisterBlocks`(纯检查、不 reserve)→ 再 flush durable → `RegisterBlocks`(PutEnd)。对齐 Mooncake `PutStart` 的公开边界形态,无 reserved 占座(`Reserve*` → 多进程/P4.7)。触硬 → `Ack.backpressure`(`HARD_QUOTA`);请求级 shedding 仍归 gateway,见 [`../features/slo.md`](../features/slo.md)。
 - 配额权重按模型负载/命中率动态调整(调度器决策,控制面下发)。
 - **扩容**:加入 KV Node,按一致性哈希重分布,仅迁移落在新节点区间的 block。
 - **缩容**:Drain 目标 Node(block 迁出或下沉 L3)再下线。
 - 迁移为后台低优先级任务,可暂停让路高峰。
 
+**P4.9 原型**(单测模拟;真跨机字节 → P5):
+
+- Proto:`GetShardMap` / `JoinShardNode` / `DrainShardNode` / `RemoveShardNode`。
+- CP 持虚拟节点一致性哈希环(`ShardRing`);`owner_of(block_hash)` 定所有权。
+- **Join**:重算环,只返回所有权迁入新节点的 `ShardMigration`(最小迁移)。
+- **Drain**:节点标 `draining` 并退出所有权环 → 迁出计划 + `push_l2` 候选(Drain 推 L2 逻辑;字节搬运/Transfer 留 P5)。
+- **Remove**:仅当该节点在位置视图中已无 L0/L1/L2 placement(迁移/推 L2 完成)才可从 shard map 删除——ownership remap ≠ 物理完成。
+- 参考:Mooncake `MetadataShard` 分片键 / Unmount 与 replica 生命周期;差异是 lake 环管 KV Node 所有权,并用 CP `locations` 作 Drain 完成门闩。
+
 ## GC
 
-回收无效/不可达 block:
+回收无效/不可达 block(P4.7 原型 RPC:`ReconcileOrphans` / `DiscardBlocks`;checkpoint:`SaveCheckpoint`/`RestoreCheckpoint`+`CheckpointStore` 内存 mock,真 etcd→P6):
 
-- **冷块回收**:引用 0 + 冷(LRU 末尾)→ 淘汰。
-- **孤儿块**:Prefill 崩溃残留的部分写入 block → 写入屏障标记未完成,TTL 后回收。
+- **冷块回收**:引用 0 + inactive(LFU-Aging/前缀亲和)→ 摘 L0/L1 位置视图,L2/L3 durable 后盾保留(radix 仍可命中);剥层后 **重新放回 inactive**,否则后续 GC/硬配额回收会漏算仍占 `used_bytes` 的 durable 冷块。
+- **孤儿块**:写入未完成残留 → `OrphanReport` 登记,TTL 后摘元数据(默认 30s,对齐 Mooncake `put_start_discard_timeout`);调用方再删 bytes。`RegisterBlocks` 成功或块已在位置视图 → 清 orphan mark;TTL sweep **不** discard 已注册块。
+- **节点级 reconcile**:`dead_node_id` → 清该节点持有的 global ref + 摘其 L0(兜底 PutEnd writeback 泄漏;不做会话级 TTL)。
 - **模型下线/旧 revision**:级联删除。
-- **元数据一致性**:以控制面元数据为权威,block 字节删除前确认元数据已无引用;崩溃恢复扫描 reconcile 孤儿块。
+- **元数据一致性**:以控制面元数据为权威,**元数据先于字节删除**;崩溃从 checkpoint 重建视图后再对账。`CheckpointSnapshot` 每块带 `prefix_chain`(root→self),restore 按链 `RegisterBlocks` 重建 radix lineage——不能只按 flat hash 当 root。
 - **节流**:后台运行,受带宽/IO 预算限制,不阻塞数据面。
 
 ## 碎片整理
@@ -335,6 +379,15 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 - **逻辑碎片**:同一序列 block 散落多 KV Node → Decode 读扇出大、传输慢。整理:把热点序列 block 迁到少数节点共置,降读扇出(热度由 radix + 访问频次判定)。
 - **物理碎片**:NVMe/RAM 空闲页零散 → 写入放大、分配失败。整理:后台压实合并空闲页。
 - 节流:消耗带宽与 CPU,须节流并与低峰重叠,可暂停可恢复;目标开销 < 总带宽 X%(P7 校准)。
+
+**P4.8 原型**(单进程 mock;真 NVMe/跨机 → P5):
+
+- Proto:`TriggerDefrag` / `PauseBackground`(挂 `ControlPlaneService`)。
+- **计划在 CP**:读 radix `prefix_chain` + Location → `DefragMove` 列表(`COMPACT` / `COLOCATE` / `BOTH`);**不**指挥调度器(方案 Z)。**COLOCATE 仅同 node**(跨节点需 Transfer + source/target → P5);打包目标须与 CP 占用视图对齐(空闲或已是目标块自身),避免生成 `place_at: slot occupied` 的死计划。
+- **执行在 tiered-store**:`SegmentArena`(L2 段式布局)+ `TierPipeline` 动作 `CompactSegment` / `CoLocateMove`;与 promote/demote/GC 共享 [`BandwidthPool`](../../rust/tiered-store/src/bandwidth.rs)(`PauseBackground` → pause/resume)。
+- **PutEnd 同步**:`register_request` 从 `LocalTierEngine::l2_placement` 填 `segment_id`/`offset`,CP 初始视图与 arena 一致(禁止固定 `1,0` 占位叠块)。
+- 完成后发 `LocationEvent::Moved` → CP `relocate_in_view` 更新 `segment_id`/`offset`。
+- **冻结**:`pin` / `global_refs>0` 的块跳过(同 demote)。自动触发阈值(扇出/碎片率)留开放点/P7。
 
 ## 故障恢复
 

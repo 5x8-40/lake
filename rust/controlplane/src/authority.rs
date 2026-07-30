@@ -1,4 +1,5 @@
-//! 位置视图权威：每 model_id 一个 `BlockRegistry` + 强句柄 + InactiveIndex。
+//! 位置视图权威：每 `(model_id, revision)` 一个命名空间；
+//! 其内按 `pool_kind`(TARGET/DRAFT) 各持一棵 `BlockRegistry`（schema 寻址含 pool_kind）。
 //!
 //! 参考:Dynamo `BlockRegistry` / `InactiveIndex`；驱逐主路径 =
 //! `LineageBackend::with_frequency`（只驱叶子 ≈ 前缀亲和 + TinyLFU 冷叶优先 ≈ LFU-Aging）。
@@ -6,6 +7,13 @@
 //! `report_ref` 满容只 skip insert（对齐 Dynamo `inactive.insert`）；
 //! 压力 `allocate` 只在显式 `evict_n`（对齐 `allocate_atomic`）。
 //! EventsManager 不接线。
+//!
+//! P4.5:显式 `RegisterModel` / `DeregisterModel`；禁止懒建命名空间。
+//! 下线 = 整表 drop（强句柄释放 → radix Weak 失效 ≈ 按命名空间剪枝）。
+//! P4.6:软/硬配额 + 借用 + 触硬 `BackpressureSignal`（RegisterBlocks 拒扩容写入）。
+//! **关键差异**(相对 Dynamo):lake 一等 `(model_id, revision)` + `TARGET|DRAFT` 同池寻址，
+//! 不能共用单 registry 的 flat→entry 表。
+//! **关键差异**(相对 Mooncake tenant quota / LMCache QuotaManager):见 `quota.rs`。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -16,39 +24,97 @@ use kvbm_logical::{
 };
 
 use crate::hash_chain::lineage_from_prefix;
+use crate::quota::{self, AdmitWrite};
 use crate::tier::{TierL0, TierL1, TierL2};
 use lake_proto::lake::*;
+
+/// Result of [`Authority::register`] after quota admission.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RegisterStatus {
+    Accepted,
+    /// Hard quota would be exceeded — write rejected; signal for gateway.
+    RejectedHardQuota(BackpressureSignal),
+}
+
+/// Pure admission plan (review #1): reject has no victims; accept lists mutations.
+#[derive(Debug, Clone)]
+enum AdmitPlan {
+    Accept {
+        own_evict_n: usize,
+        reclaim_bytes: i64,
+    },
+    Reject(BackpressureSignal),
+}
+
+impl AdmitPlan {
+    fn status(&self) -> RegisterStatus {
+        match self {
+            AdmitPlan::Accept { .. } => RegisterStatus::Accepted,
+            AdmitPlan::Reject(bp) => RegisterStatus::RejectedHardQuota(bp.clone()),
+        }
+    }
+}
 
 const INACTIVE_CAP: usize = 4096;
 /// Same threshold shape as `MultiLruBackend` / Frequency LeafPolicy.
 const FREQ_THRESHOLDS: [u8; 3] = [3, 8, 15];
 
-struct Entry {
-    seq_hash: SequenceHash,
-    meta: BlockMeta,
-    block_id: BlockId,
+/// Control-plane model namespace key = `(model_id, revision)`.
+/// Block identity within = `(pool_kind, block_hash)` → separate [`PoolView`].
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct NamespaceKey {
+    pub model_id: String,
+    pub revision: String,
 }
 
-struct Namespace {
-    registry: BlockRegistry,
-    /// Keep strong refs so Weak entries in the radix tree stay alive.
-    handles: HashMap<SequenceHash, BlockRegistrationHandle>,
-    /// Flat (content) hash → entry. Same `model_id` + same flat in different
-    /// lineages would overwrite; agent chained SHA256 is assumed globally unique
-    /// within a model namespace.
-    by_flat: HashMap<Vec<u8>, Entry>,
-    seq_to_flat: HashMap<SequenceHash, Vec<u8>>,
-    inactive: Box<dyn InactiveIndex>,
-    /// Hard cap on inactive Real nodes (slab/`LruCache` capacity hint **and**
-    /// insert gate: at cap, `report_ref` skips insert rather than allocate).
-    inactive_cap: usize,
-    /// Aggregate global refs (P4.2 skeleton: all `RefKind` summed into one
-    /// counter; `kind` on the wire is ignored). Agent local L1 + per-kind → later.
-    global_refs: HashMap<SequenceHash, i64>,
+impl NamespaceKey {
+    pub fn new(model_id: impl Into<String>, revision: impl Into<String>) -> Self {
+        Self {
+            model_id: model_id.into(),
+            revision: revision.into(),
+        }
+    }
+
+    pub fn from_id(id: &KvBlockId) -> Self {
+        Self::new(id.model_id.clone(), id.revision.clone())
+    }
+}
+
+/// Wire `POOL_UNSPECIFIED`(0) → TARGET. Reject unknown kinds.
+pub fn resolve_pool_kind(raw: i32) -> Result<i32, String> {
+    // POOL_UNSPECIFIED = 0 → TARGET (LookupPrefix / wire default).
+    if raw == 0 {
+        return Ok(PoolKind::Target as i32);
+    }
+    if raw == PoolKind::Target as i32 || raw == PoolKind::Draft as i32 {
+        return Ok(raw);
+    }
+    Err(format!("unsupported pool_kind {raw}"))
+}
+
+pub(crate) struct Entry {
+    pub(crate) seq_hash: SequenceHash,
+    pub(crate) meta: BlockMeta,
+    pub(crate) block_id: BlockId,
+    /// Flat hashes from root through this block (inclusive). Checkpoint export
+    /// needs this — PLH parent fragments alone cannot rebuild content hashes.
+    pub(crate) prefix_chain: Vec<Vec<u8>>,
+}
+
+/// One Dynamo-shaped registry domain per `pool_kind`.
+pub(crate) struct PoolView {
+    pub(crate) registry: BlockRegistry,
+    pub(crate) handles: HashMap<SequenceHash, BlockRegistrationHandle>,
+    /// Flat content hash → entry **within this pool_kind**.
+    pub(crate) by_flat: HashMap<Vec<u8>, Entry>,
+    pub(crate) seq_to_flat: HashMap<SequenceHash, Vec<u8>>,
+    pub(crate) inactive: Box<dyn InactiveIndex>,
+    pub(crate) inactive_cap: usize,
+    pub(crate) global_refs: HashMap<SequenceHash, i64>,
     next_block_id: BlockId,
 }
 
-impl Namespace {
+impl PoolView {
     fn new(inactive_cap: usize) -> Self {
         let cap = inactive_cap.max(1);
         let tracker = FrequencyTrackingCapacity::Small.create_tracker();
@@ -77,9 +143,6 @@ impl Namespace {
         id
     }
 
-    /// Drop up to `n` inactive victims from the location view.
-    /// Pressure path only — mirrors Dynamo `BlockStore::allocate_atomic`
-    /// (evict when a new slot is needed), never called from `report_ref`.
     fn drop_inactive_victims(&mut self, n: usize) -> usize {
         let victims = self.inactive.allocate(n);
         let mut removed = 0;
@@ -98,14 +161,116 @@ impl Namespace {
     }
 }
 
+pub(crate) struct Namespace {
+    pub(crate) descriptor: ModelDescriptor,
+    /// `pool_kind` → independent radix / inactive / refs.
+    pub(crate) pools: HashMap<i32, PoolView>,
+    inactive_cap: usize,
+    /// Authoritative durable-byte usage for this namespace (all pool_kinds).
+    pub(crate) used_bytes: i64,
+}
+
+impl Namespace {
+    fn new(descriptor: ModelDescriptor, inactive_cap: usize) -> Self {
+        Self {
+            descriptor,
+            pools: HashMap::new(),
+            inactive_cap: inactive_cap.max(1),
+            used_bytes: 0,
+        }
+    }
+
+    fn pool_mut(&mut self, pool_kind: i32) -> &mut PoolView {
+        let cap = self.inactive_cap;
+        self.pools
+            .entry(pool_kind)
+            .or_insert_with(|| PoolView::new(cap))
+    }
+
+    fn pool(&self, pool_kind: i32) -> Option<&PoolView> {
+        self.pools.get(&pool_kind)
+    }
+
+    fn block_count(&self) -> usize {
+        self.pools.values().map(|p| p.by_flat.len()).sum()
+    }
+
+    pub(crate) fn bytes_per_block(&self) -> i64 {
+        self.descriptor
+            .block_spec
+            .as_ref()
+            .map(|s| s.bytes_per_block as i64)
+            .unwrap_or(0)
+            .max(1)
+    }
+
+    fn quota(&self) -> Quota {
+        quota::quota_or_default(self.descriptor.quota.as_ref())
+    }
+
+    fn inactive_len(&self) -> usize {
+        self.pools.values().map(|p| p.inactive.len()).sum()
+    }
+
+    fn inactive_bytes(&self) -> i64 {
+        (self.inactive_len() as i64).saturating_mul(self.bytes_per_block())
+    }
+
+    /// Evict up to `n` inactive victims across all pool_kinds; returns blocks removed.
+    fn evict_inactive_n(&mut self, n: usize) -> usize {
+        if n == 0 {
+            return 0;
+        }
+        let bpb = self.bytes_per_block();
+        let mut left = n;
+        let mut removed = 0;
+        // Stable order: TARGET then DRAFT then others.
+        let mut kinds: Vec<i32> = self.pools.keys().copied().collect();
+        kinds.sort_unstable();
+        for pk in kinds {
+            if left == 0 {
+                break;
+            }
+            let Some(pool) = self.pools.get_mut(&pk) else {
+                continue;
+            };
+            let n_here = pool.drop_inactive_victims(left);
+            removed += n_here;
+            left = left.saturating_sub(n_here);
+        }
+        self.used_bytes = (self.used_bytes - (removed as i64) * bpb).max(0);
+        removed
+    }
+}
+
+/// Immutable identity of a registered model (quota is mutable).
+fn descriptor_identity_eq(a: &ModelDescriptor, b: &ModelDescriptor) -> bool {
+    a.model_id == b.model_id
+        && a.revision == b.revision
+        && a.num_layers == b.num_layers
+        && a.hash_algo == b.hash_algo
+        && a.block_spec == b.block_spec
+}
+
 /// Process-local authority state.
 pub struct Authority {
-    namespaces: HashMap<String, Namespace>,
+    pub(crate) namespaces: HashMap<NamespaceKey, Namespace>,
     inactive_cap: usize,
     /// Completed request barriers: `(request_id, node_id)`.
-    /// P4.3: agent flushes L2 + `ReportRef(WRITEBACK,-1)` **before** this RPC;
-    /// CP records completion for observability / future directory updates.
-    completed_barriers: HashMap<String, String>,
+    pub(crate) completed_barriers: HashMap<String, String>,
+    /// P4.6 mock pool durable capacity for borrow accounting.
+    /// `0` = unlimited free (borrow always available until per-model hard).
+    pool_capacity_bytes: i64,
+    /// P4.7: incomplete-write orphans (Mooncake zombie analogue).
+    pub(crate) orphans: HashMap<crate::reconcile::BlockKey, crate::reconcile::OrphanEntry>,
+    /// P4.7: per-node ref holdings for dead-node reconcile / writeback leak.
+    pub(crate) node_refs: HashMap<String, HashMap<crate::reconcile::BlockKey, i64>>,
+    /// P4.7: injectable clock (orphan TTL tests).
+    pub(crate) now_ms: fn() -> u64,
+    /// P4.7: last checkpoint seq.
+    pub(crate) checkpoint_seq: u64,
+    /// P4.9: consistent-hash shard ring (ownership; bytes migrate in P5).
+    pub(crate) shard: crate::shard::ShardRing,
 }
 
 impl Default for Authority {
@@ -115,42 +280,203 @@ impl Default for Authority {
 }
 
 impl Authority {
-    /// Construct with a custom inactive hard cap (tests use a small value).
     pub fn with_inactive_cap(inactive_cap: usize) -> Self {
         Self {
             namespaces: HashMap::new(),
             inactive_cap: inactive_cap.max(1),
             completed_barriers: HashMap::new(),
+            pool_capacity_bytes: 0,
+            orphans: HashMap::new(),
+            node_refs: HashMap::new(),
+            now_ms: crate::reconcile::wall_now_ms,
+            checkpoint_seq: 0,
+            shard: crate::shard::ShardRing::new(crate::shard::DEFAULT_VNODE_COUNT),
         }
     }
 
-    fn ns_mut(&mut self, model_id: &str) -> &mut Namespace {
+    /// Set total pool capacity used for borrow free-space checks (P4.6 tests).
+    pub fn set_pool_capacity_bytes(&mut self, bytes: i64) {
+        self.pool_capacity_bytes = bytes.max(0);
+    }
+
+    pub fn pool_capacity_bytes(&self) -> i64 {
+        self.pool_capacity_bytes
+    }
+
+    fn total_used_bytes(&self) -> i64 {
+        self.namespaces.values().map(|n| n.used_bytes).sum()
+    }
+
+    fn free_bytes(&self) -> i64 {
+        if self.pool_capacity_bytes <= 0 {
+            return i64::MAX / 4; // "unlimited" free for borrow
+        }
+        (self.pool_capacity_bytes - self.total_used_bytes()).max(0)
+    }
+
+    /// P4.5: register `(model_id, revision)` namespace.
+    ///
+    /// Idempotent only when immutable fields match (`num_layers` / `block_spec` /
+    /// `hash_algo` / ids). Re-register may update **quota** only; other changes
+    /// require a new `revision`.
+    pub fn register_model(&mut self, desc: ModelDescriptor) -> Result<(), String> {
+        if desc.model_id.is_empty() {
+            return Err("RegisterModel: model_id required".into());
+        }
+        if let Some(q) = desc.quota.as_ref() {
+            quota::validate_quota(q).map_err(|e| format!("RegisterModel: {e}"))?;
+        }
+        let key = NamespaceKey::new(desc.model_id.clone(), desc.revision.clone());
+        if let Some(ns) = self.namespaces.get_mut(&key) {
+            if !descriptor_identity_eq(&ns.descriptor, &desc) {
+                return Err(format!(
+                    "RegisterModel: immutable fields changed for ({}, rev={:?}); use a new revision \
+                     (num_layers/block_spec/hash_algo must match)",
+                    desc.model_id, desc.revision
+                ));
+            }
+            // Same identity → allow quota refresh (same validator as SetModelQuota).
+            ns.descriptor.quota = desc.quota;
+            return Ok(());
+        }
         let cap = self.inactive_cap;
+        self.namespaces.insert(key, Namespace::new(desc, cap));
+        Ok(())
+    }
+
+    /// Cascade-delete one namespace (all pool_kinds). Bytes → P4.7.
+    pub fn deregister_model(&mut self, model_id: &str, revision: &str) -> Result<(), String> {
+        if model_id.is_empty() {
+            return Err("DeregisterModel: model_id required".into());
+        }
+        let key = NamespaceKey::new(model_id, revision);
+        if self.namespaces.remove(&key).is_none() {
+            return Err(format!(
+                "DeregisterModel: unknown namespace ({model_id}, rev={revision:?})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// P4.6: update soft/hard/borrow for an existing namespace.
+    pub fn set_model_quota(
+        &mut self,
+        model_id: &str,
+        revision: &str,
+        quota: Quota,
+    ) -> Result<(), String> {
+        if model_id.is_empty() {
+            return Err("SetModelQuota: model_id required".into());
+        }
+        quota::validate_quota(&quota).map_err(|e| format!("SetModelQuota: {e}"))?;
+        let ns = self.ns_mut(model_id, revision).ok_or_else(|| {
+            format!("SetModelQuota: unknown namespace ({model_id}, rev={revision:?})")
+        })?;
+        ns.descriptor.quota = Some(quota);
+        Ok(())
+    }
+
+    /// P4.6: snapshot quota + usage (+ backpressure if currently over hard).
+    pub fn get_model_quota(
+        &self,
+        model_id: &str,
+        revision: &str,
+    ) -> Result<GetModelQuotaResponse, String> {
+        if model_id.is_empty() {
+            return Err("GetModelQuota: model_id required".into());
+        }
+        let ns = self.ns(model_id, revision).ok_or_else(|| {
+            format!("GetModelQuota: unknown namespace ({model_id}, rev={revision:?})")
+        })?;
+        let q = ns.quota();
+        let used = ns.used_bytes;
+        let borrowed = quota::borrowed_bytes(used, q.soft_bytes);
+        let backpressure = if q.hard_bytes > 0 && used > q.hard_bytes {
+            Some(BackpressureSignal {
+                model_id: model_id.into(),
+                revision: revision.into(),
+                used_bytes: used,
+                soft_bytes: q.soft_bytes,
+                hard_bytes: q.hard_bytes,
+                deficit_bytes: used - q.hard_bytes,
+                reason: "HARD_QUOTA".into(),
+            })
+        } else {
+            None
+        };
+        Ok(GetModelQuotaResponse {
+            quota: Some(q),
+            used_bytes: used,
+            borrowed_bytes: borrowed,
+            backpressure,
+            ok: true,
+            err: String::new(),
+        })
+    }
+
+    pub fn used_bytes(&self, model_id: &str, revision: &str) -> i64 {
+        self.ns(model_id, revision)
+            .map(|n| n.used_bytes)
+            .unwrap_or(0)
+    }
+
+    pub fn has_namespace(&self, model_id: &str, revision: &str) -> bool {
         self.namespaces
-            .entry(model_id.to_string())
-            .or_insert_with(|| Namespace::new(cap))
+            .contains_key(&NamespaceKey::new(model_id, revision))
     }
 
-    fn ns(&self, model_id: &str) -> Option<&Namespace> {
-        self.namespaces.get(model_id)
+    pub fn model_descriptor(&self, model_id: &str, revision: &str) -> Option<&ModelDescriptor> {
+        self.namespaces
+            .get(&NamespaceKey::new(model_id, revision))
+            .map(|n| &n.descriptor)
     }
 
-    /// Register durable blocks. `prefix_hashes` must be the full ordered chain;
-    /// `metas` must be a **contiguous segment** of that chain (miss suffix or
-    /// initial prefix — not an arbitrary subset).
+    pub fn block_count(&self, model_id: &str, revision: &str) -> usize {
+        self.ns(model_id, revision)
+            .map(|n| n.block_count())
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn ns_mut(&mut self, model_id: &str, revision: &str) -> Option<&mut Namespace> {
+        self.namespaces
+            .get_mut(&NamespaceKey::new(model_id, revision))
+    }
+
+    pub(crate) fn ns(&self, model_id: &str, revision: &str) -> Option<&Namespace> {
+        self.namespaces.get(&NamespaceKey::new(model_id, revision))
+    }
+
+    /// Register durable blocks. One `RegisterBlocks` batch = one `pool_kind`
+    /// contiguous segment of `prefix_hashes`.
+    ///
+    /// P4.6: charges per-namespace quota. New flats only. Soft overflow → own
+    /// inactive eviction + optional borrow/reclaim; hard overflow →
+    /// [`RegisterStatus::RejectedHardQuota`] **without** applying eviction/reclaim
+    /// (plan then commit; see [`Self::preflight_register`]).
     pub fn register(
         &mut self,
         node_id: &str,
         prefix_hashes: &[Vec<u8>],
         metas: Vec<BlockMeta>,
-    ) -> Result<(), String> {
+    ) -> Result<RegisterStatus, String> {
         if metas.is_empty() {
-            return Ok(());
+            return Ok(RegisterStatus::Accepted);
         }
         let model_id = metas
             .iter()
             .find_map(|m| m.id.as_ref().map(|i| i.model_id.clone()))
             .ok_or_else(|| "RegisterBlocks: no KVBlockID".to_string())?;
+        let revision = metas
+            .iter()
+            .find_map(|m| m.id.as_ref().map(|i| i.revision.clone()))
+            .unwrap_or_default();
+        let pool_kind = {
+            let raw = metas
+                .iter()
+                .find_map(|m| m.id.as_ref().map(|i| i.pool_kind))
+                .unwrap_or(PoolKind::Target as i32);
+            resolve_pool_kind(raw)?
+        };
 
         if prefix_hashes.is_empty() {
             return Err("RegisterBlocks: prefix_hashes required (P4.2 lineage)".into());
@@ -171,6 +497,18 @@ impl Authority {
                 return Err(format!(
                     "RegisterBlocks: mixed model_id {} vs {}",
                     model_id, id.model_id
+                ));
+            }
+            if id.revision != revision {
+                return Err(format!(
+                    "RegisterBlocks: mixed revision {:?} vs {:?}",
+                    revision, id.revision
+                ));
+            }
+            let pk = resolve_pool_kind(id.pool_kind)?;
+            if pk != pool_kind {
+                return Err(format!(
+                    "RegisterBlocks: mixed pool_kind {pk} vs {pool_kind}"
                 ));
             }
             let Some(&pos) = index_of.get(id.block_hash.as_slice()) else {
@@ -194,102 +532,72 @@ impl Authority {
             }
         }
 
-        let lineage = lineage_from_prefix(prefix_hashes);
-        let ns = self.ns_mut(&model_id);
+        if !self.has_namespace(&model_id, &revision) {
+            return Err(format!(
+                "RegisterBlocks: model not registered ({model_id}, rev={revision:?}); call RegisterModel first"
+            ));
+        }
 
-        for mut meta in metas {
-            let Some(id) = meta.id.clone() else { continue };
-            let flat = id.block_hash.clone();
-            let pos = *index_of.get(flat.as_slice()).expect("checked");
-            let seq = lineage[pos];
-
-            // Refuse invented COMPLETE (Mooncake Get-only-COMPLETE): no empty
-            // locations unless l3_present. Callers must pass settle-accurate metas.
-            if meta.locations.is_empty() && !meta.l3_present {
-                return Err(
-                    "RegisterBlocks: need L2 location or l3_present (durable first)".into(),
-                );
-            }
-            for loc in &mut meta.locations {
-                if loc.node_id.is_empty() {
-                    loc.node_id = node_id.to_string();
+        // Count new unique flats (idempotent re-register of existing = 0 charge).
+        let new_block_count = {
+            let ns = self.ns(&model_id, &revision).expect("checked");
+            let pool = ns.pool(pool_kind);
+            let mut seen = std::collections::HashSet::new();
+            let mut n = 0usize;
+            for meta in &metas {
+                let Some(id) = meta.id.as_ref() else { continue };
+                if !seen.insert(id.block_hash.clone()) {
+                    continue;
+                }
+                let exists = pool
+                    .map(|p| p.by_flat.contains_key(&id.block_hash))
+                    .unwrap_or(false);
+                if !exists {
+                    n += 1;
                 }
             }
+            n
+        };
 
-            let handle = ns.registry.register_sequence_hash(seq);
-            for loc in &meta.locations {
-                if loc.tier == Tier::L0 as i32 {
-                    handle.mark_present::<TierL0>();
-                } else if loc.tier == Tier::L1 as i32 {
-                    handle.mark_present::<TierL1>();
-                } else if loc.tier == Tier::L2 as i32 {
-                    handle.mark_present::<TierL2>();
-                }
-            }
-            ns.handles.insert(seq, handle);
-
-            let block_id = if let Some(prev) = ns.by_flat.get(&flat) {
-                prev.block_id
-            } else {
-                ns.alloc_block_id()
-            };
-            // Fresh register: not inactive candidate while ref unknown; start refs at 0
-            // until ReportRef. Agent historically set ref_count=1 on meta — keep field
-            // for Locate display but global_refs drives eviction.
-            ns.seq_to_flat.insert(seq, flat.clone());
-            ns.by_flat.insert(
-                flat,
-                Entry {
-                    seq_hash: seq,
-                    meta,
-                    block_id,
-                },
-            );
+        match self.admit_register_bytes(&model_id, &revision, new_block_count)? {
+            RegisterStatus::Accepted => {}
+            rejected => return Ok(rejected),
         }
-        Ok(())
-    }
 
-    /// Prefix lookup + soft touch. `&mut self` because of **lazy handle repair**
-    /// (`handles.insert` when a flat is in `by_flat` but missing from the registry
-    /// index) and TinyLFU `match_sequence_hash(..., touch=true)`.
-    ///
-    /// P4.3: fine under a single `Mutex<Authority>`. P6 HA / 读写分锁时：懒修复
-    /// 应挪到 register 路径，lookup 热路径只读 + 可选无锁 touch，避免永远写锁
-    ///（#20；PR #31 review §4.6）。
-    pub fn lookup_prefix(
-        &mut self,
-        model_id: &str,
-        prefix_hashes: &[Vec<u8>],
-        requester: &str,
-    ) -> (Vec<ReusableBlock>, u32, bool) {
-        if prefix_hashes.is_empty() {
-            return (Vec::new(), 0, false);
-        }
-        // Ensure namespace exists so we can lazy-index flats registered earlier.
-        let _ = self.ns_mut(model_id);
         let lineage = lineage_from_prefix(prefix_hashes);
-        let ns = self.ns_mut(model_id);
+        let mut clear_orphans = Vec::new();
+        {
+            let ns = self
+                .ns_mut(&model_id, &revision)
+                .expect("checked has_namespace");
+            let bpb = ns.bytes_per_block();
+            let pool = ns.pool_mut(pool_kind);
+            let mut charged = 0i64;
 
-        let mut out = Vec::new();
-        let mut hit = 0u32;
-        let mut all_local = true;
+            for mut meta in metas {
+                let Some(id) = meta.id.clone() else { continue };
+                // Normalize unspecified → TARGET on stored identity.
+                if let Some(ref mut mid) = meta.id {
+                    mid.pool_kind = pool_kind;
+                }
+                let flat = id.block_hash.clone();
+                let pos = *index_of.get(flat.as_slice()).expect("checked");
+                let seq = lineage[pos];
 
-        for (i, flat) in prefix_hashes.iter().enumerate() {
-            let seq = lineage[i];
-            let Some(entry) = ns.by_flat.get(flat) else {
-                all_local = false;
-                break;
-            };
-            // Wrong-chain registration must not silently hit (same flat, different lineage).
-            if entry.seq_hash != seq {
-                all_local = false;
-                break;
-            }
-            // Lazy repair: presence markers **only** from meta.locations —
-            // never invent TierL2 for L3-only blocks.
-            let meta = entry.meta.clone();
-            if !ns.handles.contains_key(&seq) {
-                let handle = ns.registry.register_sequence_hash(seq);
+                if meta.locations.is_empty() && !meta.l3_present {
+                    return Err(
+                        "RegisterBlocks: need L2 location or l3_present (durable first)".into(),
+                    );
+                }
+                for loc in &mut meta.locations {
+                    if loc.node_id.is_empty() {
+                        loc.node_id = node_id.to_string();
+                    }
+                }
+
+                let is_new = !pool.by_flat.contains_key(&flat);
+
+                let handle = pool.registry.register_sequence_hash(seq);
                 for loc in &meta.locations {
                     if loc.tier == Tier::L0 as i32 {
                         handle.mark_present::<TierL0>();
@@ -299,9 +607,341 @@ impl Authority {
                         handle.mark_present::<TierL2>();
                     }
                 }
-                ns.handles.insert(seq, handle);
+                pool.handles.insert(seq, handle);
+
+                let block_id = if let Some(prev) = pool.by_flat.get(&flat) {
+                    prev.block_id
+                } else {
+                    pool.alloc_block_id()
+                };
+                pool.seq_to_flat.insert(seq, flat.clone());
+                let prefix_chain = prefix_hashes[..=pos].to_vec();
+                pool.by_flat.insert(
+                    flat.clone(),
+                    Entry {
+                        seq_hash: seq,
+                        meta,
+                        block_id,
+                        prefix_chain,
+                    },
+                );
+                // Successful PutEnd clears any stale orphan mark for this flat.
+                clear_orphans.push(crate::reconcile::BlockKey {
+                    model_id: model_id.clone(),
+                    revision: revision.clone(),
+                    pool_kind,
+                    flat,
+                });
+                if is_new {
+                    charged += bpb;
+                }
+            }
+            ns.used_bytes = ns.used_bytes.saturating_add(charged);
+        }
+        for k in clear_orphans {
+            self.orphans.remove(&k);
+        }
+        Ok(RegisterStatus::Accepted)
+    }
+
+    /// Read-only quota preflight (Mooncake PutStart-shaped). No eviction/reclaim.
+    ///
+    /// PutEnd should call this **before** `flush_durable` so hard reject does not
+    /// leave orphan tier bytes. [`Self::register`] re-runs plan+commit under the
+    /// same rules (single-process; reserved charge deferred).
+    pub fn preflight_register(
+        &self,
+        model_id: &str,
+        revision: &str,
+        pool_kind: i32,
+        block_hashes: &[Vec<u8>],
+    ) -> Result<RegisterStatus, String> {
+        let pk = resolve_pool_kind(pool_kind)?;
+        if !self.has_namespace(model_id, revision) {
+            return Err(format!(
+                "preflight: model not registered ({model_id}, rev={revision:?})"
+            ));
+        }
+        let new_blocks = self.count_new_flats(model_id, revision, pk, block_hashes);
+        let plan = self.plan_admit(model_id, revision, new_blocks)?;
+        Ok(plan.status())
+    }
+
+    fn count_new_flats(
+        &self,
+        model_id: &str,
+        revision: &str,
+        pool_kind: i32,
+        block_hashes: &[Vec<u8>],
+    ) -> usize {
+        let Some(ns) = self.ns(model_id, revision) else {
+            return block_hashes.len();
+        };
+        let pool = ns.pool(pool_kind);
+        let mut seen = std::collections::HashSet::new();
+        let mut n = 0usize;
+        for h in block_hashes {
+            if !seen.insert(h.as_slice()) {
+                continue;
+            }
+            let exists = pool.map(|p| p.by_flat.contains_key(h)).unwrap_or(false);
+            if !exists {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// Plan+commit admission. Hard reject never mutates (no eviction/reclaim).
+    fn admit_register_bytes(
+        &mut self,
+        model_id: &str,
+        revision: &str,
+        new_blocks: usize,
+    ) -> Result<RegisterStatus, String> {
+        let plan = self.plan_admit(model_id, revision, new_blocks)?;
+        if let AdmitPlan::Reject(bp) = &plan {
+            return Ok(RegisterStatus::RejectedHardQuota(bp.clone()));
+        }
+        self.commit_admit(model_id, revision, &plan);
+        Ok(RegisterStatus::Accepted)
+    }
+
+    /// Pure planning: decide reject vs how many own/other victims to free.
+    fn plan_admit(
+        &self,
+        model_id: &str,
+        revision: &str,
+        new_blocks: usize,
+    ) -> Result<AdmitPlan, String> {
+        if new_blocks == 0 {
+            return Ok(AdmitPlan::Accept {
+                own_evict_n: 0,
+                reclaim_bytes: 0,
+            });
+        }
+        let key = NamespaceKey::new(model_id, revision);
+        let ns = self
+            .ns(model_id, revision)
+            .ok_or_else(|| format!("admit: unknown namespace ({model_id}, rev={revision:?})"))?;
+        let q = ns.quota();
+        let bpb = ns.bytes_per_block();
+        let used = ns.used_bytes;
+        let delta = (new_blocks as i64).saturating_mul(bpb);
+        let inactive_n = ns.inactive_len();
+        let inactive_bytes = ns.inactive_bytes();
+
+        // Hard ceiling: if even max own inactive eviction cannot fit, reject
+        // with **zero** mutation (review #1).
+        if q.hard_bytes > 0 && used.saturating_add(delta) > q.hard_bytes {
+            let need = used.saturating_add(delta) - q.hard_bytes;
+            if inactive_bytes < need {
+                let bp = AdmitWrite::HardQuota {
+                    used_bytes: used,
+                    soft_bytes: q.soft_bytes,
+                    hard_bytes: q.hard_bytes,
+                    deficit_bytes: need - inactive_bytes,
+                }
+                .backpressure(model_id, revision)
+                .expect("HardQuota");
+                return Ok(AdmitPlan::Reject(bp));
+            }
+        }
+
+        // Own inactive eviction: enough for hard fit + soft pressure.
+        let mut own_evict_n = 0usize;
+        if q.hard_bytes > 0 && used.saturating_add(delta) > q.hard_bytes {
+            let need = used.saturating_add(delta) - q.hard_bytes;
+            own_evict_n = own_evict_n.max(((need + bpb - 1) / bpb) as usize);
+        }
+        if q.soft_bytes > 0 && used.saturating_add(delta) > q.soft_bytes {
+            let need = used.saturating_add(delta) - q.soft_bytes;
+            own_evict_n = own_evict_n.max(((need + bpb - 1) / bpb) as usize);
+        }
+        own_evict_n = own_evict_n.min(inactive_n);
+
+        let sim_used = used.saturating_sub((own_evict_n as i64).saturating_mul(bpb));
+        let mut reclaim_bytes = 0i64;
+
+        if q.borrow_enabled && q.soft_bytes > 0 {
+            let projected = sim_used.saturating_add(delta);
+            if projected > q.soft_bytes {
+                let need_borrow = projected - q.soft_bytes;
+                // Own eviction frees pool capacity too when capacity is finite.
+                let free = if self.pool_capacity_bytes > 0 {
+                    (self.free_bytes() + (own_evict_n as i64).saturating_mul(bpb)).max(0)
+                } else {
+                    self.free_bytes()
+                };
+                if free < need_borrow {
+                    let want = need_borrow - free;
+                    let avail = self.reclaimable_borrowed_bytes(&key);
+                    if avail < want
+                        && self.pool_capacity_bytes > 0
+                        && (q.hard_bytes == 0 || projected <= q.hard_bytes)
+                    {
+                        let bp = AdmitWrite::PoolCapacity {
+                            used_bytes: projected,
+                            soft_bytes: q.soft_bytes,
+                            hard_bytes: q.hard_bytes,
+                            deficit_bytes: want - avail,
+                        }
+                        .backpressure(model_id, revision)
+                        .expect("PoolCapacity");
+                        return Ok(AdmitPlan::Reject(bp));
+                    }
+                    reclaim_bytes = want.min(avail);
+                }
+            }
+        }
+
+        match quota::classify_write(sim_used, delta, &q) {
+            r @ AdmitWrite::HardQuota { .. } => {
+                let bp = r.backpressure(model_id, revision).expect("HardQuota");
+                Ok(AdmitPlan::Reject(bp))
+            }
+            AdmitWrite::PoolCapacity { .. } => {
+                unreachable!("classify_write does not produce PoolCapacity")
+            }
+            AdmitWrite::WithinSoft | AdmitWrite::OverSoft => Ok(AdmitPlan::Accept {
+                own_evict_n,
+                reclaim_bytes,
+            }),
+        }
+    }
+
+    fn commit_admit(&mut self, model_id: &str, revision: &str, plan: &AdmitPlan) {
+        let AdmitPlan::Accept {
+            own_evict_n,
+            reclaim_bytes,
+        } = plan
+        else {
+            return;
+        };
+        if *own_evict_n > 0 {
+            if let Some(ns) = self.ns_mut(model_id, revision) {
+                ns.evict_inactive_n(*own_evict_n);
+            }
+        }
+        if *reclaim_bytes > 0 {
+            let key = NamespaceKey::new(model_id, revision);
+            self.reclaim_borrowed_bytes(&key, *reclaim_bytes);
+        }
+    }
+
+    /// Read-only: how many borrowed inactive bytes other namespaces can yield.
+    fn reclaimable_borrowed_bytes(&self, except: &NamespaceKey) -> i64 {
+        let mut total = 0i64;
+        for (k, ns) in &self.namespaces {
+            if k == except {
+                continue;
+            }
+            let over = quota::borrowed_bytes(ns.used_bytes, ns.quota().soft_bytes);
+            if over <= 0 {
+                continue;
+            }
+            total = total.saturating_add(over.min(ns.inactive_bytes()));
+        }
+        total
+    }
+
+    /// Evict inactive blocks from other namespaces that are over soft (borrowers).
+    fn reclaim_borrowed_bytes(&mut self, except: &NamespaceKey, want_bytes: i64) -> i64 {
+        if want_bytes <= 0 {
+            return 0;
+        }
+        let mut freed = 0i64;
+        let mut keys: Vec<NamespaceKey> = self
+            .namespaces
+            .iter()
+            .filter(|(k, ns)| {
+                *k != except && quota::borrowed_bytes(ns.used_bytes, ns.quota().soft_bytes) > 0
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.sort_by(|a, b| {
+            a.model_id
+                .cmp(&b.model_id)
+                .then(a.revision.cmp(&b.revision))
+        });
+
+        for key in keys {
+            if freed >= want_bytes {
+                break;
+            }
+            let Some(ns) = self.namespaces.get_mut(&key) else {
+                continue;
+            };
+            let soft = ns.quota().soft_bytes;
+            let bpb = ns.bytes_per_block();
+            let over = quota::borrowed_bytes(ns.used_bytes, soft);
+            if over <= 0 {
+                continue;
+            }
+            let still = want_bytes - freed;
+            let target = still.min(over);
+            let want_blocks = ((target + bpb - 1) / bpb).max(1) as usize;
+            let removed = ns.evict_inactive_n(want_blocks);
+            freed += (removed as i64) * bpb;
+        }
+        freed
+    }
+
+    /// Prefix lookup in one `pool_kind` domain.
+    ///
+    /// `pool_kind == UNSPECIFIED` → TARGET (P4.5 default; draft prefix opt-in).
+    pub fn lookup_prefix(
+        &mut self,
+        model_id: &str,
+        revision: &str,
+        pool_kind: i32,
+        prefix_hashes: &[Vec<u8>],
+        requester: &str,
+    ) -> (Vec<ReusableBlock>, u32, bool) {
+        if prefix_hashes.is_empty() {
+            return (Vec::new(), 0, false);
+        }
+        let Ok(pool_kind) = resolve_pool_kind(pool_kind) else {
+            return (Vec::new(), 0, false);
+        };
+        if self.ns(model_id, revision).is_none() {
+            return (Vec::new(), 0, false);
+        }
+        let lineage = lineage_from_prefix(prefix_hashes);
+        let ns = self.ns_mut(model_id, revision).expect("checked");
+        let Some(pool) = ns.pools.get_mut(&pool_kind) else {
+            return (Vec::new(), 0, false);
+        };
+
+        let mut out = Vec::new();
+        let mut hit = 0u32;
+        let mut all_local = true;
+
+        for (i, flat) in prefix_hashes.iter().enumerate() {
+            let seq = lineage[i];
+            let Some(entry) = pool.by_flat.get(flat) else {
+                all_local = false;
+                break;
+            };
+            if entry.seq_hash != seq {
+                all_local = false;
+                break;
+            }
+            let meta = entry.meta.clone();
+            if !pool.handles.contains_key(&seq) {
+                let handle = pool.registry.register_sequence_hash(seq);
+                for loc in &meta.locations {
+                    if loc.tier == Tier::L0 as i32 {
+                        handle.mark_present::<TierL0>();
+                    } else if loc.tier == Tier::L1 as i32 {
+                        handle.mark_present::<TierL1>();
+                    } else if loc.tier == Tier::L2 as i32 {
+                        handle.mark_present::<TierL2>();
+                    }
+                }
+                pool.handles.insert(seq, handle);
             } else {
-                let _ = ns.registry.match_sequence_hash(seq, true);
+                let _ = pool.registry.match_sequence_hash(seq, true);
             }
 
             let local = meta
@@ -327,74 +967,42 @@ impl Authority {
     pub fn locate(&self, ids: &[KvBlockId]) -> Vec<BlockMeta> {
         let mut blocks = Vec::new();
         for id in ids {
-            if let Some(ns) = self.ns(&id.model_id) {
-                if let Some(entry) = ns.by_flat.get(&id.block_hash) {
-                    blocks.push(entry.meta.clone());
+            let Ok(pk) = resolve_pool_kind(id.pool_kind) else {
+                continue;
+            };
+            if let Some(ns) = self.ns(&id.model_id, &id.revision) {
+                if let Some(pool) = ns.pool(pk) {
+                    if let Some(entry) = pool.by_flat.get(&id.block_hash) {
+                        blocks.push(entry.meta.clone());
+                    }
                 }
             }
         }
         blocks
     }
 
-    /// Validate a ref delta can be applied (block known). Does not mutate.
     pub fn check_report_ref(&self, delta: &RefDelta) -> Result<(), String> {
         let id = delta
             .id
             .as_ref()
             .ok_or_else(|| "RefDelta missing id".to_string())?;
+        let pk = resolve_pool_kind(id.pool_kind)?;
         let ns = self
-            .ns(&id.model_id)
-            .ok_or_else(|| format!("unknown model_id {}", id.model_id))?;
-        if !ns.by_flat.contains_key(&id.block_hash) {
+            .ns(&id.model_id, &id.revision)
+            .ok_or_else(|| format!("unknown namespace ({}, rev={:?})", id.model_id, id.revision))?;
+        let pool = ns
+            .pool(pk)
+            .ok_or_else(|| format!("RefDelta: unknown pool_kind {pk}"))?;
+        if !pool.by_flat.contains_key(&id.block_hash) {
             return Err("RefDelta: unknown block_hash".to_string());
         }
         Ok(())
     }
 
-    /// Apply one ref delta (sum into `global_refs`). Returns error if block unknown.
-    ///
-    /// P4.2: `delta.kind` is intentionally ignored (合账骨架). Per-kind buckets
-    /// and agent `ReportRef` producers land in a later slice.
     pub fn report_ref(&mut self, delta: &RefDelta) -> Result<(), String> {
-        self.check_report_ref(delta)?;
-        let id = delta.id.as_ref().expect("checked");
-        let ns = self.namespaces.get_mut(&id.model_id).expect("checked");
-        let entry = ns.by_flat.get(&id.block_hash).expect("checked");
-        let seq = entry.seq_hash;
-        let block_id = entry.block_id;
-        let _kind = delta.kind; // reserved; not booked separately in P4.2
-
-        let cur = ns.global_refs.entry(seq).or_insert(0);
-        let before = *cur;
-        *cur = cur.saturating_add(i64::from(delta.delta));
-        if *cur < 0 {
-            *cur = 0;
-        }
-        let after = *cur;
-
-        if before > 0 && after == 0 {
-            // Candidate for eviction — do not delete the view (Dynamo
-            // `release_primary` → `inactive.insert` only; allocate is separate).
-            // At cap: skip insert so Frequency tiers never silently drop leaves.
-            // Skipped block stays at ref=0 out of inactive until a later
-            // 0→正→0 cycle retries insert — `evict_n` freeing a slot does
-            // **not** auto-requeue it.
-            if !ns.inactive.has(seq) && ns.inactive.len() < ns.inactive_cap {
-                ns.inactive.insert(seq, block_id);
-            }
-        } else if before == 0 && after > 0 {
-            // Frozen again — leave inactive index (take if present).
-            let _ = ns.inactive.take(seq, block_id);
-        }
-        Ok(())
+        self.report_ref_raw(delta, /*track_node*/ true)
     }
 
-    /// Apply a batch atomically: validate all, then apply all.
-    /// On validation failure, state is unchanged (`ok: false` ⇒ safe to retry whole batch).
-    ///
-    /// Must not pressure-evict mid-batch: `report_ref` only inserts/skips, so a
-    /// later delta cannot see a peer deleted by an earlier one (would panic on
-    /// the post-check `expect` and break all-or-nothing).
     pub fn report_refs(&mut self, deltas: &[RefDelta]) -> Result<(), String> {
         for (i, d) in deltas.iter().enumerate() {
             self.check_report_ref(d)
@@ -407,36 +1015,50 @@ impl Authority {
         Ok(())
     }
 
-    /// Test / pressure hook: evict up to `n` inactive (ref==0) blocks.
-    /// Returns number of blocks removed from the location view.
-    ///
-    /// Production pressure-driven `allocate` (and agent `ReportRef` feeding) → later slice.
-    pub fn evict_n(&mut self, model_id: &str, n: usize) -> usize {
-        let Some(ns) = self.namespaces.get_mut(model_id) else {
+    pub fn evict_n(&mut self, model_id: &str, revision: &str, pool_kind: i32, n: usize) -> usize {
+        let Ok(pk) = resolve_pool_kind(pool_kind) else {
             return 0;
         };
-        ns.drop_inactive_victims(n)
-    }
-
-    /// Inactive index size (tests).
-    pub fn inactive_len(&self, model_id: &str) -> usize {
-        self.ns(model_id).map(|n| n.inactive.len()).unwrap_or(0)
-    }
-
-    pub fn global_ref(&self, model_id: &str, flat: &[u8]) -> i64 {
-        let Some(ns) = self.ns(model_id) else {
+        let Some(ns) = self.ns_mut(model_id, revision) else {
             return 0;
         };
-        let Some(entry) = ns.by_flat.get(flat) else {
-            return 0;
+        let bpb = ns.bytes_per_block();
+        let removed = {
+            let Some(pool) = ns.pools.get_mut(&pk) else {
+                return 0;
+            };
+            pool.drop_inactive_victims(n)
         };
-        ns.global_refs.get(&entry.seq_hash).copied().unwrap_or(0)
+        ns.used_bytes = (ns.used_bytes - (removed as i64) * bpb).max(0);
+        removed
     }
 
-    /// Record a completed request-end barrier (`consistency.md` §3).
-    ///
-    /// Agent contract: durable flush + `ReportRef(WRITEBACK,-1)` already applied
-    /// so radix blocks are no longer writeback-frozen. Idempotent per request_id.
+    pub fn inactive_len(&self, model_id: &str, revision: &str, pool_kind: i32) -> usize {
+        let Ok(pk) = resolve_pool_kind(pool_kind) else {
+            return 0;
+        };
+        self.ns(model_id, revision)
+            .and_then(|n| n.pool(pk))
+            .map(|p| p.inactive.len())
+            .unwrap_or(0)
+    }
+
+    pub fn global_ref(&self, model_id: &str, revision: &str, pool_kind: i32, flat: &[u8]) -> i64 {
+        let Ok(pk) = resolve_pool_kind(pool_kind) else {
+            return 0;
+        };
+        let Some(ns) = self.ns(model_id, revision) else {
+            return 0;
+        };
+        let Some(pool) = ns.pool(pk) else {
+            return 0;
+        };
+        let Some(entry) = pool.by_flat.get(flat) else {
+            return 0;
+        };
+        pool.global_refs.get(&entry.seq_hash).copied().unwrap_or(0)
+    }
+
     pub fn complete_barrier(&mut self, request_id: &str, node_id: &str) -> Result<(), String> {
         if request_id.is_empty() {
             return Err("RequestBarrier: request_id required".into());
@@ -453,26 +1075,50 @@ impl Authority {
         self.completed_barriers.contains_key(request_id)
     }
 
-    /// Publish / revoke a tier location on the view + presence markers.
-    ///
-    /// P4.3: agent promote/demote calls this after local byte moves.
+    #[allow(clippy::too_many_arguments)] // wire-shaped presence update; pack later if needed
     pub fn publish_location(
         &mut self,
         model_id: &str,
+        revision: &str,
+        pool_kind: i32,
         flat: &[u8],
         tier: Tier,
         node_id: &str,
         present: bool,
     ) -> Result<(), String> {
+        // Legacy default placement (pre-P4.8 callers).
+        self.publish_location_at(
+            model_id, revision, pool_kind, flat, tier, node_id, 1, 0, present,
+        )
+    }
+
+    /// Publish presence with explicit segment/offset (P4.8).
+    #[allow(clippy::too_many_arguments)] // wire-shaped presence + placement coords
+    pub fn publish_location_at(
+        &mut self,
+        model_id: &str,
+        revision: &str,
+        pool_kind: i32,
+        flat: &[u8],
+        tier: Tier,
+        node_id: &str,
+        segment_id: u64,
+        offset: u64,
+        present: bool,
+    ) -> Result<(), String> {
+        let pk = resolve_pool_kind(pool_kind)?;
         let ns = self
-            .namespaces
-            .get_mut(model_id)
-            .ok_or_else(|| format!("unknown model_id {model_id}"))?;
-        let entry = ns
+            .ns_mut(model_id, revision)
+            .ok_or_else(|| format!("unknown namespace ({model_id}, rev={revision:?})"))?;
+        let pool = ns
+            .pools
+            .get_mut(&pk)
+            .ok_or_else(|| format!("publish_location: unknown pool_kind {pk}"))?;
+        let entry = pool
             .by_flat
             .get_mut(flat)
             .ok_or_else(|| "publish_location: unknown block".to_string())?;
-        let handle = ns
+        let handle = pool
             .handles
             .get(&entry.seq_hash)
             .ok_or_else(|| "publish_location: missing handle".to_string())?;
@@ -488,14 +1134,23 @@ impl Authority {
             entry.meta.locations.push(Location {
                 tier: tier_i,
                 node_id: node_id.to_string(),
-                segment_id: 1,
-                offset: 0,
+                segment_id,
+                offset,
             });
             match tier {
                 Tier::L0 => handle.mark_present::<TierL0>(),
                 Tier::L1 => handle.mark_present::<TierL1>(),
                 Tier::L2 => handle.mark_present::<TierL2>(),
                 _ => {}
+            }
+        } else if present && had {
+            // Refresh coordinates (defrag Moved / re-publish).
+            for loc in &mut entry.meta.locations {
+                if loc.tier == tier_i && loc.node_id == node_id {
+                    loc.segment_id = segment_id;
+                    loc.offset = offset;
+                    break;
+                }
             }
         } else if !present && had {
             entry
@@ -515,14 +1170,20 @@ impl Authority {
     pub fn set_l3_present(
         &mut self,
         model_id: &str,
+        revision: &str,
+        pool_kind: i32,
         flat: &[u8],
         present: bool,
     ) -> Result<(), String> {
+        let pk = resolve_pool_kind(pool_kind)?;
         let ns = self
-            .namespaces
-            .get_mut(model_id)
-            .ok_or_else(|| format!("unknown model_id {model_id}"))?;
-        let entry = ns
+            .ns_mut(model_id, revision)
+            .ok_or_else(|| format!("unknown namespace ({model_id}, rev={revision:?})"))?;
+        let pool = ns
+            .pools
+            .get_mut(&pk)
+            .ok_or_else(|| format!("set_l3_present: unknown pool_kind {pk}"))?;
+        let entry = pool
             .by_flat
             .get_mut(flat)
             .ok_or_else(|| "set_l3_present: unknown block".to_string())?;
@@ -530,9 +1191,20 @@ impl Authority {
         Ok(())
     }
 
-    pub fn has_l0_on(&self, model_id: &str, flat: &[u8], node_id: &str) -> bool {
-        self.ns(model_id)
-            .and_then(|n| n.by_flat.get(flat))
+    pub fn has_l0_on(
+        &self,
+        model_id: &str,
+        revision: &str,
+        pool_kind: i32,
+        flat: &[u8],
+        node_id: &str,
+    ) -> bool {
+        let Ok(pk) = resolve_pool_kind(pool_kind) else {
+            return false;
+        };
+        self.ns(model_id, revision)
+            .and_then(|n| n.pool(pk))
+            .and_then(|p| p.by_flat.get(flat))
             .map(|e| {
                 e.meta
                     .locations

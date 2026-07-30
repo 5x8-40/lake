@@ -65,7 +65,7 @@ class WorkerServicer(lake_pb2_grpc.WorkerServiceServicer):
     def __init__(
         self,
         cp: lake_pb2_grpc.ControlPlaneServiceStub,
-        kv: lake_pb2_grpc.SkeletonKvServiceStub,
+        kv: lake_pb2_grpc.TcpDataServiceStub,
         role: Optional[RoleConfig] = None,
         *,
         start_engine: bool = True,
@@ -131,7 +131,7 @@ def serve(bind: str, cp_addr: str, kv_addr: str) -> None:
     cp_chan = grpc.insecure_channel(cp_addr)
     kv_chan = grpc.insecure_channel(kv_addr)
     cp = lake_pb2_grpc.ControlPlaneServiceStub(cp_chan)
-    kv = lake_pb2_grpc.SkeletonKvServiceStub(kv_chan)
+    kv = lake_pb2_grpc.TcpDataServiceStub(kv_chan)
 
     role = RoleConfig.from_env()
     servicer = WorkerServicer(cp, kv, role=role)

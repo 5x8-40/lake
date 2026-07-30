@@ -4,10 +4,10 @@
 
 ```
 curl → Go Router (:8080)
-         ├─ AgentService.Dispatch (:50054)   # 边10 占位 ack
+         ├─ AgentService.Dispatch + TransferService (:50054)  # 边10 + 边7/8
          └─ WorkerService.Generate (:50053)
                 ├─ ControlPlane Lookup/Register (:50051)
-                └─ SkeletonKv Put/Get (:50052)
+                └─ TcpDataService Put/Get (:50052)           # TCP 退化数据面
 ```
 
 ## 依赖
@@ -40,7 +40,7 @@ curl → Go Router (:8080)
 | 服务 | 默认 | 环境变量 |
 |------|------|----------|
 | ControlPlane | `50051` | `LAKE_CP_ADDR` |
-| SkeletonKv | `50052` | `LAKE_KV_ADDR` |
+| TcpDataService | `50052` | `LAKE_KV_ADDR` |
 | Python Worker | `50053` | `LAKE_WORKER_BIND` / `LAKE_WORKER_ADDR` |
 | Storage Agent | `50054` | `LAKE_AGENT_ADDR` |
 | Router HTTP | `8080` | `LAKE_HTTP_ADDR` |

@@ -14,7 +14,9 @@ import "schema.proto";
 // 3 个 service 按通信边划分:
 //   ControlPlaneService — 边3/4/5:Router+agent ↔ 存储控制面(控制面进程实现)
 //   AgentService        — 边10:Router/控制面 → agent(agent 进程实现)
-//   TransferService     — 边7/8:RDMA 传输的控制信令(数据旁路;**agent / KV Node agent 实现,非控制面**)
+//   TransferService     — 边7/8:传输控制信令(字节旁路;**agent / KV Node agent 实现,非控制面**)
+//                         P4:TcpTransport(gRPC 字节走 TcpDataService);P5:RdmaTransport
+//   TcpDataService      — TCP 退化数据面(Put/Get bytes;对齐 Mooncake MC_FORCE_TCP fallback)
 //
 // 参考:
 //   - Dynamo protocols.rs::RouterRequest/RouterResponse/Placement(路由协议 + 命中量化)
@@ -41,11 +43,19 @@ service ControlPlaneService {
   //   (见 kv-cache-pool.md「搬 KV 查权威分层」)。
   rpc Locate(LocateRequest) returns (LocateResponse);
 
+  // P4.6:配额写前准入(方案 A)。纯检查、不 reserve、不改位置视图。
+  //   对齐 Mooncake PutStart 的「写前问 Master」公开边界;无 reserved 占座(Reserve* → 多进程/P4.7)。
+  //   agent 须在 flush durable **之前**调用;触硬 → Ack.ok=false + backpressure。
+  //   请求体复用 RegisterBlocksRequest(只读 model/revision/pool_kind/block hashes 计费;
+  //   locations/l3_present 可空)。与进程内 ControlPlanePort::admit_register_blocks 同语义。
+  rpc AdmitRegisterBlocks(RegisterBlocksRequest) returns (Ack);
+
   // 满块注册:**耐久性由 agent 本地完成**(写 L2 durable)后,只调一次本 RPC = PutEnd。
-  //   PutStart 不进控制面(agent 本地记账即可),防半块被读。仿 Mooncake PutEnd 的控制面侧。
-  //   release 一致,写控制面内存,不进 etcd。
+  //   **可见性** PutStart(半块本地记账、防脏读)仍不进控制面; **配额** 写前走 AdmitRegisterBlocks。
+  //   仿 Mooncake PutEnd 的控制面侧。release 一致,写控制面内存,不进 etcd。
   //   与 Publish 的区别:Publish(可多次、逐层 slice)只更新位置视图;RegisterBlocks(满块 + L2 durable)才进 radix + 置 l3_present/L2。
   //   P4.2:须带 prefix_hashes 全链以便控制面建 PositionalLineageHash;`blocks` 可为 miss 后缀。
+  //   P4.6:触硬 → ok=false + backpressure;建议先 AdmitRegisterBlocks 再 flush。
   rpc RegisterBlocks(RegisterBlocksRequest) returns (Ack);
 
   // P4.2–P4.3:**控制面合账骨架**（非完整两级 ref）。
@@ -62,6 +72,44 @@ service ControlPlaneService {
 
   // lease:节点 mount/unmount segment + 续命(仿 Mooncake MountSegment/UnmountSegment + client_live_ttl_sec)。
   rpc Lease(stream LeaseHeartbeat) returns (stream LeaseAck);
+
+  // P4.5:多模型生命周期(F11)。注册登记 (model_id, revision) 命名空间 + 元数据;
+  //   下线级联删该命名空间 radix 子树 + 位置视图(字节 GC → P4.7)。
+  rpc RegisterModel(RegisterModelRequest) returns (Ack);
+  rpc DeregisterModel(DeregisterModelRequest) returns (Ack);
+
+  // P4.6:按模型软/硬配额 + 借用 + 背压(F11)。配额挂 (model_id, revision) 命名空间。
+  //   触硬配额 → Ack.backpressure 上报;请求级 shedding 仍归 gateway,池内不拒请求。
+  //   写路径:AdmitRegisterBlocks(写前) / RegisterBlocks(写后确认) 均可带 backpressure。
+  rpc SetModelQuota(SetModelQuotaRequest) returns (Ack);
+  rpc GetModelQuota(GetModelQuotaRequest) returns (GetModelQuotaResponse);
+
+  // P4.7:GC + 崩溃 reconcile(F11)。
+  //   - 上报/扫孤儿(对齐 Mooncake put_start_discard_timeout zombie);
+  //   - dead_node_id → 节点级 reconcile(清该节点 ref + 摘 L0;兜底 writeback 泄漏);
+  //   - gc_cold_limit → 冷块摘 L0/L1(留 L2/L3 durable 后盾);
+  //   - 元数据先于字节删:Response 列出待删 id,agent/kv-pool 再删 bytes。
+  rpc ReconcileOrphans(ReconcileOrphansRequest) returns (ReconcileOrphansResponse);
+  // 显式摘块(元数据);返回 Ack 后调用方删字节。
+  rpc DiscardBlocks(DiscardBlocksRequest) returns (Ack);
+  // 降频 checkpoint(P4=内存 mock;真 etcd → P6)。Save 写出快照;Restore 重建权威。
+  rpc SaveCheckpoint(SaveCheckpointRequest) returns (SaveCheckpointResponse);
+  rpc RestoreCheckpoint(RestoreCheckpointRequest) returns (Ack);
+
+  // P4.8:碎片整理(F11)。逻辑共置 + 物理压实计划;执行走 agent TierPipeline + BandwidthPool。
+  //   返回 planned moves;字节搬迁/段压实在存储层,CP 只出计划并在 Moved 后更新 Location。
+  rpc TriggerDefrag(TriggerDefragRequest) returns (TriggerDefragResponse);
+  // 暂停/恢复共享后台带宽池(promote/demote/GC/defrag,<10%)。
+  rpc PauseBackground(PauseBackgroundRequest) returns (Ack);
+
+  // P4.9:一致性哈希分片(F11 扩缩)。单测模拟环/最小迁移/Drain;真跨机字节迁移 → P5。
+  rpc GetShardMap(GetShardMapRequest) returns (GetShardMapResponse);
+  // 加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
+  rpc JoinShardNode(JoinShardNodeRequest) returns (JoinShardNodeResponse);
+  // 缩容:标记 Drain + 迁出计划 + 需先推 L2 的 block 列表(逻辑;字节迁移 P5)。
+  rpc DrainShardNode(DrainShardNodeRequest) returns (DrainShardNodeResponse);
+  // Drain 完成后从环移除(无剩余所有权时)。
+  rpc RemoveShardNode(RemoveShardNodeRequest) returns (Ack);
 }
 
 // =============================================================================
@@ -82,18 +130,29 @@ service AgentService {
 }
 
 // =============================================================================
-// TransferService — 边7/8:RDMA 传输的控制信令(字节走 RDMA 旁路)
+// TransferService — 边7/8:传输控制信令(字节走数据面旁路)
 // =============================================================================
+// P4.4:接线 TcpTransport(单进程本地拷贝 / gRPC TcpDataService 字节搬运)。
+// P5:同 API 换 RdmaTransport(Mooncake FFI),业务零改。
 service TransferService {
-  // 仿 Mooncake:allocateBatchID → submitTransfer(batch,{TransferRequest}) → getTransferStatus。
+  // 仿 Mooncake TransferEngine:
+  //   allocateBatchID → submitTransfer(batch,{TransferRequest}) → getTransferStatus → freeBatchID。
+  // SubmitTransfer = allocate + submit(返回 batch_id);task_id = 批内下标。
+  // 调用方查完 status 后须 FreeBatch(对齐 Mooncake freeBatchID),否则 batches 表泄漏。
   rpc SubmitTransfer(TransferBatchRequest) returns (TransferBatchAck);
   rpc GetTransferStatus(TransferStatusRequest) returns (TransferStatusResponse);
+  rpc FreeBatch(FreeBatchRequest) returns (Ack);
 
   // 引擎契约:pull(block_ids) 返回 handle,publish(逐层增量)上报产出。
   //   跨实例控制信令;worker 本机调 agent 走 FFI(边6)不进 proto。
   //   Pull 异步 + 可中断(仿 SGLang prefetch 三策略 + 预算);Publish layer-wise(仿 SGLang on_publish + page_first_direct)。
   rpc Pull(PullRequest) returns (PullResponse);
+  // 释放 Pull handle + 其目标段(TcpTransport arena);不调用则 handle/段按 Pull 次数泄漏。
+  rpc FreePull(FreePullRequest) returns (Ack);
   rpc Publish(PublishRequest) returns (Ack);
+  // 释放某 request_id 的 PublishStream(seq fence + layer 累计);对齐 FreeBatch 生命周期。
+  //   不调用则按请求数常驻增长(复审 should-fix)。请求结束 / barrier 后应调一次。
+  rpc FreePublish(FreePublishRequest) returns (Ack);
 }
 
 // =============================================================================
@@ -125,7 +184,214 @@ message LookupPrefixRequest {
   string model_id             = 1;
   repeated bytes prefix_hashes = 2;   // 前缀 block hash 链(沿 radix 匹配)
   string requester_node_id    = 3;   // 判定 local_hit 用
+  string revision             = 4;   // P4.5:(model_id, revision) 命名空间;空串=默认
+  // P4.5:查哪个 pool_kind 的 radix。UNSPECIFIED/缺省 → TARGET。
+  //   draft 前缀复用须显式填 DRAFT(与 TARGET 索引域隔离)。
+  lake.PoolKind pool_kind     = 5;
 }
+
+// --- 多模型生命周期(P4.5 / F11) ---
+// BlockSpec 挂 ModelDescriptor,不进 KVBlockID 寻址(#20)。
+message BlockSpec {
+  uint32 block_tokens     = 1;  // 初版默认 128(见 kv-cache-pool.md)
+  uint64 bytes_per_block  = 2;  // 不透明字节块大小提示(池不解释布局)
+}
+enum HashAlgo {
+  HASH_ALGO_UNSPECIFIED = 0;
+  HASH_SHA256_256       = 1;
+  HASH_SHA256_128       = 2;
+  HASH_BLAKE3_128       = 3;
+}
+// P4.6:软/硬配额 + 借用。soft/hard_bytes=0 → 该侧不限(兼容 P4.5 未配配额)。
+//   soft 内自由写;超 soft → 本模型冷块淘汰腾位,并可闲时借用池全局空闲;
+//   触 hard → BackpressureSignal(写入背压上报 gateway)。
+message Quota {
+  int64 soft_bytes     = 1;
+  int64 hard_bytes     = 2;
+  bool  borrow_enabled = 3;
+}
+// 写入背压信号:触硬配额或池容量不足时填入 Ack.backpressure / GetModelQuotaResponse。
+//   lake 只上报;请求级 shedding 归 gateway(见 features/slo.md「过载控制」)。
+message BackpressureSignal {
+  string model_id      = 1;
+  string revision      = 2;
+  int64  used_bytes    = 3;
+  int64  soft_bytes    = 4;
+  int64  hard_bytes    = 5;
+  int64  deficit_bytes = 6;  // HARD_QUOTA: projected-hard;POOL_CAPACITY: 缺口字节
+  string reason        = 7;  // "HARD_QUOTA" | "POOL_CAPACITY"
+}
+message ModelDescriptor {
+  string    model_id   = 1;
+  string    revision   = 2;  // 空串=未版本化默认;新 revision=新命名空间
+  uint32    num_layers = 3;
+  BlockSpec block_spec = 4;
+  HashAlgo  hash_algo  = 5;
+  Quota     quota      = 6;  // P4.6:登记即可执行;亦可事后 SetModelQuota
+}
+message RegisterModelRequest {
+  ModelDescriptor model = 1;
+}
+message DeregisterModelRequest {
+  string model_id = 1;
+  string revision = 2;  // 与 RegisterModel 同键;级联删该命名空间
+}
+message SetModelQuotaRequest {
+  string model_id = 1;
+  string revision = 2;
+  Quota  quota    = 3;
+}
+message GetModelQuotaRequest {
+  string model_id = 1;
+  string revision = 2;
+}
+message GetModelQuotaResponse {
+  Quota              quota          = 1;
+  int64              used_bytes     = 2;
+  int64              borrowed_bytes = 3;  // max(0, used - soft);soft=0 时为 0
+  BackpressureSignal backpressure   = 4;  // 当前 used>hard 时填(罕见;正常触硬已拒写)
+  bool               ok             = 5;
+  string             err            = 6;
+}
+
+// --- P4.7 GC / reconcile / checkpoint ---
+// 孤儿:写入未完成(无 PutEnd/屏障)的残留;对齐 Mooncake zombie。
+message OrphanReport {
+  string node_id              = 1;
+  repeated lake.KVBlockID ids = 2;
+  uint64 marked_at_ms         = 3;  // 0 → CP 用收到时刻戳
+}
+message ReconcileOrphansRequest {
+  repeated OrphanReport reports = 1;  // 合入孤儿表
+  string dead_node_id           = 2;  // 非空 → 节点级 reconcile(清 ref + 摘 L0)
+  uint64 orphan_ttl_ms          = 3;  // 0 → 默认 30000(Mooncake put_start_discard_timeout)
+  // 冷块 GC:按 (model,revision,pool_kind) 从 inactive 摘最多 N 个的 L0/L1(留 L2/L3)。
+  string gc_model_id            = 4;
+  string gc_revision            = 5;
+  lake.PoolKind gc_pool_kind    = 6;  // 缺省 TARGET
+  uint32 gc_cold_limit          = 7;
+}
+message ReconcileOrphansResponse {
+  repeated lake.KVBlockID discarded     = 1;  // 元数据已删;调用方应删 bytes
+  repeated lake.KVBlockID cold_stripped = 2;  // 仅剥 L0/L1;radix+L2/L3 仍在
+  uint32 refs_cleared                   = 3;  // dead_node 清掉的 ref 条数
+  bool ok                               = 4;
+  string err                            = 5;
+}
+message DiscardBlocksRequest {
+  repeated lake.KVBlockID ids = 1;
+  string reason               = 2;
+}
+// Per-block checkpoint row: meta + lineage so restore rebuilds radix, not flat roots.
+message CheckpointBlock {
+  lake.BlockMeta meta = 1;
+  // Ordered flat hashes from root through this block (inclusive).
+  // Same semantics as RegisterBlocks.prefix_hashes[:pos+1].
+  repeated bytes prefix_chain = 2;
+}
+message CheckpointSnapshot {
+  uint64 seq                        = 1;
+  repeated ModelDescriptor models   = 2;
+  repeated CheckpointBlock blocks   = 3;
+}
+message SaveCheckpointRequest {}
+message SaveCheckpointResponse {
+  CheckpointSnapshot snapshot = 1;
+  bool ok                     = 2;
+  string err                  = 3;
+}
+message RestoreCheckpointRequest {
+  // 空 → 从 CheckpointStore.load();非空 → 用请求内快照(单测注入)。
+  CheckpointSnapshot snapshot = 1;
+}
+
+// --- P4.8 碎片整理 ---
+enum DefragMode {
+  DEFRAG_MODE_UNSPECIFIED = 0;
+  COMPACT                 = 1;  // 段内压实(回收空洞)
+  COLOCATE                = 2;  // 同前缀链物理邻近
+  BOTH                    = 3;
+}
+message DefragMove {
+  lake.KVBlockID id   = 1;
+  string node_id      = 2;
+  uint64 from_segment = 3;
+  uint64 from_offset  = 4;
+  uint64 to_segment   = 5;
+  uint64 to_offset    = 6;
+  // true → 整段 CompactSegment(id 可空;只看 segment_id/node_id)
+  bool compact_segment = 7;
+  uint64 segment_id    = 8;
+}
+message TriggerDefragRequest {
+  string model_id         = 1;
+  string revision         = 2;
+  lake.PoolKind pool_kind = 3;  // 缺省 TARGET
+  DefragMode mode         = 4;  // 缺省 BOTH
+  // 段内 slot 字节数(与 SegmentArena 对齐);0 → 默认 4096(P4 mock)
+  uint64 slot_bytes       = 5;
+}
+message TriggerDefragResponse {
+  repeated DefragMove moves = 1;
+  uint32 planned_moves      = 2;
+  bool ok                   = 3;
+  string err                = 4;
+}
+message PauseBackgroundRequest {
+  bool paused = 1;  // true=暂停后台;false=恢复
+}
+
+// --- P4.9 一致性哈希分片 ---
+message ShardEntry {
+  string node_id              = 1;
+  uint32 vnode_count          = 2;
+  bool draining               = 3;
+  repeated uint64 vnode_hashes = 4;  // 调试/单测:环上虚拟节点位置
+}
+message ShardMap {
+  uint64 generation              = 1;
+  uint32 default_vnode_count     = 2;
+  repeated ShardEntry nodes      = 3;
+}
+message ShardMigration {
+  lake.KVBlockID id   = 1;
+  string from_node    = 2;
+  string to_node      = 3;
+  // Drain 路径:迁出前须先推 L2(逻辑标记;真字节 → P5)。
+  bool push_l2_first  = 4;
+}
+message GetShardMapRequest {}
+message GetShardMapResponse {
+  ShardMap map = 1;
+  bool ok      = 2;
+  string err   = 3;
+}
+message JoinShardNodeRequest {
+  string node_id       = 1;
+  uint32 vnode_count   = 2;  // 0 → 默认(Authority 内 default_vnode_count)
+}
+message JoinShardNodeResponse {
+  ShardMap map                      = 1;
+  repeated ShardMigration migrations = 2;  // 所有权迁入新节点的 block
+  uint32 migration_count            = 3;
+  bool ok                           = 4;
+  string err                        = 5;
+}
+message DrainShardNodeRequest {
+  string node_id = 1;
+}
+message DrainShardNodeResponse {
+  ShardMap map                      = 1;
+  repeated ShardMigration migrations = 2;  // 从 Drain 节点迁出
+  repeated lake.KVBlockID push_l2    = 3;  // Drain 推 L2 候选
+  uint32 migration_count            = 4;
+  bool ok                           = 5;
+  string err                        = 6;
+}
+message RemoveShardNodeRequest {
+  string node_id = 1;
+}
+
 message LookupPrefixResponse {
   repeated ReusableBlock blocks = 1;  // 沿前缀匹配的连续 block 列表
   uint32 hit_length              = 2;  // 命中到第几个 block(仿 SGLang host_hit_length)
@@ -209,12 +475,14 @@ message PlaceBlocksRequest {
 }
 
 // --- 传输(边7/8 控制信令) ---
+// 对齐 Mooncake Transport::TransferRequest{source,target_id,target_offset,length}
+// (opcode 默认 WRITE;READ 语义由 Pull 覆盖,不进本消息)。
 message TransferBatchRequest {
   repeated TransferRequest reqs = 1;
 }
 message TransferRequest {
-  lake.Location source            = 1;   // 源位置(L0/L1/L2 段式)
-  uint64 target_segment_id        = 2;   // 目标段
+  lake.Location source            = 1;   // 源位置(**tier∈{L0,L1,L2}**,拒绝 L3)
+  uint64 target_segment_id        = 2;   // 目标段(仿 Mooncake SegmentID)
   uint64 target_offset            = 3;
   uint64 length                   = 4;
 }
@@ -230,6 +498,9 @@ message TransferStatusResponse {
   State state      = 1;
   uint64 bytes_done = 2;
 }
+message FreeBatchRequest {
+  uint64 batch_id = 1;  // 对齐 Mooncake freeBatchID;释放后 GetTransferStatus 返回 NOT_FOUND
+}
 
 // --- Pull / Publish(引擎契约) ---
 message PullRequest {
@@ -244,13 +515,21 @@ enum PullPolicy {
   PULL_TIMEOUT       = 2;  // 超预算即停,返回已传
 }
 message PullResponse {
-  uint64 handle        = 1;   // agent wait ready 用
+  uint64 handle        = 1;   // agent wait ready 用;用毕须 FreePull
   uint32 pulled_length = 2;   // 实际拉到的 block 数
   bool completed       = 3;
+}
+message FreePullRequest {
+  uint64 handle = 1;  // PullResponse.handle;释放会话 + dest segment
 }
 message PublishRequest {
   repeated LayerSlice slices = 1;   // 逐层增量(page_first_direct),非整块
   uint32 seq                  = 2;  // 仿 SGLang on_publish(seq) overlap fence
+  // seq fence 按 request_id 分作用域(并发 publish 互不干扰);空串视为 "_" 默认流。
+  string request_id           = 3;
+}
+message FreePublishRequest {
+  string request_id = 1;  // 与 PublishRequest.request_id 同作用域规则(空→"_")
 }
 message LayerSlice {
   lake.KVBlockID id = 1;
@@ -263,17 +542,19 @@ message LayerSlice {
 message Ack {
   bool ok    = 1;
   string err = 2;
+  // P4.6:触硬配额时附带;其它错误可不填。gateway 据此做请求级 shedding。
+  BackpressureSignal backpressure = 3;
 }
 
 // =============================================================================
-// P3 skeleton-only services(验证三语言联通;生产路径见上方注释)
+// TcpDataService — TCP 退化数据面(P4.4 正名自 P3 SkeletonKvService)
 // =============================================================================
 //
-// SkeletonKvService — mock KV **字节**走 gRPC。
-//   生产:字节走 RDMA 旁路(边7/8),proto 只有控制信令。
-//   P3:无 RDMA/PyO3 时用本 service 把不透明 bytes 写入 Rust 内存池,验证跨语言 KV 流转。
-//   P4 起由 TransferService + 数据面取代,本 service 可删或留 debug。
-service SkeletonKvService {
+// 对齐 Mooncake `MC_FORCE_TCP` / `installTransport("tcp")` fallback:
+//   无 RDMA 时 KV **字节**走 gRPC Put/Get(CPU 拷贝,非零拷贝)。
+//   TransferService 控制信令 + TcpTransport 可经本 service 搬字节;
+//   P5 真 RDMA 旁路后本 service 仍作 TCP 退化路径保留。
+service TcpDataService {
   rpc PutBlocks(PutBlocksRequest) returns (Ack);
   rpc GetBlocks(GetBlocksRequest) returns (GetBlocksResponse);
 }
@@ -295,7 +576,7 @@ message GetBlocksResponse {
 
 // WorkerService — 计算层 Generate。
 //   生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
-//   P3:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + SkeletonKv。
+//   P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
 //       执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;**mode 固定 COLOCATED**。
 service WorkerService {
   rpc Generate(GenerateRequest) returns (GenerateResponse);

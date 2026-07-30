@@ -12,6 +12,7 @@ path = "src/main.rs"
 lake-proto.workspace = true
 lake-tiered-store = { path = "../tiered-store" }
 lake-controlplane = { path = "../controlplane" }
+lake-transfer = { path = "../transfer" }
 tonic.workspace = true
 tokio.workspace = true
 tokio-stream = { workspace = true }
@@ -27,3 +28,4 @@ compute = []
 kvnode  = []
 
 # P3:AgentService.Dispatch 占位。P4.3:PutEndSession + LocalTierEngine + ControlPlanePort。
+# P4.4:TransferService → TcpTransport(+ TcpData 形态字节库)。

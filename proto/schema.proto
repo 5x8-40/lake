@@ -25,15 +25,18 @@ option go_package = "github.com/chengda-wu/lake/go/pb;lakepb";
 //   layer_idx 不进身份,只在 LayerSlice(子块传输切片)里出现。对齐 SGLang radix(每页一 hash 当 L3 key)、
 //   vLLM prefix caching(token-based hash 跨层共享)。
 message KVBlockID {
-  string  model_id    = 1;  // 模型命名空间
+  string  model_id    = 1;  // 模型命名空间(与 revision 组成池内 registry 键)
   bytes   block_hash  = 2;  // 链式哈希 = hash(parent_block_hash || 本块 token_ids);
                             //   序列起点块 parent = ⊥(空)。相同前缀 → 相同链式 hash → 命中同一 KV
                             //   算法可插拔(BLAKE3-128 / SHA-256-128 / SHA-256-256),由模型注册元数据声明,
-                            //   proto 只规定 ≥128-bit + 链式。不同 model_id 可用不同算法。
+                            //   proto 只规定 ≥128-bit + 链式。不同 (model_id, revision) 可用不同算法。
   PoolKind pool_kind  = 3;  // TARGET | DRAFT 命名空间(draft KV 同款 schema,靠字段区分,不物理分池)
   string  scope       = 4;  // 多租户预留,默认 "public",当前不入寻址(F8 远期启用时改寻址语义不改结构)
-  // 寻址/radix key = hash(model_id, block_hash, pool_kind),**忽略 scope**(F8 前)。
+  string  revision    = 5;  // P4.5:模型 revision;与 model_id 组成命名空间。空串=未版本化默认。
+                            //   新 revision = 新命名空间(KV 通常不可跨 revision 复用)。
+  // 寻址/radix key = (model_id, revision, block_hash, pool_kind),**忽略 scope**(F8 前)。
   //   勿 hash(serialize(KVBlockID))——会把默认 scope 编进去,与「不入寻址」矛盾。F8 启用后再纳入 scope。
+  //   BlockSpec(块规格)挂 ModelDescriptor,不进本消息。
 }
 
 // Location — 单层一个物理位置(仅 L0/L1/L2 段式位置;L3 不进此处)
@@ -52,7 +55,7 @@ message BlockMeta {
   KVBlockID            id         = 1;
   BlockKind            block_kind = 2;  // T_TYPE | R_TYPE_STATE | R_TYPE_TRAILING
   repeated Location    locations  = 3;  // L0?/L1?/L2? —— 缓存副本(L0/L1 易失) + L2 durable(F4 恢复点)
-  bool                 l3_present = 4;  // L3(SSOT) 是否有副本;object key = s3://lake/kv/{model_id}/{block_hash} 现场拼,不存储
+  bool                 l3_present = 4;  // L3(SSOT) 是否有副本;object key = s3://lake/kv/{model_id}/{revision}/{block_hash} 现场拼,不存储
   uint32               ref_count  = 5;  // 全局引用汇总
   // 存在性:l3_present=false 且 locations 全空 → block 不存在;
   //        l3_present=true → 即使 locations 全空仍存在(缓存未命中,从 L3 回填)

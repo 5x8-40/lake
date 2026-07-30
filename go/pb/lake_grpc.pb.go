@@ -19,13 +19,28 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	ControlPlaneService_SubscribeView_FullMethodName  = "/lake.ControlPlaneService/SubscribeView"
-	ControlPlaneService_LookupPrefix_FullMethodName   = "/lake.ControlPlaneService/LookupPrefix"
-	ControlPlaneService_Locate_FullMethodName         = "/lake.ControlPlaneService/Locate"
-	ControlPlaneService_RegisterBlocks_FullMethodName = "/lake.ControlPlaneService/RegisterBlocks"
-	ControlPlaneService_ReportRef_FullMethodName      = "/lake.ControlPlaneService/ReportRef"
-	ControlPlaneService_RequestBarrier_FullMethodName = "/lake.ControlPlaneService/RequestBarrier"
-	ControlPlaneService_Lease_FullMethodName          = "/lake.ControlPlaneService/Lease"
+	ControlPlaneService_SubscribeView_FullMethodName       = "/lake.ControlPlaneService/SubscribeView"
+	ControlPlaneService_LookupPrefix_FullMethodName        = "/lake.ControlPlaneService/LookupPrefix"
+	ControlPlaneService_Locate_FullMethodName              = "/lake.ControlPlaneService/Locate"
+	ControlPlaneService_AdmitRegisterBlocks_FullMethodName = "/lake.ControlPlaneService/AdmitRegisterBlocks"
+	ControlPlaneService_RegisterBlocks_FullMethodName      = "/lake.ControlPlaneService/RegisterBlocks"
+	ControlPlaneService_ReportRef_FullMethodName           = "/lake.ControlPlaneService/ReportRef"
+	ControlPlaneService_RequestBarrier_FullMethodName      = "/lake.ControlPlaneService/RequestBarrier"
+	ControlPlaneService_Lease_FullMethodName               = "/lake.ControlPlaneService/Lease"
+	ControlPlaneService_RegisterModel_FullMethodName       = "/lake.ControlPlaneService/RegisterModel"
+	ControlPlaneService_DeregisterModel_FullMethodName     = "/lake.ControlPlaneService/DeregisterModel"
+	ControlPlaneService_SetModelQuota_FullMethodName       = "/lake.ControlPlaneService/SetModelQuota"
+	ControlPlaneService_GetModelQuota_FullMethodName       = "/lake.ControlPlaneService/GetModelQuota"
+	ControlPlaneService_ReconcileOrphans_FullMethodName    = "/lake.ControlPlaneService/ReconcileOrphans"
+	ControlPlaneService_DiscardBlocks_FullMethodName       = "/lake.ControlPlaneService/DiscardBlocks"
+	ControlPlaneService_SaveCheckpoint_FullMethodName      = "/lake.ControlPlaneService/SaveCheckpoint"
+	ControlPlaneService_RestoreCheckpoint_FullMethodName   = "/lake.ControlPlaneService/RestoreCheckpoint"
+	ControlPlaneService_TriggerDefrag_FullMethodName       = "/lake.ControlPlaneService/TriggerDefrag"
+	ControlPlaneService_PauseBackground_FullMethodName     = "/lake.ControlPlaneService/PauseBackground"
+	ControlPlaneService_GetShardMap_FullMethodName         = "/lake.ControlPlaneService/GetShardMap"
+	ControlPlaneService_JoinShardNode_FullMethodName       = "/lake.ControlPlaneService/JoinShardNode"
+	ControlPlaneService_DrainShardNode_FullMethodName      = "/lake.ControlPlaneService/DrainShardNode"
+	ControlPlaneService_RemoveShardNode_FullMethodName     = "/lake.ControlPlaneService/RemoveShardNode"
 )
 
 // ControlPlaneServiceClient is the client API for ControlPlaneService service.
@@ -51,12 +66,20 @@ type ControlPlaneServiceClient interface {
 	//
 	//	(见 kv-cache-pool.md「搬 KV 查权威分层」)。
 	Locate(ctx context.Context, in *LocateRequest, opts ...grpc.CallOption) (*LocateResponse, error)
+	// P4.6:配额写前准入(方案 A)。纯检查、不 reserve、不改位置视图。
+	//
+	//	对齐 Mooncake PutStart 的「写前问 Master」公开边界;无 reserved 占座(Reserve* → 多进程/P4.7)。
+	//	agent 须在 flush durable **之前**调用;触硬 → Ack.ok=false + backpressure。
+	//	请求体复用 RegisterBlocksRequest(只读 model/revision/pool_kind/block hashes 计费;
+	//	locations/l3_present 可空)。与进程内 ControlPlanePort::admit_register_blocks 同语义。
+	AdmitRegisterBlocks(ctx context.Context, in *RegisterBlocksRequest, opts ...grpc.CallOption) (*Ack, error)
 	// 满块注册:**耐久性由 agent 本地完成**(写 L2 durable)后,只调一次本 RPC = PutEnd。
 	//
-	//	PutStart 不进控制面(agent 本地记账即可),防半块被读。仿 Mooncake PutEnd 的控制面侧。
-	//	release 一致,写控制面内存,不进 etcd。
+	//	**可见性** PutStart(半块本地记账、防脏读)仍不进控制面; **配额** 写前走 AdmitRegisterBlocks。
+	//	仿 Mooncake PutEnd 的控制面侧。release 一致,写控制面内存,不进 etcd。
 	//	与 Publish 的区别:Publish(可多次、逐层 slice)只更新位置视图;RegisterBlocks(满块 + L2 durable)才进 radix + 置 l3_present/L2。
 	//	P4.2:须带 prefix_hashes 全链以便控制面建 PositionalLineageHash;`blocks` 可为 miss 后缀。
+	//	P4.6:触硬 → ok=false + backpressure;建议先 AdmitRegisterBlocks 再 flush。
 	RegisterBlocks(ctx context.Context, in *RegisterBlocksRequest, opts ...grpc.CallOption) (*Ack, error)
 	// P4.2–P4.3:**控制面合账骨架**（非完整两级 ref）。
 	//
@@ -72,6 +95,42 @@ type ControlPlaneServiceClient interface {
 	RequestBarrier(ctx context.Context, in *RequestBarrierRequest, opts ...grpc.CallOption) (*Ack, error)
 	// lease:节点 mount/unmount segment + 续命(仿 Mooncake MountSegment/UnmountSegment + client_live_ttl_sec)。
 	Lease(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LeaseHeartbeat, LeaseAck], error)
+	// P4.5:多模型生命周期(F11)。注册登记 (model_id, revision) 命名空间 + 元数据;
+	//
+	//	下线级联删该命名空间 radix 子树 + 位置视图(字节 GC → P4.7)。
+	RegisterModel(ctx context.Context, in *RegisterModelRequest, opts ...grpc.CallOption) (*Ack, error)
+	DeregisterModel(ctx context.Context, in *DeregisterModelRequest, opts ...grpc.CallOption) (*Ack, error)
+	// P4.6:按模型软/硬配额 + 借用 + 背压(F11)。配额挂 (model_id, revision) 命名空间。
+	//
+	//	触硬配额 → Ack.backpressure 上报;请求级 shedding 仍归 gateway,池内不拒请求。
+	//	写路径:AdmitRegisterBlocks(写前) / RegisterBlocks(写后确认) 均可带 backpressure。
+	SetModelQuota(ctx context.Context, in *SetModelQuotaRequest, opts ...grpc.CallOption) (*Ack, error)
+	GetModelQuota(ctx context.Context, in *GetModelQuotaRequest, opts ...grpc.CallOption) (*GetModelQuotaResponse, error)
+	// P4.7:GC + 崩溃 reconcile(F11)。
+	//   - 上报/扫孤儿(对齐 Mooncake put_start_discard_timeout zombie);
+	//   - dead_node_id → 节点级 reconcile(清该节点 ref + 摘 L0;兜底 writeback 泄漏);
+	//   - gc_cold_limit → 冷块摘 L0/L1(留 L2/L3 durable 后盾);
+	//   - 元数据先于字节删:Response 列出待删 id,agent/kv-pool 再删 bytes。
+	ReconcileOrphans(ctx context.Context, in *ReconcileOrphansRequest, opts ...grpc.CallOption) (*ReconcileOrphansResponse, error)
+	// 显式摘块(元数据);返回 Ack 后调用方删字节。
+	DiscardBlocks(ctx context.Context, in *DiscardBlocksRequest, opts ...grpc.CallOption) (*Ack, error)
+	// 降频 checkpoint(P4=内存 mock;真 etcd → P6)。Save 写出快照;Restore 重建权威。
+	SaveCheckpoint(ctx context.Context, in *SaveCheckpointRequest, opts ...grpc.CallOption) (*SaveCheckpointResponse, error)
+	RestoreCheckpoint(ctx context.Context, in *RestoreCheckpointRequest, opts ...grpc.CallOption) (*Ack, error)
+	// P4.8:碎片整理(F11)。逻辑共置 + 物理压实计划;执行走 agent TierPipeline + BandwidthPool。
+	//
+	//	返回 planned moves;字节搬迁/段压实在存储层,CP 只出计划并在 Moved 后更新 Location。
+	TriggerDefrag(ctx context.Context, in *TriggerDefragRequest, opts ...grpc.CallOption) (*TriggerDefragResponse, error)
+	// 暂停/恢复共享后台带宽池(promote/demote/GC/defrag,<10%)。
+	PauseBackground(ctx context.Context, in *PauseBackgroundRequest, opts ...grpc.CallOption) (*Ack, error)
+	// P4.9:一致性哈希分片(F11 扩缩)。单测模拟环/最小迁移/Drain;真跨机字节迁移 → P5。
+	GetShardMap(ctx context.Context, in *GetShardMapRequest, opts ...grpc.CallOption) (*GetShardMapResponse, error)
+	// 加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
+	JoinShardNode(ctx context.Context, in *JoinShardNodeRequest, opts ...grpc.CallOption) (*JoinShardNodeResponse, error)
+	// 缩容:标记 Drain + 迁出计划 + 需先推 L2 的 block 列表(逻辑;字节迁移 P5)。
+	DrainShardNode(ctx context.Context, in *DrainShardNodeRequest, opts ...grpc.CallOption) (*DrainShardNodeResponse, error)
+	// Drain 完成后从环移除(无剩余所有权时)。
+	RemoveShardNode(ctx context.Context, in *RemoveShardNodeRequest, opts ...grpc.CallOption) (*Ack, error)
 }
 
 type controlPlaneServiceClient struct {
@@ -115,6 +174,16 @@ func (c *controlPlaneServiceClient) Locate(ctx context.Context, in *LocateReques
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(LocateResponse)
 	err := c.cc.Invoke(ctx, ControlPlaneService_Locate_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) AdmitRegisterBlocks(ctx context.Context, in *RegisterBlocksRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, ControlPlaneService_AdmitRegisterBlocks_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -167,6 +236,146 @@ func (c *controlPlaneServiceClient) Lease(ctx context.Context, opts ...grpc.Call
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ControlPlaneService_LeaseClient = grpc.BidiStreamingClient[LeaseHeartbeat, LeaseAck]
 
+func (c *controlPlaneServiceClient) RegisterModel(ctx context.Context, in *RegisterModelRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, ControlPlaneService_RegisterModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) DeregisterModel(ctx context.Context, in *DeregisterModelRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, ControlPlaneService_DeregisterModel_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) SetModelQuota(ctx context.Context, in *SetModelQuotaRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, ControlPlaneService_SetModelQuota_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) GetModelQuota(ctx context.Context, in *GetModelQuotaRequest, opts ...grpc.CallOption) (*GetModelQuotaResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetModelQuotaResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_GetModelQuota_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) ReconcileOrphans(ctx context.Context, in *ReconcileOrphansRequest, opts ...grpc.CallOption) (*ReconcileOrphansResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReconcileOrphansResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_ReconcileOrphans_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) DiscardBlocks(ctx context.Context, in *DiscardBlocksRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, ControlPlaneService_DiscardBlocks_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) SaveCheckpoint(ctx context.Context, in *SaveCheckpointRequest, opts ...grpc.CallOption) (*SaveCheckpointResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SaveCheckpointResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_SaveCheckpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) RestoreCheckpoint(ctx context.Context, in *RestoreCheckpointRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, ControlPlaneService_RestoreCheckpoint_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) TriggerDefrag(ctx context.Context, in *TriggerDefragRequest, opts ...grpc.CallOption) (*TriggerDefragResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(TriggerDefragResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_TriggerDefrag_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) PauseBackground(ctx context.Context, in *PauseBackgroundRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, ControlPlaneService_PauseBackground_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) GetShardMap(ctx context.Context, in *GetShardMapRequest, opts ...grpc.CallOption) (*GetShardMapResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetShardMapResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_GetShardMap_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) JoinShardNode(ctx context.Context, in *JoinShardNodeRequest, opts ...grpc.CallOption) (*JoinShardNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(JoinShardNodeResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_JoinShardNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) DrainShardNode(ctx context.Context, in *DrainShardNodeRequest, opts ...grpc.CallOption) (*DrainShardNodeResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(DrainShardNodeResponse)
+	err := c.cc.Invoke(ctx, ControlPlaneService_DrainShardNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *controlPlaneServiceClient) RemoveShardNode(ctx context.Context, in *RemoveShardNodeRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, ControlPlaneService_RemoveShardNode_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlPlaneServiceServer is the server API for ControlPlaneService service.
 // All implementations must embed UnimplementedControlPlaneServiceServer
 // for forward compatibility.
@@ -190,12 +399,20 @@ type ControlPlaneServiceServer interface {
 	//
 	//	(见 kv-cache-pool.md「搬 KV 查权威分层」)。
 	Locate(context.Context, *LocateRequest) (*LocateResponse, error)
+	// P4.6:配额写前准入(方案 A)。纯检查、不 reserve、不改位置视图。
+	//
+	//	对齐 Mooncake PutStart 的「写前问 Master」公开边界;无 reserved 占座(Reserve* → 多进程/P4.7)。
+	//	agent 须在 flush durable **之前**调用;触硬 → Ack.ok=false + backpressure。
+	//	请求体复用 RegisterBlocksRequest(只读 model/revision/pool_kind/block hashes 计费;
+	//	locations/l3_present 可空)。与进程内 ControlPlanePort::admit_register_blocks 同语义。
+	AdmitRegisterBlocks(context.Context, *RegisterBlocksRequest) (*Ack, error)
 	// 满块注册:**耐久性由 agent 本地完成**(写 L2 durable)后,只调一次本 RPC = PutEnd。
 	//
-	//	PutStart 不进控制面(agent 本地记账即可),防半块被读。仿 Mooncake PutEnd 的控制面侧。
-	//	release 一致,写控制面内存,不进 etcd。
+	//	**可见性** PutStart(半块本地记账、防脏读)仍不进控制面; **配额** 写前走 AdmitRegisterBlocks。
+	//	仿 Mooncake PutEnd 的控制面侧。release 一致,写控制面内存,不进 etcd。
 	//	与 Publish 的区别:Publish(可多次、逐层 slice)只更新位置视图;RegisterBlocks(满块 + L2 durable)才进 radix + 置 l3_present/L2。
 	//	P4.2:须带 prefix_hashes 全链以便控制面建 PositionalLineageHash;`blocks` 可为 miss 后缀。
+	//	P4.6:触硬 → ok=false + backpressure;建议先 AdmitRegisterBlocks 再 flush。
 	RegisterBlocks(context.Context, *RegisterBlocksRequest) (*Ack, error)
 	// P4.2–P4.3:**控制面合账骨架**（非完整两级 ref）。
 	//
@@ -211,6 +428,42 @@ type ControlPlaneServiceServer interface {
 	RequestBarrier(context.Context, *RequestBarrierRequest) (*Ack, error)
 	// lease:节点 mount/unmount segment + 续命(仿 Mooncake MountSegment/UnmountSegment + client_live_ttl_sec)。
 	Lease(grpc.BidiStreamingServer[LeaseHeartbeat, LeaseAck]) error
+	// P4.5:多模型生命周期(F11)。注册登记 (model_id, revision) 命名空间 + 元数据;
+	//
+	//	下线级联删该命名空间 radix 子树 + 位置视图(字节 GC → P4.7)。
+	RegisterModel(context.Context, *RegisterModelRequest) (*Ack, error)
+	DeregisterModel(context.Context, *DeregisterModelRequest) (*Ack, error)
+	// P4.6:按模型软/硬配额 + 借用 + 背压(F11)。配额挂 (model_id, revision) 命名空间。
+	//
+	//	触硬配额 → Ack.backpressure 上报;请求级 shedding 仍归 gateway,池内不拒请求。
+	//	写路径:AdmitRegisterBlocks(写前) / RegisterBlocks(写后确认) 均可带 backpressure。
+	SetModelQuota(context.Context, *SetModelQuotaRequest) (*Ack, error)
+	GetModelQuota(context.Context, *GetModelQuotaRequest) (*GetModelQuotaResponse, error)
+	// P4.7:GC + 崩溃 reconcile(F11)。
+	//   - 上报/扫孤儿(对齐 Mooncake put_start_discard_timeout zombie);
+	//   - dead_node_id → 节点级 reconcile(清该节点 ref + 摘 L0;兜底 writeback 泄漏);
+	//   - gc_cold_limit → 冷块摘 L0/L1(留 L2/L3 durable 后盾);
+	//   - 元数据先于字节删:Response 列出待删 id,agent/kv-pool 再删 bytes。
+	ReconcileOrphans(context.Context, *ReconcileOrphansRequest) (*ReconcileOrphansResponse, error)
+	// 显式摘块(元数据);返回 Ack 后调用方删字节。
+	DiscardBlocks(context.Context, *DiscardBlocksRequest) (*Ack, error)
+	// 降频 checkpoint(P4=内存 mock;真 etcd → P6)。Save 写出快照;Restore 重建权威。
+	SaveCheckpoint(context.Context, *SaveCheckpointRequest) (*SaveCheckpointResponse, error)
+	RestoreCheckpoint(context.Context, *RestoreCheckpointRequest) (*Ack, error)
+	// P4.8:碎片整理(F11)。逻辑共置 + 物理压实计划;执行走 agent TierPipeline + BandwidthPool。
+	//
+	//	返回 planned moves;字节搬迁/段压实在存储层,CP 只出计划并在 Moved 后更新 Location。
+	TriggerDefrag(context.Context, *TriggerDefragRequest) (*TriggerDefragResponse, error)
+	// 暂停/恢复共享后台带宽池(promote/demote/GC/defrag,<10%)。
+	PauseBackground(context.Context, *PauseBackgroundRequest) (*Ack, error)
+	// P4.9:一致性哈希分片(F11 扩缩)。单测模拟环/最小迁移/Drain;真跨机字节迁移 → P5。
+	GetShardMap(context.Context, *GetShardMapRequest) (*GetShardMapResponse, error)
+	// 加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
+	JoinShardNode(context.Context, *JoinShardNodeRequest) (*JoinShardNodeResponse, error)
+	// 缩容:标记 Drain + 迁出计划 + 需先推 L2 的 block 列表(逻辑;字节迁移 P5)。
+	DrainShardNode(context.Context, *DrainShardNodeRequest) (*DrainShardNodeResponse, error)
+	// Drain 完成后从环移除(无剩余所有权时)。
+	RemoveShardNode(context.Context, *RemoveShardNodeRequest) (*Ack, error)
 	mustEmbedUnimplementedControlPlaneServiceServer()
 }
 
@@ -230,6 +483,9 @@ func (UnimplementedControlPlaneServiceServer) LookupPrefix(context.Context, *Loo
 func (UnimplementedControlPlaneServiceServer) Locate(context.Context, *LocateRequest) (*LocateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Locate not implemented")
 }
+func (UnimplementedControlPlaneServiceServer) AdmitRegisterBlocks(context.Context, *RegisterBlocksRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method AdmitRegisterBlocks not implemented")
+}
 func (UnimplementedControlPlaneServiceServer) RegisterBlocks(context.Context, *RegisterBlocksRequest) (*Ack, error) {
 	return nil, status.Error(codes.Unimplemented, "method RegisterBlocks not implemented")
 }
@@ -241,6 +497,48 @@ func (UnimplementedControlPlaneServiceServer) RequestBarrier(context.Context, *R
 }
 func (UnimplementedControlPlaneServiceServer) Lease(grpc.BidiStreamingServer[LeaseHeartbeat, LeaseAck]) error {
 	return status.Error(codes.Unimplemented, "method Lease not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) RegisterModel(context.Context, *RegisterModelRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method RegisterModel not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) DeregisterModel(context.Context, *DeregisterModelRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method DeregisterModel not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) SetModelQuota(context.Context, *SetModelQuotaRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetModelQuota not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) GetModelQuota(context.Context, *GetModelQuotaRequest) (*GetModelQuotaResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetModelQuota not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) ReconcileOrphans(context.Context, *ReconcileOrphansRequest) (*ReconcileOrphansResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReconcileOrphans not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) DiscardBlocks(context.Context, *DiscardBlocksRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method DiscardBlocks not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) SaveCheckpoint(context.Context, *SaveCheckpointRequest) (*SaveCheckpointResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SaveCheckpoint not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) RestoreCheckpoint(context.Context, *RestoreCheckpointRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method RestoreCheckpoint not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) TriggerDefrag(context.Context, *TriggerDefragRequest) (*TriggerDefragResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method TriggerDefrag not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) PauseBackground(context.Context, *PauseBackgroundRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method PauseBackground not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) GetShardMap(context.Context, *GetShardMapRequest) (*GetShardMapResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetShardMap not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) JoinShardNode(context.Context, *JoinShardNodeRequest) (*JoinShardNodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method JoinShardNode not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) DrainShardNode(context.Context, *DrainShardNodeRequest) (*DrainShardNodeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method DrainShardNode not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) RemoveShardNode(context.Context, *RemoveShardNodeRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method RemoveShardNode not implemented")
 }
 func (UnimplementedControlPlaneServiceServer) mustEmbedUnimplementedControlPlaneServiceServer() {}
 func (UnimplementedControlPlaneServiceServer) testEmbeddedByValue()                             {}
@@ -310,6 +608,24 @@ func _ControlPlaneService_Locate_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlaneService_AdmitRegisterBlocks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterBlocksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).AdmitRegisterBlocks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_AdmitRegisterBlocks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).AdmitRegisterBlocks(ctx, req.(*RegisterBlocksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _ControlPlaneService_RegisterBlocks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RegisterBlocksRequest)
 	if err := dec(in); err != nil {
@@ -360,6 +676,258 @@ func _ControlPlaneService_Lease_Handler(srv interface{}, stream grpc.ServerStrea
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ControlPlaneService_LeaseServer = grpc.BidiStreamingServer[LeaseHeartbeat, LeaseAck]
 
+func _ControlPlaneService_RegisterModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RegisterModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).RegisterModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_RegisterModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).RegisterModel(ctx, req.(*RegisterModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_DeregisterModel_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DeregisterModelRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).DeregisterModel(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_DeregisterModel_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).DeregisterModel(ctx, req.(*DeregisterModelRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_SetModelQuota_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetModelQuotaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).SetModelQuota(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_SetModelQuota_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).SetModelQuota(ctx, req.(*SetModelQuotaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_GetModelQuota_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetModelQuotaRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).GetModelQuota(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_GetModelQuota_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).GetModelQuota(ctx, req.(*GetModelQuotaRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_ReconcileOrphans_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReconcileOrphansRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).ReconcileOrphans(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_ReconcileOrphans_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).ReconcileOrphans(ctx, req.(*ReconcileOrphansRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_DiscardBlocks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DiscardBlocksRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).DiscardBlocks(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_DiscardBlocks_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).DiscardBlocks(ctx, req.(*DiscardBlocksRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_SaveCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SaveCheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).SaveCheckpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_SaveCheckpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).SaveCheckpoint(ctx, req.(*SaveCheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_RestoreCheckpoint_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RestoreCheckpointRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).RestoreCheckpoint(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_RestoreCheckpoint_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).RestoreCheckpoint(ctx, req.(*RestoreCheckpointRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_TriggerDefrag_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(TriggerDefragRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).TriggerDefrag(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_TriggerDefrag_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).TriggerDefrag(ctx, req.(*TriggerDefragRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_PauseBackground_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PauseBackgroundRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).PauseBackground(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_PauseBackground_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).PauseBackground(ctx, req.(*PauseBackgroundRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_GetShardMap_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetShardMapRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).GetShardMap(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_GetShardMap_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).GetShardMap(ctx, req.(*GetShardMapRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_JoinShardNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(JoinShardNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).JoinShardNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_JoinShardNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).JoinShardNode(ctx, req.(*JoinShardNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_DrainShardNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(DrainShardNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).DrainShardNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_DrainShardNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).DrainShardNode(ctx, req.(*DrainShardNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _ControlPlaneService_RemoveShardNode_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RemoveShardNodeRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).RemoveShardNode(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_RemoveShardNode_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).RemoveShardNode(ctx, req.(*RemoveShardNodeRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ControlPlaneService_ServiceDesc is the grpc.ServiceDesc for ControlPlaneService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -376,12 +944,72 @@ var ControlPlaneService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _ControlPlaneService_Locate_Handler,
 		},
 		{
+			MethodName: "AdmitRegisterBlocks",
+			Handler:    _ControlPlaneService_AdmitRegisterBlocks_Handler,
+		},
+		{
 			MethodName: "RegisterBlocks",
 			Handler:    _ControlPlaneService_RegisterBlocks_Handler,
 		},
 		{
 			MethodName: "RequestBarrier",
 			Handler:    _ControlPlaneService_RequestBarrier_Handler,
+		},
+		{
+			MethodName: "RegisterModel",
+			Handler:    _ControlPlaneService_RegisterModel_Handler,
+		},
+		{
+			MethodName: "DeregisterModel",
+			Handler:    _ControlPlaneService_DeregisterModel_Handler,
+		},
+		{
+			MethodName: "SetModelQuota",
+			Handler:    _ControlPlaneService_SetModelQuota_Handler,
+		},
+		{
+			MethodName: "GetModelQuota",
+			Handler:    _ControlPlaneService_GetModelQuota_Handler,
+		},
+		{
+			MethodName: "ReconcileOrphans",
+			Handler:    _ControlPlaneService_ReconcileOrphans_Handler,
+		},
+		{
+			MethodName: "DiscardBlocks",
+			Handler:    _ControlPlaneService_DiscardBlocks_Handler,
+		},
+		{
+			MethodName: "SaveCheckpoint",
+			Handler:    _ControlPlaneService_SaveCheckpoint_Handler,
+		},
+		{
+			MethodName: "RestoreCheckpoint",
+			Handler:    _ControlPlaneService_RestoreCheckpoint_Handler,
+		},
+		{
+			MethodName: "TriggerDefrag",
+			Handler:    _ControlPlaneService_TriggerDefrag_Handler,
+		},
+		{
+			MethodName: "PauseBackground",
+			Handler:    _ControlPlaneService_PauseBackground_Handler,
+		},
+		{
+			MethodName: "GetShardMap",
+			Handler:    _ControlPlaneService_GetShardMap_Handler,
+		},
+		{
+			MethodName: "JoinShardNode",
+			Handler:    _ControlPlaneService_JoinShardNode_Handler,
+		},
+		{
+			MethodName: "DrainShardNode",
+			Handler:    _ControlPlaneService_DrainShardNode_Handler,
+		},
+		{
+			MethodName: "RemoveShardNode",
+			Handler:    _ControlPlaneService_RemoveShardNode_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{
@@ -605,8 +1233,11 @@ var AgentService_ServiceDesc = grpc.ServiceDesc{
 const (
 	TransferService_SubmitTransfer_FullMethodName    = "/lake.TransferService/SubmitTransfer"
 	TransferService_GetTransferStatus_FullMethodName = "/lake.TransferService/GetTransferStatus"
+	TransferService_FreeBatch_FullMethodName         = "/lake.TransferService/FreeBatch"
 	TransferService_Pull_FullMethodName              = "/lake.TransferService/Pull"
+	TransferService_FreePull_FullMethodName          = "/lake.TransferService/FreePull"
 	TransferService_Publish_FullMethodName           = "/lake.TransferService/Publish"
+	TransferService_FreePublish_FullMethodName       = "/lake.TransferService/FreePublish"
 )
 
 // TransferServiceClient is the client API for TransferService service.
@@ -614,18 +1245,32 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // =============================================================================
-// TransferService — 边7/8:RDMA 传输的控制信令(字节走 RDMA 旁路)
+// TransferService — 边7/8:传输控制信令(字节走数据面旁路)
 // =============================================================================
+// P4.4:接线 TcpTransport(单进程本地拷贝 / gRPC TcpDataService 字节搬运)。
+// P5:同 API 换 RdmaTransport(Mooncake FFI),业务零改。
 type TransferServiceClient interface {
-	// 仿 Mooncake:allocateBatchID → submitTransfer(batch,{TransferRequest}) → getTransferStatus。
+	// 仿 Mooncake TransferEngine:
+	//
+	//	allocateBatchID → submitTransfer(batch,{TransferRequest}) → getTransferStatus → freeBatchID。
+	//
+	// SubmitTransfer = allocate + submit(返回 batch_id);task_id = 批内下标。
+	// 调用方查完 status 后须 FreeBatch(对齐 Mooncake freeBatchID),否则 batches 表泄漏。
 	SubmitTransfer(ctx context.Context, in *TransferBatchRequest, opts ...grpc.CallOption) (*TransferBatchAck, error)
 	GetTransferStatus(ctx context.Context, in *TransferStatusRequest, opts ...grpc.CallOption) (*TransferStatusResponse, error)
+	FreeBatch(ctx context.Context, in *FreeBatchRequest, opts ...grpc.CallOption) (*Ack, error)
 	// 引擎契约:pull(block_ids) 返回 handle,publish(逐层增量)上报产出。
 	//
 	//	跨实例控制信令;worker 本机调 agent 走 FFI(边6)不进 proto。
 	//	Pull 异步 + 可中断(仿 SGLang prefetch 三策略 + 预算);Publish layer-wise(仿 SGLang on_publish + page_first_direct)。
 	Pull(ctx context.Context, in *PullRequest, opts ...grpc.CallOption) (*PullResponse, error)
+	// 释放 Pull handle + 其目标段(TcpTransport arena);不调用则 handle/段按 Pull 次数泄漏。
+	FreePull(ctx context.Context, in *FreePullRequest, opts ...grpc.CallOption) (*Ack, error)
 	Publish(ctx context.Context, in *PublishRequest, opts ...grpc.CallOption) (*Ack, error)
+	// 释放某 request_id 的 PublishStream(seq fence + layer 累计);对齐 FreeBatch 生命周期。
+	//
+	//	不调用则按请求数常驻增长(复审 should-fix)。请求结束 / barrier 后应调一次。
+	FreePublish(ctx context.Context, in *FreePublishRequest, opts ...grpc.CallOption) (*Ack, error)
 }
 
 type transferServiceClient struct {
@@ -656,10 +1301,30 @@ func (c *transferServiceClient) GetTransferStatus(ctx context.Context, in *Trans
 	return out, nil
 }
 
+func (c *transferServiceClient) FreeBatch(ctx context.Context, in *FreeBatchRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, TransferService_FreeBatch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *transferServiceClient) Pull(ctx context.Context, in *PullRequest, opts ...grpc.CallOption) (*PullResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(PullResponse)
 	err := c.cc.Invoke(ctx, TransferService_Pull_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *transferServiceClient) FreePull(ctx context.Context, in *FreePullRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, TransferService_FreePull_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -676,23 +1341,47 @@ func (c *transferServiceClient) Publish(ctx context.Context, in *PublishRequest,
 	return out, nil
 }
 
+func (c *transferServiceClient) FreePublish(ctx context.Context, in *FreePublishRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, TransferService_FreePublish_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // TransferServiceServer is the server API for TransferService service.
 // All implementations must embed UnimplementedTransferServiceServer
 // for forward compatibility.
 //
 // =============================================================================
-// TransferService — 边7/8:RDMA 传输的控制信令(字节走 RDMA 旁路)
+// TransferService — 边7/8:传输控制信令(字节走数据面旁路)
 // =============================================================================
+// P4.4:接线 TcpTransport(单进程本地拷贝 / gRPC TcpDataService 字节搬运)。
+// P5:同 API 换 RdmaTransport(Mooncake FFI),业务零改。
 type TransferServiceServer interface {
-	// 仿 Mooncake:allocateBatchID → submitTransfer(batch,{TransferRequest}) → getTransferStatus。
+	// 仿 Mooncake TransferEngine:
+	//
+	//	allocateBatchID → submitTransfer(batch,{TransferRequest}) → getTransferStatus → freeBatchID。
+	//
+	// SubmitTransfer = allocate + submit(返回 batch_id);task_id = 批内下标。
+	// 调用方查完 status 后须 FreeBatch(对齐 Mooncake freeBatchID),否则 batches 表泄漏。
 	SubmitTransfer(context.Context, *TransferBatchRequest) (*TransferBatchAck, error)
 	GetTransferStatus(context.Context, *TransferStatusRequest) (*TransferStatusResponse, error)
+	FreeBatch(context.Context, *FreeBatchRequest) (*Ack, error)
 	// 引擎契约:pull(block_ids) 返回 handle,publish(逐层增量)上报产出。
 	//
 	//	跨实例控制信令;worker 本机调 agent 走 FFI(边6)不进 proto。
 	//	Pull 异步 + 可中断(仿 SGLang prefetch 三策略 + 预算);Publish layer-wise(仿 SGLang on_publish + page_first_direct)。
 	Pull(context.Context, *PullRequest) (*PullResponse, error)
+	// 释放 Pull handle + 其目标段(TcpTransport arena);不调用则 handle/段按 Pull 次数泄漏。
+	FreePull(context.Context, *FreePullRequest) (*Ack, error)
 	Publish(context.Context, *PublishRequest) (*Ack, error)
+	// 释放某 request_id 的 PublishStream(seq fence + layer 累计);对齐 FreeBatch 生命周期。
+	//
+	//	不调用则按请求数常驻增长(复审 should-fix)。请求结束 / barrier 后应调一次。
+	FreePublish(context.Context, *FreePublishRequest) (*Ack, error)
 	mustEmbedUnimplementedTransferServiceServer()
 }
 
@@ -709,11 +1398,20 @@ func (UnimplementedTransferServiceServer) SubmitTransfer(context.Context, *Trans
 func (UnimplementedTransferServiceServer) GetTransferStatus(context.Context, *TransferStatusRequest) (*TransferStatusResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTransferStatus not implemented")
 }
+func (UnimplementedTransferServiceServer) FreeBatch(context.Context, *FreeBatchRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method FreeBatch not implemented")
+}
 func (UnimplementedTransferServiceServer) Pull(context.Context, *PullRequest) (*PullResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Pull not implemented")
 }
+func (UnimplementedTransferServiceServer) FreePull(context.Context, *FreePullRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method FreePull not implemented")
+}
 func (UnimplementedTransferServiceServer) Publish(context.Context, *PublishRequest) (*Ack, error) {
 	return nil, status.Error(codes.Unimplemented, "method Publish not implemented")
+}
+func (UnimplementedTransferServiceServer) FreePublish(context.Context, *FreePublishRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method FreePublish not implemented")
 }
 func (UnimplementedTransferServiceServer) mustEmbedUnimplementedTransferServiceServer() {}
 func (UnimplementedTransferServiceServer) testEmbeddedByValue()                         {}
@@ -772,6 +1470,24 @@ func _TransferService_GetTransferStatus_Handler(srv interface{}, ctx context.Con
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TransferService_FreeBatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FreeBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TransferServiceServer).FreeBatch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TransferService_FreeBatch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TransferServiceServer).FreeBatch(ctx, req.(*FreeBatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _TransferService_Pull_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PullRequest)
 	if err := dec(in); err != nil {
@@ -786,6 +1502,24 @@ func _TransferService_Pull_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(TransferServiceServer).Pull(ctx, req.(*PullRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _TransferService_FreePull_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FreePullRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TransferServiceServer).FreePull(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TransferService_FreePull_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TransferServiceServer).FreePull(ctx, req.(*FreePullRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -808,6 +1542,24 @@ func _TransferService_Publish_Handler(srv interface{}, ctx context.Context, dec 
 	return interceptor(ctx, in, info, handler)
 }
 
+func _TransferService_FreePublish_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(FreePublishRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(TransferServiceServer).FreePublish(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: TransferService_FreePublish_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(TransferServiceServer).FreePublish(ctx, req.(*FreePublishRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // TransferService_ServiceDesc is the grpc.ServiceDesc for TransferService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -824,12 +1576,24 @@ var TransferService_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _TransferService_GetTransferStatus_Handler,
 		},
 		{
+			MethodName: "FreeBatch",
+			Handler:    _TransferService_FreeBatch_Handler,
+		},
+		{
 			MethodName: "Pull",
 			Handler:    _TransferService_Pull_Handler,
 		},
 		{
+			MethodName: "FreePull",
+			Handler:    _TransferService_FreePull_Handler,
+		},
+		{
 			MethodName: "Publish",
 			Handler:    _TransferService_Publish_Handler,
+		},
+		{
+			MethodName: "FreePublish",
+			Handler:    _TransferService_FreePublish_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -837,159 +1601,159 @@ var TransferService_ServiceDesc = grpc.ServiceDesc{
 }
 
 const (
-	SkeletonKvService_PutBlocks_FullMethodName = "/lake.SkeletonKvService/PutBlocks"
-	SkeletonKvService_GetBlocks_FullMethodName = "/lake.SkeletonKvService/GetBlocks"
+	TcpDataService_PutBlocks_FullMethodName = "/lake.TcpDataService/PutBlocks"
+	TcpDataService_GetBlocks_FullMethodName = "/lake.TcpDataService/GetBlocks"
 )
 
-// SkeletonKvServiceClient is the client API for SkeletonKvService service.
+// TcpDataServiceClient is the client API for TcpDataService service.
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // =============================================================================
-// P3 skeleton-only services(验证三语言联通;生产路径见上方注释)
+// TcpDataService — TCP 退化数据面(P4.4 正名自 P3 SkeletonKvService)
 // =============================================================================
 //
-// SkeletonKvService — mock KV **字节**走 gRPC。
+// 对齐 Mooncake `MC_FORCE_TCP` / `installTransport("tcp")` fallback:
 //
-//	生产:字节走 RDMA 旁路(边7/8),proto 只有控制信令。
-//	P3:无 RDMA/PyO3 时用本 service 把不透明 bytes 写入 Rust 内存池,验证跨语言 KV 流转。
-//	P4 起由 TransferService + 数据面取代,本 service 可删或留 debug。
-type SkeletonKvServiceClient interface {
+//	无 RDMA 时 KV **字节**走 gRPC Put/Get(CPU 拷贝,非零拷贝)。
+//	TransferService 控制信令 + TcpTransport 可经本 service 搬字节;
+//	P5 真 RDMA 旁路后本 service 仍作 TCP 退化路径保留。
+type TcpDataServiceClient interface {
 	PutBlocks(ctx context.Context, in *PutBlocksRequest, opts ...grpc.CallOption) (*Ack, error)
 	GetBlocks(ctx context.Context, in *GetBlocksRequest, opts ...grpc.CallOption) (*GetBlocksResponse, error)
 }
 
-type skeletonKvServiceClient struct {
+type tcpDataServiceClient struct {
 	cc grpc.ClientConnInterface
 }
 
-func NewSkeletonKvServiceClient(cc grpc.ClientConnInterface) SkeletonKvServiceClient {
-	return &skeletonKvServiceClient{cc}
+func NewTcpDataServiceClient(cc grpc.ClientConnInterface) TcpDataServiceClient {
+	return &tcpDataServiceClient{cc}
 }
 
-func (c *skeletonKvServiceClient) PutBlocks(ctx context.Context, in *PutBlocksRequest, opts ...grpc.CallOption) (*Ack, error) {
+func (c *tcpDataServiceClient) PutBlocks(ctx context.Context, in *PutBlocksRequest, opts ...grpc.CallOption) (*Ack, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(Ack)
-	err := c.cc.Invoke(ctx, SkeletonKvService_PutBlocks_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, TcpDataService_PutBlocks_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-func (c *skeletonKvServiceClient) GetBlocks(ctx context.Context, in *GetBlocksRequest, opts ...grpc.CallOption) (*GetBlocksResponse, error) {
+func (c *tcpDataServiceClient) GetBlocks(ctx context.Context, in *GetBlocksRequest, opts ...grpc.CallOption) (*GetBlocksResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetBlocksResponse)
-	err := c.cc.Invoke(ctx, SkeletonKvService_GetBlocks_FullMethodName, in, out, cOpts...)
+	err := c.cc.Invoke(ctx, TcpDataService_GetBlocks_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
 	return out, nil
 }
 
-// SkeletonKvServiceServer is the server API for SkeletonKvService service.
-// All implementations must embed UnimplementedSkeletonKvServiceServer
+// TcpDataServiceServer is the server API for TcpDataService service.
+// All implementations must embed UnimplementedTcpDataServiceServer
 // for forward compatibility.
 //
 // =============================================================================
-// P3 skeleton-only services(验证三语言联通;生产路径见上方注释)
+// TcpDataService — TCP 退化数据面(P4.4 正名自 P3 SkeletonKvService)
 // =============================================================================
 //
-// SkeletonKvService — mock KV **字节**走 gRPC。
+// 对齐 Mooncake `MC_FORCE_TCP` / `installTransport("tcp")` fallback:
 //
-//	生产:字节走 RDMA 旁路(边7/8),proto 只有控制信令。
-//	P3:无 RDMA/PyO3 时用本 service 把不透明 bytes 写入 Rust 内存池,验证跨语言 KV 流转。
-//	P4 起由 TransferService + 数据面取代,本 service 可删或留 debug。
-type SkeletonKvServiceServer interface {
+//	无 RDMA 时 KV **字节**走 gRPC Put/Get(CPU 拷贝,非零拷贝)。
+//	TransferService 控制信令 + TcpTransport 可经本 service 搬字节;
+//	P5 真 RDMA 旁路后本 service 仍作 TCP 退化路径保留。
+type TcpDataServiceServer interface {
 	PutBlocks(context.Context, *PutBlocksRequest) (*Ack, error)
 	GetBlocks(context.Context, *GetBlocksRequest) (*GetBlocksResponse, error)
-	mustEmbedUnimplementedSkeletonKvServiceServer()
+	mustEmbedUnimplementedTcpDataServiceServer()
 }
 
-// UnimplementedSkeletonKvServiceServer must be embedded to have
+// UnimplementedTcpDataServiceServer must be embedded to have
 // forward compatible implementations.
 //
 // NOTE: this should be embedded by value instead of pointer to avoid a nil
 // pointer dereference when methods are called.
-type UnimplementedSkeletonKvServiceServer struct{}
+type UnimplementedTcpDataServiceServer struct{}
 
-func (UnimplementedSkeletonKvServiceServer) PutBlocks(context.Context, *PutBlocksRequest) (*Ack, error) {
+func (UnimplementedTcpDataServiceServer) PutBlocks(context.Context, *PutBlocksRequest) (*Ack, error) {
 	return nil, status.Error(codes.Unimplemented, "method PutBlocks not implemented")
 }
-func (UnimplementedSkeletonKvServiceServer) GetBlocks(context.Context, *GetBlocksRequest) (*GetBlocksResponse, error) {
+func (UnimplementedTcpDataServiceServer) GetBlocks(context.Context, *GetBlocksRequest) (*GetBlocksResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetBlocks not implemented")
 }
-func (UnimplementedSkeletonKvServiceServer) mustEmbedUnimplementedSkeletonKvServiceServer() {}
-func (UnimplementedSkeletonKvServiceServer) testEmbeddedByValue()                           {}
+func (UnimplementedTcpDataServiceServer) mustEmbedUnimplementedTcpDataServiceServer() {}
+func (UnimplementedTcpDataServiceServer) testEmbeddedByValue()                        {}
 
-// UnsafeSkeletonKvServiceServer may be embedded to opt out of forward compatibility for this service.
-// Use of this interface is not recommended, as added methods to SkeletonKvServiceServer will
+// UnsafeTcpDataServiceServer may be embedded to opt out of forward compatibility for this service.
+// Use of this interface is not recommended, as added methods to TcpDataServiceServer will
 // result in compilation errors.
-type UnsafeSkeletonKvServiceServer interface {
-	mustEmbedUnimplementedSkeletonKvServiceServer()
+type UnsafeTcpDataServiceServer interface {
+	mustEmbedUnimplementedTcpDataServiceServer()
 }
 
-func RegisterSkeletonKvServiceServer(s grpc.ServiceRegistrar, srv SkeletonKvServiceServer) {
-	// If the following call panics, it indicates UnimplementedSkeletonKvServiceServer was
+func RegisterTcpDataServiceServer(s grpc.ServiceRegistrar, srv TcpDataServiceServer) {
+	// If the following call panics, it indicates UnimplementedTcpDataServiceServer was
 	// embedded by pointer and is nil.  This will cause panics if an
 	// unimplemented method is ever invoked, so we test this at initialization
 	// time to prevent it from happening at runtime later due to I/O.
 	if t, ok := srv.(interface{ testEmbeddedByValue() }); ok {
 		t.testEmbeddedByValue()
 	}
-	s.RegisterService(&SkeletonKvService_ServiceDesc, srv)
+	s.RegisterService(&TcpDataService_ServiceDesc, srv)
 }
 
-func _SkeletonKvService_PutBlocks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _TcpDataService_PutBlocks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(PutBlocksRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(SkeletonKvServiceServer).PutBlocks(ctx, in)
+		return srv.(TcpDataServiceServer).PutBlocks(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: SkeletonKvService_PutBlocks_FullMethodName,
+		FullMethod: TcpDataService_PutBlocks_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SkeletonKvServiceServer).PutBlocks(ctx, req.(*PutBlocksRequest))
+		return srv.(TcpDataServiceServer).PutBlocks(ctx, req.(*PutBlocksRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-func _SkeletonKvService_GetBlocks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+func _TcpDataService_GetBlocks_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetBlocksRequest)
 	if err := dec(in); err != nil {
 		return nil, err
 	}
 	if interceptor == nil {
-		return srv.(SkeletonKvServiceServer).GetBlocks(ctx, in)
+		return srv.(TcpDataServiceServer).GetBlocks(ctx, in)
 	}
 	info := &grpc.UnaryServerInfo{
 		Server:     srv,
-		FullMethod: SkeletonKvService_GetBlocks_FullMethodName,
+		FullMethod: TcpDataService_GetBlocks_FullMethodName,
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(SkeletonKvServiceServer).GetBlocks(ctx, req.(*GetBlocksRequest))
+		return srv.(TcpDataServiceServer).GetBlocks(ctx, req.(*GetBlocksRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
 
-// SkeletonKvService_ServiceDesc is the grpc.ServiceDesc for SkeletonKvService service.
+// TcpDataService_ServiceDesc is the grpc.ServiceDesc for TcpDataService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
-var SkeletonKvService_ServiceDesc = grpc.ServiceDesc{
-	ServiceName: "lake.SkeletonKvService",
-	HandlerType: (*SkeletonKvServiceServer)(nil),
+var TcpDataService_ServiceDesc = grpc.ServiceDesc{
+	ServiceName: "lake.TcpDataService",
+	HandlerType: (*TcpDataServiceServer)(nil),
 	Methods: []grpc.MethodDesc{
 		{
 			MethodName: "PutBlocks",
-			Handler:    _SkeletonKvService_PutBlocks_Handler,
+			Handler:    _TcpDataService_PutBlocks_Handler,
 		},
 		{
 			MethodName: "GetBlocks",
-			Handler:    _SkeletonKvService_GetBlocks_Handler,
+			Handler:    _TcpDataService_GetBlocks_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},
@@ -1007,7 +1771,7 @@ const (
 // WorkerService — 计算层 Generate。
 //
 //	生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
-//	P3:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + SkeletonKv。
+//	P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
 //	    执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;**mode 固定 COLOCATED**。
 type WorkerServiceClient interface {
 	Generate(ctx context.Context, in *GenerateRequest, opts ...grpc.CallOption) (*GenerateResponse, error)
@@ -1038,7 +1802,7 @@ func (c *workerServiceClient) Generate(ctx context.Context, in *GenerateRequest,
 // WorkerService — 计算层 Generate。
 //
 //	生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
-//	P3:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + SkeletonKv。
+//	P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
 //	    执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;**mode 固定 COLOCATED**。
 type WorkerServiceServer interface {
 	Generate(context.Context, *GenerateRequest) (*GenerateResponse, error)

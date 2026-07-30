@@ -190,7 +190,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 | 点 | P3 | 生产（P4+） |
 |----|----|-------------|
 | Gateway | **不做 Bifrost**；客户端直打 Router OpenAI HTTP（边2） | Bifrost → Router（远期） |
-| KV 字节 | `SkeletonKvService` **gRPC 传 bytes**（入 Rust 内存池） | RDMA 旁路（边7/8），proto 仅控制信令 |
+| KV 字节 | `SkeletonKvService` **gRPC 传 bytes**（入 Rust 内存池；P4.4 正名 `TcpDataService`） | RDMA 旁路（边7/8），proto 仅控制信令；TCP 退化保留 |
 | worker↔agent | Router → `AgentService.Dispatch`（边10 **ack 占位**）→ `WorkerService.Generate`；worker 内调 ControlPlane+SkeletonKv | Dispatch → agent 组 batch → FFI(边6) |
 | 执行模式 | 固定 **混部**（同进程 mock prefill+decode） | Router 三模式选路 |
 | 前缀复用 | ControlPlane `LookupPrefix` + `RegisterBlocks`（进程内存） | 同协议；权威仍在 Rust 控制面内存 |
@@ -198,7 +198,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 参考：早期单进程 `src/` 冒烟（两请求共享前缀）；Dynamo `DefaultWorkerSelector` / SGLang `match_prefix`（LookupPrefix）；vLLM `KVConnectorBase_V1`（worker↔池）；Mooncake PutEnd（RegisterBlocks）。
 
 - [x] 客户端 → Go Router OpenAI `/v1/chat/completions`（**无 Gateway/Bifrost**）→ Dispatch → `WorkerService.Generate`
-- [x] Python mock worker：LookupPrefix → SkeletonKv Get/Put → RegisterBlocks → mock decode
+- [x] Python mock worker：LookupPrefix → SkeletonKv/TcpData Get/Put → RegisterBlocks → mock decode
 - [x] Rust `controlplane` + `kv-pool` + `storage-agent` 进程（内存权威 + 内存 bytes + Dispatch ack）
 - [x] 端到端冒烟：两请求共享前缀，第二个 `reused_blocks>=3`（`./deploy/smoke.sh`，替代 `python -m src`）
 - [x] `deploy/run-local.sh` 一条命令起全栈，curl 打通；`deploy/README.md` + CI `p3.yml`
@@ -220,12 +220,12 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 - [x] 内容寻址 block 存储 + 引用计数 + LFU-Aging / 前缀亲和驱逐（复用 B 起步；P4.2：`ReportRef` **合账骨架**——只累加 `global_refs`、忽略 `RefKind`，agent 本地一级/分 kind 后续；驱逐主路径 `LineageBackend::with_frequency`＝叶子约束≈前缀亲和 + TinyLFU 冷叶≈LFU-Aging；`MultiLruBackend` 仍 pub 对照；不 pub 纯 Lru/Fifo，见 `rust/vendor/UPSTREAM.md`。**驱逐正确性 = Authority 单测**（含 inactive 上界：满容 skip insert；压力 `allocate` 仅 `evict_n`）；生产 `ReportRef` 喂数与压力 `allocate` → 后续切片）
 - [x] radix tree 前缀索引（前缀复用查询）（复用 B；P4.2：`RegisterBlocks.prefix_hashes` + `LookupPrefix`）
 - [x] 分层缓存引擎（RAM/NVMe，对象存储回填）（P4.3：写回只 L2；L3=demote/cap XOR；L1=demotion；`TierPipeline`/`BandwidthPool`/PutEnd COMPLETE；真 NVMe/跨机 defer P5；满块顺便写 L1 留 P7。[PR #31](https://github.com/chengda-wu/lake/pull/31)）
-- [ ] gRPC 接口 + RDMA 数据平面（先 TCP 后 RDMA）（传输面复用 A）
-- [ ] 一致性哈希分片 + KV Node 扩缩时的 block 重分布
-- [ ] **多模型生命周期**：模型注册/下线级联删、revision 失效（F11）
-- [ ] **按模型配额与空间分配**（软/硬配额 + 借用 + 背压信号）
-- [ ] **GC**：冷块/孤儿块回收 + 崩溃 reconcile（P4.3 review 遗留详见 [#20](https://github.com/chengda-wu/lake/issues/20) P4.7 + 评论「PR #31 review 遗留」：barrier 失败 inactive 窗口、WRITEBACK−1 失败永久冻结、`apply_location_events` 非原子等）
-- [ ] **碎片整理**：逻辑共置 + 物理压实，后台节流可暂停
+- [x] gRPC 接口 + RDMA 数据平面（先 TCP 后 RDMA）（传输面复用 A；P4.4：`Transport`+`TcpTransport`+`TcpDataService` 正名自 SkeletonKv；`TransferService` 接线；真 RDMA → P5）
+- [~] 一致性哈希分片 + KV Node 扩缩时的 block 重分布（P4.9：`GetShardMap`/`JoinShardNode`/`DrainShardNode`；环+最小迁移+Drain 推 L2 计划；真跨机字节 → P5，见 #20）
+- [~] **多模型生命周期**：模型注册/下线级联删、revision 失效（F11；P4.5：`RegisterModel`/`DeregisterModel` + `(model_id,revision)` 命名空间，见 #20；PR #33 待合）
+- [~] **按模型配额与空间分配**（软/硬配额 + 借用 + 背压；P4.6：`AdmitRegisterBlocks` 写前准入(方案 A，不 reserve) + `SetModelQuota`/`GetModelQuota` + `BackpressureSignal`；`Reserve*` → 多进程/P4.7，见 #20）
+- [~] **GC**：冷块/孤儿块回收 + 崩溃 reconcile（P4.7：`ReconcileOrphans`/`DiscardBlocks`/`CheckpointStore` 内存 mock；节点级 reconcile 兜底 writeback 泄漏；见 #20。P4.3 review 半原子 `apply_location_events` 等仍可后续收紧）
+- [~] **碎片整理**：逻辑共置 + 物理压实，后台节流可暂停（P4.8：`TriggerDefrag`/`PauseBackground` + `SegmentArena` + pipeline Compact/CoLocate；共享 BandwidthPool；见 #20）
 
 **完成判据**：前缀复用命中率、驱逐正确性有单测；吞吐 micro-benchmark；多模型隔离/配额/GC/碎片整理各有验证用例。
 

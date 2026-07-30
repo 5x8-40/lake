@@ -1,4 +1,4 @@
-"""P3：ControlPlane + SkeletonKv 实现的 StorageAgent（同步 mock）。"""
+"""P3/P4：ControlPlane + TcpDataService 实现的 StorageAgent（同步 mock）。"""
 
 from __future__ import annotations
 
@@ -50,7 +50,7 @@ class GrpcSkeletonAgent:
     def __init__(
         self,
         cp: lake_pb2_grpc.ControlPlaneServiceStub,
-        kv: lake_pb2_grpc.SkeletonKvServiceStub,
+        kv: lake_pb2_grpc.TcpDataServiceStub,
     ) -> None:
         self._cp = cp
         self._kv = kv
@@ -58,10 +58,32 @@ class GrpcSkeletonAgent:
         self._host_reqs: Mapping[str, Req] = {}
         # 已对本机 ensure 过 prompt KV 的 req（避免每步 decode Lookup 污染/重复 Get）
         self._ensured_prefix: set[str] = set()
+        # P4.5:已 RegisterModel 的 (model_id, revision)；空 revision=默认
+        self._registered_models: set[tuple[str, str]] = set()
 
     def bind_host_reqs(self, reqs: Mapping[str, Req]) -> None:
         """PoolIface 在 prepare 前注入 Host Req（协议层不持权威）。"""
         self._host_reqs = reqs
+
+    def _ensure_model(self, model_id: str, revision: str = "") -> None:
+        """P4.5:RegisterBlocks 前须 RegisterModel（幂等）。"""
+        key = (model_id, revision)
+        if key in self._registered_models:
+            return
+        ack = self._cp.RegisterModel(
+            lake_pb2.RegisterModelRequest(
+                model=lake_pb2.ModelDescriptor(
+                    model_id=model_id,
+                    revision=revision,
+                    num_layers=1,
+                    block_spec=lake_pb2.BlockSpec(block_tokens=BLOCK_SIZE, bytes_per_block=0),
+                    hash_algo=lake_pb2.HASH_SHA256_256,
+                )
+            )
+        )
+        if not ack.ok:
+            raise RuntimeError(ack.err or "RegisterModel failed")
+        self._registered_models.add(key)
 
     def probe_prefix(self, req: Req) -> PrefixHint:
         """只读 LookupPrefix；P3 注册在 L2 → local_hit 恒 False。"""
@@ -69,11 +91,14 @@ class GrpcSkeletonAgent:
         if not hashes:
             return PrefixHint()
         try:
+            self._ensure_model(req.model_id)
             lookup = self._cp.LookupPrefix(
                 lake_pb2.LookupPrefixRequest(
                     model_id=req.model_id,
                     prefix_hashes=hashes,
                     requester_node_id=req.node_id,
+                    revision="",
+                    pool_kind=schema_pb2.TARGET,  # P4.5:缺省 TARGET；draft 前缀须显式 DRAFT
                 )
             )
         except grpc.RpcError as e:
@@ -147,12 +172,14 @@ class GrpcSkeletonAgent:
     def _ensure_prefix_kv(self, req: Req) -> StepStats:
         prompt = req.prompt_token_ids
         hashes = chain_block_hashes(prompt)
+        self._ensure_model(req.model_id)
         ids = [
             schema_pb2.KVBlockID(
                 model_id=req.model_id,
                 block_hash=h,
                 pool_kind=schema_pb2.TARGET,
                 scope="public",
+                revision="",
             )
             for h in hashes
         ]
@@ -162,6 +189,8 @@ class GrpcSkeletonAgent:
                 model_id=req.model_id,
                 prefix_hashes=hashes,
                 requester_node_id=req.node_id,
+                revision="",
+                pool_kind=schema_pb2.TARGET,
             )
         )
         reused = int(lookup.hit_length)

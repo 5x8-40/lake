@@ -14,4 +14,4 @@ tonic.workspace = true
 tokio.workspace = true
 prost.workspace = true
 
-# P3:SkeletonKvService 内存字节池(生产 RDMA 旁路前的 mock 数据面)。
+# P4.4:TcpDataService 内存字节池(TCP 退化数据面;对齐 Mooncake MC_FORCE_TCP)。

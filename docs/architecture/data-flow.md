@@ -23,6 +23,32 @@
 ⑦ 完成 → 响应
 ```
 
+### 请求生命周期总图
+
+```mermaid
+flowchart TD
+    gateway["Bifrost Gateway\n鉴权 / 限流 / 准入"] -->|"已准入"| router["Go Router\n读 view mirror + 选模式"]
+    gateway -->|"过载拒绝"| rejected["拒绝\n不计推理系统失败率"]
+
+    router -->|"D-direct"| direct["目标计算节点\n残差 prefill + decode"]
+    router -->|"混部"| colocated["单计算节点\n完整或增量 prefill + decode"]
+    router -->|"PD 分离"| prefill["Prefill 节点\n产出 KV"]
+
+    prefill -->|"池发起 L0 到 L0 或经 L1 / L2"| decode["Decode 节点\nready / done"]
+    direct --> writeback["PutEnd 写回\nL2 durable + radix register"]
+    colocated --> writeback
+    decode --> writeback
+
+    writeback --> refs["ReportRef / RequestBarrier\n释放请求引用"]
+    refs --> response["响应完成"]
+    writeback --> futureHit["radix 生长\n服务后续前缀命中"]
+
+    direct -.故障 / 超时.-> recovery["F4 恢复\nRouter 重跑模式选择"]
+    colocated -.故障 / 超时.-> recovery
+    decode -.故障 / 超时.-> recovery
+    recovery --> router
+```
+
 **职责切分**：① 归 gateway（过载/限流/丢弃，见 [`../features/slo.md`](../features/slo.md)）；②③ 归 Router/控制面（路由 + 模式选择 + 优先级排队，不丢请求）；④ 归计算层（引擎零分层逻辑，只消费 ready→算→发 done）+ 存储池（放置/传输/写回，池 agent 发起）；⑤⑥ 归存储池。
 
 ## 2. 模式选择决策树
@@ -32,15 +58,15 @@
 ```mermaid
 flowchart TD
     Q[Router 读本地命中视图镜像:前缀复用 block + 位置 + 负载视图]
-    Q --> L{前缀 KV 已被池预放置到<br/>某执行节点 HBM?<br/>(本地命中)}
-    L -- 是 --> DD[D-direct:路由到该节点<br/>残差 prefill + decode,零传输]
-    L -- 否 --> S{单节点完成划算?<br/>(prompt 短 / 传输成本 > 分离收益)}
-    S -- 是 --> CO[混部:路由到一节点<br/>完整/增量 prefill + decode,本机完成]
-    S -- 否 --> PD[PD 分离:时序二正向<br/>A prefill 产出 → 池搬到 B → B decode]
-    DD --> R[decode 延伸前缀?<br/>(多轮 agent)]
+    Q --> L{前缀 KV 已被池预放置到\n某执行节点 HBM?\n本地命中}
+    L -- 是 --> DD[D-direct:路由到该节点\n残差 prefill + decode,零传输]
+    L -- 否 --> S{单节点完成划算?\nprompt 短 / 传输成本 > 分离收益}
+    S -- 是 --> CO[混部:路由到一节点\n完整/增量 prefill + decode,本机完成]
+    S -- 否 --> PD[PD 分离:时序二正向\nA prefill 产出 → 池搬到 B → B decode]
+    DD --> R[decode 延伸前缀?\n多轮 agent]
     CO --> R
     PD --> R
-    R -- 是 --> RB[触发时序二反向回传<br/>延伸 KV 回池,radix 生长]
+    R -- 是 --> RB[触发时序二反向回传\n延伸 KV 回池,radix 生长]
     R -- 否 --> DONE[完成]
     RB --> DONE
 ```
@@ -153,6 +179,25 @@ agent 多轮场景：第 N 轮 decode 产出的延伸 KV 是**第 N+1 轮 prefil
 
 引擎不感知 block 满不满（block 对引擎纯寻址单位）——满块判断、哈希、radix 注册、写回全归池。
 
+### PutEnd 写回与生命周期图
+
+```mermaid
+flowchart TD
+    done["engine done fence\n新 KV 已写入 L0 slot"] --> full{"block 已满?"}
+    full -- 否 --> tail["尾块\n请求结束点写一次"]
+    full -- 是 --> hash["agent 计算内容哈希\n形成 KVBlockID"]
+
+    hash --> admit["AdmitRegisterBlocks\nquota + namespace preflight"]
+    admit -- reject --> discard["discard settled bytes\n不注册 radix"]
+    admit -- admit --> durable["flush durable\n写入 L2 NVMe"]
+    durable --> register["RegisterBlocks\nradix + location view"]
+    register --> refs["writeback ref 保持冻结\n直到 RequestBarrier"]
+    refs --> inactive["ref=0 后进入 inactive\n可被 GC / defrag / demotion 处理"]
+    tail --> l2Recovery["L2 恢复点\n不进 radix"]
+```
+
+这张图补充 P4.3–P4.8 后的关键顺序：`AdmitRegisterBlocks` 必须先于 durable 写入,`RegisterBlocks` 必须晚于 L2 落稳；GC、defrag、shard 只操作已经在控制面 view 中可解释的位置。
+
 ## 5. F4 故障分支
 
 执行失败（节点故障/超时）→ 触发 F4 → Router 依最新集群状态**重跑模式选择**（§2 纯函数）。**不设 mode-to-mode 降级阶梯**——模式选择是纯函数，失败即重跑该函数，由最新状态重新定模式与节点。
@@ -161,6 +206,17 @@ agent 多轮场景：第 N 轮 decode 产出的延伸 KV 是**第 N+1 轮 prefil
 执行失败(故障/超时) → F4 触发 → Router 重跑 f(请求, 最新集群状态) → (新模式, 新节点)
                                           ↓
                         池把该 sequence 的已有 KV 放置到新节点 HBM → 续推
+```
+
+```mermaid
+flowchart TD
+    failure["worker / 节点故障或超时"] --> detect["存储池与 Router 接收故障信号"]
+    detect --> freeze["控制面保留 sequence 引用\n避免恢复窗口被 GC"]
+    freeze --> reroute["Router 重跑模式选择函数\n不走预设 fallback 链"]
+    reroute --> locate["Authority 查询已有 KV\n优先 L2 恢复点 / L3 SSOT"]
+    locate --> place["池将 KV 放置到新节点 L0\n必要时从 L1 / L2 / L3 拉取"]
+    place --> resume["新 worker ready\n继续推理"]
+    resume --> barrier["完成后 RequestBarrier\n释放旧请求引用"]
 ```
 
 **worker 崩溃续推**：

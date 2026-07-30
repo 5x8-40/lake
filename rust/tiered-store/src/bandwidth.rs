@@ -1,6 +1,6 @@
 //! 后台迁移带宽池骨架（`<10%` 节流，可暂停）。
 //!
-//! P4.3：令牌桶计数，供 promote/demote/GC 共享；真网络节流 P5。
+//! P4.3/P4.8：令牌桶计数，供 promote/demote/GC/defrag 共享；真网络节流 P5。
 
 /// Shared background bandwidth budget (bytes per window).
 #[derive(Debug, Clone)]

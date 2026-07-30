@@ -13,7 +13,7 @@ members = [
 ]
 
 # 存储层 Rust 工作区。
-# P2:空壳编译;P3:controlplane / kv-pool 提供可执行 gRPC 服务(内存权威 + SkeletonKv)。
+# P2:空壳编译;P3:controlplane / kv-pool gRPC;P4.4:transfer TcpTransport + TcpDataService。
 
 [workspace.dependencies]
 tonic = { version = "0.12", features = ["transport"] }

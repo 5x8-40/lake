@@ -97,6 +97,17 @@ submitTransfer(BatchID, {TransferRequest{WRITE, source=local_kv_addr,
 
 `MetadataStoragePlugin`(`transfer_metadata_plugin.h`):etcd / redis / http 后端。维护 `SegmentDesc`/`BufferDesc`/`HandShakeDesc`。
 
+## lake 落地(P4.4)
+
+| Mooncake | lake |
+|----------|------|
+| `Transport` + `allocateBatchID`/`submitTransfer`/`getTransferStatus` | `rust/transfer`::`Transport` + `TcpTransport` |
+| `MC_FORCE_TCP` → `TcpTransport`(CPU 拷贝) | `TcpTransport`(进程内段拷贝)+ `TcpDataService` Put/Get |
+| `TransferEngine` 门面 | `TransferService` gRPC(`TransferServer`)挂 storage-agent |
+| `RdmaTransport` | **P5**(同 trait,FFI) |
+
+**关键差异**:抄 API/生命周期与 TCP 退化语义,**不**接入 Mooncake CMake/FFI;位置视图/radix 仍在 controlplane,不在 TE。
+
 ## 代码索引
 
 > 沿代码回溯用。符号名锚定,行号会漂移——找不到时 `grep -n "符号名" <文件>`。

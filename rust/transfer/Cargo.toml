@@ -7,5 +7,10 @@ publish = false
 [dependencies]
 lake-proto.workspace = true
 tonic.workspace = true
+tokio.workspace = true
+tokio-stream = { workspace = true }
+prost.workspace = true
 
-# 空壳:KV 传输(RDMA + TCP 退化)。P2 仅验证 proto 生成 + 编译。
+# P4.4: Transport trait + TcpTransport + TransferService gRPC。
+# 参考 Mooncake transfer-engine `transport.h` / `TcpTransport`(MC_FORCE_TCP)。
+# P5:同 trait 加 RdmaTransport(FFI),业务零改。

@@ -9,7 +9,7 @@ echo "==> rust: bins + controlplane unit tests"
   -p lake-controlplane --bin lake-controlplane \
   -p lake-kv-pool --bin lake-kv-pool \
   -p lake-storage-agent --bin lake-storage-agent)
-(cd rust && cargo test -q -p lake-controlplane)
+(cd rust && cargo test -q -p lake-controlplane -p lake-transfer)
 
 echo "==> go: module"
 (cd go && go build ./...)
@@ -22,7 +22,8 @@ from runtime.worker import chain_block_hashes, mock_kv_bytes
 from runtime.node_scheduler import NodeScheduler, build_req_from_generate, mock_decode_tokens
 from engine.model_runner import ModelRunner
 assert hasattr(lake_pb2_grpc, 'WorkerServiceStub')
-assert hasattr(lake_pb2_grpc, 'SkeletonKvServiceStub')
+assert hasattr(lake_pb2_grpc, 'TcpDataServiceStub')
+assert hasattr(lake_pb2_grpc, 'TransferServiceStub')
 assert hasattr(lake_pb2_grpc, 'AgentServiceStub')
 h = chain_block_hashes(list(range(24)))
 assert len(h) == 3, h

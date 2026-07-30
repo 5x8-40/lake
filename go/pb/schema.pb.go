@@ -185,13 +185,14 @@ func (BlockKind) EnumDescriptor() ([]byte, []int) {
 //	vLLM prefix caching(token-based hash 跨层共享)。
 type KVBlockID struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
-	ModelId   string                 `protobuf:"bytes,1,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`       // 模型命名空间
+	ModelId   string                 `protobuf:"bytes,1,opt,name=model_id,json=modelId,proto3" json:"model_id,omitempty"`       // 模型命名空间(与 revision 组成池内 registry 键)
 	BlockHash []byte                 `protobuf:"bytes,2,opt,name=block_hash,json=blockHash,proto3" json:"block_hash,omitempty"` // 链式哈希 = hash(parent_block_hash || 本块 token_ids);
 	// 序列起点块 parent = ⊥(空)。相同前缀 → 相同链式 hash → 命中同一 KV
 	// 算法可插拔(BLAKE3-128 / SHA-256-128 / SHA-256-256),由模型注册元数据声明,
-	// proto 只规定 ≥128-bit + 链式。不同 model_id 可用不同算法。
+	// proto 只规定 ≥128-bit + 链式。不同 (model_id, revision) 可用不同算法。
 	PoolKind      PoolKind `protobuf:"varint,3,opt,name=pool_kind,json=poolKind,proto3,enum=lake.PoolKind" json:"pool_kind,omitempty"` // TARGET | DRAFT 命名空间(draft KV 同款 schema,靠字段区分,不物理分池)
 	Scope         string   `protobuf:"bytes,4,opt,name=scope,proto3" json:"scope,omitempty"`                                           // 多租户预留,默认 "public",当前不入寻址(F8 远期启用时改寻址语义不改结构)
+	Revision      string   `protobuf:"bytes,5,opt,name=revision,proto3" json:"revision,omitempty"`                                     // P4.5:模型 revision;与 model_id 组成命名空间。空串=未版本化默认。
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -250,6 +251,13 @@ func (x *KVBlockID) GetPoolKind() PoolKind {
 func (x *KVBlockID) GetScope() string {
 	if x != nil {
 		return x.Scope
+	}
+	return ""
+}
+
+func (x *KVBlockID) GetRevision() string {
+	if x != nil {
+		return x.Revision
 	}
 	return ""
 }
@@ -330,7 +338,7 @@ type BlockMeta struct {
 	Id            *KVBlockID             `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
 	BlockKind     BlockKind              `protobuf:"varint,2,opt,name=block_kind,json=blockKind,proto3,enum=lake.BlockKind" json:"block_kind,omitempty"` // T_TYPE | R_TYPE_STATE | R_TYPE_TRAILING
 	Locations     []*Location            `protobuf:"bytes,3,rep,name=locations,proto3" json:"locations,omitempty"`                                       // L0?/L1?/L2? —— 缓存副本(L0/L1 易失) + L2 durable(F4 恢复点)
-	L3Present     bool                   `protobuf:"varint,4,opt,name=l3_present,json=l3Present,proto3" json:"l3_present,omitempty"`                     // L3(SSOT) 是否有副本;object key = s3://lake/kv/{model_id}/{block_hash} 现场拼,不存储
+	L3Present     bool                   `protobuf:"varint,4,opt,name=l3_present,json=l3Present,proto3" json:"l3_present,omitempty"`                     // L3(SSOT) 是否有副本;object key = s3://lake/kv/{model_id}/{revision}/{block_hash} 现场拼,不存储
 	RefCount      uint32                 `protobuf:"varint,5,opt,name=ref_count,json=refCount,proto3" json:"ref_count,omitempty"`                        // 全局引用汇总
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -405,13 +413,14 @@ var File_schema_proto protoreflect.FileDescriptor
 
 const file_schema_proto_rawDesc = "" +
 	"\n" +
-	"\fschema.proto\x12\x04lake\"\x88\x01\n" +
+	"\fschema.proto\x12\x04lake\"\xa4\x01\n" +
 	"\tKVBlockID\x12\x19\n" +
 	"\bmodel_id\x18\x01 \x01(\tR\amodelId\x12\x1d\n" +
 	"\n" +
 	"block_hash\x18\x02 \x01(\fR\tblockHash\x12+\n" +
 	"\tpool_kind\x18\x03 \x01(\x0e2\x0e.lake.PoolKindR\bpoolKind\x12\x14\n" +
-	"\x05scope\x18\x04 \x01(\tR\x05scope\"z\n" +
+	"\x05scope\x18\x04 \x01(\tR\x05scope\x12\x1a\n" +
+	"\brevision\x18\x05 \x01(\tR\brevision\"z\n" +
 	"\bLocation\x12\x1e\n" +
 	"\x04tier\x18\x01 \x01(\x0e2\n" +
 	".lake.TierR\x04tier\x12\x17\n" +

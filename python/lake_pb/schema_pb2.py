@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0cschema.proto\x12\x04lake\"c\n\tKVBlockID\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x12\n\nblock_hash\x18\x02 \x01(\x0c\x12!\n\tpool_kind\x18\x03 \x01(\x0e\x32\x0e.lake.PoolKind\x12\r\n\x05scope\x18\x04 \x01(\t\"Y\n\x08Location\x12\x18\n\x04tier\x18\x01 \x01(\x0e\x32\n.lake.Tier\x12\x0f\n\x07node_id\x18\x02 \x01(\t\x12\x12\n\nsegment_id\x18\x03 \x01(\x04\x12\x0e\n\x06offset\x18\x04 \x01(\x04\"\x97\x01\n\tBlockMeta\x12\x1b\n\x02id\x18\x01 \x01(\x0b\x32\x0f.lake.KVBlockID\x12#\n\nblock_kind\x18\x02 \x01(\x0e\x32\x0f.lake.BlockKind\x12!\n\tlocations\x18\x03 \x03(\x0b\x32\x0e.lake.Location\x12\x12\n\nl3_present\x18\x04 \x01(\x08\x12\x11\n\tref_count\x18\x05 \x01(\r*<\n\x04Tier\x12\x14\n\x10TIER_UNSPECIFIED\x10\x00\x12\x06\n\x02L0\x10\x01\x12\x06\n\x02L1\x10\x02\x12\x06\n\x02L2\x10\x03\x12\x06\n\x02L3\x10\x04*7\n\x08PoolKind\x12\x14\n\x10POOL_UNSPECIFIED\x10\x00\x12\n\n\x06TARGET\x10\x01\x12\t\n\x05\x44RAFT\x10\x02*T\n\tBlockKind\x12\x14\n\x10KIND_UNSPECIFIED\x10\x00\x12\n\n\x06T_TYPE\x10\x01\x12\x10\n\x0cR_TYPE_STATE\x10\x02\x12\x13\n\x0fR_TYPE_TRAILING\x10\x03\x42)Z\'github.com/chengda-wu/lake/go/pb;lakepbb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0cschema.proto\x12\x04lake\"u\n\tKVBlockID\x12\x10\n\x08model_id\x18\x01 \x01(\t\x12\x12\n\nblock_hash\x18\x02 \x01(\x0c\x12!\n\tpool_kind\x18\x03 \x01(\x0e\x32\x0e.lake.PoolKind\x12\r\n\x05scope\x18\x04 \x01(\t\x12\x10\n\x08revision\x18\x05 \x01(\t\"Y\n\x08Location\x12\x18\n\x04tier\x18\x01 \x01(\x0e\x32\n.lake.Tier\x12\x0f\n\x07node_id\x18\x02 \x01(\t\x12\x12\n\nsegment_id\x18\x03 \x01(\x04\x12\x0e\n\x06offset\x18\x04 \x01(\x04\"\x97\x01\n\tBlockMeta\x12\x1b\n\x02id\x18\x01 \x01(\x0b\x32\x0f.lake.KVBlockID\x12#\n\nblock_kind\x18\x02 \x01(\x0e\x32\x0f.lake.BlockKind\x12!\n\tlocations\x18\x03 \x03(\x0b\x32\x0e.lake.Location\x12\x12\n\nl3_present\x18\x04 \x01(\x08\x12\x11\n\tref_count\x18\x05 \x01(\r*<\n\x04Tier\x12\x14\n\x10TIER_UNSPECIFIED\x10\x00\x12\x06\n\x02L0\x10\x01\x12\x06\n\x02L1\x10\x02\x12\x06\n\x02L2\x10\x03\x12\x06\n\x02L3\x10\x04*7\n\x08PoolKind\x12\x14\n\x10POOL_UNSPECIFIED\x10\x00\x12\n\n\x06TARGET\x10\x01\x12\t\n\x05\x44RAFT\x10\x02*T\n\tBlockKind\x12\x14\n\x10KIND_UNSPECIFIED\x10\x00\x12\n\n\x06T_TYPE\x10\x01\x12\x10\n\x0cR_TYPE_STATE\x10\x02\x12\x13\n\x0fR_TYPE_TRAILING\x10\x03\x42)Z\'github.com/chengda-wu/lake/go/pb;lakepbb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -32,16 +32,16 @@ _builder.BuildTopDescriptorsAndMessages(DESCRIPTOR, 'schema_pb2', _globals)
 if not _descriptor._USE_C_DESCRIPTORS:
   _globals['DESCRIPTOR']._loaded_options = None
   _globals['DESCRIPTOR']._serialized_options = b'Z\'github.com/chengda-wu/lake/go/pb;lakepb'
-  _globals['_TIER']._serialized_start=368
-  _globals['_TIER']._serialized_end=428
-  _globals['_POOLKIND']._serialized_start=430
-  _globals['_POOLKIND']._serialized_end=485
-  _globals['_BLOCKKIND']._serialized_start=487
-  _globals['_BLOCKKIND']._serialized_end=571
+  _globals['_TIER']._serialized_start=386
+  _globals['_TIER']._serialized_end=446
+  _globals['_POOLKIND']._serialized_start=448
+  _globals['_POOLKIND']._serialized_end=503
+  _globals['_BLOCKKIND']._serialized_start=505
+  _globals['_BLOCKKIND']._serialized_end=589
   _globals['_KVBLOCKID']._serialized_start=22
-  _globals['_KVBLOCKID']._serialized_end=121
-  _globals['_LOCATION']._serialized_start=123
-  _globals['_LOCATION']._serialized_end=212
-  _globals['_BLOCKMETA']._serialized_start=215
-  _globals['_BLOCKMETA']._serialized_end=366
+  _globals['_KVBLOCKID']._serialized_end=139
+  _globals['_LOCATION']._serialized_start=141
+  _globals['_LOCATION']._serialized_end=230
+  _globals['_BLOCKMETA']._serialized_start=233
+  _globals['_BLOCKMETA']._serialized_end=384
 # @@protoc_insertion_point(module_scope)

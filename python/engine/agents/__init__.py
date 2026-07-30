@@ -1,4 +1,4 @@
-"""可替换 StorageAgent 实现：memory（单测）/ grpc_skeleton（P3）。"""
+"""可替换 StorageAgent 实现：memory（单测）/ grpc_skeleton（P3/P4 TcpData）。"""
 
 from engine.agents.memory import InMemoryAgent
 

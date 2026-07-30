@@ -4,34 +4,60 @@ lake 以 **KV 为中心**做彻底存算分离:所有有状态物(权重、KV ca
 
 ## 分层视图
 
-```
-                       ┌──────────────────────┐
-                       │   Bifrost → Router   │   Bifrost(=Gateway,外部,不自研):鉴权/限流/入口准入(过载 shedding,只决定"进/不进");Router(无状态,KV 感知):f → (模式,节点/rank),选路权威收束于此(倾向 External 式,计算侧不再二次 DP LB;见 scheduling.md §1.1)
-                       └──────────┬───────────┘
-                                  │
-                       ┌──────────┴───────────┐
-                       ▼                      ▼
-              ┌─────────────────┐    ┌─────────────────┐
-              │  计算节点池      │    │  计算节点池      │   同质、可互换;角色(P/D/draft)
-              │  prefill / decode│    │  …(未来 encoder)│   由调度器分配,非固定
-              └────────┬────────┘    └────────┬────────┘
-                       │                      │
-                       ▼                      ▼
-              ┌─────────────────────────────────────────┐
-              │            存储池(统一管理 L0–L3)         │
-              │  HBM(L0) · DRAM(L1,池化) · NVMe(L2,池化)│
-              │  · 对象存储(L3, SSOT)                    │
-              │  放置 / 冷热 / 生命周期 / radix 索引 / 位置视图 │
-              └─────────────────────────────────────────┘
-                       │ 数据面:KV 跨节点传输(RDMA / TCP)
-                       ▼
-              ┌─────────────────────────────────────────┐
-              │              控制面(etcd)                │
-              │  KV 位置元数据 · 节点拓扑 · 负载视图       │
-              └─────────────────────────────────────────┘
+```mermaid
+flowchart TB
+    client["Client"] --> gateway["Bifrost Gateway\n鉴权 / 限流 / 准入"]
+    gateway --> router["Go Router\nview mirror + 模式选择"]
+
+    subgraph computePool["计算节点池"]
+        worker["Python Worker\nscheduler + ModelRunner"]
+        agent["Rust storage-agent\nFFI + transfer endpoint"]
+        localOverlay["agent local overlay\nL0/L1/L2 state + local ref"]
+        l0["L0 HBM"]
+        l1Local["L1 DRAM\n本机载体"]
+        l2Local["L2 NVMe\n本机载体"]
+        worker <--> agent
+        agent <--> localOverlay
+        localOverlay --- l0
+        localOverlay --- l1Local
+        localOverlay --- l2Local
+    end
+
+    subgraph storagePool["存储池"]
+        storageCp["Rust Storage Control Plane\nAuthority global view"]
+        kvAgent["KV Node agent\nlocal tier serve"]
+        kvOverlay["agent local overlay\nL1 MR + L2 NVMe"]
+        l1Remote["L1 DRAM\n池化载体"]
+        l2Remote["L2 NVMe\n池化载体"]
+        objectStore[("L3 Object Store\nSSOT")]
+        storageCp -->|"放置 / GC / defrag / shard"| kvAgent
+        kvAgent <--> kvOverlay
+        kvOverlay --- l1Remote
+        kvOverlay --- l2Remote
+        storageCp --> objectStore
+    end
+
+    subgraph metadata["低频元数据"]
+        etcd[("etcd\nleader lease + checkpoint")]
+    end
+
+    router -->|"Dispatch"| worker
+    router <-->|"view stream / snapshot"| storageCp
+    agent -->|"async events / batched commit"| storageCp
+    agent <-->|"Locate confirm / barrier"| storageCp
+    agent <-->|"TransferService\nRDMA / TCP fallback"| kvAgent
+    storageCp <-->|"checkpoint / lease"| etcd
 ```
 
-计算节点不拥有内存——HBM/RAM/NVMe 是存储池的物理载体,不是 worker 私有状态。计算服务向存储池申请"把所需 KV 放进本机 HBM",而非自行管理本地缓存。
+计算节点不拥有内存——HBM/RAM/NVMe 是存储池的物理载体,不是 worker 私有状态。热路径上由本机 agent 写 `local overlay`（slot/free-list/local ref/L1-L2 本地状态）,再把可全局可见的事件批量提交给存储控制面；`Authority` 维护的是全局提交态视图,不是每 token/step 的同步热路径。
+
+## 架构图索引
+
+- **总体架构**：本页上图，说明 Gateway / Router / 计算节点 / 存储控制面 / KV Node / L0–L3 的边界。
+- **KV Pool 模块图**：见 [`kv-cache-pool.md`](kv-cache-pool.md) "KV Pool 模块图"，说明 block 身份、radix、位置视图、agent 与分层介质。
+- **控制面权威图**：见 [`control-plane.md`](control-plane.md) "控制面模块图"，说明 Authority、checkpoint、view mirror 与 Router/agent 的关系。
+- **请求生命周期图**：见 [`data-flow.md`](data-flow.md) "请求生命周期总图"，说明准入、选路、执行、写回与失败恢复。
+- **存储层职责切分图**：见 [`storage-layer.md`](storage-layer.md) "分层缓存"，说明为何采用纵切职责而不是按层横切 owner。
 
 ## 关键设计决策
 

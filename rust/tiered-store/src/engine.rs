@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
+use crate::segment::{Placement, Relocate, SegmentArena, DEFAULT_SLOT_BYTES};
 use crate::stats::{AccessKind, HitStats};
 
 /// Soft capacity knobs (block counts). `0` = unlimited.
@@ -83,6 +84,8 @@ pub struct LocalTierEngine {
     l2_order: VecDeque<Vec<u8>>,
     /// Local freeze (request / writeback / in-flight). Demote skips when >0.
     pins: HashMap<Vec<u8>, u32>,
+    /// L2 segment layout (P4.8); bytes stay in `l2`, arena tracks segment/offset.
+    pub l2_arena: SegmentArena,
     pub stats: HitStats,
 }
 
@@ -98,6 +101,10 @@ impl LocalTierEngine {
     }
 
     pub fn with_caps(caps: TierCaps) -> Self {
+        Self::with_caps_arena(caps, SegmentArena::new(DEFAULT_SLOT_BYTES, 64))
+    }
+
+    pub fn with_caps_arena(caps: TierCaps, l2_arena: SegmentArena) -> Self {
         Self {
             caps,
             l0: HashMap::new(),
@@ -108,8 +115,49 @@ impl LocalTierEngine {
             l1_order: VecDeque::new(),
             l2_order: VecDeque::new(),
             pins: HashMap::new(),
+            l2_arena,
             stats: HitStats::default(),
         }
+    }
+
+    pub fn l2_placement(&self, h: &[u8]) -> Option<Placement> {
+        self.l2_arena.placement(h)
+    }
+
+    fn note_l2_present(&mut self, h: &[u8]) {
+        if self.l2_arena.placement(h).is_none() {
+            let _ = self.l2_arena.alloc(h);
+        }
+    }
+
+    fn note_l2_absent(&mut self, h: &[u8]) {
+        let _ = self.l2_arena.free(h);
+    }
+
+    /// Compact one L2 segment. Fails if any resident block is pinned.
+    pub fn compact_l2_segment(&mut self, segment_id: u64) -> Result<Vec<Relocate>, String> {
+        for hash in self.l2_arena.hashes_in_segment(segment_id) {
+            if self.pin_count(&hash) > 0 {
+                return Err("compact: pinned block in segment".into());
+            }
+        }
+        self.l2_arena.compact(segment_id)
+    }
+
+    /// Co-locate move on L2 arena. Fails if pinned or hash not on L2.
+    pub fn colocate_l2_move(
+        &mut self,
+        hash: &[u8],
+        dest_segment: u64,
+        dest_offset: u64,
+    ) -> Result<Relocate, String> {
+        if self.pin_count(hash) > 0 {
+            return Err("colocate: pinned".into());
+        }
+        if !self.l2.contains_key(hash) {
+            return Err("colocate: not on L2".into());
+        }
+        self.l2_arena.relocate(hash, dest_segment, dest_offset)
     }
 
     pub fn caps(&self) -> TierCaps {
@@ -163,6 +211,23 @@ impl LocalTierEngine {
             self.pins.remove(h);
         }
         Ok(())
+    }
+
+    /// Drop a block from all local tiers (PutEnd register/quota failure rollback).
+    ///
+    /// Does **not** reverse collateral L2→L3 demotes of *other* hashes from the
+    /// same `put_durable` window — those stay. Call only for the session's own
+    /// hashes after CP rejected registration (see PutEnd preflight).
+    pub fn discard_settled(&mut self, h: &[u8]) {
+        self.l0.remove(h);
+        self.l1.remove(h);
+        self.l2.remove(h);
+        self.l3.remove(h);
+        self.l0_order.retain(|x| x.as_slice() != h);
+        self.l1_order.retain(|x| x.as_slice() != h);
+        self.l2_order.retain(|x| x.as_slice() != h);
+        self.pins.remove(h);
+        self.note_l2_absent(h);
     }
 
     pub(crate) fn l0_nbytes(&self, h: &[u8]) -> u64 {
@@ -222,8 +287,12 @@ impl LocalTierEngine {
         bytes: &[u8],
     ) -> Result<(LocalTier, TierSideEffects), String> {
         let prior_l2 = self.l2.get(h).cloned();
+        let had_placement = self.l2_arena.placement(h).is_some();
         self.l2.insert(h.to_vec(), bytes.to_vec());
         Self::touch(&mut self.l2_order, h);
+        if !had_placement {
+            self.note_l2_present(h);
+        }
         let l2_demoted_to_l3 = match self.ensure_l2_cap() {
             Ok(d) => d.into_hashes(),
             Err((demoted, e)) => {
@@ -237,11 +306,17 @@ impl LocalTierEngine {
                     None => {
                         self.l2.remove(h);
                         self.l2_order.retain(|x| x.as_slice() != h);
+                        if !had_placement {
+                            self.note_l2_absent(h);
+                        }
                     }
                 }
                 return Err(e);
             }
         };
+        for victim in &l2_demoted_to_l3 {
+            self.note_l2_absent(victim);
+        }
         let effects = TierSideEffects {
             l0_demoted: Vec::new(),
             l2_demoted_to_l3,
@@ -250,6 +325,7 @@ impl LocalTierEngine {
             Ok((LocalTier::L2, effects))
         } else if self.l3.contains_key(h) {
             // This hash itself was immediately demoted under L2 cap → L3 only.
+            self.note_l2_absent(h);
             Ok((LocalTier::L3, effects))
         } else {
             Err("put_durable: block lost after L2 cap demote".into())
@@ -310,6 +386,7 @@ impl LocalTierEngine {
             }
             self.l2.insert(d.hash.clone(), d.l2_bytes.clone());
             Self::touch(&mut self.l2_order, &d.hash);
+            self.note_l2_present(&d.hash);
         }
     }
 
@@ -367,12 +444,19 @@ impl LocalTierEngine {
         if !self.l2.contains_key(h) && self.l3.contains_key(h) {
             self.l2.insert(h.to_vec(), bytes.clone());
             Self::touch(&mut self.l2_order, h);
+            self.note_l2_present(h);
             match self.ensure_l2_cap() {
-                Ok(d) => effects.l2_demoted_to_l3 = d.into_hashes(),
+                Ok(d) => {
+                    for victim in &d.0 {
+                        self.note_l2_absent(&victim.hash);
+                    }
+                    effects.l2_demoted_to_l3 = d.into_hashes();
+                }
                 Err((demoted, e)) => {
                     self.undo_l2_demotes(&demoted);
                     self.l2.remove(h);
                     self.l2_order.retain(|x| x.as_slice() != h);
+                    self.note_l2_absent(h);
                     return Err(e);
                 }
             }
@@ -475,6 +559,7 @@ impl LocalTierEngine {
         let n = bytes.len() as u64;
         self.l2_order.retain(|x| x.as_slice() != h);
         self.l3.insert(h.to_vec(), bytes);
+        self.note_l2_absent(h);
         Ok(n)
     }
 }

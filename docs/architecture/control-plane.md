@@ -23,6 +23,61 @@ lake 原定"位置视图进 etcd 强一致"。但位置变更含**满块注册**
 
 为什么这合理（强一致 ≠ 必须进 etcd、不丢 ≠ 强一致、三档一致性分级）的理论依据见 [`consistency.md`](consistency.md) §8。本节只给结论，它是下文 Router 镜像方案选择的前提。
 
+### 控制面模块图
+
+```mermaid
+flowchart TB
+    subgraph callers["外部调用方"]
+        router["Go Router\n本地 view mirror"]
+        agent["storage-agent\ncompute / KV Node"]
+        admin["Admin / test client\nquota / GC / defrag / shard"]
+    end
+
+    subgraph cp["Rust Storage Control Plane"]
+        service["ControlPlaneService gRPC"]
+        viewStream["View stream\nsnapshot + incremental events"]
+        authority["Authority\nsingle-writer in-memory truth"]
+
+        subgraph indexes["Authority 内部索引"]
+            namespace["model namespace\nmodel_id + revision"]
+            radix["prefix radix\nblock lineage"]
+            locations["location view\nL0 / L1 / L2 + l3_present"]
+            refs["ref state\nglobal_refs + node_refs + inactive"]
+            quota["quota / admission\nsoft + hard + borrowing"]
+            reconcile["GC / reconcile\norphans + cold blocks"]
+            defrag["defrag planner\ncompact + colocate"]
+            shard["shard ring\njoin + drain + remove"]
+        end
+
+        checkpoint["CheckpointStore\nstate snapshot"]
+
+        service --> authority
+        authority --> namespace
+        authority --> radix
+        authority --> locations
+        authority --> refs
+        authority --> quota
+        authority --> reconcile
+        authority --> defrag
+        authority --> shard
+        authority --> viewStream
+        authority --> checkpoint
+    end
+
+    etcd[("etcd\nleader lease + checkpoint")]
+    l3[("L3 Object Store\nSSOT data")]
+
+    router <-->|"Locate / view updates"| service
+    agent <-->|"Register / ReportRef / Barrier"| service
+    admin <-->|"SetQuota / TriggerGC / Defrag / Shard"| service
+    viewStream --> router
+    viewStream --> agent
+    checkpoint <-->|"低频保存 / 恢复"| etcd
+    locations -->|"l3_present only"| l3
+```
+
+图中只有 `Authority` 是全局提交态 KV 元数据权威。Router 和 agent 的 global view mirror 都是只读派生视图,用于降低跨节点可见状态的查询成本；agent 另有本机可写的 local overlay（slot/free-list/local ref/L1-L2 本地状态）,热路径先写本地 overlay,再以事件/批量提交方式更新 `Authority`。etcd 只承载 leader lease 与降频 checkpoint,不在每次命中判断中做强一致读写。
+
 ## Router 持位置视图镜像（对应 #4）
 
 Dynamo router 维护**本地 radix 树副本**（每 router 实例一份），更新路径（`lib/kv-router/src/services/indexer/listener.rs`）：
@@ -80,11 +135,11 @@ Dynamo router 维护**本地 radix 树副本**（每 router 实例一份），�
 
 ```mermaid
 flowchart TB
-    L1["控制面 leader (活)"] -->|"keepalive"| ETCD_HA[("etcd<br/>/lake/storage/leader lease<br/>+ 降频 checkpoint")]
+    L1["控制面 leader (活)"] -->|"keepalive"| ETCD_HA[("etcd\n/lake/storage/leader lease\n+ 降频 checkpoint")]
     L2["standby 控制面"] -.->|"抢 lease (leader 死)"| ETCD_HA
-    L2 -->|"从 checkpoint 重建内存权威<br/>radix + 位置视图 + ref"| L2B["新 leader"]
-    L2B --> ROUTER["Router/agent 镜像: 仍在<br/>选路不中断, 只是更陈旧"]
-    L2B --> AGENT["agent 搬 KV: 查权威重试<br/>stream resume + gap replay"]
+    L2 -->|"从 checkpoint 重建内存权威\nradix + 位置视图 + ref"| L2B["新 leader"]
+    L2B --> ROUTER["Router/agent 镜像: 仍在\n选路不中断, 只是更陈旧"]
+    L2B --> AGENT["agent 搬 KV: 查权威重试\nstream resume + gap replay"]
 ```
 
 **选主**：etcd lease + keepalive（仿 Mooncake `EtcdLeaderCoordinator`，`ha/leadership/leader_coordinator.h`）。控制面进程启动抢 `/lake/storage/leader` lease（TTL），抢到为 leader，余 standby；leader 周期 keepalive，lease 过期 → standby 抢。**Raft 在 etcd 内，控制面不自研 Raft**。

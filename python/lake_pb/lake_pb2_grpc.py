@@ -34,7 +34,9 @@ class ControlPlaneServiceStub:
     3 个 service 按通信边划分:
     ControlPlaneService — 边3/4/5:Router+agent ↔ 存储控制面(控制面进程实现)
     AgentService        — 边10:Router/控制面 → agent(agent 进程实现)
-    TransferService     — 边7/8:RDMA 传输的控制信令(数据旁路;**agent / KV Node agent 实现,非控制面**)
+    TransferService     — 边7/8:传输控制信令(字节旁路;**agent / KV Node agent 实现,非控制面**)
+    P4:TcpTransport(gRPC 字节走 TcpDataService);P5:RdmaTransport
+    TcpDataService      — TCP 退化数据面(Put/Get bytes;对齐 Mooncake MC_FORCE_TCP fallback)
 
     参考:
     - Dynamo protocols.rs::RouterRequest/RouterResponse/Placement(路由协议 + 命中量化)
@@ -68,6 +70,11 @@ class ControlPlaneServiceStub:
                 request_serializer=lake__pb2.LocateRequest.SerializeToString,
                 response_deserializer=lake__pb2.LocateResponse.FromString,
                 _registered_method=True)
+        self.AdmitRegisterBlocks = channel.unary_unary(
+                '/lake.ControlPlaneService/AdmitRegisterBlocks',
+                request_serializer=lake__pb2.RegisterBlocksRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
         self.RegisterBlocks = channel.unary_unary(
                 '/lake.ControlPlaneService/RegisterBlocks',
                 request_serializer=lake__pb2.RegisterBlocksRequest.SerializeToString,
@@ -88,6 +95,76 @@ class ControlPlaneServiceStub:
                 request_serializer=lake__pb2.LeaseHeartbeat.SerializeToString,
                 response_deserializer=lake__pb2.LeaseAck.FromString,
                 _registered_method=True)
+        self.RegisterModel = channel.unary_unary(
+                '/lake.ControlPlaneService/RegisterModel',
+                request_serializer=lake__pb2.RegisterModelRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
+        self.DeregisterModel = channel.unary_unary(
+                '/lake.ControlPlaneService/DeregisterModel',
+                request_serializer=lake__pb2.DeregisterModelRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
+        self.SetModelQuota = channel.unary_unary(
+                '/lake.ControlPlaneService/SetModelQuota',
+                request_serializer=lake__pb2.SetModelQuotaRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
+        self.GetModelQuota = channel.unary_unary(
+                '/lake.ControlPlaneService/GetModelQuota',
+                request_serializer=lake__pb2.GetModelQuotaRequest.SerializeToString,
+                response_deserializer=lake__pb2.GetModelQuotaResponse.FromString,
+                _registered_method=True)
+        self.ReconcileOrphans = channel.unary_unary(
+                '/lake.ControlPlaneService/ReconcileOrphans',
+                request_serializer=lake__pb2.ReconcileOrphansRequest.SerializeToString,
+                response_deserializer=lake__pb2.ReconcileOrphansResponse.FromString,
+                _registered_method=True)
+        self.DiscardBlocks = channel.unary_unary(
+                '/lake.ControlPlaneService/DiscardBlocks',
+                request_serializer=lake__pb2.DiscardBlocksRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
+        self.SaveCheckpoint = channel.unary_unary(
+                '/lake.ControlPlaneService/SaveCheckpoint',
+                request_serializer=lake__pb2.SaveCheckpointRequest.SerializeToString,
+                response_deserializer=lake__pb2.SaveCheckpointResponse.FromString,
+                _registered_method=True)
+        self.RestoreCheckpoint = channel.unary_unary(
+                '/lake.ControlPlaneService/RestoreCheckpoint',
+                request_serializer=lake__pb2.RestoreCheckpointRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
+        self.TriggerDefrag = channel.unary_unary(
+                '/lake.ControlPlaneService/TriggerDefrag',
+                request_serializer=lake__pb2.TriggerDefragRequest.SerializeToString,
+                response_deserializer=lake__pb2.TriggerDefragResponse.FromString,
+                _registered_method=True)
+        self.PauseBackground = channel.unary_unary(
+                '/lake.ControlPlaneService/PauseBackground',
+                request_serializer=lake__pb2.PauseBackgroundRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
+        self.GetShardMap = channel.unary_unary(
+                '/lake.ControlPlaneService/GetShardMap',
+                request_serializer=lake__pb2.GetShardMapRequest.SerializeToString,
+                response_deserializer=lake__pb2.GetShardMapResponse.FromString,
+                _registered_method=True)
+        self.JoinShardNode = channel.unary_unary(
+                '/lake.ControlPlaneService/JoinShardNode',
+                request_serializer=lake__pb2.JoinShardNodeRequest.SerializeToString,
+                response_deserializer=lake__pb2.JoinShardNodeResponse.FromString,
+                _registered_method=True)
+        self.DrainShardNode = channel.unary_unary(
+                '/lake.ControlPlaneService/DrainShardNode',
+                request_serializer=lake__pb2.DrainShardNodeRequest.SerializeToString,
+                response_deserializer=lake__pb2.DrainShardNodeResponse.FromString,
+                _registered_method=True)
+        self.RemoveShardNode = channel.unary_unary(
+                '/lake.ControlPlaneService/RemoveShardNode',
+                request_serializer=lake__pb2.RemoveShardNodeRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
 
 
 class ControlPlaneServiceServicer:
@@ -99,7 +176,9 @@ class ControlPlaneServiceServicer:
     3 个 service 按通信边划分:
     ControlPlaneService — 边3/4/5:Router+agent ↔ 存储控制面(控制面进程实现)
     AgentService        — 边10:Router/控制面 → agent(agent 进程实现)
-    TransferService     — 边7/8:RDMA 传输的控制信令(数据旁路;**agent / KV Node agent 实现,非控制面**)
+    TransferService     — 边7/8:传输控制信令(字节旁路;**agent / KV Node agent 实现,非控制面**)
+    P4:TcpTransport(gRPC 字节走 TcpDataService);P5:RdmaTransport
+    TcpDataService      — TCP 退化数据面(Put/Get bytes;对齐 Mooncake MC_FORCE_TCP fallback)
 
     参考:
     - Dynamo protocols.rs::RouterRequest/RouterResponse/Placement(路由协议 + 命中量化)
@@ -139,12 +218,24 @@ class ControlPlaneServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def AdmitRegisterBlocks(self, request, context):
+        """P4.6:配额写前准入(方案 A)。纯检查、不 reserve、不改位置视图。
+        对齐 Mooncake PutStart 的「写前问 Master」公开边界;无 reserved 占座(Reserve* → 多进程/P4.7)。
+        agent 须在 flush durable **之前**调用;触硬 → Ack.ok=false + backpressure。
+        请求体复用 RegisterBlocksRequest(只读 model/revision/pool_kind/block hashes 计费;
+        locations/l3_present 可空)。与进程内 ControlPlanePort::admit_register_blocks 同语义。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def RegisterBlocks(self, request, context):
         """满块注册:**耐久性由 agent 本地完成**(写 L2 durable)后,只调一次本 RPC = PutEnd。
-        PutStart 不进控制面(agent 本地记账即可),防半块被读。仿 Mooncake PutEnd 的控制面侧。
-        release 一致,写控制面内存,不进 etcd。
+        **可见性** PutStart(半块本地记账、防脏读)仍不进控制面; **配额** 写前走 AdmitRegisterBlocks。
+        仿 Mooncake PutEnd 的控制面侧。release 一致,写控制面内存,不进 etcd。
         与 Publish 的区别:Publish(可多次、逐层 slice)只更新位置视图;RegisterBlocks(满块 + L2 durable)才进 radix + 置 l3_present/L2。
         P4.2:须带 prefix_hashes 全链以便控制面建 PositionalLineageHash;`blocks` 可为 miss 后缀。
+        P4.6:触硬 → ok=false + backpressure;建议先 AdmitRegisterBlocks 再 flush。
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -177,6 +268,109 @@ class ControlPlaneServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def RegisterModel(self, request, context):
+        """P4.5:多模型生命周期(F11)。注册登记 (model_id, revision) 命名空间 + 元数据;
+        下线级联删该命名空间 radix 子树 + 位置视图(字节 GC → P4.7)。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DeregisterModel(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SetModelQuota(self, request, context):
+        """P4.6:按模型软/硬配额 + 借用 + 背压(F11)。配额挂 (model_id, revision) 命名空间。
+        触硬配额 → Ack.backpressure 上报;请求级 shedding 仍归 gateway,池内不拒请求。
+        写路径:AdmitRegisterBlocks(写前) / RegisterBlocks(写后确认) 均可带 backpressure。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetModelQuota(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReconcileOrphans(self, request, context):
+        """P4.7:GC + 崩溃 reconcile(F11)。
+        - 上报/扫孤儿(对齐 Mooncake put_start_discard_timeout zombie);
+        - dead_node_id → 节点级 reconcile(清该节点 ref + 摘 L0;兜底 writeback 泄漏);
+        - gc_cold_limit → 冷块摘 L0/L1(留 L2/L3 durable 后盾);
+        - 元数据先于字节删:Response 列出待删 id,agent/kv-pool 再删 bytes。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DiscardBlocks(self, request, context):
+        """显式摘块(元数据);返回 Ack 后调用方删字节。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def SaveCheckpoint(self, request, context):
+        """降频 checkpoint(P4=内存 mock;真 etcd → P6)。Save 写出快照;Restore 重建权威。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RestoreCheckpoint(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def TriggerDefrag(self, request, context):
+        """P4.8:碎片整理(F11)。逻辑共置 + 物理压实计划;执行走 agent TierPipeline + BandwidthPool。
+        返回 planned moves;字节搬迁/段压实在存储层,CP 只出计划并在 Moved 后更新 Location。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def PauseBackground(self, request, context):
+        """暂停/恢复共享后台带宽池(promote/demote/GC/defrag,<10%)。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def GetShardMap(self, request, context):
+        """P4.9:一致性哈希分片(F11 扩缩)。单测模拟环/最小迁移/Drain;真跨机字节迁移 → P5。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def JoinShardNode(self, request, context):
+        """加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def DrainShardNode(self, request, context):
+        """缩容:标记 Drain + 迁出计划 + 需先推 L2 的 block 列表(逻辑;字节迁移 P5)。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def RemoveShardNode(self, request, context):
+        """Drain 完成后从环移除(无剩余所有权时)。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
 
 def add_ControlPlaneServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
@@ -194,6 +388,11 @@ def add_ControlPlaneServiceServicer_to_server(servicer, server):
                     servicer.Locate,
                     request_deserializer=lake__pb2.LocateRequest.FromString,
                     response_serializer=lake__pb2.LocateResponse.SerializeToString,
+            ),
+            'AdmitRegisterBlocks': grpc.unary_unary_rpc_method_handler(
+                    servicer.AdmitRegisterBlocks,
+                    request_deserializer=lake__pb2.RegisterBlocksRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
             ),
             'RegisterBlocks': grpc.unary_unary_rpc_method_handler(
                     servicer.RegisterBlocks,
@@ -215,6 +414,76 @@ def add_ControlPlaneServiceServicer_to_server(servicer, server):
                     request_deserializer=lake__pb2.LeaseHeartbeat.FromString,
                     response_serializer=lake__pb2.LeaseAck.SerializeToString,
             ),
+            'RegisterModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.RegisterModel,
+                    request_deserializer=lake__pb2.RegisterModelRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
+            'DeregisterModel': grpc.unary_unary_rpc_method_handler(
+                    servicer.DeregisterModel,
+                    request_deserializer=lake__pb2.DeregisterModelRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
+            'SetModelQuota': grpc.unary_unary_rpc_method_handler(
+                    servicer.SetModelQuota,
+                    request_deserializer=lake__pb2.SetModelQuotaRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
+            'GetModelQuota': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetModelQuota,
+                    request_deserializer=lake__pb2.GetModelQuotaRequest.FromString,
+                    response_serializer=lake__pb2.GetModelQuotaResponse.SerializeToString,
+            ),
+            'ReconcileOrphans': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReconcileOrphans,
+                    request_deserializer=lake__pb2.ReconcileOrphansRequest.FromString,
+                    response_serializer=lake__pb2.ReconcileOrphansResponse.SerializeToString,
+            ),
+            'DiscardBlocks': grpc.unary_unary_rpc_method_handler(
+                    servicer.DiscardBlocks,
+                    request_deserializer=lake__pb2.DiscardBlocksRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
+            'SaveCheckpoint': grpc.unary_unary_rpc_method_handler(
+                    servicer.SaveCheckpoint,
+                    request_deserializer=lake__pb2.SaveCheckpointRequest.FromString,
+                    response_serializer=lake__pb2.SaveCheckpointResponse.SerializeToString,
+            ),
+            'RestoreCheckpoint': grpc.unary_unary_rpc_method_handler(
+                    servicer.RestoreCheckpoint,
+                    request_deserializer=lake__pb2.RestoreCheckpointRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
+            'TriggerDefrag': grpc.unary_unary_rpc_method_handler(
+                    servicer.TriggerDefrag,
+                    request_deserializer=lake__pb2.TriggerDefragRequest.FromString,
+                    response_serializer=lake__pb2.TriggerDefragResponse.SerializeToString,
+            ),
+            'PauseBackground': grpc.unary_unary_rpc_method_handler(
+                    servicer.PauseBackground,
+                    request_deserializer=lake__pb2.PauseBackgroundRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
+            'GetShardMap': grpc.unary_unary_rpc_method_handler(
+                    servicer.GetShardMap,
+                    request_deserializer=lake__pb2.GetShardMapRequest.FromString,
+                    response_serializer=lake__pb2.GetShardMapResponse.SerializeToString,
+            ),
+            'JoinShardNode': grpc.unary_unary_rpc_method_handler(
+                    servicer.JoinShardNode,
+                    request_deserializer=lake__pb2.JoinShardNodeRequest.FromString,
+                    response_serializer=lake__pb2.JoinShardNodeResponse.SerializeToString,
+            ),
+            'DrainShardNode': grpc.unary_unary_rpc_method_handler(
+                    servicer.DrainShardNode,
+                    request_deserializer=lake__pb2.DrainShardNodeRequest.FromString,
+                    response_serializer=lake__pb2.DrainShardNodeResponse.SerializeToString,
+            ),
+            'RemoveShardNode': grpc.unary_unary_rpc_method_handler(
+                    servicer.RemoveShardNode,
+                    request_deserializer=lake__pb2.RemoveShardNodeRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
             'lake.ControlPlaneService', rpc_method_handlers)
@@ -232,7 +501,9 @@ class ControlPlaneService:
     3 个 service 按通信边划分:
     ControlPlaneService — 边3/4/5:Router+agent ↔ 存储控制面(控制面进程实现)
     AgentService        — 边10:Router/控制面 → agent(agent 进程实现)
-    TransferService     — 边7/8:RDMA 传输的控制信令(数据旁路;**agent / KV Node agent 实现,非控制面**)
+    TransferService     — 边7/8:传输控制信令(字节旁路;**agent / KV Node agent 实现,非控制面**)
+    P4:TcpTransport(gRPC 字节走 TcpDataService);P5:RdmaTransport
+    TcpDataService      — TCP 退化数据面(Put/Get bytes;对齐 Mooncake MC_FORCE_TCP fallback)
 
     参考:
     - Dynamo protocols.rs::RouterRequest/RouterResponse/Placement(路由协议 + 命中量化)
@@ -316,6 +587,33 @@ class ControlPlaneService:
             '/lake.ControlPlaneService/Locate',
             lake__pb2.LocateRequest.SerializeToString,
             lake__pb2.LocateResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def AdmitRegisterBlocks(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/AdmitRegisterBlocks',
+            lake__pb2.RegisterBlocksRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
             options,
             channel_credentials,
             insecure,
@@ -424,6 +722,384 @@ class ControlPlaneService:
             '/lake.ControlPlaneService/Lease',
             lake__pb2.LeaseHeartbeat.SerializeToString,
             lake__pb2.LeaseAck.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RegisterModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/RegisterModel',
+            lake__pb2.RegisterModelRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DeregisterModel(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/DeregisterModel',
+            lake__pb2.DeregisterModelRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SetModelQuota(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/SetModelQuota',
+            lake__pb2.SetModelQuotaRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetModelQuota(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/GetModelQuota',
+            lake__pb2.GetModelQuotaRequest.SerializeToString,
+            lake__pb2.GetModelQuotaResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReconcileOrphans(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/ReconcileOrphans',
+            lake__pb2.ReconcileOrphansRequest.SerializeToString,
+            lake__pb2.ReconcileOrphansResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DiscardBlocks(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/DiscardBlocks',
+            lake__pb2.DiscardBlocksRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def SaveCheckpoint(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/SaveCheckpoint',
+            lake__pb2.SaveCheckpointRequest.SerializeToString,
+            lake__pb2.SaveCheckpointResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RestoreCheckpoint(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/RestoreCheckpoint',
+            lake__pb2.RestoreCheckpointRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def TriggerDefrag(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/TriggerDefrag',
+            lake__pb2.TriggerDefragRequest.SerializeToString,
+            lake__pb2.TriggerDefragResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def PauseBackground(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/PauseBackground',
+            lake__pb2.PauseBackgroundRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def GetShardMap(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/GetShardMap',
+            lake__pb2.GetShardMapRequest.SerializeToString,
+            lake__pb2.GetShardMapResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def JoinShardNode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/JoinShardNode',
+            lake__pb2.JoinShardNodeRequest.SerializeToString,
+            lake__pb2.JoinShardNodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def DrainShardNode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/DrainShardNode',
+            lake__pb2.DrainShardNodeRequest.SerializeToString,
+            lake__pb2.DrainShardNodeResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def RemoveShardNode(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/RemoveShardNode',
+            lake__pb2.RemoveShardNodeRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
             options,
             channel_credentials,
             insecure,
@@ -610,8 +1286,10 @@ class AgentService:
 
 class TransferServiceStub:
     """=============================================================================
-    TransferService — 边7/8:RDMA 传输的控制信令(字节走 RDMA 旁路)
+    TransferService — 边7/8:传输控制信令(字节走数据面旁路)
     =============================================================================
+    P4.4:接线 TcpTransport(单进程本地拷贝 / gRPC TcpDataService 字节搬运)。
+    P5:同 API 换 RdmaTransport(Mooncake FFI),业务零改。
     """
 
     def __init__(self, channel):
@@ -630,32 +1308,58 @@ class TransferServiceStub:
                 request_serializer=lake__pb2.TransferStatusRequest.SerializeToString,
                 response_deserializer=lake__pb2.TransferStatusResponse.FromString,
                 _registered_method=True)
+        self.FreeBatch = channel.unary_unary(
+                '/lake.TransferService/FreeBatch',
+                request_serializer=lake__pb2.FreeBatchRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
         self.Pull = channel.unary_unary(
                 '/lake.TransferService/Pull',
                 request_serializer=lake__pb2.PullRequest.SerializeToString,
                 response_deserializer=lake__pb2.PullResponse.FromString,
+                _registered_method=True)
+        self.FreePull = channel.unary_unary(
+                '/lake.TransferService/FreePull',
+                request_serializer=lake__pb2.FreePullRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
                 _registered_method=True)
         self.Publish = channel.unary_unary(
                 '/lake.TransferService/Publish',
                 request_serializer=lake__pb2.PublishRequest.SerializeToString,
                 response_deserializer=lake__pb2.Ack.FromString,
                 _registered_method=True)
+        self.FreePublish = channel.unary_unary(
+                '/lake.TransferService/FreePublish',
+                request_serializer=lake__pb2.FreePublishRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
 
 
 class TransferServiceServicer:
     """=============================================================================
-    TransferService — 边7/8:RDMA 传输的控制信令(字节走 RDMA 旁路)
+    TransferService — 边7/8:传输控制信令(字节走数据面旁路)
     =============================================================================
+    P4.4:接线 TcpTransport(单进程本地拷贝 / gRPC TcpDataService 字节搬运)。
+    P5:同 API 换 RdmaTransport(Mooncake FFI),业务零改。
     """
 
     def SubmitTransfer(self, request, context):
-        """仿 Mooncake:allocateBatchID → submitTransfer(batch,{TransferRequest}) → getTransferStatus。
+        """仿 Mooncake TransferEngine:
+        allocateBatchID → submitTransfer(batch,{TransferRequest}) → getTransferStatus → freeBatchID。
+        SubmitTransfer = allocate + submit(返回 batch_id);task_id = 批内下标。
+        调用方查完 status 后须 FreeBatch(对齐 Mooncake freeBatchID),否则 batches 表泄漏。
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
     def GetTransferStatus(self, request, context):
+        """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def FreeBatch(self, request, context):
         """Missing associated documentation comment in .proto file."""
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -670,8 +1374,23 @@ class TransferServiceServicer:
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
 
+    def FreePull(self, request, context):
+        """释放 Pull handle + 其目标段(TcpTransport arena);不调用则 handle/段按 Pull 次数泄漏。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
     def Publish(self, request, context):
         """Missing associated documentation comment in .proto file."""
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def FreePublish(self, request, context):
+        """释放某 request_id 的 PublishStream(seq fence + layer 累计);对齐 FreeBatch 生命周期。
+        不调用则按请求数常驻增长(复审 should-fix)。请求结束 / barrier 后应调一次。
+        """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
         raise NotImplementedError('Method not implemented!')
@@ -689,14 +1408,29 @@ def add_TransferServiceServicer_to_server(servicer, server):
                     request_deserializer=lake__pb2.TransferStatusRequest.FromString,
                     response_serializer=lake__pb2.TransferStatusResponse.SerializeToString,
             ),
+            'FreeBatch': grpc.unary_unary_rpc_method_handler(
+                    servicer.FreeBatch,
+                    request_deserializer=lake__pb2.FreeBatchRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
             'Pull': grpc.unary_unary_rpc_method_handler(
                     servicer.Pull,
                     request_deserializer=lake__pb2.PullRequest.FromString,
                     response_serializer=lake__pb2.PullResponse.SerializeToString,
             ),
+            'FreePull': grpc.unary_unary_rpc_method_handler(
+                    servicer.FreePull,
+                    request_deserializer=lake__pb2.FreePullRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
             'Publish': grpc.unary_unary_rpc_method_handler(
                     servicer.Publish,
                     request_deserializer=lake__pb2.PublishRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
+            'FreePublish': grpc.unary_unary_rpc_method_handler(
+                    servicer.FreePublish,
+                    request_deserializer=lake__pb2.FreePublishRequest.FromString,
                     response_serializer=lake__pb2.Ack.SerializeToString,
             ),
     }
@@ -709,8 +1443,10 @@ def add_TransferServiceServicer_to_server(servicer, server):
  # This class is part of an EXPERIMENTAL API.
 class TransferService:
     """=============================================================================
-    TransferService — 边7/8:RDMA 传输的控制信令(字节走 RDMA 旁路)
+    TransferService — 边7/8:传输控制信令(字节走数据面旁路)
     =============================================================================
+    P4.4:接线 TcpTransport(单进程本地拷贝 / gRPC TcpDataService 字节搬运)。
+    P5:同 API 换 RdmaTransport(Mooncake FFI),业务零改。
     """
 
     @staticmethod
@@ -768,6 +1504,33 @@ class TransferService:
             _registered_method=True)
 
     @staticmethod
+    def FreeBatch(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.TransferService/FreeBatch',
+            lake__pb2.FreeBatchRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
     def Pull(request,
             target,
             options=(),
@@ -784,6 +1547,33 @@ class TransferService:
             '/lake.TransferService/Pull',
             lake__pb2.PullRequest.SerializeToString,
             lake__pb2.PullResponse.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def FreePull(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.TransferService/FreePull',
+            lake__pb2.FreePullRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
             options,
             channel_credentials,
             insecure,
@@ -821,16 +1611,43 @@ class TransferService:
             metadata,
             _registered_method=True)
 
+    @staticmethod
+    def FreePublish(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.TransferService/FreePublish',
+            lake__pb2.FreePublishRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
 
-class SkeletonKvServiceStub:
+
+class TcpDataServiceStub:
     """=============================================================================
-    P3 skeleton-only services(验证三语言联通;生产路径见上方注释)
+    TcpDataService — TCP 退化数据面(P4.4 正名自 P3 SkeletonKvService)
     =============================================================================
 
-    SkeletonKvService — mock KV **字节**走 gRPC。
-    生产:字节走 RDMA 旁路(边7/8),proto 只有控制信令。
-    P3:无 RDMA/PyO3 时用本 service 把不透明 bytes 写入 Rust 内存池,验证跨语言 KV 流转。
-    P4 起由 TransferService + 数据面取代,本 service 可删或留 debug。
+    对齐 Mooncake `MC_FORCE_TCP` / `installTransport("tcp")` fallback:
+    无 RDMA 时 KV **字节**走 gRPC Put/Get(CPU 拷贝,非零拷贝)。
+    TransferService 控制信令 + TcpTransport 可经本 service 搬字节;
+    P5 真 RDMA 旁路后本 service 仍作 TCP 退化路径保留。
     """
 
     def __init__(self, channel):
@@ -840,26 +1657,26 @@ class SkeletonKvServiceStub:
             channel: A grpc.Channel.
         """
         self.PutBlocks = channel.unary_unary(
-                '/lake.SkeletonKvService/PutBlocks',
+                '/lake.TcpDataService/PutBlocks',
                 request_serializer=lake__pb2.PutBlocksRequest.SerializeToString,
                 response_deserializer=lake__pb2.Ack.FromString,
                 _registered_method=True)
         self.GetBlocks = channel.unary_unary(
-                '/lake.SkeletonKvService/GetBlocks',
+                '/lake.TcpDataService/GetBlocks',
                 request_serializer=lake__pb2.GetBlocksRequest.SerializeToString,
                 response_deserializer=lake__pb2.GetBlocksResponse.FromString,
                 _registered_method=True)
 
 
-class SkeletonKvServiceServicer:
+class TcpDataServiceServicer:
     """=============================================================================
-    P3 skeleton-only services(验证三语言联通;生产路径见上方注释)
+    TcpDataService — TCP 退化数据面(P4.4 正名自 P3 SkeletonKvService)
     =============================================================================
 
-    SkeletonKvService — mock KV **字节**走 gRPC。
-    生产:字节走 RDMA 旁路(边7/8),proto 只有控制信令。
-    P3:无 RDMA/PyO3 时用本 service 把不透明 bytes 写入 Rust 内存池,验证跨语言 KV 流转。
-    P4 起由 TransferService + 数据面取代,本 service 可删或留 debug。
+    对齐 Mooncake `MC_FORCE_TCP` / `installTransport("tcp")` fallback:
+    无 RDMA 时 KV **字节**走 gRPC Put/Get(CPU 拷贝,非零拷贝)。
+    TransferService 控制信令 + TcpTransport 可经本 service 搬字节;
+    P5 真 RDMA 旁路后本 service 仍作 TCP 退化路径保留。
     """
 
     def PutBlocks(self, request, context):
@@ -875,7 +1692,7 @@ class SkeletonKvServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
 
-def add_SkeletonKvServiceServicer_to_server(servicer, server):
+def add_TcpDataServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'PutBlocks': grpc.unary_unary_rpc_method_handler(
                     servicer.PutBlocks,
@@ -889,21 +1706,21 @@ def add_SkeletonKvServiceServicer_to_server(servicer, server):
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
-            'lake.SkeletonKvService', rpc_method_handlers)
+            'lake.TcpDataService', rpc_method_handlers)
     server.add_generic_rpc_handlers((generic_handler,))
-    server.add_registered_method_handlers('lake.SkeletonKvService', rpc_method_handlers)
+    server.add_registered_method_handlers('lake.TcpDataService', rpc_method_handlers)
 
 
  # This class is part of an EXPERIMENTAL API.
-class SkeletonKvService:
+class TcpDataService:
     """=============================================================================
-    P3 skeleton-only services(验证三语言联通;生产路径见上方注释)
+    TcpDataService — TCP 退化数据面(P4.4 正名自 P3 SkeletonKvService)
     =============================================================================
 
-    SkeletonKvService — mock KV **字节**走 gRPC。
-    生产:字节走 RDMA 旁路(边7/8),proto 只有控制信令。
-    P3:无 RDMA/PyO3 时用本 service 把不透明 bytes 写入 Rust 内存池,验证跨语言 KV 流转。
-    P4 起由 TransferService + 数据面取代,本 service 可删或留 debug。
+    对齐 Mooncake `MC_FORCE_TCP` / `installTransport("tcp")` fallback:
+    无 RDMA 时 KV **字节**走 gRPC Put/Get(CPU 拷贝,非零拷贝)。
+    TransferService 控制信令 + TcpTransport 可经本 service 搬字节;
+    P5 真 RDMA 旁路后本 service 仍作 TCP 退化路径保留。
     """
 
     @staticmethod
@@ -920,7 +1737,7 @@ class SkeletonKvService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/lake.SkeletonKvService/PutBlocks',
+            '/lake.TcpDataService/PutBlocks',
             lake__pb2.PutBlocksRequest.SerializeToString,
             lake__pb2.Ack.FromString,
             options,
@@ -947,7 +1764,7 @@ class SkeletonKvService:
         return grpc.experimental.unary_unary(
             request,
             target,
-            '/lake.SkeletonKvService/GetBlocks',
+            '/lake.TcpDataService/GetBlocks',
             lake__pb2.GetBlocksRequest.SerializeToString,
             lake__pb2.GetBlocksResponse.FromString,
             options,
@@ -964,7 +1781,7 @@ class SkeletonKvService:
 class WorkerServiceStub:
     """WorkerService — 计算层 Generate。
     生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
-    P3:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + SkeletonKv。
+    P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
     执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;**mode 固定 COLOCATED**。
     """
 
@@ -984,7 +1801,7 @@ class WorkerServiceStub:
 class WorkerServiceServicer:
     """WorkerService — 计算层 Generate。
     生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
-    P3:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + SkeletonKv。
+    P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
     执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;**mode 固定 COLOCATED**。
     """
 
@@ -1013,7 +1830,7 @@ def add_WorkerServiceServicer_to_server(servicer, server):
 class WorkerService:
     """WorkerService — 计算层 Generate。
     生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
-    P3:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + SkeletonKv。
+    P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
     执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;**mode 固定 COLOCATED**。
     """
 
