@@ -287,6 +287,7 @@ impl LocalTierEngine {
         bytes: &[u8],
     ) -> Result<(LocalTier, TierSideEffects), String> {
         let prior_l2 = self.l2.get(h).cloned();
+        let prior_l2_order = self.l2_order.clone();
         let had_placement = self.l2_arena.placement(h).is_some();
         self.l2.insert(h.to_vec(), bytes.to_vec());
         Self::touch(&mut self.l2_order, h);
@@ -311,6 +312,7 @@ impl LocalTierEngine {
                         }
                     }
                 }
+                self.l2_order = prior_l2_order;
                 return Err(e);
             }
         };
@@ -720,11 +722,13 @@ mod tests {
         e.l2_order.push_back(b"z".to_vec());
         e.pin(b"z");
         assert_eq!(e.l2_len(), 3);
+        let prior_order = e.l2_order.clone();
         let err = e.put_durable(b"y", b"NEW").unwrap_err();
         assert!(err.contains("pinned"), "{err}");
         assert_eq!(e.get(b"y"), Some(b"OLD".as_slice()));
         assert!(e.is_l2_durable(b"y"));
         assert!(!e.l3_present(b"y"));
+        assert_eq!(e.l2_order, prior_order);
     }
 
     #[test]
@@ -746,6 +750,7 @@ mod tests {
         e.l2_order.push_back(b"z".to_vec());
         e.pin(b"z");
         assert_eq!(e.l2_len(), 3);
+        let prior_order = e.l2_order.clone();
         let err = e.put_durable(b"y", b"Y").unwrap_err();
         assert!(err.contains("pinned"), "{err}");
         assert!(!e.l3_present(b"y") && !e.is_settled(b"y"));
@@ -753,5 +758,6 @@ mod tests {
         assert!(e.is_l2_durable(b"w"), "w restored to L2");
         assert!(!e.l3_present(b"w"), "w not left on L3");
         assert_eq!(e.get(b"w"), Some(b"W".as_slice()));
+        assert_eq!(e.l2_order, prior_order);
     }
 }

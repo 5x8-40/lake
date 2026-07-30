@@ -557,30 +557,56 @@ impl Authority {
         delta: &RefDelta,
         track_node: bool,
     ) -> Result<(), String> {
-        self.check_report_ref(delta)?;
+        let target = self.ref_target(delta)?;
         let id = delta.id.as_ref().expect("checked");
-        let pk = resolve_pool_kind(id.pool_kind).expect("checked");
-        let key = NamespaceKey::from_id(id);
-        let ns = self.namespaces.get_mut(&key).expect("checked");
-        let pool = ns.pools.get_mut(&pk).expect("checked");
+        if track_node && !delta.node_id.is_empty() && delta.delta != 0 {
+            let bk = BlockKey::from_id(id);
+            let before = self
+                .node_refs
+                .get(&delta.node_id)
+                .and_then(|held| held.get(&bk).copied())
+                .unwrap_or(0);
+            let after = before
+                .checked_add(i64::from(delta.delta))
+                .ok_or_else(|| "RefDelta: node_ref overflow".to_string())?;
+            if after < 0 {
+                return Err(format!(
+                    "RefDelta: node_ref underflow for node_id={} model_id={} revision={:?} pool_kind={} block_hash_len={}",
+                    delta.node_id,
+                    id.model_id,
+                    id.revision,
+                    target.pool_kind,
+                    id.block_hash.len()
+                ));
+            }
+        }
+        let ns = self.namespaces.get_mut(&target.key).expect("checked");
+        let pool = ns.pools.get_mut(&target.pool_kind).expect("checked");
         let entry = pool.by_flat.get(&id.block_hash).expect("checked");
-        let seq = entry.seq_hash;
         let block_id = entry.block_id;
 
-        let cur = pool.global_refs.entry(seq).or_insert(0);
+        let cur = pool.global_refs.entry(target.seq).or_insert(0);
         let before = *cur;
-        *cur = cur.saturating_add(i64::from(delta.delta));
-        if *cur < 0 {
-            *cur = 0;
+        let after = before
+            .checked_add(i64::from(delta.delta))
+            .ok_or_else(|| "RefDelta: ref_count overflow".to_string())?;
+        if after < 0 {
+            return Err(format!(
+                "RefDelta: ref_count underflow for model_id={} revision={:?} pool_kind={} block_hash_len={}",
+                id.model_id,
+                id.revision,
+                target.pool_kind,
+                id.block_hash.len()
+            ));
         }
-        let after = *cur;
+        *cur = after;
 
         if before > 0 && after == 0 {
-            if !pool.inactive.has(seq) && pool.inactive.len() < pool.inactive_cap {
-                pool.inactive.insert(seq, block_id);
+            if !pool.inactive.has(target.seq) && pool.inactive.len() < pool.inactive_cap {
+                pool.inactive.insert(target.seq, block_id);
             }
         } else if before == 0 && after > 0 {
-            let _ = pool.inactive.take(seq, block_id);
+            let _ = pool.inactive.take(target.seq, block_id);
         }
 
         if track_node && !delta.node_id.is_empty() && delta.delta != 0 {

@@ -6,7 +6,7 @@
   - KVPool: block 的注册 / 查找 / 引用计数 / 驱逐
 
 这是单进程内存版原型，用于验证前缀复用与引用计数逻辑。
-真实实现见 docs/05-kv-cache-pool.md（RDMA + 分片 KV Node）。
+真实实现见 docs/architecture/kv-cache-pool.md（RDMA + 分片 KV Node）。
 """
 
 from __future__ import annotations

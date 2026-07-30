@@ -22,7 +22,8 @@ mod shard;
 mod tier;
 
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -83,6 +84,7 @@ pub struct ControlPlane {
     checkpoints: Arc<MemoryCheckpointStore>,
     /// Shared pause flag for promote/demote/GC/defrag (agent syncs BandwidthPool).
     background_paused: Arc<Mutex<bool>>,
+    authority_poisoned_reported: Arc<AtomicBool>,
 }
 
 impl ControlPlane {
@@ -95,6 +97,7 @@ impl ControlPlane {
             inner: Arc::new(Mutex::new(Authority::default())),
             checkpoints: Arc::new(store),
             background_paused: Arc::new(Mutex::new(false)),
+            authority_poisoned_reported: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -104,6 +107,27 @@ impl ControlPlane {
 
     pub fn set_background_paused(&self, paused: bool) {
         *self.background_paused.lock().unwrap() = paused;
+    }
+
+    pub fn authority_poisoned_reported(&self) -> bool {
+        self.authority_poisoned_reported.load(Ordering::Relaxed)
+    }
+}
+
+impl ControlPlane {
+    fn lock_authority(&self) -> Result<MutexGuard<'_, Authority>, ()> {
+        self.inner.lock().map_err(|_| {
+            if !self
+                .authority_poisoned_reported
+                .swap(true, Ordering::Relaxed)
+            {
+                eprintln!("controlplane authority lock poisoned; returning INTERNAL until restart");
+            }
+        })
+    }
+
+    fn lock_authority_status(_: ()) -> Status {
+        Status::internal("controlplane authority unavailable")
     }
 }
 
@@ -126,7 +150,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<LookupPrefixRequest>,
     ) -> Result<Response<LookupPrefixResponse>, Status> {
         let req = request.into_inner();
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         let (blocks, hit_length, all_local_hit) = auth.lookup_prefix(
             &req.model_id,
             &req.revision,
@@ -146,7 +170,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<LocateRequest>,
     ) -> Result<Response<LocateResponse>, Status> {
         let req = request.into_inner();
-        let auth = self.inner.lock().unwrap();
+        let auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         let blocks = auth.locate(&req.ids);
         Ok(Response::new(LocateResponse { blocks }))
     }
@@ -166,7 +190,7 @@ impl ControlPlaneService for ControlPlane {
                 }));
             }
         };
-        let auth = self.inner.lock().unwrap();
+        let auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.preflight_register(&keys.model_id, &keys.revision, keys.pool_kind, &keys.hashes)
         {
             Ok(RegisterStatus::Accepted) => Ok(Response::new(Ack {
@@ -195,7 +219,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<RegisterBlocksRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.register(&req.node_id, &req.prefix_hashes, req.blocks) {
             Ok(RegisterStatus::Accepted) => Ok(Response::new(Ack {
                 ok: true,
@@ -227,7 +251,7 @@ impl ControlPlaneService for ControlPlane {
         while let Some(delta) = stream.message().await? {
             deltas.push(delta);
         }
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.report_refs(&deltas) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -247,7 +271,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<RequestBarrierRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         // P4.3: agent must flush L2 + ReportRef(WRITEBACK,-1) before this call.
         match auth.complete_barrier(&req.request_id, &req.node_id) {
             Ok(()) => Ok(Response::new(Ack {
@@ -288,7 +312,7 @@ impl ControlPlaneService for ControlPlane {
                 backpressure: None,
             }));
         };
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.register_model(model) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -308,7 +332,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<DeregisterModelRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.deregister_model(&req.model_id, &req.revision) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -335,7 +359,7 @@ impl ControlPlaneService for ControlPlane {
                 backpressure: None,
             }));
         };
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.set_model_quota(&req.model_id, &req.revision, quota) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -355,7 +379,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<GetModelQuotaRequest>,
     ) -> Result<Response<GetModelQuotaResponse>, Status> {
         let req = request.into_inner();
-        let auth = self.inner.lock().unwrap();
+        let auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.get_model_quota(&req.model_id, &req.revision) {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Ok(Response::new(GetModelQuotaResponse {
@@ -374,7 +398,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<ReconcileOrphansRequest>,
     ) -> Result<Response<ReconcileOrphansResponse>, Status> {
         let req = request.into_inner();
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.reconcile_orphans(&req) {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Ok(Response::new(ReconcileOrphansResponse {
@@ -392,7 +416,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<DiscardBlocksRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.discard_blocks(&req.ids) {
             Ok(_) => Ok(Response::new(Ack {
                 ok: true,
@@ -411,7 +435,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         _request: Request<SaveCheckpointRequest>,
     ) -> Result<Response<SaveCheckpointResponse>, Status> {
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         auth.checkpoint_seq = auth.checkpoint_seq.saturating_add(1);
         let snap = auth.export_snapshot(auth.checkpoint_seq);
         drop(auth);
@@ -455,7 +479,7 @@ impl ControlPlaneService for ControlPlane {
                 }
             }
         };
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.import_snapshot(&snap) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -476,7 +500,7 @@ impl ControlPlaneService for ControlPlane {
     ) -> Result<Response<TriggerDefragResponse>, Status> {
         let req = request.into_inner();
         let mode = DefragMode::try_from(req.mode).unwrap_or(DefragMode::Both);
-        let auth = self.inner.lock().unwrap();
+        let auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.plan_defrag(
             &req.model_id,
             &req.revision,
@@ -519,7 +543,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         _request: Request<GetShardMapRequest>,
     ) -> Result<Response<GetShardMapResponse>, Status> {
-        let auth = self.inner.lock().unwrap();
+        let auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         Ok(Response::new(GetShardMapResponse {
             map: Some(auth.shard_map()),
             ok: true,
@@ -532,7 +556,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<JoinShardNodeRequest>,
     ) -> Result<Response<JoinShardNodeResponse>, Status> {
         let req = request.into_inner();
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.join_shard_node(&req.node_id, req.vnode_count) {
             Ok((map, migrations)) => {
                 let migration_count = migrations.len() as u32;
@@ -559,7 +583,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<DrainShardNodeRequest>,
     ) -> Result<Response<DrainShardNodeResponse>, Status> {
         let req = request.into_inner();
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.drain_shard_node(&req.node_id) {
             Ok((map, migrations, push_l2)) => {
                 let migration_count = migrations.len() as u32;
@@ -588,7 +612,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<RemoveShardNodeRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self.inner.lock().unwrap();
+        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
         match auth.remove_shard_node(&req.node_id) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -1026,6 +1050,86 @@ mod tests {
         let mut auth = Authority::default();
         assert!(auth.complete_barrier("", "n0").is_err());
         assert!(auth.complete_barrier("r", "").is_err());
+    }
+
+    #[test]
+    fn report_ref_underflow_is_rejected() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"under"]);
+        auth.register("n0", &full, vec![meta("m", b"under")])
+            .unwrap();
+        let minus = delta("m", b"under", -1);
+        let err = auth.report_ref(&minus).unwrap_err();
+        assert!(err.contains("underflow"));
+        assert_eq!(
+            auth.global_ref("m", "", PoolKind::Target as i32, b"under"),
+            0
+        );
+        assert_eq!(auth.inactive_len("m", "", PoolKind::Target as i32), 0);
+    }
+
+    #[test]
+    fn report_refs_underflow_is_all_or_nothing() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"ok", b"bad"]);
+        auth.register("n0", &full, vec![meta("m", b"ok"), meta("m", b"bad")])
+            .unwrap();
+        let err = auth
+            .report_refs(&[delta("m", b"ok", 1), delta("m", b"bad", -1)])
+            .unwrap_err();
+        assert!(err.contains("underflow"));
+        assert_eq!(auth.global_ref("m", "", PoolKind::Target as i32, b"ok"), 0);
+        assert_eq!(auth.global_ref("m", "", PoolKind::Target as i32, b"bad"), 0);
+    }
+
+    #[test]
+    fn report_refs_node_underflow_is_all_or_nothing() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"a", b"b"]);
+        auth.register("n0", &full, vec![meta("m", b"a"), meta("m", b"b")])
+            .unwrap();
+        auth.report_ref(&delta("m", b"a", 1)).unwrap();
+
+        let mut wrong_node_release = delta("m", b"a", -1);
+        wrong_node_release.node_id = "n1".into();
+        let err = auth
+            .report_refs(&[delta("m", b"b", 1), wrong_node_release])
+            .unwrap_err();
+        assert!(err.contains("node_ref underflow"));
+        assert_eq!(auth.global_ref("m", "", PoolKind::Target as i32, b"a"), 1);
+        assert_eq!(auth.global_ref("m", "", PoolKind::Target as i32, b"b"), 0);
+    }
+
+    #[test]
+    fn inactive_duplicate_insert_does_not_panic() {
+        use kvbm_logical::{FrequencyTrackingCapacity, InactiveIndex, LineageBackend};
+        let tracker = FrequencyTrackingCapacity::Small.create_tracker();
+        let mut inactive =
+            LineageBackend::with_frequency(4, [3, 8, 15], std::sync::Arc::clone(&tracker) as _)
+                .unwrap();
+        let seq = super::hash_chain::lineage_from_prefix(&prefix(&[b"dup"]))[0];
+        inactive.insert(seq, 1);
+        inactive.insert(seq, 1);
+        assert!(inactive.has(seq));
+    }
+
+    #[tokio::test]
+    async fn poisoned_authority_lock_returns_status() {
+        let cp = ControlPlane::default();
+        let inner = cp.inner.clone();
+        let _ = std::panic::catch_unwind(move || {
+            let _guard = inner.lock().unwrap();
+            panic!("poison authority");
+        });
+        let err = cp
+            .locate(Request::new(LocateRequest { ids: Vec::new() }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Internal);
+        assert!(cp.authority_poisoned_reported());
     }
 
     #[test]

@@ -1,6 +1,6 @@
 """计算层 — Prefill / Decode / Draft 算力池的抽象。
 
-节点无状态（详见 docs/04-compute-layer.md）。
+节点无状态（详见 docs/architecture/compute-layer.md）。
 本原型用伪前向（不调用真实模型）验证池间协作与 KV 流转。
 """
 

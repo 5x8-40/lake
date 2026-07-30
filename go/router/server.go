@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -30,10 +31,14 @@ type Config struct {
 // P3 入口即本服务(边2);不经 Bifrost。
 // LookupPrefix 在 worker 侧完成(直连 ControlPlane)。
 type Server struct {
-	cfg    Config
-	worker lakepb.WorkerServiceClient
-	agent  lakepb.AgentServiceClient
+	cfg        Config
+	worker     lakepb.WorkerServiceClient
+	agent      lakepb.AgentServiceClient
+	workerConn *grpc.ClientConn
+	agentConn  *grpc.ClientConn
 }
+
+const maxChatRequestBytes = 1 << 20
 
 func New(cfg Config) (*Server, error) {
 	if cfg.HTTPAddr == "" {
@@ -51,13 +56,27 @@ func New(cfg Config) (*Server, error) {
 	}
 	aconn, err := grpc.NewClient(cfg.AgentAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
+		_ = wconn.Close()
 		return nil, fmt.Errorf("dial agent: %w", err)
 	}
 	return &Server{
-		cfg:    cfg,
-		worker: lakepb.NewWorkerServiceClient(wconn),
-		agent:  lakepb.NewAgentServiceClient(aconn),
+		cfg:        cfg,
+		worker:     lakepb.NewWorkerServiceClient(wconn),
+		agent:      lakepb.NewAgentServiceClient(aconn),
+		workerConn: wconn,
+		agentConn:  aconn,
 	}, nil
+}
+
+func (s *Server) Close() error {
+	var errs []error
+	if s.workerConn != nil {
+		errs = append(errs, s.workerConn.Close())
+	}
+	if s.agentConn != nil {
+		errs = append(errs, s.agentConn.Close())
+	}
+	return errors.Join(errs...)
 }
 
 func (s *Server) Handler() http.Handler {
@@ -110,14 +129,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxChatRequestBytes))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "request body too large", http.StatusRequestEntityTooLarge)
 		return
 	}
 	var req chatRequest
 	if err := json.Unmarshal(body, &req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		http.Error(w, "invalid JSON request", http.StatusBadRequest)
 		return
 	}
 	promptText := ""
@@ -156,7 +175,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !ack.GetOk() {
-		http.Error(w, "Dispatch rejected: "+ack.GetErr(), http.StatusBadGateway)
+		if ack.GetErr() != "" {
+			log.Printf("Dispatch rejected: %s", ack.GetErr())
+		}
+		http.Error(w, "Dispatch rejected", http.StatusBadGateway)
 		return
 	}
 
@@ -203,16 +225,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 func mapGRPCError(op string, err error) (httpStatus int, msg string) {
 	st, ok := status.FromError(err)
 	if !ok {
-		return http.StatusBadGateway, op + ": " + err.Error()
+		log.Printf("%s RPC error: %v", op, err)
+		return http.StatusBadGateway, op + " upstream failed"
 	}
-	msg = fmt.Sprintf("%s: %s", op, st.Message())
+	log.Printf("%s RPC error: code=%s msg=%q", op, st.Code(), st.Message())
 	switch st.Code() {
 	case codes.InvalidArgument:
-		return http.StatusBadRequest, msg
+		return http.StatusBadRequest, op + " request invalid"
 	case codes.Unavailable, codes.DeadlineExceeded:
-		return http.StatusServiceUnavailable, msg
+		return http.StatusServiceUnavailable, op + " upstream unavailable"
 	default:
-		return http.StatusBadGateway, msg
+		return http.StatusBadGateway, op + " upstream failed"
 	}
 }
 

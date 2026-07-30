@@ -52,7 +52,7 @@ impl TcpDataService for KvPool {
             store.data.insert(key(&id), blk.data);
         }
         Ok(Response::new(Ack {
-            ok: true,
+            ok: skipped_missing_id == 0,
             err: if skipped_missing_id == 0 {
                 String::new()
             } else {
@@ -78,5 +78,66 @@ impl TcpDataService for KvPool {
             }
         }
         Ok(Response::new(GetBlocksResponse { blocks }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn put_blocks_missing_id_is_not_ok() {
+        let pool = KvPool::default();
+        let ack = pool
+            .put_blocks(Request::new(PutBlocksRequest {
+                node_id: "n0".into(),
+                blocks: vec![OpaqueBlock {
+                    id: None,
+                    data: b"bad".to_vec(),
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert!(!ack.ok);
+        assert!(ack.err.contains("skipped 1 block"));
+    }
+
+    #[tokio::test]
+    async fn put_then_get_blocks_round_trip() {
+        let pool = KvPool::default();
+        let id = KvBlockId {
+            model_id: "m".into(),
+            revision: "r1".into(),
+            pool_kind: PoolKind::Target as i32,
+            block_hash: b"h0".to_vec(),
+            scope: "public".into(),
+        };
+        let data = b"payload".to_vec();
+
+        let ack = pool
+            .put_blocks(Request::new(PutBlocksRequest {
+                node_id: "n0".into(),
+                blocks: vec![OpaqueBlock {
+                    id: Some(id.clone()),
+                    data: data.clone(),
+                }],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.ok, "put failed: {}", ack.err);
+
+        let resp = pool
+            .get_blocks(Request::new(GetBlocksRequest {
+                ids: vec![id.clone()],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(resp.blocks.len(), 1);
+        assert_eq!(resp.blocks[0].id.as_ref(), Some(&id));
+        assert_eq!(resp.blocks[0].data, data);
     }
 }

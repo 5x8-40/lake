@@ -11,13 +11,6 @@ import (
 	lakepb "github.com/chengda-wu/lake/go/pb"
 )
 
-// ServiceName 与 proto lake.AgentService / ControlPlaneService 客户端占位对齐。
-// Router 热路径读本地命中视图镜像(零 RPC);冷路径才调 ControlPlaneService.LookupPrefix。
-const (
-	ControlPlaneService = "lake.ControlPlaneService"
-	AgentService        = "lake.AgentService"
-)
-
 // Compile-time 锚定:保证生成的 Dispatch / LookupPrefix 消息仍在 stub 中。
 var (
 	_ = (*lakepb.DispatchRequest)(nil)

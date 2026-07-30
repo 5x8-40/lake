@@ -1,6 +1,6 @@
 """分层缓存存储 — 对象存储(SSOT) 之上的多级缓存。
 
-层级（详见 docs/03-storage-layer.md）：
+层级（详见 docs/architecture/storage-layer.md）：
   L0 GPU HBM   — 节点本地，不在此模块建模
   L1 主机 RAM  — per-node
   L2 本地 NVMe — per-node

@@ -1,4 +1,4 @@
-"""路由与调度 — 无状态决策器（详见 docs/06-scheduling.md）。
+"""路由与调度 — 无状态决策器（详见 docs/architecture/scheduling.md）。
 
 本原型实现请求级路由的核心逻辑：
   1. 前缀解析（查 KV Pool 已有 block）

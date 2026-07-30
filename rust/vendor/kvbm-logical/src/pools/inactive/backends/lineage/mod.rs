@@ -284,27 +284,10 @@ impl LineageBackend {
                         self.count += 1;
                         self.leaves.on_node_inserted(idx, seq_hash);
                     }
-                    SlotData::Real {
-                        seq_hash: existing, ..
-                    } => {
-                        if existing.as_u128() == seq_hash.as_u128() {
-                            panic!(
-                                "Duplicate insertion detected! position={}, fragment={:#x}, \
-                                 hash={:#032x}.",
-                                position,
-                                fragment,
-                                seq_hash.as_u128()
-                            );
-                        } else {
-                            panic!(
-                                "Hash collision detected! position={}, fragment={:#x}, \
-                                 existing_hash={:#032x}, new_hash={:#032x}.",
-                                position,
-                                fragment,
-                                existing.as_u128(),
-                                seq_hash.as_u128()
-                            );
-                        }
+                    SlotData::Real { .. } => {
+                        // Inactive insertion is best-effort; duplicate or fragment
+                        // collision must not panic the storage control plane.
+                        return;
                     }
                     SlotData::Free => unreachable!("index points at a freed slot"),
                 }

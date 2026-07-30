@@ -263,9 +263,16 @@ impl PutEndSession {
             // Register already succeeded. Correct for "no holder", but leaves a
             // register→retry window under real tonic + concurrent eviction.
             // Deferred: #20 P4.7（PR #31 review §4.1 / writeback 泄漏兜底）.
-            let _ = cp.report_refs(&self.writeback_deltas(-1));
-            self.writeback_open = false;
+            let rollback = cp.report_refs(&self.writeback_deltas(-1));
+            if rollback.is_ok() {
+                self.writeback_open = false;
+            }
             unpin_all(store, &self.blocks);
+            if let Err(rollback_err) = rollback {
+                return Err(format!(
+                    "{e}; writeback rollback failed after barrier error: {rollback_err}"
+                ));
+            }
             return Err(e);
         }
         if let Err(e) = cp.report_refs(&self.writeback_deltas(-1)) {
@@ -731,6 +738,92 @@ mod tests {
             "WRITEBACK -1 必须在 barrier 之后 (M1(B))，got {:?}",
             port.calls
         );
+    }
+
+    #[test]
+    fn barrier_error_surfaces_writeback_rollback_failure() {
+        struct FailingRollbackPort {
+            auth: Authority,
+        }
+        impl ControlPlanePort for FailingRollbackPort {
+            fn admit_register_blocks(
+                &mut self,
+                _req: &RegisterBlocksRequest,
+            ) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn register_blocks(&mut self, req: RegisterBlocksRequest) -> Result<(), String> {
+                self.auth
+                    .register(&req.node_id, &req.prefix_hashes, req.blocks)
+                    .map(|_| ())
+            }
+            fn report_refs(&mut self, deltas: &[RefDelta]) -> Result<(), String> {
+                if deltas.iter().any(|d| d.delta < 0) {
+                    return Err("rollback unavailable".into());
+                }
+                self.auth.report_refs(deltas)
+            }
+            fn request_barrier(&mut self, _req: RequestBarrierRequest) -> Result<(), String> {
+                Err("barrier unavailable".into())
+            }
+            fn publish_location(
+                &mut self,
+                model_id: &str,
+                revision: &str,
+                pool_kind: i32,
+                flat: &[u8],
+                tier: Tier,
+                node_id: &str,
+                present: bool,
+            ) -> Result<(), String> {
+                self.auth
+                    .publish_location(model_id, revision, pool_kind, flat, tier, node_id, present)
+            }
+            fn set_l3_present(
+                &mut self,
+                model_id: &str,
+                revision: &str,
+                pool_kind: i32,
+                flat: &[u8],
+                present: bool,
+            ) -> Result<(), String> {
+                self.auth
+                    .set_l3_present(model_id, revision, pool_kind, flat, present)
+            }
+            fn relocate_in_view(
+                &mut self,
+                model_id: &str,
+                revision: &str,
+                pool_kind: i32,
+                flat: &[u8],
+                tier: Tier,
+                node_id: &str,
+                segment_id: u64,
+                offset: u64,
+            ) -> Result<(), String> {
+                self.auth.relocate_in_view(
+                    model_id, revision, pool_kind, flat, tier, node_id, segment_id, offset,
+                )
+            }
+        }
+
+        let mut store = LocalTierEngine::new();
+        let mut port = FailingRollbackPort {
+            auth: Authority::default(),
+        };
+        ensure_model(&mut port.auth, "m");
+        let mut sess = PutEndSession::new("r-rollback", "n0", "m");
+        sess.put_start(b"h0".to_vec(), b"KV:h0".to_vec());
+        let err = sess.commit_through(&mut store, &mut port).unwrap_err();
+        assert!(err.contains("barrier unavailable"));
+        assert!(err.contains("writeback rollback failed"));
+        assert_eq!(
+            port.auth
+                .global_ref("m", "", PoolKind::Target as i32, b"h0"),
+            1
+        );
+        assert!(sess.writeback_open);
     }
 
     #[test]

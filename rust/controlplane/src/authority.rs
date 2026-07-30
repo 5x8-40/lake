@@ -80,6 +80,13 @@ impl NamespaceKey {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct RefTarget {
+    pub(crate) key: NamespaceKey,
+    pub(crate) pool_kind: i32,
+    pub(crate) seq: SequenceHash,
+}
+
 /// Wire `POOL_UNSPECIFIED`(0) → TARGET. Reject unknown kinds.
 pub fn resolve_pool_kind(raw: i32) -> Result<i32, String> {
     // POOL_UNSPECIFIED = 0 → TARGET (LookupPrefix / wire default).
@@ -982,21 +989,32 @@ impl Authority {
     }
 
     pub fn check_report_ref(&self, delta: &RefDelta) -> Result<(), String> {
+        self.ref_target(delta).map(|_| ())
+    }
+
+    pub(crate) fn ref_target(&self, delta: &RefDelta) -> Result<RefTarget, String> {
         let id = delta
             .id
             .as_ref()
             .ok_or_else(|| "RefDelta missing id".to_string())?;
-        let pk = resolve_pool_kind(id.pool_kind)?;
+        let pool_kind = resolve_pool_kind(id.pool_kind)?;
+        let key = NamespaceKey::from_id(id);
         let ns = self
-            .ns(&id.model_id, &id.revision)
+            .namespaces
+            .get(&key)
             .ok_or_else(|| format!("unknown namespace ({}, rev={:?})", id.model_id, id.revision))?;
         let pool = ns
-            .pool(pk)
-            .ok_or_else(|| format!("RefDelta: unknown pool_kind {pk}"))?;
-        if !pool.by_flat.contains_key(&id.block_hash) {
-            return Err("RefDelta: unknown block_hash".to_string());
-        }
-        Ok(())
+            .pool(pool_kind)
+            .ok_or_else(|| format!("RefDelta: unknown pool_kind {pool_kind}"))?;
+        let entry = pool
+            .by_flat
+            .get(&id.block_hash)
+            .ok_or_else(|| "RefDelta: unknown block_hash".to_string())?;
+        Ok(RefTarget {
+            key,
+            pool_kind,
+            seq: entry.seq_hash,
+        })
     }
 
     pub fn report_ref(&mut self, delta: &RefDelta) -> Result<(), String> {
@@ -1004,9 +1022,45 @@ impl Authority {
     }
 
     pub fn report_refs(&mut self, deltas: &[RefDelta]) -> Result<(), String> {
+        let mut projected: HashMap<RefTarget, i64> = HashMap::new();
+        let mut projected_node: HashMap<(String, crate::reconcile::BlockKey), i64> = HashMap::new();
         for (i, d) in deltas.iter().enumerate() {
-            self.check_report_ref(d)
+            let target = self
+                .ref_target(d)
                 .map_err(|e| format!("ReportRef batch[{i}]: {e}"))?;
+            let id = d.id.as_ref().expect("ref_target checked id");
+            let cur = *projected.entry(target.clone()).or_insert_with(|| {
+                self.namespaces
+                    .get(&target.key)
+                    .and_then(|ns| ns.pool(target.pool_kind))
+                    .and_then(|pool| pool.global_refs.get(&target.seq).copied())
+                    .unwrap_or(0)
+            });
+            let next = cur
+                .checked_add(i64::from(d.delta))
+                .ok_or_else(|| format!("ReportRef batch[{i}]: ref_count overflow"))?;
+            if next < 0 {
+                return Err(format!("ReportRef batch[{i}]: ref_count underflow"));
+            }
+            projected.insert(target, next);
+
+            if !d.node_id.is_empty() && d.delta != 0 {
+                let block_key = crate::reconcile::BlockKey::from_id(id);
+                let node_key = (d.node_id.clone(), block_key);
+                let cur = *projected_node.entry(node_key.clone()).or_insert_with(|| {
+                    self.node_refs
+                        .get(&node_key.0)
+                        .and_then(|held| held.get(&node_key.1).copied())
+                        .unwrap_or(0)
+                });
+                let next = cur
+                    .checked_add(i64::from(d.delta))
+                    .ok_or_else(|| format!("ReportRef batch[{i}]: node_ref overflow"))?;
+                if next < 0 {
+                    return Err(format!("ReportRef batch[{i}]: node_ref underflow"));
+                }
+                projected_node.insert(node_key, next);
+            }
         }
         for d in deltas {
             self.report_ref(d)

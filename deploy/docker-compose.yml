@@ -2,7 +2,7 @@
 # 更常用本地脚本:./deploy/run-local.sh
 services:
   controlplane:
-    image: rust:1.85-bookworm
+    image: rust:1.96.1-bookworm
     working_dir: /src/rust
     volumes: ["../:/src"]
     command: bash -lc "cargo run -p lake-controlplane"
@@ -10,7 +10,7 @@ services:
       LAKE_CP_ADDR: "0.0.0.0:50051"
     ports: ["50051:50051"]
   kv-pool:
-    image: rust:1.85-bookworm
+    image: rust:1.96.1-bookworm
     working_dir: /src/rust
     volumes: ["../:/src"]
     command: bash -lc "cargo run -p lake-kv-pool"
