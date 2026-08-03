@@ -334,16 +334,15 @@ impl Authority {
                         .locations
                         .retain(|l| !(l.tier == Tier::L0 as i32 && l.node_id == node_id));
                     if let Some(handle) = pool.handles.get(&entry.seq_hash) {
-                        // mark_absent is presence-count based; if other nodes still
-                        // have L0, count may stay >0 — acceptable for P4 mock.
-                        if !entry
-                            .meta
-                            .locations
-                            .iter()
-                            .any(|l| l.tier == Tier::L0 as i32)
-                        {
-                            handle.mark_absent::<TierL0>();
-                        }
+                        // `had` (checked above) guarantees this dead node
+                        // contributed an L0 presence marker, so mark_absent is
+                        // safe. Decrement once per dead node — mirrors
+                        // `publish_location(present=false)` per-node precision.
+                        // A blanket `!any(L0)` guard would skip the decrement
+                        // while sibling nodes still hold L0, leaving the
+                        // refcounted shadow inflated (count N though only N-1
+                        // real L0 locations remain).
+                        handle.mark_absent::<TierL0>();
                     }
                     touched.push(KvBlockId {
                         model_id: ns_key.model_id.clone(),

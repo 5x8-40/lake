@@ -194,8 +194,19 @@ pub fn apply_location_events<P: ControlPlanePort>(
     node_id: &str,
     events: &[LocationEvent],
 ) -> Result<(), String> {
-    for ev in events {
-        match ev {
+    // Best-effort batch: a single event failure must not abort the whole batch
+    // and leave the CP view half-applied. Collect per-event failures, continue
+    // applying the rest, and return an aggregate error at the end. Successful
+    // events are retained — rolling them back would be worse (it would
+    // un-publish a Present that landed or re-publish an Absent block as
+    // present, manufacturing a more inconsistent view than the failure itself).
+    // The batch is idempotent (Present/Absent/Moved re-application is a no-op:
+    // `publish_location` refreshes coords; `set_l3_present` overwrites;`
+    // `relocate_in_view` overwrites), so the caller may retry the whole batch
+    // on aggregate error.
+    let mut failed: Vec<(usize, String)> = Vec::new();
+    for (i, ev) in events.iter().enumerate() {
+        let res: Result<(), String> = match ev {
             LocationEvent::Present { hash, tier } => match tier {
                 LocalTier::L0 => cp.publish_location(
                     model_id,
@@ -205,7 +216,7 @@ pub fn apply_location_events<P: ControlPlanePort>(
                     Tier::L0,
                     node_id,
                     true,
-                )?,
+                ),
                 LocalTier::L1 => cp.publish_location(
                     model_id,
                     revision,
@@ -214,7 +225,7 @@ pub fn apply_location_events<P: ControlPlanePort>(
                     Tier::L1,
                     node_id,
                     true,
-                )?,
+                ),
                 LocalTier::L2 => cp.publish_location(
                     model_id,
                     revision,
@@ -223,8 +234,8 @@ pub fn apply_location_events<P: ControlPlanePort>(
                     Tier::L2,
                     node_id,
                     true,
-                )?,
-                LocalTier::L3 => cp.set_l3_present(model_id, revision, pool_kind, hash, true)?,
+                ),
+                LocalTier::L3 => cp.set_l3_present(model_id, revision, pool_kind, hash, true),
             },
             LocationEvent::Absent { hash, tier } => match tier {
                 LocalTier::L0 => cp.publish_location(
@@ -235,7 +246,7 @@ pub fn apply_location_events<P: ControlPlanePort>(
                     Tier::L0,
                     node_id,
                     false,
-                )?,
+                ),
                 LocalTier::L1 => cp.publish_location(
                     model_id,
                     revision,
@@ -244,7 +255,7 @@ pub fn apply_location_events<P: ControlPlanePort>(
                     Tier::L1,
                     node_id,
                     false,
-                )?,
+                ),
                 LocalTier::L2 => cp.publish_location(
                     model_id,
                     revision,
@@ -253,8 +264,8 @@ pub fn apply_location_events<P: ControlPlanePort>(
                     Tier::L2,
                     node_id,
                     false,
-                )?,
-                LocalTier::L3 => cp.set_l3_present(model_id, revision, pool_kind, hash, false)?,
+                ),
+                LocalTier::L3 => cp.set_l3_present(model_id, revision, pool_kind, hash, false),
             },
             LocationEvent::Moved {
                 hash,
@@ -286,11 +297,27 @@ pub fn apply_location_events<P: ControlPlanePort>(
                     n,
                     *segment_id,
                     *offset,
-                )?;
+                )
             }
+        };
+        if let Err(e) = res {
+            failed.push((i, e));
         }
     }
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        let details = failed
+            .iter()
+            .map(|(i, e)| format!("[{i}] {e}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        Err(format!(
+            "apply_location_events: {} of {} events failed: {details}",
+            failed.len(),
+            events.len()
+        ))
+    }
 }
 
 /// Enqueue CP-planned defrag moves onto the tier pipeline.

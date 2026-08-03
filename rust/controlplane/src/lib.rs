@@ -1724,6 +1724,44 @@ mod tests {
         assert_eq!(auth.evict_n("m", "", PoolKind::Target as i32, 1), 1);
     }
 
+    /// H4: dead-node reconcile must decrement the L0 presence marker per
+    /// dead node, not only when no node holds L0. With a blanket `!any(L0)`
+    /// guard the shadow count stays inflated when sibling nodes still hold
+    /// L0, so the final dead node leaves count=1 though no L0 remains.
+    #[test]
+    fn p47_dead_node_l0_presence_precise() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let pk = PoolKind::Target as i32;
+        auth.register("n0", &prefix(&[b"l0"]), vec![meta("m", b"l0")])
+            .unwrap();
+        // Two nodes each hold an L0 replica → presence count = 2.
+        auth.publish_location("m", "", pk, b"l0", Tier::L0, "n0", true)
+            .unwrap();
+        auth.publish_location("m", "", pk, b"l0", Tier::L0, "n1", true)
+            .unwrap();
+        assert!(auth.has_l0_presence("m", "", pk, b"l0"));
+        assert!(auth.has_l0_on("m", "", pk, b"l0", "n0"));
+        assert!(auth.has_l0_on("m", "", pk, b"l0", "n1"));
+
+        // Dead n0: count 2→1. n1 still holds L0 → shadow must stay true.
+        auth.reconcile_dead_node("n0").unwrap();
+        assert!(
+            auth.has_l0_presence("m", "", pk, b"l0"),
+            "one L0 replica remains on n1"
+        );
+        assert!(!auth.has_l0_on("m", "", pk, b"l0", "n0"));
+        assert!(auth.has_l0_on("m", "", pk, b"l0", "n1"));
+
+        // Dead n1: count 1→0. No L0 left → shadow must read false.
+        auth.reconcile_dead_node("n1").unwrap();
+        assert!(
+            !auth.has_l0_presence("m", "", pk, b"l0"),
+            "no L0 replica remains; shadow must be cleared"
+        );
+        assert!(!auth.has_l0_on("m", "", pk, b"l0", "n1"));
+    }
+
     /// Checkpoint save/restore rebuilds namespace + blocks (metadata before bytes).
     #[test]
     fn p47_checkpoint_roundtrip() {

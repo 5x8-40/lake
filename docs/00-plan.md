@@ -209,7 +209,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 
 ---
 
-## P4 — KV Pool 原型（Rust）（当前首要）
+## P4 — KV Pool 原型（Rust）(done 2026-07-30)
 
 > 实现参考:`3rdparty/` 五个 submodule 逐层对应见 [`research/3rdparty-reference.md`](research/3rdparty-reference.md)。  
 > **代码级复用（两模块正交）**：  
@@ -221,13 +221,14 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 - [x] radix tree 前缀索引（前缀复用查询）（复用 B；P4.2：`RegisterBlocks.prefix_hashes` + `LookupPrefix`）
 - [x] 分层缓存引擎（RAM/NVMe，对象存储回填）（P4.3：写回只 L2；L3=demote/cap XOR；L1=demotion；`TierPipeline`/`BandwidthPool`/PutEnd COMPLETE；真 NVMe/跨机 defer P5；满块顺便写 L1 留 P7。[PR #31](https://github.com/chengda-wu/lake/pull/31)）
 - [x] gRPC 接口 + RDMA 数据平面（先 TCP 后 RDMA）（传输面复用 A；P4.4：`Transport`+`TcpTransport`+`TcpDataService` 正名自 SkeletonKv；`TransferService` 接线；真 RDMA → P5）
-- [~] 一致性哈希分片 + KV Node 扩缩时的 block 重分布（P4.9：`GetShardMap`/`JoinShardNode`/`DrainShardNode`；环+最小迁移+Drain 推 L2 计划；真跨机字节 → P5，见 #20）
-- [~] **多模型生命周期**：模型注册/下线级联删、revision 失效（F11；P4.5：`RegisterModel`/`DeregisterModel` + `(model_id,revision)` 命名空间，见 #20；PR #33 待合）
-- [~] **按模型配额与空间分配**（软/硬配额 + 借用 + 背压；P4.6：`AdmitRegisterBlocks` 写前准入(方案 A，不 reserve) + `SetModelQuota`/`GetModelQuota` + `BackpressureSignal`；`Reserve*` → 多进程/P4.7，见 #20）
-- [~] **GC**：冷块/孤儿块回收 + 崩溃 reconcile（P4.7：`ReconcileOrphans`/`DiscardBlocks`/`CheckpointStore` 内存 mock；节点级 reconcile 兜底 writeback 泄漏；见 #20。P4.3 review 半原子 `apply_location_events` 等仍可后续收紧）
-- [~] **碎片整理**：逻辑共置 + 物理压实，后台节流可暂停（P4.8：`TriggerDefrag`/`PauseBackground` + `SegmentArena` + pipeline Compact/CoLocate；共享 BandwidthPool；见 #20）
+- [x] 一致性哈希分片 + KV Node 扩缩时的 block 重分布（P4.9：`GetShardMap`/`JoinShardNode`/`DrainShardNode`；环+最小迁移+Drain 推 L2 计划；真跨机字节 → P5，见 #20）
+- [x] **多模型生命周期**：模型注册/下线级联删、revision 失效（F11；P4.5：`RegisterModel`/`DeregisterModel` + `(model_id,revision)` 命名空间，见 #20）
+- [x] **按模型配额与空间分配**（软/硬配额 + 借用 + 背压；P4.6：`AdmitRegisterBlocks` 写前准入(方案 A，不 reserve) + `SetModelQuota`/`GetModelQuota` + `BackpressureSignal`；`Reserve*` → 多进程/P4.7，见 #20）
+- [x] **GC**：冷块/孤儿块回收 + 崩溃 reconcile（P4.7：`ReconcileOrphans`/`DiscardBlocks`/`CheckpointStore` 内存 mock；节点级 reconcile 兜底 writeback 泄漏；见 #20。P4.3 review 半原子 `apply_location_events` 等仍可后续收紧）
+- [x] **碎片整理**：逻辑共置 + 物理压实，后台节流可暂停（P4.8：`TriggerDefrag`/`PauseBackground` + `SegmentArena` + pipeline Compact/CoLocate；共享 BandwidthPool；见 #20）
 
 **完成判据**：前缀复用命中率、驱逐正确性有单测；吞吐 micro-benchmark；多模型隔离/配额/GC/碎片整理各有验证用例。
+> 口径：P4「前缀复用命中率」= 行为级命中验证（`LookupPrefix` 单测 + smoke `reused_blocks>=3`）；真实 workload hit-rate 曲线与带宽/成本校准归 P7。
 
 ---
 
@@ -279,7 +280,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 
 ## 当前优先级
 
-**现在做**：**P4 KV Pool 原型（Rust）**——内容寻址 block 存储 + radix 前缀索引 + 分层缓存引擎 + RDMA/TCP 数据面 + 一致性哈希分片 + 多模型生命周期/配额/GC/碎片整理。
+**现在做**：**P5 存算分离验证**——Prefill→Decode KV 迁移流水线 + 故障注入（P4 KV Pool 原型已收口，全切片合入 main）。
 
 P0–P3 已完成（特性 / 架构 / 三语言空壳+proto / 跨语言联通+前缀复用冒烟）。P3 入口直打 Router（无 Bifrost）。
 

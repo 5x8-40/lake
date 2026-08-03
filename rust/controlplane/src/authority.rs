@@ -5,7 +5,8 @@
 //! `LineageBackend::with_frequency`（只驱叶子 ≈ 前缀亲和 + TinyLFU 冷叶优先 ≈ LFU-Aging）。
 //! 不用 `BlockManager`/`BlockStore`——因此必须自己守 inactive 上界：
 //! `report_ref` 满容只 skip insert（对齐 Dynamo `inactive.insert`）；
-//! 压力 `allocate` 只在显式 `evict_n`（对齐 `allocate_atomic`）。
+//! 压力 `allocate` 走生产准入路径 `commit_admit`→`evict_inactive_n`
+//! （RegisterBlocks 命中配额时触发）；`evict_n` 是测试钩子（对齐 `allocate_atomic`）。
 //! EventsManager 不接线。
 //!
 //! P4.5:显式 `RegisterModel` / `DeregisterModel`；禁止懒建命名空间。
@@ -1265,6 +1266,30 @@ impl Authority {
                     .iter()
                     .any(|l| l.tier == Tier::L0 as i32 && l.node_id == node_id)
             })
+            .unwrap_or(false)
+    }
+
+    /// Read the refcounted L0 presence-marker shadow for a block.
+    /// Unlike `has_l0_on` (which reads the authoritative `locations` vec),
+    /// this reads the registry's refcounted shadow that `mark_present`/
+    /// `mark_absent` maintain. The two must agree in steady state; a
+    /// divergence indicates a leaked/decrement-skipped marker. Exposed for
+    /// reconcile/eviction correctness tests (and future `&self lookup_prefix`
+    /// via `check_presence`).
+    pub fn has_l0_presence(
+        &self,
+        model_id: &str,
+        revision: &str,
+        pool_kind: i32,
+        flat: &[u8],
+    ) -> bool {
+        let Ok(pk) = resolve_pool_kind(pool_kind) else {
+            return false;
+        };
+        self.ns(model_id, revision)
+            .and_then(|n| n.pool(pk))
+            .and_then(|p| p.by_flat.get(flat).and_then(|e| p.handles.get(&e.seq_hash)))
+            .map(|h| h.has_block::<TierL0>())
             .unwrap_or(false)
     }
 }
