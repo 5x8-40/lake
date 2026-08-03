@@ -898,8 +898,17 @@ impl Authority {
     /// Prefix lookup in one `pool_kind` domain.
     ///
     /// `pool_kind == UNSPECIFIED` → TARGET (P4.5 default; draft prefix opt-in).
+    ///
+    /// Read-only (`&self`, P6.1): no structural repair on the read path —
+    /// handles are created eagerly by `register` / `import_snapshot` (the only
+    /// `by_flat` ingestion paths), so a missing handle here is defensive-only
+    /// and simply skips the touch. Frequency touch stays on the lookup hot
+    /// path via `BlockRegistry::touch` (internally synchronized, `&self`),
+    /// preserving query-hotness TinyLFU semantics: a D-direct lookup queries
+    /// without ever taking a ref, so moving the touch to `report_ref` would
+    /// silently change eviction ordering.
     pub fn lookup_prefix(
-        &mut self,
+        &self,
         model_id: &str,
         revision: &str,
         pool_kind: i32,
@@ -916,8 +925,8 @@ impl Authority {
             return (Vec::new(), 0, false);
         }
         let lineage = lineage_from_prefix(prefix_hashes);
-        let ns = self.ns_mut(model_id, revision).expect("checked");
-        let Some(pool) = ns.pools.get_mut(&pool_kind) else {
+        let ns = self.ns(model_id, revision).expect("checked");
+        let Some(pool) = ns.pools.get(&pool_kind) else {
             return (Vec::new(), 0, false);
         };
 
@@ -936,20 +945,8 @@ impl Authority {
                 break;
             }
             let meta = entry.meta.clone();
-            if !pool.handles.contains_key(&seq) {
-                let handle = pool.registry.register_sequence_hash(seq);
-                for loc in &meta.locations {
-                    if loc.tier == Tier::L0 as i32 {
-                        handle.mark_present::<TierL0>();
-                    } else if loc.tier == Tier::L1 as i32 {
-                        handle.mark_present::<TierL1>();
-                    } else if loc.tier == Tier::L2 as i32 {
-                        handle.mark_present::<TierL2>();
-                    }
-                }
-                pool.handles.insert(seq, handle);
-            } else {
-                let _ = pool.registry.match_sequence_hash(seq, true);
+            if pool.handles.contains_key(&seq) {
+                pool.registry.touch(seq);
             }
 
             let local = meta

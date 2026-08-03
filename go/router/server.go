@@ -25,17 +25,21 @@ type Config struct {
 	HTTPAddr   string // 默认 :8080
 	WorkerAddr string // WorkerService,默认 127.0.0.1:50053
 	AgentAddr  string // AgentService(边10 Dispatch),默认 127.0.0.1:50054
+	CPAddr     string // ControlPlaneService(权威回退查询),默认 127.0.0.1:50051
 }
 
 // Server OpenAI 兼容 HTTP → Dispatch(agent) → Generate(worker)。
 // P3 入口即本服务(边2);不经 Bifrost。
-// LookupPrefix 在 worker 侧完成(直连 ControlPlane)。
+// P6.1:Router 已接 CP 客户端(LookupPrefix/Locate 权威回退档,冷启动/gap 用);
+// 选路权威收归 Router(worker 不再自查前缀)归 P6.3。
 type Server struct {
 	cfg        Config
 	worker     lakepb.WorkerServiceClient
 	agent      lakepb.AgentServiceClient
+	cp         lakepb.ControlPlaneServiceClient
 	workerConn *grpc.ClientConn
 	agentConn  *grpc.ClientConn
+	cpConn     *grpc.ClientConn
 }
 
 const maxChatRequestBytes = 1 << 20
@@ -50,6 +54,9 @@ func New(cfg Config) (*Server, error) {
 	if cfg.AgentAddr == "" {
 		cfg.AgentAddr = "127.0.0.1:50054"
 	}
+	if cfg.CPAddr == "" {
+		cfg.CPAddr = "127.0.0.1:50051"
+	}
 	wconn, err := grpc.NewClient(cfg.WorkerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		return nil, fmt.Errorf("dial worker: %w", err)
@@ -59,12 +66,20 @@ func New(cfg Config) (*Server, error) {
 		_ = wconn.Close()
 		return nil, fmt.Errorf("dial agent: %w", err)
 	}
+	cconn, err := grpc.NewClient(cfg.CPAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		_ = wconn.Close()
+		_ = aconn.Close()
+		return nil, fmt.Errorf("dial controlplane: %w", err)
+	}
 	return &Server{
 		cfg:        cfg,
 		worker:     lakepb.NewWorkerServiceClient(wconn),
 		agent:      lakepb.NewAgentServiceClient(aconn),
+		cp:         lakepb.NewControlPlaneServiceClient(cconn),
 		workerConn: wconn,
 		agentConn:  aconn,
+		cpConn:     cconn,
 	}, nil
 }
 
@@ -76,7 +91,27 @@ func (s *Server) Close() error {
 	if s.agentConn != nil {
 		errs = append(errs, s.agentConn.Close())
 	}
+	if s.cpConn != nil {
+		errs = append(errs, s.cpConn.Close())
+	}
 	return errors.Join(errs...)
+}
+
+// LookupPrefixOnAuthority 冷路径权威查询(线性一致档):冷启动 / 镜像 gap 回退时
+// 直查 CP 权威树。热路径(P6.2 起)读本地镜像,不走本方法。
+func (s *Server) LookupPrefixOnAuthority(ctx context.Context, req *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error) {
+	if s.cp == nil {
+		return nil, errors.New("controlplane client not configured")
+	}
+	return s.cp.LookupPrefix(ctx, req)
+}
+
+// LocateOnAuthority 与 LookupPrefix 同档的权威回退:按 block id 查位置。
+func (s *Server) LocateOnAuthority(ctx context.Context, req *lakepb.LocateRequest) (*lakepb.LocateResponse, error) {
+	if s.cp == nil {
+		return nil, errors.New("controlplane client not configured")
+	}
+	return s.cp.Locate(ctx, req)
 }
 
 func (s *Server) Handler() http.Handler {

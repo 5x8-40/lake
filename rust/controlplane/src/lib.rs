@@ -6,6 +6,9 @@
 //! P4.7:冷块 GC / 孤儿 TTL / 节点 reconcile / `CheckpointStore` 内存 mock。
 //! P4.8:碎片整理计划(`TriggerDefrag`/`PauseBackground`)+ Location segment/offset。
 //! P4.9:一致性哈希分片(`GetShardMap`/`JoinShardNode`/`DrainShardNode`)。
+//! P6.1:`Mutex→RwLock` 读写分锁(lookup/locate/admit/defrag/shard_map 读路径并发);
+//! `lookup_prefix` 改 `&self`——读路径懒修复本是死代码(register/import_snapshot
+//! 均预建 handle),frequency touch 经内部同步的 registry 留在读路径(查询热度语义不变)。
 //! 参考:`registry/mod.rs::register_sequence_hash`；Mooncake `ClearInvalidHandles` /
 //! `put_start_discard_timeout` / `MetadataShard`；LMCache `QuotaManager`；
 //! Mooncake allocator(无 compaction)。
@@ -23,7 +26,7 @@ mod tier;
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -80,7 +83,10 @@ fn admit_keys_from_request(req: &RegisterBlocksRequest) -> Result<AdmitKeys, Str
 
 #[derive(Clone, Default)]
 pub struct ControlPlane {
-    inner: Arc<Mutex<Authority>>,
+    /// P6.1: `Mutex → RwLock`——lookup/locate/admit/defrag/shard_map 读路径
+    /// 并发（读多写少）；register/report_ref/reconcile/restore 等写路径仍互斥，
+    /// 单写者权威语义不变。
+    inner: Arc<RwLock<Authority>>,
     checkpoints: Arc<MemoryCheckpointStore>,
     /// Shared pause flag for promote/demote/GC/defrag (agent syncs BandwidthPool).
     background_paused: Arc<Mutex<bool>>,
@@ -94,7 +100,7 @@ impl ControlPlane {
 
     pub fn with_checkpoint_store(store: MemoryCheckpointStore) -> Self {
         Self {
-            inner: Arc::new(Mutex::new(Authority::default())),
+            inner: Arc::new(RwLock::new(Authority::default())),
             checkpoints: Arc::new(store),
             background_paused: Arc::new(Mutex::new(false)),
             authority_poisoned_reported: Arc::new(AtomicBool::new(false)),
@@ -115,15 +121,21 @@ impl ControlPlane {
 }
 
 impl ControlPlane {
-    fn lock_authority(&self) -> Result<MutexGuard<'_, Authority>, ()> {
-        self.inner.lock().map_err(|_| {
-            if !self
-                .authority_poisoned_reported
-                .swap(true, Ordering::Relaxed)
-            {
-                eprintln!("controlplane authority lock poisoned; returning INTERNAL until restart");
-            }
-        })
+    fn note_lock_poisoned(&self) {
+        if !self
+            .authority_poisoned_reported
+            .swap(true, Ordering::Relaxed)
+        {
+            eprintln!("controlplane authority lock poisoned; returning INTERNAL until restart");
+        }
+    }
+
+    fn read_authority(&self) -> Result<RwLockReadGuard<'_, Authority>, ()> {
+        self.inner.read().map_err(|_| self.note_lock_poisoned())
+    }
+
+    fn write_authority(&self) -> Result<RwLockWriteGuard<'_, Authority>, ()> {
+        self.inner.write().map_err(|_| self.note_lock_poisoned())
     }
 
     fn lock_authority_status(_: ()) -> Status {
@@ -150,7 +162,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<LookupPrefixRequest>,
     ) -> Result<Response<LookupPrefixResponse>, Status> {
         let req = request.into_inner();
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let auth = self.read_authority().map_err(Self::lock_authority_status)?;
         let (blocks, hit_length, all_local_hit) = auth.lookup_prefix(
             &req.model_id,
             &req.revision,
@@ -170,7 +182,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<LocateRequest>,
     ) -> Result<Response<LocateResponse>, Status> {
         let req = request.into_inner();
-        let auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let auth = self.read_authority().map_err(Self::lock_authority_status)?;
         let blocks = auth.locate(&req.ids);
         Ok(Response::new(LocateResponse { blocks }))
     }
@@ -190,7 +202,7 @@ impl ControlPlaneService for ControlPlane {
                 }));
             }
         };
-        let auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let auth = self.read_authority().map_err(Self::lock_authority_status)?;
         match auth.preflight_register(&keys.model_id, &keys.revision, keys.pool_kind, &keys.hashes)
         {
             Ok(RegisterStatus::Accepted) => Ok(Response::new(Ack {
@@ -219,7 +231,9 @@ impl ControlPlaneService for ControlPlane {
         request: Request<RegisterBlocksRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.register(&req.node_id, &req.prefix_hashes, req.blocks) {
             Ok(RegisterStatus::Accepted) => Ok(Response::new(Ack {
                 ok: true,
@@ -251,7 +265,9 @@ impl ControlPlaneService for ControlPlane {
         while let Some(delta) = stream.message().await? {
             deltas.push(delta);
         }
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.report_refs(&deltas) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -271,7 +287,9 @@ impl ControlPlaneService for ControlPlane {
         request: Request<RequestBarrierRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         // P4.3: agent must flush L2 + ReportRef(WRITEBACK,-1) before this call.
         match auth.complete_barrier(&req.request_id, &req.node_id) {
             Ok(()) => Ok(Response::new(Ack {
@@ -312,7 +330,9 @@ impl ControlPlaneService for ControlPlane {
                 backpressure: None,
             }));
         };
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.register_model(model) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -332,7 +352,9 @@ impl ControlPlaneService for ControlPlane {
         request: Request<DeregisterModelRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.deregister_model(&req.model_id, &req.revision) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -359,7 +381,9 @@ impl ControlPlaneService for ControlPlane {
                 backpressure: None,
             }));
         };
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.set_model_quota(&req.model_id, &req.revision, quota) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -379,7 +403,7 @@ impl ControlPlaneService for ControlPlane {
         request: Request<GetModelQuotaRequest>,
     ) -> Result<Response<GetModelQuotaResponse>, Status> {
         let req = request.into_inner();
-        let auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let auth = self.read_authority().map_err(Self::lock_authority_status)?;
         match auth.get_model_quota(&req.model_id, &req.revision) {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Ok(Response::new(GetModelQuotaResponse {
@@ -398,7 +422,9 @@ impl ControlPlaneService for ControlPlane {
         request: Request<ReconcileOrphansRequest>,
     ) -> Result<Response<ReconcileOrphansResponse>, Status> {
         let req = request.into_inner();
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.reconcile_orphans(&req) {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Ok(Response::new(ReconcileOrphansResponse {
@@ -416,7 +442,9 @@ impl ControlPlaneService for ControlPlane {
         request: Request<DiscardBlocksRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.discard_blocks(&req.ids) {
             Ok(_) => Ok(Response::new(Ack {
                 ok: true,
@@ -435,7 +463,9 @@ impl ControlPlaneService for ControlPlane {
         &self,
         _request: Request<SaveCheckpointRequest>,
     ) -> Result<Response<SaveCheckpointResponse>, Status> {
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         auth.checkpoint_seq = auth.checkpoint_seq.saturating_add(1);
         let snap = auth.export_snapshot(auth.checkpoint_seq);
         drop(auth);
@@ -479,7 +509,9 @@ impl ControlPlaneService for ControlPlane {
                 }
             }
         };
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.import_snapshot(&snap) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -500,7 +532,7 @@ impl ControlPlaneService for ControlPlane {
     ) -> Result<Response<TriggerDefragResponse>, Status> {
         let req = request.into_inner();
         let mode = DefragMode::try_from(req.mode).unwrap_or(DefragMode::Both);
-        let auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let auth = self.read_authority().map_err(Self::lock_authority_status)?;
         match auth.plan_defrag(
             &req.model_id,
             &req.revision,
@@ -543,7 +575,7 @@ impl ControlPlaneService for ControlPlane {
         &self,
         _request: Request<GetShardMapRequest>,
     ) -> Result<Response<GetShardMapResponse>, Status> {
-        let auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let auth = self.read_authority().map_err(Self::lock_authority_status)?;
         Ok(Response::new(GetShardMapResponse {
             map: Some(auth.shard_map()),
             ok: true,
@@ -556,7 +588,9 @@ impl ControlPlaneService for ControlPlane {
         request: Request<JoinShardNodeRequest>,
     ) -> Result<Response<JoinShardNodeResponse>, Status> {
         let req = request.into_inner();
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.join_shard_node(&req.node_id, req.vnode_count) {
             Ok((map, migrations)) => {
                 let migration_count = migrations.len() as u32;
@@ -583,7 +617,9 @@ impl ControlPlaneService for ControlPlane {
         request: Request<DrainShardNodeRequest>,
     ) -> Result<Response<DrainShardNodeResponse>, Status> {
         let req = request.into_inner();
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.drain_shard_node(&req.node_id) {
             Ok((map, migrations, push_l2)) => {
                 let migration_count = migrations.len() as u32;
@@ -612,7 +648,9 @@ impl ControlPlaneService for ControlPlane {
         request: Request<RemoveShardNodeRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self.lock_authority().map_err(Self::lock_authority_status)?;
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
         match auth.remove_shard_node(&req.node_id) {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
@@ -1120,8 +1158,9 @@ mod tests {
     async fn poisoned_authority_lock_returns_status() {
         let cp = ControlPlane::default();
         let inner = cp.inner.clone();
+        // RwLock poisons only when a *writer* panics while holding the lock.
         let _ = std::panic::catch_unwind(move || {
-            let _guard = inner.lock().unwrap();
+            let _guard = inner.write().unwrap();
             panic!("poison authority");
         });
         let err = cp
@@ -1130,6 +1169,51 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::Internal);
         assert!(cp.authority_poisoned_reported());
+    }
+
+    /// P6.1 判据 1: `lookup_prefix` is `&self` — callable through a shared
+    /// reference (compile-time proof; was `&mut self` before the lazy-repair
+    /// removal). Frequency touch stays on the read path via the internally
+    /// synchronized registry.
+    #[test]
+    fn lookup_prefix_via_shared_ref() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"h0", b"h1"]);
+        auth.register("n0", &full, vec![meta("m", b"h0"), meta("m", b"h1")])
+            .unwrap();
+        let shared: &Authority = &auth;
+        let (blocks, hit, _) = shared.lookup_prefix("m", "", PoolKind::Target as i32, &full, "n0");
+        assert_eq!(hit, 2);
+        assert_eq!(blocks.len(), 2);
+    }
+
+    /// P6.1 判据 2: read paths share the RwLock — a lookup RPC is served
+    /// while another read guard is held. Under the old `Mutex<Authority>`
+    /// this deadlocked (non-reentrant), so the test doubles as a revert
+    /// guard (it would hang the harness on revert).
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // 故意持读 guard 跨 await:验证读-读共享
+    async fn lookup_prefix_served_while_read_guard_held() {
+        let cp = ControlPlane::default();
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            let full = prefix(&[b"h0"]);
+            auth.register("n0", &full, vec![meta("m", b"h0")]).unwrap();
+        }
+        let _outer = cp.read_authority().unwrap();
+        let resp = cp
+            .lookup_prefix(Request::new(LookupPrefixRequest {
+                model_id: "m".into(),
+                revision: String::new(),
+                pool_kind: PoolKind::Target as i32,
+                prefix_hashes: prefix(&[b"h0"]),
+                requester_node_id: "n0".into(),
+            }))
+            .await;
+        let ok = resp.expect("read path must be served under a concurrent reader");
+        assert_eq!(ok.into_inner().hit_length, 1);
     }
 
     #[test]

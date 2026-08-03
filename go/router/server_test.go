@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
+	"google.golang.org/grpc/test/bufconn"
 )
 
 type fakeAgent struct {
@@ -37,6 +39,115 @@ type fakeWorker struct {
 
 func (f fakeWorker) Generate(ctx context.Context, req *lakepb.GenerateRequest, _ ...grpc.CallOption) (*lakepb.GenerateResponse, error) {
 	return f.generate(ctx, req)
+}
+
+// fakeCP:P6.1 用进程内 gRPC 服务冒充 CP 权威树(嵌入 Unimplemented 兜底其余 RPC)。
+type fakeCP struct {
+	lakepb.UnimplementedControlPlaneServiceServer
+	lookupPrefix func(context.Context, *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error)
+	locate       func(context.Context, *lakepb.LocateRequest) (*lakepb.LocateResponse, error)
+}
+
+func (f fakeCP) LookupPrefix(ctx context.Context, req *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error) {
+	return f.lookupPrefix(ctx, req)
+}
+
+func (f fakeCP) Locate(ctx context.Context, req *lakepb.LocateRequest) (*lakepb.LocateResponse, error) {
+	return f.locate(ctx, req)
+}
+
+// dialFakeCP 起 bufconn 进程内 CP,返回接好客户端的 Server。
+func dialFakeCP(t *testing.T, cp lakepb.ControlPlaneServiceServer) *Server {
+	t.Helper()
+	lis := bufconn.Listen(1 << 20)
+	gsrv := grpc.NewServer()
+	lakepb.RegisterControlPlaneServiceServer(gsrv, cp)
+	go func() { _ = gsrv.Serve(lis) }()
+	t.Cleanup(gsrv.Stop)
+
+	conn, err := grpc.NewClient(
+		"passthrough:///bufconn",
+		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
+			return lis.DialContext(ctx)
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return &Server{cp: lakepb.NewControlPlaneServiceClient(conn), cpConn: conn}
+}
+
+// P6.1 判据:Go Router 单测能查 CP 权威树(经真实 gRPC 编解码链路)。
+func TestLookupPrefixOnAuthorityQueriesCP(t *testing.T) {
+	srv := dialFakeCP(t, fakeCP{
+		lookupPrefix: func(_ context.Context, req *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error) {
+			if req.GetModelId() != "m" || req.GetRequesterNodeId() != "n0" {
+				return nil, status.Error(codes.InvalidArgument, "bad request")
+			}
+			return &lakepb.LookupPrefixResponse{
+				Blocks: []*lakepb.ReusableBlock{{
+					Id:       &lakepb.KVBlockID{ModelId: "m", BlockHash: []byte("h0")},
+					LocalHit: true,
+				}},
+				HitLength:   1,
+				AllLocalHit: true,
+			}, nil
+		},
+	})
+
+	resp, err := srv.LookupPrefixOnAuthority(context.Background(), &lakepb.LookupPrefixRequest{
+		ModelId:         "m",
+		PoolKind:        lakepb.PoolKind_TARGET,
+		PrefixHashes:    [][]byte{[]byte("h0")},
+		RequesterNodeId: "n0",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.GetHitLength() != 1 || !resp.GetAllLocalHit() {
+		t.Fatalf("resp = %+v, want hit_length=1 all_local_hit=true", resp)
+	}
+	if !resp.GetBlocks()[0].GetLocalHit() {
+		t.Fatalf("block local_hit = false, want true (D-direct 信号)")
+	}
+}
+
+func TestLocateOnAuthorityQueriesCP(t *testing.T) {
+	srv := dialFakeCP(t, fakeCP{
+		locate: func(_ context.Context, req *lakepb.LocateRequest) (*lakepb.LocateResponse, error) {
+			if len(req.GetIds()) != 1 {
+				return nil, status.Error(codes.InvalidArgument, "want 1 id")
+			}
+			return &lakepb.LocateResponse{
+				Blocks: []*lakepb.BlockMeta{{
+					Id:        req.GetIds()[0],
+					L3Present: true,
+				}},
+			}, nil
+		},
+	})
+
+	resp, err := srv.LocateOnAuthority(context.Background(), &lakepb.LocateRequest{
+		Ids: []*lakepb.KVBlockID{{ModelId: "m", BlockHash: []byte("h0")}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.GetBlocks()) != 1 || !resp.GetBlocks()[0].GetL3Present() {
+		t.Fatalf("resp = %+v, want 1 block with l3_present", resp)
+	}
+}
+
+func TestAuthorityQueryWithoutCPClientFails(t *testing.T) {
+	srv := &Server{}
+	if _, err := srv.LookupPrefixOnAuthority(context.Background(), &lakepb.LookupPrefixRequest{}); err == nil {
+		t.Fatal("want error when cp client not configured")
+	}
+	if _, err := srv.LocateOnAuthority(context.Background(), &lakepb.LocateRequest{}); err == nil {
+		t.Fatal("want error when cp client not configured")
+	}
 }
 
 func testServer(agent lakepb.AgentServiceClient, worker lakepb.WorkerServiceClient) *Server {
