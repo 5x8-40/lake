@@ -203,14 +203,22 @@ func TestServerViewSyncBuildsMirror(t *testing.T) {
 	}
 }
 
-func testServer(agent lakepb.AgentServiceClient, worker lakepb.WorkerServiceClient) *Server {
+func testServer(t *testing.T, agent lakepb.AgentServiceClient, worker lakepb.WorkerServiceClient) *Server {
 	// P6.3:handler 选路读镜像;cp=nil 时 prefixHint 权威回退报错按冷请求处理。
-	return &Server{
+	// P6.4:handler 经 PQScheduler 执行;测试用大并发(不引入排队/抢占时序),
+	// 调度语义由 pq_test.go 专测。
+	t.Helper()
+	s := &Server{
 		agent:  agent,
 		worker: worker,
 		mirror: NewViewMirror(),
-		cfg:    Config{NodeRole: string(RoleHybrid)},
+		cfg:    Config{NodeRole: string(RoleHybrid), MaxInFlight: 64},
+		sched:  NewPQScheduler(64, time.Second),
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go s.sched.Run(ctx)
+	return s
 }
 
 func postChat(t *testing.T, srv *Server, body string) *httptest.ResponseRecorder {
@@ -222,7 +230,7 @@ func postChat(t *testing.T, srv *Server, body string) *httptest.ResponseRecorder
 }
 
 func TestChatBodyLimit(t *testing.T) {
-	srv := testServer(nil, nil)
+	srv := testServer(t, nil, nil)
 	rec := postChat(t, srv, strings.Repeat("x", maxChatRequestBytes+1))
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
@@ -252,7 +260,7 @@ func TestServerCloseClosesClientConnections(t *testing.T) {
 }
 
 func TestInvalidJSONUsesGenericError(t *testing.T) {
-	srv := testServer(nil, nil)
+	srv := testServer(t, nil, nil)
 	rec := postChat(t, srv, "{")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
@@ -264,7 +272,7 @@ func TestInvalidJSONUsesGenericError(t *testing.T) {
 }
 
 func TestGRPCErrorDoesNotLeakBackendMessage(t *testing.T) {
-	srv := testServer(fakeAgent{
+	srv := testServer(t, fakeAgent{
 		dispatch: func(context.Context, *lakepb.DispatchRequest) (*lakepb.Ack, error) {
 			return nil, status.Error(codes.Unavailable, "secret backend details")
 		},
@@ -280,7 +288,7 @@ func TestGRPCErrorDoesNotLeakBackendMessage(t *testing.T) {
 }
 
 func TestRejectedAckDoesNotLeakReason(t *testing.T) {
-	srv := testServer(fakeAgent{
+	srv := testServer(t, fakeAgent{
 		dispatch: func(context.Context, *lakepb.DispatchRequest) (*lakepb.Ack, error) {
 			return &lakepb.Ack{Ok: false, Err: "secret quota details"}, nil
 		},
@@ -298,7 +306,7 @@ func TestRejectedAckDoesNotLeakReason(t *testing.T) {
 func TestChatSelectsDDirectFromMirror(t *testing.T) {
 	var gotDispatch *lakepb.DispatchRequest
 	var gotGen *lakepb.GenerateRequest
-	srv := testServer(fakeAgent{
+	srv := testServer(t, fakeAgent{
 		dispatch: func(_ context.Context, req *lakepb.DispatchRequest) (*lakepb.Ack, error) {
 			gotDispatch = req
 			return &lakepb.Ack{Ok: true}, nil
@@ -333,7 +341,7 @@ func TestChatSelectsDDirectFromMirror(t *testing.T) {
 // 镜像无命中且权威不可达(cp=nil)→ 冷请求 COLOCATED 无复用,不阻塞执行。
 func TestChatColdMissColocated(t *testing.T) {
 	var gotGen *lakepb.GenerateRequest
-	srv := testServer(fakeAgent{
+	srv := testServer(t, fakeAgent{
 		dispatch: func(context.Context, *lakepb.DispatchRequest) (*lakepb.Ack, error) {
 			return &lakepb.Ack{Ok: true}, nil
 		},

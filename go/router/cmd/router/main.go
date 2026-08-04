@@ -2,7 +2,8 @@
 //
 //	go run ./router/cmd/router
 //
-// 环境变量:LAKE_HTTP_ADDR / LAKE_WORKER_ADDR / LAKE_AGENT_ADDR / LAKE_CP_ADDR / LAKE_NODE_ROLE
+// 环境变量:LAKE_HTTP_ADDR / LAKE_WORKER_ADDR / LAKE_AGENT_ADDR / LAKE_CP_ADDR /
+// LAKE_NODE_ROLE / LAKE_MAX_INFLIGHT(P6.4 并发执行上限,默认 1;队列无界不拒请求)
 package main
 
 import (
@@ -12,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -20,11 +22,12 @@ import (
 
 func main() {
 	cfg := router.Config{
-		HTTPAddr:   env("LAKE_HTTP_ADDR", ":8080"),
-		WorkerAddr: env("LAKE_WORKER_ADDR", "127.0.0.1:50053"),
-		AgentAddr:  env("LAKE_AGENT_ADDR", "127.0.0.1:50054"),
-		CPAddr:     env("LAKE_CP_ADDR", "127.0.0.1:50051"),
-		NodeRole:   env("LAKE_NODE_ROLE", "hybrid"),
+		HTTPAddr:    env("LAKE_HTTP_ADDR", ":8080"),
+		WorkerAddr:  env("LAKE_WORKER_ADDR", "127.0.0.1:50053"),
+		AgentAddr:   env("LAKE_AGENT_ADDR", "127.0.0.1:50054"),
+		CPAddr:      env("LAKE_CP_ADDR", "127.0.0.1:50051"),
+		NodeRole:    env("LAKE_NODE_ROLE", "hybrid"),
+		MaxInFlight: envInt("LAKE_MAX_INFLIGHT", 1),
 	}
 	s, err := router.New(cfg)
 	if err != nil {
@@ -67,6 +70,15 @@ func main() {
 func env(k, def string) string {
 	if v := os.Getenv(k); v != "" {
 		return v
+	}
+	return def
+}
+
+func envInt(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
 	}
 	return def
 }

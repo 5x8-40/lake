@@ -115,10 +115,13 @@ impl ControlPlanePort for AuthorityPort<'_> {
             &keys.hashes,
         )? {
             RegisterStatus::Accepted => Ok(()),
-            RegisterStatus::RejectedHardQuota(bp) => Err(format!(
-                "AdmitRegister: admission rejected reason={} deficit={}",
-                bp.reason, bp.deficit_bytes
-            )),
+            RegisterStatus::RejectedHardQuota(bp) => {
+                crate::record_backpressure(bp.clone());
+                Err(format!(
+                    "AdmitRegister: admission rejected reason={} deficit={}",
+                    bp.reason, bp.deficit_bytes
+                ))
+            }
         }
     }
 
@@ -129,10 +132,13 @@ impl ControlPlanePort for AuthorityPort<'_> {
             .register(&req.node_id, &req.prefix_hashes, req.blocks)?
         {
             RegisterStatus::Accepted => Ok(()),
-            RegisterStatus::RejectedHardQuota(bp) => Err(format!(
-                "RegisterBlocks: admission rejected reason={} deficit={}",
-                bp.reason, bp.deficit_bytes
-            )),
+            RegisterStatus::RejectedHardQuota(bp) => {
+                crate::record_backpressure(bp.clone());
+                Err(format!(
+                    "RegisterBlocks: admission rejected reason={} deficit={}",
+                    bp.reason, bp.deficit_bytes
+                ))
+            }
         }
     }
 

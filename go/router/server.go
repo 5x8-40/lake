@@ -22,11 +22,12 @@ import (
 
 // Config P3 Router 配置。
 type Config struct {
-	HTTPAddr   string // 默认 :8080
-	WorkerAddr string // WorkerService,默认 127.0.0.1:50053
-	AgentAddr  string // AgentService(边10 Dispatch),默认 127.0.0.1:50054
-	CPAddr     string // ControlPlaneService(权威回退查询),默认 127.0.0.1:50051
-	NodeRole   string // 候选执行节点角色(hybrid/prefill/decode,LAKE_NODE_ROLE),P6.3 选路输入;单节点原型默认 hybrid
+	HTTPAddr    string // 默认 :8080
+	WorkerAddr  string // WorkerService,默认 127.0.0.1:50053
+	AgentAddr   string // AgentService(边10 Dispatch),默认 127.0.0.1:50054
+	CPAddr      string // ControlPlaneService(权威回退查询),默认 127.0.0.1:50051
+	NodeRole    string // 候选执行节点角色(hybrid/prefill/decode,LAKE_NODE_ROLE),P6.3 选路输入;单节点原型默认 hybrid
+	MaxInFlight int    // P6.4:Router 并发执行上限(非准入控制——队列无界不拒请求);单 worker mock 默认 1
 }
 
 // Server OpenAI 兼容 HTTP → Dispatch(agent) → Generate(worker)。
@@ -36,16 +37,21 @@ type Config struct {
 // 选路读镜像零 RPC,gap/断线自动 resume,resume 过老 CP 回退快照。
 // P6.3:选路权威收归 Router——chainBlockHashes + 镜像 PrefixLookup(miss 回退权威)
 // → SelectExecMode → GenerateRequest.exec_mode/hint 下发;worker 不再自查前缀。
+// P6.4:已准入请求经 PQScheduler 按 priority 排序/抢占(被抢占者重排不丢,KV 留池
+// 重跑命中前缀);RunLoadSync 上报 LoadSnapshot 并回收 agent 转发来的池写背压
+// (触硬配额 → 该 model 新启动暂停,池间流控;shedding 归 gateway,Router 不拒请求)。
 type Server struct {
-	cfg        Config
-	worker     lakepb.WorkerServiceClient
-	agent      lakepb.AgentServiceClient
-	cp         lakepb.ControlPlaneServiceClient
-	workerConn *grpc.ClientConn
-	agentConn  *grpc.ClientConn
-	cpConn     *grpc.ClientConn
-	mirror     *ViewMirror
-	viewCancel context.CancelFunc
+	cfg         Config
+	worker      lakepb.WorkerServiceClient
+	agent       lakepb.AgentServiceClient
+	cp          lakepb.ControlPlaneServiceClient
+	workerConn  *grpc.ClientConn
+	agentConn   *grpc.ClientConn
+	cpConn      *grpc.ClientConn
+	mirror      *ViewMirror
+	viewCancel  context.CancelFunc
+	sched       *PQScheduler
+	schedCancel context.CancelFunc
 }
 
 const maxChatRequestBytes = 1 << 20
@@ -65,6 +71,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.NodeRole == "" {
 		cfg.NodeRole = string(RoleHybrid)
+	}
+	if cfg.MaxInFlight <= 0 {
+		cfg.MaxInFlight = 1
 	}
 	wconn, err := grpc.NewClient(cfg.WorkerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -94,12 +103,20 @@ func New(cfg Config) (*Server, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	s.viewCancel = cancel
 	go RunViewSync(ctx, s.cp, s.mirror, "router", 200*time.Millisecond)
+	s.sched = NewPQScheduler(cfg.MaxInFlight, 30*time.Second)
+	schedCtx, schedCancel := context.WithCancel(context.Background())
+	s.schedCancel = schedCancel
+	go s.sched.Run(schedCtx)
+	go RunLoadSync(schedCtx, s.agent, s.sched, "router", time.Second)
 	return s, nil
 }
 
 func (s *Server) Close() error {
 	if s.viewCancel != nil {
 		s.viewCancel()
+	}
+	if s.schedCancel != nil {
+		s.schedCancel()
 	}
 	var errs []error
 	if s.workerConn != nil {
@@ -159,6 +176,7 @@ type chatRequest struct {
 		Content string `json:"content"`
 	} `json:"messages"`
 	MaxTokens int `json:"max_tokens"`
+	Priority  int `json:"priority"` // P6.4:大者优先;缺省 0。仅决定已准入请求顺序/抢占,不丢请求
 }
 
 type chatResponse struct {
@@ -226,39 +244,66 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	hint := s.prefixHint(ctx, model, hashes, len(tokens), nodeID)
 	mode := SelectExecMode(hint, len(tokens), WorkerRole(s.cfg.NodeRole))
 
-	// 边10:先 Dispatch 到 agent(P3 仅 ack;执行仍在 Worker.Generate)。
-	ack, err := s.agent.Dispatch(ctx, &lakepb.DispatchRequest{
-		Mode:         string(mode),
-		TargetNodeId: nodeID,
-		Hints:        map[string]string{"request_id": rid, "model_id": model},
-	})
-	if err != nil {
-		code, msg := mapGRPCError("Dispatch", err)
-		http.Error(w, msg, code)
-		return
-	}
-	if !ack.GetOk() {
-		if ack.GetErr() != "" {
-			log.Printf("Dispatch rejected: %s", ack.GetErr())
+	// P6.4:已准入请求进优先级调度器(排序/抢占/背压暂停;不丢请求)。
+	// 抢占重排会重跑本闭包——attempt 后缀避免 worker 侧 duplicate req_id;
+	// 被抢占者 KV 已留池,重跑命中前缀(抢占重算式,对齐 vLLM v1)。
+	var gen *lakepb.GenerateResponse
+	attempt := 0
+	exec := func(execCtx context.Context) error {
+		attempt++
+		reqID := rid
+		if attempt > 1 {
+			reqID = fmt.Sprintf("%s-r%d", rid, attempt)
 		}
-		http.Error(w, "Dispatch rejected", http.StatusBadGateway)
-		return
+		// 边10:先 Dispatch 到 agent(P3 仅 ack;执行仍在 Worker.Generate)。
+		ack, err := s.agent.Dispatch(execCtx, &lakepb.DispatchRequest{
+			Mode:         string(mode),
+			TargetNodeId: nodeID,
+			Hints:        map[string]string{"request_id": reqID, "model_id": model},
+		})
+		if err != nil {
+			return &dispatchCallError{err: err}
+		}
+		if !ack.GetOk() {
+			if ack.GetErr() != "" {
+				log.Printf("Dispatch rejected: %s", ack.GetErr())
+			}
+			return errDispatchRejected
+		}
+		g, err := s.worker.Generate(execCtx, &lakepb.GenerateRequest{
+			RequestId:       reqID,
+			ModelId:         model,
+			PromptTokens:    tokens,
+			MaxNewTokens:    uint32(maxNew),
+			RequesterNodeId: nodeID,
+			ExecMode:        string(mode),
+			ComputedTokens:  uint32(hint.ComputedTokens),
+			ReusedBlocks:    uint32(hint.ReusedBlocks),
+			LocalHit:        hint.LocalHit,
+		})
+		if err != nil {
+			return &generateCallError{err: err}
+		}
+		gen = g
+		return nil
 	}
-
-	gen, err := s.worker.Generate(ctx, &lakepb.GenerateRequest{
-		RequestId:       rid,
-		ModelId:         model,
-		PromptTokens:    tokens,
-		MaxNewTokens:    uint32(maxNew),
-		RequesterNodeId: nodeID,
-		ExecMode:        string(mode),
-		ComputedTokens:  uint32(hint.ComputedTokens),
-		ReusedBlocks:    uint32(hint.ReusedBlocks),
-		LocalHit:        hint.LocalHit,
-	})
-	if err != nil {
-		code, msg := mapGRPCError("Generate", err)
-		http.Error(w, msg, code)
+	if err := s.sched.Submit(ctx, req.Priority, model, exec); err != nil {
+		var dce *dispatchCallError
+		var gce *generateCallError
+		switch {
+		case errors.As(err, &dce):
+			code, msg := mapGRPCError("Dispatch", dce.err)
+			http.Error(w, msg, code)
+		case errors.Is(err, errDispatchRejected):
+			http.Error(w, "Dispatch rejected", http.StatusBadGateway)
+		case errors.As(err, &gce):
+			code, msg := mapGRPCError("Generate", gce.err)
+			http.Error(w, msg, code)
+		default:
+			// 客户端断开/超时(ctx)或调度器内部错误
+			code, msg := mapGRPCError("Generate", err)
+			http.Error(w, msg, code)
+		}
 		return
 	}
 
@@ -288,6 +333,17 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
+
+// P6.4 handler 错误分型:保留 P3 的 HTTP 映射语义(不泄后端细节)。
+type dispatchCallError struct{ err error }
+
+func (e *dispatchCallError) Error() string { return e.err.Error() }
+
+var errDispatchRejected = errors.New("dispatch rejected")
+
+type generateCallError struct{ err error }
+
+func (e *generateCallError) Error() string { return e.err.Error() }
 
 func mapGRPCError(op string, err error) (httpStatus int, msg string) {
 	st, ok := status.FromError(err)
