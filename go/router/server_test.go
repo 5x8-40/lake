@@ -19,7 +19,8 @@ import (
 )
 
 type fakeAgent struct {
-	dispatch func(context.Context, *lakepb.DispatchRequest) (*lakepb.Ack, error)
+	dispatch    func(context.Context, *lakepb.DispatchRequest) (*lakepb.Ack, error)
+	placeBlocks func(context.Context, *lakepb.PlaceBlocksRequest) (*lakepb.Ack, error)
 }
 
 func (f fakeAgent) Dispatch(ctx context.Context, req *lakepb.DispatchRequest, _ ...grpc.CallOption) (*lakepb.Ack, error) {
@@ -30,8 +31,11 @@ func (fakeAgent) ReportLoad(context.Context, ...grpc.CallOption) (grpc.BidiStrea
 	return nil, status.Error(codes.Unimplemented, "not implemented")
 }
 
-func (fakeAgent) PlaceBlocks(context.Context, *lakepb.PlaceBlocksRequest, ...grpc.CallOption) (*lakepb.Ack, error) {
-	return nil, status.Error(codes.Unimplemented, "not implemented")
+func (f fakeAgent) PlaceBlocks(ctx context.Context, req *lakepb.PlaceBlocksRequest, _ ...grpc.CallOption) (*lakepb.Ack, error) {
+	if f.placeBlocks == nil {
+		return nil, status.Error(codes.Unimplemented, "not implemented")
+	}
+	return f.placeBlocks(ctx, req)
 }
 
 type fakeWorker struct {

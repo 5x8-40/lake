@@ -222,6 +222,49 @@ func (r *nodeRegistry) lastReady() (string, bool) {
 	return r.ready[len(r.ready)-1], true
 }
 
+// hotSet 近期前缀命中块(有界 FIFO 去重)——P6.6:扩容新节点时 prefetch 热 KV
+// 到其 HBM(权重预加载/layer-async 在 Python coldstart;本结构管"预热什么")。
+type hotSet struct {
+	mu    sync.Mutex
+	cap   int
+	seen  map[string]struct{} // model\x00hex(hash)
+	order []*lakepb.KVBlockID // FIFO,超 cap 摘最旧
+}
+
+func newHotSet(cap int) *hotSet {
+	if cap <= 0 {
+		cap = 256
+	}
+	return &hotSet{cap: cap, seen: make(map[string]struct{})}
+}
+
+func hotKey(id *lakepb.KVBlockID) string {
+	return id.GetModelId() + "\x00" + string(id.GetBlockHash())
+}
+
+func (h *hotSet) add(ids ...*lakepb.KVBlockID) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, id := range ids {
+		k := hotKey(id)
+		if _, ok := h.seen[k]; ok {
+			continue
+		}
+		h.seen[k] = struct{}{}
+		h.order = append(h.order, id)
+	}
+	for len(h.order) > h.cap {
+		delete(h.seen, hotKey(h.order[0]))
+		h.order = h.order[1:]
+	}
+}
+
+func (h *hotSet) snapshot() []*lakepb.KVBlockID {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]*lakepb.KVBlockID(nil), h.order...)
+}
+
 func (r *nodeRegistry) drainingList() []string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -255,6 +298,26 @@ func (s *Server) applyScale(ctx context.Context, d ScaleDecision) error {
 		s.lastReadyLatencyMu.Unlock()
 		log.Printf("scale-out: %s ready (migrations=%d, ring_gen=%d)",
 			id, resp.GetMigrationCount(), resp.GetMap().GetGeneration())
+		// P6.6:KV prefetch——热块异步铺到新节点 HBM(不阻塞 Ready;
+		// 真实字节搬运归 P5,此处走 agent PlaceBlocks 控制信令)。
+		if s.hot != nil {
+			if ids := s.hot.snapshot(); len(ids) > 0 {
+				go func() {
+					pctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+					defer cancel()
+					ack, err := s.agent.PlaceBlocks(pctx, &lakepb.PlaceBlocksRequest{
+						Ids: ids, TargetNodeId: id,
+					})
+					if err != nil {
+						log.Printf("scale-out prefetch %s: %v", id, err)
+					} else if !ack.GetOk() {
+						log.Printf("scale-out prefetch %s rejected: %s", id, ack.GetErr())
+					} else {
+						log.Printf("scale-out prefetch: %d hot blocks → %s", len(ids), id)
+					}
+				}()
+			}
+		}
 	case DecideScaleIn:
 		victim, ok := s.nodes.lastReady()
 		if !ok {

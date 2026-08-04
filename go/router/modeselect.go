@@ -92,12 +92,14 @@ func (s *Server) prefixHint(
 		if err != nil || resp == nil {
 			return PrefixHint{} // 权威不可达按冷请求处理,不阻塞执行
 		}
+		s.recordHot(resp.GetBlocks())
 		return PrefixHint{
 			ComputedTokens: minInt(int(resp.GetHitLength())*BlockSize, promptLen),
 			ReusedBlocks:   int(resp.GetHitLength()),
 			LocalHit:       anyLocalHit(resp.GetBlocks()),
 		}
 	}
+	s.recordHotIDs(modelID, prefixHashes[:hitLen])
 	localHit := false
 	for _, b := range blocks {
 		if b.LocalHit {
@@ -120,6 +122,32 @@ func anyLocalHit(blocks []*lakepb.ReusableBlock) bool {
 		}
 	}
 	return false
+}
+
+// recordHot P6.6:权威回退路径的命中块记入热集。
+func (s *Server) recordHot(blocks []*lakepb.ReusableBlock) {
+	if s.hot == nil {
+		return
+	}
+	ids := make([]*lakepb.KVBlockID, 0, len(blocks))
+	for _, b := range blocks {
+		if b.GetId() != nil {
+			ids = append(ids, b.GetId())
+		}
+	}
+	s.hot.add(ids...)
+}
+
+// recordHotIDs P6.6:镜像命中路径(ID 由 model+前缀哈希重建,MirrorBlock 不存 ID)。
+func (s *Server) recordHotIDs(modelID string, hashes [][]byte) {
+	if s.hot == nil {
+		return
+	}
+	ids := make([]*lakepb.KVBlockID, 0, len(hashes))
+	for _, h := range hashes {
+		ids = append(ids, &lakepb.KVBlockID{ModelId: modelID, BlockHash: h})
+	}
+	s.hot.add(ids...)
 }
 
 func minInt(a, b int) int {

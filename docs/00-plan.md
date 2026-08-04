@@ -275,7 +275,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 - [ ] 无状态 router + 本地命中视图镜像（权威在 Rust 存储控制面进程内存,etcd 只 checkpoint;Go Router 零 RPC 读镜像；读写分锁 P6.1 已落地:`Mutex→RwLock` + `lookup_prefix` 改 `&self`(读路径懒修复确认为死代码移除,frequency touch 经内部同步 registry 留在读路径) + Go Router 接 CP 客户端权威回退;P6.2 已落地:SubscribeView snapshot+增量+gap replay(有界 replay buffer,超限回退快照) + Go ViewMirror/RunViewSync 消费建镜像;P6.3 已落地:`select_exec_mode` 移植 Go Router(`modeselect.go`,三模式单测) + `ChainBlockHashes` 跨语言字节一致(测试向量锚定) + `GenerateRequest.exec_mode/hint` 下发、worker 去 `probe_prefix` 自查 + 镜像 total-miss 回退权威(防注册事件未播到丢复用);P6.4 已落地:Router PQScheduler(priority 排序/抢占重排 errPreempted/队列无界无 shedding) + RunLoadSync 上报 LoadSnapshot 并经 Ack 回收池写背压(触硬 → 该 model 新启动暂停 bpTTL,池间流控不拒请求) + storage-agent ReportLoad 落地(逐条 ack 携带 TTL 内背压,写路径 RejectedHardQuota 进程态记录);弹性扩缩/冷启动见 issue #52 P6.5/P6.6）
 - [x] 池间调度 + 反压（Router model 级背压暂停新启动,已在途不受影响,自动解除——P6.4）
 - [x] 基于指标的弹性扩缩容（队列长度/TTFT/ITL/命中率;P6.5 已落地:Router Autoscaler 决策器(队列深度持续超阈+防抖+cooldown+min/max 边界;命中率累计统计,TTFT/ITL 预留 P7) + 扩容 JoinShardNode 入路由表(决策→Ready 时延记录,原型=join RPC 完成;真实 provision<10s 待 P7) + 缩容 LIFO victim DrainShardNode 推 L2 计划→摘路由→RemoveShardNode(placement 未清拒则留 draining 下周期 reap,不丢请求) + Rust 环 join→drain→remove 往返所有权完全恢复测试;默认关 LAKE_AUTOSCALE=1 开;真跨机 provision 归外部编排——issue #52 P6.5）
-- [ ] 冷启动压缩（权重预加载、layer-async serve、KV prefetch）
+- [x] 冷启动压缩（权重预加载、layer-async serve、KV prefetch;P6.6 已落地:Python `runtime/coldstart.py` 三阶段管线(前 N 层就绪即开 serve 门 + 热 KV 与权重加载重叠拉取;参考 Dynamo ModelExpress 边传边服务,传输层归 P5/P7) + micro-bench 实测 gate 3.9x 提前/fully_ready 重叠省 33%(目标值待 P7 校准) + Go 扩容接线(hotSet 近期命中块,scale-out Ready 后 PlaceBlocks 异步 prefetch 到新节点 HBM,不阻塞 Ready)）
 
 **完成判据**：扩容决策到 Ready 接受请求 < 10s（目标值，待 P7 校准）。
 

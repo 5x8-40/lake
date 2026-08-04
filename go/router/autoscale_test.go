@@ -305,3 +305,59 @@ func TestAutoscaleTickDrivenBySchedulerQueue(t *testing.T) {
 		t.Fatalf("nodes = %d, want 2", srv.nodes.count())
 	}
 }
+
+// P6.6 判据(接线):扩容新节点 Ready 后,近期命中热块经 PlaceBlocks prefetch 到其 HBM。
+func TestScaleOutPrefetchesHotBlocks(t *testing.T) {
+	type placeCall struct {
+		target string
+		ids    int
+		hash0  string
+	}
+	placeCh := make(chan placeCall, 4)
+	srv := dialFakeCP(t, fakeCP{
+		joinShardNode: func(_ context.Context, req *lakepb.JoinShardNodeRequest) (*lakepb.JoinShardNodeResponse, error) {
+			return &lakepb.JoinShardNodeResponse{Ok: true, Map: &lakepb.ShardMap{Generation: 2}}, nil
+		},
+	})
+	defer srv.Close()
+	srv.nodes = newNodeRegistry("worker-0")
+	srv.hot = newHotSet(16)
+	srv.agent = fakeAgent{
+		placeBlocks: func(_ context.Context, req *lakepb.PlaceBlocksRequest) (*lakepb.Ack, error) {
+			c := placeCall{target: req.GetTargetNodeId(), ids: len(req.GetIds())}
+			if c.ids > 0 {
+				c.hash0 = string(req.GetIds()[0].GetBlockHash())
+			}
+			placeCh <- c
+			return &lakepb.Ack{Ok: true}, nil
+		},
+	}
+
+	// 经 prefixHint 真实命中路径记录热块(镜像预置 L0 命中)
+	tokens := []uint32{1, 2, 3, 4, 5, 6, 7, 8}
+	hashes := ChainBlockHashes(tokens, BlockSize)
+	if err := srv.Mirror().Apply(&lakepb.ViewUpdate{Seq: 0, Events: []*lakepb.ViewEvent{
+		regEvent("m", string(hashes[0]), l0on("worker-0")),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	hint := srv.prefixHint(context.Background(), "m", hashes, len(tokens), "worker-0")
+	if hint.ReusedBlocks != 1 {
+		t.Fatalf("hint = %+v, want 1 reused block", hint)
+	}
+
+	if err := srv.applyScale(context.Background(), DecideScaleOut); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case c := <-placeCh:
+		if c.target != "worker-1" {
+			t.Fatalf("prefetch target = %q, want worker-1(新节点)", c.target)
+		}
+		if c.ids != 1 || c.hash0 != string(hashes[0]) {
+			t.Fatalf("prefetch ids = %d hash0 = %q, want 1/%q(命中热块)", c.ids, c.hash0, hashes[0])
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timeout waiting for scale-out prefetch PlaceBlocks")
+	}
+}

@@ -65,6 +65,7 @@ type Server struct {
 	lastReadyLatencyMu     sync.Mutex
 	lastReadyLatency       time.Duration // 最近扩容决策→Ready 时延(原型=join RPC 完成)
 	hitBlocks, totalBlocks atomic.Uint64 // 命中率分子/分母(累计 block 数)
+	hot                    *hotSet       // P6.6:近期命中块,扩容时 prefetch 到新节点
 }
 
 const maxChatRequestBytes = 1 << 20
@@ -123,6 +124,7 @@ func New(cfg Config) (*Server, error) {
 	go RunLoadSync(schedCtx, s.agent, s.sched, "router", time.Second)
 	s.nodes = newNodeRegistry("worker-0")
 	s.scaler = NewAutoscaler(AutoscaleConfig{})
+	s.hot = newHotSet(256)
 	if cfg.Autoscale {
 		go s.runAutoscale(schedCtx, 2*time.Second)
 	}
