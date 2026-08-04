@@ -26,14 +26,16 @@ type Config struct {
 	WorkerAddr string // WorkerService,默认 127.0.0.1:50053
 	AgentAddr  string // AgentService(边10 Dispatch),默认 127.0.0.1:50054
 	CPAddr     string // ControlPlaneService(权威回退查询),默认 127.0.0.1:50051
+	NodeRole   string // 候选执行节点角色(hybrid/prefill/decode,LAKE_NODE_ROLE),P6.3 选路输入;单节点原型默认 hybrid
 }
 
 // Server OpenAI 兼容 HTTP → Dispatch(agent) → Generate(worker)。
 // P3 入口即本服务(边2);不经 Bifrost。
-// P6.1:Router 已接 CP 客户端(LookupPrefix/Locate 权威回退档,冷启动/gap 用);
-// 选路权威收归 Router(worker 不再自查前缀)归 P6.3。
+// P6.1:Router 已接 CP 客户端(LookupPrefix/Locate 权威回退档,冷启动/gap 用)。
 // P6.2:后台 RunViewSync 消费 CP SubscribeView 维护本地只读镜像(ViewMirror);
 // 选路读镜像零 RPC,gap/断线自动 resume,resume 过老 CP 回退快照。
+// P6.3:选路权威收归 Router——chainBlockHashes + 镜像 PrefixLookup(miss 回退权威)
+// → SelectExecMode → GenerateRequest.exec_mode/hint 下发;worker 不再自查前缀。
 type Server struct {
 	cfg        Config
 	worker     lakepb.WorkerServiceClient
@@ -60,6 +62,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.CPAddr == "" {
 		cfg.CPAddr = "127.0.0.1:50051"
+	}
+	if cfg.NodeRole == "" {
+		cfg.NodeRole = string(RoleHybrid)
 	}
 	wconn, err := grpc.NewClient(cfg.WorkerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -215,9 +220,15 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	rid := uuid.NewString()
 	nodeID := "worker-0"
 
+	// P6.3:选路权威在 Router——哈希链 → 镜像查命中(miss 回退权威)→ 选模式。
+	// 纯内存读,模式选择开销 µs 级,满足 D-direct < 5ms 的 SLO 预算。
+	hashes := ChainBlockHashes(tokens, BlockSize)
+	hint := s.prefixHint(ctx, model, hashes, len(tokens), nodeID)
+	mode := SelectExecMode(hint, len(tokens), WorkerRole(s.cfg.NodeRole))
+
 	// 边10:先 Dispatch 到 agent(P3 仅 ack;执行仍在 Worker.Generate)。
 	ack, err := s.agent.Dispatch(ctx, &lakepb.DispatchRequest{
-		Mode:         "COLOCATED",
+		Mode:         string(mode),
 		TargetNodeId: nodeID,
 		Hints:        map[string]string{"request_id": rid, "model_id": model},
 	})
@@ -240,6 +251,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		PromptTokens:    tokens,
 		MaxNewTokens:    uint32(maxNew),
 		RequesterNodeId: nodeID,
+		ExecMode:        string(mode),
+		ComputedTokens:  uint32(hint.ComputedTokens),
+		ReusedBlocks:    uint32(hint.ReusedBlocks),
+		LocalHit:        hint.LocalHit,
 	})
 	if err != nil {
 		code, msg := mapGRPCError("Generate", err)

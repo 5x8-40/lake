@@ -204,7 +204,13 @@ func TestServerViewSyncBuildsMirror(t *testing.T) {
 }
 
 func testServer(agent lakepb.AgentServiceClient, worker lakepb.WorkerServiceClient) *Server {
-	return &Server{agent: agent, worker: worker}
+	// P6.3:handler 选路读镜像;cp=nil 时 prefixHint 权威回退报错按冷请求处理。
+	return &Server{
+		agent:  agent,
+		worker: worker,
+		mirror: NewViewMirror(),
+		cfg:    Config{NodeRole: string(RoleHybrid)},
+	}
 }
 
 func postChat(t *testing.T, srv *Server, body string) *httptest.ResponseRecorder {
@@ -285,5 +291,64 @@ func TestRejectedAckDoesNotLeakReason(t *testing.T) {
 	}
 	if strings.Contains(rec.Body.String(), "secret quota details") {
 		t.Fatalf("leaked ack err: %q", rec.Body.String())
+	}
+}
+
+// P6.3 判据:Router 读镜像选路并下发——本地命中 → D-direct,GenerateRequest 带 mode/hint。
+func TestChatSelectsDDirectFromMirror(t *testing.T) {
+	var gotDispatch *lakepb.DispatchRequest
+	var gotGen *lakepb.GenerateRequest
+	srv := testServer(fakeAgent{
+		dispatch: func(_ context.Context, req *lakepb.DispatchRequest) (*lakepb.Ack, error) {
+			gotDispatch = req
+			return &lakepb.Ack{Ok: true}, nil
+		},
+	}, fakeWorker{
+		generate: func(_ context.Context, req *lakepb.GenerateRequest) (*lakepb.GenerateResponse, error) {
+			gotGen = req
+			return &lakepb.GenerateResponse{RequestId: req.GetRequestId(), Mode: req.GetExecMode()}, nil
+		},
+	})
+	// 预置镜像:该 prompt 的首块在 worker-0 L0(本地命中,部分命中也算 D-direct)
+	tokens := tokenizeMock("hi")
+	hashes := ChainBlockHashes(tokens, BlockSize)
+	if err := srv.mirror.Apply(&lakepb.ViewUpdate{Seq: 0, Events: []*lakepb.ViewEvent{
+		regEvent("m", string(hashes[0]), l0on("worker-0")),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	rec := postChat(t, srv, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if gotDispatch.GetMode() != string(ExecModeDDirect) {
+		t.Fatalf("Dispatch.Mode = %q, want D_DIRECT", gotDispatch.GetMode())
+	}
+	if gotGen.GetExecMode() != string(ExecModeDDirect) || !gotGen.GetLocalHit() ||
+		gotGen.GetReusedBlocks() != 1 || gotGen.GetComputedTokens() != 8 {
+		t.Fatalf("GenerateRequest = %+v, want D_DIRECT local reused=1 computed=8", gotGen)
+	}
+}
+
+// 镜像无命中且权威不可达(cp=nil)→ 冷请求 COLOCATED 无复用,不阻塞执行。
+func TestChatColdMissColocated(t *testing.T) {
+	var gotGen *lakepb.GenerateRequest
+	srv := testServer(fakeAgent{
+		dispatch: func(context.Context, *lakepb.DispatchRequest) (*lakepb.Ack, error) {
+			return &lakepb.Ack{Ok: true}, nil
+		},
+	}, fakeWorker{
+		generate: func(_ context.Context, req *lakepb.GenerateRequest) (*lakepb.GenerateResponse, error) {
+			gotGen = req
+			return &lakepb.GenerateResponse{RequestId: req.GetRequestId(), Mode: req.GetExecMode()}, nil
+		},
+	})
+	rec := postChat(t, srv, `{"model":"m","messages":[{"role":"user","content":"hi"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%q", rec.Code, rec.Body.String())
+	}
+	if gotGen.GetExecMode() != string(ExecModeColocated) || gotGen.GetReusedBlocks() != 0 ||
+		gotGen.GetComputedTokens() != 0 || gotGen.GetLocalHit() {
+		t.Fatalf("GenerateRequest = %+v, want COLOCATED 无复用", gotGen)
 	}
 }

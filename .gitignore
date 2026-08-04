@@ -38,3 +38,6 @@ logs/
 
 .claude/settings.json
 .claude/
+
+# 本地浏览器工具产物
+.playwright-mcp/

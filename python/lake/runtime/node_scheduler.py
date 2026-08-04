@@ -19,7 +19,7 @@ from lake.engine.pool_types import ReadyHandle
 from lake.runtime.executor import ExecutorInput, RuntimeExecutor, SingleProcessExecutor
 from lake.runtime.exec_mode import ExecMode
 from lake.runtime.future_map import FutureMap
-from lake.runtime.mode_select import full_local_hit, select_exec_mode
+from lake.runtime.mode_select import full_local_hit
 from lake.runtime.prefix_hint import PrefixHint
 from lake.runtime.req import Req
 from lake.runtime.role import RoleConfig
@@ -103,9 +103,8 @@ class NodeScheduler:
                 )
         if hint is not None:
             req.apply_prefix_hint(hint)
-            req.exec_mode = select_exec_mode(
-                hint, prompt_len=len(req.prompt_token_ids), role=self._role.role
-            )
+            # P6.3:exec_mode 由 Router 下发(req.exec_mode 已设),此处不再重选;
+            # full_local_hit 是调度几何(整段在 L0 → computed=prompt_len),非选路。
             if full_local_hit(hint, len(req.prompt_token_ids)):
                 # vLLM 几何：整段已在 L0 → computed=prompt_len，下一步直接生成
                 req.num_computed_tokens = len(req.prompt_token_ids)

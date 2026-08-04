@@ -52,6 +52,7 @@ def test_full_local_hit_skips_prompt_phase() -> None:
         prebuilt=True,
     )
     req = build_req_from_generate("d1", "m", prompt, 2, "n0")
+    req.exec_mode = ExecMode.D_DIRECT  # P6.3:由 Router 下发,scheduler 不再重选
     sched.add_request(req, hint=hint)
     assert req.exec_mode == ExecMode.D_DIRECT
     assert req.num_computed_tokens == len(prompt)
@@ -89,6 +90,7 @@ def test_partial_hit_prompt_residual_has_read_set() -> None:
     assert hint.computed_tokens == 8
     assert hint.local_hit is True
     req = build_req_from_generate("p1", "m", prompt, 1, "n0")
+    req.exec_mode = ExecMode.D_DIRECT  # P6.3:由 Router 下发,scheduler 不再重选
     sched.add_request(req, hint=hint)
     assert req.exec_mode == ExecMode.D_DIRECT
     out = sched.schedule()

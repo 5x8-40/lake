@@ -4271,8 +4271,14 @@ type GenerateRequest struct {
 	PromptTokens    []uint32               `protobuf:"varint,3,rep,packed,name=prompt_tokens,json=promptTokens,proto3" json:"prompt_tokens,omitempty"`    // 已 tokenize 的 prompt(P3 跳过真实 tokenizer)
 	MaxNewTokens    uint32                 `protobuf:"varint,4,opt,name=max_new_tokens,json=maxNewTokens,proto3" json:"max_new_tokens,omitempty"`         // mock decode 长度
 	RequesterNodeId string                 `protobuf:"bytes,5,opt,name=requester_node_id,json=requesterNodeId,proto3" json:"requester_node_id,omitempty"` // LookupPrefix local_hit 判定
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// P6.3:选路权威收归 Router(读本地命中视图镜像零-RPC 决策,miss 回退权威)。
+	// 以下字段由 Router 决策后下发,worker 消费、不再自调 LookupPrefix 自查前缀。
+	ExecMode       string `protobuf:"bytes,6,opt,name=exec_mode,json=execMode,proto3" json:"exec_mode,omitempty"`                    // COLOCATED / PD_DISAGG / D_DIRECT;空=调用方未经 Router → 按 COLOCATED 无复用
+	ComputedTokens uint32 `protobuf:"varint,7,opt,name=computed_tokens,json=computedTokens,proto3" json:"computed_tokens,omitempty"` // 前缀命中换算的可复用 token 数(PrefixHint.computed_tokens)
+	ReusedBlocks   uint32 `protobuf:"varint,8,opt,name=reused_blocks,json=reusedBlocks,proto3" json:"reused_blocks,omitempty"`       // 命中 block 数
+	LocalHit       bool   `protobuf:"varint,9,opt,name=local_hit,json=localHit,proto3" json:"local_hit,omitempty"`                   // 命中含 requester 本机 L0(D-direct 依据)
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *GenerateRequest) Reset() {
@@ -4340,13 +4346,41 @@ func (x *GenerateRequest) GetRequesterNodeId() string {
 	return ""
 }
 
+func (x *GenerateRequest) GetExecMode() string {
+	if x != nil {
+		return x.ExecMode
+	}
+	return ""
+}
+
+func (x *GenerateRequest) GetComputedTokens() uint32 {
+	if x != nil {
+		return x.ComputedTokens
+	}
+	return 0
+}
+
+func (x *GenerateRequest) GetReusedBlocks() uint32 {
+	if x != nil {
+		return x.ReusedBlocks
+	}
+	return 0
+}
+
+func (x *GenerateRequest) GetLocalHit() bool {
+	if x != nil {
+		return x.LocalHit
+	}
+	return false
+}
+
 type GenerateResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	RequestId     string                 `protobuf:"bytes,1,opt,name=request_id,json=requestId,proto3" json:"request_id,omitempty"`
 	OutputTokens  []uint32               `protobuf:"varint,2,rep,packed,name=output_tokens,json=outputTokens,proto3" json:"output_tokens,omitempty"`
 	ReusedBlocks  uint32                 `protobuf:"varint,3,opt,name=reused_blocks,json=reusedBlocks,proto3" json:"reused_blocks,omitempty"`    // 前缀命中 block 数(对齐 src/ 冒烟语义)
 	PrefillBlocks uint32                 `protobuf:"varint,4,opt,name=prefill_blocks,json=prefillBlocks,proto3" json:"prefill_blocks,omitempty"` // 本次新算 block 数
-	Mode          string                 `protobuf:"bytes,5,opt,name=mode,proto3" json:"mode,omitempty"`                                         // P3 固定 "COLOCATED";生产才报 PD_SEPARATED / D_DIRECT
+	Mode          string                 `protobuf:"bytes,5,opt,name=mode,proto3" json:"mode,omitempty"`                                         // 回显实际执行模式(COLOCATED / PD_DISAGG / D_DIRECT)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -4731,14 +4765,18 @@ const file_lake_proto_rawDesc = "" +
 	"\x10GetBlocksRequest\x12!\n" +
 	"\x03ids\x18\x01 \x03(\v2\x0f.lake.KVBlockIDR\x03ids\">\n" +
 	"\x11GetBlocksResponse\x12)\n" +
-	"\x06blocks\x18\x01 \x03(\v2\x11.lake.OpaqueBlockR\x06blocks\"\xc2\x01\n" +
+	"\x06blocks\x18\x01 \x03(\v2\x11.lake.OpaqueBlockR\x06blocks\"\xca\x02\n" +
 	"\x0fGenerateRequest\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12\x19\n" +
 	"\bmodel_id\x18\x02 \x01(\tR\amodelId\x12#\n" +
 	"\rprompt_tokens\x18\x03 \x03(\rR\fpromptTokens\x12$\n" +
 	"\x0emax_new_tokens\x18\x04 \x01(\rR\fmaxNewTokens\x12*\n" +
-	"\x11requester_node_id\x18\x05 \x01(\tR\x0frequesterNodeId\"\xb6\x01\n" +
+	"\x11requester_node_id\x18\x05 \x01(\tR\x0frequesterNodeId\x12\x1b\n" +
+	"\texec_mode\x18\x06 \x01(\tR\bexecMode\x12'\n" +
+	"\x0fcomputed_tokens\x18\a \x01(\rR\x0ecomputedTokens\x12#\n" +
+	"\rreused_blocks\x18\b \x01(\rR\freusedBlocks\x12\x1b\n" +
+	"\tlocal_hit\x18\t \x01(\bR\blocalHit\"\xb6\x01\n" +
 	"\x10GenerateResponse\x12\x1d\n" +
 	"\n" +
 	"request_id\x18\x01 \x01(\tR\trequestId\x12#\n" +

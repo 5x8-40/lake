@@ -1782,7 +1782,8 @@ class WorkerServiceStub:
     """WorkerService — 计算层 Generate。
     生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
     P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
-    执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;**mode 固定 COLOCATED**。
+    执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;
+    P6.3 起 mode 由 Router 读镜像决策后经 GenerateRequest.exec_mode 下发。
     """
 
     def __init__(self, channel):
@@ -1802,7 +1803,8 @@ class WorkerServiceServicer:
     """WorkerService — 计算层 Generate。
     生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
     P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
-    执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;**mode 固定 COLOCATED**。
+    执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;
+    P6.3 起 mode 由 Router 读镜像决策后经 GenerateRequest.exec_mode 下发。
     """
 
     def Generate(self, request, context):
@@ -1831,7 +1833,8 @@ class WorkerService:
     """WorkerService — 计算层 Generate。
     生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
     P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
-    执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;**mode 固定 COLOCATED**。
+    执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;
+    P6.3 起 mode 由 Router 读镜像决策后经 GenerateRequest.exec_mode 下发。
     """
 
     @staticmethod
