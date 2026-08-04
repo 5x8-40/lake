@@ -23,12 +23,13 @@ mod quota;
 mod reconcile;
 mod shard;
 mod tier;
+mod view;
 
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -81,7 +82,11 @@ fn admit_keys_from_request(req: &RegisterBlocksRequest) -> Result<AdmitKeys, Str
     })
 }
 
-#[derive(Clone, Default)]
+/// P6.2: 视图广播通道容量。慢订阅者 Lagged 后由订阅任务快照重同步;
+/// 断线订阅者的 gap 由 `view::ViewLog`(replay buffer)兜底。
+pub const DEFAULT_VIEW_BROADCAST_CAP: usize = 256;
+
+#[derive(Clone)]
 pub struct ControlPlane {
     /// P6.1: `Mutex → RwLock`——lookup/locate/admit/defrag/shard_map 读路径
     /// 并发（读多写少）；register/report_ref/reconcile/restore 等写路径仍互斥，
@@ -91,6 +96,21 @@ pub struct ControlPlane {
     /// Shared pause flag for promote/demote/GC/defrag (agent syncs BandwidthPool).
     background_paused: Arc<Mutex<bool>>,
     authority_poisoned_reported: Arc<AtomicBool>,
+    /// P6.2: SubscribeView 直播通道(写 handler 提交事件后广播)。
+    view_tx: broadcast::Sender<ViewUpdate>,
+}
+
+impl Default for ControlPlane {
+    fn default() -> Self {
+        let (view_tx, _) = broadcast::channel(DEFAULT_VIEW_BROADCAST_CAP);
+        Self {
+            inner: Arc::new(RwLock::new(Authority::default())),
+            checkpoints: Arc::new(MemoryCheckpointStore::default()),
+            background_paused: Arc::new(Mutex::new(false)),
+            authority_poisoned_reported: Arc::new(AtomicBool::new(false)),
+            view_tx,
+        }
+    }
 }
 
 impl ControlPlane {
@@ -99,11 +119,13 @@ impl ControlPlane {
     }
 
     pub fn with_checkpoint_store(store: MemoryCheckpointStore) -> Self {
+        let (view_tx, _) = broadcast::channel(DEFAULT_VIEW_BROADCAST_CAP);
         Self {
             inner: Arc::new(RwLock::new(Authority::default())),
             checkpoints: Arc::new(store),
             background_paused: Arc::new(Mutex::new(false)),
             authority_poisoned_reported: Arc::new(AtomicBool::new(false)),
+            view_tx,
         }
     }
 
@@ -141,6 +163,23 @@ impl ControlPlane {
     fn lock_authority_status(_: ()) -> Status {
         Status::internal("controlplane authority unavailable")
     }
+
+    /// P6.2: 提交本写调用累积的视图事件并广播(写锁内调用,提交序=广播序)。
+    /// 无论 RPC 成败都调用:事件反映状态迁移,部分变异也要让镜像看到。
+    fn commit_and_broadcast(&self, auth: &mut Authority) {
+        if let Some(u) = auth.commit_view_events() {
+            // 无订阅者时 send 返回 Err,忽略;慢订阅者 Lagged 由订阅任务快照重同步。
+            let _ = self.view_tx.send(u);
+        }
+    }
+}
+
+/// P6.2: 锚点更新(空事件):快照/重放之后告知接收方当前权威 seq。
+fn anchor_update(seq: u64) -> ViewUpdate {
+    ViewUpdate {
+        seq,
+        events: Vec::new(),
+    }
 }
 
 #[tonic::async_trait]
@@ -148,13 +187,75 @@ impl ControlPlaneService for ControlPlane {
     type SubscribeViewStream =
         Pin<Box<dyn tokio_stream::Stream<Item = Result<ViewUpdate, Status>> + Send + 'static>>;
 
+    /// P6.2: snapshot-on-connect / resume 重放 / 增量直播。
+    ///
+    /// 协议(见 `view.rs` 头注释):先 subscribe broadcast 再取读锁做快照——读锁
+    /// 释放后的提交 seq 必大于锚点且经 broadcast 送达,重叠部分按 `seq <= last`
+    /// 去重(借鉴 Dynamo `DeduplicatingStream`,单权威退化为单流序号)。
     async fn subscribe_view(
         &self,
-        _request: Request<SubscribeRequest>,
+        request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeViewStream>, Status> {
-        Err(Status::unimplemented(
-            "SubscribeView 未实现;Router 冷路径用 LookupPrefix",
-        ))
+        let req = request.into_inner();
+        let mut rx = self.view_tx.subscribe();
+        let (initial, anchor) = {
+            let auth = self.read_authority().map_err(Self::lock_authority_status)?;
+            if req.resume_from_seq == 0 {
+                let last = auth.view_last_seq();
+                (vec![auth.view_snapshot(), anchor_update(last)], last)
+            } else {
+                match auth.replay_view_after(req.resume_from_seq) {
+                    Some(ups) => {
+                        let anchor = ups.last().map(|u| u.seq).unwrap_or(req.resume_from_seq);
+                        (ups, anchor)
+                    }
+                    // replay buffer 已逐出 → 回退快照(有界 buffer 语义)
+                    None => {
+                        let last = auth.view_last_seq();
+                        (vec![auth.view_snapshot(), anchor_update(last)], last)
+                    }
+                }
+            }
+        };
+        let (tx, out) = mpsc::channel(64);
+        let inner = Arc::clone(&self.inner);
+        tokio::spawn(async move {
+            for u in initial {
+                if tx.send(Ok(u)).await.is_err() {
+                    return;
+                }
+            }
+            let mut last = anchor;
+            loop {
+                match rx.recv().await {
+                    Ok(u) => {
+                        if u.seq <= last {
+                            continue; // 去重:快照/广播重叠
+                        }
+                        last = u.seq;
+                        if tx.send(Ok(u)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // 慢订阅者:快照重同步(单写者顺序提交保证之后 seq 连续)
+                        let (snap, a) = match inner.read() {
+                            Ok(auth) => (auth.view_snapshot(), auth.view_last_seq()),
+                            Err(_) => return, // poisoned:让客户端重连走 resume
+                        };
+                        if tx.send(Ok(snap)).await.is_err() {
+                            return;
+                        }
+                        if tx.send(Ok(anchor_update(a))).await.is_err() {
+                            return;
+                        }
+                        last = a;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(ReceiverStream::new(out))))
     }
 
     async fn lookup_prefix(
@@ -234,7 +335,9 @@ impl ControlPlaneService for ControlPlane {
         let mut auth = self
             .write_authority()
             .map_err(Self::lock_authority_status)?;
-        match auth.register(&req.node_id, &req.prefix_hashes, req.blocks) {
+        let result = auth.register(&req.node_id, &req.prefix_hashes, req.blocks);
+        self.commit_and_broadcast(&mut auth);
+        match result {
             Ok(RegisterStatus::Accepted) => Ok(Response::new(Ack {
                 ok: true,
                 err: String::new(),
@@ -355,7 +458,9 @@ impl ControlPlaneService for ControlPlane {
         let mut auth = self
             .write_authority()
             .map_err(Self::lock_authority_status)?;
-        match auth.deregister_model(&req.model_id, &req.revision) {
+        let result = auth.deregister_model(&req.model_id, &req.revision);
+        self.commit_and_broadcast(&mut auth);
+        match result {
             Ok(()) => Ok(Response::new(Ack {
                 ok: true,
                 err: String::new(),
@@ -425,7 +530,9 @@ impl ControlPlaneService for ControlPlane {
         let mut auth = self
             .write_authority()
             .map_err(Self::lock_authority_status)?;
-        match auth.reconcile_orphans(&req) {
+        let result = auth.reconcile_orphans(&req);
+        self.commit_and_broadcast(&mut auth);
+        match result {
             Ok(resp) => Ok(Response::new(resp)),
             Err(e) => Ok(Response::new(ReconcileOrphansResponse {
                 discarded: vec![],
@@ -445,7 +552,9 @@ impl ControlPlaneService for ControlPlane {
         let mut auth = self
             .write_authority()
             .map_err(Self::lock_authority_status)?;
-        match auth.discard_blocks(&req.ids) {
+        let result = auth.discard_blocks(&req.ids);
+        self.commit_and_broadcast(&mut auth);
+        match result {
             Ok(_) => Ok(Response::new(Ack {
                 ok: true,
                 err: String::new(),
@@ -513,11 +622,17 @@ impl ControlPlaneService for ControlPlane {
             .write_authority()
             .map_err(Self::lock_authority_status)?;
         match auth.import_snapshot(&snap) {
-            Ok(()) => Ok(Response::new(Ack {
-                ok: true,
-                err: String::new(),
-                backpressure: None,
-            })),
+            Ok(()) => {
+                // P6.2: 权威已整体重建——向在线订阅者广播新快照(seq=0 重置语义)+ 锚点;
+                // 断开的订阅者 resume 时因 buffer 已清空回退快照。
+                let _ = self.view_tx.send(auth.view_snapshot());
+                let _ = self.view_tx.send(anchor_update(auth.view_last_seq()));
+                Ok(Response::new(Ack {
+                    ok: true,
+                    err: String::new(),
+                    backpressure: None,
+                }))
+            }
             Err(e) => Ok(Response::new(Ack {
                 ok: false,
                 err: e,
@@ -685,6 +800,7 @@ const _ANCHOR: fn() = || {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio_stream::StreamExt as _;
 
     fn ensure_model(auth: &mut Authority, model: &str) {
         ensure_model_rev(auth, model, "");
@@ -1214,6 +1330,252 @@ mod tests {
             .await;
         let ok = resp.expect("read path must be served under a concurrent reader");
         assert_eq!(ok.into_inner().hit_length, 1);
+    }
+
+    // ---- P6.2: SubscribeView ----
+
+    async fn recv_update(stream: &mut ControlPlaneSubscribeStream) -> ViewUpdate {
+        tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())
+            .await
+            .expect("view update timed out")
+            .expect("stream closed early")
+            .expect("view update error")
+    }
+
+    type ControlPlaneSubscribeStream =
+        Pin<Box<dyn tokio_stream::Stream<Item = Result<ViewUpdate, Status>> + Send>>;
+
+    /// 冷启动:snapshot-on-connect(seq=0 全量)+ 锚点(空事件带权威 seq)。
+    #[tokio::test]
+    async fn subscribe_view_snapshot_on_connect() {
+        let cp = ControlPlane::default();
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            let full = prefix(&[b"h0", b"h1"]);
+            auth.register("n0", &full, vec![meta("m", b"h0"), meta("m", b"h1")])
+                .unwrap();
+            auth.commit_view_events(); // 直接 Authority 调用需手动提交(handler 路径自动)
+        }
+        let mut stream = cp
+            .subscribe_view(Request::new(SubscribeRequest {
+                subscriber_id: "r0".into(),
+                resume_from_seq: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        let snap = recv_update(&mut stream).await;
+        assert_eq!(snap.seq, 0, "snapshot uses reserved seq=0");
+        assert_eq!(snap.events.len(), 2);
+        assert!(snap
+            .events
+            .iter()
+            .all(|e| e.kind == view_event::Kind::Registered as i32));
+        let anchor = recv_update(&mut stream).await;
+        assert_eq!(anchor.seq, 1, "anchor carries authoritative last seq");
+        assert!(anchor.events.is_empty());
+    }
+
+    /// 订阅后的写经广播直播:register RPC → seq=1 REGISTERED 增量。
+    #[tokio::test]
+    async fn subscribe_view_live_increment_after_register() {
+        let cp = ControlPlane::default();
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+        }
+        let mut stream = cp
+            .subscribe_view(Request::new(SubscribeRequest {
+                subscriber_id: "r0".into(),
+                resume_from_seq: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let _snap = recv_update(&mut stream).await; // 空快照
+        let anchor = recv_update(&mut stream).await;
+        assert_eq!(anchor.seq, 0);
+
+        let ack = cp
+            .register_blocks(Request::new(RegisterBlocksRequest {
+                node_id: "n0".into(),
+                prefix_hashes: prefix(&[b"h0"]),
+                blocks: vec![meta("m", b"h0")],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.ok, "register_blocks failed: {}", ack.err);
+
+        let live = recv_update(&mut stream).await;
+        assert_eq!(live.seq, 1);
+        assert_eq!(live.events.len(), 1);
+        assert_eq!(live.events[0].kind, view_event::Kind::Registered as i32);
+    }
+
+    /// 断线 resume:重放 `(N, ...]` 缓冲批,不发快照。
+    #[tokio::test]
+    async fn subscribe_view_resume_replays_missed() {
+        let cp = ControlPlane::default();
+        let anchor;
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            let full = prefix(&[b"h0"]);
+            auth.register("n0", &full, vec![meta("m", b"h0")]).unwrap();
+            auth.commit_view_events();
+            anchor = auth.view_last_seq(); // = 1
+                                           // 断线期间的变更:publish L0(seq=2)+ discard(seq=3)
+            auth.publish_location(
+                "m",
+                "",
+                PoolKind::Target as i32,
+                b"h0",
+                Tier::L0,
+                "n0",
+                true,
+            )
+            .unwrap();
+            auth.commit_view_events();
+            auth.discard_blocks(&[KvBlockId {
+                model_id: "m".into(),
+                revision: String::new(),
+                pool_kind: PoolKind::Target as i32,
+                block_hash: b"h0".to_vec(),
+                scope: "public".into(),
+            }])
+            .unwrap();
+            auth.commit_view_events();
+        }
+        let mut stream = cp
+            .subscribe_view(Request::new(SubscribeRequest {
+                subscriber_id: "r0".into(),
+                resume_from_seq: anchor,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let r1 = recv_update(&mut stream).await;
+        assert_eq!(r1.seq, 2, "replay starts right after resume point");
+        assert_eq!(r1.events[0].kind, view_event::Kind::Moved as i32);
+        assert_eq!(r1.events[0].locations.len(), 2, "MOVED 带变更后全量位置");
+        let r2 = recv_update(&mut stream).await;
+        assert_eq!(r2.seq, 3);
+        assert_eq!(r2.events[0].kind, view_event::Kind::Invalidated as i32);
+    }
+
+    /// replay buffer 有界:resume 点过老 → 回退 seq=0 快照(判据单测)。
+    #[tokio::test]
+    async fn subscribe_view_resume_too_old_falls_back_to_snapshot() {
+        let cp = ControlPlane::default();
+        {
+            let mut auth = cp.write_authority().unwrap();
+            auth.view_log = crate::view::ViewLog::with_cap(2);
+            ensure_model(&mut auth, "m");
+            // 4 批提交 → seq 1..=4,buffer 只留 [3,4],floor=3
+            for i in 0..4u8 {
+                let h = vec![b'a' + i];
+                auth.register("n0", &prefix(&[h.as_slice()]), vec![meta("m", &h)])
+                    .unwrap();
+                auth.commit_view_events();
+            }
+        }
+        let mut stream = cp
+            .subscribe_view(Request::new(SubscribeRequest {
+                subscriber_id: "r0".into(),
+                resume_from_seq: 1, // 1+1=2 < floor=3 → 回退快照
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = recv_update(&mut stream).await;
+        assert_eq!(first.seq, 0, "过老 resume 回退快照");
+        assert_eq!(first.events.len(), 4, "快照携带全量现存 block");
+        let anchor = recv_update(&mut stream).await;
+        assert_eq!(anchor.seq, 4);
+    }
+
+    /// 变更路径事件覆盖:register→REGISTERED / publish→MOVED(全量位置) /
+    /// discard→INVALIDATED / 驱逐→INVALIDATED。
+    #[test]
+    fn view_events_cover_mutation_paths() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"h0", b"h1"]);
+        auth.register("n0", &full, vec![meta("m", b"h0"), meta("m", b"h1")])
+            .unwrap();
+        let u = auth.commit_view_events().unwrap();
+        assert_eq!(u.seq, 1);
+        assert_eq!(u.events.len(), 2);
+        assert!(u
+            .events
+            .iter()
+            .all(|e| e.kind == view_event::Kind::Registered as i32));
+
+        auth.publish_location(
+            "m",
+            "",
+            PoolKind::Target as i32,
+            b"h0",
+            Tier::L0,
+            "n0",
+            true,
+        )
+        .unwrap();
+        let u = auth.commit_view_events().unwrap();
+        assert_eq!(u.events.len(), 1);
+        assert_eq!(u.events[0].kind, view_event::Kind::Moved as i32);
+        assert_eq!(u.events[0].locations.len(), 2, "MOVED 带变更后全量位置");
+
+        auth.discard_blocks(&[KvBlockId {
+            model_id: "m".into(),
+            revision: String::new(),
+            pool_kind: PoolKind::Target as i32,
+            block_hash: b"h0".to_vec(),
+            scope: "public".into(),
+        }])
+        .unwrap();
+        let u = auth.commit_view_events().unwrap();
+        assert_eq!(u.events.len(), 1);
+        assert_eq!(u.events[0].kind, view_event::Kind::Invalidated as i32);
+
+        // 驱逐路径:report_ref 0→>0→0 入 inactive 后 evict → INVALIDATED
+        auth.report_refs(&[delta("m", b"h1", 1)]).unwrap();
+        auth.report_refs(&[delta("m", b"h1", -1)]).unwrap();
+        assert_eq!(auth.evict_n("m", "", PoolKind::Target as i32, 1), 1);
+        let u = auth.commit_view_events().unwrap();
+        assert!(u
+            .events
+            .iter()
+            .any(|e| e.kind == view_event::Kind::Invalidated as i32));
+    }
+
+    /// relocate_in_view(defrag Moved)同样发 MOVED 事件(P6.2 覆盖补齐,review #54)。
+    #[test]
+    fn view_events_cover_relocate_in_view() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        auth.register("n0", &prefix(&[b"h0"]), vec![meta("m", b"h0")])
+            .unwrap();
+        auth.commit_view_events();
+        auth.relocate_in_view(
+            "m",
+            "",
+            PoolKind::Target as i32,
+            b"h0",
+            Tier::L2,
+            "n0",
+            7,
+            42,
+        )
+        .unwrap();
+        let u = auth.commit_view_events().unwrap();
+        assert_eq!(u.events.len(), 1);
+        assert_eq!(u.events[0].kind, view_event::Kind::Moved as i32);
+        assert_eq!(u.events[0].locations[0].segment_id, 7);
+        assert_eq!(u.events[0].locations[0].offset, 42);
     }
 
     #[test]

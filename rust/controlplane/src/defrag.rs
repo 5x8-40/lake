@@ -105,6 +105,21 @@ impl Authority {
                 }
             }
         }
+        // P6.2: defrag Moved → MOVED 事件(变更后全量位置)。
+        let view_ev = crate::view::upsert_event(
+            view_event::Kind::Moved,
+            entry.meta.id.clone().unwrap_or_else(|| KvBlockId {
+                model_id: model_id.into(),
+                revision: revision.into(),
+                pool_kind: pk,
+                block_hash: flat.to_vec(),
+                scope: "public".into(),
+            }),
+            entry.meta.locations.clone(),
+            entry.meta.l3_present,
+            0,
+        );
+        self.pending_view_events.push(view_ev);
         Ok(())
     }
 }

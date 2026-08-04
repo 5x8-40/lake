@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	lakepb "github.com/chengda-wu/lake/go/pb"
 	"google.golang.org/grpc"
@@ -44,8 +45,9 @@ func (f fakeWorker) Generate(ctx context.Context, req *lakepb.GenerateRequest, _
 // fakeCP:P6.1 用进程内 gRPC 服务冒充 CP 权威树(嵌入 Unimplemented 兜底其余 RPC)。
 type fakeCP struct {
 	lakepb.UnimplementedControlPlaneServiceServer
-	lookupPrefix func(context.Context, *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error)
-	locate       func(context.Context, *lakepb.LocateRequest) (*lakepb.LocateResponse, error)
+	lookupPrefix  func(context.Context, *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error)
+	locate        func(context.Context, *lakepb.LocateRequest) (*lakepb.LocateResponse, error)
+	subscribeView func(*lakepb.SubscribeRequest, grpc.ServerStreamingServer[lakepb.ViewUpdate]) error
 }
 
 func (f fakeCP) LookupPrefix(ctx context.Context, req *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error) {
@@ -54,6 +56,16 @@ func (f fakeCP) LookupPrefix(ctx context.Context, req *lakepb.LookupPrefixReques
 
 func (f fakeCP) Locate(ctx context.Context, req *lakepb.LocateRequest) (*lakepb.LocateResponse, error) {
 	return f.locate(ctx, req)
+}
+
+func (f fakeCP) SubscribeView(
+	req *lakepb.SubscribeRequest,
+	stream grpc.ServerStreamingServer[lakepb.ViewUpdate],
+) error {
+	if f.subscribeView == nil {
+		return status.Error(codes.Unimplemented, "not implemented")
+	}
+	return f.subscribeView(req, stream)
 }
 
 // dialFakeCP 起 bufconn 进程内 CP,返回接好客户端的 Server。
@@ -76,7 +88,12 @@ func dialFakeCP(t *testing.T, cp lakepb.ControlPlaneServiceServer) *Server {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = conn.Close() })
-	return &Server{cp: lakepb.NewControlPlaneServiceClient(conn), cpConn: conn}
+	s := &Server{cp: lakepb.NewControlPlaneServiceClient(conn), cpConn: conn, mirror: NewViewMirror()}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.viewCancel = cancel
+	t.Cleanup(cancel)
+	go RunViewSync(ctx, s.cp, s.mirror, "router-test", time.Millisecond)
+	return s
 }
 
 // P6.1 判据:Go Router 单测能查 CP 权威树(经真实 gRPC 编解码链路)。
@@ -147,6 +164,42 @@ func TestAuthorityQueryWithoutCPClientFails(t *testing.T) {
 	}
 	if _, err := srv.LocateOnAuthority(context.Background(), &lakepb.LocateRequest{}); err == nil {
 		t.Fatal("want error when cp client not configured")
+	}
+}
+
+// P6.2 判据:Router 后台 view sync 建镜像后,选路读本地镜像零 RPC。
+func TestServerViewSyncBuildsMirror(t *testing.T) {
+	srv := dialFakeCP(t, fakeCP{
+		subscribeView: func(req *lakepb.SubscribeRequest, stream grpc.ServerStreamingServer[lakepb.ViewUpdate]) error {
+			if req.GetResumeFromSeq() != 0 {
+				return status.Error(codes.FailedPrecondition, "want cold subscribe")
+			}
+			for _, u := range []*lakepb.ViewUpdate{
+				{Seq: 0, Events: []*lakepb.ViewEvent{regEvent("m", "h0", l0on("n0")), regEvent("m", "h1")}},
+				{Seq: 1}, // 锚点
+			} {
+				if err := stream.Send(u); err != nil {
+					return err
+				}
+			}
+			<-stream.Context().Done()
+			return nil
+		},
+	})
+	defer srv.Close()
+	waitFor(t, 3*time.Second, "mirror synced to seq 1", func() bool {
+		return srv.Mirror().LastSeq() == 1
+	})
+	blocks, hitLen, allLocal := srv.Mirror().PrefixLookup(
+		"m", "", lakepb.PoolKind_TARGET, [][]byte{[]byte("h0"), []byte("h1")}, "n0")
+	if hitLen != 2 {
+		t.Fatalf("hitLen = %d, want 2", hitLen)
+	}
+	if allLocal {
+		t.Fatal("allLocal = true, want false(h1 不在 n0)")
+	}
+	if !blocks[0].LocalHit || blocks[1].LocalHit {
+		t.Fatalf("local_hit = [%v %v], want [true false]", blocks[0].LocalHit, blocks[1].LocalHit)
 	}
 }
 

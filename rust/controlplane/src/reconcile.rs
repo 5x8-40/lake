@@ -159,6 +159,9 @@ impl Authority {
         for held in self.node_refs.values_mut() {
             held.remove(&BlockKey::from_id(id));
         }
+        // P6.2: block 彻底移除 → 镜像失效。
+        self.pending_view_events
+            .push(crate::view::invalidated_event(id.clone()));
         Ok(true)
     }
 
@@ -190,6 +193,8 @@ impl Authority {
         // Durable peel consumes inactive via allocate; must re-insert so later
         // GC / hard-quota reclaim still see ref=0 L2/L3 blocks.
         let mut reinsert = Vec::new();
+        // P6.2: 剥离(durable)→ MOVED;彻底移除 → INVALIDATED(在 full_remove 循环补)。
+        let mut view_events = Vec::new();
 
         for (seq, bid) in victims {
             if pool.global_refs.get(&seq).copied().unwrap_or(0) > 0 {
@@ -242,6 +247,13 @@ impl Authority {
                 .locations
                 .retain(|l| l.tier != Tier::L0 as i32 && l.tier != Tier::L1 as i32);
             if durable {
+                view_events.push(crate::view::upsert_event(
+                    view_event::Kind::Moved,
+                    id.clone(),
+                    entry.meta.locations.clone(),
+                    entry.meta.l3_present,
+                    0,
+                ));
                 stripped.push(id);
                 reinsert.push((seq, bid));
             } else {
@@ -259,6 +271,7 @@ impl Authority {
                     pool.seq_to_flat.remove(&seq);
                     let _ = pool.inactive.take(seq, bid);
                     ns.used_bytes = (ns.used_bytes - bpb).max(0);
+                    view_events.push(crate::view::invalidated_event(id.clone()));
                     discarded_keys.push(id);
                 }
             }
@@ -276,6 +289,7 @@ impl Authority {
         for id in &discarded_keys {
             self.orphans.remove(&BlockKey::from_id(id));
         }
+        self.pending_view_events.extend(view_events);
         Ok((stripped, discarded_keys))
     }
 
@@ -306,6 +320,7 @@ impl Authority {
 
         // Strip L0 locations for this node across all namespaces.
         let mut touched = Vec::new();
+        let mut view_events = Vec::new();
         let keys: Vec<NamespaceKey> = self.namespaces.keys().cloned().collect();
         for ns_key in keys {
             let Some(ns) = self.namespaces.get_mut(&ns_key) else {
@@ -344,16 +359,26 @@ impl Authority {
                         // real L0 locations remain).
                         handle.mark_absent::<TierL0>();
                     }
-                    touched.push(KvBlockId {
+                    let id = KvBlockId {
                         model_id: ns_key.model_id.clone(),
                         revision: ns_key.revision.clone(),
                         pool_kind: pk,
                         block_hash: flat,
                         scope: "public".into(),
-                    });
+                    };
+                    // P6.2: 死节点 L0 被剥离 → MOVED(变更后全量位置)。
+                    view_events.push(crate::view::upsert_event(
+                        view_event::Kind::Moved,
+                        id.clone(),
+                        entry.meta.locations.clone(),
+                        entry.meta.l3_present,
+                        0,
+                    ));
+                    touched.push(id);
                 }
             }
         }
+        self.pending_view_events.extend(view_events);
         Ok((refs_cleared, touched))
     }
 
@@ -499,6 +524,10 @@ impl Authority {
         self.node_refs.clear();
         self.completed_barriers.clear();
         self.checkpoint_seq = snap.seq;
+        // P6.2: 权威被整体替换,旧事件流失效——清空 replay buffer(next_seq 保持单调),
+        // 由 restore handler 向在线订阅者广播新快照;断开的订阅者 resume 时回退快照。
+        self.pending_view_events.clear();
+        self.view_log.reset();
 
         for m in &snap.models {
             self.register_model(m.clone())?;

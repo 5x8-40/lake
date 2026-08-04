@@ -151,9 +151,11 @@ impl PoolView {
         id
     }
 
-    fn drop_inactive_victims(&mut self, n: usize) -> usize {
+    /// Drop up to `n` inactive victims; returns removed `(seq_hash, flat)` pairs
+    /// (P6.2: callers turn them into INVALIDATED view events).
+    fn drop_inactive_victims(&mut self, n: usize) -> Vec<(SequenceHash, Vec<u8>)> {
         let victims = self.inactive.allocate(n);
-        let mut removed = 0;
+        let mut removed = Vec::new();
         for (seq, _bid) in victims {
             if self.global_refs.get(&seq).copied().unwrap_or(0) > 0 {
                 continue;
@@ -162,7 +164,7 @@ impl PoolView {
             self.global_refs.remove(&seq);
             if let Some(flat) = self.seq_to_flat.remove(&seq) {
                 self.by_flat.remove(&flat);
-                removed += 1;
+                removed.push((seq, flat));
             }
         }
         removed
@@ -224,14 +226,15 @@ impl Namespace {
         (self.inactive_len() as i64).saturating_mul(self.bytes_per_block())
     }
 
-    /// Evict up to `n` inactive victims across all pool_kinds; returns blocks removed.
-    fn evict_inactive_n(&mut self, n: usize) -> usize {
+    /// Evict up to `n` inactive victims across all pool_kinds;
+    /// returns removed `(pool_kind, seq_hash, flat)` triples (P6.2: view events).
+    fn evict_inactive_n(&mut self, n: usize) -> Vec<(i32, SequenceHash, Vec<u8>)> {
         if n == 0 {
-            return 0;
+            return Vec::new();
         }
         let bpb = self.bytes_per_block();
         let mut left = n;
-        let mut removed = 0;
+        let mut removed: Vec<(i32, SequenceHash, Vec<u8>)> = Vec::new();
         // Stable order: TARGET then DRAFT then others.
         let mut kinds: Vec<i32> = self.pools.keys().copied().collect();
         kinds.sort_unstable();
@@ -242,11 +245,12 @@ impl Namespace {
             let Some(pool) = self.pools.get_mut(&pk) else {
                 continue;
             };
-            let n_here = pool.drop_inactive_victims(left);
-            removed += n_here;
-            left = left.saturating_sub(n_here);
+            for (seq, flat) in pool.drop_inactive_victims(left) {
+                left = left.saturating_sub(1);
+                removed.push((pk, seq, flat));
+            }
         }
-        self.used_bytes = (self.used_bytes - (removed as i64) * bpb).max(0);
+        self.used_bytes = (self.used_bytes - (removed.len() as i64) * bpb).max(0);
         removed
     }
 }
@@ -258,6 +262,26 @@ fn descriptor_identity_eq(a: &ModelDescriptor, b: &ModelDescriptor) -> bool {
         && a.num_layers == b.num_layers
         && a.hash_algo == b.hash_algo
         && a.block_spec == b.block_spec
+}
+
+/// P6.2: removed `(pool_kind, _seq, flat)` triples → INVALIDATED view events.
+fn invalidated_events_for(
+    model_id: &str,
+    revision: &str,
+    removed: Vec<(i32, SequenceHash, Vec<u8>)>,
+) -> Vec<ViewEvent> {
+    removed
+        .into_iter()
+        .map(|(pk, _seq, flat)| {
+            crate::view::invalidated_event(KvBlockId {
+                model_id: model_id.into(),
+                revision: revision.into(),
+                pool_kind: pk,
+                block_hash: flat,
+                scope: "public".into(),
+            })
+        })
+        .collect()
 }
 
 /// Process-local authority state.
@@ -279,6 +303,11 @@ pub struct Authority {
     pub(crate) checkpoint_seq: u64,
     /// P4.9: consistent-hash shard ring (ownership; bytes migrate in P5).
     pub(crate) shard: crate::shard::ShardRing,
+    /// P6.2: 视图事件日志(SubscribeView replay buffer,有界)。
+    pub(crate) view_log: crate::view::ViewLog,
+    /// P6.2: 本写调用累积的视图事件;handler 无论成败都 commit
+    /// (事件反映**状态迁移**而非 RPC 成败——部分变异也要让镜像看到)。
+    pub(crate) pending_view_events: Vec<ViewEvent>,
 }
 
 impl Default for Authority {
@@ -299,6 +328,8 @@ impl Authority {
             now_ms: crate::reconcile::wall_now_ms,
             checkpoint_seq: 0,
             shard: crate::shard::ShardRing::new(crate::shard::DEFAULT_VNODE_COUNT),
+            view_log: crate::view::ViewLog::default(),
+            pending_view_events: Vec::new(),
         }
     }
 
@@ -313,6 +344,65 @@ impl Authority {
 
     fn total_used_bytes(&self) -> i64 {
         self.namespaces.values().map(|n| n.used_bytes).sum()
+    }
+
+    /// P6.2: 提交本写调用累积的视图事件(若有)为一个带序号的 `ViewUpdate`。
+    /// 单写者持写锁调用;提交序即广播序。
+    pub fn commit_view_events(&mut self) -> Option<ViewUpdate> {
+        if self.pending_view_events.is_empty() {
+            return None;
+        }
+        let events = std::mem::take(&mut self.pending_view_events);
+        Some(self.view_log.commit(events))
+    }
+
+    /// P6.2: 全量快照(`seq = 0`;接收方重置镜像)。确定性排序(测试可断言)。
+    pub fn view_snapshot(&self) -> ViewUpdate {
+        let mut keys: Vec<&NamespaceKey> = self.namespaces.keys().collect();
+        keys.sort_by(|a, b| {
+            a.model_id
+                .cmp(&b.model_id)
+                .then(a.revision.cmp(&b.revision))
+        });
+        let mut events = Vec::new();
+        for k in keys {
+            let ns = &self.namespaces[k];
+            let mut pks: Vec<i32> = ns.pools.keys().copied().collect();
+            pks.sort_unstable();
+            for pk in pks {
+                let pool = &ns.pools[&pk];
+                let mut flats: Vec<&Vec<u8>> = pool.by_flat.keys().collect();
+                flats.sort();
+                for flat in flats {
+                    let entry = &pool.by_flat[flat];
+                    let id = entry.meta.id.clone().unwrap_or_else(|| KvBlockId {
+                        model_id: k.model_id.clone(),
+                        revision: k.revision.clone(),
+                        pool_kind: pk,
+                        block_hash: flat.clone(),
+                        scope: "public".into(),
+                    });
+                    events.push(crate::view::upsert_event(
+                        view_event::Kind::Registered,
+                        id,
+                        entry.meta.locations.clone(),
+                        entry.meta.l3_present,
+                        entry.meta.block_kind,
+                    ));
+                }
+            }
+        }
+        ViewUpdate { seq: 0, events }
+    }
+
+    /// P6.2: resume 重放 `(from_seq, ...]`;`None` → 过老,回退快照。
+    pub fn replay_view_after(&self, from_seq: u64) -> Option<Vec<ViewUpdate>> {
+        self.view_log.replay_after(from_seq)
+    }
+
+    /// P6.2: 已提交的最后 seq(快照锚点;无事件时 0)。
+    pub fn view_last_seq(&self) -> u64 {
+        self.view_log.last_seq()
     }
 
     fn free_bytes(&self) -> i64 {
@@ -358,10 +448,22 @@ impl Authority {
             return Err("DeregisterModel: model_id required".into());
         }
         let key = NamespaceKey::new(model_id, revision);
-        if self.namespaces.remove(&key).is_none() {
+        let Some(ns) = self.namespaces.remove(&key) else {
             return Err(format!(
                 "DeregisterModel: unknown namespace ({model_id}, rev={revision:?})"
             ));
+        };
+        // P6.2: 命名空间整体下线 → 其全部 block 对镜像失效。
+        for (pk, pool) in &ns.pools {
+            let evs = invalidated_events_for(
+                model_id,
+                revision,
+                pool.by_flat
+                    .iter()
+                    .map(|(flat, entry)| (*pk, entry.seq_hash, flat.clone()))
+                    .collect(),
+            );
+            self.pending_view_events.extend(evs);
         }
         Ok(())
     }
@@ -572,8 +674,19 @@ impl Authority {
             rejected => return Ok(rejected),
         }
 
+        // Validate-then-mutate(P6.2):耐久性校验前置,变异循环不再中途失败——
+        // 视图事件必须恰好对应已提交的状态迁移。
+        for meta in &metas {
+            if meta.id.is_some() && meta.locations.is_empty() && !meta.l3_present {
+                return Err(
+                    "RegisterBlocks: need L2 location or l3_present (durable first)".into(),
+                );
+            }
+        }
+
         let lineage = lineage_from_prefix(prefix_hashes);
         let mut clear_orphans = Vec::new();
+        let mut view_events = Vec::new();
         {
             let ns = self
                 .ns_mut(&model_id, &revision)
@@ -592,11 +705,6 @@ impl Authority {
                 let pos = *index_of.get(flat.as_slice()).expect("checked");
                 let seq = lineage[pos];
 
-                if meta.locations.is_empty() && !meta.l3_present {
-                    return Err(
-                        "RegisterBlocks: need L2 location or l3_present (durable first)".into(),
-                    );
-                }
                 for loc in &mut meta.locations {
                     if loc.node_id.is_empty() {
                         loc.node_id = node_id.to_string();
@@ -624,6 +732,18 @@ impl Authority {
                 };
                 pool.seq_to_flat.insert(seq, flat.clone());
                 let prefix_chain = prefix_hashes[..=pos].to_vec();
+                // P6.2: 事件携带变更后全量位置;is_new → REGISTERED,否则 MOVED。
+                view_events.push(crate::view::upsert_event(
+                    if is_new {
+                        view_event::Kind::Registered
+                    } else {
+                        view_event::Kind::Moved
+                    },
+                    meta.id.clone().expect("checked"),
+                    meta.locations.clone(),
+                    meta.l3_present,
+                    meta.block_kind,
+                ));
                 pool.by_flat.insert(
                     flat.clone(),
                     Entry {
@@ -646,6 +766,7 @@ impl Authority {
             }
             ns.used_bytes = ns.used_bytes.saturating_add(charged);
         }
+        self.pending_view_events.extend(view_events);
         for k in clear_orphans {
             self.orphans.remove(&k);
         }
@@ -827,9 +948,13 @@ impl Authority {
             return;
         };
         if *own_evict_n > 0 {
-            if let Some(ns) = self.ns_mut(model_id, revision) {
-                ns.evict_inactive_n(*own_evict_n);
-            }
+            let removed = if let Some(ns) = self.ns_mut(model_id, revision) {
+                ns.evict_inactive_n(*own_evict_n)
+            } else {
+                Vec::new()
+            };
+            self.pending_view_events
+                .extend(invalidated_events_for(model_id, revision, removed));
         }
         if *reclaim_bytes > 0 {
             let key = NamespaceKey::new(model_id, revision);
@@ -890,7 +1015,9 @@ impl Authority {
             let target = still.min(over);
             let want_blocks = ((target + bpb - 1) / bpb).max(1) as usize;
             let removed = ns.evict_inactive_n(want_blocks);
-            freed += (removed as i64) * bpb;
+            freed += (removed.len() as i64) * bpb;
+            let evs = invalidated_events_for(&key.model_id, &key.revision, removed);
+            self.pending_view_events.extend(evs);
         }
         freed
     }
@@ -1081,8 +1208,15 @@ impl Authority {
             };
             pool.drop_inactive_victims(n)
         };
-        ns.used_bytes = (ns.used_bytes - (removed as i64) * bpb).max(0);
-        removed
+        ns.used_bytes = (ns.used_bytes - (removed.len() as i64) * bpb).max(0);
+        let count = removed.len();
+        let evs = invalidated_events_for(
+            model_id,
+            revision,
+            removed.into_iter().map(|(s, f)| (pk, s, f)).collect(),
+        );
+        self.pending_view_events.extend(evs);
+        count
     }
 
     pub fn inactive_len(&self, model_id: &str, revision: &str, pool_kind: i32) -> usize {
@@ -1216,6 +1350,27 @@ impl Authority {
                 _ => {}
             }
         }
+        // P6.2: 任何实际位置变更 → MOVED(变更后全量位置);!present && !had 为无操作。
+        let view_ev = if present || had {
+            Some(crate::view::upsert_event(
+                view_event::Kind::Moved,
+                entry.meta.id.clone().unwrap_or_else(|| KvBlockId {
+                    model_id: model_id.into(),
+                    revision: revision.into(),
+                    pool_kind: pk,
+                    block_hash: flat.to_vec(),
+                    scope: "public".into(),
+                }),
+                entry.meta.locations.clone(),
+                entry.meta.l3_present,
+                0,
+            ))
+        } else {
+            None
+        };
+        if let Some(ev) = view_ev {
+            self.pending_view_events.push(ev);
+        }
         Ok(())
     }
 
@@ -1240,6 +1395,21 @@ impl Authority {
             .get_mut(flat)
             .ok_or_else(|| "set_l3_present: unknown block".to_string())?;
         entry.meta.l3_present = present;
+        // P6.2: l3 存在性变更 → MOVED(位置不变,全量带上)。
+        let view_ev = crate::view::upsert_event(
+            view_event::Kind::Moved,
+            entry.meta.id.clone().unwrap_or_else(|| KvBlockId {
+                model_id: model_id.into(),
+                revision: revision.into(),
+                pool_kind: pk,
+                block_hash: flat.to_vec(),
+                scope: "public".into(),
+            }),
+            entry.meta.locations.clone(),
+            entry.meta.l3_present,
+            0,
+        );
+        self.pending_view_events.push(view_ev);
         Ok(())
     }
 

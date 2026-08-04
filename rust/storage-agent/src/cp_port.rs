@@ -98,6 +98,12 @@ fn admit_keys_from_request(req: &RegisterBlocksRequest) -> Result<AdmitKeys, Str
     })
 }
 
+// TODO(P6.2 潜伏,review #54):本 port 直接调 Authority,publish_location /
+// set_l3_present / relocate_in_view 会把 MOVED 事件推进 `pending_view_events`
+// 但**不 commit**——只有 ControlPlane RPC handler 的 `commit_and_broadcast`
+// 会落日志+广播。当前无生产调用方(无 PublishLocation wire RPC,仅测试用),
+// 暂非活 bug;但未来接 wire RPC 或 agent 与 CP 同进程运行时,该路径必须
+// 调 `commit_view_events`(+广播),否则 tier 放置变更不进镜像且 pending 积压。
 impl ControlPlanePort for AuthorityPort<'_> {
     fn admit_register_blocks(&mut self, req: &RegisterBlocksRequest) -> Result<(), String> {
         use lake_controlplane::RegisterStatus;

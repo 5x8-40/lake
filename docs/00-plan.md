@@ -272,7 +272,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 
 ## P6 — 弹性与调度（Go）
 
-- [ ] 无状态 router + 本地命中视图镜像（权威在 Rust 存储控制面进程内存,etcd 只 checkpoint;Go Router 零 RPC 读镜像；读写分锁 P6.1 已落地:`Mutex→RwLock` + `lookup_prefix` 改 `&self`(读路径懒修复确认为死代码移除,frequency touch 经内部同步 registry 留在读路径) + Go Router 接 CP 客户端权威回退;镜像/选路移植见 issue #52 P6.2/P6.3）
+- [ ] 无状态 router + 本地命中视图镜像（权威在 Rust 存储控制面进程内存,etcd 只 checkpoint;Go Router 零 RPC 读镜像；读写分锁 P6.1 已落地:`Mutex→RwLock` + `lookup_prefix` 改 `&self`(读路径懒修复确认为死代码移除,frequency touch 经内部同步 registry 留在读路径) + Go Router 接 CP 客户端权威回退;P6.2 已落地:SubscribeView snapshot+增量+gap replay(有界 replay buffer,超限回退快照) + Go ViewMirror/RunViewSync 消费建镜像;选路移植见 issue #52 P6.3）
 - [ ] 池间调度 + 反压
 - [ ] 基于指标的弹性扩缩容（队列长度/TTFT/ITL/命中率）
 - [ ] 冷启动压缩（权重预加载、layer-async serve、KV prefetch）

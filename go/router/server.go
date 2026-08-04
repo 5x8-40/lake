@@ -32,6 +32,8 @@ type Config struct {
 // P3 入口即本服务(边2);不经 Bifrost。
 // P6.1:Router 已接 CP 客户端(LookupPrefix/Locate 权威回退档,冷启动/gap 用);
 // 选路权威收归 Router(worker 不再自查前缀)归 P6.3。
+// P6.2:后台 RunViewSync 消费 CP SubscribeView 维护本地只读镜像(ViewMirror);
+// 选路读镜像零 RPC,gap/断线自动 resume,resume 过老 CP 回退快照。
 type Server struct {
 	cfg        Config
 	worker     lakepb.WorkerServiceClient
@@ -40,6 +42,8 @@ type Server struct {
 	workerConn *grpc.ClientConn
 	agentConn  *grpc.ClientConn
 	cpConn     *grpc.ClientConn
+	mirror     *ViewMirror
+	viewCancel context.CancelFunc
 }
 
 const maxChatRequestBytes = 1 << 20
@@ -72,7 +76,7 @@ func New(cfg Config) (*Server, error) {
 		_ = aconn.Close()
 		return nil, fmt.Errorf("dial controlplane: %w", err)
 	}
-	return &Server{
+	s := &Server{
 		cfg:        cfg,
 		worker:     lakepb.NewWorkerServiceClient(wconn),
 		agent:      lakepb.NewAgentServiceClient(aconn),
@@ -80,10 +84,18 @@ func New(cfg Config) (*Server, error) {
 		workerConn: wconn,
 		agentConn:  aconn,
 		cpConn:     cconn,
-	}, nil
+		mirror:     NewViewMirror(),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.viewCancel = cancel
+	go RunViewSync(ctx, s.cp, s.mirror, "router", 200*time.Millisecond)
+	return s, nil
 }
 
 func (s *Server) Close() error {
+	if s.viewCancel != nil {
+		s.viewCancel()
+	}
 	var errs []error
 	if s.workerConn != nil {
 		errs = append(errs, s.workerConn.Close())
@@ -95,6 +107,11 @@ func (s *Server) Close() error {
 		errs = append(errs, s.cpConn.Close())
 	}
 	return errors.Join(errs...)
+}
+
+// Mirror 本地只读位置视图镜像(P6.2;选路零 RPC 的读取入口)。
+func (s *Server) Mirror() *ViewMirror {
+	return s.mirror
 }
 
 // LookupPrefixOnAuthority 冷路径权威查询(线性一致档):冷启动 / 镜像 gap 回退时
