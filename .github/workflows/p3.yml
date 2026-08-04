@@ -27,9 +27,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # 对齐 python/pyproject.toml 与生成 stub 校验(grpcio≥1.82.1 / protobuf≥7.35.0)。
-      - name: Python grpc deps
-        run: pip install "grpcio>=1.82.1" "protobuf>=7.35.0"
+      # 对齐根目录 pyproject.toml 与生成 stub 校验；Qwen3 config 来自 transformers。
+      - name: Python runtime deps
+        run: pip install "grpcio>=1.82.1" "protobuf>=7.35.0" "transformers"
       - name: verify-p3
         run: ./scripts/verify-p3.sh
 
@@ -46,9 +46,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Python grpc deps
-        run: pip install "grpcio>=1.82.1" "protobuf>=7.35.0"
+      - name: Python runtime deps
+        run: pip install "grpcio>=1.82.1" "protobuf>=7.35.0" "transformers"
       - name: start stack
+        env:
+          # P3 smoke 只验证三语言骨架联通性；不安装 Torch，避免触发 Qwen3 backend。
+          LAKE_MODEL_BACKEND: mock
+          LAKE_SERVED_MODEL_NAME: mock-llm
         run: |
           ./deploy/run-local.sh &
           echo $! > /tmp/lake-stack.pid
@@ -73,6 +77,6 @@ jobs:
           pkill -f lake-controlplane 2>/dev/null || true
           pkill -f lake-kv-pool 2>/dev/null || true
           pkill -f lake-storage-agent 2>/dev/null || true
-          pkill -f 'python3 -m runtime' 2>/dev/null || true
+          pkill -f 'python3 -m lake.runtime' 2>/dev/null || true
           pkill -f lake-router 2>/dev/null || true
           true

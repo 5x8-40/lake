@@ -155,6 +155,29 @@ lake/
 > ```
 > （浅克隆后无法在 submodule 内切换 ref，升级 submodule 需先 `git submodule deinit -f <path>` 再重新深克隆 init。）
 
+## Python 开发环境（uv）
+
+`uv` 仅用于开发期 Python 环境管理；Rust / Go 仍分别使用 `cargo` / `go`。从仓库根目录执行：
+
+```bash
+uv venv --python 3.12
+source .venv/bin/activate
+uv pip install -e ".[dev]"
+```
+
+验证 Python 计算层：
+
+```bash
+.venv/bin/python -m pytest python/lake/engine/tests python/lake/runtime/tests
+.venv/bin/python -c "import lake; from lake.pb import lake_pb2; import lake.engine, lake.runtime, lake.kernels"
+```
+
+需要 Torch / Triton 时再安装 CUDA extra：
+
+```bash
+uv pip install -e ".[dev,cuda]"
+```
+
 ## 设计文档速览
 
 - **路线图**：见 [`docs/00-plan.md`](docs/00-plan.md)

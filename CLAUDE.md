@@ -75,12 +75,13 @@ docs/
 | `3rdparty/mooncake` | kvcache-ai/Mooncake | **transfer-engine**(RDMA 零拷贝)→ Transfer Bus;**mooncake-store** → KV Pool(L3) |
 | `3rdparty/lmcache` | LMCache/LMCache | 跨请求/跨实例 KV 复用、多存储后端、`rust/` 工程模式 |
 | `3rdparty/vllm` | vllm-project/vllm | **计算层**:PagedAttention、worker/`GPUModelRunner`、`KVConnectorBase_V1` 接口(存算分离接入点)、spec decode |
+| `3rdparty/transformers` | huggingface/transformers | **模型定义参考**:Qwen3/PyTorch `nn.Module` 结构、HF config 字段、decoder/model/causal-lm 分层；只作模型骨架与配置对照,不作服务端执行参考 |
 | `3rdparty/dynamo` | ai-dynamo/dynamo | **编排层/控制面**:KV-aware router、KVBM(GPU→CPU→SSD→远端 三层 offload)逻辑/物理/引擎三层、Rust 编排、多后端通信(etcd/nats/tcp/zmq) |
 | `3rdparty/tilert` | tile-ai/TileRT | **超低延迟 decode**(tile runtime,核闭源) + **vLLM PD 插件**(`TileRTConnector`/`pd_vllm`,NIXL/Mooncake)→ 见 [`docs/research/tilert/`](docs/research/tilert/) |
 | `3rdparty/memcache` | Ascend/memcache | **昇腾分布式 KVCache 对象池**(MetaService/LocalService、HBM/DRAM/SSD、MemFabric OneCopy)→ 见 [`docs/research/memcache/`](docs/research/memcache/) |
 | `3rdparty/ucm` | ModelEngine-Group/unified-cache-management | **统一缓存框架**(可插拔 KVStore、vLLM connector、稀疏插件、PD-via-pool)→ 见 [`docs/research/ucm/`](docs/research/ucm/) |
 
-逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm}/`。
+逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm}/`；Transformers 仅作为模型定义源码参考。
 
 约定:
 - `3rdparty/` **只读**,不修改 submodule 内代码。要改造先 fork 换 URL。
@@ -109,6 +110,7 @@ docs/
    - **昇腾 KV 对象池**(MemCache):Meta/Local、HBM/DRAM/SSD、MemFabric OneCopy → `docs/research/memcache/{overview,architecture,pain-points}.md`（与 Mooncake store 同层对照；非 radix 控制面）
    - **统一缓存框架(UCM)**:可插拔 KVStore、vLLM connector、PD-via-pool、稀疏插件 → `docs/research/ucm/{overview,architecture,pain-points}.md`（引擎插件层；与 LMCache 同层对照）
    - **计算层(vLLM)**:PagedAttention/worker/model runner + KV connector 接口(worker↔存储池接入点) + spec decode + 权重加载 → `docs/research/vllm/{overview,compute}.md`
+ - **模型定义(Transformers)**:Qwen3 `nn.Module`/HF config/decoder/model/causal-lm 分层 → `docs/research/transformers/overview.md`
    - **vLLM Q3 KV/Session 调度**(#48168 agent prefix · #48501 `session_id`/`continuation_id` · retention) → `docs/research/vllm/kv-session-roadmap.md`
    - **编排层/控制面**:KV-aware router(overlap 量化) + KVBM logical/physical/engine 三层 offload + Placement/StorageTier(介质非位置) + 链式 block 哈希 + 多后端通信(etcd/nats/tcp/zmq) → `docs/research/dynamo/overview.md`
    - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）
@@ -172,7 +174,7 @@ cd rust && cargo build
 # Go 请求控制面(pb.go 入仓)
 cd go && go build ./...
 # Python 计算层(stub 入仓,worker 包可 import)
-PYTHONPATH=python python3 -c "from lake_pb import lake_pb2; import prefill, runtime"
+python3 -c "import lake; from lake.pb import lake_pb2; import lake.prefill, lake.runtime"
 ```
 
 改 `proto/` 后重生成 Go/Python stub(入仓):`bash scripts/gen_stubs.sh`(工具链版本见脚本头注释)。CI(`.github/workflows/build.yml`)跑三语言 build + stub-drift 检查。

@@ -1,0 +1,2 @@
+"""Lake Python package."""
+

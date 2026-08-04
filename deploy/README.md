@@ -14,7 +14,7 @@ curl → Go Router (:8080)
 
 - Rust toolchain（`cargo`）
 - Go 1.22+
-- Python 3 + `grpcio` / `protobuf`（与 `python/lake_pb` 一致）
+- Python 3 + `grpcio` / `protobuf`（与 `python/lake/pb` 一致）
 
 ## 起栈
 

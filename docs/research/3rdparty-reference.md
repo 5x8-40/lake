@@ -6,6 +6,7 @@
 - [`lmcache/`](lmcache/) — LMCache:[总览](lmcache/overview.md) · [跨实例复用与后端](lmcache/sharing-and-backends.md)
 - [`mooncake/`](mooncake/) — Mooncake:[总览](mooncake/overview.md) · [传输引擎](mooncake/transfer-engine.md) · [KV 存储与池化](mooncake/kv-store.md)
 - [`vllm/`](vllm/) — vLLM:[总览](vllm/overview.md) · [计算层抽象与存算分离接入点](vllm/compute.md) · [block 生命周期](vllm/block-lifecycle.md) · [上游痛点与 lake 对照](vllm/pain-points.md) · [Q3 KV/Session 调度 #48168/#48501](vllm/kv-session-roadmap.md)
+- [`transformers/`](transformers/) — Hugging Face Transformers:[总览](transformers/overview.md) · Qwen3 `nn.Module` 模型定义、HF config 字段、decoder/model/causal-lm 分层源码参考
 - [`dynamo/`](dynamo/) — Dynamo(NVIDIA):[总览](dynamo/overview.md) · 数据中心级推理编排(KV-aware router + KVBM 三层 + Rust 控制面)
 - [`tilert/`](tilert/) — TileRT:[总览](tilert/overview.md) · [vLLM PD 插件](tilert/pd-vllm.md) · [痛点与 lake 对照](tilert/pain-points.md)
 - [`memcache/`](memcache/) — Ascend MemCache:[总览](memcache/overview.md) · [架构](memcache/architecture.md) · [痛点与 lake 对照](memcache/pain-points.md)
@@ -24,6 +25,7 @@
 | `3rdparty/lmcache` | [LMCache/LMCache](https://github.com/LMCache/LMCache) | nightly | 跨实例复用 + 多后端 + Rust I/O |
 | `3rdparty/mooncake` | [kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake) | main HEAD | 传输引擎 + 对象级 KV 池 |
 | `3rdparty/vllm` | [vllm-project/vllm](https://github.com/vllm-project/vllm) | main HEAD (ab132ee98) | **计算层**(PagedAttention/worker/connector/spec decode) |
+| `3rdparty/transformers` | [huggingface/transformers](https://github.com/huggingface/transformers) | main HEAD | **模型定义**:Qwen3 `nn.Module`/HF config/decoder 分层,作为 vLLM/SGLang 模型实现的上游对照 |
 | `3rdparty/dynamo` | [ai-dynamo/dynamo](https://github.com/ai-dynamo/dynamo) | main HEAD | **编排层/控制面**:KV-aware router + KVBM 三层 offload + Rust 编排 + 多后端通信 |
 | `3rdparty/tilert` | [tile-ai/TileRT](https://github.com/tile-ai/TileRT) | main HEAD (`a8368a6`, v0.1.5) | **超低延迟 decode** + **vLLM PD 插件**(`TileRTConnector`);见 [tilert/](tilert/) |
 | `3rdparty/memcache` | [Ascend/memcache](https://github.com/Ascend/memcache) | master HEAD (`14b4e35`) | **昇腾 KV 对象池** Meta/Local + MemFabric;见 [memcache/](memcache/) |

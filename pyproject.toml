@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lake"
+version = "0.0.0"
+requires-python = ">=3.12"
+# 版本下限对齐生成 stub:lake_pb2.py 校验 protobuf runtime ≥ 7.35.0(major 7),
+# lake_pb2_grpc.py 校验 grpcio ≥ 1.82.1。低于此 import 即炸,故钉到生成版本。
+dependencies = [
+    "grpcio>=1.82.1",
+    "numpy",
+    "protobuf>=7.35.0",
+    "torch",
+    "transformers",
+]
+
+# 已定技术选型 Python+Torch+Triton；torch 是计算层基础依赖，triton 随 CUDA 开发路径安装。
+[project.optional-dependencies]
+cuda = ["triton"]
+dev = [
+    "grpcio-tools==1.82.1",
+    "pytest>=8",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+# uv 仅用于开发期 Python 环境管理；Rust/Go 仍分别用 cargo / go。
+package = true
+
+[tool.setuptools.packages.find]
+# 根目录统一 Python 开发入口,源码仍放在 python/ 子目录。
+# 白名单(非 find_packages 自动发现):新增 lake/ 子包必须改这里,否则
+# `pip install -e .` 会静默不打包。CI 现走 PYTHONPATH,import 不受影响,属隐患。
+# 当前发布命名空间:lake.*。
+where = ["python"]
+include = ["lake*"]

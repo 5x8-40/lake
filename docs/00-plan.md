@@ -79,7 +79,7 @@ P7  性能建模与验证   → 量化各假设，回填设计
   - **多租户隔离(B2 闭环)**：**lake 不做多租户**(与 goals.md "不做多租户隔离"一致),F8 降级到 Could(远期预留)。当前 `KVBlockID=(model_id, layer, block_hash)` 不含租户维度,同 model_id 内 KV 全局共享复用;多租户隔离归外部控制面/部署切分(按 model_id 命名空间或独立集群)。未来若需,可加 `scope` 维度(public/tenant,靠 scope 过滤隔离、公共只可平台写)——仅预留,不入当前寻址。消了 goals(不做)↔ F8/nonfunctional(要做)的矛盾。详见 [`features/features.md`](features/features.md) F8、[`architecture/kv-cache-pool.md`](architecture/kv-cache-pool.md) "Block 寻址"预留。
   - **Router 命中视图访问(B3 闭环)**：Router 持**本地命中视图镜像**(全局位置视图的本地副本,与 in-process agent 同机制),模式选择 = 本地读镜像 + 本地纯函数决策,**零 RPC**,守 5ms。镜像内容是全局的(本地命中判定需知"哪个节点 HBM 有"),副本存本地。刷新由控制面**推送**(gRPC stream 主方案,同机走共享内存直读;etcd 只存降频 checkpoint,非推送源),触发=位置视图权威变更(放置/驱逐覆写/迁移/满块注册);ref 归 0 不推(未驱逐不摘视图)。陈旧由 miss→控制面确认→从池(L1/L2)回填兜底,只影响命中率不影响正确性。统一了 overview/scheduling/data-flow 里"Router 查池/一次 RPC"的措辞。详见 [`architecture/scheduling.md`](architecture/scheduling.md) §1 前缀解析。
   - **选路形态倾向 External 式(本轮固化)**：KV 感知下选路权威收束到 Router 一层(逻辑单一选路面,实例可水平扩展);计算节点按部署独立或 TP/PP 联合执行,**默认不在引擎内做 Internal/Hybrid 式二次 DP LB**。对齐 vLLM External + 强化 SGLang 层 B(`sgl-model-gateway`/`cache_aware`)方向,用存储池命中视图替换近似树;拒绝 SGLang 层 A(`DataParallelController`)与 vLLM head `DPLBAsyncMPClient` 作第二权威。详见 [`architecture/scheduling.md`](architecture/scheduling.md) §1.1、[`research/sglang/model-runner.md`](research/sglang/model-runner.md)「SGLang 双层管理模式」。
-  - **计算引擎结构(本轮固化)**：Python 计算层对齐 vLLM Model Runner V2 目录形态 + 薄 `model_runner.py`;节点调度落 `runtime/node_scheduler.py`;`engine/` 取代 prefill/decode/draft 三包,执行形态由角色配置 + `SchedulerOutput` 选择。**DP step 信息同步(token 数/mode/IDLE)落 Scheduler**,不进 ModelRunner。**Host `Req` 权威完全在 `node_scheduler`**(引擎无长期 RequestState);**默认启用 overlap**;请求结束 → `agent.on_request_finished`(引擎不 free KV)。详见 [`architecture/compute-layer.md`](architecture/compute-layer.md)「计算引擎结构」、[`architecture/scheduling.md`](architecture/scheduling.md) §3。
+  - **计算引擎结构(本轮固化)**：Python 计算层对齐 vLLM Model Runner V2 目录形态 + 薄 `model_runner.py`;节点调度落 `lake.runtime.node_scheduler`;`lake.engine` 取代 prefill/decode/draft 三包,执行形态由角色配置 + `SchedulerOutput` 选择。**DP step 信息同步(token 数/mode/IDLE)落 Scheduler**,不进 ModelRunner。**Host `Req` 权威完全在 `node_scheduler`**(引擎无长期 RequestState);**默认启用 overlap**;请求结束 → `agent.on_request_finished`(引擎不 free KV)。详见 [`architecture/compute-layer.md`](architecture/compute-layer.md)「计算引擎结构」、[`architecture/scheduling.md`](architecture/scheduling.md) §3。
 - **技术选型已定**（P2 落地）：存储 + 存储控制面 Rust / 请求控制面 Go / 计算 Python+Triton；元数据 etcd；SSOT 用 S3/MinIO；跨语言 gRPC+Protobuf（大块 KV 走 RDMA 旁路）。3rdparty 五个 submodule（sglang/lmcache/mooncake/vllm/dynamo）作实现参考。
 - **KV 类型 t-type / r-type + 投机解码机制（本轮新增）**：
   - **KV 类型**：按 HBM 存储形态分 t-type(逐 token 完整 KV,paged block,full attention/MLA)与 r-type(紧凑表示——窗口最近 W token / Mamba 定长 state,sliding window/Mamba/卷积)。**两类复用条件一致**:都需命中全部前缀才能复用;区别**仅在 HBM(L0)存储形态**,目的是降低 r-type 的 HBM 占用。HBM 两类并存、分 arena 管理(r-type 另设固定状态 arena 入图);L1–L3 统一按 block(128 token)组织(两类复用条件一致、不区分类型),r-type 落下层在 block 边界 checkpoint 紧凑状态(trailing pages / state 快照)——相对 SGLang multi-pool 物理分池,我们把类型差异收敛到 L0 存储形态 + block 内布局,而非物理分池。详见 [`architecture/storage-layer.md`](architecture/storage-layer.md) "KV 类型"节、[`architecture/kv-cache-pool.md`](architecture/kv-cache-pool.md) "t-type / r-type"。
@@ -131,6 +131,14 @@ P7  性能建模与验证   → 量化各假设，回填设计
 | 对象存储 | SSOT | S3 / MinIO | 现成，不自研 |
 | 控制面存储 | 元数据权威 | **控制面进程内存**（强一致）+ etcd（降频 checkpoint + lease） | 强一致权威在进程内存（满块注册高频写不压 etcd）；etcd 只存低频 checkpoint + 节点 lease，非强一致位置表。详见 [`architecture/control-plane.md`](architecture/control-plane.md)「位置视图权威的归属」 |
 | 跨语言通信 | 统一 RPC | **gRPC + Protobuf** | Rust/Go/Python 都有一等支持；数据平面大块 KV 走 RDMA/共享内存旁路 gRPC |
+
+### 开发环境约定
+
+- **Python 开发环境用 `uv` 管理**：根目录保留统一 `pyproject.toml` 和 `.venv`，从仓库根执行 `uv venv --python 3.12`、`source .venv/bin/activate`、`uv pip install -e ".[dev]"`。
+- **边界**：`uv` 只管 Python 开发依赖与本地测试环境；Rust / Go 仍分别使用 `cargo` / `go`，三语言构建入口不合并到 uv。
+- **Torch/CUDA/Triton/Transformers**：Torch 是 Python 计算层基础依赖；模型加载用安装依赖 `transformers` 的 `AutoConfig.from_pretrained(model_path)` 读取 HF config，再按 `config.architectures` 进入 lake model registry，`3rdparty/transformers` 只作源码参考、不进安装路径。本机 CUDA wheel 由安装源/平台解析决定（如 PyPI 默认 CUDA wheel 或 PyTorch 指定 CUDA index），`cuda` extra 仅补 Triton 开发路径。对照 vLLM 与 SGLang：两者都在包依赖和 `ModelRunner` / `InputBatch` / Qwen3 模型热路径中硬依赖 `torch`，因此 lake 的生产 Qwen3 backend 也不把 Torch 伪装成可选依赖；但 `engine` / `runtime` 轻量 import、mock 测试路径仍应避免顶层触发 Torch。
+- **模型启动参数**：计算 worker 使用 `LAKE_MODEL_PATH`（或测试里显式传 `RoleConfig.model_path` / 本地模型目录）作为加载源；不再有 `default_model_id`。对外名称用 `LAKE_SERVED_MODEL_NAME`，默认 `"model"`，不从模型路径派生，避免暴露本地存储路径。加载时由 `AutoConfig.from_pretrained(model_path)` / loader 自然抛出加载错误，再按 HF config 的 `architectures` 判断模型类是否支持；KV Pool 命名空间仍按 #49 单独讨论。测试里的 Qwen3 example 对齐 vLLM 做法，默认使用 HF repo id `Qwen/Qwen3-0.6B`，不在仓库内保存模型文件或模型 submodule；本地基本测试可设置 `LAKE_TEST_QWEN3_MODEL_PATH=~/models/Qwen/Qwen3-0.6B` 复用已下载模型，本地网络无法直连 Hugging Face 时也可临时设置 `HF_ENDPOINT` 指向可用镜像。
+- **参考取向**：vLLM 更偏 uv-first（推荐 `uv venv`、`uv pip install ... --torch-backend=auto`）；SGLang 也推荐 uv 并在 CI/Docker 中使用，但保留平台 fallback。lake 采用其开发环境管理经验，不改变既定语言技术选型。
 
 ### 模块与目录划分
 
@@ -236,18 +244,24 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 
 > 计算层落地节奏见 [`architecture/compute-layer.md`](architecture/compute-layer.md)「计算层实现里程碑」C0–C5（vLLM V2 目录 + SGLang Req/overlap；KV 归池）。
 
-- [x] **C0**：D1 `SchedulerOutput` 定稿 + `python/engine`·`runtime/node_scheduler` 骨架 + P3 Generate 挂新路径（mock）
+- [x] **C0**：D1 `SchedulerOutput` 定稿 + `python/lake/engine`·`python/lake/runtime/node_scheduler` 骨架 + P3 Generate 挂新路径（mock）
 - [x] **C1**：continuous batching + overlap 主循环 + FutureMap host 占位
 - [x] **C2**：`pool_iface` FFI 草签（D2/D5）
-- [x] **C3**：TinyLM + attn/sample 最小路径（零强制 torch；P3 默认仍 `model_backend=mock`）
-- [x] **C4**：共置 TinyMTP（post/pre_forward）+ TARGET_VERIFY + chain reject
+- [x] **C3**：早期 TinyLM + attn/sample 最小路径（已移除；主计算层转向 Torch/Qwen3 + HF config）
+- [ ] **C4**：共置投机模型（post/pre_forward）+ TARGET_VERIFY + chain reject（等待后续真实 draft/spec 模型接入）
 - [x] **C5**：vLLM 调度几何（`num_computed` + 本步 token）+ 三模式选路骨架（`PrefixHint`/`mode_select`）；整段本地命中→`computed=prompt_len`（无 PREBUILT 分相）；Go Router 权威联调后续
 - [x] **C6–C10** 填充 scheduler/worker/runner（vLLM 为主）：详见 [`architecture/compute-layer.md`](architecture/compute-layer.md)「C6–C10 填充计划」
   - [x] **C6**：Worker 长期单环（一份 scheduler；Generate 入队；step 前 drain）
   - [x] **C7**：token_budget + chunked extend
-  - [x] **C8**：InputBatch + AttentionMetadata（D4）+ TinyLM 批路径
+  - [x] **C8**：InputBatch + AttentionMetadata（D4）+ runner token 批路径
   - [x] **C9**：D10 overlap×agent + D6 dummy_run
   - [x] **C10**：Warm/容量信号骨架（生命周期 + CapacitySignal；Router/真 pin 联调后置）
+- [x] **C11–C15** 计算模块本轮开发（`cal-0727`，vLLM 对比后补齐生产形状接口）：详见 [`architecture/compute-layer.md`](architecture/compute-layer.md)「C11–C15 本轮开发计划」
+  - [x] **C11**：Runner 静态 buffer + lake AttentionMetadata v2（Python 固定 buffer 镜像 + agent block table / slot mapping；真 device tensor 后置）
+  - [x] **C12**：真实模型加载骨架（`load_model` / `warmup` / 权重 pin 回调；Worker Warm 阶段执行，容量信号带模型状态）
+  - [x] **C13**：Sampling / structured output 挂载点（`GrammarOutput` / bitmask 占位 + spec×grammar overlap 例外）
+  - [x] **C14**：`pool_iface` 生产会计契约（`commit_write_extent`、partial hit、prepare/done 错误路径）
+  - [x] **C15**：D8 runtime executor 草案（一份 `SchedulerOutput` 扇出接口；TP/PP 真通信后置）
 - [ ] 同步工程基建：CI 以 `engine`/`runtime`/`kernels` 为主（旧三包仅兼容 import）
 - [ ] Prefill→Decode 的 KV 迁移流水线（计算与传输重叠）
 - [ ] 故障注入：杀 Decode 节点 → 从 KV Pool 续推

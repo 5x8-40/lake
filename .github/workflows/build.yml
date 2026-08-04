@@ -67,11 +67,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # stub 顶部校验 protobuf runtime ≥ 7.35.0 / grpcio ≥ 1.82.1(见 python/pyproject.toml)。
+      # stub 顶部校验 protobuf runtime ≥ 7.35.0 / grpcio ≥ 1.82.1(见根目录 pyproject.toml)；
+      # Qwen3 config 由 transformers AutoConfig 读取，轻量 import 路径不安装 torch。
       # 装运行时依赖即可,空壳阶段不 pip install -e .(PEP 668 机器会炸;
       # worker 包就在 python/ 下,PYTHONPATH 直接 import,与本地验证一致)。
-      - run: pip install "grpcio>=1.82.1" "protobuf>=7.35.0"
-      - run: PYTHONPATH=. python -c "from lake_pb import lake_pb2, lake_pb2_grpc, schema_pb2; import kernels, runtime, engine; import prefill, decode, draft; from runtime.node_scheduler import NodeScheduler; from engine.model_runner import ModelRunner; from engine.models import TinyLM; from engine.drafter import TinyMTPDrafter; from kernels import causal_attn; print('py OK')"
+      - run: pip install "grpcio>=1.82.1" "protobuf>=7.35.0" "transformers"
+      - run: PYTHONPATH=. python -c "from lake.pb import lake_pb2, lake_pb2_grpc, schema_pb2; import lake.kernels, lake.runtime, lake.engine; import lake.prefill, lake.decode, lake.draft; from lake.runtime.node_scheduler import NodeScheduler; from lake.engine.model_runner import ModelRunner; from lake.engine.model_executor.models import ModelRegistry; from lake.kernels import causal_attn; print('py OK')"
 
   # stub drift:重生成 Go/Python stub 后 git diff --exit-code。
   # 拦「proto 改了没重生成 stub」与「工具版本漂移致生成物变」(见 PR #17 review #4)。

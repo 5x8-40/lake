@@ -16,11 +16,11 @@ echo "==> go: module"
 
 echo "==> python: stub + runtime/engine import"
 PYTHONPATH=python python3 -c "
-from lake_pb import lake_pb2, lake_pb2_grpc, schema_pb2
-import runtime, prefill, decode, engine
-from runtime.worker import chain_block_hashes, mock_kv_bytes
-from runtime.node_scheduler import NodeScheduler, build_req_from_generate, mock_decode_tokens
-from engine.model_runner import ModelRunner
+from lake.pb import lake_pb2, lake_pb2_grpc, schema_pb2
+import lake.runtime, lake.prefill, lake.decode, lake.engine
+from lake.runtime.worker import chain_block_hashes, mock_kv_bytes
+from lake.runtime.node_scheduler import NodeScheduler, build_req_from_generate, mock_decode_tokens
+from lake.engine.model_runner import ModelRunner
 assert hasattr(lake_pb2_grpc, 'WorkerServiceStub')
 assert hasattr(lake_pb2_grpc, 'TcpDataServiceStub')
 assert hasattr(lake_pb2_grpc, 'TransferServiceStub')

@@ -83,7 +83,7 @@
 
 ## 2. 池间调度
 
-> 本节「Prefill / Decode / Draft 池」指**部署与扩缩画像**(逻辑池),不是 `python/prefill|decode|draft/` 代码包——进程内只有一套 `engine/`,角色由启动配置选择。见 [`compute-layer.md`](compute-layer.md)「池 ≠ 代码包」。
+> 本节「Prefill / Decode / Draft 池」指**部署与扩缩画像**(逻辑池),不是 `python/lake/{prefill,decode,draft}/` 代码包——进程内只有一套 `lake.engine`,角色由启动配置选择。见 [`compute-layer.md`](compute-layer.md)「池 ≠ 代码包」。
 
 - Prefill → Decode 的 KV 传递通过存储池传输引擎(RDMA 数据面,见 [`kv-cache-pool.md`](kv-cache-pool.md) "跨实例 KV 传输"),需在 Prefill 完成时序上对齐 Decode 就绪（**仅 PD 分离模式**;混部/D-direct 为本地完成、无跨节点传输,见 [`execution-modes.md`](execution-modes.md)）。
 - 投机解码：Draft 池(部署画像;默认 drafter 与 Decode 共置,独立 Draft 池可选)在 Decode 侧生成候选，验证失败回退到标准 decode。
@@ -91,10 +91,10 @@
 
 ## 3. 节点级调度
 
-- **落点**:`python/runtime/node_scheduler.py` → 产出 `SchedulerOutput`(节点侧;字段草图见 [`compute-layer.md`](compute-layer.md)「D1 — SchedulerOutput 字段草图」)。集群选路仍归 Go Router;计算节点内**一份**调度决策扇出多卡(见 compute-layer TP)。
+- **落点**:`python/lake/runtime/node_scheduler.py` → 产出 `SchedulerOutput`(节点侧;字段草图见 [`compute-layer.md`](compute-layer.md)「D1 — SchedulerOutput 字段草图」)。集群选路仍归 Go Router;计算节点内**一份**调度决策扇出多卡(见 compute-layer TP)。
 - **Host `Req` 权威**:**完全**在 `node_scheduler`(token 历史、采样/stop/grammar、结束判定);`ModelRunner` 无长期请求表。见 [`compute-layer.md`](compute-layer.md) 决策 5。
 - **默认 overlap**:主循环对齐 SGLang `event_loop_overlap`(CPU 收尾 ∥ 下一 GPU forward;device 侧 token 接力)。请求结束 → `agent.on_request_finished`(见 compute-layer「请求结束与资源释放」)。
-- **Continuous batching**：Decode / 混部节点动态拼接 batch;执行形态由角色配置 + 本步 `SchedulerOutput` 选择(同一 `engine/`,非 prefill/decode 分树)。
+- **Continuous batching**：Decode / 混部节点动态拼接 batch;执行形态由角色配置 + 本步 `SchedulerOutput` 选择(同一 `lake.engine`,非 prefill/decode 分树)。
 - **PagedAttention** 风格的块状 KV 管理，与存储池的 block 粒度对齐(表由池 agent 组装,调度器不持 KV 权威)。
 - **放置与 batch 单向耦合（方案 Z）**：同一 batch 各 sequence 的 KV 必须同时在本机 HBM（attention 一次读全部）。存储池按热度主动预放置 KV 到 HBM 并发布位置视图;调度器读视图组 batch（本地命中优先），缺失补拉，不反向指挥放置。见 [`storage-layer.md`](storage-layer.md) / [`execution-modes.md`](execution-modes.md)。
 - **一步交互序（D5 已定）**：`schedule`（只读视图）→ `prepare_step`（**唯一**补拉/占槽/ready）→ `execute` → `done` → 结束则 `on_request_finished`。补拉预算 `pull_budget_ms`（0=同步等到齐）；默认 **不允许批内缺块请求仍进算**（`allow_partial_hit=false` = all-or-nothing；与单请求前缀部分命中无关）。`allow_partial_hit=true` 时 agent 回缩 `effective_*_set`，调度器须过滤后再 execute。详见 [`compute-layer.md`](compute-layer.md)「D5」。

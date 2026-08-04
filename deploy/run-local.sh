@@ -13,6 +13,8 @@ export LAKE_WORKER_BIND="${LAKE_WORKER_BIND:-[::]:50053}"
 export LAKE_WORKER_ADDR="${LAKE_WORKER_ADDR:-127.0.0.1:50053}"
 export LAKE_AGENT_ADDR="${LAKE_AGENT_ADDR:-127.0.0.1:50054}"
 export LAKE_HTTP_ADDR="${LAKE_HTTP_ADDR:-:8080}"
+export LAKE_MODEL_BACKEND="${LAKE_MODEL_BACKEND:-mock}"
+export LAKE_SERVED_MODEL_NAME="${LAKE_SERVED_MODEL_NAME:-mock-llm}"
 
 # 兼容 CARGO_TARGET_DIR 覆盖(如 CI/sandbox);不要写死 rust/target/debug。
 RUST_DEBUG="$(
@@ -94,7 +96,7 @@ wait_tcp 127.0.0.1:50054 storage-agent
 echo "==> start python worker"
 (
   cd python
-  PYTHONPATH=. python3 -m runtime
+  PYTHONPATH=. python3 -m lake.runtime
 ) &
 PIDS+=($!)
 wait_tcp 127.0.0.1:50053 worker

@@ -22,3 +22,6 @@
 [submodule "3rdparty/ucm"]
 	path = 3rdparty/ucm
 	url = https://github.com/modelengine-group/unified-cache-management.git
+[submodule "3rdparty/transformers"]
+	path = 3rdparty/transformers
+	url = https://github.com/huggingface/transformers.git
