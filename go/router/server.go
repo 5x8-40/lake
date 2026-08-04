@@ -9,6 +9,8 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -27,7 +29,8 @@ type Config struct {
 	AgentAddr   string // AgentService(边10 Dispatch),默认 127.0.0.1:50054
 	CPAddr      string // ControlPlaneService(权威回退查询),默认 127.0.0.1:50051
 	NodeRole    string // 候选执行节点角色(hybrid/prefill/decode,LAKE_NODE_ROLE),P6.3 选路输入;单节点原型默认 hybrid
-	MaxInFlight int    // P6.4:Router 并发执行上限(非准入控制——队列无界不拒请求);单 worker mock 默认 1
+	MaxInFlight int    // P6.4:单节点并发执行上限(P6.5 起总并发=×ready 节点数;非准入控制——队列无界不拒请求);单 worker mock 默认 1
+	Autoscale   bool   // P6.5:基于指标的弹性扩缩(LAKE_AUTOSCALE=1);默认关——单进程原型不起真实 worker
 }
 
 // Server OpenAI 兼容 HTTP → Dispatch(agent) → Generate(worker)。
@@ -40,6 +43,9 @@ type Config struct {
 // P6.4:已准入请求经 PQScheduler 按 priority 排序/抢占(被抢占者重排不丢,KV 留池
 // 重跑命中前缀);RunLoadSync 上报 LoadSnapshot 并回收 agent 转发来的池写背压
 // (触硬配额 → 该 model 新启动暂停,池间流控;shedding 归 gateway,Router 不拒请求)。
+// P6.5:可选弹性扩缩(LAKE_AUTOSCALE=1)——按队列深度等指标决策,扩容 JoinShardNode
+// (一致性哈希最小迁移)入路由表,缩容 DrainShardNode(推 L2 计划)摘路由、
+// placement 清后 RemoveShardNode;真实 provision 归外部编排,Ready<10s 待 P7。
 type Server struct {
 	cfg         Config
 	worker      lakepb.WorkerServiceClient
@@ -52,6 +58,13 @@ type Server struct {
 	viewCancel  context.CancelFunc
 	sched       *PQScheduler
 	schedCancel context.CancelFunc
+
+	// P6.5:扩缩容状态
+	nodes                  *nodeRegistry
+	scaler                 *Autoscaler
+	lastReadyLatencyMu     sync.Mutex
+	lastReadyLatency       time.Duration // 最近扩容决策→Ready 时延(原型=join RPC 完成)
+	hitBlocks, totalBlocks atomic.Uint64 // 命中率分子/分母(累计 block 数)
 }
 
 const maxChatRequestBytes = 1 << 20
@@ -108,6 +121,11 @@ func New(cfg Config) (*Server, error) {
 	s.schedCancel = schedCancel
 	go s.sched.Run(schedCtx)
 	go RunLoadSync(schedCtx, s.agent, s.sched, "router", time.Second)
+	s.nodes = newNodeRegistry("worker-0")
+	s.scaler = NewAutoscaler(AutoscaleConfig{})
+	if cfg.Autoscale {
+		go s.runAutoscale(schedCtx, 2*time.Second)
+	}
 	return s, nil
 }
 
@@ -236,7 +254,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	rid := uuid.NewString()
-	nodeID := "worker-0"
+	nodeID := s.pickNode()
 
 	// P6.3:选路权威在 Router——哈希链 → 镜像查命中(miss 回退权威)→ 选模式。
 	// 纯内存读,模式选择开销 µs 级,满足 D-direct < 5ms 的 SLO 预算。
@@ -307,6 +325,10 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// P6.5:命中率统计(扩缩决策输入之一;累计口径,原型足够)
+	s.totalBlocks.Add(uint64(len(hashes)))
+	s.hitBlocks.Add(uint64(gen.GetReusedBlocks()))
+
 	content := detokenizeMock(gen.OutputTokens)
 	resp := chatResponse{
 		ID:      "chatcmpl-" + rid[:8],
@@ -332,6 +354,30 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// pickNode 选目标执行节点(单节点原型 = worker-0;P6.5 扩缩后读路由表首节点)。
+func (s *Server) pickNode() string {
+	if s.nodes == nil {
+		return "worker-0"
+	}
+	return s.nodes.pick()
+}
+
+// hitRate 累计前缀命中率(P6.5 扩缩决策输入;P7 换滑动窗口)。
+func (s *Server) hitRate() float64 {
+	total := s.totalBlocks.Load()
+	if total == 0 {
+		return 0
+	}
+	return float64(s.hitBlocks.Load()) / float64(total)
+}
+
+// lastReadyLatency 最近扩容决策→Ready 时延(原型:JoinShardNode 完成即 Ready)。
+func (s *Server) LastReadyLatency() time.Duration {
+	s.lastReadyLatencyMu.Lock()
+	defer s.lastReadyLatencyMu.Unlock()
+	return s.lastReadyLatency
 }
 
 // P6.4 handler 错误分型:保留 P3 的 HTTP 映射语义(不泄后端细节)。

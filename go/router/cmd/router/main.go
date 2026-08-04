@@ -3,7 +3,8 @@
 //	go run ./router/cmd/router
 //
 // 环境变量:LAKE_HTTP_ADDR / LAKE_WORKER_ADDR / LAKE_AGENT_ADDR / LAKE_CP_ADDR /
-// LAKE_NODE_ROLE / LAKE_MAX_INFLIGHT(P6.4 并发执行上限,默认 1;队列无界不拒请求)
+// LAKE_NODE_ROLE / LAKE_MAX_INFLIGHT(P6.4 并发执行上限,默认 1;队列无界不拒请求)/
+// LAKE_AUTOSCALE(P6.5 弹性扩缩开关,=1 开启;默认关——单进程原型不起真实 worker)
 package main
 
 import (
@@ -28,6 +29,7 @@ func main() {
 		CPAddr:      env("LAKE_CP_ADDR", "127.0.0.1:50051"),
 		NodeRole:    env("LAKE_NODE_ROLE", "hybrid"),
 		MaxInFlight: envInt("LAKE_MAX_INFLIGHT", 1),
+		Autoscale:   os.Getenv("LAKE_AUTOSCALE") == "1",
 	}
 	s, err := router.New(cfg)
 	if err != nil {

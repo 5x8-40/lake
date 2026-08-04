@@ -45,9 +45,12 @@ func (f fakeWorker) Generate(ctx context.Context, req *lakepb.GenerateRequest, _
 // fakeCP:P6.1 用进程内 gRPC 服务冒充 CP 权威树(嵌入 Unimplemented 兜底其余 RPC)。
 type fakeCP struct {
 	lakepb.UnimplementedControlPlaneServiceServer
-	lookupPrefix  func(context.Context, *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error)
-	locate        func(context.Context, *lakepb.LocateRequest) (*lakepb.LocateResponse, error)
-	subscribeView func(*lakepb.SubscribeRequest, grpc.ServerStreamingServer[lakepb.ViewUpdate]) error
+	lookupPrefix    func(context.Context, *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error)
+	locate          func(context.Context, *lakepb.LocateRequest) (*lakepb.LocateResponse, error)
+	subscribeView   func(*lakepb.SubscribeRequest, grpc.ServerStreamingServer[lakepb.ViewUpdate]) error
+	joinShardNode   func(context.Context, *lakepb.JoinShardNodeRequest) (*lakepb.JoinShardNodeResponse, error)
+	drainShardNode  func(context.Context, *lakepb.DrainShardNodeRequest) (*lakepb.DrainShardNodeResponse, error)
+	removeShardNode func(context.Context, *lakepb.RemoveShardNodeRequest) (*lakepb.Ack, error)
 }
 
 func (f fakeCP) LookupPrefix(ctx context.Context, req *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error) {
@@ -66,6 +69,27 @@ func (f fakeCP) SubscribeView(
 		return status.Error(codes.Unimplemented, "not implemented")
 	}
 	return f.subscribeView(req, stream)
+}
+
+func (f fakeCP) JoinShardNode(ctx context.Context, req *lakepb.JoinShardNodeRequest) (*lakepb.JoinShardNodeResponse, error) {
+	if f.joinShardNode == nil {
+		return nil, status.Error(codes.Unimplemented, "not implemented")
+	}
+	return f.joinShardNode(ctx, req)
+}
+
+func (f fakeCP) DrainShardNode(ctx context.Context, req *lakepb.DrainShardNodeRequest) (*lakepb.DrainShardNodeResponse, error) {
+	if f.drainShardNode == nil {
+		return nil, status.Error(codes.Unimplemented, "not implemented")
+	}
+	return f.drainShardNode(ctx, req)
+}
+
+func (f fakeCP) RemoveShardNode(ctx context.Context, req *lakepb.RemoveShardNodeRequest) (*lakepb.Ack, error) {
+	if f.removeShardNode == nil {
+		return nil, status.Error(codes.Unimplemented, "not implemented")
+	}
+	return f.removeShardNode(ctx, req)
 }
 
 // dialFakeCP 起 bufconn 进程内 CP,返回接好客户端的 Server。

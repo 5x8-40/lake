@@ -444,4 +444,32 @@ mod tests {
             }
         }
     }
+
+    // P6.5 判据(drain/迁移最小化验证):扩容→缩容全周期后,所有权完全恢复
+    // 扩容前——扩缩只动该动的 key(最小迁移的往返闭环)。
+    #[test]
+    fn p65_join_drain_roundtrip_restores_ownership() {
+        let mut ring = ShardRing::new(32);
+        ring.join("n0", 32).unwrap();
+        ring.join("n1", 32).unwrap();
+        let keys: Vec<Vec<u8>> = (0..200u64).map(|i| format!("k{i}").into_bytes()).collect();
+        let before = ring.clone();
+
+        // 扩容:迁入新节点的比例有界(理想 ≈1/3)
+        ring.join("n2", 32).unwrap();
+        let expand_ratio = migration_ratio(&before, &ring, &keys);
+        assert!(
+            expand_ratio > 0.0 && expand_ratio < 0.55,
+            "expand should move a bounded fraction, ratio={expand_ratio}"
+        );
+
+        // 缩容:drain(摘出 ownership)+ remove → 所有权逐 key 恢复扩容前
+        ring.mark_drain("n2").unwrap();
+        ring.remove("n2").unwrap();
+        let restored = migration_ratio(&before, &ring, &keys);
+        assert_eq!(
+            restored, 0.0,
+            "drain+remove round-trip should restore pre-join ownership exactly"
+        );
+    }
 }

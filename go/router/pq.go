@@ -114,6 +114,17 @@ func (s *PQScheduler) Submit(
 	}
 }
 
+// SetMaxInFlight 动态调整并发上限(P6.5:随 ready 节点数伸缩)。
+func (s *PQScheduler) SetMaxInFlight(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	s.mu.Lock()
+	s.maxInFlight = n
+	s.mu.Unlock()
+	s.signal()
+}
+
 // SetBackpressure 标记 model 背压(池触硬配额上传),now+ttl 后自动解除。
 func (s *PQScheduler) SetBackpressure(model string, now time.Time) {
 	s.mu.Lock()
