@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-import torch
+import pytest
+
+torch = pytest.importorskip("torch", reason="torch 不在 CI 最小环境,跳过(真机/GPU 环境跑)")
 
 from lake.engine.model_executor.layers.attentions import TorchAttentionBackend
 from lake.engine.model_executor.models.qwen.qwen3 import Qwen3PagedAttention

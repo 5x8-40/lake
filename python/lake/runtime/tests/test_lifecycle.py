@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 
@@ -11,11 +10,6 @@ from lake.runtime.lifecycle import WorkerLifecycle, WorkerState
 from lake.runtime.node_scheduler import build_req_from_generate
 from lake.runtime.role import RoleConfig
 from lake.runtime.worker_engine import WorkerEngine, _Inbound
-
-
-QWEN3_0_6B_MODEL_ID = os.path.expanduser(
-    os.environ.get("LAKE_TEST_QWEN3_MODEL_PATH", "Qwen/Qwen3-0.6B")
-)
 
 
 class FakePool:
@@ -46,12 +40,14 @@ def test_lifecycle_forward_and_drain() -> None:
 
 
 def test_engine_capacity_signal() -> None:
+    # mock 后端即可:load_model 置 model_loaded=True 不碰真模型
+    # (model_runner.py mock 分支),容量信号路径收回 CI 常跑(issue #72)。
     pool = FakePool()
-    runner = ModelRunner(pool)  # type: ignore[arg-type]
+    runner = ModelRunner(pool, model_backend="mock")  # type: ignore[arg-type]
     eng = WorkerEngine(
         pool,
         runner,
-        RoleConfig(model_path=QWEN3_0_6B_MODEL_ID, served_model_name="public-qwen"),
+        RoleConfig(model_path="mock-qwen", served_model_name="public-qwen"),
         coalesce_s=0,
     )  # type: ignore[arg-type]
     eng.start()

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import os
+from conftest import QWEN3_0_6B_MODEL_ID, requires_qwen3
 
 from lake.engine.agents.memory import InMemoryAgent
 from lake.engine.model_runner import ModelLoadInfo, ModelRunner
@@ -10,11 +10,6 @@ from lake.engine.pool_iface import PoolIface
 from lake.engine.pool_types import PreparePlan
 from lake.runtime.req import Req
 from lake.runtime.scheduler_output import ForwardMode, ReqIoSet, SamplingParams, SchedulerOutput
-
-
-QWEN3_0_6B_MODEL_ID = os.path.expanduser(
-    os.environ.get("LAKE_TEST_QWEN3_MODEL_PATH", "Qwen/Qwen3-0.6B")
-)
 
 
 def test_commit_does_not_undercut_newer_prepare() -> None:
@@ -138,6 +133,7 @@ def test_execute_model_does_not_done_failed_step() -> None:
     assert ag._ready_step == 7  # noqa: SLF001
 
 
+@requires_qwen3
 def test_load_qwen3_model_pins_weights_and_warmup_skips_pool() -> None:
     ag = InMemoryAgent()
     pool = PoolIface(ag)

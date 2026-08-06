@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-import os
+import pytest
 
-import torch
+torch = pytest.importorskip("torch", reason="torch 不在 CI 最小环境,跳过(真机/GPU 环境跑)")
 from transformers import Qwen3Config
+
+from conftest import QWEN3_0_6B_MODEL_ID, qwen3_available
 
 from lake.engine.agents.memory import InMemoryAgent
 from lake.engine.model_runner import ModelRunner
@@ -26,9 +28,12 @@ from lake.runtime.role import RoleConfig
 from lake.runtime.scheduler_output import ForwardMode, GrammarOutput, SamplingParams, SchedulerOutput
 
 
-QWEN3_0_6B_MODEL_ID = os.path.expanduser(
-    os.environ.get("LAKE_TEST_QWEN3_MODEL_PATH", "Qwen/Qwen3-0.6B")
-)
+if not qwen3_available():
+    pytest.skip(
+        "Qwen3-0.6B 不在本地缓存且未设 LAKE_TEST_QWEN3_MODEL_PATH(离线环境跳过)",
+        allow_module_level=True,
+    )
+
 QWEN3_0_6B_CONFIG = load_hf_config(QWEN3_0_6B_MODEL_ID)
 
 
