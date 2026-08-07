@@ -59,15 +59,22 @@ Req  →  ScheduleBatch  →  ForwardBatch
 
 `ForwardMode`(`model_executor/forward_batch_info.py::ForwardMode`)常用值:
 
-| Mode | 用途 |
-|------|------|
-| `EXTEND` | Prefill / 残差 prefill |
-| `DECODE` | 普通 decode |
-| `MIXED` | chunked / 混批 |
-| `TARGET_VERIFY` | target 并行验证 draft(含 DFLASH 家族的 draft 前向) |
-| `DRAFT_EXTEND_V2` | EAGLE 家族 draft-extend(同步 draft KV + seed) |
+| Mode | 用途 | SGLang 的分类含义 |
+|------|------|---------------------|
+| `EXTEND` | Prefill / 残差 prefill | 常规多 token context forward |
+| `DECODE` | 普通 decode | 每请求一个 query token 的延迟敏感路径 |
+| `MIXED` | chunked / 混批 | 同一 batch 同时含 extend 与 decode 几何 |
+| `TARGET_VERIFY` | target 并行验证 draft(含 DFLASH 家族的 draft 前向) | 逻辑上归 `is_extend()`，但可走 decode graph |
+| `DRAFT_EXTEND_V2` | EAGLE 家族 draft-extend(同步 draft KV + seed) | 仅在显式允许时才计入 extend 谓词 |
+| `PREBUILT` / `SPLIT_PREFILL` | PD decode ready / PD multiplexing prefill | SGLang 的分相、PD 专用标签 |
+| `DLLM_EXTEND` | Diffusion LLM mask block 推理 | 不是自回归 token decode，另有请求 phase/结果处理 |
+| `IDLE` | 无本地请求的陪跑 step | DP/collective 对齐，不等同 graph capture dummy |
 
 `CaptureHiddenMode`:`NULL` / `LAST` / `FULL` — 投机决定 target 是否吐 hidden states 给 draft。
+
+**不要把这个枚举当作唯一执行几何。** `ForwardMode.is_extend()` 把 `MIXED`、`TARGET_VERIFY`、`SPLIT_PREFILL`、`DLLM_EXTEND` 都归为 extend，而 `is_decode()` 只承认普通单 token `DECODE`。这是为了复用调度、attention 和并行通信分派中的已有分支；target verify 的 `q_len>1` 并不自动意味着它只能使用 prefill kernel 或 prefill graph。
+
+**对 lake**：应保留“每请求 `num_computed_tokens + 本步 q_len`”作为权威执行几何；普通生成关闭投机时就是 `q_len=1`，投机 verify 时是 `q_len>1`。可以不保留 SGLang 式持久 Prefill/Decode 状态机，但仍要从几何派生批标签（attention layout、graph bucket、MoE 通信、日志），否则“全部叫 extend”会掩盖关键执行差异。
 
 ### 字段驻留(host vs device)
 
@@ -312,6 +319,16 @@ self.chain_mtp_hidden_states = draft_arch in ["Step3p5MTP"]
 Ragged 模式(`SGLANG_RAGGED_VERIFY_MODE`):`static` / `cap-accept` / `compact`;graph 按 **token bucket** 键控。  
 相对 DFLASH:markov head + 可选 confidence + ragged verify + epilogue 可 fold accept/commit。
 
+#### Ragged verify：几何在 device，bucket 决策可在 host
+
+固定宽度 verify 会把 batch 内每个请求都 pad 到同一 `gamma+1`。DSPARK 的 `RaggedVerifyLayout` 改为每请求一条 `verify_lens[i] >= 1`，以 `qo_indptr` 表示不等长 query 的前缀和，并派生 `extend_start_loc`；attention 因此能在一个 batch 内跑不同 verify 宽度，而不是为短请求计算无效 draft 位。
+
+- `RaggedVerifyLayout.from_verify_lens_device` 以 device `verify_lens` 通过 `BuildQoIndptr` 生成 device `qo_indptr`，可避免为 layout 本身把长度同步回 host。
+- `from_verify_lens` 的 host 路径保留 `verify_lens_cpu`、`total_verify_tokens`，用 `round_up_grid` 决定 CUDA graph 的 token bucket；这是**形状选择**需要的 host 信息，不是 attention 必然要求的 D2H。
+- `static` 保固定窗口，`cap-accept` 限制有效接受宽度，`compact` 按有效 token 紧凑；三者在 padding、可 capture bucket 与调度复杂度之间取舍。
+
+> **对 lake**：`InputBatch.query_start/query_end`（或等价的 device `qo_indptr`）应是 ragged query 几何的权威执行接口，而 Host `Req` 的长度只用于调度与结果提交。不要在纯 Torch GPU 路径对 query 长度逐项 `.item()`；若 graph bucket 必须由 host 选择，应把这次同步明确限制在 bucket 边界，并测量它是否落在 forward 阴影内。
+
 ---
 
 ## 方案对照表
@@ -358,6 +375,24 @@ TpModelWorker → ModelRunner.forward → self.model
 ```
 
 投机时多一层编排 Worker(`EAGLEWorkerV2` 等)罩在外面,内部仍经 draft/target 各自的 `TpModelWorker`→`ModelRunner`。NGRAM 无 draft runner;Frozen-KV MTP 的 draft runner 不写自有 KV,但仍经 `ModelRunner` 跑 draft head。
+
+---
+
+## CUDA graph：按捕获形状和 runner 选路，不只看 `is_extend`
+
+SGLang 维护独立 `PrefillCudaGraphRunner` 与 `DecodeCudaGraphRunner`。前者以 `ForwardMode.EXTEND` capture、按 prefill token bucket 固定地址 buffer；后者以 decode batch/token bucket capture，并可适配 speculative 与 ragged verify 的 replay metadata。
+
+| 运行几何 | 典型 runner | 关键行为 |
+|----------|-------------|----------|
+| 普通 prefill / 残差 prefill | prefill graph（可用时）或 eager | `PrefillCudaGraphRunner` capture mode=`EXTEND` |
+| chunked prefill 的 `MIXED` batch | prefill graph（满足形状/后端时）或 eager | 为 replay 把混批几何规范化到 extend capture buffer；不表示 batch 失去 decode 部分 |
+| 普通 `DECODE` | decode graph | 延迟路径，固定 decode buffers / batch bucket |
+| `TARGET_VERIFY` | decode graph（可 capture 时）或 eager | `eagle_prepare_for_verify` 明确询问 `decode_cuda_graph_runner.can_run_graph` 并加载 batch；capture-time 的并行通信标签可因此与 eager verify 不同 |
+| DSPARK ragged verify | decode graph 的 token bucket 或 eager | `RaggedVerifyLayout.graph_num_tokens` 决定 bucket；device layout 可无同步，host bucket 决策仍可能需要镜像 |
+
+因此“extend 可能跑 prefill graph，也可能跑 decode graph”在语义上是对的：`TARGET_VERIFY` 被 `is_extend()` 归类，却使用 decode runner；`MIXED` 可以复用 EXTEND capture。graph runner 选择还受 backend、bucket、hidden capture、并行通信和静态 buffer 地址约束，不能仅由 `q_len` 或枚举名称推断。
+
+> **对 lake**：统一的 `execute_model(SchedulerOutput)` 入口可接受任意 q_len，但 graph 选择应是显式的纯派生函数，如 `(query geometry, spec kind, attention backend, parallel mode, capture buckets) -> graph/eager plan`。这保留代码接口的统一性，又不会让 `DECODE` 名称的删除误删低延迟 graph、MoE 或 attention 的专用优化。
 
 ---
 
@@ -1025,6 +1060,10 @@ Worker × (TP×PP)          ← 每 GPU 一个;无独立 Scheduler
 | 拒绝采样 | `speculative/reject_sampling.py::chain_speculative_sampling_triton` |
 | Draft 池名 | `mem_cache/hicache_storage.py::PoolName.DRAFT` |
 | Draft 公共工厂 | `speculative/draft_worker_common.py::build_draft_tp_worker` |
+| 批执行模式谓词 | `model_executor/forward_batch_info.py::ForwardMode` |
+| verify 选 decode graph | `speculative/eagle_utils.py::eagle_prepare_for_verify` |
+| prefill graph capture/replay | `model_executor/runner/prefill_cuda_graph_runner.py::PrefillCudaGraphRunner` |
+| decode graph + ragged replay | `model_executor/runner/decode_cuda_graph_runner.py::DecodeCudaGraphRunner` |
 
 ### 相关文档
 
@@ -1032,6 +1071,8 @@ Worker × (TP×PP)          ← 每 GPU 一个;无独立 Scheduler
 |------|------|
 | [overview.md](overview.md) / [hicache.md](hicache.md) | L1/L2/L3 分层与 HiRadix |
 | [block-lifecycle.md](block-lifecycle.md) | block 释放/降层 |
+| [moe-communication.md](moe-communication.md) | MoE routing、DeepEP `auto` 与 graph 例外 |
+| [loading-and-integrations.md](loading-and-integrations.md) | 权重多线程/远端加载、外部依赖集成边界 |
 | [pain-points.md](pain-points.md) | HiCache×EAGLE/MTP 组合 hang 等 |
 | [`../vllm/compute.md`](../vllm/compute.md) | vLLM V1/V2 runner、dummy、DP/TP/PP 控制面 |
 | [`../../architecture/compute-layer.md`](../../architecture/compute-layer.md) | lake 计算层与投机落点 |

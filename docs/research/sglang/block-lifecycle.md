@@ -80,6 +80,23 @@ run_batch / forward（GPU）
 
 > **对照 lake**:与 lake「ref 归 0 = 可驱逐候选,非删内存;归 0 不摘位置视图」完全一致。
 
+### 投机尾部：分配长度不是已提交长度
+
+投机解码中，`ReqKvInfo.kv_allocated_len` 与 `Req.kv_committed_len` 都是 **host `Req` 上的 Python 整数**，不是 device 权威状态：
+
+| 量 | 含义 | device 上的对应物 |
+|----|------|------------------|
+| `kv_committed_len` | 已经 target 接受、可作为请求逻辑序列和缓存前缀处理的 KV 长度 | 当前 step 的 `seq_lens`、block-table 行等执行镜像 |
+| `kv_allocated_len` | 已从 allocator 取得、已经写进 `req_to_token` 行的最高 KV 长度，允许含尚未接受的 draft/verify 槽 | `req_to_token[req_pool_idx, :]`、`out_cache_loc` 和本步 batch tensor |
+
+`allocation.py::alloc_for_extend` 创建或推进 `ReqKvInfo.kv_allocated_len`，`alloc_for_decode` 每次按 `token_per_req` 增加它；它们写 device `req_to_token` 的索引表，却不把整数的权威搬到 GPU。故 Python/CPU 纯 Torch 调度可以维护请求长度，**只要不在热路径用 `.item()` 读回 device 的计算结果**；SGLang 同时保留 `seq_lens_cpu` 镜像，按路径选择 host 或 device tensor。
+
+EAGLE verify/reject 后，SGLang 通常不会立刻 free “最后一个页里只有被拒 draft”的槽。下一轮保留可覆盖的 speculative reserve，避免频繁 alloc/free；`kv_allocated_len` 因而可持续大于 `kv_committed_len`。这只是请求运行期的空槽保留，**既不是 radix 可复用前缀，也不是已提交 KV**。
+
+请求结束才统一收尾：`release_kv_cache` 先把 `effective_kv_committed_len()` 交给 `cache_finished_req` 处理可插树的 committed 段，再调用 `_release_overallocated_kv_indices(req, committed, allocated, ...)` 回收尾部物理槽。page 大于 1 时起点向上 page-align，故整页中已提交的部分保留、未对齐尾部按页规则处理。也就是说，当前设计是“运行中复用 reserve，结束时回收 over-allocation”，而不是每轮 rejection 都释放孤立 draft 页。
+
+> **对照 lake**：lake 应同样区分 `allocated`（池 agent 已 prepare/冻结的物理 write extent）和 `committed`（target acceptance 后可发布的逻辑 extent）。在途 reserve 不能被 radix 发布或逐出；结束/abort 才通过 agent 的一次性收尾归还未提交 extent。不同点是 lake 的 L0–L3 物理映射仍由池权威，而非 worker 私有 allocator。
+
 ### 层级 2 — 驱逐(容量压力触发)
 
 **纯 RadixCache(无 HiCache)** `radix_cache.py::evict`(L564):按优先级堆弹叶子 → `allocator.free(x.value)` + `_delete_leaf`。**一步到位:还内存 + 删节点 = 彻底放弃**,下次要用只能重算。
@@ -171,6 +188,7 @@ flowchart TB
 | 物理槽位 free + 延迟释放组 | `python/sglang/srt/mem_cache/multi_ended_allocator.py`::`free`(L910)/ `free_group_begin`(L1653)/ `free_group_end`(L1657) |
 | 请求结束调度阶段 | `managers/scheduler_components/batch_result_processor.py`::`_handle_finish_state_updated_req` / `process_batch_result_*` |
 | 请求结束 KV 入口 | `mem_cache/common.py`::`release_kv_cache` |
+| 投机长度与尾部回收 | `mem_cache/allocation.py`::`alloc_for_extend` / `alloc_for_decode`; `mem_cache/common.py`::`_release_overallocated_kv_indices` |
 | 请求结束即时 free | `mem_cache/radix_cache.py`::`cache_finished_req` / `cache_unfinished_req` |
 | ref 计数(可驱逐↔保护) | `radix_cache.py`::`inc_lock_ref`(L593)/ `dec_lock_ref`(L608) |
 | 纯 radix 驱逐(=彻底放弃) | `radix_cache.py`::`evict`(L564) |

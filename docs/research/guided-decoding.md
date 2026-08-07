@@ -73,6 +73,18 @@ CPU:           accept(N-1) + fill_bitmask(N) ─┘
 
 **SGLang 判断**：非 spec guided ≈ 能藏进 overlap；**spec + grammar 明确不支持 overlap，做不到无空闲**。
 
+### draft tree 的预计算：已有覆盖与未消除的依赖
+
+「为每个可能接受长度预生成 grammar 状态，验证后按 `accepted_len` 选择」不是空白思路：SGLang target verify 前已经做了它的**前半段**。`spec_utils.py::traverse_tree` DFS draft tree，在每条合法分支上 `grammar.accept_token`，为该节点填下一 token 的 mask，再以 `grammar.rollback(1)` 回到父状态；`generate_token_bitmask` 将整棵树的 CPU packed masks 交给 verify batch。这样 target 可在一次 `q_len > 1` verify 中对每个 draft 节点应用与其前缀相符的 grammar mask，不必等 verify 后才生成这些 mask。
+
+但这不是可长期持有、按接受长度直接切换的 matcher snapshot，且不能消除下一轮的全部 host 依赖：
+
+1. **接受的 draft 前缀**：可按 target 的 `accepted_len` 选择对应分支；若 draft 是线性链，状态数为 `K+1`，若是 tree 则随合法节点数增长。SGLang 以 DFS + rollback 临时重建，避免为每个节点复制完整 `GrammarMatcher`。
+2. **拒绝位置的 replacement / 全接受后的 bonus token**：它们是 target sampling 的真实输出，verify 前未知，不能由有限个 draft-prefix 状态覆盖（除非枚举整个 vocab）。最终已提交 grammar state 仍须接收这个 token，或由 GPU FSM 在 device 上推进。
+3. **分支选择本身**：如果 `accepted_len`、replacement token 或 finish 判定必须回 host 才能更新请求状态，下一轮仍有 D2H/CPU 依赖。预计算能缩短 grammar mask 准备的关键路径，**不能单独证明 overlap × spec × grammar 无气泡**。
+
+因此 SGLang 的 `need_grammar_sync` 仍然合理：它保护的是上述“真实结果已返回前不能提交 host grammar 游标”的依赖，不是因为 verify 内完全没有分支状态的预计算。
+
 ## vLLM：async scheduling × structured output
 
 后端：`xgrammar`（默认）/ `outlines` / `guidance`(llguidance) / `lm-format-enforcer`。
@@ -121,6 +133,26 @@ TensorRT-LLM 更进一步：把 grammar advance / mask gen 挂 **CUDA callback**
 | device 绝对无空闲 | 未做到（async/spec 破洞） | 若要绝对零气泡：自研 GPU FSM 或 CUDA-callback-in-graph（TRT-LLM 方向），代价远高于接 xgrammar——**默认接受「mask ≪ forward」近零，不把绝对无空闲当硬 SLO** |
 | grammar 归属 | host `Req` / scheduler 侧 manager | 与 lake「语义状态在 host、device 只镜像执行必要张量」一致（见 model-runner「请求数据结构」） |
 
+### lake 的后续候选：GrammarFrontier（非 C13 交付）
+
+当 C4 接入真实 speculative decoding 后，可将每个 structured 请求在一次 verify 前得到的结果显式建模为**一次性 `GrammarFrontier`**，而不是把它误称为持久 GPU state：
+
+```text
+host committed matcher state
+  + draft tree (token ids, parent/sibling)
+      → DFS accept / fill mask / rollback
+      → GrammarFrontier { node → packed next-token mask, parent relation }
+      → async H2D copy → target verify
+      → accepted path + replacement/bonus token
+      → host commit，或未来 device FSM commit
+```
+
+- **短期（CPU FSM）**：frontier 的 packed mask 与 verify input 同生命周期，copy 可与 target forward 重叠；验证结果可先在 device 侧用于 token/KV relay，但 host 要在提交 replacement/bonus token 前推进权威 matcher。若这一步赶不上下一轮 sample，保留 C13 的 drain/defer，不以错误状态换吞吐。
+- **规模边界**：只遍历 draft tree 已出现且 grammar 合法的节点；不按 vocab 枚举 replacement token，也不复制完整 matcher。frontier 的节点数、CPU DFS 时间、packed-mask bytes/H2D 时间应被 P7 记录，作为 draft 宽度/深度的预算信号。
+- **长期（消除最后依赖）**：需要可在 GPU 上推进并提交 DFA/FSM state，或类似 TensorRT-LLM 的 CUDA callback-in-graph。此时 host 只异步镜像游标；必须定义 device state 的请求级所有权、抢占/恢复的 checkpoint，以及 TP 各 rank 一致的 token/state 提交协议。
+
+**决策**：C13 当前“spec + structured + overlap 时 drain”保持不变。`GrammarFrontier` 是在真实 spec 接入后测量的优化候选；只有 benchmark 证明 host commit 是瓶颈，才评估 GPU FSM / CUDA callback 的工程成本。它不改变 KV 属池、Host `Req` 归 `NodeScheduler`、也不引入引擎私有请求状态。
+
 **结论**：接现成库 + 重叠调度即可覆盖主流 structured output；不要假设「库已把 guided decoding 全部 GPU 化」。spec + guided 的无气泡路径是增量课题，不是开箱能力。
 
 ## 代码索引
@@ -151,6 +183,7 @@ TensorRT-LLM 更进一步：把 grammar advance / mask gen 挂 **CUDA callback**
 | SGLang accept token | `python/sglang/srt/managers/scheduler_components/batch_result_processor.py`::`_accept_grammar_tokens` |
 | SGLang TP sync（grammar） | `python/sglang/srt/layers/sampler.py`::`_sync_token_ids_across_tp` |
 | SGLang spec 路径 bitmask | `python/sglang/srt/speculative/spec_utils.py`::`generate_token_bitmask` |
+| SGLang draft tree grammar frontier | `python/sglang/srt/speculative/spec_utils.py`::`traverse_tree`（`accept_token` → `fill_vocab_mask` → `rollback`） |
 | vLLM sync step 重叠 | `vllm/v1/engine/core.py`::`step`（`execute_model` → `get_grammar_bitmask` → `sample_tokens`） |
 | vLLM async batch queue + defer | `vllm/v1/engine/core.py`::`step_with_batch_queue`（`pending_structured_output_tokens`） |
 | vLLM async placeholder | `vllm/v1/core/sched/async_scheduler.py`::`AsyncScheduler._update_after_schedule` |
