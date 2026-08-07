@@ -4,7 +4,7 @@
 //! `write_backup` 后再丢 device；Dynamo offload 副作用需回写 presence。
 //! 关键差异：无 BlockStore；位置权威在 CP；本 crate 通过 [`TierSideEffects`] 上报副作用。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::segment::{Placement, Relocate, SegmentArena, DEFAULT_SLOT_BYTES};
 use crate::stats::{AccessKind, HitStats};
@@ -33,6 +33,19 @@ pub enum LocalTier {
     L1,
     L2,
     L3,
+}
+
+/// [`LocalTierEngine::begin_promote`] 登记结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BeginPromote {
+    /// 新登记在途,字节未搬。
+    Started,
+    /// 同块已在途(去重命中,不重复发起)。
+    AlreadyInFlight,
+    /// 已在 L0,无需 promote。
+    AlreadyL0,
+    /// 各层均无此块。
+    Missing,
 }
 
 /// Collateral tier mutations that **must** be published to the controlplane view.
@@ -84,6 +97,21 @@ pub struct LocalTierEngine {
     l2_order: VecDeque<Vec<u8>>,
     /// Local freeze (request / writeback / in-flight). Demote skips when >0.
     pins: HashMap<Vec<u8>, u32>,
+    /// 命中计数(决策 B 准入信号)。**原型本地站位**:生产权威挂 CP radix 节点
+    /// (SGLang `TreeNode.hit_count` 同款),经位置视图镜像带到 agent;此处引擎
+    /// 本地记账,语义对齐 `hiradix_cache.py::_inc_hit_count`。
+    hit_counts: HashMap<Vec<u8>, u32>,
+    /// promote 频率准入阈值:hit_count ≥ 此值才给热块待遇(默认 2,对齐 SGLang
+    /// `write_through_selective` threshold=2;1 = 关闭准入,退化为命中即热)。
+    /// per-agent 配置,无需跨节点一致。
+    promote_admit_after: u32,
+    /// one-shot 标记:冷块(hit_count < 阈值)promote 进 L0 后**驱逐最优先**,
+    /// 不挤兑热块(SGLang 只备份热数据 / Mooncake CountMinSketch 准入的同族形态;
+    /// 注意 GPU 约束下"不加载直读"不成立,冷块仍须进 L0 才能算,准入砍的是级联)。
+    one_shot: HashSet<Vec<u8>>,
+    /// promote 在途登记(决策:in-flight 去重)。同块重复发起只登记一次,
+    /// 对齐 Dynamo offload 去重;异步原语见 [`begin_promote`] / [`finish_promote`]。
+    promote_inflight: HashSet<Vec<u8>>,
     /// L2 segment layout (P4.8); bytes stay in `l2`, arena tracks segment/offset.
     pub l2_arena: SegmentArena,
     pub stats: HitStats,
@@ -115,9 +143,27 @@ impl LocalTierEngine {
             l1_order: VecDeque::new(),
             l2_order: VecDeque::new(),
             pins: HashMap::new(),
+            hit_counts: HashMap::new(),
+            promote_admit_after: 2,
+            one_shot: HashSet::new(),
+            promote_inflight: HashSet::new(),
             l2_arena,
             stats: HitStats::default(),
         }
+    }
+
+    /// per-agent 准入阈值配置(1 = 关闭准入)。
+    pub fn with_promote_admit_after(mut self, n: u32) -> Self {
+        self.promote_admit_after = n.max(1);
+        self
+    }
+
+    pub fn hit_count(&self, h: &[u8]) -> u32 {
+        self.hit_counts.get(h).copied().unwrap_or(0)
+    }
+
+    pub fn is_one_shot(&self, h: &[u8]) -> bool {
+        self.one_shot.contains(h)
     }
 
     pub fn l2_placement(&self, h: &[u8]) -> Option<Placement> {
@@ -227,6 +273,9 @@ impl LocalTierEngine {
         self.l1_order.retain(|x| x.as_slice() != h);
         self.l2_order.retain(|x| x.as_slice() != h);
         self.pins.remove(h);
+        self.one_shot.remove(h);
+        self.promote_inflight.remove(h);
+        self.hit_counts.remove(h);
         self.note_l2_absent(h);
     }
 
@@ -275,6 +324,14 @@ impl LocalTierEngine {
     /// 对齐 `storage-layer.md`：写回不写 L1、不写 L3。L3 仅经 [`demote_l2_to_l3`]
     /// 或 L2 容量压力（迁移窗后稳态 XOR）。参考：SGLang 满块不写 host；
     /// Mooncake PutEnd 完成当前副本；Dynamo offload 链式 demote 而非 Put 双写。
+    ///
+    /// 写回时机由 agent 侧 `flush_every_n` 批量旋钮调节(见 `WritebackBatcher`):
+    /// N=1 每满块即 flush(eager,F4 窗口最小);N 大则攒批 + 请求屏障兜底(lazy,
+    /// ops ∝ 1/N,字节量不变,F4 窗口 ∝ N)。**备选暂不做(双轨注册)**:N 很大时
+    /// "flush 后才注册"会让 radix 生长滞后 N 个块——备选方案是把注册拆两轨,
+    /// 易失位置(块已在 L0,字节真在)即满即注册、durable 位置 flush 后补注册,
+    /// 各说各的真话,不破坏 durable-first 不变量;N=2–4 时滞后仅 5–10s 且多轮
+    /// 复用发生在请求屏障之后,损失可忽略,故暂缓。
     ///
     /// `ensure_l2_cap` 失败时**回滚本窗全部 L2→L3 demote**（含本次 hash 被挤到 L3
     /// 的情况），避免 Err 仍 `is_settled` / 污染 L3。
@@ -404,6 +461,16 @@ impl LocalTierEngine {
         } else {
             AccessKind::Miss
         };
+        if kind != AccessKind::Miss {
+            *self.hit_counts.entry(h.to_vec()).or_insert(0) += 1;
+            // one-shot 毕业后又达阈值 → 摘标记转热块待遇(不再驱逐最优先)。
+            if kind == AccessKind::L0Hit
+                && self.one_shot.contains(h)
+                && self.hit_count(h) >= self.promote_admit_after
+            {
+                self.one_shot.remove(h);
+            }
+        }
         self.stats.record(kind);
         kind
     }
@@ -487,6 +554,7 @@ impl LocalTierEngine {
         }
         let n = self.l0.remove(h).map(|b| b.len() as u64).unwrap_or(0);
         self.l0_order.retain(|x| x.as_slice() != h);
+        self.one_shot.remove(h);
         Ok(n)
     }
 
@@ -498,14 +566,75 @@ impl LocalTierEngine {
         self.promote_to_l0(h)
     }
 
+    /// 带频率准入的 promote(决策 B:用完留不留)。
+    ///
+    /// hit_count ≥ `promote_admit_after` → 热块待遇(正常 LRU 位,未来预放置候选);
+    /// < 阈值 → **one-shot**:照样进 L0(GPU 约束:attention 只读 HBM,不存在
+    /// Mooncake 式"不搬直读"),但驱逐最优先、读完不挤兑热块——准入砍的是
+    /// 一次性块引发的级联循环,不是 promote 本身。
+    /// 对照:SGLang `write_through_selective`(hit_count≥2 才回写 L3)、
+    /// Mooncake `FileStorage` CountMinSketch(DRAM↔SSD 提升频率门槛)。
+    pub fn promote_to_l0_admitted(&mut self, h: &[u8]) -> Result<(u64, TierSideEffects), String> {
+        let hot = self.hit_count(h) >= self.promote_admit_after;
+        let r = self.promote_to_l0(h)?;
+        if hot {
+            self.one_shot.remove(h);
+        } else {
+            self.one_shot.insert(h.to_vec());
+        }
+        Ok(r)
+    }
+
+    /// 异步 promote 第一段:登记 in-flight(**去重**),不搬字节。
+    ///
+    /// 形态对齐 SGLang `prefetch_from_storage`(调度时发起、与排队/batching 重叠):
+    /// agent 在 dispatch 收到预取清单即 `begin_promote`,`prepare_step` 只
+    /// `finish_promote` 等残余。同块在途重复发起返回 [`BeginPromote::AlreadyInFlight`]
+    /// (Dynamo offload 去重同款)。单进程原型两段式模拟;生产 begin 发起 RDMA
+    /// 读、finish 收完成事件。
+    pub fn begin_promote(&mut self, h: &[u8]) -> BeginPromote {
+        if self.l0.contains_key(h) {
+            return BeginPromote::AlreadyL0;
+        }
+        if self.get(h).is_none() {
+            return BeginPromote::Missing;
+        }
+        if !self.promote_inflight.insert(h.to_vec()) {
+            return BeginPromote::AlreadyInFlight;
+        }
+        BeginPromote::Started
+    }
+
+    /// 异步 promote 第二段:实际搬运(走准入判定)+ 清 in-flight 登记。
+    /// 未经 begin 直接调用也可(等价同步 promote)。
+    pub fn finish_promote(&mut self, h: &[u8]) -> Result<(u64, TierSideEffects), String> {
+        self.promote_inflight.remove(h);
+        self.promote_to_l0_admitted(h)
+    }
+
+    /// 在途 promote 数(探针/测试)。
+    pub fn promote_inflight_len(&self) -> usize {
+        self.promote_inflight.len()
+    }
+
     pub fn evict_l0_pressure(&mut self) -> Result<Option<Vec<u8>>, String> {
         if self.caps.l0 == 0 || self.l0.len() < self.caps.l0 {
             return Ok(None);
         }
+        // one-shot 优先:冷块 promote 后先被驱逐,不挤兑热块(准入砍级联的落点)。
         let victim = self
             .l0_order
             .iter()
-            .find(|h| self.pin_count(h) == 0 && self.has_durable_backing(h.as_slice()))
+            .find(|h| {
+                self.one_shot.contains(h.as_slice())
+                    && self.pin_count(h) == 0
+                    && self.has_durable_backing(h.as_slice())
+            })
+            .or_else(|| {
+                self.l0_order
+                    .iter()
+                    .find(|h| self.pin_count(h) == 0 && self.has_durable_backing(h.as_slice()))
+            })
             .cloned()
             .ok_or_else(|| {
                 "evict_l0: no durable unpinned victim (pin/writeback first)".to_string()
@@ -759,5 +888,77 @@ mod tests {
         assert!(!e.l3_present(b"w"), "w not left on L3");
         assert_eq!(e.get(b"w"), Some(b"W".as_slice()));
         assert_eq!(e.l2_order, prior_order);
+    }
+
+    #[test]
+    fn hit_count_only_on_hits() {
+        let mut e = LocalTierEngine::new();
+        e.put_durable(b"a", b"A").unwrap();
+        assert_eq!(e.probe(b"a"), AccessKind::L2Hit);
+        assert_eq!(e.hit_count(b"a"), 1);
+        e.probe(b"nobody");
+        assert_eq!(e.hit_count(b"nobody"), 0, "miss 不计 hit_count");
+    }
+
+    #[test]
+    fn admitted_promote_marks_cold_one_shot_and_graduates() {
+        let mut e = LocalTierEngine::with_caps(TierCaps {
+            l0: 4,
+            l1: 8,
+            l2: 8,
+        });
+        e.put_durable(b"cold", b"C").unwrap();
+        e.put_durable(b"hot", b"H").unwrap();
+        // cold: 首次命中(hit_count=1 < 2)→ one-shot。
+        e.probe(b"cold");
+        e.promote_to_l0_admitted(b"cold").unwrap();
+        assert!(e.is_one_shot(b"cold"));
+        // hot: 两次命中达阈值 → 热块待遇。
+        e.probe(b"hot");
+        e.probe(b"hot");
+        e.promote_to_l0_admitted(b"hot").unwrap();
+        assert!(!e.is_one_shot(b"hot"));
+        // one-shot 毕业后(再命中达阈值)→ 摘标记。
+        e.probe(b"cold"); // L0 hit,hit_count=2
+        assert!(!e.is_one_shot(b"cold"), "达阈值后 L0 命中应毕业");
+    }
+
+    #[test]
+    fn one_shot_evicted_before_hot() {
+        let mut e = LocalTierEngine::with_caps(TierCaps {
+            l0: 2,
+            l1: 8,
+            l2: 8,
+        });
+        e.put_durable(b"cold", b"C").unwrap();
+        e.put_durable(b"hot", b"H").unwrap();
+        e.probe(b"cold");
+        e.promote_to_l0_admitted(b"cold").unwrap(); // one-shot
+        e.probe(b"hot");
+        e.probe(b"hot");
+        e.promote_to_l0_admitted(b"hot").unwrap(); // hot
+                                                   // 第三个块挤占 L0(cap=2):one-shot 的 cold 先被逐,即使 hot 更久没碰。
+        e.put_durable(b"new", b"N").unwrap();
+        e.promote_to_l0(b"new").unwrap();
+        assert_eq!(e.local_tier(b"cold"), Some(LocalTier::L1), "one-shot 先逐");
+        assert_eq!(e.local_tier(b"hot"), Some(LocalTier::L0), "热块留住");
+    }
+
+    #[test]
+    fn async_promote_dedups_inflight() {
+        let mut e = LocalTierEngine::new();
+        e.put_durable(b"a", b"A").unwrap();
+        assert_eq!(e.begin_promote(b"a"), BeginPromote::Started);
+        assert_eq!(
+            e.begin_promote(b"a"),
+            BeginPromote::AlreadyInFlight,
+            "同块在途不重复发起"
+        );
+        assert_eq!(e.promote_inflight_len(), 1);
+        e.finish_promote(b"a").unwrap();
+        assert_eq!(e.promote_inflight_len(), 0);
+        assert_eq!(e.local_tier(b"a"), Some(LocalTier::L0));
+        assert_eq!(e.begin_promote(b"a"), BeginPromote::AlreadyL0);
+        assert_eq!(e.begin_promote(b"nobody"), BeginPromote::Missing);
     }
 }

@@ -44,6 +44,9 @@ type pqRequest struct {
 	cancel    context.CancelCauseFunc
 	err       error // exec 返回值;执行 goroutine 写,经 finished chan 同步后读
 	abandoned bool  // 客户端已在途取消(mu 保护):finishOne 不重排不投递
+
+	enqueuedAt time.Time     // Submit 入队时刻(P7.1 队列等待探针)
+	queueWait  time.Duration // 出队启动时回填;finishOne 收入 waitSamples
 }
 
 // PQScheduler 优先级调度器。Run 驱动执行;Submit 提交并等待结果。
@@ -59,6 +62,8 @@ type PQScheduler struct {
 
 	notify   chan struct{} // 队列/背压变化信号(buffered 1)
 	finished chan *pqRequest
+
+	waitSamples []time.Duration // P7.1:已完成请求的队列等待采样(环形,上限 4096)
 }
 
 func NewPQScheduler(maxInFlight int, bpTTL time.Duration) *PQScheduler {
@@ -84,10 +89,11 @@ func (s *PQScheduler) Submit(
 	exec func(ctx context.Context) error,
 ) error {
 	req := &pqRequest{
-		priority: priority,
-		model:    model,
-		exec:     exec,
-		done:     make(chan error, 1),
+		priority:   priority,
+		model:      model,
+		exec:       exec,
+		done:       make(chan error, 1),
+		enqueuedAt: time.Now(),
 	}
 	s.mu.Lock()
 	s.seq++
@@ -123,6 +129,13 @@ func (s *PQScheduler) SetMaxInFlight(n int) {
 	s.maxInFlight = n
 	s.mu.Unlock()
 	s.signal()
+}
+
+// WaitSamples 返回已完成请求的队列等待采样副本(P7.1 探针)。
+func (s *PQScheduler) WaitSamples() []time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Duration(nil), s.waitSamples...)
 }
 
 // SetBackpressure 标记 model 背压(池触硬配额上传),now+ttl 后自动解除。
@@ -230,6 +243,7 @@ func (s *PQScheduler) startEligible(ctx context.Context) {
 		req := s.queue[idx]
 		s.queue = append(s.queue[:idx], s.queue[idx+1:]...)
 		s.inFlight[req] = struct{}{}
+		req.queueWait = now.Sub(req.enqueuedAt)
 		req.execCtx, req.cancel = context.WithCancelCause(ctx)
 		go func() {
 			req.err = req.exec(req.execCtx)
@@ -252,15 +266,25 @@ func (s *PQScheduler) finishOne(req *pqRequest) {
 	s.mu.Unlock()
 
 	if abandoned {
-		return // 无人等待:不重排(防僵尸 Generate)、不投递
+		return // 无人等待:不重排(防僵尸 Generate)、不投递、不采样
 	}
 	if req.err != nil && errors.Is(context.Cause(req.execCtx), errPreempted) {
 		s.mu.Lock()
+		// 重排重新计时:queueWait 只量「本次入队 → 启动」,不把前次执行算进排队;
+		// 被抢占者不入 waitSamples(样本语义 = 完成请求的排队等待,抢占不是完成)。
+		req.enqueuedAt = time.Now()
 		s.insertLocked(req)
 		s.mu.Unlock()
 		s.signal()
 		return
 	}
+	s.mu.Lock()
+	// 环形采样:满了丢弃最旧(探针只看近期分布)
+	if len(s.waitSamples) >= 4096 {
+		s.waitSamples = s.waitSamples[1:]
+	}
+	s.waitSamples = append(s.waitSamples, req.queueWait)
+	s.mu.Unlock()
 	req.done <- req.err
 }
 

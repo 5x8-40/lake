@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	lakepb "github.com/chengda-wu/lake/go/pb"
@@ -133,18 +135,57 @@ type nodeRegistry struct {
 	draining map[string]bool
 	seq      int // 已分配的最大节点序号(worker-N)
 	rr       int // pick 轮询游标
+	// P7.6(B1):per-node 在途请求数(atomic,免锁读)——亲和护栏与加权 HRW
+	// 的负载信号。注意区别于 loadsync.go 的出站上报:那是 Router→agent 的
+	// 集群级遥测,这里的计数是选路热路径的即时本地信号。
+	inflight map[string]*atomic.Int64
 }
 
 func newNodeRegistry(initial ...string) *nodeRegistry {
-	r := &nodeRegistry{draining: make(map[string]bool)}
+	r := &nodeRegistry{draining: make(map[string]bool), inflight: make(map[string]*atomic.Int64)}
 	for _, id := range initial {
 		r.ready = append(r.ready, id)
+		r.inflight[id] = &atomic.Int64{}
 		var n int
 		if _, err := fmt.Sscanf(id, "worker-%d", &n); err == nil && n > r.seq {
 			r.seq = n
 		}
 	}
 	return r
+}
+
+// readyIDs ready 节点有序快照(排序保证亲和扫描/HRW tie-break 与池侧
+// rust/controlplane ready_nodes 同序,跨语言确定性一致)。
+func (r *nodeRegistry) readyIDs() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := append([]string(nil), r.ready...)
+	sort.Strings(out)
+	return out
+}
+
+// incInFlight/decInFlight 在途记账:选路即占 +1、请求完成 -1(含排队与
+// 重试在途;server.go handleChatCompletions,非 dispatch 边界)
+// (调用方 defer);draining 节点在途照计(跑完才摘除)。
+func (r *nodeRegistry) incInFlight(id string) { r.slot(id).Add(1) }
+func (r *nodeRegistry) decInFlight(id string) { r.slot(id).Add(-1) }
+
+func (r *nodeRegistry) inFlight(id string) int64 { return r.slot(id).Load() }
+
+func (r *nodeRegistry) slot(id string) *atomic.Int64 {
+	r.mu.RLock()
+	s, ok := r.inflight[id]
+	r.mu.RUnlock()
+	if ok {
+		return s
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if s, ok = r.inflight[id]; !ok {
+		s = &atomic.Int64{}
+		r.inflight[id] = s
+	}
+	return s
 }
 
 // pick 轮询取 ready 节点(空表兜底 worker-0)——P6.5 review:扩缩后请求
@@ -222,13 +263,22 @@ func (r *nodeRegistry) lastReady() (string, bool) {
 	return r.ready[len(r.ready)-1], true
 }
 
-// hotSet 近期前缀命中块(有界 FIFO 去重)——P6.6:扩容新节点时 prefetch 热 KV
-// 到其 HBM(权重预加载/layer-async 在 Python coldstart;本结构管"预热什么")。
+// hotSet 命中观测窗(按服务节点分桶,有界 FIFO,窗内去重)——P7 收口(方案 Z):
+// Router 只作热度传感器,命中批量上报 CP(ReportHits → radix hit_count);
+// 扩容 warmup / 预放置的选块与发起归池侧,Router 不指挥放置。
+// P7.6(B2):命中按服务节点分桶——ReportHits.node_id = 命中流量的服务节点
+// (跟随流量放置的目标节点),不再笼统上报 "router"。
 type hotSet struct {
-	mu    sync.Mutex
-	cap   int
-	seen  map[string]struct{} // model\x00hex(hash)
-	order []*lakepb.KVBlockID // FIFO,超 cap 摘最旧
+	mu      sync.Mutex
+	cap     int
+	seen    map[string]struct{} // node\x00model\x00hash,窗内去重
+	pending []hotHit            // 自上次 drain 以来的新命中
+}
+
+// hotHit 一条待上报命中:服务节点 + 命中块。
+type hotHit struct {
+	node string
+	id   *lakepb.KVBlockID
 }
 
 func newHotSet(cap int) *hotSet {
@@ -238,31 +288,39 @@ func newHotSet(cap int) *hotSet {
 	return &hotSet{cap: cap, seen: make(map[string]struct{})}
 }
 
-func hotKey(id *lakepb.KVBlockID) string {
-	return id.GetModelId() + "\x00" + string(id.GetBlockHash())
+func hotKey(node string, id *lakepb.KVBlockID) string {
+	return node + "\x00" + id.GetModelId() + "\x00" + string(id.GetBlockHash())
 }
 
-func (h *hotSet) add(ids ...*lakepb.KVBlockID) {
+func (h *hotSet) add(node string, ids ...*lakepb.KVBlockID) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	for _, id := range ids {
-		k := hotKey(id)
+		k := hotKey(node, id)
 		if _, ok := h.seen[k]; ok {
 			continue
 		}
 		h.seen[k] = struct{}{}
-		h.order = append(h.order, id)
+		h.pending = append(h.pending, hotHit{node: node, id: id})
 	}
-	for len(h.order) > h.cap {
-		delete(h.seen, hotKey(h.order[0]))
-		h.order = h.order[1:]
+	// 窗有界:超 cap 摘最旧(未上报也丢——best-effort,CP 计数偏弱可容忍)。
+	for len(h.pending) > h.cap {
+		delete(h.seen, hotKey(h.pending[0].node, h.pending[0].id))
+		h.pending = h.pending[1:]
 	}
 }
 
-func (h *hotSet) snapshot() []*lakepb.KVBlockID {
+// drain 取出本窗命中并按服务节点分桶,开窗新窗。上报丢失不重发(best-effort)。
+func (h *hotSet) drain() map[string][]*lakepb.KVBlockID {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	return append([]*lakepb.KVBlockID(nil), h.order...)
+	out := make(map[string][]*lakepb.KVBlockID)
+	for _, hit := range h.pending {
+		out[hit.node] = append(out[hit.node], hit.id)
+	}
+	h.pending = nil
+	h.seen = make(map[string]struct{})
+	return out
 }
 
 func (r *nodeRegistry) drainingList() []string {
@@ -298,26 +356,12 @@ func (s *Server) applyScale(ctx context.Context, d ScaleDecision) error {
 		s.lastReadyLatencyMu.Unlock()
 		log.Printf("scale-out: %s ready (migrations=%d, ring_gen=%d)",
 			id, resp.GetMigrationCount(), resp.GetMap().GetGeneration())
-		// P6.6:KV prefetch——热块异步铺到新节点 HBM(不阻塞 Ready;
-		// 真实字节搬运归 P5,此处走 agent PlaceBlocks 控制信令)。
-		if s.hot != nil {
-			if ids := s.hot.snapshot(); len(ids) > 0 {
-				go func() {
-					pctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-					defer cancel()
-					ack, err := s.agent.PlaceBlocks(pctx, &lakepb.PlaceBlocksRequest{
-						Ids: ids, TargetNodeId: id,
-					})
-					if err != nil {
-						log.Printf("scale-out prefetch %s: %v", id, err)
-					} else if !ack.GetOk() {
-						log.Printf("scale-out prefetch %s rejected: %s", id, ack.GetErr())
-					} else {
-						log.Printf("scale-out prefetch: %d hot blocks → %s", len(ids), id)
-					}
-				}()
-			}
-		}
+		// P7 收口(方案 Z):新节点 warmup 由池侧自主决策发起——CP 在
+		// JoinShardNode 后按 hit_count(ReportHits 喂入)选热块并下发
+		// PlaceBlocks;Router 不指挥放置,只持续上报命中(autoscaleTick 尾部)。
+		// P7.4 注:原 Router 侧 prefetch 时延探针随归属迁移移除——warmup
+		// 时延观测归池侧(CP warmup 计划 + P5 真字节路径),冷启动瀑布的
+		// KV 段改由池侧埋点(见 bench/coldstart_waterfall.py 口径注记)。
 	case DecideScaleIn:
 		victim, ok := s.nodes.lastReady()
 		if !ok {
@@ -373,6 +417,13 @@ func (s *Server) reapDraining(ctx context.Context) {
 // autoscaleTick 一个评估周期:先收割 draining,再按指标决策执行。
 func (s *Server) autoscaleTick(ctx context.Context) {
 	s.reapDraining(ctx)
+	// P7 收口(方案 Z):命中观测批量上报 CP(radix hit_count),供池侧
+	// 扩容 warmup / 未来预放置选块;Router 只报告、不指挥放置。
+	// 先于 applyScale 上报:同 tick 的命中计数能喂进本次 Join 的 warmup_plan。
+	s.flushHotHits(ctx)
+	if !s.cfg.Autoscale {
+		return // 命中上报不随扩缩容开关;评估/执行才被开关门控
+	}
 	snap := s.sched.LoadSnapshot("router")
 	m := MetricsSnapshot{
 		QueueLen:     int(snap.GetQueueLen()),
@@ -389,7 +440,24 @@ func (s *Server) autoscaleTick(ctx context.Context) {
 	}
 }
 
-// runAutoscale 后台评估循环(LAKE_AUTOSCALE=1 时由 New 启动)。
+// flushHotHits 本窗命中按服务节点分桶批量上报 CP(best-effort:失败不重发,
+// CP 计数偏弱可容忍)。NodeId = 命中流量的服务节点(P7.6 B2 跟随流量放置目标)。
+func (s *Server) flushHotHits(ctx context.Context) {
+	if s.hot == nil {
+		return
+	}
+	byNode := s.hot.drain()
+	for node, ids := range byNode {
+		if node == "" || len(ids) == 0 {
+			continue
+		}
+		if _, err := s.cp.ReportHits(ctx, &lakepb.ReportHitsRequest{NodeId: node, Ids: ids}); err != nil {
+			log.Printf("report hits: %v", err)
+		}
+	}
+}
+
+// runAutoscale 后台周期循环(New 无条件启动):命中上报常做,扩缩容评估/执行由 Config.Autoscale 门控。
 func (s *Server) runAutoscale(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()

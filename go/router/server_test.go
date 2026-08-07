@@ -55,6 +55,7 @@ type fakeCP struct {
 	joinShardNode   func(context.Context, *lakepb.JoinShardNodeRequest) (*lakepb.JoinShardNodeResponse, error)
 	drainShardNode  func(context.Context, *lakepb.DrainShardNodeRequest) (*lakepb.DrainShardNodeResponse, error)
 	removeShardNode func(context.Context, *lakepb.RemoveShardNodeRequest) (*lakepb.Ack, error)
+	reportHits      func(context.Context, *lakepb.ReportHitsRequest) (*lakepb.Ack, error)
 }
 
 func (f fakeCP) LookupPrefix(ctx context.Context, req *lakepb.LookupPrefixRequest) (*lakepb.LookupPrefixResponse, error) {
@@ -94,6 +95,13 @@ func (f fakeCP) RemoveShardNode(ctx context.Context, req *lakepb.RemoveShardNode
 		return nil, status.Error(codes.Unimplemented, "not implemented")
 	}
 	return f.removeShardNode(ctx, req)
+}
+
+func (f fakeCP) ReportHits(ctx context.Context, req *lakepb.ReportHitsRequest) (*lakepb.Ack, error) {
+	if f.reportHits == nil {
+		return nil, status.Error(codes.Unimplemented, "not implemented")
+	}
+	return f.reportHits(ctx, req)
 }
 
 // dialFakeCP 起 bufconn 进程内 CP,返回接好客户端的 Server。

@@ -19,6 +19,7 @@ mod authority;
 mod checkpoint;
 mod defrag;
 mod hash_chain;
+mod placement;
 mod quota;
 mod reconcile;
 mod shard;
@@ -86,6 +87,26 @@ fn admit_keys_from_request(req: &RegisterBlocksRequest) -> Result<AdmitKeys, Str
 /// 断线订阅者的 gap 由 `view::ViewLog`(replay buffer)兜底。
 pub const DEFAULT_VIEW_BROADCAST_CAP: usize = 256;
 
+/// P7 收口:单次扩容 warmup 选块上限(对齐 Router 热集窗口量级)。
+pub const DEFAULT_WARMUP_K: usize = 256;
+
+/// 池侧 warmup 出口(方案 Z:扩容 warmup 由池自主发起,Router 只经
+/// `ReportHits` 报告命中、不指挥放置)。生产接目标节点 agent `PlaceBlocks`
+/// 客户端;原型默认日志实现(真实字节搬运归 P5),测试注入记录器。
+pub trait WarmupSink: Send + Sync {
+    fn warm(&self, target_node_id: &str, ids: Vec<KvBlockId>);
+}
+
+struct LogWarmup;
+impl WarmupSink for LogWarmup {
+    fn warm(&self, target_node_id: &str, ids: Vec<KvBlockId>) {
+        eprintln!(
+            "warmup plan: {} hot blocks → {target_node_id} (bytes P5)",
+            ids.len()
+        );
+    }
+}
+
 #[derive(Clone)]
 pub struct ControlPlane {
     /// P6.1: `Mutex → RwLock`——lookup/locate/admit/defrag/shard_map 读路径
@@ -98,6 +119,8 @@ pub struct ControlPlane {
     authority_poisoned_reported: Arc<AtomicBool>,
     /// P6.2: SubscribeView 直播通道(写 handler 提交事件后广播)。
     view_tx: broadcast::Sender<ViewUpdate>,
+    /// P7 收口:扩容 warmup 池侧出口。
+    warmup_sink: Arc<dyn WarmupSink>,
 }
 
 impl Default for ControlPlane {
@@ -109,6 +132,7 @@ impl Default for ControlPlane {
             background_paused: Arc::new(Mutex::new(false)),
             authority_poisoned_reported: Arc::new(AtomicBool::new(false)),
             view_tx,
+            warmup_sink: Arc::new(LogWarmup),
         }
     }
 }
@@ -126,7 +150,13 @@ impl ControlPlane {
             background_paused: Arc::new(Mutex::new(false)),
             authority_poisoned_reported: Arc::new(AtomicBool::new(false)),
             view_tx,
+            warmup_sink: Arc::new(LogWarmup),
         }
+    }
+
+    pub fn with_warmup_sink(mut self, sink: Arc<dyn WarmupSink>) -> Self {
+        self.warmup_sink = sink;
+        self
     }
 
     pub fn background_paused(&self) -> bool {
@@ -335,8 +365,26 @@ impl ControlPlaneService for ControlPlane {
         let mut auth = self
             .write_authority()
             .map_err(Self::lock_authority_status)?;
+        // P7.6(B2-a):HRW 预放置需链所属命名空间,register 移动 blocks 前取出。
+        let ns_identity = req
+            .blocks
+            .iter()
+            .find_map(|m| m.id.as_ref())
+            .map(|i| (i.model_id.clone(), i.revision.clone(), i.pool_kind));
         let result = auth.register(&req.node_id, &req.prefix_hashes, req.blocks);
+        // P7.6(B2-a):register 成功后按 HRW(链锚点, ready 节点集)预放置
+        // (稳态常见情形=生产节点即家节点,计划为空零动作)。
+        let preplace = if matches!(result, Ok(RegisterStatus::Accepted)) {
+            ns_identity.and_then(|(mid, rev, pk)| {
+                auth.preplace_on_register(&mid, &rev, pk, &req.prefix_hashes)
+            })
+        } else {
+            None
+        };
         self.commit_and_broadcast(&mut auth);
+        if let Some((home, plan)) = preplace {
+            self.warmup_sink.warm(&home, plan);
+        }
         match result {
             Ok(RegisterStatus::Accepted) => Ok(Response::new(Ack {
                 ok: true,
@@ -709,6 +757,12 @@ impl ControlPlaneService for ControlPlane {
         match auth.join_shard_node(&req.node_id, req.vnode_count) {
             Ok((map, migrations)) => {
                 let migration_count = migrations.len() as u32;
+                // P7 收口(方案 Z):新节点 warmup 由池侧按 hit_count 自主选块
+                // 发起;Router 只经 ReportHits 报告命中,不指挥放置。
+                let plan = auth.warmup_plan(&req.node_id, DEFAULT_WARMUP_K);
+                if !plan.is_empty() {
+                    self.warmup_sink.warm(&req.node_id, plan);
+                }
                 Ok(Response::new(JoinShardNodeResponse {
                     map: Some(map),
                     migrations,
@@ -756,6 +810,29 @@ impl ControlPlaneService for ControlPlane {
                 err: e,
             })),
         }
+    }
+
+    /// P7 收口:命中上报 → radix hit_count(供 warmup 选块/预放置)。
+    /// best-effort:未知块跳过,不报错;不进 ViewEvent。
+    /// P7.6(B2-b):per-(block,node) 计数 + 跟随流量放置(过阈值经 WarmupSink
+    /// 下发,滞回不重复;`node_id` = 命中流量的服务节点)。
+    async fn report_hits(
+        &self,
+        request: Request<ReportHitsRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let req = request.into_inner();
+        let mut auth = self
+            .write_authority()
+            .map_err(Self::lock_authority_status)?;
+        let plans = auth.report_hits(&req.node_id, &req.ids);
+        for (node, plan) in plans {
+            self.warmup_sink.warm(&node, plan);
+        }
+        Ok(Response::new(Ack {
+            ok: true,
+            err: String::new(),
+            backpressure: None,
+        }))
     }
 
     async fn remove_shard_node(
@@ -2563,6 +2640,376 @@ mod tests {
             .iter()
             .all(|m| m.from_node == "n0" || m.from_node == "n1"));
         assert!(migs.iter().all(|m| !m.push_l2_first));
+    }
+
+    /// P7 收口(方案 Z):ReportHits 喂 hit_count → warmup_plan 按热度选块,
+    /// 已在目标 L0 的块排除;未知块上报跳过(best-effort)。
+    #[test]
+    fn p7_report_hits_feeds_warmup_plan() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"hot", b"cold"]);
+        auth.register("n0", &full, vec![meta("m", b"hot"), meta("m", b"cold")])
+            .unwrap();
+        let id_of = |h: &[u8]| KvBlockId {
+            model_id: "m".into(),
+            block_hash: h.to_vec(),
+            pool_kind: PoolKind::Target as i32,
+            scope: "public".into(),
+            revision: String::new(),
+        };
+        auth.report_hits(
+            "router-0",
+            &[
+                id_of(b"hot"),
+                id_of(b"hot"),
+                id_of(b"hot"),
+                id_of(b"cold"),
+                id_of(b"ghost"), // 未注册 → 跳过
+            ],
+        );
+        let key = NamespaceKey::new("m", "");
+        assert_eq!(auth.hit_count(&key, PoolKind::Target as i32, b"hot"), 3);
+        assert_eq!(auth.hit_count(&key, PoolKind::Target as i32, b"cold"), 1);
+        assert_eq!(auth.hit_count(&key, PoolKind::Target as i32, b"ghost"), 0);
+
+        let plan = auth.warmup_plan("n1", 10);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].block_hash, b"hot".to_vec(), "按 hit_count 降序");
+
+        // hot 已在 n0 L0 → warm 到 n0 时排除。
+        auth.publish_location(
+            "m",
+            "",
+            PoolKind::Target as i32,
+            b"hot",
+            Tier::L0,
+            "n0",
+            true,
+        )
+        .unwrap();
+        let plan0 = auth.warmup_plan("n0", 10);
+        assert_eq!(plan0.len(), 1);
+        assert_eq!(plan0[0].block_hash, b"cold".to_vec());
+    }
+
+    /// P7.6(B2-b):跟随流量——per-(block,node) 计数过阈值触发放置,滞回不重复。
+    #[test]
+    fn p76_follow_traffic_threshold_and_hysteresis() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"solo"]);
+        auth.register("n0", &full, vec![meta("m", b"solo")])
+            .unwrap();
+        let id_of = |h: &[u8]| KvBlockId {
+            model_id: "m".into(),
+            block_hash: h.to_vec(),
+            pool_kind: PoolKind::Target as i32,
+            scope: "public".into(),
+            revision: String::new(),
+        };
+        let key = NamespaceKey::new("m", "");
+
+        // 第 1 次命中:未达阈值(2)→ 无计划。
+        let plans = auth.report_hits("n5", &[id_of(b"solo")]);
+        assert!(plans.is_empty());
+        assert_eq!(
+            auth.hit_count_on(&key, PoolKind::Target as i32, b"solo", "n5"),
+            1
+        );
+
+        // 第 2 次命中:达阈值 → 对 n5 触发放置。
+        let plans = auth.report_hits("n5", &[id_of(b"solo")]);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].0, "n5");
+        assert_eq!(plans[0].1.len(), 1);
+        assert_eq!(plans[0].1[0].block_hash, b"solo".to_vec());
+
+        // 滞回:继续命中不重复下发。
+        let plans = auth.report_hits("n5", &[id_of(b"solo")]);
+        assert!(plans.is_empty(), "已下发过 (block,node) 不重复触发");
+        assert_eq!(
+            auth.hit_count_on(&key, PoolKind::Target as i32, b"solo", "n5"),
+            3
+        );
+
+        // 同一块在另一节点独立计数/触发。
+        let plans = auth.report_hits("n7", &[id_of(b"solo")]);
+        assert!(plans.is_empty());
+        let plans = auth.report_hits("n7", &[id_of(b"solo")]);
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].0, "n7");
+        assert_eq!(auth.hit_count(&key, PoolKind::Target as i32, b"solo"), 5);
+    }
+
+    /// P7.6(B2-b):前缀祖先共置——放置块 c 时把未放置的祖先链 a、b 一并放
+    /// (D-direct 需要整链),根→叶序。
+    #[test]
+    fn p76_follow_traffic_colocates_ancestors() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"a", b"b", b"c"]);
+        auth.register(
+            "n0",
+            &full,
+            vec![meta("m", b"a"), meta("m", b"b"), meta("m", b"c")],
+        )
+        .unwrap();
+        let id_of = |h: &[u8]| KvBlockId {
+            model_id: "m".into(),
+            block_hash: h.to_vec(),
+            pool_kind: PoolKind::Target as i32,
+            scope: "public".into(),
+            revision: String::new(),
+        };
+        // a 已在 n5 L0 → 共置只补 b、c。
+        auth.publish_location("m", "", PoolKind::Target as i32, b"a", Tier::L0, "n5", true)
+            .unwrap();
+
+        let plans = auth.report_hits("n5", &[id_of(b"c")]);
+        assert!(plans.is_empty());
+        let plans = auth.report_hits("n5", &[id_of(b"c")]);
+        assert_eq!(plans.len(), 1);
+        let hashes: Vec<Vec<u8>> = plans[0].1.iter().map(|i| i.block_hash.clone()).collect();
+        assert_eq!(
+            hashes,
+            vec![b"b".to_vec(), b"c".to_vec()],
+            "祖先共置,跳过已在 n5 L0 的 a,根→叶序"
+        );
+    }
+
+    /// P7.6(B2-b):块已在该节点 L0 → 不触发(且不标记,未来被驱逐可自愈)。
+    #[test]
+    fn p76_follow_traffic_skips_already_l0() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"solo"]);
+        auth.register("n0", &full, vec![meta("m", b"solo")])
+            .unwrap();
+        auth.publish_location(
+            "m",
+            "",
+            PoolKind::Target as i32,
+            b"solo",
+            Tier::L0,
+            "n5",
+            true,
+        )
+        .unwrap();
+        let id = KvBlockId {
+            model_id: "m".into(),
+            block_hash: b"solo".to_vec(),
+            pool_kind: PoolKind::Target as i32,
+            scope: "public".into(),
+            revision: String::new(),
+        };
+        for _ in 0..3 {
+            let plans = auth.report_hits("n5", std::slice::from_ref(&id));
+            assert!(plans.is_empty(), "已在 L0 不重复放");
+        }
+        let key = NamespaceKey::new("m", "");
+        assert_eq!(
+            auth.hit_count_on(&key, PoolKind::Target as i32, b"solo", "n5"),
+            3
+        );
+    }
+
+    /// P7.6(B2-a):HRW 预放置——空环无计划;ready 节点集确定家节点;
+    /// 链不在家节点 L0 的块全量预放;滞回不重复;已在家节点 L0 零动作。
+    #[test]
+    fn p76_preplace_on_register_hrw_home() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"a", b"b"]);
+        let pk = PoolKind::Target as i32;
+
+        // 空环 → None。
+        assert!(auth.preplace_on_register("m", "", pk, &full).is_none());
+
+        auth.register("n0", &full, vec![meta("m", b"a"), meta("m", b"b")])
+            .unwrap();
+        auth.join_shard_node("n0", 16).unwrap();
+        // 唯一 ready 节点 → 家节点必为 n0;块仅 L2 → 整链预放。
+        let (home, plan) = auth.preplace_on_register("m", "", pk, &full).unwrap();
+        assert_eq!(home, "n0");
+        let hashes: Vec<Vec<u8>> = plan.iter().map(|i| i.block_hash.clone()).collect();
+        assert_eq!(hashes, vec![b"a".to_vec(), b"b".to_vec()]);
+
+        // 滞回:重复调用不再产生计划。
+        assert!(auth.preplace_on_register("m", "", pk, &full).is_none());
+
+        // 新链已在家节点 L0(生产节点==家节点的稳态)→ 零动作。
+        let full2 = prefix(&[b"x"]);
+        let mut meta_x = meta("m", b"x");
+        meta_x.locations.push(Location {
+            tier: Tier::L0 as i32,
+            node_id: "n0".into(),
+            segment_id: 1,
+            offset: 0,
+        });
+        auth.register("n0", &full2, vec![meta_x]).unwrap();
+        assert!(auth.preplace_on_register("m", "", pk, &full2).is_none());
+    }
+
+    /// P7.6(B2-b):ReportHits handler 接线——过阈值经 WarmupSink 下发,
+    /// 滞回后不再下发。
+    #[tokio::test]
+    async fn p76_report_hits_handler_follow_traffic_warm() {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct RecSink {
+            calls: StdMutex<Vec<(String, Vec<Vec<u8>>)>>,
+        }
+        impl WarmupSink for RecSink {
+            fn warm(&self, target: &str, ids: Vec<KvBlockId>) {
+                self.calls.lock().unwrap().push((
+                    target.to_string(),
+                    ids.into_iter().map(|i| i.block_hash).collect(),
+                ));
+            }
+        }
+
+        let sink = Arc::new(RecSink::default());
+        let cp = ControlPlane::default().with_warmup_sink(sink.clone());
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            let full = prefix(&[b"a", b"c"]);
+            auth.register("n0", &full, vec![meta("m", b"a"), meta("m", b"c")])
+                .unwrap();
+        }
+        let id_of = |h: &[u8]| KvBlockId {
+            model_id: "m".into(),
+            block_hash: h.to_vec(),
+            pool_kind: PoolKind::Target as i32,
+            scope: "public".into(),
+            revision: String::new(),
+        };
+        for _ in 0..2 {
+            cp.report_hits(Request::new(ReportHitsRequest {
+                node_id: "n5".into(),
+                ids: vec![id_of(b"c")],
+            }))
+            .await
+            .unwrap();
+        }
+        // 祖先共置:a、c 一并下发到 n5。
+        {
+            let calls = sink.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert_eq!(calls[0].0, "n5");
+            assert_eq!(calls[0].1, vec![b"a".to_vec(), b"c".to_vec()]);
+        }
+        // 滞回:再次过阈值不下发。
+        for _ in 0..2 {
+            cp.report_hits(Request::new(ReportHitsRequest {
+                node_id: "n5".into(),
+                ids: vec![id_of(b"c")],
+            }))
+            .await
+            .unwrap();
+        }
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "滞回:不重复下发");
+    }
+
+    /// P7.6(B2-a):RegisterBlocks handler 接线——成功后按 HRW 对家节点预放置。
+    #[tokio::test]
+    async fn p76_register_handler_hrw_preplace() {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct RecSink {
+            calls: StdMutex<Vec<(String, Vec<Vec<u8>>)>>,
+        }
+        impl WarmupSink for RecSink {
+            fn warm(&self, target: &str, ids: Vec<KvBlockId>) {
+                self.calls.lock().unwrap().push((
+                    target.to_string(),
+                    ids.into_iter().map(|i| i.block_hash).collect(),
+                ));
+            }
+        }
+
+        let sink = Arc::new(RecSink::default());
+        let cp = ControlPlane::default().with_warmup_sink(sink.clone());
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            // 环先就位(ready 节点集 = [n0]),register 才有预放置目标。
+            auth.join_shard_node("n0", 16).unwrap();
+        }
+        let resp = cp
+            .register_blocks(Request::new(RegisterBlocksRequest {
+                node_id: "n0".into(),
+                prefix_hashes: prefix(&[b"a", b"b"]),
+                blocks: vec![meta("m", b"a"), meta("m", b"b")],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok, "register 应成功:{}", resp.err);
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "唯一 ready 节点 → 家节点 n0,整链预放");
+        assert_eq!(calls[0].0, "n0");
+        assert_eq!(calls[0].1, vec![b"a".to_vec(), b"b".to_vec()]);
+    }
+
+    /// P7 收口(方案 Z):join 后 warmup 由池侧自主发起(WarmupSink),
+    /// 不经 Router PlaceBlocks。
+    #[tokio::test]
+    async fn p7_join_triggers_pool_side_warmup() {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct RecSink {
+            calls: StdMutex<Vec<(String, Vec<Vec<u8>>)>>,
+        }
+        impl WarmupSink for RecSink {
+            fn warm(&self, target: &str, ids: Vec<KvBlockId>) {
+                self.calls.lock().unwrap().push((
+                    target.to_string(),
+                    ids.into_iter().map(|i| i.block_hash).collect(),
+                ));
+            }
+        }
+
+        let sink = Arc::new(RecSink::default());
+        let cp = ControlPlane::default().with_warmup_sink(sink.clone());
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            let full = prefix(&[b"hot"]);
+            auth.register("n0", &full, vec![meta("m", b"hot")]).unwrap();
+        }
+        cp.report_hits(Request::new(ReportHitsRequest {
+            node_id: "router-0".into(),
+            ids: vec![KvBlockId {
+                model_id: "m".into(),
+                block_hash: b"hot".to_vec(),
+                pool_kind: PoolKind::Target as i32,
+                scope: "public".into(),
+                revision: String::new(),
+            }],
+        }))
+        .await
+        .unwrap();
+
+        let resp = cp
+            .join_shard_node(Request::new(JoinShardNodeRequest {
+                node_id: "n1".into(),
+                vnode_count: 16,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(resp.ok);
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "join 应触发一次池侧 warmup");
+        assert_eq!(calls[0].0, "n1");
+        assert_eq!(calls[0].1, vec![b"hot".to_vec()]);
     }
 
     #[test]

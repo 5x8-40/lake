@@ -105,11 +105,20 @@ service ControlPlaneService {
   // P4.9:一致性哈希分片(F11 扩缩)。单测模拟环/最小迁移/Drain;真跨机字节迁移 → P5。
   rpc GetShardMap(GetShardMapRequest) returns (GetShardMapResponse);
   // 加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
+  //   P7 收口(方案 Z):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
+  //   hit_count 选热块 → agent PlaceBlocks),Router 只报告命中(ReportHits)、
+  //   不指挥放置。
   rpc JoinShardNode(JoinShardNodeRequest) returns (JoinShardNodeResponse);
   // 缩容:标记 Drain + 迁出计划 + 需先推 L2 的 block 列表(逻辑;字节迁移 P5)。
   rpc DrainShardNode(DrainShardNodeRequest) returns (DrainShardNodeResponse);
   // Drain 完成后从环移除(无剩余所有权时)。
   rpc RemoveShardNode(RemoveShardNodeRequest) returns (Ack);
+
+  // P7 收口:命中上报(best-effort 批量)。Router 在本地镜像上观测到前缀命中后
+  //   批量回传,CP 累计到 radix 节点 hit_count(SGLang TreeNode.hit_count 同款),
+  //   供 promote 准入 / 扩容 warmup 选块 / 未来方案 Z 预放置复用——一套热度信号。
+  //   丢失可容忍(计数偏弱),不进 ViewEvent。
+  rpc ReportHits(ReportHitsRequest) returns (Ack);
 }
 
 // =============================================================================
@@ -390,6 +399,11 @@ message DrainShardNodeResponse {
 }
 message RemoveShardNodeRequest {
   string node_id = 1;
+}
+
+message ReportHitsRequest {
+  string node_id = 1;                 // 上报方(Router 实例标识,观测来源)
+  repeated lake.KVBlockID ids = 2;    // 命中块(批量,去重由 CP 计数语义保证幂等)
 }
 
 message LookupPrefixResponse {

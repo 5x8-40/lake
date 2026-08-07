@@ -128,3 +128,92 @@ def run_layer_async(
         time_to_fully_ready=fully,
         layers_loaded_at_gate=serve_after_layers,
     )
+
+
+@dataclass
+class WaterfallSegment:
+    """冷启动瀑布的一段(P7.4 时延分解)。"""
+
+    name: str
+    start_s: float
+    end_s: float
+    critical: bool  # True = 在 serve-gate 关键路径上(决定「Ready 接受请求」)
+
+    @property
+    def dur_ms(self) -> float:
+        return (self.end_s - self.start_s) * 1000
+
+
+def waterfall_layer_async(
+    source: LayerSource,
+    serve_after_layers: int,
+    prefetcher: KVPrefetcher | None = None,
+    hot_blocks: Sequence[bytes] = (),
+    provision_s: float = 0.0,
+) -> tuple[ColdStartMetrics, list[WaterfallSegment]]:
+    """layer-async 冷启动的瀑布分解:provision → 权重逐层(gate 前/后)→ KV prefetch。
+
+    返回 (metrics, segments);segments 按时间序,critical 标记 serve-gate 关键路径
+    (SLO「扩容决策→Ready <10s」只被 critical 段消耗;KV prefetch 与 gate 后权重
+    在后台,不进 Ready 预算)。
+    """
+    if serve_after_layers <= 0 or serve_after_layers > source.num_layers:
+        raise ValueError("serve_after_layers 须在 (0, num_layers]")
+
+    segs: list[WaterfallSegment] = []
+    t0 = time.monotonic()
+    if provision_s > 0:
+        time.sleep(provision_s)  # mock 节点 provision(真实=调度/拉起进程)
+        segs.append(WaterfallSegment("provision", 0.0, time.monotonic() - t0, critical=True))
+
+    kv_done = threading.Event()
+    kv_span: list[float] = [0.0, 0.0]  # [start, end] 相对 t0
+
+    def _prefetch() -> None:
+        kv_span[0] = time.monotonic() - t0
+        if prefetcher is not None and hot_blocks:
+            prefetcher.prefetch(hot_blocks)
+        kv_span[1] = time.monotonic() - t0
+        kv_done.set()
+
+    pt = threading.Thread(target=_prefetch, daemon=True)
+    pt.start()
+
+    gate_at = 0.0
+    layer_start = time.monotonic() - t0
+    for i in range(source.num_layers):
+        source.load_layer(i)
+        now = time.monotonic() - t0
+        segs.append(WaterfallSegment(
+            f"weight_layer_{i}", layer_start, now, critical=(i + 1 <= serve_after_layers),
+        ))
+        layer_start = now
+        if i + 1 == serve_after_layers:
+            gate_at = now
+    weights_done = time.monotonic() - t0
+    pt.join()
+    if prefetcher is not None and hot_blocks:
+        segs.append(WaterfallSegment("kv_prefetch", kv_span[0], kv_span[1], critical=False))
+    # 无 prefetch 时 kv_warm 恒 0(ColdStartMetrics 字段语义),不取线程时间戳。
+    kv_warm_at = kv_span[1] if (prefetcher is not None and hot_blocks) else 0.0
+    fully = max(weights_done, kv_warm_at)
+    return ColdStartMetrics(
+        strategy="layer_async+kv_prefetch",
+        time_to_serve_gate=gate_at,
+        time_to_weights_done=weights_done,
+        time_to_kv_warm=kv_warm_at,
+        time_to_fully_ready=fully,
+        layers_loaded_at_gate=serve_after_layers,
+    ), segs
+
+
+def format_waterfall(segs: list[WaterfallSegment], total_s: float, width: int = 60) -> str:
+    """甘特式文本瀑布:每段一行,`#`=关键路径,`.`=后台。"""
+    lines = []
+    scale = width / max(total_s, 1e-9)
+    for s in segs:
+        a = int(s.start_s * scale)
+        b = max(a + 1, int(s.end_s * scale))
+        bar = "".join("#" if s.critical else "." for _ in range(b - a))
+        lines.append(f"{s.name:<18} |{' ' * a}{bar:<{width - a}}| {s.dur_ms:>8.1f}ms")
+    return "\n".join(lines)

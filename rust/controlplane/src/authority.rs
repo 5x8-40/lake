@@ -119,6 +119,14 @@ pub(crate) struct PoolView {
     pub(crate) inactive: Box<dyn InactiveIndex>,
     pub(crate) inactive_cap: usize,
     pub(crate) global_refs: HashMap<SequenceHash, i64>,
+    /// P7 收口:命中计数(ReportHits 喂入)。生产挂 radix 节点
+    /// (SGLang `TreeNode.hit_count` 同款),原型平铺按 flat hash;
+    /// 供扩容 warmup 选块 / 方案 Z 预放置复用。
+    /// P7.6(B2):扩成 per-(block,node)——识别「热在哪个节点」,
+    /// 供跟随流量预放置(`placement.rs`)。
+    pub(crate) hit_counts: HashMap<Vec<u8>, HashMap<String, u32>>,
+    /// P7.6(B2):放置滞回标记(已下发计划的 (block,node) 不重复下发)。
+    pub(crate) placement_marks: crate::placement::PlacementMarks,
     next_block_id: BlockId,
 }
 
@@ -141,6 +149,8 @@ impl PoolView {
             inactive,
             inactive_cap: cap,
             global_refs: HashMap::new(),
+            hit_counts: HashMap::new(),
+            placement_marks: crate::placement::PlacementMarks::default(),
             next_block_id: 1,
         }
     }
@@ -164,6 +174,10 @@ impl PoolView {
             self.global_refs.remove(&seq);
             if let Some(flat) = self.seq_to_flat.remove(&seq) {
                 self.by_flat.remove(&flat);
+                // 块生命周期终结,连带清理 P7.6 的 per-(block,node) 热度与
+                // 放置滞回标记(否则池侧两张表随 GC 单调泄漏)。
+                self.hit_counts.remove(&flat);
+                self.placement_marks.retain(|(f, _)| f != &flat);
                 removed.push((seq, flat));
             }
         }

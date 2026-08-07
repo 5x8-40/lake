@@ -6,7 +6,12 @@
 
 import time
 
-from lake.runtime.coldstart import run_layer_async, run_sequential
+from lake.runtime.coldstart import (
+    format_waterfall,
+    run_layer_async,
+    run_sequential,
+    waterfall_layer_async,
+)
 
 NUM_LAYERS = 8
 LAYER_COST = 0.005  # 5ms/层
@@ -75,3 +80,27 @@ def test_serve_after_layers_validated() -> None:
         run_layer_async(MockLayerSource(), 0)
     with pytest.raises(ValueError):
         run_layer_async(MockLayerSource(), NUM_LAYERS + 1)
+
+
+def test_waterfall_segments_cover_timeline() -> None:
+    """P7.4:瀑布分解——段覆盖完整时间线,critical 段之和 = serve gate。"""
+    m, segs = waterfall_layer_async(
+        MockLayerSource(), serve_after_layers=2,
+        prefetcher=MockPrefetcher(), hot_blocks=HOT, provision_s=0.01,
+    )
+    names = [s.name for s in segs]
+    assert names[0] == "provision"
+    assert "kv_prefetch" in names
+    weight_segs = [s for s in segs if s.name.startswith("weight_layer_")]
+    assert len(weight_segs) == NUM_LAYERS
+    # critical = provision + 前 2 层;其余层与 kv_prefetch 在后台
+    critical = [s for s in segs if s.critical]
+    assert len(critical) == 3  # provision + layer_0 + layer_1
+    critical_end = max(s.end_s for s in critical)
+    assert abs(critical_end - m.time_to_serve_gate) < 0.01
+    # 段总和 ≈ fully_ready 时间线内(无段超出)
+    assert all(s.end_s <= m.time_to_fully_ready + 0.01 for s in segs)
+    # 甘特输出包含关键/后台两种标记
+    gantt = format_waterfall(segs, m.time_to_fully_ready)
+    assert "#" in gantt and "." in gantt
+    print(f"\n[waterfall]\n{gantt}")

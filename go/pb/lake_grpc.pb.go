@@ -41,6 +41,7 @@ const (
 	ControlPlaneService_JoinShardNode_FullMethodName       = "/lake.ControlPlaneService/JoinShardNode"
 	ControlPlaneService_DrainShardNode_FullMethodName      = "/lake.ControlPlaneService/DrainShardNode"
 	ControlPlaneService_RemoveShardNode_FullMethodName     = "/lake.ControlPlaneService/RemoveShardNode"
+	ControlPlaneService_ReportHits_FullMethodName          = "/lake.ControlPlaneService/ReportHits"
 )
 
 // ControlPlaneServiceClient is the client API for ControlPlaneService service.
@@ -126,11 +127,21 @@ type ControlPlaneServiceClient interface {
 	// P4.9:一致性哈希分片(F11 扩缩)。单测模拟环/最小迁移/Drain;真跨机字节迁移 → P5。
 	GetShardMap(ctx context.Context, in *GetShardMapRequest, opts ...grpc.CallOption) (*GetShardMapResponse, error)
 	// 加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
+	//
+	//	P7 收口(方案 Z):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
+	//	hit_count 选热块 → agent PlaceBlocks),Router 只报告命中(ReportHits)、
+	//	不指挥放置。
 	JoinShardNode(ctx context.Context, in *JoinShardNodeRequest, opts ...grpc.CallOption) (*JoinShardNodeResponse, error)
 	// 缩容:标记 Drain + 迁出计划 + 需先推 L2 的 block 列表(逻辑;字节迁移 P5)。
 	DrainShardNode(ctx context.Context, in *DrainShardNodeRequest, opts ...grpc.CallOption) (*DrainShardNodeResponse, error)
 	// Drain 完成后从环移除(无剩余所有权时)。
 	RemoveShardNode(ctx context.Context, in *RemoveShardNodeRequest, opts ...grpc.CallOption) (*Ack, error)
+	// P7 收口:命中上报(best-effort 批量)。Router 在本地镜像上观测到前缀命中后
+	//
+	//	批量回传,CP 累计到 radix 节点 hit_count(SGLang TreeNode.hit_count 同款),
+	//	供 promote 准入 / 扩容 warmup 选块 / 未来方案 Z 预放置复用——一套热度信号。
+	//	丢失可容忍(计数偏弱),不进 ViewEvent。
+	ReportHits(ctx context.Context, in *ReportHitsRequest, opts ...grpc.CallOption) (*Ack, error)
 }
 
 type controlPlaneServiceClient struct {
@@ -376,6 +387,16 @@ func (c *controlPlaneServiceClient) RemoveShardNode(ctx context.Context, in *Rem
 	return out, nil
 }
 
+func (c *controlPlaneServiceClient) ReportHits(ctx context.Context, in *ReportHitsRequest, opts ...grpc.CallOption) (*Ack, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(Ack)
+	err := c.cc.Invoke(ctx, ControlPlaneService_ReportHits_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ControlPlaneServiceServer is the server API for ControlPlaneService service.
 // All implementations must embed UnimplementedControlPlaneServiceServer
 // for forward compatibility.
@@ -459,11 +480,21 @@ type ControlPlaneServiceServer interface {
 	// P4.9:一致性哈希分片(F11 扩缩)。单测模拟环/最小迁移/Drain;真跨机字节迁移 → P5。
 	GetShardMap(context.Context, *GetShardMapRequest) (*GetShardMapResponse, error)
 	// 加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
+	//
+	//	P7 收口(方案 Z):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
+	//	hit_count 选热块 → agent PlaceBlocks),Router 只报告命中(ReportHits)、
+	//	不指挥放置。
 	JoinShardNode(context.Context, *JoinShardNodeRequest) (*JoinShardNodeResponse, error)
 	// 缩容:标记 Drain + 迁出计划 + 需先推 L2 的 block 列表(逻辑;字节迁移 P5)。
 	DrainShardNode(context.Context, *DrainShardNodeRequest) (*DrainShardNodeResponse, error)
 	// Drain 完成后从环移除(无剩余所有权时)。
 	RemoveShardNode(context.Context, *RemoveShardNodeRequest) (*Ack, error)
+	// P7 收口:命中上报(best-effort 批量)。Router 在本地镜像上观测到前缀命中后
+	//
+	//	批量回传,CP 累计到 radix 节点 hit_count(SGLang TreeNode.hit_count 同款),
+	//	供 promote 准入 / 扩容 warmup 选块 / 未来方案 Z 预放置复用——一套热度信号。
+	//	丢失可容忍(计数偏弱),不进 ViewEvent。
+	ReportHits(context.Context, *ReportHitsRequest) (*Ack, error)
 	mustEmbedUnimplementedControlPlaneServiceServer()
 }
 
@@ -539,6 +570,9 @@ func (UnimplementedControlPlaneServiceServer) DrainShardNode(context.Context, *D
 }
 func (UnimplementedControlPlaneServiceServer) RemoveShardNode(context.Context, *RemoveShardNodeRequest) (*Ack, error) {
 	return nil, status.Error(codes.Unimplemented, "method RemoveShardNode not implemented")
+}
+func (UnimplementedControlPlaneServiceServer) ReportHits(context.Context, *ReportHitsRequest) (*Ack, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReportHits not implemented")
 }
 func (UnimplementedControlPlaneServiceServer) mustEmbedUnimplementedControlPlaneServiceServer() {}
 func (UnimplementedControlPlaneServiceServer) testEmbeddedByValue()                             {}
@@ -928,6 +962,24 @@ func _ControlPlaneService_RemoveShardNode_Handler(srv interface{}, ctx context.C
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ControlPlaneService_ReportHits_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReportHitsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ControlPlaneServiceServer).ReportHits(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ControlPlaneService_ReportHits_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ControlPlaneServiceServer).ReportHits(ctx, req.(*ReportHitsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ControlPlaneService_ServiceDesc is the grpc.ServiceDesc for ControlPlaneService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -1010,6 +1062,10 @@ var ControlPlaneService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RemoveShardNode",
 			Handler:    _ControlPlaneService_RemoveShardNode_Handler,
+		},
+		{
+			MethodName: "ReportHits",
+			Handler:    _ControlPlaneService_ReportHits_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

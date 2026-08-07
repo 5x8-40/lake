@@ -13,11 +13,13 @@ mod engine;
 mod pipeline;
 mod segment;
 mod stats;
+mod writeback;
 
 pub use bandwidth::BandwidthPool;
-pub use engine::{LocalTier, LocalTierEngine, TierCaps, TierSideEffects};
+pub use engine::{BeginPromote, LocalTier, LocalTierEngine, TierCaps, TierSideEffects};
 pub use pipeline::{LocationEvent, PipelineAction, TierPipeline};
 pub use segment::{Placement, Relocate, SegmentArena, DEFAULT_SLOT_BYTES};
 pub use stats::{AccessKind, HitStats, TierCost};
+pub use writeback::WritebackBatcher;
 
 pub use lake_proto::lake::*;

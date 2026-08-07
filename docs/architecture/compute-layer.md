@@ -713,6 +713,24 @@ process_batch_result → finished? → on_request_finished
 
 **阈值**：`pull_budget_ms` 初值与 TTFT/ITL 预算对齐，待 P7 校准；默认 0 保 P3 正确性。
 
+**异步 promote 修订（2026-08-05，issue #68 决策 5）**：补拉发起点前移到 dispatch——
+
+```
+dispatch(req → 节点) 随 PreparePlan 带 prefetch hint(read_set 派生的预取清单)
+        │
+        ▼
+agent 收单即 begin_promote(在途去重)     # 与排队 / batching 重叠
+        │                                # SGLang prefetch-at-schedule 同款形态
+        ▼                                # (hiradix_cache.py::prefetch_from_storage
+prepare_step 只 finish_promote 等残余     #  由 prefill adder 发起,不等排队结束)
+```
+
+- **不违方案 Z**：hint 从 read_set 派生（"这次要读什么"），不是放置命令（"把块放哪给未来用"）；拉取仍由 agent 发起，调度器接口里没有放置动词。
+- **不违 ready/done**：ready fence 前 read set 必须齐（all-or-nothing 不变）；异步只是把搬运与排队重叠，prepare 的等待从"全程"变"残余"。
+- **不违 durable-first**：promote 源只认已发布（durable）位置；在途块由 in-flight 去重保证单发起（`engine.rs::begin_promote/finish_promote`）。
+- hint 是**可忽略建议**：agent 忙/块已 L0/在途，直接弃；失败不阻塞 dispatch，退化回 prepare 同步补拉。
+- 时延收益（排队期隐藏搬运）待 P5 真字节路径校准；L3 短段在 hint 生成时即按成本模型阈值截断（`cost_model.py::load_or_recompute`），不进清单。
+
 ## 开发前待补设计
 
 > 引擎结构与 Q1/Q2 已定;下列缺口在写生产路径代码前应补齐(或明确标 P5/P7 后置)。按**阻塞开发**优先级排列。
@@ -725,7 +743,7 @@ process_batch_result → finished? → on_request_finished
 | D2 | **`pool_iface` FFI 契约** | **已定**（见上节「D2」）；代码 `lake/engine/agent.py` + `lake/engine/pool_types.py` | 本节；FFI 不进 proto |
 | D3 | **角色配置 schema** | `role=prefill\|decode\|hybrid` 已定方向;未定完整启动配置(模型、TP、是否挂 drafter、arena 尺寸、上报指标标签)；C0 仅最小 `RoleConfig` | `runtime` 配置节;与冷启动 Warm 对齐 |
 | D4 | **Attention 后端与 metadata 边界** | **C8 初版已定**：`attn/metadata.py::AttentionMetadata` + `ReadyHandle.block_table_by_req`（agent 出表、runner 只读）；`forward_queries` 残差路径；真固定地址 tensor / paged kernel 仍待生产 | 对照 vLLM `AttentionMetadataBuilder` |
-| D5 | **节点级 scheduler 与 agent 的交互序** | **已定**（见上节「D5」）：schedule→prepare(预算)→ready→execute→done；默认 all-or-nothing；overlap 延迟 free | 本节 + [`scheduling.md`](scheduling.md) §3 |
+| D5 | **节点级 scheduler 与 agent 的交互序** | **已定**（见上节「D5」）：schedule→prepare(预算)→ready→execute→done；默认 all-or-nothing；overlap 延迟 free；**+异步 promote 修订**（dispatch 带 prefetch hint，agent 收单即 begin、prepare 只等残余，issue #68 决策 5） | 本节 + [`scheduling.md`](scheduling.md) §3 |
 
 ### 可与骨架并行(不阻塞空壳,阻塞真模型)
 

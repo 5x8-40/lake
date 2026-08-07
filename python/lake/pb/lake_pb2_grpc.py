@@ -165,6 +165,11 @@ class ControlPlaneServiceStub:
                 request_serializer=lake__pb2.RemoveShardNodeRequest.SerializeToString,
                 response_deserializer=lake__pb2.Ack.FromString,
                 _registered_method=True)
+        self.ReportHits = channel.unary_unary(
+                '/lake.ControlPlaneService/ReportHits',
+                request_serializer=lake__pb2.ReportHitsRequest.SerializeToString,
+                response_deserializer=lake__pb2.Ack.FromString,
+                _registered_method=True)
 
 
 class ControlPlaneServiceServicer:
@@ -352,6 +357,9 @@ class ControlPlaneServiceServicer:
 
     def JoinShardNode(self, request, context):
         """加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
+        P7 收口(方案 Z):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
+        hit_count 选热块 → agent PlaceBlocks),Router 只报告命中(ReportHits)、
+        不指挥放置。
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -366,6 +374,16 @@ class ControlPlaneServiceServicer:
 
     def RemoveShardNode(self, request, context):
         """Drain 完成后从环移除(无剩余所有权时)。
+        """
+        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
+        context.set_details('Method not implemented!')
+        raise NotImplementedError('Method not implemented!')
+
+    def ReportHits(self, request, context):
+        """P7 收口:命中上报(best-effort 批量)。Router 在本地镜像上观测到前缀命中后
+        批量回传,CP 累计到 radix 节点 hit_count(SGLang TreeNode.hit_count 同款),
+        供 promote 准入 / 扩容 warmup 选块 / 未来方案 Z 预放置复用——一套热度信号。
+        丢失可容忍(计数偏弱),不进 ViewEvent。
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')
@@ -482,6 +500,11 @@ def add_ControlPlaneServiceServicer_to_server(servicer, server):
             'RemoveShardNode': grpc.unary_unary_rpc_method_handler(
                     servicer.RemoveShardNode,
                     request_deserializer=lake__pb2.RemoveShardNodeRequest.FromString,
+                    response_serializer=lake__pb2.Ack.SerializeToString,
+            ),
+            'ReportHits': grpc.unary_unary_rpc_method_handler(
+                    servicer.ReportHits,
+                    request_deserializer=lake__pb2.ReportHitsRequest.FromString,
                     response_serializer=lake__pb2.Ack.SerializeToString,
             ),
     }
@@ -1099,6 +1122,33 @@ class ControlPlaneService:
             target,
             '/lake.ControlPlaneService/RemoveShardNode',
             lake__pb2.RemoveShardNodeRequest.SerializeToString,
+            lake__pb2.Ack.FromString,
+            options,
+            channel_credentials,
+            insecure,
+            call_credentials,
+            compression,
+            wait_for_ready,
+            timeout,
+            metadata,
+            _registered_method=True)
+
+    @staticmethod
+    def ReportHits(request,
+            target,
+            options=(),
+            channel_credentials=None,
+            call_credentials=None,
+            insecure=False,
+            compression=None,
+            wait_for_ready=None,
+            timeout=None,
+            metadata=None):
+        return grpc.experimental.unary_unary(
+            request,
+            target,
+            '/lake.ControlPlaneService/ReportHits',
+            lake__pb2.ReportHitsRequest.SerializeToString,
             lake__pb2.Ack.FromString,
             options,
             channel_credentials,

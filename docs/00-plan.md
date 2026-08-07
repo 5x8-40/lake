@@ -83,20 +83,20 @@ P7  性能建模与验证   → 量化各假设，回填设计
 - **技术选型已定**（P2 落地）：存储 + 存储控制面 Rust / 请求控制面 Go / 计算 Python+Triton；元数据 etcd；SSOT 用 S3/MinIO；跨语言 gRPC+Protobuf（大块 KV 走 RDMA 旁路）。3rdparty 五个 submodule（sglang/lmcache/mooncake/vllm/dynamo）作实现参考。
 - **KV 类型 t-type / r-type + 投机解码机制（本轮新增）**：
   - **KV 类型**：按 HBM 存储形态分 t-type(逐 token 完整 KV,paged block,full attention/MLA)与 r-type(紧凑表示——窗口最近 W token / Mamba 定长 state,sliding window/Mamba/卷积)。**两类复用条件一致**:都需命中全部前缀才能复用;区别**仅在 HBM(L0)存储形态**,目的是降低 r-type 的 HBM 占用。HBM 两类并存、分 arena 管理(r-type 另设固定状态 arena 入图);L1–L3 统一按 block(128 token)组织(两类复用条件一致、不区分类型),r-type 落下层在 block 边界 checkpoint 紧凑状态(trailing pages / state 快照)——相对 SGLang multi-pool 物理分池,我们把类型差异收敛到 L0 存储形态 + block 内布局,而非物理分池。详见 [`architecture/storage-layer.md`](architecture/storage-layer.md) "KV 类型"节、[`architecture/kv-cache-pool.md`](architecture/kv-cache-pool.md) "t-type / r-type"。
-  - **block 粒度 128 token**：缓存命中/复用/传输/写回最小单位(初版默认,待 P7 校准)。
+  - **block 粒度 128 token**：缓存命中/复用/传输/写回最小单位(P7.3 已校准:有效复用率 94.6%,优于 256 的 89.2%;维持 128)。
   - **投机解码(仿 SGLang)**：drafter 与 decode(target)默认共置、同 step 串行。**pre/post 共用同一 drafter 模型,拆 `post_forward` / `pre_forward` 两阶段(同类的两个方法,非独立组件)**统一自回归类与 diffusion 类编排:**`post_forward`**(target 之后,吃 target 输出做强耦合部分)承载 MTP/EAGLE/EAGLE3 的 draft head 前向(参数与主模型一致)+ DFLASH/DSPARK 的 draft cache 准备;**`pre_forward`**(下轮 target 之前)承载 MTP/EAGLE/EAGLE3 的自回归多 token 生成 + DFLASH/DSPARK 的 diffusion 并行产 block。**prefill 阶段仍产 draft**(drafter forward 照跑),差异在产出是否使用:vLLM PD 分离下 P 侧 draft 弃用、forward 仅为保 drafter KV 同步(`llm_base_proposer.py:567`),SGLang 暂未细究——**记为遗留问题,初步判断不影响整体设计**(prefill 产出是否用属节点侧策略)。**decode 多层 MTP** 分 chain-style(每层用自己上步输出 hidden,需 FULL 暂存)/ non-chain(每层用 target hidden,只需 LAST)两范式,参考 SGLang `multi_layer_eagle_worker_v2.py::chain_mtp_hidden_states`;单层 MTP 是 non-chain 退化。**drafter 自己的 KV 与 target KV 同款——进存储池统一管理、跨请求前缀复用、随迁**(SGLang `PoolName.DRAFT`,纠正此前"draft L0-only 不进池"的误记);seed hidden(自回归)/ 窗口状态(diffusion)是否跨请求缓存待定,先按 SGLang 重算式(draft-extend 重建,不进 radix),记为遗留问题。MTP 重算产出 `1+num_mtp_layers` token,残差 prefill 短时左 pad。**主攻方案**:MTP/EAGLE/EAGLE3/DFLASH/DSPARK(后两者 diffusion 类,半年内进生产),不主攻 medusa/mlp_speculator/ngram/独立 draft 模型。**支持梳理**:MTP/EAGLE/EAGLE3/DFLASH 两边都有;**DSPARK 仅 SGLang**;不参考 vLLM `spec_target_max_model_len`(独立 draft 模型时代遗留)。详见 [`architecture/compute-layer.md`](architecture/compute-layer.md) "投机解码"节。
   - **缓存命中感知调度**：命中(Pool/本地)是模式选择与 batch 组成的一等输入;新增**跨请求前缀共调度**(同前缀请求组同 batch/节点,前缀 block 复用+本地命中叠加,参考 SGLang `match_prefix` cache-aware scheduling / vLLM `get_computed_blocks`);守方案 Z 单向耦合(只读视图、不指挥放置),draft 候选不进 radix。详见 [`architecture/scheduling.md`](architecture/scheduling.md) "缓存命中感知调度"节。
   - **长度边界规避(max_model_length vs runner_max_model_length)**：推理临近最大长度时的边界 bug(drafter 跳过致 EP/DP 集合通信盲等、block 申请不够致请求永不可调度)在 vLLM/sglang 均靠累积特殊逻辑兜(vLLM `reserve_full_isl`+spec pad break+PD+spec lookahead=0;sglang `init_req_max_new_tokens` admission clamp+`speculative_skip_dp_mlp_sync`+`_build_trivial_verify_input`)。lake 用双长度变量规避:对外 `max_model_length`(gateway/scheduler 守,length cap+SLO 契约)+ 计算层内部 `runner_max_model_length = max_model_length + headroom`(arena/block table/graph 预分配);headroom 吸收 draft transient,runner 不写近 max debug 逻辑。代价:额外 HBM arena。详见 [`architecture/compute-layer.md`](architecture/compute-layer.md) "长度边界规避"节。
 
 ### P1 待讨论 / 开放点
 
-- decode 写回频率 N：多轮 agent（重前缀增强时效，N 小）vs 单轮（重带宽/容错，N 大），待 P7。
-- 满块写回频率（满一个就写 vs 攒几个满块一起写），待 P7。
+- decode 写回频率 N：多轮 agent（重前缀增强时效，N 小）vs 单轮（重带宽/容错，N 大）。P7.3 已校准 ops/字节维度（字节与 N 无关、ops∝1/N，建议 N=2–4 块/批）；**issue #68 决策 1 已落地为 per-agent 配置**（`WritebackBatcher`，不同 agent 可不同 N；三维权衡 ops∝1/N / F4 窗口∝N / radix 滞后∝N 见 [`architecture/kv-cache-pool.md`](architecture/kv-cache-pool.md)）；多轮时效维度随真实 agent workload 复核。
+- ~~满块写回频率（满一个就写 vs 攒几个满块一起写）~~ P7.3 已校准（同上 N=2–4）。
 - 反向回传的 radix 增长时效：写回到 radix 可见的滞后上限。
-- 分块流水线深度（`page_first_direct` 子块传输 k 与 prefill 层数对齐），待 P7。
-- D→P 选路（§3.4 子情况 A/B 与 P 侧自拉的 NIC 带宽视图决策、collective 突发窗避让）待 P7。
-- 模式选择决策树的具体阈值（本地命中判定、传输成本 vs 分离收益）待 P7；**决策树结构本身待 `data-flow.md` 落定**（结构定型、阈值留空标 P7）。
-- **block 粒度 128 token** 与传输/写放大/碎片率的权衡,待 P7 校准。
+- 分块流水线深度（`page_first_direct` 子块传输 k 与 prefill 层数对齐）——依赖传输引擎字节布局落地（P5 遗留），blocked。
+- D→P 选路（§3.4 子情况 A/B 与 P 侧自拉的 NIC 带宽视图决策、collective 突发窗避让）——依赖双网络真拓扑/NIC 带宽视图，blocked on 真机（issue #68 §6）。
+- ~~模式选择决策树的具体阈值~~ P7.2 已回填 v1（[`features/features.md`](features/features.md) 执行模式节）；决策树结构已落定。
+- ~~**block 粒度 128 token** 与传输/写放大/碎片率的权衡~~ P7.3 已校准（维持 128）。
 - **r-type 状态 checkpoint**:Mamba/卷积 recurrent state 落 L1+ 的 checkpoint 间距/形式、sliding window trailing pages 阈值,待实现/P7 校准。
 - **r-type SWA 尾段重算优化(idea,暂不实现,已记预留)**:SWA KV 不落 L1+、prefix 命中时重算匹配序列最后 `n*(w-1)+1` 个 token(position `[L+n-n*w-1, L)`)仅刷 SWA 窗口、不写非 SWA 模块(slot_mapping=-1),省存储换重算。暂不实现,但已留两处接口预留:① agent 的 slot 分配按模块差异化(只给 SWA 分 write slot,模块意识留池侧、引擎契约不破,经 Q2 张力权衡选此);② 残差路径区分"增量 prefill(未匹配尾)"与"刷新重算(已匹配尾,仅 SWA 写)"。r-type SWA 是否落 L1+(持久 vs 重算)二选一,待 P7。详见 [`architecture/compute-layer.md`](architecture/compute-layer.md) "r-type SWA 前缀复用的尾段重算优化"。
 - **MTP 左 pad 策略**:是否总 pad 到固定宽度、pad token 是否复用命中 KV、pad 窗口上限,待实现/P7 校准。
@@ -283,12 +283,14 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 
 ## P7 — 性能建模与验证
 
-- [ ] 成本模型：KV 传输带宽 vs prefill/decode 计算时间
-- [ ] 分层缓存的命中率/成本曲线（P4.3 仅有 `HitStats` 计数骨架 + criterion micro-bench；`estimate_promote_cost` = `nbytes × hops`，hops∈{0..3} 对齐 L0/L1/L2/L3→L0 跳数，见 `LocalTierEngine::estimate_promote_cost`；真 workload 曲线与带宽校准本项）
-- [ ] 弹性冷启动时延分解
-- [ ] 回填到 `docs/` 与 SLO，修正非目标与设计假设
+- [x] P7.1 测量基座：三语言指标采集点 + bench 运行器（结构化 JSON 结果，后续阶段共用）✅ PR #63
+- [x] P7.2 成本模型 v1：KV 传输带宽 vs prefill/decode 计算时间（模式选择阈值的量化输入）✅ PR #64（[`architecture/cost-model.md`](architecture/cost-model.md)）
+- [x] P7.3 分层缓存命中率/成本曲线（合成 workload 驱动 `HitStats`；校准 `LocalTierEngine::estimate_promote_cost` 跳数模型；block 粒度/写回频率/GC 带宽占比）✅ PR #65（[`architecture/kv-cache-pool.md`](architecture/kv-cache-pool.md)「P7.3 校准结论」）
+- [x] P7.4 弹性冷启动时延分解（扩 P6.6 coldstart harness；「扩容决策→Ready <10s」校准）✅ PR #66（[`features/slo.md`](features/slo.md) 弹性节）
+- [x] P7.5 回填 `docs/` 与 SLO：draft → 校准值，每个 P0 假设给量化结论 ✅ PR #67（含 issue #68  churn 抑制八决策落地同步：写回 N per-agent 配置 / promote 准入 one-shot / 异步 promote D5 修订 / warmup 挪池侧）
+- [x] P7.6 本地命中闭环（slo.md「本地命中率 >40%」验证）：B2 池侧稳态预放置（per-(block,node) 计数 + 跟随流量放置/祖先共置/滞回 + HRW 预放置）✅ 并入 PR #65（Rust）；B3 本地命中率探针 + workload harness ✅ 并入 PR #67（Go `bench_p76_test.go`）；B1 亲和两段式选路（镜像 L0 得分 + in-flight 护栏降级 + 冷路径负载权重 HRW）✅ PR #69（Go `affinity.go`）。实测 RR 0.106–0.230 → 亲和 0.905–1.000（连续本地前缀口径复测），结论回填 [`features/slo.md`](features/slo.md)「本地命中率」P7.6 校准
 
-**完成判据**：每个 P0 假设有量化结论（成立/不成立/在何条件下成立）。
+**完成判据**：每个 P0 假设有量化结论（成立/不成立/在何条件下成立）。阶段实施计划见 issue #61；结论表见 [`features/slo.md`](features/slo.md)「P7 校准结论」。
 
 ---
 

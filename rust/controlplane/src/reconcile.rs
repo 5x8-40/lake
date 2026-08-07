@@ -269,6 +269,9 @@ impl Authority {
                     pool.handles.remove(&seq);
                     pool.global_refs.remove(&seq);
                     pool.seq_to_flat.remove(&seq);
+                    // 同 drop_inactive_victims:连带清理热度与滞回标记。
+                    pool.hit_counts.remove(&flat);
+                    pool.placement_marks.retain(|(f, _)| f != &flat);
                     let _ = pool.inactive.take(seq, bid);
                     ns.used_bytes = (ns.used_bytes - bpb).max(0);
                     view_events.push(crate::view::invalidated_event(id.clone()));
@@ -376,6 +379,10 @@ impl Authority {
                     ));
                     touched.push(id);
                 }
+                // 死节点的放置滞回标记一并清除:否则 (flat, dead) 单调残留,
+                // 且节点以同 id 重 join 时旧标记会抑制 follow_traffic 向重生
+                // 节点的再放置(旧计划可能从未在死节点上执行完)。
+                pool.placement_marks.retain(|(_, n)| n.as_str() != node_id);
             }
         }
         self.pending_view_events.extend(view_events);
