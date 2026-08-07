@@ -2,6 +2,8 @@
 
 lake 以 **KV 为中心**做彻底存算分离:所有有状态物(权重、KV cache、调度队列)从算力路径剥离,算力节点可随时销毁/拉起。请求短暂、节点可换,**KV 是贯穿多请求、多节点、多轮次的唯一长存物**。
 
+> 设计动机的展开(虚拟内存 → PagedAttention → 存算分离)与业界对照,见 [`kv-virtual-memory.md`](kv-virtual-memory.md)。
+
 ## 分层视图
 
 ```mermaid
