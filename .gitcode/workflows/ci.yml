@@ -1,0 +1,124 @@
+# GitCode 流水线:三语言构建/测试/lint/stub-drift 门禁(移植自 .github/workflows/build.yml)。
+# 平台差异与决策:
+#   - 工作流位于 .gitcode/workflows/;运行器 euleros-2.10.1(yum 系);步骤内先 `cd repo_workspace`。
+#   - 内置动作仅用 checkout-action;工具链全部裸装(平台 setup-* 动作版本语义未验证,宁可显式)。
+#   - 国内网络:Go 走 goproxy.cn + golang.google.cn;pip 走清华镜像;Rust 走 rsproxy。
+#   - Go 模块路径仍是 github.com/chengda-wu/lake/go(go.mod 未改),不影响编译。
+# 首跑若 euleros 源缺包或镜像超时,按步骤注释里的备选改。
+name: build
+
+on:
+  push:
+    branches: [ "main", "ci/*" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  rust:
+    runs-on: euleros-2.10.1
+    steps:
+      - uses: checkout-action@v0.0.1
+      # tonic-build(build.rs)在线生成 stub 需 protoc;euleros 源若无 protobuf-compiler 包,
+      # 备选:curl 官方 release 压缩包解压到 /usr/local(见 stub-drift job)。
+      - run: sudo yum install -y protobuf-compiler
+      # Rust 钉 1.96.1(rust/rust-toolchain.toml,与 3rdparty/dynamo 对齐),rsproxy 镜像加速。
+      - name: 安装 Rust 工具链
+        run: |
+          export RUSTUP_DIST_SERVER=https://rsproxy.cn RUSTUP_UPDATE_ROOT=https://rsproxy.cn/rustup
+          curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y --default-toolchain 1.96.1 --component rustfmt clippy
+      # crates 镜像(可选加速;失败可删本步,cargo 直连 crates.io 也能跑)。
+      - name: 配置 crates 镜像
+        run: |
+          mkdir -p "$HOME/.cargo" && printf '[source.crates-io]\nreplace-with = "rsproxy-sparse"\n[source.rsproxy-sparse]\nregistry = "sparse+https://rsproxy.cn/index/"\n[registries.crates-io]\nprotocol = "sparse"\n' > "$HOME/.cargo/config.toml"
+      - name: 构建(全 workspace + storage-agent 双角色 feature)
+        run: |
+          cd repo_workspace/rust
+          source "$HOME/.cargo/env"
+          cargo build --workspace
+          cargo build -p lake-storage-agent --no-default-features --features compute
+          cargo build -p lake-storage-agent --no-default-features --features kvnode
+      # 格式 + lint 先跑;vendor 只读排除 -D warnings(见 rust/vendor/UPSTREAM.md)。
+      - name: fmt + clippy
+        run: |
+          cd repo_workspace/rust
+          source "$HOME/.cargo/env"
+          cargo fmt --check
+          cargo clippy --workspace --all-targets --exclude kvbm-logical --exclude dynamo-tokens -- -D warnings
+      - name: 测试(vendor fork + lake 自有 crate 全门禁)
+        run: |
+          cd repo_workspace/rust
+          source "$HOME/.cargo/env"
+          cargo test --workspace
+
+  go:
+    runs-on: euleros-2.10.1
+    steps:
+      - uses: checkout-action@v0.0.1
+      # 裸装 Go(go.mod 钉 1.22;用 1.22.x 最新补丁版)。golang.google.cn 为国内可达镜像。
+      - name: 安装 Go
+        run: |
+          curl -sSLo /tmp/go.tgz https://golang.google.cn/dl/go1.22.12.linux-amd64.tar.gz
+          sudo tar -C /usr/local -xzf /tmp/go.tgz
+          /usr/local/go/bin/go version
+      - name: build + fmt + vet + test
+        env:
+          GOPROXY: https://goproxy.cn,direct
+        run: |
+          export PATH=/usr/local/go/bin:$PATH
+          cd repo_workspace/go
+          go build ./...
+          test -z "$(gofmt -l .)"   # 有输出即失败
+          go vet ./...
+          go test ./...
+
+  python:
+    runs-on: euleros-2.10.1
+    steps:
+      - uses: checkout-action@v0.0.1
+      # 仓库要求 Python >=3.12(根 pyproject.toml)。euleros 自带 python3 版本过低,
+      # 用平台内置 setup-python;若该动作不支持 3.12,备选:源码编译或 Miniconda 镜像。
+      - uses: setup-python@v0.0.1
+        with:
+          python-version: "3.12"
+      - name: 依赖 + import 冒烟 + pytest(lake/ 与 bench/ 双门禁)
+        run: |
+          cd repo_workspace/python
+          pip install -i https://pypi.tuna.tsinghua.edu.cn/simple "grpcio>=1.82.1" "protobuf>=7.35.0" "transformers" pytest
+          PYTHONPATH=. python -c "from lake.pb import lake_pb2, lake_pb2_grpc, schema_pb2; import lake.kernels, lake.runtime, lake.engine; import lake.prefill, lake.decode, lake.draft; print('py OK')"
+          PYTHONPATH=. python -m pytest lake/ -q
+          cd ../bench && python -m pytest test_cost_model.py -q
+
+  # stub drift:重生成 Go/Python stub 后 git diff --exit-code,拦「proto 改了没重生成」。
+  stub-drift:
+    runs-on: euleros-2.10.1
+    steps:
+      - uses: checkout-action@v0.0.1
+      # 钉 protoc 3.21.12(与 gen_stubs.sh 头注释一致;yum 源版本不定,直接官方 release)。
+      # GitHub release 国内若超时,备选 ghproxy 镜像:https://mirror.ghproxy.com/ 前缀。
+      - name: 安装 protoc 3.21.12
+        run: |
+          curl -sSLo /tmp/protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v21.12/protoc-21.12-linux-x86_64.zip
+          sudo yum install -y unzip && sudo unzip -o /tmp/protoc.zip -d /usr/local
+          protoc --version
+      - name: 安装 Go + protoc 插件(钉版)
+        env:
+          GOPROXY: https://goproxy.cn,direct
+        run: |
+          curl -sSLo /tmp/go.tgz https://golang.google.cn/dl/go1.22.12.linux-amd64.tar.gz
+          sudo tar -C /usr/local -xzf /tmp/go.tgz
+          export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+          go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+      - uses: setup-python@v0.0.1
+        with:
+          python-version: "3.12"
+      - name: 重生成并核对 drift
+        env:
+          LAKE_GEN_STUBS_STRICT: "1"
+        run: |
+          export PATH=/usr/local/go/bin:$HOME/go/bin:$PATH
+          pip install -i https://pypi.tuna.tsinghua.edu.cn/simple grpcio-tools==1.82.1
+          cd repo_workspace
+          bash scripts/gen_stubs.sh
+          git diff --exit-code
