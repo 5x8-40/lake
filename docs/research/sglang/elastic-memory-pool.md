@@ -40,6 +40,27 @@ PyTorch blog：[Hybrid Models Meet SGLang: More Than Full Attention](https://pyt
 
 > **opt-in 状态**：unified memory pool 已合入主线（PR [#29678](https://github.com/sgl-project/sglang/pull/29678)，2026-07-01），由 `--enable-unified-memory` 开启，隐含 `--enable-page-major-kv-layout`。本地 submodule `37f94cb7a0` 已含此功能与 `UnifiedRadixCache`。注意：当前版本 **不兼容 PD 分离**（`server_args.py:6549-6552` 显式拒绝）。
 
+### 2.1 压实何时触发、会搬什么
+
+压实不按固定周期运行；它由**释放、静点与分配压力**驱动。这里的「slot 位置变化」只发生在 allocator 私有的物理层：请求 block table / radix 节点仍持有 virtual slot ID，实际搬迁后只改 `virtual_to_physical` / `physical_to_virtual`。
+
+```
+virtual slot v ──v2p──> physical page p     # forward 前翻译为实际读写位置
+                         ↓ compaction copy
+virtual slot v ──v2p──> physical page p'    # 上层引用 v 不变
+```
+
+| 模式 | `free()` 时 | 压实触发 | 延迟/空间取舍 |
+|------|-------------|----------|---------------|
+| **eager**（`lazy_compaction=False`，构造参数默认值） | 立即解除 v2p，并调用 `_compact_pending` | 每个未被 `free_group` 聚合的 `free` | 空间立即连续、对端池可立刻长入；overlap 下可能等待 in-flight forward，释放热路径更重 |
+| **lazy** | 仅记录物理空洞、解除 v2p/p2v，不搬 KV | scheduler 静点 `flush_opportunistic()`；若分配发现共享 gap 不足，则对**对端池**做 urgent `_flush()` | 普通释放轻；暂时允许洞存在，压力时的一次 urgent flush 可能较重 |
+
+eager 并不意味着每次 free 都复制大量 KV：若释放页位于当前分配边界，watermark 直接后退，搬运数为 0；只有内部 hole 才需将边界一侧的存活页搬入。实际搬运是一个批次 `move_kv_cache`，之后批量更新 v2p/p2v。其代价仍不能忽略：eager 路径在 overlap 模式会先 `wait_stream(forward_stream)`，且会有一次 GPU→CPU 同步检查。
+
+lazy 的 non-urgent flush 会把已释放页批量排序、吸收边界洞、再以双指针搬存活页；若发现 forward 正在写候选源页，会停止于该处而非与写入竞争。urgent flush 则先等待最近的 forward 完成，再做 full-pack，以保证此次分配能够真正取得连续空间。non-urgent 路径默认单次最多搬 4096 页（`SGLANG_LAZY_COMPACTION_MAX_MOVES_PER_CALL`），限制后台整理抢占执行带宽。`flush_opportunistic()` 可能被 scheduler 高频调用，但空集合是快速 no-op；源码注释估计约 99% 调用命中该路径。
+
+**结论**：eager 偏向“free 即还给对端”的低碎片语义；lazy 将 copy 和同步从请求结束路径挪到可控静点或容量短缺点。后者避免稳定 decode 路径被频繁搬迁打断，但必须为压力时的 burst 留出延迟与带宽预算。
+
 ### 3. Hybrid 双池的语义来源
 
 `memory_pool.py::MambaPool`（L311，request 级定长 SSM 状态）、`HybridReqToTokenPool`（L876）、`HybridLinearKVPool`（L2508，full attention 的 token 级 KV + 线性层状态分离）。`hi_mamba_radix_cache.py::HiMambaRadixCache` 要求 `HybridLinearKVPool`（L114-120）。elastic pool 的价值正在于：full-attention KV（随 token 增长）与 SSM 状态（随 request 定长）的最佳比例随负载漂移，静态切分会浪费——两端相向生长让两者动态争用同一 buffer。
@@ -51,6 +72,8 @@ PyTorch blog：[Hybrid Models Meet SGLang: More Than Full Attention](https://pyt
 | CUDA VMM arena | `KvVmmArena` | `kv_vmm_backing.py:100`（`commit_range` L199、`cuMemAddressReserve` L36） |
 | 共享字节 buffer + 两子池 | `UnifiedKVPool` | `unified_memory_pool.py:177` |
 | 端向 allocator + v2p/p2v | `MultiEndedAllocator` | `multi_ended_allocator.py:99` |
+| eager free + 即时压实 | `MultiEndedAllocator.free` / `_compact_pending_impl` | `multi_ended_allocator.py` |
+| lazy free + 静点/紧急批量压实 | `_free_lazy` / `flush_opportunistic` / `_flush` | `multi_ended_allocator.py` |
 | 子池规格（grow_direction） | `SubPoolSpec` | `unified_memory_pool.py:75` |
 | Mamba 定长状态池 | `MambaPool` | `memory_pool.py:311` |
 | Hybrid 请求→token 映射 | `HybridReqToTokenPool` | `memory_pool.py:876` |
