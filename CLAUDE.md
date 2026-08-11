@@ -147,13 +147,15 @@ SLO 数值是 draft（待 P7 校准），但**约束关系是硬的**：TTFT/ITL
 
 ## Git 约定
 
-- **禁止直接推送到 `main`**。所有改动走 PR:在新分支上提交,推送后开 PR,经用户确认后再合并。
+- **主仓在 GitLab**:`https://gitlab.com/BeeBreeze/lake`(remote `gitlab`,2026-08 自 GitHub→GitCode→GitLab 迁入)。`origin`(GitHub)/`gitcode` 两个 remote 已停用,勿推送。
+- **禁止直接推送到 `main`**。所有改动走 MR:在新分支上提交,推送后开 MR,经用户确认后再合并。
 - **动手前先问用户是否建新分支**:开始实质改动前,主动询问用户是否要建新分支(若当前已在 `main`,默认应建)。不要自行直接在 `main` 上提交。
 - 分支命名:用 `docs/...` / `feat/...` / `fix/...` 等前缀 + 简短描述(如 `docs/vllm-kv-roadmap-update`)。
 - 提交信息中文,开头用 `docs(P0):` / `feat:` / `fix:` 等前缀,结尾附 `Co-Authored-By: Claude <noreply@anthropic.com>`。
-- 推送走 SSH:`git@github.com:chengda-wu/lake.git`。本地已配 `origin`。
+- 推送:`git push gitlab <branch>`(HTTPS,凭据由 git credential 管理)。
 - 用户尚未配置全局 git 身份,仓库本地配置为 `witcher` / `witcher@users.noreply.github.com`,提交时用 `git -c commit.gpgsign=false commit`。
-- PR 流程用 `gh pr create`;合并由用户决定,不自行合并。
+- MR/issue/流水线操作用 `glab` CLI(已认证 gitlab.com):`glab mr create` / `glab issue list` / `glab ci list`;合并由用户决定,不自行合并。
+- CI:GitLab CI(`.gitlab-ci.yml`),main push 与 MR 触发;`.github/workflows/` 与 `.gitcode/workflows/` 为历史遗留配置,已停用勿维护。
 
 ## 原型运行
 
