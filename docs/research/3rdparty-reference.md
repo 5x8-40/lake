@@ -262,6 +262,23 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 
 - **A 不管「这块 KV 算不算前缀命中」**；**B 不管「跨节点怎么 RDMA 搬字节」**。
 - Dynamo `kvbm-physical::TransferManager` 是**抽象**，生产数据面仍优先接 A（Mooncake TE），避免两套传输栈。
+
+**A 行补充：为什么是 TE 而不是 NIXL**。注意 dynamo 自己没有传输引擎，它的 KV 传输生产后端是 NIXL——所以真正的备选是 NIXL。
+
+- 两者形态不同：TE 是为 KV 搬迁写的专用引擎，segment 注册、slice 切分、拓扑选 NIC、多 NIC 聚合、故障重传、TCP 退化都是现成的；NIXL 是"统一 API + 可插后端"的抽象层。lake 自己的抽象已经有了（`rust/transfer` 的 `Transport` trait），再引入一层抽象没有增量。
+- 寻址模型合拍：TE 的 `(SegmentID, offset, len)` 就是 lake `Location{segment_id, offset}` 的形状，接起来不用翻译；NIXL 的 agent/descriptor 风格对不上。
+- 多 NIC 开箱即用：TE 自带 NUMA 拓扑发现和带宽聚合（`Topology::selectDevice`）；NIXL 要多网卡聚合得自己配 `UCX_NET_DEVICES`。
+- 生产实证和生态：TE 在 Kimi 生产环境跑 PD 分离的 KV 搬迁；SGLang HiCache、vLLM `MooncakeConnector`、LMCache、TileRT 都接它，将来 lake 与任何引擎对接，TE 是共同语言。
+- 但不是终身绑定：P5 若发现 FFI 成本超预期，NIXL 仍可作为 `Transport` trait 的另一个实现。
+
+**B 行补充：为什么 physical/engine 不能像 logical 那样 vendor**：
+
+- logical 层不关心"KV 归谁"——它就是块池、链式哈希、presence、驱逐索引这些纯数据结构，拿过来改一张小表（见 `rust/vendor/UPSTREAM.md`）就能用，还白拿 480 个单测。physical 和 engine 不一样：它们整个建在"KV 归引擎、引擎发起、只往下沉（demote-only）"的假设上，这正是 lake 要推翻的模型。
+- 控制流对不上：dynamo 里传输由引擎内的 leader 在 offload 编排里发起；lake 是池做调度、agent 执行、双向流动（预放置、读 miss 回填、节点间直传）。physical 层能不能用，取决于 engine 层的控制模型能不能用——而 engine 层那套 leader/collectives/per-instance 协调，是 [`../architecture/control-plane.md`](../architecture/control-plane.md) 明确拒绝的。
+- 布局也对不上：lake 用 page-first（整块所有层连续、一条 `(ptr, len)` 传给引擎，对齐 SGLang），和 dynamo 的 layout 假设不同。
+- vendor 的主要收益——现成的测试——在这两层拿不到：它们的正确性依赖真实环境（NIXL、RDMA 网卡、GPU、S3），拷过来单测跑不起来，只剩下钉工具链和 re-vendor 合并的成本。
+- 语言边界：engine 层管对接推理引擎，lake 的引擎对接在 Python 计算层，用不上它。
+- 推论：就算传输底座改选 NIXL，也只能救回 physical 的 transfer 半边，engine 层依然不可用。真正的决策点是"KV 归谁、谁发起传输"，传输底座的选择是它的下游。
 - 其余（SGLang HiCache 策略、LMCache 后端思路、vLLM `KVConnectorBase_V1`、Dynamo kv-router 选路公式）继续以**借鉴/对照**为主，默认不链进依赖树；计算层（P5）再评估 vLLM/SGLang 引擎经 connector 接入。
 
 **现状（P4.2 合入 / P4.3）**：复用 **B** vendor + controlplane radix/驱逐。**P4.3**：`LocalTierEngine`（写回**只 L2**；L3 仅 demote/cap XOR；`pin`≈`lock_ref`；`TierSideEffects`）+ `TierPipeline` + `apply_location_events`；PutEnd=Mooncake COMPLETE。对齐 `storage-layer.md` 写回路径与 SGLang demotion-only L1。真 NVMe/跨机 defer P5；满块顺便写 L1 留 P7。

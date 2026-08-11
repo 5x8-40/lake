@@ -108,6 +108,24 @@ submitTransfer(BatchID, {TransferRequest{WRITE, source=local_kv_addr,
 
 **关键差异**:抄 API/生命周期与 TCP 退化语义,**不**接入 Mooncake CMake/FFI;位置视图/radix 仍在 controlplane,不在 TE。
 
+### 为什么 P4 不接 FFI,P5 才接
+
+接 FFI 的成本是固定的:CMake 工程进 Rust workspace、工具链要钉两套、CI 变重、崩溃时多一层调试面。收益则随阶段变化:FFI 买到的是 RDMA 硬件路径,只有"机器上有 RDMA 网卡,且这个阶段要验证的恰恰是传输性能"时才值钱。
+
+- P4 两个条件都不满足。P4 验证的是池语义(radix、位置视图、ref 冻结、durable-first),字节怎么搬不影响结论;原型机上没有 RDMA 网卡,就算接了 TE,启动时也会走它自己的 TCP 退化路径(`MC_FORCE_TCP` 或无 HCA)——花全部接入成本,买回来一个我们已经写过的 TCP 兜底。
+- P5 两个条件都满足。存算分离要验证的核心变量就是传输时间:D-direct 省掉传输的收益有多大、5ms 模式选择预算怎么核算、DualPath 带宽怎么分,都要在真实 RDMA 路径上量,TCP 进程内拷贝量不出来。
+- 到 P5 也不能继续靠自写。性能路径要的是硬件原语工程:verbs 编程、QP 管理、CQ 轮询、GPU 内存的 DMA-BUF 注册、多 NIC 拓扑调度。这些 TE 已经在生产环境踩平,自写等于再造一个 TE——这个阶段 FFI 比自研便宜,还能跟上上游维护。
+
+顺序也有讲究:先自写 `Transport` trait,是把"lake 需要传输层长什么样"用自己的代码钉死,P5 让 TE 来适配这个形状。如果 P4 就 FFI,池的语义会反过来被 TE 的 C++ 接口(注册模型、错误模型、batch 生命周期)拖着走。
+
+### 现状:接口 + 原型实现 + 将来的第二个实现
+
+- `Transport` trait:业务代码(storage-agent、kv-pool)只面对它,不关心底层是 TCP 还是 TE。
+- `TcpTransport`:现在的原型实现,P5 之后不扔,留作没有 RDMA 环境的兜底——对应 TE 自己的 TCP 退化路径。
+- `RdmaTransport`(P5):同一个 trait 的第二个实现,FFI 适配 TE。接入动作是"加一个实现、按环境选择",不是"换掉原型"。
+
+备选也留着:NIXL 可以作为 trait 的另一个实现;`TransferService` 已经是 gRPC 形状,TE 也可以不进进程、以 sidecar 方式挂在后面。FFI 和进程外两条路都没堵死。
+
 ## 代码索引
 
 > 沿代码回溯用。符号名锚定,行号会漂移——找不到时 `grep -n "符号名" <文件>`。
