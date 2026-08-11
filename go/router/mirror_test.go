@@ -81,6 +81,57 @@ func TestMirrorApplySnapshotAnchorIncrement(t *testing.T) {
 	}
 }
 
+// D1(issue #74):快照(seq=0)必须重置 lastSeq——CP 重启后序号世代归 1,
+// 否则后续 seq <= 旧 lastSeq 的增量被去重分支静默丢弃,镜像永久陈旧。
+func TestMirrorSnapshotResetsSeq(t *testing.T) {
+	m := NewViewMirror()
+	// 旧世代:快照 + 锚点推进到 lastSeq=100。
+	if err := m.Apply(&lakepb.ViewUpdate{Seq: 0, Events: []*lakepb.ViewEvent{
+		regEvent("m", "old"),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Apply(&lakepb.ViewUpdate{Seq: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.LastSeq(); got != 100 {
+		t.Fatalf("lastSeq = %d, want 100", got)
+	}
+
+	// CP 重启:新快照(seq=0)只含新世代的块。
+	if err := m.Apply(&lakepb.ViewUpdate{Seq: 0, Events: []*lakepb.ViewEvent{
+		regEvent("m", "new"),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.LastSeq(); got != 0 {
+		t.Fatalf("snapshot must reset lastSeq, got %d", got)
+	}
+	if _, ok := m.Locate(&lakepb.KVBlockID{
+		ModelId: "m", PoolKind: lakepb.PoolKind_TARGET, BlockHash: []byte("old"),
+	}, ""); ok {
+		t.Fatal("snapshot must rebuild blocks (old block gone)")
+	}
+	// 锚点推进到新世代 last=1。
+	if err := m.Apply(&lakepb.ViewUpdate{Seq: 1}); err != nil {
+		t.Fatal(err)
+	}
+	// 新世代增量 seq=2 必须被接受(修复前会被 seq<=100 去重静默丢弃)。
+	if err := m.Apply(&lakepb.ViewUpdate{Seq: 2, Events: []*lakepb.ViewEvent{
+		regEvent("m", "h2"),
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.Locate(&lakepb.KVBlockID{
+		ModelId: "m", PoolKind: lakepb.PoolKind_TARGET, BlockHash: []byte("h2"),
+	}, ""); !ok {
+		t.Fatal("post-restart increment seq=2 must be applied")
+	}
+	if got := m.LastSeq(); got != 2 {
+		t.Fatalf("lastSeq = %d, want 2", got)
+	}
+}
+
 func TestMirrorApplyGap(t *testing.T) {
 	m := NewViewMirror()
 	if err := m.Apply(&lakepb.ViewUpdate{Seq: 0, Events: []*lakepb.ViewEvent{regEvent("m", "h0")}}); err != nil {

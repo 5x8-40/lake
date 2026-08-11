@@ -68,23 +68,6 @@ impl TierSideEffects {
     }
 }
 
-/// One L2→L3 demote — enough to undo if the enclosing op fails.
-struct L2Demote {
-    hash: Vec<u8>,
-    /// Bytes removed from L2 (restored on undo even when L3 already had SSOT).
-    l2_bytes: Vec<u8>,
-    /// Whether this demote inserted into L3 (`entry` was vacant).
-    inserted_l3: bool,
-}
-
-struct L2DemoteBatch(Vec<L2Demote>);
-
-impl L2DemoteBatch {
-    fn into_hashes(self) -> Vec<Vec<u8>> {
-        self.0.into_iter().map(|d| d.hash).collect()
-    }
-}
-
 /// In-process L0–L3 byte maps + LRU + local pin (≈ SGLang `lock_ref`).
 pub struct LocalTierEngine {
     caps: TierCaps,
@@ -333,8 +316,9 @@ impl LocalTierEngine {
     /// 各说各的真话,不破坏 durable-first 不变量;N=2–4 时滞后仅 5–10s 且多轮
     /// 复用发生在请求屏障之后,损失可忽略,故暂缓。
     ///
-    /// `ensure_l2_cap` 失败时**回滚本窗全部 L2→L3 demote**（含本次 hash 被挤到 L3
-    /// 的情况），避免 Err 仍 `is_settled` / 污染 L3。
+    /// `ensure_l2_cap` 失败时**保证零变更**（两阶段：先扫描定受害者，确认可达
+    /// cap 才应用；全 pinned 则 Err 且未动任何状态），因此 Err 路径只需撤销本次
+    /// insert/touch，不存在"回滚本窗 demote"的需求。
     ///
     /// 覆盖写（同 hash 已有 L2）失败时**恢复原先 L2 字节**，不无条件 `remove`
     ///（幂等重放 / 重试安全）。新插入失败则撤掉本次 key。
@@ -344,7 +328,11 @@ impl LocalTierEngine {
         bytes: &[u8],
     ) -> Result<(LocalTier, TierSideEffects), String> {
         let prior_l2 = self.l2.get(h).cloned();
-        let prior_l2_order = self.l2_order.clone();
+        // S6(issue #74):轻量回滚记录——只记 h 在 l2_order 的原位置(O(N) 比较、
+        // 无分配),替代原先全量 VecDeque clone(N 个 Vec<u8> 深拷贝,每次 put 都付)。
+        // 配合 ensure_l2_cap 两阶段 Err 零变更,失败时弹出队尾 h 并按原位置插回
+        // 即可逐位复原 LRU 顺序(PR #47「失败回滚不扰动 LRU」语义不变)。
+        let h_prior_pos = self.l2_order.iter().position(|x| x.as_slice() == h);
         let had_placement = self.l2_arena.placement(h).is_some();
         self.l2.insert(h.to_vec(), bytes.to_vec());
         Self::touch(&mut self.l2_order, h);
@@ -352,24 +340,27 @@ impl LocalTierEngine {
             self.note_l2_present(h);
         }
         let l2_demoted_to_l3 = match self.ensure_l2_cap() {
-            Ok(d) => d.into_hashes(),
-            Err((demoted, e)) => {
-                // Undo every demote in this window, then restore pre-call L2.
-                self.undo_l2_demotes(&demoted);
+            Ok(d) => d,
+            Err(e) => {
+                // ensure_l2_cap Err = 零变更;只需撤销本次 insert/touch。
                 match prior_l2 {
                     Some(old) => {
                         self.l2.insert(h.to_vec(), old);
-                        Self::touch(&mut self.l2_order, h);
                     }
                     None => {
                         self.l2.remove(h);
-                        self.l2_order.retain(|x| x.as_slice() != h);
                         if !had_placement {
                             self.note_l2_absent(h);
                         }
                     }
                 }
-                self.l2_order = prior_l2_order;
+                // h 现居队尾(touch 放入、ensure_l2_cap 未动);弹出后按原位置
+                // 插回(原本不在 = 新插入,截断即复原)。
+                debug_assert_eq!(self.l2_order.back().map(|x| x.as_slice()), Some(h));
+                self.l2_order.pop_back();
+                if let Some(pos) = h_prior_pos {
+                    self.l2_order.insert(pos, h.to_vec());
+                }
                 return Err(e);
             }
         };
@@ -391,62 +382,64 @@ impl LocalTierEngine {
         }
     }
 
-    /// Coldest-first LRU demote L2→L3. On stuck-pinned, returns demotes so far
-    /// for caller rollback (put/promote must not leak L3 on Err).
-    fn ensure_l2_cap(&mut self) -> Result<L2DemoteBatch, (L2DemoteBatch, String)> {
-        let mut demoted = Vec::new();
+    /// Coldest-first LRU demote L2→L3。两阶段(S6, issue #74):先按索引扫描选定
+    /// 受害者(不变更任何状态),确认可达 cap 才进入应用阶段;扫描发现全 pinned
+    /// 则 Err 且**零变更**,调用方无需回滚 demote(替代旧 pop/rotate + 失败时
+    /// 全量快照恢复)。受害者选择与旧实现一致:unpinned 中 coldest-first。
+    fn ensure_l2_cap(&mut self) -> Result<Vec<Vec<u8>>, String> {
         let cap = self.caps.l2;
         if cap == 0 {
-            return Ok(L2DemoteBatch(demoted));
+            return Ok(Vec::new());
         }
-        let mut skipped = 0usize;
-        while self.l2.len() > cap {
-            if skipped >= self.l2.len() {
-                return Err((
-                    L2DemoteBatch(demoted),
-                    format!(
-                        "l2 over cap ({}>{cap}): all victims pinned — unpin before put",
-                        self.l2.len()
-                    ),
+        // 阶段一:扫描(只读)。stale 条目(不在 l2)不计数,应用阶段顺带 GC——
+        // 与旧实现 pop 后 continue 的清理语义一致。
+        let mut demote_idx: Vec<usize> = Vec::new();
+        let mut stale_idx: Vec<usize> = Vec::new();
+        let mut evictable = self.l2.len();
+        if evictable > cap {
+            for (i, h) in self.l2_order.iter().enumerate() {
+                if evictable <= cap {
+                    break;
+                }
+                if !self.l2.contains_key(h) {
+                    stale_idx.push(i);
+                    continue;
+                }
+                // pinned 保持原位:旧实现 rotate 到队尾是 pop/push 的副产物,
+                // 并非设计语义(pin 不应让块变热)。
+                if self.pin_count(h) > 0 {
+                    continue;
+                }
+                demote_idx.push(i);
+                evictable -= 1;
+            }
+            if evictable > cap {
+                return Err(format!(
+                    "l2 over cap ({}>{cap}): all victims pinned — unpin before put",
+                    self.l2.len()
                 ));
             }
-            let Some(victim) = self.l2_order.pop_front() else {
-                break;
-            };
-            if !self.l2.contains_key(&victim) {
-                continue;
-            }
-            if self.pin_count(&victim) > 0 {
-                self.l2_order.push_back(victim);
-                skipped += 1;
-                continue;
-            }
-            skipped = 0;
+        }
+        // 阶段二:应用(l2/l3 map 操作不可失败)。
+        let mut demoted = Vec::with_capacity(demote_idx.len());
+        for &i in &demote_idx {
+            let victim = self.l2_order[i].clone();
             if let Some(bytes) = self.l2.remove(&victim) {
-                let inserted_l3 = !self.l3.contains_key(&victim);
-                if inserted_l3 {
-                    self.l3.insert(victim.clone(), bytes.clone());
-                }
-                // else: L3 already holds SSOT; drop L2 copy (same as `or_insert`).
-                demoted.push(L2Demote {
-                    hash: victim,
-                    l2_bytes: bytes,
-                    inserted_l3,
-                });
+                // L3 已有 SSOT 时仅丢 L2 副本(同旧 `or_insert` 语义)。
+                self.l3.entry(victim.clone()).or_insert(bytes);
+                demoted.push(victim);
             }
         }
-        Ok(L2DemoteBatch(demoted))
-    }
-
-    fn undo_l2_demotes(&mut self, demoted: &L2DemoteBatch) {
-        for d in demoted.0.iter().rev() {
-            if d.inserted_l3 {
-                self.l3.remove(&d.hash);
-            }
-            self.l2.insert(d.hash.clone(), d.l2_bytes.clone());
-            Self::touch(&mut self.l2_order, &d.hash);
-            self.note_l2_present(&d.hash);
+        if !demote_idx.is_empty() || !stale_idx.is_empty() {
+            let drop: HashSet<usize> = demote_idx.iter().chain(&stale_idx).copied().collect();
+            let mut i = 0usize;
+            self.l2_order.retain(|_| {
+                let keep = !drop.contains(&i);
+                i += 1;
+                keep
+            });
         }
+        Ok(demoted)
     }
 
     pub fn probe(&mut self, h: &[u8]) -> AccessKind {
@@ -515,14 +508,14 @@ impl LocalTierEngine {
             Self::touch(&mut self.l2_order, h);
             self.note_l2_present(h);
             match self.ensure_l2_cap() {
-                Ok(d) => {
-                    for victim in &d.0 {
-                        self.note_l2_absent(&victim.hash);
+                Ok(demoted) => {
+                    for victim in &demoted {
+                        self.note_l2_absent(victim);
                     }
-                    effects.l2_demoted_to_l3 = d.into_hashes();
+                    effects.l2_demoted_to_l3 = demoted;
                 }
-                Err((demoted, e)) => {
-                    self.undo_l2_demotes(&demoted);
+                Err(e) => {
+                    // ensure_l2_cap Err = 零变更;撤掉本次 insert/touch 即可。
                     self.l2.remove(h);
                     self.l2_order.retain(|x| x.as_slice() != h);
                     self.note_l2_absent(h);
@@ -665,6 +658,10 @@ impl LocalTierEngine {
     /// 因此 L1 drop 无需 revoke。`LocationEvent::Present{L1}` / `apply_location_events`
     /// 的 L1 arm 为未来「满块顺便写 L1 / P7」预留，当前无生产者——若开始发 L1
     /// 事件，此处必须同步上报 Absent，否则视图漂移（#20；PR #31 review §4.2）。
+    ///
+    /// S8(issue #74 备忘,出处 issue #20 遗留表 4.2):L1 驱逐静默是**设计一致**
+    ///（L1 presence 不进 CP 视图,视图无账可漂）;若将来 L1 presence 上视图,
+    /// 本函数的驱逐必须同步 Absent 事件,否则 CP 镜像永久残留 L1 位置。
     fn ensure_l1_room(&mut self) {
         let cap = self.caps.l1;
         if cap == 0 {
@@ -807,6 +804,30 @@ mod tests {
         assert!(e.is_l2_durable(b"x") && e.l3_present(b"y"));
     }
 
+    /// PR #77 review:两阶段 `ensure_l2_cap` 的有意语义变更钉测——pinned 块在
+    /// L2 压力下保持 LRU 原位,不再像旧实现 pop/rotate 到队尾(pin 是冻结语义,
+    /// 不应让块变热)。若有人改回 rotate,本测试失败。
+    #[test]
+    fn s6_pinned_victim_keeps_l2_lru_position() {
+        let mut e = LocalTierEngine::with_caps(TierCaps {
+            l0: 4,
+            l1: 8,
+            l2: 3,
+        });
+        e.put_durable(b"x", b"X").unwrap();
+        e.put_durable(b"a", b"A").unwrap();
+        e.put_durable(b"b", b"B").unwrap();
+        e.pin(b"x"); // 最冷块 pinned:扫描必经,旧实现会把它 rotate 到队尾
+        e.put_durable(b"c", b"C").unwrap(); // 压力:demote 最冷 unpinned(a)
+        assert!(e.l3_present(b"a") && !e.is_l2_durable(b"a"));
+        let order: Vec<&[u8]> = e.l2_order.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            order,
+            [b"x".as_slice(), b"b".as_slice(), b"c".as_slice()],
+            "pinned x 必须保持队首原位(旧实现 rotate 后为 [b, x, c])"
+        );
+    }
+
     #[test]
     fn all_pinned_l2_over_cap_errors_and_rolls_back() {
         let mut e = LocalTierEngine::with_caps(TierCaps {
@@ -888,6 +909,38 @@ mod tests {
         assert!(!e.l3_present(b"w"), "w not left on L3");
         assert_eq!(e.get(b"w"), Some(b"W".as_slice()));
         assert_eq!(e.l2_order, prior_order);
+    }
+
+    /// S6(issue #74):大 L2 队列下失败回滚逐位保序——轻量回滚记录(h 原位置)
+    /// 与全量快照等效;新写与覆盖写两种失败路径都验证。
+    #[test]
+    fn put_durable_err_rollback_large_l2_order_preserved() {
+        let mut e = LocalTierEngine::with_caps(TierCaps {
+            l0: 4,
+            l1: 8,
+            l2: 1024,
+        });
+        // 1024 个 pinned 常驻块填满 cap。
+        for i in 0..1024u32 {
+            let h = format!("b{i:04}").into_bytes();
+            e.put_durable(&h, b"V").unwrap();
+            e.pin(&h);
+        }
+        // 强制再塞一个 pinned 常驻 → over cap。
+        e.l2.insert(b"z".to_vec(), b"Z".to_vec());
+        e.l2_order.push_back(b"z".to_vec());
+        e.pin(b"z");
+        let prior_order = e.l2_order.clone();
+        // 新写失败(全 pinned):顺序逐位不变,块不留痕。
+        let err = e.put_durable(b"y", b"Y").unwrap_err();
+        assert!(err.contains("pinned"), "{err}");
+        assert_eq!(e.l2_order, prior_order, "新写失败回滚后 LRU 逐位不变");
+        assert!(!e.is_settled(b"y"));
+        // 覆盖写失败(改写队首块):旧字节恢复,顺序逐位不变。
+        let err = e.put_durable(b"b0000", b"NEW").unwrap_err();
+        assert!(err.contains("pinned"), "{err}");
+        assert_eq!(e.l2_order, prior_order, "覆盖写失败回滚后 LRU 逐位不变");
+        assert_eq!(e.get(b"b0000"), Some(b"V".as_slice()));
     }
 
     #[test]

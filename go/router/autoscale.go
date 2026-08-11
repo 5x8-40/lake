@@ -3,7 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -354,8 +354,8 @@ func (s *Server) applyScale(ctx context.Context, d ScaleDecision) error {
 		s.lastReadyLatencyMu.Lock()
 		s.lastReadyLatency = time.Since(start)
 		s.lastReadyLatencyMu.Unlock()
-		log.Printf("scale-out: %s ready (migrations=%d, ring_gen=%d)",
-			id, resp.GetMigrationCount(), resp.GetMap().GetGeneration())
+		slog.Info("scale-out: node ready",
+			"node", id, "migrations", resp.GetMigrationCount(), "ring_gen", resp.GetMap().GetGeneration())
 		// P7 收口(方案 Z):新节点 warmup 由池侧自主决策发起——CP 在
 		// JoinShardNode 后按 hit_count(ReportHits 喂入)选热块并下发
 		// PlaceBlocks;Router 不指挥放置,只持续上报命中(autoscaleTick 尾部)。
@@ -382,8 +382,8 @@ func (s *Server) applyScale(ctx context.Context, d ScaleDecision) error {
 			return fmt.Errorf("DrainShardNode rejected: %s", resp.GetErr())
 		}
 		s.syncCapacity() // victim 摘出路由 → 并发随节点数降
-		log.Printf("scale-in: drain %s (migrations=%d, push_l2=%d)",
-			victim, resp.GetMigrationCount(), len(resp.GetPushL2()))
+		slog.Info("scale-in: drain node",
+			"node", victim, "migrations", resp.GetMigrationCount(), "push_l2", len(resp.GetPushL2()))
 		s.reapDraining(ctx)
 	}
 	return nil
@@ -409,7 +409,7 @@ func (s *Server) reapDraining(ctx context.Context) {
 		ack, err := s.cp.RemoveShardNode(ctx, &lakepb.RemoveShardNodeRequest{NodeId: id})
 		if err == nil && ack.GetOk() {
 			s.nodes.remove(id)
-			log.Printf("scale-in: %s removed from shard ring", id)
+			slog.Info("scale-in: node removed from shard ring", "node", id)
 		}
 	}
 }
@@ -433,9 +433,9 @@ func (s *Server) autoscaleTick(ctx context.Context) {
 	}
 	d := s.scaler.Evaluate(time.Now(), m, s.nodes.count())
 	if d != DecideNone {
-		log.Printf("autoscale: %+v nodes=%d → %s", m, s.nodes.count(), d)
+		slog.Info("autoscale decision", "metrics", m, "nodes", s.nodes.count(), "decision", d)
 		if err := s.applyScale(ctx, d); err != nil {
-			log.Printf("autoscale apply %s: %v", d, err)
+			slog.Error("autoscale apply failed", "decision", d, "err", err)
 		}
 	}
 }
@@ -452,7 +452,8 @@ func (s *Server) flushHotHits(ctx context.Context) {
 			continue
 		}
 		if _, err := s.cp.ReportHits(ctx, &lakepb.ReportHitsRequest{NodeId: node, Ids: ids}); err != nil {
-			log.Printf("report hits: %v", err)
+			// best-effort(失败不重发)——可容忍失败降级 Warn,不打 Error。
+			slog.Warn("report hits failed", "node", node, "ids", len(ids), "err", err)
 		}
 	}
 }

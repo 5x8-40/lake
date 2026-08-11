@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -37,7 +38,7 @@ func main() {
 	}
 	defer func() {
 		if err := s.Close(); err != nil {
-			log.Printf("close router: %v", err)
+			slog.Error("close router failed", "err", err)
 		}
 	}()
 
@@ -50,8 +51,8 @@ func main() {
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("lake-router OpenAI HTTP on %s → agent %s → worker %s",
-			cfg.HTTPAddr, cfg.AgentAddr, cfg.WorkerAddr)
+		slog.Info("lake-router OpenAI HTTP listening",
+			"http_addr", cfg.HTTPAddr, "agent_addr", cfg.AgentAddr, "worker_addr", cfg.WorkerAddr)
 		errCh <- httpServer.ListenAndServe()
 	}()
 

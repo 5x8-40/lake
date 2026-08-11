@@ -75,6 +75,8 @@ D-direct 的残差 prefill 与 P 侧同算力成本，省掉整段传输——**
 
 **与 SGLang 互证**：派生阈值 ≈256 token 恰与 SGLang 硬编码 `prefetch_threshold=256`（`hiradix_cache.py::prefetch_from_storage`，L3 命中段短于阈值则放弃预取直接重算，见 [`../research/sglang/hicache.md`](../research/sglang/hicache.md)）同值——reference 的拍脑袋魔数被本模型从介质成本推出，互为印证。关键差异：SGLang 阈值全局硬编码；我们按层派生、随真机剖面校准。
 
+**回归锚**：本节派生阈值（H*@10GB/s、L1/L3 T*）由 [`bench/test_cost_model.py`](../../bench/test_cost_model.py) 钉死并入 CI 门禁（钉法同 Go/Rust HRW 跨语言镜像向量测试）；改 `ModelParams` 常量 / `TIER_LOAD_PROFILES` 剖面需同步更新本文阈值表与 [`../features/slo.md`](../features/slo.md) 回填，不能只改测试。
+
 **与决策 B 的正交性**（churn 抑制，见 [`kv-cache-pool.md`](kv-cache-pool.md)「P7.3 校准结论」）：本节回答「本次用不用」（成本判定）；「用完留不留」（promote 后待遇）由 hit_count 准入判定。L3 命中段 ≥2 块才加载，加载后是否给热块待遇仍看 hit_count。
 
 ### 6. 带宽输入的三层结构（sub-GB/s 细分，issue #68 条目 4 定稿 2026-08-05）

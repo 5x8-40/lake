@@ -127,13 +127,15 @@ func (DefragMode) EnumDescriptor() ([]byte, []int) {
 }
 
 // --- 全局 ref 上报(P4.2 合账骨架；完整两级见 architecture/kv-cache-pool.md) ---
-// RefKind：wire 预留三类本地子计数；P4.2 控制面尚未分账（见 ReportRef 注释）。
+// RefKind：S4(issue #74)起 CP 按 kind 分账；`resolve_ref_kind` 仅接受
+//
+//	REQUEST/WRITEBACK——IN_FLIGHT 预留未接线、UNSPECIFIED 为缺省，二者显式报错。
 type RefKind int32
 
 const (
 	RefKind_REF_KIND_UNSPECIFIED RefKind = 0
 	RefKind_REQUEST              RefKind = 1 // 请求持有
-	RefKind_IN_FLIGHT            RefKind = 2 // 在途传输
+	RefKind_IN_FLIGHT            RefKind = 2 // 在途传输(预留未接线,上报即报错)
 	RefKind_WRITEBACK            RefKind = 3 // 写回未 durable ack
 )
 
@@ -2980,7 +2982,7 @@ func (x *RegisterBlocksRequest) GetPrefixHashes() [][]byte {
 type RefDelta struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Id            *KVBlockID             `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
-	Kind          RefKind                `protobuf:"varint,2,opt,name=kind,proto3,enum=lake.RefKind" json:"kind,omitempty"` // P4.2 可填但 CP 忽略；后续分账用
+	Kind          RefKind                `protobuf:"varint,2,opt,name=kind,proto3,enum=lake.RefKind" json:"kind,omitempty"` // 必填 REQUEST/WRITEBACK；IN_FLIGHT/UNSPECIFIED 显式拒绝
 	Delta         int32                  `protobuf:"varint,3,opt,name=delta,proto3" json:"delta,omitempty"`                 // +1 / -1(允许多)
 	NodeId        string                 `protobuf:"bytes,4,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
 	unknownFields protoimpl.UnknownFields

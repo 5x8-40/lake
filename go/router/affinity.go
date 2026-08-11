@@ -136,7 +136,7 @@ func (s *Server) pickNodeForRequest(model string, hashes [][]byte, routingKey []
 				return c.id
 			}
 		}
-		// 全部命中节点过载 → 冷路径(加权 HRW 会自然绕开高载)。
+		// 全部命中节点过载 → 冷路径(护栏过滤的纯整数 HRW,见下;负载不进 score)。
 	}
 
 	// 冷路径:纯整数 HRW(负载经护栏过滤表达,不进 score;与池侧预放置同构)。

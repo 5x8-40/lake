@@ -109,6 +109,54 @@ pub(crate) struct Entry {
     pub(crate) prefix_chain: Vec<Vec<u8>>,
 }
 
+/// S4(issue #74):per-block ref 按 proto `RefKind` 分账(请求持有 / 写回未 durable)。
+/// 驱逐冻结语义仍看**总数**(`total() > 0` 冻结不变);分账的价值是 kind 级
+/// underflow 定位与可观测性(写回泄漏 vs 请求泄漏可区分)。
+/// 参考:SGLang `radix_cache.py::inc_lock_ref/dec_lock_ref` 分 kind 持锁——
+/// kind 只影响记账维度,不改变「任一持有即冻结」的判定;lake 同构。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RefAccounts {
+    pub(crate) request: i64,
+    pub(crate) writeback: i64,
+}
+
+impl RefAccounts {
+    pub(crate) fn total(&self) -> i64 {
+        self.request + self.writeback
+    }
+
+    pub(crate) fn bucket_mut(&mut self, kind: RefKind) -> &mut i64 {
+        match kind {
+            RefKind::Request => &mut self.request,
+            RefKind::Writeback => &mut self.writeback,
+            // 入账前必经 `resolve_ref_kind` 过滤,此处不可达。
+            _ => unreachable!("unsupported ref_kind filtered by resolve_ref_kind"),
+        }
+    }
+
+    pub(crate) fn bucket(&self, kind: RefKind) -> i64 {
+        match kind {
+            RefKind::Request => self.request,
+            RefKind::Writeback => self.writeback,
+            _ => unreachable!("unsupported ref_kind filtered by resolve_ref_kind"),
+        }
+    }
+}
+
+/// S4:入账 kind 解析——REQUEST/WRITEBACK 记账;IN_FLIGHT 预留未接线、
+/// UNSPECIFIED 为缺省,一律显式报错(对齐 PR #47 显式错误哲学;agent 当前
+/// 只上报 REQUEST/WRITEBACK,见 storage-agent `putend.rs`)。
+pub(crate) fn resolve_ref_kind(raw: i32) -> Result<RefKind, String> {
+    let kind = RefKind::try_from(raw).map_err(|_| format!("RefDelta: unknown ref_kind {raw}"))?;
+    match kind {
+        RefKind::Request | RefKind::Writeback => Ok(kind),
+        _ => Err(format!(
+            "RefDelta: unsupported ref_kind {} (want REQUEST/WRITEBACK)",
+            kind.as_str_name()
+        )),
+    }
+}
+
 /// One Dynamo-shaped registry domain per `pool_kind`.
 pub(crate) struct PoolView {
     pub(crate) registry: BlockRegistry,
@@ -118,7 +166,8 @@ pub(crate) struct PoolView {
     pub(crate) seq_to_flat: HashMap<SequenceHash, Vec<u8>>,
     pub(crate) inactive: Box<dyn InactiveIndex>,
     pub(crate) inactive_cap: usize,
-    pub(crate) global_refs: HashMap<SequenceHash, i64>,
+    /// S4:per-block ref 按 kind 分账;冻结/驱逐判定看 `RefAccounts::total()`。
+    pub(crate) global_refs: HashMap<SequenceHash, RefAccounts>,
     /// P7 收口:命中计数(ReportHits 喂入)。生产挂 radix 节点
     /// (SGLang `TreeNode.hit_count` 同款),原型平铺按 flat hash;
     /// 供扩容 warmup 选块 / 方案 Z 预放置复用。
@@ -167,7 +216,14 @@ impl PoolView {
         let victims = self.inactive.allocate(n);
         let mut removed = Vec::new();
         for (seq, _bid) in victims {
-            if self.global_refs.get(&seq).copied().unwrap_or(0) > 0 {
+            if self
+                .global_refs
+                .get(&seq)
+                .copied()
+                .unwrap_or_default()
+                .total()
+                > 0
+            {
                 continue;
             }
             self.handles.remove(&seq);
@@ -310,7 +366,8 @@ pub struct Authority {
     /// P4.7: incomplete-write orphans (Mooncake zombie analogue).
     pub(crate) orphans: HashMap<crate::reconcile::BlockKey, crate::reconcile::OrphanEntry>,
     /// P4.7: per-node ref holdings for dead-node reconcile / writeback leak.
-    pub(crate) node_refs: HashMap<String, HashMap<crate::reconcile::BlockKey, i64>>,
+    /// S4:与 global_refs 同口径按 kind 分账,死节点清账按 kind 精确回冲。
+    pub(crate) node_refs: HashMap<String, HashMap<crate::reconcile::BlockKey, RefAccounts>>,
     /// P4.7: injectable clock (orphan TTL tests).
     pub(crate) now_ms: fn() -> u64,
     /// P4.7: last checkpoint seq.
@@ -1085,6 +1142,13 @@ impl Authority {
                 all_local = false;
                 break;
             }
+            // S5(issue #74,评估后保留):此处 clone BlockMeta 是有意为之。
+            // 评估结论:① proto 边界(ReusableBlock.meta / locate 的 Vec<BlockMeta>)
+            // 要求 owned 值,内部改 Arc<BlockMeta> 只是把 clone 挪到边界、省不掉;
+            // ② BlockMeta 体量小(id + 少量 locations + 时间戳),clone 成本 O(locations);
+            // ③ lookup_prefix 每请求只 clone 命中前缀段(受前缀长度约束),locate 走
+            // 批量/观测路径而非逐 token 热路径。若 P7  profiling 证明此处成热点的,
+            // 再考虑返回轻量视图(hash+locations 摘要)并同步改 proto。
             let meta = entry.meta.clone();
             if pool.handles.contains_key(&seq) {
                 pool.registry.touch(seq);
@@ -1161,44 +1225,62 @@ impl Authority {
     }
 
     pub fn report_refs(&mut self, deltas: &[RefDelta]) -> Result<(), String> {
-        let mut projected: HashMap<RefTarget, i64> = HashMap::new();
-        let mut projected_node: HashMap<(String, crate::reconcile::BlockKey), i64> = HashMap::new();
+        // S4:批投影按 kind 分账——同一批内同块不同 kind 各自累计、各自校验。
+        let mut projected: HashMap<RefTarget, RefAccounts> = HashMap::new();
+        let mut projected_node: HashMap<(String, crate::reconcile::BlockKey), RefAccounts> =
+            HashMap::new();
         for (i, d) in deltas.iter().enumerate() {
             let target = self
                 .ref_target(d)
                 .map_err(|e| format!("ReportRef batch[{i}]: {e}"))?;
+            let kind =
+                resolve_ref_kind(d.kind).map_err(|e| format!("ReportRef batch[{i}]: {e}"))?;
             let id = d.id.as_ref().expect("ref_target checked id");
-            let cur = *projected.entry(target.clone()).or_insert_with(|| {
+            let accounts = projected.entry(target.clone()).or_insert_with(|| {
                 self.namespaces
                     .get(&target.key)
                     .and_then(|ns| ns.pool(target.pool_kind))
                     .and_then(|pool| pool.global_refs.get(&target.seq).copied())
-                    .unwrap_or(0)
+                    .unwrap_or_default()
             });
-            let next = cur
-                .checked_add(i64::from(d.delta))
-                .ok_or_else(|| format!("ReportRef batch[{i}]: ref_count overflow"))?;
+            let bucket = accounts.bucket_mut(kind);
+            let next = bucket.checked_add(i64::from(d.delta)).ok_or_else(|| {
+                format!(
+                    "ReportRef batch[{i}]: ref_count overflow (kind={})",
+                    kind.as_str_name()
+                )
+            })?;
             if next < 0 {
-                return Err(format!("ReportRef batch[{i}]: ref_count underflow"));
+                return Err(format!(
+                    "ReportRef batch[{i}]: ref_count underflow (kind={})",
+                    kind.as_str_name()
+                ));
             }
-            projected.insert(target, next);
+            *bucket = next;
 
             if !d.node_id.is_empty() && d.delta != 0 {
                 let block_key = crate::reconcile::BlockKey::from_id(id);
                 let node_key = (d.node_id.clone(), block_key);
-                let cur = *projected_node.entry(node_key.clone()).or_insert_with(|| {
+                let accounts = projected_node.entry(node_key.clone()).or_insert_with(|| {
                     self.node_refs
                         .get(&node_key.0)
                         .and_then(|held| held.get(&node_key.1).copied())
-                        .unwrap_or(0)
+                        .unwrap_or_default()
                 });
-                let next = cur
-                    .checked_add(i64::from(d.delta))
-                    .ok_or_else(|| format!("ReportRef batch[{i}]: node_ref overflow"))?;
+                let bucket = accounts.bucket_mut(kind);
+                let next = bucket.checked_add(i64::from(d.delta)).ok_or_else(|| {
+                    format!(
+                        "ReportRef batch[{i}]: node_ref overflow (kind={})",
+                        kind.as_str_name()
+                    )
+                })?;
                 if next < 0 {
-                    return Err(format!("ReportRef batch[{i}]: node_ref underflow"));
+                    return Err(format!(
+                        "ReportRef batch[{i}]: node_ref underflow (kind={})",
+                        kind.as_str_name()
+                    ));
                 }
-                projected_node.insert(node_key, next);
+                *bucket = next;
             }
         }
         for d in deltas {
@@ -1243,20 +1325,38 @@ impl Authority {
             .unwrap_or(0)
     }
 
+    /// 总 ref(两种 kind 合计)——驱逐冻结语义的判定口径。
     pub fn global_ref(&self, model_id: &str, revision: &str, pool_kind: i32, flat: &[u8]) -> i64 {
+        let (request, writeback) = self.global_ref_by_kind(model_id, revision, pool_kind, flat);
+        request + writeback
+    }
+
+    /// S4(issue #74):分 kind 观测——返回 `(request, writeback)`。
+    pub fn global_ref_by_kind(
+        &self,
+        model_id: &str,
+        revision: &str,
+        pool_kind: i32,
+        flat: &[u8],
+    ) -> (i64, i64) {
         let Ok(pk) = resolve_pool_kind(pool_kind) else {
-            return 0;
+            return (0, 0);
         };
         let Some(ns) = self.ns(model_id, revision) else {
-            return 0;
+            return (0, 0);
         };
         let Some(pool) = ns.pool(pk) else {
-            return 0;
+            return (0, 0);
         };
         let Some(entry) = pool.by_flat.get(flat) else {
-            return 0;
+            return (0, 0);
         };
-        pool.global_refs.get(&entry.seq_hash).copied().unwrap_or(0)
+        let a = pool
+            .global_refs
+            .get(&entry.seq_hash)
+            .copied()
+            .unwrap_or_default();
+        (a.request, a.writeback)
     }
 
     pub fn complete_barrier(&mut self, request_id: &str, node_id: &str) -> Result<(), String> {
@@ -1363,6 +1463,14 @@ impl Authority {
                 Tier::L2 => handle.mark_absent::<TierL2>(),
                 _ => {}
             }
+            // S1(issue #74):L0 驱逐连带清 (flat,node) 放置滞回标记——否则已计划→
+            // 放置→被驱逐的块永远无法再触发对该节点的放置,follow_traffic 注释声称的
+            // 「驱逐后可再触发(自愈)」不成立。与死节点清 marks(reconcile.rs
+            // `placement_marks.retain(|(_, n)| ...)`)同构。
+            if tier == Tier::L0 {
+                pool.placement_marks
+                    .remove(&(flat.to_vec(), node_id.to_string()));
+            }
         }
         // P6.2: 任何实际位置变更 → MOVED(变更后全量位置);!present && !had 为无操作。
         let view_ev = if present || had {
@@ -1383,6 +1491,15 @@ impl Authority {
             None
         };
         if let Some(ev) = view_ev {
+            tracing::debug!(
+                model_id,
+                revision,
+                pool_kind,
+                tier = ?tier,
+                node_id,
+                present,
+                "publish_location"
+            );
             self.pending_view_events.push(ev);
         }
         Ok(())

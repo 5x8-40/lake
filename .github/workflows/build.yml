@@ -78,6 +78,10 @@ jobs:
       # pytest 入门禁(issue #70):torch 依赖测试用 importorskip 守卫、Qwen3 模型依赖测试
       # 用 requires_qwen3/模块级 skip 守卫,CI 无 torch 无模型缓存时自动跳过。
       - run: PYTHONPATH=. python -m pytest lake/ -q
+      # bench/ 成本模型钉测试入门禁(P7 校准声称回归锚,issue #74 口径声明):
+      # 纯函数无 torch 依赖,在仓库根直接跑(working-directory 覆盖 job 默认的 python/)。
+      - run: python -m pytest bench/ -q
+        working-directory: .
 
   # stub drift:重生成 Go/Python stub 后 git diff --exit-code。
   # 拦「proto 改了没重生成 stub」与「工具版本漂移致生成物变」(见 PR #17 review #4)。

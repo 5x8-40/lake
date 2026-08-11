@@ -119,7 +119,7 @@ Dynamo router 维护**本地 radix 树副本**（每 router 实例一份），�
 
 ### 粒度与协议（答 #4 待定）
 
-1. **粒度 = 增量事件 + 单流序号 + gap replay（非快照）**。控制面是**单权威、单发布者**，`publisher_id` 恒为控制面，退化为单流 sequence（比 dynamo 多发布者简单）。借鉴 `DeduplicatingStream`（`mod.rs:218`）的 `(publisher_id, sequence)` 去重。冷启动：snapshot-on-connect（带序号建镜像）→ 之后增量。断线：Router 报 "resume from seq N"，控制面重放。
+1. **粒度 = 增量事件 + 单流序号 + gap replay（非快照）**。控制面是**单权威、单发布者**，`publisher_id` 恒为控制面，退化为单流 sequence（比 dynamo 多发布者简单）。借鉴 `DeduplicatingStream`（`mod.rs:218`）的 `(publisher_id, sequence)` 去重。冷启动：snapshot-on-connect（带序号建镜像）→ 之后增量。断线：Router 报 "resume from seq N"，控制面重放。重放有界，两种回退全量快照：`N+1` 早于 replay buffer floor（缓冲逐出）；或 `N` 达到/超过控制面已发序号上界（CP 重启 `next_seq` 归 1、buffer 空，旧 resume 点无法用重放证明有效，issue #74 S2/D1）——接收方收快照（`seq=0`）时重置镜像与本地序号。
 2. **gap replay 通道 = 单 bidi stream（带 resume），非单独 RPC**。单权威 → 单连接 → 单序号上下文。dynamo 用单独 DEALER socket 是多发布者 pub/sub 拓扑的需要，lake 不必照搬。
 3. **agent 与 Router 同协议**。dynamo router 和 worker 引擎连同一事件流、不同订阅者。→ 边4（Router）与边5（agent）**同一套推送协议**，不同订阅者（对应 #3 待讨论 #6 = 是）。
 4. **etcd checkpoint 三重角色**（非浪费）：控制面重启重建内存权威 / Router 冷启动 snapshot 源 / stream 断时 Router 回退（更陈旧但非空）直到重连。这让主方案"依赖控制面在线"有了兜底。

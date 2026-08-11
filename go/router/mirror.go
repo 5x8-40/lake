@@ -63,6 +63,10 @@ func (m *ViewMirror) Apply(u *lakepb.ViewUpdate) error {
 	if u.GetSeq() == 0 {
 		// 快照:重置后重建(空快照同样是合法重置)。
 		m.blocks = make(map[mirrorNSKey]map[string]*mirrorEntry)
+		// D1(issue #74):快照同时重置权威序号——CP 重启后序号世代归 1,
+		// 不重置会让后续 seq <= 旧 lastSeq 的增量被下方去重分支静默丢弃,
+		// 镜像永久陈旧。随后的锚点(空事件)把 lastSeq 推进到新世代 last。
+		m.lastSeq = 0
 		for _, ev := range u.GetEvents() {
 			m.upsertLocked(ev)
 		}

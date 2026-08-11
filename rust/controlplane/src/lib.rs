@@ -93,6 +93,12 @@ pub const DEFAULT_WARMUP_K: usize = 256;
 /// 池侧 warmup 出口(方案 Z:扩容 warmup 由池自主发起,Router 只经
 /// `ReportHits` 报告命中、不指挥放置)。生产接目标节点 agent `PlaceBlocks`
 /// 客户端;原型默认日志实现(真实字节搬运归 P5),测试注入记录器。
+///
+/// 投递语义(原型边界,生产化前需重估):`warm` 无返回值、无投递确认——
+/// 计划一生成就已写入 `placement_marks`(滞回),投递失败/丢失不会重试也不会
+/// 清 mark,对应块在滞回窗口内不会再触发对同节点的放置。生产化需确认语义
+/// (ack / 失败清 mark / 有界重试)。调用点(register_blocks/join_shard_node/
+/// report_hits)一律在 Authority 写锁释放后调用,实现可以回调 CP 或等待 agent。
 pub trait WarmupSink: Send + Sync {
     fn warm(&self, target_node_id: &str, ids: Vec<KvBlockId>);
 }
@@ -100,9 +106,30 @@ pub trait WarmupSink: Send + Sync {
 struct LogWarmup;
 impl WarmupSink for LogWarmup {
     fn warm(&self, target_node_id: &str, ids: Vec<KvBlockId>) {
-        eprintln!(
-            "warmup plan: {} hot blocks → {target_node_id} (bytes P5)",
-            ids.len()
+        tracing::info!(
+            target_node = target_node_id,
+            blocks = ids.len(),
+            "warmup plan (bytes P5)"
+        );
+    }
+}
+
+/// S3(issue #74):自动 defrag 计划的出口(与 `WarmupSink` 同型)。
+/// 生产接执行侧(agent 按 moves 搬字节 + `RelocateBlocks` 回报,带宽池节流归 P5);
+/// 原型默认日志实现,测试注入记录器。
+pub trait DefragSink: Send + Sync {
+    fn defrag_plan(&self, model_id: &str, revision: &str, pool_kind: i32, moves: Vec<DefragMove>);
+}
+
+struct LogDefrag;
+impl DefragSink for LogDefrag {
+    fn defrag_plan(&self, model_id: &str, revision: &str, pool_kind: i32, moves: Vec<DefragMove>) {
+        tracing::info!(
+            model_id,
+            revision,
+            pool_kind,
+            moves = moves.len(),
+            "auto defrag plan (bytes P5)"
         );
     }
 }
@@ -121,6 +148,10 @@ pub struct ControlPlane {
     view_tx: broadcast::Sender<ViewUpdate>,
     /// P7 收口:扩容 warmup 池侧出口。
     warmup_sink: Arc<dyn WarmupSink>,
+    /// S3(issue #74):自动 defrag 阈值(L2 碎片率,None=关,原型保守默认)。
+    auto_defrag_threshold: Option<f64>,
+    /// S3:自动 defrag 计划出口。
+    defrag_sink: Arc<dyn DefragSink>,
 }
 
 impl Default for ControlPlane {
@@ -133,6 +164,8 @@ impl Default for ControlPlane {
             authority_poisoned_reported: Arc::new(AtomicBool::new(false)),
             view_tx,
             warmup_sink: Arc::new(LogWarmup),
+            auto_defrag_threshold: None,
+            defrag_sink: Arc::new(LogDefrag),
         }
     }
 }
@@ -151,11 +184,24 @@ impl ControlPlane {
             authority_poisoned_reported: Arc::new(AtomicBool::new(false)),
             view_tx,
             warmup_sink: Arc::new(LogWarmup),
+            auto_defrag_threshold: None,
+            defrag_sink: Arc::new(LogDefrag),
         }
     }
 
     pub fn with_warmup_sink(mut self, sink: Arc<dyn WarmupSink>) -> Self {
         self.warmup_sink = sink;
+        self
+    }
+
+    /// S3:配置自动 defrag 阈值(`Some(0..=1)` L2 碎片率;`None` 关闭)。
+    pub fn with_auto_defrag_threshold(mut self, threshold: Option<f64>) -> Self {
+        self.auto_defrag_threshold = threshold.filter(|t| (0.0..=1.0).contains(t));
+        self
+    }
+
+    pub fn with_defrag_sink(mut self, sink: Arc<dyn DefragSink>) -> Self {
+        self.defrag_sink = sink;
         self
     }
 
@@ -178,7 +224,12 @@ impl ControlPlane {
             .authority_poisoned_reported
             .swap(true, Ordering::Relaxed)
         {
-            eprintln!("controlplane authority lock poisoned; returning INTERNAL until restart");
+            tracing::warn!(
+                event = "mutex_poisoned",
+                component = "controlplane",
+                lock = "authority",
+                action = "return_internal_until_restart",
+            );
         }
     }
 
@@ -202,14 +253,66 @@ impl ControlPlane {
             let _ = self.view_tx.send(u);
         }
     }
+
+    /// S3(issue #74):配置门控的自动 defrag 评估(当前挂 register_blocks 写路径——
+    /// L2 布局随注册增长的主入口;relocate/evict 路径的评估挂点留待生产化)。
+    ///
+    /// 碎片率 ≥ 阈值 → 生成 defrag plan 经 `DefragSink` 下发。遵守
+    /// `PauseBackground` 暂停语义(与 promote/demote/GC 共享后台暂停旗标;
+    /// 字节级带宽节流归 P5 `BandwidthPool`,此处只出计划)。
+    /// 已知原型边界:计划下发到 agent 执行 `RelocateBlocks` 回报之间,后续
+    /// register 会重复触发同碎段计划——执行幂等(同坐标 relocate 为坐标刷新),
+    /// 生产化时由执行侧去重/节流。
+    /// 挂点边界(PR #77 review):评估只挂 `register_blocks` 写路径——稳态触发
+    /// 依赖 register 频次;只 relocate/evict 不再 re-register 的负载永不触发,
+    /// relocate/evict 路径的评估挂点留生产化。
+    /// 锁内只**生成**计划:返回 `(model_id, revision, pool_kind, moves)` 供锁外
+    /// 投递。DefragSink 是外部边界(生产实现可能等待 agent 或回调 CP 如 Locate/
+    /// 迁移回报)——写锁内同步调用会阻塞全局 CP 读写,回调即死锁(PR #77 review)。
+    fn plan_auto_defrag(
+        &self,
+        auth: &Authority,
+        model_id: &str,
+        revision: &str,
+        pool_kind: i32,
+    ) -> Option<(String, String, i32, Vec<DefragMove>)> {
+        let threshold = self.auto_defrag_threshold?;
+        if self.background_paused() {
+            return None;
+        }
+        let ratio = auth.l2_fragmentation_ratio(model_id, revision, pool_kind, 0);
+        if ratio < threshold {
+            return None;
+        }
+        match auth.plan_defrag(model_id, revision, pool_kind, DefragMode::Both, 0) {
+            Ok(moves) if !moves.is_empty() => {
+                Some((model_id.to_string(), revision.to_string(), pool_kind, moves))
+            }
+            _ => None,
+        }
+    }
 }
 
 /// P6.2: 锚点更新(空事件):快照/重放之后告知接收方当前权威 seq。
-fn anchor_update(seq: u64) -> ViewUpdate {
-    ViewUpdate {
+/// seq=0 返回 None(不发):快照(seq=0,重置语义)之后接收方 lastSeq 已为 0,
+/// 零锚点无信息量;且接收方把 seq==0 一律按快照重置处理(见 Go ViewMirror),
+/// 零锚点会把刚应用的非空快照清空——全新进程 import_snapshot 恢复非空权威后
+/// view_last_seq()==0 正是该场景。
+fn anchor_update(seq: u64) -> Option<ViewUpdate> {
+    (seq > 0).then_some(ViewUpdate {
         seq,
         events: Vec::new(),
+    })
+}
+
+/// 快照 + 锚点(last>0 时)的初始序列与锚点 seq,供 subscribe_view 两个快照分支共用。
+fn snapshot_with_anchor(auth: &Authority) -> (Vec<ViewUpdate>, u64) {
+    let last = auth.view_last_seq();
+    let mut initial = vec![auth.view_snapshot()];
+    if let Some(anchor) = anchor_update(last) {
+        initial.push(anchor);
     }
+    (initial, last)
 }
 
 #[tonic::async_trait]
@@ -227,12 +330,16 @@ impl ControlPlaneService for ControlPlane {
         request: Request<SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeViewStream>, Status> {
         let req = request.into_inner();
+        tracing::debug!(
+            subscriber_id = %req.subscriber_id,
+            resume_from_seq = req.resume_from_seq,
+            "subscribe_view connected"
+        );
         let mut rx = self.view_tx.subscribe();
         let (initial, anchor) = {
             let auth = self.read_authority().map_err(Self::lock_authority_status)?;
             if req.resume_from_seq == 0 {
-                let last = auth.view_last_seq();
-                (vec![auth.view_snapshot(), anchor_update(last)], last)
+                snapshot_with_anchor(&auth)
             } else {
                 match auth.replay_view_after(req.resume_from_seq) {
                     Some(ups) => {
@@ -240,10 +347,7 @@ impl ControlPlaneService for ControlPlane {
                         (ups, anchor)
                     }
                     // replay buffer 已逐出 → 回退快照(有界 buffer 语义)
-                    None => {
-                        let last = auth.view_last_seq();
-                        (vec![auth.view_snapshot(), anchor_update(last)], last)
-                    }
+                    None => snapshot_with_anchor(&auth),
                 }
             }
         };
@@ -259,6 +363,16 @@ impl ControlPlaneService for ControlPlane {
             loop {
                 match rx.recv().await {
                     Ok(u) => {
+                        if u.seq == 0 {
+                            // restore 广播的快照(重置语义)不是订阅时的快照/广播重叠,
+                            // 必须转发;dedup 水位归零,后续新世代增量照常经下方去重。
+                            // 否则在线订阅者永远收不到权威重建,镜像保留旧状态发散。
+                            last = 0;
+                            if tx.send(Ok(u)).await.is_err() {
+                                return;
+                            }
+                            continue;
+                        }
                         if u.seq <= last {
                             continue; // 去重:快照/广播重叠
                         }
@@ -276,8 +390,10 @@ impl ControlPlaneService for ControlPlane {
                         if tx.send(Ok(snap)).await.is_err() {
                             return;
                         }
-                        if tx.send(Ok(anchor_update(a))).await.is_err() {
-                            return;
+                        if let Some(anchor) = anchor_update(a) {
+                            if tx.send(Ok(anchor)).await.is_err() {
+                                return;
+                            }
                         }
                         last = a;
                     }
@@ -341,14 +457,24 @@ impl ControlPlaneService for ControlPlane {
                 err: String::new(),
                 backpressure: None,
             })),
-            Ok(RegisterStatus::RejectedHardQuota(bp)) => Ok(Response::new(Ack {
-                ok: false,
-                err: format!(
-                    "AdmitRegisterBlocks: admission rejected reason={} deficit={}",
-                    bp.reason, bp.deficit_bytes
-                ),
-                backpressure: Some(bp),
-            })),
+            Ok(RegisterStatus::RejectedHardQuota(bp)) => {
+                tracing::warn!(
+                    model_id = %keys.model_id,
+                    revision = %keys.revision,
+                    pool_kind = keys.pool_kind,
+                    reason = %bp.reason,
+                    deficit_bytes = bp.deficit_bytes,
+                    "admission rejected: hard quota backpressure"
+                );
+                Ok(Response::new(Ack {
+                    ok: false,
+                    err: format!(
+                        "AdmitRegisterBlocks: admission rejected reason={} deficit={}",
+                        bp.reason, bp.deficit_bytes
+                    ),
+                    backpressure: Some(bp),
+                }))
+            }
             Err(e) => Ok(Response::new(Ack {
                 ok: false,
                 err: e,
@@ -362,28 +488,49 @@ impl ControlPlaneService for ControlPlane {
         request: Request<RegisterBlocksRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self
-            .write_authority()
-            .map_err(Self::lock_authority_status)?;
+        tracing::debug!(
+            node_id = %req.node_id,
+            blocks = req.blocks.len(),
+            "register_blocks"
+        );
         // P7.6(B2-a):HRW 预放置需链所属命名空间,register 移动 blocks 前取出。
         let ns_identity = req
             .blocks
             .iter()
             .find_map(|m| m.id.as_ref())
             .map(|i| (i.model_id.clone(), i.revision.clone(), i.pool_kind));
-        let result = auth.register(&req.node_id, &req.prefix_hashes, req.blocks);
-        // P7.6(B2-a):register 成功后按 HRW(链锚点, ready 节点集)预放置
-        // (稳态常见情形=生产节点即家节点,计划为空零动作)。
-        let preplace = if matches!(result, Ok(RegisterStatus::Accepted)) {
-            ns_identity.and_then(|(mid, rev, pk)| {
-                auth.preplace_on_register(&mid, &rev, pk, &req.prefix_hashes)
-            })
-        } else {
-            None
+        // 锁内只做视图读写与计划生成;外部 sink(WarmupSink/DefragSink)一律锁外
+        // 投递——实现可能等待 agent 或回调 CP,锁内调用会全局阻塞/死锁(PR #77 review)。
+        let (result, preplace, defrag) = {
+            let mut auth = self
+                .write_authority()
+                .map_err(Self::lock_authority_status)?;
+            let result = auth.register(&req.node_id, &req.prefix_hashes, req.blocks);
+            // P7.6(B2-a):register 成功后按 HRW(链锚点, ready 节点集)预放置
+            // (稳态常见情形=生产节点即家节点,计划为空零动作)。
+            let preplace = if matches!(result, Ok(RegisterStatus::Accepted)) {
+                ns_identity.as_ref().and_then(|(mid, rev, pk)| {
+                    auth.preplace_on_register(mid, rev, *pk, &req.prefix_hashes)
+                })
+            } else {
+                None
+            };
+            // S3(issue #74):配置门控自动 defrag 评估(默认关;暂停期不触发)。
+            let defrag = if matches!(result, Ok(RegisterStatus::Accepted)) {
+                ns_identity
+                    .as_ref()
+                    .and_then(|(mid, rev, pk)| self.plan_auto_defrag(&auth, mid, rev, *pk))
+            } else {
+                None
+            };
+            self.commit_and_broadcast(&mut auth);
+            (result, preplace, defrag)
         };
-        self.commit_and_broadcast(&mut auth);
         if let Some((home, plan)) = preplace {
             self.warmup_sink.warm(&home, plan);
+        }
+        if let Some((mid, rev, pk, moves)) = defrag {
+            self.defrag_sink.defrag_plan(&mid, &rev, pk, moves);
         }
         match result {
             Ok(RegisterStatus::Accepted) => Ok(Response::new(Ack {
@@ -391,14 +538,22 @@ impl ControlPlaneService for ControlPlane {
                 err: String::new(),
                 backpressure: None,
             })),
-            Ok(RegisterStatus::RejectedHardQuota(bp)) => Ok(Response::new(Ack {
-                ok: false,
-                err: format!(
-                    "RegisterBlocks: admission rejected reason={} deficit={}",
-                    bp.reason, bp.deficit_bytes
-                ),
-                backpressure: Some(bp),
-            })),
+            Ok(RegisterStatus::RejectedHardQuota(bp)) => {
+                tracing::warn!(
+                    node_id = %req.node_id,
+                    reason = %bp.reason,
+                    deficit_bytes = bp.deficit_bytes,
+                    "register_blocks rejected: hard quota backpressure"
+                );
+                Ok(Response::new(Ack {
+                    ok: false,
+                    err: format!(
+                        "RegisterBlocks: admission rejected reason={} deficit={}",
+                        bp.reason, bp.deficit_bytes
+                    ),
+                    backpressure: Some(bp),
+                }))
+            }
             Err(e) => Ok(Response::new(Ack {
                 ok: false,
                 err: e,
@@ -416,6 +571,7 @@ impl ControlPlaneService for ControlPlane {
         while let Some(delta) = stream.message().await? {
             deltas.push(delta);
         }
+        tracing::debug!(deltas = deltas.len(), "report_ref");
         let mut auth = self
             .write_authority()
             .map_err(Self::lock_authority_status)?;
@@ -425,11 +581,15 @@ impl ControlPlaneService for ControlPlane {
                 err: String::new(),
                 backpressure: None,
             })),
-            Err(e) => Ok(Response::new(Ack {
-                ok: false,
-                err: e,
-                backpressure: None,
-            })),
+            Err(e) => {
+                // S4:underflow/overflow 全有或全无拒绝——账本不一致信号,告警可见。
+                tracing::warn!(err = %e, "report_ref rejected");
+                Ok(Response::new(Ack {
+                    ok: false,
+                    err: e,
+                    backpressure: None,
+                }))
+            }
         }
     }
 
@@ -481,6 +641,11 @@ impl ControlPlaneService for ControlPlane {
                 backpressure: None,
             }));
         };
+        tracing::info!(
+            model_id = %model.model_id,
+            revision = %model.revision,
+            "register_model"
+        );
         let mut auth = self
             .write_authority()
             .map_err(Self::lock_authority_status)?;
@@ -503,6 +668,11 @@ impl ControlPlaneService for ControlPlane {
         request: Request<DeregisterModelRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
+        tracing::info!(
+            model_id = %req.model_id,
+            revision = %req.revision,
+            "deregister_model"
+        );
         let mut auth = self
             .write_authority()
             .map_err(Self::lock_authority_status)?;
@@ -581,7 +751,28 @@ impl ControlPlaneService for ControlPlane {
         let result = auth.reconcile_orphans(&req);
         self.commit_and_broadcast(&mut auth);
         match result {
-            Ok(resp) => Ok(Response::new(resp)),
+            Ok(resp) => {
+                tracing::info!(
+                    dead_node_id = %req.dead_node_id,
+                    discarded = resp.discarded.len(),
+                    cold_stripped = resp.cold_stripped.len(),
+                    refs_cleared = resp.refs_cleared,
+                    "reconcile_orphans"
+                );
+                if !resp.discarded.is_empty()
+                    || !resp.cold_stripped.is_empty()
+                    || resp.refs_cleared > 0
+                {
+                    tracing::warn!(
+                        dead_node_id = %req.dead_node_id,
+                        discarded = resp.discarded.len(),
+                        cold_stripped = resp.cold_stripped.len(),
+                        refs_cleared = resp.refs_cleared,
+                        "reconcile found orphans/dead-node holdings"
+                    );
+                }
+                Ok(Response::new(resp))
+            }
             Err(e) => Ok(Response::new(ReconcileOrphansResponse {
                 discarded: vec![],
                 cold_stripped: vec![],
@@ -674,7 +865,9 @@ impl ControlPlaneService for ControlPlane {
                 // P6.2: 权威已整体重建——向在线订阅者广播新快照(seq=0 重置语义)+ 锚点;
                 // 断开的订阅者 resume 时因 buffer 已清空回退快照。
                 let _ = self.view_tx.send(auth.view_snapshot());
-                let _ = self.view_tx.send(anchor_update(auth.view_last_seq()));
+                if let Some(anchor) = anchor_update(auth.view_last_seq()) {
+                    let _ = self.view_tx.send(anchor);
+                }
                 Ok(Response::new(Ack {
                     ok: true,
                     err: String::new(),
@@ -705,6 +898,14 @@ impl ControlPlaneService for ControlPlane {
         ) {
             Ok(moves) => {
                 let planned_moves = moves.len() as u32;
+                tracing::info!(
+                    model_id = %req.model_id,
+                    revision = %req.revision,
+                    pool_kind = req.pool_kind,
+                    mode = ?mode,
+                    planned_moves,
+                    "trigger_defrag"
+                );
                 Ok(Response::new(TriggerDefragResponse {
                     moves,
                     planned_moves,
@@ -727,6 +928,7 @@ impl ControlPlaneService for ControlPlane {
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
         self.set_background_paused(req.paused);
+        tracing::info!(paused = req.paused, "pause_background");
         Ok(Response::new(Ack {
             ok: true,
             err: String::new(),
@@ -751,34 +953,51 @@ impl ControlPlaneService for ControlPlane {
         request: Request<JoinShardNodeRequest>,
     ) -> Result<Response<JoinShardNodeResponse>, Status> {
         let req = request.into_inner();
-        let mut auth = self
-            .write_authority()
-            .map_err(Self::lock_authority_status)?;
-        match auth.join_shard_node(&req.node_id, req.vnode_count) {
-            Ok((map, migrations)) => {
-                let migration_count = migrations.len() as u32;
-                // P7 收口(方案 Z):新节点 warmup 由池侧按 hit_count 自主选块
-                // 发起;Router 只经 ReportHits 报告命中,不指挥放置。
-                let plan = auth.warmup_plan(&req.node_id, DEFAULT_WARMUP_K);
-                if !plan.is_empty() {
-                    self.warmup_sink.warm(&req.node_id, plan);
+        // 锁内 join + 生成 warmup 计划;WarmupSink 锁外投递(同 register_blocks
+        // 的锁外投递约束,PR #77 review)。
+        let (resp, warm) = {
+            let mut auth = self
+                .write_authority()
+                .map_err(Self::lock_authority_status)?;
+            match auth.join_shard_node(&req.node_id, req.vnode_count) {
+                Ok((map, migrations)) => {
+                    let migration_count = migrations.len() as u32;
+                    tracing::info!(
+                        node_id = %req.node_id,
+                        vnode_count = req.vnode_count,
+                        migration_count,
+                        "join_shard_node"
+                    );
+                    // P7 收口(方案 Z):新节点 warmup 由池侧按 hit_count 自主选块
+                    // 发起;Router 只经 ReportHits 报告命中,不指挥放置。
+                    let plan = auth.warmup_plan(&req.node_id, DEFAULT_WARMUP_K);
+                    (
+                        JoinShardNodeResponse {
+                            map: Some(map),
+                            migrations,
+                            migration_count,
+                            ok: true,
+                            err: String::new(),
+                        },
+                        if plan.is_empty() { None } else { Some(plan) },
+                    )
                 }
-                Ok(Response::new(JoinShardNodeResponse {
-                    map: Some(map),
-                    migrations,
-                    migration_count,
-                    ok: true,
-                    err: String::new(),
-                }))
+                Err(e) => (
+                    JoinShardNodeResponse {
+                        map: None,
+                        migrations: vec![],
+                        migration_count: 0,
+                        ok: false,
+                        err: e,
+                    },
+                    None,
+                ),
             }
-            Err(e) => Ok(Response::new(JoinShardNodeResponse {
-                map: None,
-                migrations: vec![],
-                migration_count: 0,
-                ok: false,
-                err: e,
-            })),
+        };
+        if let Some(plan) = warm {
+            self.warmup_sink.warm(&req.node_id, plan);
         }
+        Ok(Response::new(resp))
     }
 
     async fn drain_shard_node(
@@ -821,10 +1040,19 @@ impl ControlPlaneService for ControlPlane {
         request: Request<ReportHitsRequest>,
     ) -> Result<Response<Ack>, Status> {
         let req = request.into_inner();
-        let mut auth = self
-            .write_authority()
-            .map_err(Self::lock_authority_status)?;
-        let plans = auth.report_hits(&req.node_id, &req.ids);
+        tracing::debug!(
+            node_id = %req.node_id,
+            ids = req.ids.len(),
+            "report_hits"
+        );
+        // 锁内只累计命中并生成跟随流量计划;WarmupSink 锁外投递(同
+        // register_blocks 的锁外投递约束,PR #77 review)。
+        let plans = {
+            let mut auth = self
+                .write_authority()
+                .map_err(Self::lock_authority_status)?;
+            auth.report_hits(&req.node_id, &req.ids)
+        };
         for (node, plan) in plans {
             self.warmup_sink.warm(&node, plan);
         }
@@ -844,11 +1072,14 @@ impl ControlPlaneService for ControlPlane {
             .write_authority()
             .map_err(Self::lock_authority_status)?;
         match auth.remove_shard_node(&req.node_id) {
-            Ok(()) => Ok(Response::new(Ack {
-                ok: true,
-                err: String::new(),
-                backpressure: None,
-            })),
+            Ok(()) => {
+                tracing::info!(node_id = %req.node_id, "remove_shard_node");
+                Ok(Response::new(Ack {
+                    ok: true,
+                    err: String::new(),
+                    backpressure: None,
+                }))
+            }
             Err(e) => Ok(Response::new(Ack {
                 ok: false,
                 err: e,
@@ -1283,6 +1514,104 @@ mod tests {
         assert!(auth.complete_barrier("r", "").is_err());
     }
 
+    /// S4(issue #74):RefKind 分账——WRITEBACK/REQUEST 分别入账、按 kind 回冲,
+    /// 冻结/驱逐语义仍看总数。
+    #[test]
+    fn s4_ref_accounts_split_by_kind() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"k"]);
+        auth.register("n0", &full, vec![meta("m", b"k")]).unwrap();
+        let pk = PoolKind::Target as i32;
+
+        let req = delta("m", b"k", 1); // REQUEST+1
+        let mut wb = delta("m", b"k", 1);
+        wb.kind = RefKind::Writeback as i32; // WRITEBACK+1
+        auth.report_ref(&req).unwrap();
+        auth.report_ref(&wb).unwrap();
+        assert_eq!(auth.global_ref_by_kind("m", "", pk, b"k"), (1, 1));
+        assert_eq!(auth.global_ref("m", "", pk, b"k"), 2);
+
+        // WRITEBACK-1 只减 writeback 账簿,request 不动。
+        let mut wb_minus = wb.clone();
+        wb_minus.delta = -1;
+        auth.report_ref(&wb_minus).unwrap();
+        assert_eq!(auth.global_ref_by_kind("m", "", pk, b"k"), (1, 0));
+        assert_eq!(
+            auth.inactive_len("m", "", pk),
+            0,
+            "总数仍 >0 → 冻结语义不变"
+        );
+
+        // REQUEST-1 → 总数归零 → 回到 inactive(驱逐候选)。
+        let mut req_minus = req.clone();
+        req_minus.delta = -1;
+        auth.report_ref(&req_minus).unwrap();
+        assert_eq!(auth.global_ref_by_kind("m", "", pk, b"k"), (0, 0));
+        assert_eq!(auth.inactive_len("m", "", pk), 1, "总数归零仍标驱逐候选");
+    }
+
+    /// S4:kind 级 underflow 报错并指明 kind;IN_FLIGHT/UNSPECIFIED 显式拒绝;
+    /// 批内非法 kind 全有或全无。
+    #[test]
+    fn s4_ref_underflow_scoped_by_kind() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"u"]);
+        auth.register("n0", &full, vec![meta("m", b"u")]).unwrap();
+        let pk = PoolKind::Target as i32;
+
+        // writeback 账簿有 1;REQUEST-1 必须 kind 级 underflow(总数 1 不抵)。
+        let mut wb = delta("m", b"u", 1);
+        wb.kind = RefKind::Writeback as i32;
+        auth.report_ref(&wb).unwrap();
+        let mut req_minus = delta("m", b"u", -1);
+        req_minus.node_id = String::new(); // 置空 node 聚焦全局账簿(node 账簿先行校验)
+        let err = auth.report_ref(&req_minus).unwrap_err();
+        assert!(err.contains("ref_count underflow"), "{err}");
+        assert!(err.contains("REQUEST"), "{err}");
+        assert_eq!(
+            auth.global_ref_by_kind("m", "", pk, b"u"),
+            (0, 1),
+            "underflow 拒绝后不落账"
+        );
+
+        // IN_FLIGHT 预留未接线 → 显式报错(不静默入账)。
+        let mut inflight = delta("m", b"u", 1);
+        inflight.kind = RefKind::InFlight as i32;
+        let err = auth.report_ref(&inflight).unwrap_err();
+        assert!(err.contains("unsupported ref_kind"), "{err}");
+
+        // 批内混非法 kind → 整批拒绝,前缀 delta 不落账。
+        let err = auth
+            .report_refs(&[delta("m", b"u", 1), inflight])
+            .unwrap_err();
+        assert!(err.contains("unsupported ref_kind"), "{err}");
+        assert_eq!(auth.global_ref_by_kind("m", "", pk, b"u"), (0, 1));
+    }
+
+    /// S4:死节点 reconcile 按 kind 分别回冲(清账语义不变——总数归零可驱逐)。
+    #[test]
+    fn s4_dead_node_reconcile_clears_each_kind() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"z"]);
+        auth.register("n0", &full, vec![meta("m", b"z")]).unwrap();
+        let pk = PoolKind::Target as i32;
+        let req = delta("m", b"z", 1); // REQUEST+1 @n0
+        let mut wb = delta("m", b"z", 1);
+        wb.kind = RefKind::Writeback as i32; // WRITEBACK+1 @n0
+        auth.report_ref(&req).unwrap();
+        auth.report_ref(&wb).unwrap();
+        assert_eq!(auth.global_ref_by_kind("m", "", pk, b"z"), (1, 1));
+        assert_eq!(auth.evict_n("m", "", pk, 1), 0, "任一 kind 持有即冻结");
+
+        let (cleared, _) = auth.reconcile_dead_node("n0").unwrap();
+        assert_eq!(cleared, 1);
+        assert_eq!(auth.global_ref_by_kind("m", "", pk, b"z"), (0, 0));
+        assert_eq!(auth.evict_n("m", "", pk, 1), 1, "两本账清零后可驱逐");
+    }
+
     #[test]
     fn report_ref_underflow_is_rejected() {
         let mut auth = Authority::default();
@@ -1472,8 +1801,13 @@ mod tests {
             .unwrap()
             .into_inner();
         let _snap = recv_update(&mut stream).await; // 空快照
-        let anchor = recv_update(&mut stream).await;
-        assert_eq!(anchor.seq, 0);
+                                                    // last==0 时不发零锚点(anchor_update(0)=None):下一个更新只能是注册后的直播增量。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                .await
+                .is_err(),
+            "last==0 时不应再发 seq=0 空锚点"
+        );
 
         let ack = cp
             .register_blocks(Request::new(RegisterBlocksRequest {
@@ -1490,6 +1824,118 @@ mod tests {
         assert_eq!(live.seq, 1);
         assert_eq!(live.events.len(), 1);
         assert_eq!(live.events[0].kind, view_event::Kind::Registered as i32);
+    }
+
+    /// 回归(评审发现):全新 CP 进程 restore 非空 checkpoint 后 view_last_seq()==0,
+    /// subscribe 应只收到一个非空快照,不得再发 seq=0 空锚点——接收方把 seq==0
+    /// 一律按快照重置,零锚点会把刚应用的快照清空。
+    #[tokio::test]
+    async fn subscribe_view_after_restore_sends_no_zero_anchor() {
+        // donor:造出含两个块的非空快照。
+        let donor = ControlPlane::default();
+        let snap = {
+            let mut auth = donor.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            let full = prefix(&[b"h0", b"h1"]);
+            auth.register("n0", &full, vec![meta("m", b"h0"), meta("m", b"h1")])
+                .unwrap();
+            auth.commit_view_events();
+            auth.export_snapshot(1)
+        };
+        // 全新 CP(模拟重启):经 restore RPC 注入快照。
+        let cp = ControlPlane::default();
+        let ack = cp
+            .restore_checkpoint(Request::new(RestoreCheckpointRequest {
+                snapshot: Some(snap),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.ok, "restore_checkpoint failed: {}", ack.err);
+        assert_eq!(
+            cp.read_authority().unwrap().view_last_seq(),
+            0,
+            "全新进程 restore 后未发任何增量事件"
+        );
+
+        let mut stream = cp
+            .subscribe_view(Request::new(SubscribeRequest {
+                subscriber_id: "r0".into(),
+                resume_from_seq: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let snap = recv_update(&mut stream).await;
+        assert_eq!(snap.seq, 0, "snapshot uses reserved seq=0");
+        assert_eq!(snap.events.len(), 2, "恢复快照应含全部块");
+        // 关键断言:last==0 时不再有第二个更新(零锚点)。
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), stream.next())
+                .await
+                .is_err(),
+            "last==0 时不应再发 seq=0 空锚点(会清空刚应用的非空快照)"
+        );
+    }
+
+    /// 回归(复审发现):在线订阅者必须收到 restore 广播的重置快照——此前广播循环的
+    /// dedup `seq <= last` 把 seq=0 快照当订阅期重叠丢弃,在线镜像保留旧状态,
+    /// 后续新世代增量打在陈旧底座上,永久发散。
+    #[tokio::test]
+    async fn subscribe_view_live_receives_restore_snapshot() {
+        let cp = ControlPlane::default();
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            auth.register("n0", &prefix(&[b"old"]), vec![meta("m", b"old")])
+                .unwrap();
+            auth.commit_view_events();
+        }
+        let mut stream = cp
+            .subscribe_view(Request::new(SubscribeRequest {
+                subscriber_id: "r0".into(),
+                resume_from_seq: 0,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let snap = recv_update(&mut stream).await;
+        assert_eq!(snap.seq, 0);
+        assert_eq!(snap.events.len(), 1);
+        let anchor = recv_update(&mut stream).await;
+        assert_eq!(anchor.seq, 1);
+
+        // 另一权威造新快照(只含 new 块),经 restore 注入并广播给在线订阅者。
+        let donor = ControlPlane::default();
+        let new_snap = {
+            let mut auth = donor.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            auth.register("n0", &prefix(&[b"new"]), vec![meta("m", b"new")])
+                .unwrap();
+            auth.commit_view_events();
+            auth.export_snapshot(1)
+        };
+        let ack = cp
+            .restore_checkpoint(Request::new(RestoreCheckpointRequest {
+                snapshot: Some(new_snap),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.ok, "restore failed: {}", ack.err);
+
+        // 在线流必须收到重置快照(seq=0,内容为恢复后的 new 块)+ 后续锚点。
+        let reset = recv_update(&mut stream).await;
+        assert_eq!(reset.seq, 0, "restore 快照必须转发给在线订阅者");
+        assert_eq!(reset.events.len(), 1);
+        assert_eq!(
+            reset.events[0].id.as_ref().unwrap().block_hash,
+            b"new".to_vec(),
+            "快照内容应为恢复后的权威,而非订阅时的旧快照"
+        );
+        // restore 后 last 保持单调(=1>0)→ 有锚点推进水位。
+        let anchor = recv_update(&mut stream).await;
+        assert!(anchor.seq >= 1 && anchor.events.is_empty());
     }
 
     /// 断线 resume:重放 `(N, ...]` 缓冲批,不发快照。
@@ -1572,6 +2018,33 @@ mod tests {
         assert_eq!(first.events.len(), 4, "快照携带全量现存 block");
         let anchor = recv_update(&mut stream).await;
         assert_eq!(anchor.seq, 4);
+    }
+
+    /// S2(issue #74):resume 点超过已发序号上界(CP 重启场景)→ 回退快照,
+    /// 而非空重放(空重放会让客户端带着旧镜像静默发散,见 Go mirror D1)。
+    #[tokio::test]
+    async fn subscribe_view_resume_ahead_of_issued_seq_falls_back_to_snapshot() {
+        let cp = ControlPlane::default();
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            let full = prefix(&[b"h0"]);
+            auth.register("n0", &full, vec![meta("m", b"h0")]).unwrap();
+            auth.commit_view_events(); // seq=1,已发上界 last=1
+        }
+        let mut stream = cp
+            .subscribe_view(Request::new(SubscribeRequest {
+                subscriber_id: "r0".into(),
+                resume_from_seq: 100, // 旧 CP 世代的序号,本实例从未签发
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = recv_update(&mut stream).await;
+        assert_eq!(first.seq, 0, "超前 resume 必须回退快照");
+        assert_eq!(first.events.len(), 1, "快照携带现存 block");
+        let anchor = recv_update(&mut stream).await;
+        assert_eq!(anchor.seq, 1, "锚点同步本实例权威 seq");
     }
 
     /// 变更路径事件覆盖:register→REGISTERED / publish→MOVED(全量位置) /
@@ -2285,6 +2758,45 @@ mod tests {
         assert!(!auth.has_l0_on("m", "", pk, b"l0", "n1"));
     }
 
+    /// 回归(评审发现):账簿为 i64 而 proto `RefDelta.delta` 为 int32——dead-node
+    /// 回冲计数 > i32::MAX 时必须拆批清零,不得 `as i32` 截留(截留会让账清不净,
+    /// 且错误被 best-effort 丢弃后无任何信号)。
+    #[test]
+    fn reconcile_dead_node_splits_oversized_ref_counts() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let pk = PoolKind::Target as i32;
+        auth.register("n0", &prefix(&[b"big"]), vec![meta("m", b"big")])
+            .unwrap();
+        let id = KvBlockId {
+            model_id: "m".into(),
+            block_hash: b"big".to_vec(),
+            pool_kind: pk,
+            scope: "public".into(),
+            revision: String::new(),
+        };
+        // 垫账到 i32::MAX+2(模拟计数腐化/失控 agent):单 delta 上限即 i32::MAX,两笔入账。
+        for d in [i32::MAX, 2] {
+            auth.report_ref(&RefDelta {
+                id: Some(id.clone()),
+                kind: RefKind::Request as i32,
+                delta: d,
+                node_id: "n0".into(),
+            })
+            .unwrap();
+        }
+        let huge = i32::MAX as i64 + 2;
+        assert_eq!(auth.global_ref("m", "", pk, b"big"), huge);
+
+        let (cleared, _) = auth.reconcile_dead_node("n0").unwrap();
+        assert_eq!(cleared, 1);
+        assert_eq!(
+            auth.global_ref("m", "", pk, b"big"),
+            0,
+            "拆批回冲必须清零,不得截留"
+        );
+    }
+
     /// Checkpoint save/restore rebuilds namespace + blocks (metadata before bytes).
     #[test]
     fn p47_checkpoint_roundtrip() {
@@ -2604,6 +3116,233 @@ mod tests {
         }
     }
 
+    // --- S3(issue #74):自动 defrag 阈值(配置门控) ---
+
+    /// 碎片率度量:致密 → 0;有洞 → 1;混合按比例;冻结段不计入。
+    #[test]
+    fn s3_l2_fragmentation_ratio_metric() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let pk = PoolKind::Target as i32;
+        let slot = 100u64;
+        // seg1 致密(0,100);seg2 有洞(0,200)。
+        auth.register(
+            "n0",
+            &prefix(&[b"a", b"b", b"c", b"d"]),
+            vec![
+                meta_l2_at("m", b"a", 1, 0),
+                meta_l2_at("m", b"b", 1, 100),
+                meta_l2_at("m", b"c", 2, 0),
+                meta_l2_at("m", b"d", 2, 200),
+            ],
+        )
+        .unwrap();
+        let ratio = auth.l2_fragmentation_ratio("m", "", pk, slot);
+        assert_eq!(ratio, 0.5, "1 致密 + 1 有洞 → 1/2;got {ratio}");
+
+        // 冻结 seg2(其上任一块 ref>0)→ 该段不计入,只剩致密 seg1 → 0。
+        auth.report_ref(&delta("m", b"c", 1)).unwrap();
+        assert_eq!(auth.l2_fragmentation_ratio("m", "", pk, slot), 0.0);
+    }
+
+    /// 门控语义:默认关;阈值未达不触发;达到触发且计划非空。
+    #[tokio::test]
+    async fn s3_auto_defrag_threshold_gated() {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct DefragRec {
+            calls: StdMutex<Vec<usize>>,
+        }
+        impl DefragSink for DefragRec {
+            fn defrag_plan(&self, _m: &str, _r: &str, _pk: i32, moves: Vec<DefragMove>) {
+                self.calls.lock().unwrap().push(moves.len());
+            }
+        }
+
+        let fragmented = || {
+            vec![
+                meta_l2_at("m", b"a", 1, 0),
+                meta_l2_at("m", b"b", 1, 8192), // 非致密(slot=4096)
+            ]
+        };
+        let register = |cp: &ControlPlane, blocks: Vec<BlockMeta>| {
+            let cp = cp.clone();
+            async move {
+                cp.register_blocks(Request::new(RegisterBlocksRequest {
+                    node_id: "n0".into(),
+                    prefix_hashes: prefix(&[b"a", b"b"]),
+                    blocks,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+            }
+        };
+
+        // 默认 None=关:碎片布局也不触发。
+        let sink = Arc::new(DefragRec::default());
+        let cp = ControlPlane::default().with_defrag_sink(sink.clone());
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+        }
+        assert!(register(&cp, fragmented()).await.ok);
+        assert_eq!(sink.calls.lock().unwrap().len(), 0, "默认关闭不得触发");
+
+        // 阈值未达(1/3 < 0.5)不触发。
+        let sink2 = Arc::new(DefragRec::default());
+        let cp2 = ControlPlane::default()
+            .with_defrag_sink(sink2.clone())
+            .with_auto_defrag_threshold(Some(0.5));
+        {
+            let mut auth = cp2.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+        }
+        let ack = cp2
+            .register_blocks(Request::new(RegisterBlocksRequest {
+                node_id: "n0".into(),
+                prefix_hashes: prefix(&[b"a", b"b", b"c", b"d", b"e", b"f"]),
+                blocks: vec![
+                    meta_l2_at("m", b"a", 1, 0),
+                    meta_l2_at("m", b"b", 1, 8192), // seg1 有洞
+                    meta_l2_at("m", b"c", 2, 0),
+                    meta_l2_at("m", b"d", 2, 4096), // seg2 致密
+                    meta_l2_at("m", b"e", 3, 0),
+                    meta_l2_at("m", b"f", 3, 4096), // seg3 致密
+                ],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.ok, "{}", ack.err);
+        assert_eq!(
+            sink2.calls.lock().unwrap().len(),
+            0,
+            "碎片率 1/3 < 阈值 0.5 不得触发"
+        );
+        // 「阈值未达」分支自证:直接钉比值(3 段 1 段有洞 → 1/3)。
+        let ratio = cp2
+            .read_authority()
+            .unwrap()
+            .l2_fragmentation_ratio("m", "", 0, 0);
+        assert!(
+            (ratio - 1.0 / 3.0).abs() < 1e-9,
+            "碎片率应为 1/3,实得 {ratio}"
+        );
+
+        // 达到阈值(1/1 ≥ 0.5)→ 触发一次且计划非空。
+        let sink3 = Arc::new(DefragRec::default());
+        let cp3 = ControlPlane::default()
+            .with_defrag_sink(sink3.clone())
+            .with_auto_defrag_threshold(Some(0.5));
+        {
+            let mut auth = cp3.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+        }
+        assert!(register(&cp3, fragmented()).await.ok);
+        let calls = sink3.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "达阈值应触发一次");
+        assert!(calls[0] > 0, "触发的计划必须非空");
+    }
+
+    /// PR #77 review(高):DefragSink 必须在 Authority 写锁**外**投递——sink
+    /// 回调 CP(读锁)或等待 agent 时,锁内调用即全局阻塞/死锁。本测试 sink 内
+    /// 立刻取 CP 读锁;RPC 放独立阻塞线程 + 超时,回归(锁内投递)时超时失败
+    /// 而非挂死 CI。WarmupSink 三处调用点(register_blocks/join_shard_node/
+    /// report_hits)同修法、同约束。
+    #[tokio::test]
+    async fn s3_defrag_sink_delivered_outside_authority_lock() {
+        use std::sync::Mutex as StdMutex;
+        use std::time::Duration;
+
+        struct ReentrantSink(StdMutex<Option<ControlPlane>>);
+        impl DefragSink for ReentrantSink {
+            fn defrag_plan(&self, _m: &str, _r: &str, _pk: i32, moves: Vec<DefragMove>) {
+                assert!(!moves.is_empty());
+                let cp = self.0.lock().unwrap().clone().unwrap();
+                // 锁内投递(回归)时:调用方持写锁,此处读锁同线程死锁。
+                let _guard = cp.read_authority().expect("read authority");
+            }
+        }
+
+        let sink = Arc::new(ReentrantSink(StdMutex::new(None)));
+        let cp = ControlPlane::default()
+            .with_defrag_sink(sink.clone())
+            .with_auto_defrag_threshold(Some(0.5));
+        *sink.0.lock().unwrap() = Some(cp.clone());
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+        }
+
+        let cp2 = cp.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                cp2.register_blocks(Request::new(RegisterBlocksRequest {
+                    node_id: "n0".into(),
+                    prefix_hashes: prefix(&[b"a", b"b"]),
+                    blocks: vec![
+                        meta_l2_at("m", b"a", 1, 0),
+                        meta_l2_at("m", b"b", 1, 8192), // seg1 有洞 → 碎片率 1/1 ≥ 0.5
+                    ],
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+            })
+        });
+        let ack = tokio::time::timeout(Duration::from_secs(10), handle)
+            .await
+            .expect("超时:DefragSink 在写锁内投递(死锁回归)")
+            .unwrap();
+        assert!(ack.ok, "{}", ack.err);
+    }
+
+    /// PauseBackground 期间不触发(与 promote/demote/GC 共享暂停语义)。
+    #[tokio::test]
+    async fn s3_auto_defrag_paused_skipped() {
+        use std::sync::Mutex as StdMutex;
+
+        #[derive(Default)]
+        struct DefragRec {
+            calls: StdMutex<Vec<usize>>,
+        }
+        impl DefragSink for DefragRec {
+            fn defrag_plan(&self, _m: &str, _r: &str, _pk: i32, moves: Vec<DefragMove>) {
+                self.calls.lock().unwrap().push(moves.len());
+            }
+        }
+
+        let sink = Arc::new(DefragRec::default());
+        let cp = ControlPlane::default()
+            .with_defrag_sink(sink.clone())
+            .with_auto_defrag_threshold(Some(0.5));
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+        }
+        cp.set_background_paused(true);
+        let ack = cp
+            .register_blocks(Request::new(RegisterBlocksRequest {
+                node_id: "n0".into(),
+                prefix_hashes: prefix(&[b"a", b"b"]),
+                blocks: vec![meta_l2_at("m", b"a", 1, 0), meta_l2_at("m", b"b", 1, 8192)],
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.ok, "{}", ack.err);
+        assert_eq!(
+            sink.calls.lock().unwrap().len(),
+            0,
+            "PauseBackground 期间不得触发"
+        );
+    }
+
     // --- P4.9: consistent-hash sharding ---
 
     #[test]
@@ -2814,6 +3553,51 @@ mod tests {
         );
     }
 
+    /// S1(issue #74):计划→放置→L0 驱逐→同块同节点可再触发(自愈回归)。
+    /// 修复前 `publish_location_at` 剥 L0 不清滞回标记,已计划块永远无法再触发
+    /// 对该节点的放置;修复后 L0 驱逐(present=false)连带清 (flat,node) 标记。
+    #[test]
+    fn s1_l0_evict_clears_placement_mark_and_retriggers() {
+        let mut auth = Authority::default();
+        ensure_model(&mut auth, "m");
+        let full = prefix(&[b"solo"]);
+        auth.register("n0", &full, vec![meta("m", b"solo")])
+            .unwrap();
+        let pk = PoolKind::Target as i32;
+        let id = KvBlockId {
+            model_id: "m".into(),
+            block_hash: b"solo".to_vec(),
+            pool_kind: pk,
+            scope: "public".into(),
+            revision: String::new(),
+        };
+
+        // 过阈值 → 下发计划(记滞回标记);再命中 → 滞回不重复。
+        assert!(auth.report_hits("n5", std::slice::from_ref(&id)).is_empty());
+        let plans = auth.report_hits("n5", std::slice::from_ref(&id));
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].0, "n5");
+        assert!(auth.report_hits("n5", std::slice::from_ref(&id)).is_empty());
+
+        // 放置完成(agent PlaceBlocks → PublishLocation)→ 之后 L0 被驱逐。
+        auth.publish_location("m", "", pk, b"solo", Tier::L0, "n5", true)
+            .unwrap();
+        auth.publish_location("m", "", pk, b"solo", Tier::L0, "n5", false)
+            .unwrap();
+
+        // 自愈:滞回标记已随驱逐清除,再次命中(计数仍 ≥ 阈值)可再触发。
+        let plans = auth.report_hits("n5", std::slice::from_ref(&id));
+        assert_eq!(
+            plans.len(),
+            1,
+            "L0 驱逐后滞回标记必须清除,同块同节点可再触发"
+        );
+        assert_eq!(plans[0].0, "n5");
+        assert_eq!(plans[0].1[0].block_hash, b"solo".to_vec());
+        // 再触发后滞回重建:继续命中不重复下发。
+        assert!(auth.report_hits("n5", std::slice::from_ref(&id)).is_empty());
+    }
+
     /// P7.6(B2-a):HRW 预放置——空环无计划;ready 节点集确定家节点;
     /// 链不在家节点 L0 的块全量预放;滞回不重复;已在家节点 L0 零动作。
     #[test]
@@ -3010,6 +3794,70 @@ mod tests {
         assert_eq!(calls.len(), 1, "join 应触发一次池侧 warmup");
         assert_eq!(calls[0].0, "n1");
         assert_eq!(calls[0].1, vec![b"hot".to_vec()]);
+    }
+
+    /// WarmupSink 与 DefragSink 同约束(见 s3_defrag_sink_delivered_outside_authority_lock):
+    /// 投递必须在 Authority 写锁释放后——sink 内回调 CP(读锁)时,锁内调用即
+    /// 同线程死锁。本测试在 warm() 内取 CP 读锁;RPC 放独立阻塞线程 + 超时,
+    /// 回归(锁内投递)时超时失败而非挂死 CI。覆盖 join_shard_node 调用点
+    /// (register_blocks/report_hits 同构,锁外投递由同一重构保证)。
+    #[tokio::test]
+    async fn warmup_sink_delivered_outside_authority_lock() {
+        use std::sync::Mutex as StdMutex;
+        use std::time::Duration;
+
+        struct ReentrantWarm(StdMutex<Option<ControlPlane>>);
+        impl WarmupSink for ReentrantWarm {
+            fn warm(&self, _target: &str, ids: Vec<KvBlockId>) {
+                assert!(!ids.is_empty());
+                let cp = self.0.lock().unwrap().clone().unwrap();
+                // 锁内投递(回归)时:调用方持写锁,此处读锁同线程死锁。
+                let _guard = cp.read_authority().expect("read authority");
+            }
+        }
+
+        let sink = Arc::new(ReentrantWarm(StdMutex::new(None)));
+        let cp = ControlPlane::default().with_warmup_sink(sink.clone());
+        *sink.0.lock().unwrap() = Some(cp.clone());
+        {
+            let mut auth = cp.write_authority().unwrap();
+            ensure_model(&mut auth, "m");
+            let full = prefix(&[b"hot"]);
+            auth.register("n0", &full, vec![meta("m", b"hot")]).unwrap();
+        }
+        cp.report_hits(Request::new(ReportHitsRequest {
+            node_id: "router-0".into(),
+            ids: vec![KvBlockId {
+                model_id: "m".into(),
+                block_hash: b"hot".to_vec(),
+                pool_kind: PoolKind::Target as i32,
+                scope: "public".into(),
+                revision: String::new(),
+            }],
+        }))
+        .await
+        .unwrap();
+
+        let cp2 = cp.clone();
+        let handle = tokio::task::spawn_blocking(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                cp2.join_shard_node(Request::new(JoinShardNodeRequest {
+                    node_id: "n1".into(),
+                    vnode_count: 16,
+                }))
+                .await
+                .unwrap()
+                .into_inner()
+            })
+        });
+        let resp = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("join_shard_node timed out (sink 疑似在锁内投递)")
+            .unwrap();
+        assert!(resp.ok);
     }
 
     #[test]

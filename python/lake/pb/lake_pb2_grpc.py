@@ -248,9 +248,9 @@ class ControlPlaneServiceServicer:
 
     def ReportRef(self, request_iterator, context):
         """P4.2–P4.3:**控制面合账骨架**（非完整两级 ref）。
-        累加 delta → global_refs；**忽略 RefKind**（不按 kind 分账）。
-        P4.3:agent `PutEndSession` 对 WRITEBACK 调本 RPC（+1 注册后 / -1 屏障前）；
-        本地一级 REQUEST/IN_FLIGHT 与 CP 分 kind → 后续。
+        累加 delta → global_refs；S4(issue #74)起**按 kind 分账**（REQUEST/WRITEBACK
+        分别计数，冻结语义仍看总数；underflow/overflow 按 kind 显式报错）。
+        P4.3:agent `PutEndSession` 对 WRITEBACK 调本 RPC（+1 注册后 / -1 屏障前）。
         流式：先收齐再 **全有或全无** apply（任一条未知 block → 整批不改，可安全重试）。
         不进 ViewEvent(B1)。
         """

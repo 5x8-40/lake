@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -201,8 +201,8 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) ListenAndServe() error {
-	log.Printf("lake-router OpenAI HTTP on %s → agent %s → worker %s",
-		s.cfg.HTTPAddr, s.cfg.AgentAddr, s.cfg.WorkerAddr)
+	slog.Info("lake-router OpenAI HTTP listening",
+		"http_addr", s.cfg.HTTPAddr, "agent_addr", s.cfg.AgentAddr, "worker_addr", s.cfg.WorkerAddr)
 	return http.ListenAndServe(s.cfg.HTTPAddr, s.Handler())
 }
 
@@ -338,7 +338,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		if !ack.GetOk() {
 			if ack.GetErr() != "" {
-				log.Printf("Dispatch rejected: %s", ack.GetErr())
+				slog.Warn("Dispatch rejected", "err", ack.GetErr())
 			}
 			return errDispatchRejected
 		}
@@ -501,10 +501,10 @@ func (e *generateCallError) Error() string { return e.err.Error() }
 func mapGRPCError(op string, err error) (httpStatus int, msg string) {
 	st, ok := status.FromError(err)
 	if !ok {
-		log.Printf("%s RPC error: %v", op, err)
+		slog.Error("upstream RPC error", "op", op, "err", err)
 		return http.StatusBadGateway, op + " upstream failed"
 	}
-	log.Printf("%s RPC error: code=%s msg=%q", op, st.Code(), st.Message())
+	slog.Error("upstream RPC error", "op", op, "code", st.Code(), "msg", st.Message())
 	switch st.Code() {
 	case codes.InvalidArgument:
 		return http.StatusBadRequest, op + " request invalid"

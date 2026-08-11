@@ -16,6 +16,80 @@ use crate::tier::TierL2;
 pub const DEFAULT_DEFRAG_SLOT_BYTES: u64 = 4096;
 
 impl Authority {
+    /// S3(issue #74):L2 碎片率 = 非致密 (node, segment) 组数 / 参与评估的组数。
+    ///
+    /// 与 [`plan_compact`] 同口径:只统计含 ≥2 个不同 offset 的组(单块组无洞
+    /// 可压);致密 = `offs[i] == i * slot`;冻结段(ref 总数 >0 的块所在段)
+    /// 不计入——defrag 动不了它,计入只会让阈值触发空转。无 L2 布局 → 0.0。
+    pub fn l2_fragmentation_ratio(
+        &self,
+        model_id: &str,
+        revision: &str,
+        pool_kind: i32,
+        slot_bytes: u64,
+    ) -> f64 {
+        let slot = if slot_bytes == 0 {
+            DEFAULT_DEFRAG_SLOT_BYTES
+        } else {
+            slot_bytes
+        };
+        let Ok(pk) = resolve_pool_kind(pool_kind) else {
+            return 0.0;
+        };
+        let Some(ns) = self.ns(model_id, revision) else {
+            return 0.0;
+        };
+        let Some(pool) = ns.pools.get(&pk) else {
+            return 0.0;
+        };
+        let mut groups: HashMap<(String, u64), Vec<u64>> = HashMap::new();
+        let mut frozen_segments: HashSet<(String, u64)> = HashSet::new();
+        for entry in pool.by_flat.values() {
+            let frozen = pool
+                .global_refs
+                .get(&entry.seq_hash)
+                .copied()
+                .unwrap_or_default()
+                .total()
+                > 0;
+            for loc in &entry.meta.locations {
+                if loc.tier != Tier::L2 as i32 {
+                    continue;
+                }
+                if frozen {
+                    frozen_segments.insert((loc.node_id.clone(), loc.segment_id));
+                    continue;
+                }
+                groups
+                    .entry((loc.node_id.clone(), loc.segment_id))
+                    .or_default()
+                    .push(loc.offset);
+            }
+        }
+        let mut total = 0usize;
+        let mut fragmented = 0usize;
+        for ((node_id, segment_id), offs) in groups.iter_mut() {
+            if frozen_segments.contains(&(node_id.clone(), *segment_id)) {
+                continue;
+            }
+            offs.sort_unstable();
+            offs.dedup();
+            if offs.len() < 2 {
+                continue;
+            }
+            total += 1;
+            let dense = (0..offs.len()).all(|i| offs[i] == (i as u64).saturating_mul(slot));
+            if !dense {
+                fragmented += 1;
+            }
+        }
+        if total == 0 {
+            0.0
+        } else {
+            fragmented as f64 / total as f64
+        }
+    }
+
     /// Build defrag moves from the location view (no byte mutation).
     pub fn plan_defrag(
         &self,
@@ -129,7 +203,13 @@ fn plan_compact(pool: &crate::authority::PoolView, slot: u64) -> Vec<DefragMove>
     let mut groups: HashMap<(String, u64), Vec<u64>> = HashMap::new();
     let mut frozen_segments: HashSet<(String, u64)> = HashSet::new();
     for entry in pool.by_flat.values() {
-        let frozen = pool.global_refs.get(&entry.seq_hash).copied().unwrap_or(0) > 0;
+        let frozen = pool
+            .global_refs
+            .get(&entry.seq_hash)
+            .copied()
+            .unwrap_or_default()
+            .total()
+            > 0;
         for loc in &entry.meta.locations {
             if loc.tier != Tier::L2 as i32 {
                 continue;
@@ -203,7 +283,14 @@ fn plan_colocate(pool: &crate::authority::PoolView, slot: u64) -> Vec<DefragMove
         if entry.prefix_chain.is_empty() {
             continue;
         }
-        if pool.global_refs.get(&entry.seq_hash).copied().unwrap_or(0) > 0 {
+        if pool
+            .global_refs
+            .get(&entry.seq_hash)
+            .copied()
+            .unwrap_or_default()
+            .total()
+            > 0
+        {
             continue;
         }
         let Some(l2) = entry

@@ -140,7 +140,14 @@ impl Authority {
             return Ok(false);
         };
         let seq = entry.seq_hash;
-        if pool.global_refs.get(&seq).copied().unwrap_or(0) > 0 {
+        if pool
+            .global_refs
+            .get(&seq)
+            .copied()
+            .unwrap_or_default()
+            .total()
+            > 0
+        {
             return Err("DiscardBlocks: block has global_refs > 0".into());
         }
         let entry = pool
@@ -197,7 +204,14 @@ impl Authority {
         let mut view_events = Vec::new();
 
         for (seq, bid) in victims {
-            if pool.global_refs.get(&seq).copied().unwrap_or(0) > 0 {
+            if pool
+                .global_refs
+                .get(&seq)
+                .copied()
+                .unwrap_or_default()
+                .total()
+                > 0
+            {
                 // Inactive victims should be ref=0 because report_ref 0→>0
                 // removes them from inactive. If stale defensive state slips in,
                 // dropping this allocation result is safe: the next >0→0 transition
@@ -281,7 +295,14 @@ impl Authority {
         }
         if let Some(pool) = ns.pools.get_mut(&pk) {
             for (seq, bid) in reinsert {
-                if pool.global_refs.get(&seq).copied().unwrap_or(0) > 0 {
+                if pool
+                    .global_refs
+                    .get(&seq)
+                    .copied()
+                    .unwrap_or_default()
+                    .total()
+                    > 0
+                {
                     continue;
                 }
                 if !pool.inactive.has(seq) && pool.inactive.len() < pool.inactive_cap {
@@ -304,21 +325,39 @@ impl Authority {
         }
         let held = self.node_refs.remove(node_id).unwrap_or_default();
         let mut refs_cleared = 0u32;
-        for (bk, count) in held {
-            if count == 0 {
+        for (bk, accounts) in held {
+            if accounts.total() == 0 {
                 continue;
             }
             refs_cleared += 1;
-            let delta = RefDelta {
-                id: Some(bk.to_id()),
-                kind: RefKind::Unspecified as i32,
-                delta: -(count as i32),
-                // `track_node=false` below is the primary guard; keep node_id
-                // empty too so dead-node cleanup cannot re-enter node_refs.
-                node_id: String::new(),
-            };
-            // Best-effort: block may already be gone.
-            let _ = self.report_ref_raw(&delta, /*track_node*/ false);
+            // S4(issue #74):按 kind 分别回冲(清账语义不变——总数归零;
+            // 分 kind 后 underflow 能定位到具体账簿,且不再借 UNSPECIFIED 入账)。
+            for (kind, count) in [
+                (RefKind::Request, accounts.request),
+                (RefKind::Writeback, accounts.writeback),
+            ] {
+                if count == 0 {
+                    continue;
+                }
+                // 账簿为 i64 而 proto `RefDelta.delta` 为 int32:按 i32::MAX 拆批回冲,
+                // 避免 count > i32::MAX 时 `as i32` 截断导致清账不净(原型期不可达,
+                // 但类型洞不留)。-(i32::MAX) 不会触发 i32::MIN 取负溢出。
+                let mut remaining = count;
+                while remaining > 0 {
+                    let step = remaining.min(i32::MAX as i64) as i32;
+                    let delta = RefDelta {
+                        id: Some(bk.to_id()),
+                        kind: kind as i32,
+                        delta: -step,
+                        // `track_node=false` below is the primary guard; keep node_id
+                        // empty too so dead-node cleanup cannot re-enter node_refs.
+                        node_id: String::new(),
+                    };
+                    // Best-effort: block may already be gone.
+                    let _ = self.report_ref_raw(&delta, /*track_node*/ false);
+                    remaining -= step as i64;
+                }
+            }
         }
 
         // Strip L0 locations for this node across all namespaces.
@@ -587,12 +626,16 @@ impl Authority {
     }
 
     /// Apply ref without optional node tracking (used by dead-node clear).
+    ///
+    /// S4:按 `delta.kind` 增/减对应账簿;underflow/overflow 按 kind 报错。
+    /// inactive 迁入迁出仍由**总数**穿越 0 驱动(冻结语义不分 kind)。
     pub(crate) fn report_ref_raw(
         &mut self,
         delta: &RefDelta,
         track_node: bool,
     ) -> Result<(), String> {
         let target = self.ref_target(delta)?;
+        let kind = crate::authority::resolve_ref_kind(delta.kind)?;
         let id = delta.id.as_ref().expect("checked");
         if track_node && !delta.node_id.is_empty() && delta.delta != 0 {
             let bk = BlockKey::from_id(id);
@@ -600,13 +643,15 @@ impl Authority {
                 .node_refs
                 .get(&delta.node_id)
                 .and_then(|held| held.get(&bk).copied())
-                .unwrap_or(0);
-            let after = before
-                .checked_add(i64::from(delta.delta))
-                .ok_or_else(|| "RefDelta: node_ref overflow".to_string())?;
+                .unwrap_or_default()
+                .bucket(kind);
+            let after = before.checked_add(i64::from(delta.delta)).ok_or_else(|| {
+                format!("RefDelta: node_ref overflow (kind={})", kind.as_str_name())
+            })?;
             if after < 0 {
                 return Err(format!(
-                    "RefDelta: node_ref underflow for node_id={} model_id={} revision={:?} pool_kind={} block_hash_len={}",
+                    "RefDelta: node_ref underflow (kind={}) for node_id={} model_id={} revision={:?} pool_kind={} block_hash_len={}",
+                    kind.as_str_name(),
                     delta.node_id,
                     id.model_id,
                     id.revision,
@@ -620,37 +665,41 @@ impl Authority {
         let entry = pool.by_flat.get(&id.block_hash).expect("checked");
         let block_id = entry.block_id;
 
-        let cur = pool.global_refs.entry(target.seq).or_insert(0);
-        let before = *cur;
-        let after = before
+        let accounts = pool.global_refs.entry(target.seq).or_default();
+        let before_total = accounts.total();
+        let bucket = accounts.bucket_mut(kind);
+        let after = bucket
             .checked_add(i64::from(delta.delta))
-            .ok_or_else(|| "RefDelta: ref_count overflow".to_string())?;
+            .ok_or_else(|| format!("RefDelta: ref_count overflow (kind={})", kind.as_str_name()))?;
         if after < 0 {
             return Err(format!(
-                "RefDelta: ref_count underflow for model_id={} revision={:?} pool_kind={} block_hash_len={}",
+                "RefDelta: ref_count underflow (kind={}) for model_id={} revision={:?} pool_kind={} block_hash_len={}",
+                kind.as_str_name(),
                 id.model_id,
                 id.revision,
                 target.pool_kind,
                 id.block_hash.len()
             ));
         }
-        *cur = after;
+        *bucket = after;
+        let after_total = accounts.total();
 
-        if before > 0 && after == 0 {
+        if before_total > 0 && after_total == 0 {
             if !pool.inactive.has(target.seq) && pool.inactive.len() < pool.inactive_cap {
                 pool.inactive.insert(target.seq, block_id);
             }
-        } else if before == 0 && after > 0 {
+        } else if before_total == 0 && after_total > 0 {
             let _ = pool.inactive.take(target.seq, block_id);
         }
 
         if track_node && !delta.node_id.is_empty() && delta.delta != 0 {
             let bk = BlockKey::from_id(id);
             let held = self.node_refs.entry(delta.node_id.clone()).or_default();
-            let e = held.entry(bk).or_insert(0);
-            *e = e.saturating_add(i64::from(delta.delta));
-            if *e <= 0 {
-                held.remove(&BlockKey::from_id(id));
+            let accounts = held.entry(bk.clone()).or_default();
+            let bucket = accounts.bucket_mut(kind);
+            *bucket = bucket.saturating_add(i64::from(delta.delta));
+            if accounts.total() <= 0 {
+                held.remove(&bk);
             }
         }
         Ok(())

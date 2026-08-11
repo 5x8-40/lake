@@ -3,7 +3,7 @@ package router
 import (
 	"context"
 	"io"
-	"log"
+	"log/slog"
 	"time"
 
 	lakepb "github.com/chengda-wu/lake/go/pb"
@@ -46,7 +46,7 @@ func runLoadSyncOnce(
 ) {
 	stream, err := agent.ReportLoad(ctx)
 	if err != nil {
-		log.Printf("ReportLoad dial: %v", err)
+		slog.Error("ReportLoad dial failed", "err", err)
 		return
 	}
 	ackCh := make(chan *lakepb.Ack, 8)
@@ -72,7 +72,7 @@ func runLoadSyncOnce(
 			return
 		case err := <-errCh:
 			if err != io.EOF {
-				log.Printf("ReportLoad recv: %v", err)
+				slog.Error("ReportLoad recv failed", "err", err)
 			}
 			return
 		case ack := <-ackCh:
@@ -81,7 +81,7 @@ func runLoadSyncOnce(
 			}
 		case <-ticker.C:
 			if err := stream.Send(sched.LoadSnapshot(nodeID)); err != nil {
-				log.Printf("ReportLoad send: %v", err)
+				slog.Error("ReportLoad send failed", "err", err)
 				return
 			}
 		}
