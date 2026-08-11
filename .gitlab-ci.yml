@@ -1,0 +1,137 @@
+# lake GitLab CI — 迁移自 .github/workflows/build.yml + p3.yml (2026-08)
+# 三语言 build/test/lint + P3 verify + smoke(不安装 torch,Qwen3 依赖测试自动跳过)
+#
+# 注意:本项目含 vendored 3rdparty(dynamo-tokens/kvbm-logical),clippy -D warnings 需排除之。
+
+stages:
+  - build
+  - verify
+  - smoke
+
+# 只创建 main push 与 MR 的流水线;其余分支 push 不跑 CI。
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == "main"'
+    - when: never
+
+default:
+  cache:
+    key: "$CI_COMMIT_REF_SLUG"
+    paths:
+      - rust/target/
+      - .cache/pip/
+      - go/bin/
+
+# ---------- build ----------
+
+rust:
+  stage: build
+  image: rust:1.96.1
+  before_script:
+    - apt-get update && apt-get install -y protobuf-compiler
+  script:
+    - cd rust
+    # tonic-build(build.rs) 调 protoc 在线生成 stub,CI 需装 protoc。
+    - cargo build --workspace
+    # storage-agent 双角色 feature 各自可单独编译(默认全开;部署期只开其一)。
+    - cargo build -p lake-storage-agent --no-default-features --features compute
+    - cargo build -p lake-storage-agent --no-default-features --features kvnode
+    # 格式 + lint 先跑;失败时免白跑 ~500 vendor 测。
+    - cargo fmt --check
+    # vendor 只读、源码不改:-D warnings 排除之,避免上游/新 lint 逼改 fork。
+    - cargo clippy --workspace --all-targets --exclude kvbm-logical --exclude dynamo-tokens -- -D warnings
+    # 全 workspace 单测(含 vendored fork)+ lake 自有 crate 门禁,防 lake 侧回归漏网。
+    - cargo test --workspace
+
+go:
+  stage: build
+  image: golang:1.22
+  script:
+    - cd go
+    - go build ./...
+    - gofmt -l . | tee /dev/stderr | (! read)  # 有输出即失败
+    - go vet ./...
+    - go test ./...
+
+python:
+  stage: build
+  image: python:3.12
+  before_script:
+    - pip install "grpcio>=1.82.1" "protobuf>=7.35.0" "transformers" pytest
+  script:
+    - cd python
+    # stub 顶部校验 protobuf runtime >= 7.35.0 / grpcio >= 1.82.1;Qwen3 config 由 transformers
+    # AutoConfig 读取,轻量 import 路径不安装 torch。worker 包在 python/ 下,PYTHONPATH 直接 import。
+    - PYTHONPATH=. python -c "from lake.pb import lake_pb2, lake_pb2_grpc, schema_pb2; import lake.kernels, lake.runtime, lake.engine; import lake.prefill, lake.decode, lake.draft; from lake.runtime.node_scheduler import NodeScheduler; from lake.engine.model_runner import ModelRunner; from lake.engine.model_executor.models import ModelRegistry; from lake.kernels import causal_attn; print('py OK')"
+    # torch 依赖测试用 importorskip 守卫、Qwen3 模型依赖测试用 requires_qwen3/模块级 skip 守卫,
+    # CI 无 torch 无模型缓存时自动跳过。
+    - PYTHONPATH=. python -m pytest lake/ -q
+
+# stub drift:重生成 Go/Python stub 后 git diff --exit-code。
+# 拦「proto 改了没重生成 stub」与「工具版本漂移致生成物变」。
+stub-drift:
+  stage: build
+  image: golang:1.22
+  variables:
+    GOTOOLCHAIN: auto  # protoc-gen-go v1.36.11 需 go>=1.23,自动切到所需 toolchain
+  before_script:
+    - apt-get update && apt-get install -y protobuf-compiler python3 python3-pip
+    - go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
+    - go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
+    - pip3 install --break-system-packages grpcio-tools==1.82.1
+  script:
+    - export PATH="$HOME/go/bin:$PATH"
+    - bash scripts/gen_stubs.sh
+    - git diff --exit-code
+
+# ---------- verify / smoke (p3.yml) ----------
+
+# P3 编译门禁(不含起全栈冒烟)。rust:1.96.1 自带 rust,apt 装 python3,Go 用官方二进制。
+verify-p3:
+  stage: verify
+  image: rust:1.96.1
+  needs: []
+  before_script:
+    - apt-get update && apt-get install -y protobuf-compiler python3 python3-pip curl
+    - curl -fsSL https://go.dev/dl/go1.22.12.linux-amd64.tar.gz | tar -C /usr/local -xz
+    - export PATH="/usr/local/go/bin:$PATH"
+    - pip3 install --break-system-packages "grpcio>=1.82.1" "protobuf>=7.35.0" "transformers"
+  script:
+    - bash scripts/verify-p3.sh
+
+# P3 冒烟:起全栈(rust 三服务 + go router + python worker),两次共享前缀请求,
+# 第二次 reused_blocks >= 3(多 block 复用)。仅 main/MR;不安装 Torch(LAKE_MODEL_BACKEND=mock)。
+smoke:
+  stage: smoke
+  image: rust:1.96.1
+  needs: ["verify-p3"]
+  before_script:
+    - apt-get update && apt-get install -y protobuf-compiler python3 python3-pip curl
+    - curl -fsSL https://go.dev/dl/go1.22.12.linux-amd64.tar.gz | tar -C /usr/local -xz
+    - export PATH="/usr/local/go/bin:$PATH"
+    - pip3 install --break-system-packages "grpcio>=1.82.1" "protobuf>=7.35.0" "transformers"
+  script:
+    - |
+      LAKE_MODEL_BACKEND=mock LAKE_SERVED_MODEL_NAME=mock-llm ./deploy/run-local.sh &
+      echo $! > /tmp/lake-stack.pid
+      for i in $(seq 1 120); do
+        if curl -sf http://127.0.0.1:8080/healthz >/dev/null; then
+          echo "router ready"; break
+        fi
+        sleep 1
+      done
+      ./deploy/smoke.sh
+      rc=$?
+      kill "$(cat /tmp/lake-stack.pid)" 2>/dev/null || true
+      pkill -f lake-controlplane 2>/dev/null || true
+      pkill -f lake-kv-pool 2>/dev/null || true
+      pkill -f lake-storage-agent 2>/dev/null || true
+      pkill -f 'python3 -m lake.runtime' 2>/dev/null || true
+      pkill -f lake-router 2>/dev/null || true
+      exit $rc
+  after_script:
+    - pkill -f lake-controlplane 2>/dev/null || true
+    - pkill -f lake-kv-pool 2>/dev/null || true
+    - pkill -f lake-storage-agent 2>/dev/null || true
+    - pkill -f lake-router 2>/dev/null || true
