@@ -3,577 +3,146 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CMX · PD Prefill 跑满</title>
-  <style>
-    :root {
-      --bg: #12110f;
-      --bg2: #1b1916;
-      --bg3: #24211c;
-      --line: #3a352c;
-      --ink: #ece6d8;
-      --muted: #9a917f;
-      --accent: #e08a3c;
-      --read: #4aa3d9;
-      --write: #e08a3c;
-      --ok: #7cb87a;
-      --bad: #d46a5c;
-      --mono: "IBM Plex Mono", "ui-monospace", "SFMono-Regular", Menlo, Consolas, monospace;
-      --sans: "Source Serif 4", "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
-      --ui: "IBM Plex Sans", "Segoe UI", system-ui, sans-serif;
-    }
-    * { box-sizing: border-box; }
-    html, body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.45 var(--ui); }
-    a { color: var(--read); }
-    header {
-      padding: 28px 28px 12px;
-      border-bottom: 1px solid var(--line);
-    }
-    header h1 { font: 600 28px/1.2 var(--sans); margin: 0 0 8px; letter-spacing: -0.02em; }
-    header p { margin: 0; color: var(--muted); max-width: 78ch; }
-    .warn {
-      margin-top: 12px;
-      padding: 10px 12px;
-      background: #2a2018;
-      border-left: 3px solid var(--accent);
-      color: #e6d3b8;
-      font-size: 13px;
-      max-width: 92ch;
-    }
-    .layout { display: grid; grid-template-columns: 320px 1fr; min-height: calc(100vh - 140px); }
-    aside {
-      border-right: 1px solid var(--line);
-      padding: 16px 18px 32px;
-      background: var(--bg2);
-    }
-    aside h2 { font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); margin: 18px 0 8px; }
-    label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
-    input[type="number"], select {
-      width: 100%;
-      background: var(--bg);
-      color: var(--ink);
-      border: 1px solid var(--line);
-      padding: 7px 8px;
-      font: 13px var(--mono);
-    }
-    input[type="range"] { width: 100%; accent-color: var(--accent); }
-    .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-    .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
-    button.chip, .chips button {
-      background: var(--bg3);
-      color: var(--ink);
-      border: 1px solid var(--line);
-      padding: 4px 8px;
-      font: 12px var(--ui);
-      cursor: pointer;
-    }
-    button.chip.on, .chips button.on { border-color: var(--accent); color: var(--accent); }
-    main { padding: 18px 24px 48px; }
-    .stats {
-      display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-      gap: 10px;
-      margin-bottom: 18px;
-    }
-    .stat {
-      background: var(--bg2);
-      border: 1px solid var(--line);
-      padding: 12px 14px;
-    }
-    .stat .k { font-size: 11px; color: var(--muted); letter-spacing: 0.04em; }
-    .stat .v { font: 600 22px/1.2 var(--mono); margin-top: 4px; }
-    .stat .s { font-size: 11px; color: var(--muted); margin-top: 4px; }
-    .stat.hot .v { color: var(--accent); }
-    .stat.bad .v { color: var(--bad); }
-    .stat.ok .v { color: var(--ok); }
-    .panel {
-      background: var(--bg2);
-      border: 1px solid var(--line);
-      padding: 14px 16px;
-      margin-bottom: 14px;
-    }
-    .panel h3 { margin: 0 0 10px; font: 600 16px var(--sans); }
-    pre.formula {
-      margin: 0;
-      white-space: pre-wrap;
-      font: 12.5px/1.55 var(--mono);
-      color: #d8d0c0;
-      overflow-x: auto;
-    }
-    .tabs { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
-    .chart-wrap { height: 340px; }
-    svg.chart { width: 100%; height: 100%; display: block; }
-    table { width: 100%; border-collapse: collapse; font: 13px var(--mono); }
-    th, td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line); }
-    th:first-child, td:first-child { text-align: left; }
-    th { color: var(--muted); font: 11px var(--ui); letter-spacing: 0.06em; text-transform: uppercase; }
-    details { margin-top: 8px; color: var(--muted); font-size: 13px; }
-    footer { color: var(--muted); font-size: 12px; max-width: 90ch; }
-    @media (max-width: 980px) {
-      .layout { grid-template-columns: 1fr; }
-      aside { border-right: 0; border-bottom: 1px solid var(--line); }
-    }
-  </style>
+  <title>NVIDIA CMX 分析 · Vera Rubin</title>
+  <link rel="stylesheet" href="app.css" />
 </head>
 <body>
+  <nav class="topnav">
+    <a href="index.html" class="on">CMX 分析</a>
+    <a href="prefill.html">仿真 · Prefill 跑满</a>
+    <a href="capacity.html">仿真 · 容量驻留</a>
+  </nav>
   <header>
-    <h1>Vera Rubin × CMX · PD 分离 Prefill 跑满</h1>
+    <h1>NVIDIA CMX：G3.5 上下文存储，不是一块更快的企业盘</h1>
     <p>
-      负载：每人一条约 1M token 会话，前缀命中可调。工作点是 <b>Prefill 池 GPU 算力打满</b>，不是 Decode 每步用 HBM 扫完整 KV。
-      高命中时 Prefill 几乎不产新 KV，但要把前缀从 CMX 预取到 Prefill GPU 才能 attend——读远大于写。
+      平台是 Vera Rubin POD。CMX 跑在 BlueField-4 STX 机柜上，作用域是整个 GPU POD 的共享 KV，不是单机本地 SSD。
+      下面只根据 NVIDIA 公开材料拆技术点；数字能钉的钉，钉不住的标明是定性口径。
     </p>
     <div class="warn">
-      V4-Pro 在 1,048,576 token、BF16 下是 <b>9.62 GiB</b>（vLLM 附录：30×c4a + 31×c128a，共享 KV 1024 B/entry）。
-      先前用「论文 10% of V3.2」或「平均 5.2 KB/token」会得到 ~5 GiB，那是错的。
+      两个仿真在另外两页：<b>Prefill 跑满</b>是 PD 分离下算力打满时 CMX 的读写；<b>容量驻留</b>是 1M 会话在 G1/G2/CMX 能住多少。
+      不要用「Decode 每步扫完整 1M KV 的 HBM 上限」去代替 Prefill 跑满。
     </div>
   </header>
 
-  <div class="layout">
-    <aside>
-      <h2>模型 / 精度</h2>
-      <label for="model">模型</label>
-      <select id="model">
-        <option value="v4pro" selected>DeepSeek V4-Pro（1.6T / 49B）</option>
-        <option value="v4flash">DeepSeek V4-Flash（284B / 13B）</option>
-        <option value="glm52">GLM-5.2（744B / 40B）</option>
-        <option value="k3">Kimi K3（2.8T / 104B）</option>
-      </select>
-      <label>KV dtype（可选，不跟模型绑定）</label>
-      <div class="chips" id="dtypeChips">
-        <button type="button" data-dtype="bf16" class="on">BF16</button>
-        <button type="button" data-dtype="fp8">FP8</button>
-        <button type="button" data-dtype="fp8_fp4">FP8 + FP4 indexer</button>
-      </div>
-      <p id="dtypeHint" style="font-size:12px;color:var(--muted);margin:8px 0 0;"></p>
-      <div id="glmLayoutWrap" hidden>
-        <label>GLM MLA 页布局（仅 FP8，可选）</label>
-        <div class="chips" id="glmLayoutChips">
-          <button type="button" data-layout="logical" class="on">逻辑 576 B/层</button>
-          <button type="button" data-layout="fp8_ds_mla">引擎 656 B/层</button>
-        </div>
-      </div>
-      <p id="modelNote" style="font-size:12px;color:var(--muted);margin:8px 0 0;"></p>
+  <article class="prose">
+    <h2>CMX 在补哪一层</h2>
+    <p>
+      NVIDIA 的判断：agentic / 百万 token 上下文把 KV 变成一种既要快、又要大、又不必按企业数据做耐久的东西。
+      G1 HBM 太小太贵；G4 共享文件/对象是为不可重建数据准备的（副本、scrub、元数据），拿来扛热 KV 会拉高每 token 功耗、让 GPU 空转。
+      G3 本地 SSD 能缓冲，但绑在单节点上，换 GPU、跨 agent 复用还得再搬一次。
+    </p>
+    <p>
+      CMX 的产品名在材料里也叫 Inference Context Memory Storage（ICMS）。它插的是 <b>G3.5</b>：以太网闪存、POD 级共享、专为 ephemeral KV。
+      公开定性口径是「每个 GPU POD 数 PB 共享容量」，用来在 HBM/DRAM 挤出之后仍保留可复用历史，并频繁 prestaging 回主机/GPU，避免 decode stall。
+      时间点：2026 H2 经制造/存储伙伴出货；对比基线写的是 traditional storage，不是某一家推理引擎的实测。
+    </p>
 
-      <h2>会话</h2>
-      <label>上下文长度 <span id="ctxVal"></span></label>
-      <input id="ctx" type="range" min="8192" max="1048576" step="8192" value="1048576" />
-      <input id="ctxNum" type="number" min="1024" max="1048576" step="1024" value="1048576" />
-      <label>前缀命中率 <span id="hitVal"></span></label>
-      <input id="hit" type="range" min="80" max="99.5" step="0.5" value="99" />
-      <div class="chips" id="hitChips">
-        <button type="button" data-hit="90">90%</button>
-        <button type="button" data-hit="95">95%</button>
-        <button type="button" data-hit="99" class="on">99%</button>
-      </div>
-      <label for="extra">额外 unique token / 请求（本轮新输入）</label>
-      <input id="extra" type="number" min="0" step="1" value="0" />
+    <h2>在 Rubin POD 里的位置</h2>
+    <p>
+      Vera Rubin POD 是五类机柜拼起来的：<b>NVL72</b>（72 Rubin GPU + 36 Vera CPU，NVLink 6）、
+      <b>Groq 3 LPX</b>、<b>Vera CPU</b>、<b>BlueField-4 STX</b>、<b>Spectrum-6 SPX</b>。
+      公开数字：约 40 机柜、1152 Rubin GPU。CMX 住在 STX 上，计算柜经 Spectrum-X 访问，不是 NVL72 机柜里的本地盘。
+    </p>
+    <p>
+      STX 机柜：BlueField-4 = Vera CPU + ConnectX-9 SuperNIC，scale-out 走 Spectrum-X。
+      计算节点上的 BlueField-4 在另一篇 Rubin 芯片文里写成 64 核 Grace + CX-9、最高 800 Gb/s——和 STX「Vera + CX-9」的表述并存。
+      分析时把两者当成<b>同一代 DPU 家族的两个落点</b>（计算节点发起端 / 存储柜终止端），不要合成一颗芯片的一张规格表。
+    </p>
+    <table>
+      <tr><th>层</th><th>Rubin 上的介质</th><th>这套 1M 负载下干什么</th></tr>
+      <tr><td>G1</td><td>288 GB HBM4 / GPU，22 TB/s</td><td>正在算的 KV；Prefill attend、Decode 逐步扫描都在这里</td></tr>
+      <tr><td>G2</td><td>NVL72 柜内 54 TB LPDDR5X</td><td>预取缓冲、HBM 溢出</td></tr>
+      <tr><td>G3</td><td>节点本地 SSD</td><td>单机暖 KV；别的 GPU 看不见</td></tr>
+      <tr><td>G3.5 CMX</td><td>STX 以太网闪存</td><td>POD 内共享的 1M 会话 / 共享前缀</td></tr>
+      <tr><td>G4</td><td>对象/文件</td><td>要留下的冷历史，不在 decode 热路径</td></tr>
+    </table>
 
-      <h2>Prefill 池（跑满）</h2>
-      <label for="gpus">Prefill GPU 数</label>
-      <input id="gpus" type="number" min="1" step="1" value="72" />
-      <div class="chips" id="gpuChips">
-        <button type="button" data-gpus="8">8</button>
-        <button type="button" data-gpus="72" class="on">NVL72</button>
-        <button type="button" data-gpus="1152">POD 1152</button>
-      </div>
-      <div class="row2">
-        <div>
-          <label for="pflops">PFLOPS / GPU</label>
-          <input id="pflops" type="number" min="1" step="0.1" value="50" />
-        </div>
-        <div>
-          <label for="util">算力利用率</label>
-          <input id="util" type="number" min="0.05" max="1" step="0.05" value="0.40" />
-        </div>
-      </div>
-      <label for="nic">出柜 NIC GB/s / GPU（默认 CX-9 1.6 Tb/s 单向 ≈ 200）</label>
-      <input id="nic" type="number" min="10" step="10" value="200" />
+    <h2>数据路径</h2>
+    <p>
+      计算柜 BlueField-4 做发起端：NVMe-oF / NVMe KV，线速 CRC 和加密，KV 不进主机 CPU 拷贝链。
+      STX 上的 BlueField-4 终止协议、读写闪存。Spectrum-X 提供可预期时延的 RDMA。
+      NIXL 的职责是在计算开始前把命中块 prestaging 到 G2/G1。没有这条预取，CMX 就退化成稍快一点的 G4。
+    </p>
+    <p>
+      KV 在 CMX 上按可重建、短寿命处理：不做企业存储那套多副本和后台 scrub。块丢了就从 token 重算。
+      热集靠预取留在 G1/G2。这是「5× 能效」叙事的前提，不是闪存介质本身 magically 省电。
+    </p>
 
-      <h2>图</h2>
-      <select id="chartKind">
-        <option value="hitIo">命中率 → CMX 读/写</option>
-        <option value="hitNic">命中率 → NIC 占用</option>
-        <option value="hitTps">命中率 → 请求率</option>
-        <option value="ctxKv">上下文 → KV 体积</option>
-        <option value="ctxFlops">上下文 → unique tok/s</option>
-        <option value="models">四模型对照（当前命中）</option>
-        <option value="dtypeKv">dtype → KV / 读写</option>
-      </select>
-    </aside>
-
-    <main>
-      <div class="stats" id="stats"></div>
-
+    <h2>技术点</h2>
+    <div class="grid2">
       <div class="panel">
-        <h3>当前工作点公式</h3>
-        <pre class="formula" id="formula"></pre>
+        <h3>1. KV 是单独数据类</h3>
+        <p>相对权重和业务对象，KV 可重算、按会话生长、访问是多对多持续打满。CMX 的存储栈按这个假设裁掉耐久服务。公开博客原话：critical for performance yet inherently ephemeral。</p>
       </div>
-
       <div class="panel">
-        <h3 id="chartTitle">图</h3>
-        <div class="tabs" id="legend"></div>
-        <div class="chart-wrap"><svg class="chart" id="chart" viewBox="0 0 900 340"></svg></div>
+        <h3>2. G3.5 补的是共享，不只是容量</h3>
+        <p>G1/G2/G3 随 GPU 线性涨，但 G3 绑节点。1M 会话要在多轮、多 agent、换 GPU 之后复用，必须有一层 POD 内大家都能 RDMA 到的闪存。插 G3.5 的原因是这个，不是「本地盘不够再买一块」。</p>
       </div>
-
       <div class="panel">
-        <h3>四模型对照（同一会话 / 硬件）</h3>
-        <table id="cmp"></table>
+        <h3>3. 预取，不是同步 miss</h3>
+        <p>1M 会话每轮预取是数 GB 到几十 GB。同步 miss 会让 GPU 空转。官方 5× TPS 建立在「预取成功、GPU 持续有活干」上。工作负载、命中率、ISL/OSL 都没公开。</p>
       </div>
-
       <div class="panel">
-        <h3>假设与口径</h3>
-        <ul style="margin:0;padding-left:18px;color:var(--muted);font-size:13px;">
-          <li>PD 分离：Prefill GPU 只做 unique token 的前向。前缀 KV 从 CMX 预取到 Prefill HBM（NIXL prestaging 这条路径）。</li>
-          <li>跑满 = <code>unique_tok/s = (peak_FLOPS × util) / FLOPs_per_unique_token(C)</code>。默认 Rubin NVFP4 50 PFLOPS、util 40%，两者都可改。</li>
-          <li>写 CMX = 新 KV（unique × 增量字节）。读 CMX = 每个请求把命中前缀拉到 Prefill。99% @ 1M 时读/写 ≈ 99。</li>
-          <li>dtype 是独立选项：切模型不会改精度。V4 附录 9.62 GiB 用 BF16；GLM/K3 的 1M serving 常用 FP8。GLM 还可选逻辑 576 B/层或 vLLM <code>fp8_ds_mla</code> 656 B/层。</li>
-          <li>V4 体积用压缩后的 entry 数，不是 SGLang <code>DeepSeekV4SingleKVPool.get_bytes_per_token</code> 的 584 B 未压缩页布局。</li>
-          <li>没有对照 lake / Mooncake / 其它集群。数字只描述这条 Prefill→CMX 管道。</li>
-        </ul>
-        <details>
-          <summary>对照：若误用「Decode 每步 HBM 扫 1M KV」</summary>
-          <p id="wrongModel"></p>
-        </details>
+        <h3>4. DOCA 是 KV 的 I/O 面</h3>
+        <p>Rubin 芯片文：DOCA 提供 KV communication and storage interfaces。闪存被呈现成 POD 级 key-value，不解释张量。完整性、加密、协议终止在 DPU。NVIDIA 写明对存储伙伴和更广编排开放。</p>
       </div>
+      <div class="panel">
+        <h3>5. Dynamo / NIXL 是编排，不是闪存前提</h3>
+        <p>公开路径：Dynamo 管 KV 块在层次间的放置，NIXL 做传输。这是 NVIDIA 画出的控制面怎么用 CMX，不是 STX 机柜加电的物理前提。CMX 机柜 + DOCA 是存储面；没有 Dynamo 也可以有别的编排去调 prestaging，只是公开演示不是那样画的。</p>
+      </div>
+      <div class="panel">
+        <h3>6. 官方 5× 在说什么</h3>
+        <p>原文相对 traditional storage：通用 x86 存储栈、为不可重建数据准备的副本/元数据。STX 新闻稿另外还有「相对传统 CPU 存储架构 4× 能效、2× 摄入」——那是 STX 存储参考架构的另一条声明，不要和 CMX 的 5× TPS 混成一个数。都没有公开模型与负载。</p>
+      </div>
+    </div>
 
-      <footer>
-        KV：<a href="https://vllm-project.github.io/2026/04/24/deepseek-v4.html">vLLM DeepSeek V4 附录</a>
-        · 层配置：DeepSeek-V4 论文 §4.2.1（arXiv:2606.19348）
-        · Rubin：288 GB HBM4 @ 22 TB/s，50 PFLOPS NVFP4/GPU，NVL72=72 GPU，POD≈1152
-        · GLM-5.2：78+MTP 层 MLA 576-d + 22 indexer；K3：24 MLA + 69 KDA 固定态
-      </footer>
-    </main>
-  </div>
+    <h2>公开数字 vs 没公布的</h2>
+    <table>
+      <tr><th>有</th><th>没有（不要当成数据表）</th></tr>
+      <tr>
+        <td>NVL72：72 GPU，288 GB HBM4 @ 22 TB/s/GPU，柜 20.7 TB HBM + 54 TB LPDDR5X，NVFP4 inf 50 PFLOPS/GPU；POD ≈ 1152 GPU；CX-9 端点 1.6 Tb/s/GPU（部分表）/ BF4 800 Gb/s</td>
+        <td>CMX 每柜闪存 TB、每 GPU 保证带宽、prestaging SLA、副本因子、故障后重算预算</td>
+      </tr>
+      <tr>
+        <td>「PB / GPU POD」、以太网闪存、H2 2026 伙伴出货</td>
+        <td>5× 的对照负载（模型、ctx、命中、batch）</td>
+      </tr>
+    </table>
+    <p>
+      出柜去 CMX 的带宽，本仿真默认按 ConnectX-9 1.6 Tb/s 单向 ≈ <b>200 GB/s/GPU</b>，可在仿真页改。
+      若采用「0.4 TB/s/GPU」那种机柜汇总表，按双向或不同口径理解，不要和 200 GB/s 混用。
+    </p>
 
-  <script src="sim.js"></script>
-  <script>
-    const S = window.CmxSim;
-    const $ = (id) => document.getElementById(id);
-    let dtypeId = "bf16";
-    let mlaPacked = false;
+    <h2>1M 会话下，CMX 实际会被打到哪一面</h2>
+    <p>负载：每人一条 ~1M token 会话，前缀命中 90/95/99%，PD 分离。两件不同的事：</p>
+    <ul>
+      <li><b>Prefill 跑满</b>（主仿真）：算力打满时 unique tok/s 由 GEMM+indexer 决定。高命中时新 KV 很小，但 Prefill GPU 仍要把命中前缀从 CMX 拉进来才能 attend → <b>读主导</b>。99% @ 1M 时读/写 ≈ 99。</li>
+      <li><b>容量驻留</b>（第二仿真）：活着的 1M 会话数一旦超过 G1（再超过 G2），多出来的只能在 CMX。Agent 在工具上等待的会话不占算力，但占容量。这和「PB/POD」口径对得上。</li>
+      <li>Decode 若整段 KV 已在 HBM，CMX 不参与那一步。用 <code>22 TB/s ÷ KV</code> 得到的 tok/s 是 G1 扫描上限，不是 CMX 带宽模型。</li>
+    </ul>
 
-    function params() {
-      return {
-        modelId: $("model").value,
-        dtypeId: dtypeId,
-        mlaPacked: $("model").value === "glm52" && dtypeId !== "bf16" && mlaPacked,
-        ctx: Number($("ctxNum").value),
-        hit: Number($("hit").value) / 100,
-        extraUnique: Number($("extra").value) || 0,
-        gpus: Number($("gpus").value) || 1,
-        pflops: Number($("pflops").value) || 50,
-        util: Number($("util").value) || 0.4,
-        nicGBs: Number($("nic").value) || 200,
-      };
-    }
+    <h2>四模型 KV 口径（仿真里可改 dtype）</h2>
+    <table>
+      <tr><th>模型</th><th>结构</th><th>BF16 @ 1,048,576</th><th>FP8 @ 1M（常见 serving）</th></tr>
+      <tr><td>V4-Pro</td><td>30 c4a + 31 c128a，共享 KV</td><td>9.62 GiB</td><td>~4.8 GiB（FP8+FP4 再小）</td></tr>
+      <tr><td>V4-Flash</td><td>2 SWA + 21 c4a + 20 c128a</td><td>6.72 GiB</td><td>~3.4 GiB</td></tr>
+      <tr><td>GLM-5.2</td><td>79×MLA 576-d + 22 indexer</td><td>94.4 GiB</td><td>47.3 GiB（引擎 656 页则 53.5）</td></tr>
+      <tr><td>Kimi K3</td><td>24 MLA + 69 KDA 固定态</td><td>27.2 GiB</td><td>13.7 GiB</td></tr>
+    </table>
+    <p>
+      V4-Pro 的 9.62 GiB 钉在 vLLM 2026-04-24 附录。GLM/K3 钉在 HuggingFace 官方 config。
+      不要用「V3.2 的 10%」或平均 KB/token 去代替逐层公式。
+    </p>
 
-    function setDtype(id) {
-      dtypeId = id;
-      document.querySelectorAll("#dtypeChips button").forEach((b) => {
-        b.classList.toggle("on", b.dataset.dtype === id);
-      });
-    }
-
-    function setLayout(packed) {
-      mlaPacked = packed;
-      document.querySelectorAll("#glmLayoutChips button").forEach((b) => {
-        b.classList.toggle("on", (b.dataset.layout === "fp8_ds_mla") === packed);
-      });
-    }
-
-    function setHit(pct) {
-      $("hit").value = pct;
-      document.querySelectorAll("#hitChips button").forEach((b) => {
-        b.classList.toggle("on", Number(b.dataset.hit) === Number(pct));
-      });
-    }
-
-    $("ctx").addEventListener("input", () => { $("ctxNum").value = $("ctx").value; render(); });
-    $("ctxNum").addEventListener("input", () => {
-      $("ctx").value = Math.min(1048576, Math.max(8192, $("ctxNum").value));
-      render();
-    });
-    $("hit").addEventListener("input", () => { setHit($("hit").value); render(); });
-    $("hitChips").addEventListener("click", (e) => {
-      if (e.target.dataset.hit) { setHit(e.target.dataset.hit); render(); }
-    });
-    $("gpuChips").addEventListener("click", (e) => {
-      if (e.target.dataset.gpus) {
-        $("gpus").value = e.target.dataset.gpus;
-        document.querySelectorAll("#gpuChips button").forEach((b) => {
-          b.classList.toggle("on", b.dataset.gpus === e.target.dataset.gpus);
-        });
-        render();
-      }
-    });
-    $("dtypeChips").addEventListener("click", (e) => {
-      if (e.target.dataset.dtype) { setDtype(e.target.dataset.dtype); render(); }
-    });
-    $("glmLayoutChips").addEventListener("click", (e) => {
-      if (e.target.dataset.layout) {
-        setLayout(e.target.dataset.layout === "fp8_ds_mla");
-        render();
-      }
-    });
-    ["model", "extra", "gpus", "pflops", "util", "nic", "chartKind"].forEach((id) => {
-      $(id).addEventListener("input", render);
-      $(id).addEventListener("change", render);
-    });
-
-    function stat(k, v, s, cls) {
-      return `<div class="stat ${cls || ""}"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s || ""}</div></div>`;
-    }
-
-    function renderStats(r) {
-      const nicCls = r.nicPct >= 100 ? "bad" : r.nicPct >= 70 ? "hot" : "ok";
-      $("stats").innerHTML = [
-        stat("KV / 会话", r.kvGiB.toFixed(2) + " GiB", r.dtype.label, "hot"),
-        stat("unique / 请求", Math.round(r.uniqueTok).toLocaleString(), `ctx×(1−hit)+extra`),
-        stat("unique tok/s · GPU", S.fmtTps(r.uniqueTpsGpu), `${r.gpus} GPU 合计 ${S.fmtTps(r.uniqueTps)}`),
-        stat("请求/s · 池", S.fmtNum(r.reqs, 2), `${r.reqsGpu.toFixed(2)} / GPU`),
-        stat("CMX 读（前缀预取）", S.fmtGBs(r.read), `${S.fmtGBs(r.readGpu)} / GPU · ${(r.readTBh).toFixed(1)} TB/h`),
-        stat("CMX 写（新 KV）", S.fmtGBs(r.write), `${S.fmtGBs(r.writeGpu)} / GPU · ${(r.writeTBh).toFixed(1)} TB/h`),
-        stat("读 / 写", (r.write > 0 ? r.read / r.write : Infinity).toFixed(1) + "×", "高命中 → 读主导"),
-        stat("NIC 占用 / GPU", r.nicPct.toFixed(0) + "%", r.bottleneck === "nic" ? "打满：NIC" : "打满：算力", nicCls),
-      ].join("");
-    }
-
-    function renderFormula(r) {
-      const C = r.ctx;
-      const h = r.hit;
-      const m = r.model;
-      let kvLine = "";
-      if (m.kind === "v4") {
-        const d = r.kvDetail;
-        kvLine =
-`dtype = ${r.dtype.id}  (${r.dtype.label})
-KV(C) = n_c4a·[(128 + C/4)·${d.kvB} + (C/4)·${d.idxB}] + n_c128a·[(128 + C/128)·${d.kvB}] + n_swa·128·${d.kvB}
-      = ${m.nC4}×c4a + ${m.nC128}×c128a + ${m.nSwaOnly}×SWA
-      = ${S.fmtGiB(r.kvBytes)}   // BF16 @ 1,048,576 → V4-Pro 9.62 GiB；当前 dtype 按上式缩放`;
-      } else if (m.kind === "glm") {
-        const mlaB = r.kvDetail.mlaB;
-        kvLine =
-`dtype = ${r.dtype.id}  (${r.dtype.label}${r.mlaPacked ? " · fp8_ds_mla 656 B/层" : ""})
-KV(C) = C · (MLA_bpt + indexer_bpt) = C · (${mlaB} + ${r.kvDetail.idxBpt})
-      = ${S.fmtGiB(r.kvBytes)}`;
-      } else {
-        kvLine =
-`dtype = ${r.dtype.id}  (${r.dtype.label})
-KV(C) = C · (24×576×${r.dtype.kv} B) + KDA_fixed
-      = ${S.fmtGiB(r.kvBytes)}   // KDA ≈ 221.55 MiB/会话，与 C、dtype 无关（按 bf16 计）`;
-      }
-      $("formula").textContent =
-`${kvLine}
-
-unique = C·(1 − h) + extra = ${C}·(1 − ${h}) + ${Number($("extra").value) || 0} = ${Math.round(r.uniqueTok)}
-
-FLOPs/unique_token(C) = 2·N_active + attn(C)
-                      = 2·${S.fmtNum(m.nActive, 0)} + ${S.fmtNum(r.flops.attn, 2)}
-                      = ${S.fmtNum(r.flops.total, 2)}   // GEMM ${S.fmtNum(r.flops.gemm, 2)} + attn ${S.fmtNum(r.flops.attn, 2)}
-
-unique_tok/s/GPU = (peak_FLOPS · util) / FLOPs
-                 = (${(r.peakFlops/1e15).toFixed(0)} PFLOPS · ${r.util}) / ${S.fmtNum(r.flops.total, 2)}
-                 = ${S.fmtTps(r.uniqueTpsGpu)} tok/s
-
-req/s/GPU = unique_tok/s / unique = ${r.reqsGpu.toFixed(3)}
-
-write/GPU = unique_tok/s · ΔB/token = ${S.fmtTps(r.uniqueTpsGpu)} · ${r.bpt.toFixed(0)} B = ${S.fmtGBs(r.writeGpu)}
-read/GPU  = req/s · KV(h·C)         = ${r.reqsGpu.toFixed(3)} · ${S.fmtGiB(r.kvHitBytes)} = ${S.fmtGBs(r.readGpu)}
-
-瓶颈 = max(算力饱和, (read+write)/NIC) → ${r.bottleneck === "nic" ? "NIC " + r.nicPct.toFixed(0) + "%" : "算力（NIC " + r.nicPct.toFixed(0) + "%）"}`;
-    }
-
-    function niceTicks(min, max, n) {
-      const span = max - min || 1;
-      const step = Math.pow(10, Math.floor(Math.log10(span / n)));
-      const err = (n * step) / span;
-      const mul = err <= 0.15 ? 10 : err <= 0.35 ? 5 : err <= 0.75 ? 2 : 1;
-      const s = step * mul;
-      const t0 = Math.ceil(min / s) * s;
-      const ticks = [];
-      for (let x = t0; x <= max + s * 0.01; x += s) ticks.push(x);
-      return ticks;
-    }
-
-    function drawChart(spec) {
-      const svg = $("chart");
-      const W = 900, H = 340, L = 64, R = 18, T = 16, B = 42;
-      const iw = W - L - R, ih = H - T - B;
-      const xs = spec.series.flatMap((s) => s.pts.map((p) => p.x));
-      const ys = spec.series.flatMap((s) => s.pts.map((p) => p.y));
-      let xmin = Math.min(...xs), xmax = Math.max(...xs);
-      let ymin = 0, ymax = Math.max(...ys, 1e-9);
-      if (spec.ymin != null) ymin = spec.ymin;
-      if (spec.ymax != null) ymax = spec.ymax;
-      const xmap = (x) => L + ((x - xmin) / (xmax - xmin || 1)) * iw;
-      const ymap = (y) => T + ih - ((y - ymin) / (ymax - ymin || 1)) * ih;
-      const xt = niceTicks(xmin, xmax, 6);
-      const yt = niceTicks(ymin, ymax, 5);
-      const grid = yt.map((y) => {
-        const yy = ymap(y);
-        return `<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="#2e2a24" />
-          <text x="${L-8}" y="${yy+4}" fill="#9a917f" font-size="11" text-anchor="end">${spec.yfmt(y)}</text>`;
-      }).join("");
-      const xlabels = xt.map((x) =>
-        `<text x="${xmap(x)}" y="${H-14}" fill="#9a917f" font-size="11" text-anchor="middle">${spec.xfmt(x)}</text>`
-      ).join("");
-      const lines = spec.kind === "bar" ? "" : spec.series.map((s) => {
-        const d = s.pts.map((p, i) => `${i ? "L" : "M"}${xmap(p.x)},${ymap(p.y)}`).join(" ");
-        const dash = s.dash ? `stroke-dasharray="${s.dash}"` : "";
-        return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.2" ${dash} />`;
-      }).join("");
-      let bars = "";
-      if (spec.kind === "bar") {
-        const n = spec.series[0].pts.length;
-        const groups = spec.series.length;
-        const bw = iw / n * 0.72;
-        spec.series.forEach((s, si) => {
-          s.pts.forEach((p, i) => {
-            const gw = bw / groups;
-            const x = L + (i + 0.14) * (iw / n) + si * gw;
-            const y = ymap(p.y);
-            bars += `<rect x="${x}" y="${y}" width="${gw - 2}" height="${Math.max(0, ymap(0) - y)}" fill="${s.color}" />`;
-          });
-        });
-      }
-      svg.innerHTML = `${grid}${xlabels}<line x1="${L}" y1="${T+ih}" x2="${W-R}" y2="${T+ih}" stroke="#5a5246"/>${lines}${bars}
-        <text x="${W/2}" y="${H-2}" fill="#9a917f" font-size="11" text-anchor="middle">${spec.xlabel}</text>`;
-      $("legend").innerHTML = spec.series.map((s) =>
-        `<span style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#cfc6b6">
-          <i style="width:18px;height:3px;background:${s.color};display:inline-block;${s.dash ? "opacity:.8" : ""}"></i>${s.name}</span>`
-      ).join("");
-      $("chartTitle").textContent = spec.title;
-    }
-
-    function renderChart(p) {
-      const kind = $("chartKind").value;
-      const hits = [];
-      for (let h = 80; h <= 99.5; h += 0.5) hits.push(h / 100);
-      const ctxs = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
-      if (kind === "hitIo") {
-        const rows = S.hitSweep(p, hits);
-        drawChart({
-          title: "前缀命中率 ↑ 时，Prefill 侧 CMX 从写主导变成读主导",
-          xlabel: "hit",
-          xfmt: (x) => (x * 100).toFixed(0) + "%",
-          yfmt: (y) => (y / 1e9 >= 10 ? (y / 1e9).toFixed(0) : (y / 1e9).toFixed(1)) + " GB/s",
-          series: [
-            { name: "读（前缀预取）· 池", color: "#4aa3d9", pts: rows.map((r) => ({ x: r.hit, y: r.read })) },
-            { name: "写（新 KV）· 池", color: "#e08a3c", pts: rows.map((r) => ({ x: r.hit, y: r.write })) },
-            { name: "NIC 上限 · 池", color: "#7a7264", dash: "6 5", pts: rows.map((r) => ({ x: r.hit, y: r.nic * r.gpus })) },
-          ],
-        });
-      } else if (kind === "hitNic") {
-        const rows = S.hitSweep(p, hits);
-        drawChart({
-          title: "单 GPU NIC 占用（读+写）/ 200 GB/s",
-          xlabel: "hit",
-          ymax: Math.max(120, ...rows.map((r) => r.nicPct)),
-          xfmt: (x) => (x * 100).toFixed(0) + "%",
-          yfmt: (y) => y.toFixed(0) + "%",
-          series: [{ name: "NIC % / GPU", color: "#d46a5c", pts: rows.map((r) => ({ x: r.hit, y: r.nicPct })) }],
-        });
-      } else if (kind === "hitTps") {
-        const rows = S.hitSweep(p, hits);
-        drawChart({
-          title: "Prefill 跑满时的请求率（unique 变少 → 请求变密 → 预取更猛）",
-          xlabel: "hit",
-          xfmt: (x) => (x * 100).toFixed(0) + "%",
-          yfmt: (y) => S.fmtNum(y, 1),
-          series: [{ name: "req/s · 池", color: "#7cb87a", pts: rows.map((r) => ({ x: r.hit, y: r.reqs })) }],
-        });
-      } else if (kind === "ctxKv") {
-        const rows = S.ctxSweep(p, ctxs);
-        drawChart({
-          title: "KV 体积随上下文（V4 因 1/4 与 1/128 压缩，斜率远小于 GLM）",
-          xlabel: "context tokens",
-          xfmt: (x) => (x >= 1e6 ? "1M" : x >= 1e3 ? (x / 1024).toFixed(0) + "K" : String(x)),
-          yfmt: (y) => (y / S.GiB).toFixed(y / S.GiB >= 10 ? 0 : 1) + " GiB",
-          series: [{ name: "KV / 会话", color: "#e08a3c", pts: rows.map((r) => ({ x: r.ctx, y: r.kvBytes })) }],
-        });
-      } else if (kind === "ctxFlops") {
-        const rows = S.ctxSweep(p, ctxs);
-        drawChart({
-          title: "unique tok/s / GPU（长上下文 indexer 变贵，V4 仍远好于对全量 C 打分）",
-          xlabel: "context tokens",
-          xfmt: (x) => (x >= 1e6 ? "1M" : (x / 1024).toFixed(0) + "K"),
-          yfmt: (y) => S.fmtTps(y),
-          series: [{ name: "unique tok/s / GPU", color: "#4aa3d9", pts: rows.map((r) => ({ x: r.ctx, y: r.uniqueTpsGpu })) }],
-        });
-      } else if (kind === "models") {
-        const ids = ["v4pro", "v4flash", "glm52", "k3"];
-        const rows = ids.map((id) => S.simulate(Object.assign({}, p, { modelId: id })));
-        drawChart({
-          kind: "bar",
-          title: "四模型 · 池级 CMX 读（蓝）/ 写（橙），GiB 会话体积见表",
-          xlabel: "模型",
-          xfmt: (x) => rows[x] ? rows[x].model.name.replace("DeepSeek ", "") : "",
-          yfmt: (y) => (y / 1e9).toFixed(0) + " GB/s",
-          series: [
-            { name: "读 GB/s", color: "#4aa3d9", pts: rows.map((r, i) => ({ x: i, y: r.read })) },
-            { name: "写 GB/s", color: "#e08a3c", pts: rows.map((r, i) => ({ x: i, y: r.write })) },
-          ],
-        });
-      } else if (kind === "dtypeKv") {
-        const ids = ["bf16", "fp8", "fp8_fp4"];
-        const rows = S.dtypeSweep(p, ids);
-        const names = { bf16: "BF16", fp8: "FP8", fp8_fp4: "FP8+FP4" };
-        drawChart({
-          kind: "bar",
-          title: "同一模型 · 三种 dtype 的 KV（左轴 GiB 见表）与池级 CMX 读/写",
-          xlabel: "dtype",
-          xfmt: (x) => names[ids[x]] || "",
-          yfmt: (y) => (y / 1e9).toFixed(0) + " GB/s",
-          series: [
-            { name: "读 GB/s", color: "#4aa3d9", pts: rows.map((r, i) => ({ x: i, y: r.read })) },
-            { name: "写 GB/s", color: "#e08a3c", pts: rows.map((r, i) => ({ x: i, y: r.write })) },
-          ],
-        });
-      }
-    }
-
-    function renderCmp(p) {
-      const ids = ["v4pro", "v4flash", "glm52", "k3"];
-      const rows = ids.map((id) => S.simulate(Object.assign({}, p, { modelId: id })));
-      $("cmp").innerHTML =
-        `<tr><th>模型（${p.dtypeId}${p.mlaPacked ? " · 656" : ""}）</th><th>KV</th><th>ΔB/tok</th><th>unique tok/s/GPU</th><th>req/s 池</th><th>读 池</th><th>写 池</th><th>NIC/GPU</th></tr>` +
-        rows.map((r) => `<tr>
-          <td>${r.model.name}</td>
-          <td>${r.kvGiB.toFixed(2)} GiB</td>
-          <td>${r.bpt.toFixed(0)}</td>
-          <td>${S.fmtTps(r.uniqueTpsGpu)}</td>
-          <td>${S.fmtNum(r.reqs, 2)}</td>
-          <td>${S.fmtGBs(r.read)}</td>
-          <td>${S.fmtGBs(r.write)}</td>
-          <td>${r.nicPct.toFixed(0)}%</td>
-        </tr>`).join("");
-    }
-
-    function render() {
-      const p = params();
-      $("ctxVal").textContent = Number(p.ctx).toLocaleString();
-      $("hitVal").textContent = (p.hit * 100).toFixed(1) + "%";
-      const hints = {
-        v4pro: "附录 9.62 GiB 用 BF16。线上常用 FP8+FP4，大约再小一半。切模型不会改你选的 dtype。",
-        v4flash: "Flash BF16 @ 1M ≈ 6.73 GiB。线上常用 FP8+FP4。切模型不会改 dtype。",
-        glm52: "1M serving 常用 FP8（逻辑 47.3 GiB）。BF16 是理论上限 ~94 GiB。FP8 下可再选引擎 656 B/层。",
-        k3: "1M serving 常用 FP8（MLA 13.5 GiB + KDA 0.22 GiB）。BF16 MLA 为 27 GiB。切模型不会改 dtype。",
-      };
-      $("dtypeHint").textContent = hints[p.modelId] || "";
-      $("modelNote").textContent = S.MODELS[p.modelId].note;
-      const showLayout = p.modelId === "glm52" && dtypeId !== "bf16";
-      $("glmLayoutWrap").hidden = !showLayout;
-      const r = S.simulate(p);
-      renderStats(r);
-      renderFormula(r);
-      renderChart(p);
-      renderCmp(p);
-      const hbm = 22e12;
-      const decodeTps = hbm / r.kvBytes;
-      $("wrongModel").textContent =
-        `HBM 22 TB/s / KV = ${S.fmtTps(decodeTps)} decode tok/s/GPU。这是「每步扫完整 1M KV」的带宽上限，不是 Prefill 跑满。V4-Pro 9.62 GiB 时这个数看起来很亮，但 PD 分离的 Prefill 瓶颈是 GEMM+indexer FLOPs 以及把前缀从 CMX 拉到 Prefill GPU 的 NIC。`;
-    }
-
-    render();
-  </script>
+    <h2>来源</h2>
+    <ul>
+      <li><a href="https://developer.nvidia.com/blog/introducing-nvidia-bluefield-4-powered-inference-context-memory-storage-platform-for-the-next-frontier-of-ai/">NVIDIA：BlueField-4-powered CMX</a>（G1–G4、G3.5、5×、prestaging）</li>
+      <li><a href="https://developer.nvidia.com/blog/nvidia-vera-rubin-pod-seven-chips-five-rack-scale-systems-one-ai-supercomputer/">NVIDIA：Vera Rubin POD</a>（五类机柜、STX 上的 CMX、1152 GPU）</li>
+      <li><a href="https://developer.nvidia.com/blog/inside-the-nvidia-rubin-platform-six-new-chips-one-ai-supercomputer/">NVIDIA：Inside Vera Rubin</a>（BF4 800 Gb/s、ICMS PB/POD、Dynamo/NIXL/DOCA）</li>
+      <li><a href="https://nvidianews.nvidia.com/news/nvidia-launches-bluefield-4-stx-storage-architecture-with-broad-industry-adoption">NVIDIA Newsroom：STX</a>（Vera CPU + CX-9；5× TPS vs traditional storage）</li>
+      <li><a href="https://vllm-project.github.io/2026/04/24/deepseek-v4.html">vLLM DeepSeek V4 附录</a>（9.62 GiB）</li>
+    </ul>
+    <footer>本页不对照其它推理系统或存储方案。仿真公式见 Prefill / 容量两页。</footer>
+  </article>
 </body>
 </html>

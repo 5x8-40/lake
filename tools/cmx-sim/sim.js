@@ -306,9 +306,40 @@
     return x.toFixed(d == null ? 1 : d);
   }
 
+  var HW = {
+    gpusRack: 72,
+    gpusPod: 1152,
+    hbmGpu: 288e9,
+    hbmRack: 20.7e12,
+    hbmBw: 22e12,
+    dramRack: 54e12,
+    nicGpu: 200e9,
+    pflops: 50,
+  };
+
+  function capacity(p) {
+    var r = simulate(p);
+    var hbmGpu = Number(p.hbmGpu) || HW.hbmGpu;
+    var hbmRack = Number(p.hbmRack) || HW.hbmRack;
+    var dramRack = Number(p.dramRack) || HW.dramRack;
+    var weightFrac = Math.min(0.9, Math.max(0, Number(p.weightFrac) != null ? p.weightFrac : 0.25));
+    var cmxBytes = (Number(p.cmxPB) || 1) * 1e15;
+    var kv = Math.max(1, r.kvBytes);
+    return Object.assign({}, r, {
+      sessGpu: Math.floor((hbmGpu * (1 - weightFrac)) / kv),
+      sessRackHbm: Math.floor((hbmRack * (1 - weightFrac)) / kv),
+      sessDram: Math.floor(dramRack / kv),
+      sessCmx: Math.floor(cmxBytes / kv),
+      weightFrac: weightFrac,
+      cmxBytes: cmxBytes,
+      hbmBwDecodeTps: HW.hbmBw / kv,
+    });
+  }
+
   var api = {
     GiB: GiB,
     GB: GB,
+    HW: HW,
     DTYPE: DTYPE,
     MODELS: MODELS,
     kvAt: kvAt,
@@ -318,6 +349,7 @@
     hitSweep: hitSweep,
     ctxSweep: ctxSweep,
     dtypeSweep: dtypeSweep,
+    capacity: capacity,
     fmtGiB: fmtGiB,
     fmtGBs: fmtGBs,
     fmtTps: fmtTps,
