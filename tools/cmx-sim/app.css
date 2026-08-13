@@ -33,6 +33,8 @@ a { color: var(--read); }
   border: 1px solid transparent;
 }
 .topnav a.on, .topnav a:hover { color: var(--ink); border-color: var(--line); }
+.topnav .navdoc { margin-left: auto; color: var(--muted); font-size: 13px; padding: 6px 0; }
+.topnav .navdoc a { color: var(--read); padding: 0; border: 0; }
 header {
   padding: 28px 28px 12px;
   border-bottom: 1px solid var(--line);
@@ -117,14 +119,7 @@ th:first-child, td:first-child { text-align: left; }
 th { color: var(--muted); font: 11px var(--ui); letter-spacing: 0.06em; text-transform: uppercase; }
 details { margin-top: 8px; color: var(--muted); font-size: 13px; }
 footer { color: var(--muted); font-size: 12px; max-width: 90ch; }
-.prose { max-width: 92ch; padding: 8px 28px 72px; }
-.prose h2 { font: 600 22px/1.25 var(--sans); margin: 32px 0 10px; }
-.prose h3 { font: 600 16px var(--sans); margin: 22px 0 8px; }
-.prose p, .prose li { color: #d4cdc0; }
-.prose ul { padding-left: 20px; }
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
 @media (max-width: 980px) {
   .layout { grid-template-columns: 1fr; }
   aside { border-right: 0; border-bottom: 1px solid var(--line); }
-  .grid2 { grid-template-columns: 1fr; }
 }

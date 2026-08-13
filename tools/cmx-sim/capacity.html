@@ -8,15 +8,15 @@
 </head>
 <body>
   <nav class="topnav">
-    <a href="index.html">CMX 分析</a>
-    <a href="prefill.html">仿真 · Prefill 跑满</a>
-    <a href="capacity.html" class="on">仿真 · 容量驻留</a>
+    <a href="index.html">Prefill 跑满</a>
+    <a href="capacity.html" class="on">容量驻留</a>
+    <span class="navdoc">分析见 <a href="cmx.md">cmx.md</a></span>
   </nav>
   <header>
     <h1>1M 会话在 G1 / G2 / CMX 能住多少</h1>
     <p>
       Agent 在工具上等待的会话不占算力，但占容量。活会话一旦超过 HBM（再超过柜内 DRAM），多出来的 1M 上下文只能在 CMX。
-      读写数字仍按 <a href="prefill.html">Prefill 跑满</a> 同一套公式，方便对照「容量满了」和「算力满了」不是一件事。
+      读写数字仍按 <a href="index.html">Prefill 跑满</a> 同一套公式，方便对照「容量满了」和「算力满了」不是一件事。
     </p>
   </header>
   <div class="layout">
