@@ -2,7 +2,7 @@
 
 只根据 NVIDIA 公开材料拆 CMX 在 Vera Rubin 上是什么、补哪一层、数据怎么走。数字能钉的钉，钉不住的标成定性口径。不对照其它推理系统或存储方案。
 
-可调公式与图在同目录仿真页：[`index.html`](index.html)（PD 分离 Prefill 跑满）、[`capacity.html`](capacity.html)（1M 会话在 G1/G2/CMX 驻留）。
+可调公式与图在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)：[`index.html`](../../tools/cmx-sim/index.html)（PD 分离 Prefill 跑满）、[`capacity.html`](../../tools/cmx-sim/capacity.html)（1M 会话在 G1/G2/CMX 驻留）。
 
 ## CMX 在补哪一层
 

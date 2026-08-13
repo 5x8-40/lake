@@ -1,6 +1,6 @@
 # NVIDIA CMX 仿真
 
-技术分析是 Markdown：[`cmx.md`](cmx.md)。本目录 HTML 只做可调公式和图表。
+技术分析在 [`docs/research/nvidia-cmx.md`](../../docs/research/nvidia-cmx.md)。本目录 HTML 只做可调公式和图表。
 
 ```bash
 python3 -m http.server --directory tools/cmx-sim
