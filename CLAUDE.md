@@ -113,7 +113,7 @@ docs/
  - **模型定义(Transformers)**:Qwen3 `nn.Module`/HF config/decoder/model/causal-lm 分层 → `docs/research/transformers/overview.md`
    - **vLLM Q3 KV/Session 调度**(#48168 agent prefix · #48501 `session_id`/`continuation_id` · retention) → `docs/research/vllm/kv-session-roadmap.md`
    - **编排层/控制面**:KV-aware router(overlap 量化) + KVBM logical/physical/engine 三层 offload + Placement/StorageTier(介质非位置) + 链式 block 哈希 + 多后端通信(etcd/nats/tcp/zmq) → `docs/research/dynamo/overview.md`
-   - **NVIDIA CMX**(G3.5 / ICMS / Vera Rubin STX、DOCA KV I/O、NIXL prestaging) → `docs/research/nvidia-cmx.md`（公开材料分析；仿真 `tools/cmx-sim/`）
+   - **NVIDIA CMX**(G3.5 / DOCA Memos 双端 KV 设备 / NVMe-KV 128-bit key / NIXL prestaging) → `docs/research/nvidia-cmx.md`（公开材料+GTC S81773+NIXL 插件；仿真 `tools/cmx-sim/`）
    - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）
    - 跨项目逐层对应与借鉴顺序 → `docs/research/3rdparty-reference.md`
 3. **沿代码回溯**：每个参考文档末尾都有「代码索引」节，把概念/机制映射到 `文件:符号`。符号名是稳定锚点（行号会漂移，找不到时 `grep -n "符号名" 3rdparty/<repo>/<文件路径>`）。需要确认实现细节时，直接读对应符号的源码。
