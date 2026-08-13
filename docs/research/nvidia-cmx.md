@@ -407,6 +407,109 @@ Q&A 里几条对难点有用：
 - GDS 经 **DOCA**；东西向还是南北向挂 CMX，台上说是部署方选择（NVIDIA 过去最佳实践是南北向存储）。
 - 现有 BF3 集群再加 CMX / BF4，**没有**台上给出的混部方案。
 
+不要把 **CNode-X** 和「CNode 跑在 GPU 服务器 BF4 上」混成一件事。CNode-X（VAST Forward 2026）是 VAST 自己的 **带 GPU 的 AI OS 服务器**（cuVS / Sirius / NIM），用来加速向量检索和 SQL；新闻稿里「支持 CMX」指集群配置能挂 BF4 + Spectrum-X，不是说 CNode-X 替代了 STX 盘框。
+
+## 生态、软件切口、DPU/盘上的算法
+
+DPU、DOCA、CMX 盘框是 **基板**。VAST 没再造一颗 DPU，也没再造一种 NAND。它做的是基板上的 **存储软件**。下面三问分开答：生态上 VAST 已经交了什么、软件还能做什么、硬件侧到底有没有算法可做。
+
+### 生态里谁干什么
+
+| 角色 | 谁 | 交什么 |
+|------|----|--------|
+| 参考架构 + 芯片 + 编排 | NVIDIA | Rubin GPU、BF4、Spectrum-X、STX 外形、DOCA Memos、Dynamo、NIXL |
+| 盘框 OEM | AIC / Quanta / Supermicro | JBOF（32 盘 F2032-G6、24 盘 STX 展机） |
+| **存储软件（公开讲清楚的）** | **VAST** | CNode 上计算侧 BF4 + DNode 上盘框 BF4 + DASE + Dynamo 对接 |
+| 其它点名伙伴 | WEKA、DDN、Dell、IBM、Nutanix、Cloudian… | Lockwood 的读法：多数是「对齐 CMX」新闻稿，没有把控制面塞进客户端 BF 的公开设计 |
+
+NVIDIA 给存储伙伴留的官方挂钩是两截：DOCA Memos 的开放 KV 接口（把你做成 G3.5），以及 Dynamo KVBM 的 **Event Plane**（你被动听 Store/Remove，自己建树、做冷热）。VAST 走的是更重的一条：把 **整套 CNode 控制面**搬进 GPU 服务器上的 BF4，而不只是做一个 G4 blob 后端。
+
+### VAST 已经做了哪些软件
+
+相对 NVIDIA 参考栈「故意拿掉企业功能」，VAST 加回去的都是 **可选软件**，不是新硬件 SKU。
+
+| 软件 | 跑在哪 | 对 CMX 的作用 |
+|------|--------|----------------|
+| **CNode** | GPU 服务器 BF4（计算侧） | 放置、准入、快路径元数据；取消 x86 存储头。每个 CNode 看见全部 SSD 命名空间 |
+| **DNode** | CMX/STX JBOF 的 BF4 | 管盘。BF-1/BF-3 就开始卸，BF4 加马力 |
+| **DASE** | 上述两端 | 无东西向协调 → 全 GPU 并发时每主机一份专用带宽。这是他们的核心算法，不是盘规格 |
+| **NFS-oRDMA / GDS**（今天） | 现网，当 Dynamo **G3** | 20× TTFT 实验走的是这条，不是 Rubin CMX |
+| **S3 over RDMA**（下一步） | Dynamo **G4** | 冷历史、对引擎不透明的生命周期 |
+| **DOCA / virtio-fs**（G3.5，upcoming） | BF4 → 主机 | 目标是成为 G3.5 本身。控制面仍可能是文件（virtio-fs），和 Memos KV API 还没收口 |
+| **数据缩减** | 存储软件 | 实验 1.4×（共享 system prompt / 常见前缀去重）。Memos 默认不透明 128-bit 对象没有这层 |
+| **可选数据服务** | 存储软件，可关 | 纠删码、加密、多租户、审计、保留期。KV 可重算所以 EC 可以关；监管场景再打开 |
+| **跨 G3.5 和 G4 的同一命名空间** | VAST AI OS | 热 KV 和冷日志不必两套阵列 |
+| **sizing 方法** | 咨询/规划 | 1 万用户 × 32 GB × 保留会话数 → 320 TB / 数 PB / 48 PB。这是产品化，不是芯片 |
+
+PolicyEngine / TuningEngine（VAST 称 2026 年底）管的是 **agent 访问权限和流水线**，不是 CMX 热路径上的 KV I/O。不要算进 G3.5 数据面。
+
+### 软件上还能做什么
+
+按层排。NVIDIA 参考栈把策略留在 Dynamo/引擎，把 I/O 留给 DOCA；中间的空档就是软件切口。
+
+**Dynamo / 引擎（主机侧，公开代码里已经有钩子）**
+
+| 切口 | 现状 | 还能做 |
+|------|------|--------|
+| **G3.5 当成一等层** | `StorageTier` 无独立档；Disk 与 External 同一 `disk_cache_hit_weight` | 给 CMX 单独权重和 onboard 路径，别和 G4 对象混打分 |
+| **预取预算** | 博客只说 prestage 进 G2/G1，没有 SLA | timeout / best-effort / 按 token 数的预算（SGLang HiCache 有同类三策略，NIXL 这边还没写成 CMX 专用） |
+| **offload 过滤** | `OffloadFilter` + `FrequencyFilter`（按 sequence_hash 频次，加倍计数、定期衰减） | 只把「还会被别的请求复用」的块写 CMX；一次性 decode 后缀不必出柜 |
+| **partial retrieve / hole** | GTC 说 Dynamo 和 vLLM 在做 | 缺一块只重算缺的；Router overlap 不能把 hole 当成后缀全灭 |
+| **两套哈希对齐** | Router u64 链 vs Memos 128-bit vs G4 `ObjectStorage` u64 | 调度身份如何压进 16 字节、会不会碰撞——公开材料没钉，这是软件必须定的契约 |
+| **P/D 布局身份** | CMX 不转换张量 | key 混入 dtype/TP/`page_size`，或 bounce buffer 里 convert。见后文「布局不一样」节 |
+| **禁止 exist-then-get、huge page** | DOCA 强加的契约 | 引擎/NIXL 改控制流；`ignore_read_not_found` 已经是插件开关 |
+
+**NIXL（传输胶水）**
+
+- `DOCA_MEMOS` 插件：设备地址、`subnqn`/`ns_id`/`NGUID`、threaded 进度引擎、读 miss 开关。
+- bounce 今天 **必须 CPU**。软件上能做的是减少 bounce 次数、和 GDS 路径怎么收口——不能假装已经是 GPU 当 NVMe initiator。
+- 东西向 PD 和南北向 CMX 共用一套 transfer API：prestaging 和 P→D 可以排进同一个队列。
+
+**存储伙伴（Dynamo 给的官方扩展模型）**
+
+KVBM **不指挥盘怎么排**。Event Plane 批量发 StoreEvent / RemoveEvent（`sequence_hash`、`prefix_hash`、`storage_location`，约 100 B，可 ~10 s 一批）。伙伴侧 **Storage Advisor**（kvbm-design 里写明 optional）可以：
+
+- 用 `prefix_hash` 建树 / LRU，做 **热块提升、冷块下降、按前缀压实**。
+- 自己决定这份 KV 当缓存（可丢）还是要耐久（G4）。VAST 设想未来 Dynamo API 会按数据集把这个意图说清楚。
+- 不必改 KVBM 热路径。
+
+VAST 的 CNode 比这个 Advisor 更重：元数据解析直接在计算侧 BF4 上，不是主机上一个订阅进程。其它厂商可以只做轻量 Advisor + G4 blob。
+
+### 硬件上有算法吗？
+
+有。只是算法跑在 **BF4 的硅加速器 / ARM / 盘固件** 上，不跑在主机 Python 里。DPU 和盘框不是「没有软件的铁盒子」。NVIDIA 自己对 STX 存储处理器的表述是：KV I/O、**元数据、放置、队列、recall/pre-staging、租户策略、数据保护** 都靠近存储和网络路径，而不是把闪存呈现成一块普通盘。
+
+分三层，免得和 Dynamo 的策略混在一起：
+
+**1. 已经在硅里的，不必再发明**
+
+| 能力 | 在哪 | 对 KV 的意义 |
+|------|------|----------------|
+| 线速加密 / CRC | BF4 加速器，公开口径 800 Gb/s 不吃 Grace | KV 不做副本仍要在线上做完整性 |
+| NVMe-oF / RDMA 终止 | BF4 + CX-9 | 主机 CPU 不进热路径 |
+| Spectrum-X 拥塞控制、自适应路由、无损 RoCE | 交换机 + NIC | 全 POD 同时打 KV 时压尾延迟 |
+
+**2. 必须跑在 DPU 上的算法（这是「硬件侧软件」的主战场）**
+
+这些公开材料 **点了名、没给公式**。VAST 的 CNode/DASE 是目前唯一讲清楚的实现。
+
+| 算法 | 为什么必须在 DPU / 盘侧 | 已知约束 |
+|------|------------------------|----------|
+| **key → 柜 / 盘 的映射** | 主机不持 18 PB 的 per-object 目录；计算侧 BF4 仍要把 retrieve 送到正确的柜 | 一致性哈希 / 故障改向 **没有公开算法** |
+| **KV volume 按 max block size 切** | 固定块大小（GTC：DeepSeek ~800 KB → 1 MB 卷；Llama-70B ~10 MB 另卷；当前 key 最长 128 bit） | 一种模型家族一个卷；P/D 块大小不同就要两卷 |
+| **NAND packing（GTC：按约定 format and layout 写到盘上）** | 写放大要接近 1；KV 不可变、整块、顺序 | **NAND 布局，不是张量布局**。适合大顺序写的 FTL/GC，而不是 POSIX 4K 随机 |
+| **放置与共置** | 同一前缀的连续 block 物理靠近，预取一次顺序读 | Event Plane 的 `prefix_hash` 就是给这件事用的；Memos 默认不保证 |
+| **队列 / QoS / 多租户隔离** | 所有 GPU 同时 RDMA；要在 DPU 上做，不能回到 x86 头节点 | STX 博客点名 tenant policy；VAST 用 DASE 消东西向争用 |
+| **recall / 辅助 prestaging** | NVIDIA 说存储处理器也参与 cache recall 和 pre-staging | **何时**预取仍归 KVBM；DPU 做的是 outstanding I/O 和靠近介质的调度 |
+| **耐久策略** | KV 可重算 → 默认可关 EC/副本；监管再打开 | 要不要 HA = GPU 重算成本 vs SSD 成本（VAST Q&A） |
+| **去重 / 压缩** | 共享前缀字节相同 | VAST 1.4× 是软件缩减；BF4 有压缩加速器，Q&A 说 VAST 会用。Memos 不透明对象默认不做 |
+
+**3. 不要放到硬件里的**
+
+选哪张 GPU、P/D 怎么拆、张量 dtype/TP 转换、Router overlap——这些是 Dynamo / 引擎。放到 DPU 上会把存储软件变成第二套调度器，和「应用无状态、DPU 只做 KV 设备」的切分打架。
+
+一句话：**硬件侧的算法是「固定大小、不可变、可丢的 KV 对象，在 PB 级闪存上怎么映射、怎么排、怎么顺序写、怎么在全并发下隔离」；软件侧的算法是「这块对象该不该出 HBM、该不该预取、请求去哪张 GPU」。** VAST 把前一半做成了 DASE+CNode；后一半仍是 Dynamo，而且 G3.5 档还没长进开源枚举。
+
 ## 10. 公开数字 vs 没公布的
 
 | 有 | 没有（不要当成数据表） |
@@ -530,8 +633,9 @@ NIXL 不在本仓库 submodule。沿符号回溯：
 | 链式 block hash（Router overlap，64-bit） | `protocols.rs`::`ExternalSequenceBlockHash` / `LocalBlockHash` |
 | KVBM 四层（尚无 G3.5） | `3rdparty/dynamo/lib/kvbm-engine/docs/architecture.md`；`docs/design-docs/kvbm-design.md` |
 | Offload / onboard 状态机 | `3rdparty/dynamo/lib/llm/src/block_manager/offload.rs`::`OffloadManager` |
+| 按频次过滤是否卸层 | 同目录 `filter.rs`::`OffloadFilter` / `FrequencyFilter` |
 | G4 不透明 blob、u64 key | `3rdparty/dynamo/lib/llm/src/block_manager/storage/object.rs`::`ObjectStorage` |
-| NIXL get/put + Event Plane | `3rdparty/dynamo/docs/design-docs/kvbm-design.md`（`registerVolume` / StoreEvent） |
+| NIXL get/put + Event Plane / Storage Advisor | `3rdparty/dynamo/docs/design-docs/kvbm-design.md`（`registerVolume` / StoreEvent / prefix 树冷热） |
 | 请求/控制/状态三平面 | `3rdparty/dynamo/docs/design-docs/architecture.md` |
 | NIXL DOCA_MEMOS 后端 | `ai-dynamo/nixl` `src/plugins/doca_memos/doca_memos_backend.{h,cpp}`::`nixlDocaMemosEngine` / `docaMemosKey` |
 | KV 设备进度与 `doca_kvdev_io_set_conf` | `src/plugins/doca_memos/doca_memos_progress_engine.cpp` |
@@ -555,6 +659,8 @@ NIXL 不在本仓库 submodule。沿符号回溯：
 - [Glenn Lockwood：CMX / ICMS 笔记](https://glennklockwood.com/garden/icms)（Jensen 4×BF4 / 600 TB / 16 TB/GPU；virtio-fs vs DOCA KV）
 - [NVIDIA CMX 产品页](https://www.nvidia.com/en-us/data-center/ai-storage/cmx/)（Dynamo：KV-aware placement；DOCA Memos：KV API + 无状态应用）
 - [NVIDIA：BlueField-4-powered CMX](https://developer.nvidia.com/blog/introducing-nvidia-bluefield-4-powered-inference-context-memory-storage-platform-for-the-next-frontier-of-ai/)（KVBM+NIXL 编排层间移动；Grove 拓扑放置；Memos 开放给存储伙伴）
+- [NVIDIA：Scaling Agentic AI Factories with BlueField](https://developer.nvidia.com/blog/scaling-agentic-ai-factories-through-extreme-co-design-with-nvidia-bluefield/)（STX 存储处理器：KV I/O、元数据、放置、队列、recall/pre-staging、租户策略）
+- [VAST Forward：CNode-X / CMX 集群配置](https://www.vastdata.com/press-releases/vast-data-introduces-end-to-end-fully-accelerated-ai-data-stack-with-nvidia)（CNode-X ≠ CNode-on-BF4）
 - Dynamo 源码：`docs/design-docs/{architecture,kvbm-design}.md`；`lib/kv-router/src/protocols.rs`；`lib/llm/src/block_manager/offload.rs`
 - [NVIDIA：Vera Rubin POD](https://developer.nvidia.com/blog/nvidia-vera-rubin-pod-seven-chips-five-rack-scale-systems-one-ai-supercomputer/)
 - [NVIDIA：Inside Vera Rubin](https://developer.nvidia.com/blog/inside-the-nvidia-rubin-platform-six-new-chips-one-ai-supercomputer/)
