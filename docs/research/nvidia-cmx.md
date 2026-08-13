@@ -1,16 +1,18 @@
 # NVIDIA CMX（Inference Context Memory Storage）
 
-> 公开材料 + GTC 2026 S81773（DOCA for Storage）+ GTC 2026 S82255 / VAST Forward「Breaking Through the GPU Memory Wall」（VAST × Dynamo 架构师）+ NIXL `DOCA_MEMOS` 插件。  
-> DOCA Memos 的正式 SDK 文档尚未随 DOCA 4.0 公开（LMCache 维护者 2026-06 称要等秋季 SDK）。下面能钉到会话/插件/规范的钉，其余标成定性口径。  
+> 公开材料 + GTC 2026 S81773（DOCA for Storage）+ GTC 2026 S82255 / VAST Forward「Breaking Through the GPU Memory Wall」（VAST × Dynamo 架构师）+ NIXL `DOCA_MEMOS` 插件 + Dynamo KVBM / Router 源码。  
+> DOCA Memos 的正式 SDK 文档尚未随 DOCA 4.0 公开（LMCache 维护者 2026-06 称要等秋季 SDK）。下面能钉到会话/插件/规范/开源树的钉，其余标成定性口径。  
 > 不对照其它推理系统。VAST 是 NVIDIA 点名的 CMX 软件落法，单独成节。
 
 可调公式与图在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)。
 
 ## 一句话
 
-CMX 的核心**不是**「以太网闪存比企业盘快」。核心是：把 KV cache 当成**独立数据类**，用**两颗 BlueField-4 把 I/O 管道切开**，从主机到闪存几乎全程走 **KV 语义**（`store(key, value)` / `retrieve(key)`），**最后一跳**才变成对 SSD 的 block 布局。POSIX、分布式文件系统、对象元数据、多副本、100% 耐久——按 KV 的性质被故意拿掉。
+CMX **不是**一块盘，也不是「以太网闪存比企业盘快」。它是一套 **KV cache 存储解决方案**：GPU 算、Dynamo 编排、NIXL 搬、DOCA Memos 在双端 BlueField-4 上把 KV I/O 做到闪存、STX/CMX 盘框提供 G3.5 介质、Spectrum-X 提供可预期的 RDMA。
 
-没有这条栈，STX 机柜只是稍近一点的 G4。有这条栈，G3.5 才成立。
+把 KV 当成**独立数据类**之后，从主机到闪存几乎全程走 `store(key, value)` / `retrieve(key)`，**最后一跳**才变成对 SSD 的 block 布局。POSIX、分布式文件系统、对象元数据、多副本、100% 耐久——按 KV 的性质被故意拿掉。
+
+没有 Dynamo，盘框里的 KV 不会被选路、预取、跨 PD 复用。没有 DOCA，主机仍在走文件/块协议，STX 机柜只是稍近一点的 G4。两截都在，G3.5 才成立。
 
 ## 1. 要解决的是数据路径，不只是容量
 
@@ -38,33 +40,154 @@ GTC S81773 里，DOCA Memos 的设计是从 KV **作为存储对象**的性质�
 
 这五条合在一起，就是「为什么不在闪存上挂分布式文件系统」。block 协议最省，但 **block 不好共享**；文件系统能共享，但 feature 太重。Memos 走中间：对上是 KV，对下是 block。
 
-## 3. 四层各管一件事
+## 3. 整条栈：GPU + Dynamo + NIXL + DOCA + DPU + 盘框
+
+NVIDIA 产品页把 CMX 写成 BlueField-4 + DOCA + Spectrum-X 加上 Dynamo。拆开之后，每一截只答一类问题：
 
 ```
-推理引擎 (vLLM / SGLang / TRT-LLM)
-    │  KV block 的张量布局、page、attention
-    ▼
-Dynamo
-    │  选哪张 GPU、KV 在哪一层、PD 怎么拆（编排，不是闪存）
-    ▼
+请求
+  │
+  ▼
+Dynamo Frontend / Router / Grove
+  │  这个请求去哪张 GPU？P/D 怎么拆？worker 放哪柜？
+  ▼
+GPU 上的引擎 (vLLM / SGLang / TRT-LLM)
+  │  张量布局、page、attention；G1 HBM 里正在算的 KV
+  ▼
+Dynamo KVBM
+  │  这块 KV 现在该在哪一层？何时 offload / onboard / prestage？
+  ▼
 NIXL
-    │  异构传输：GPU↔GPU（PD 东西向）和 GPU↔存储（CMX 南北向）同一套 API
-    ▼
-DOCA Memos（DOCA 4.0 SDK，双端）
-    │  主机：模拟出来的 KV 设备（store/retrieve）
-    │  计算节点 BF4：隔离、加密、完整性、映射、把请求送到正确的 CMX 柜
-    │  CMX 柜 BF4：按约定 layout 落到 SSD（这里才是 block API）
-    ▼
+  │  异构传输：GPU↔GPU（PD 东西向）和 GPU↔存储（CMX 南北向）同一套 API
+  ▼
+DOCA Memos（DOCA 4.0，跑在双端 BlueField-4 上）
+  │  主机看见模拟 KV 设备；计算侧 BF4 映射/加密/完整性；
+  │  存储侧 BF4 把最后一跳变成对 SSD 的 block
+  ▼
 Spectrum-X Ethernet（RoCE / RDMA）
-    ▼
-STX 机柜里的 NVMe 闪存
+  ▼
+STX / CMX 盘框里的 NVMe
 ```
 
-要点：**应用保持无状态**。主机不要维护「每个 KV 在哪、还在不在」的全量索引；位置、路由、介质布局在 DPU / CMX 一侧。Dynamo 仍然要知道 **block 的逻辑身份和层级**（否则没法选路），但那是编排索引，不是给 18 PB 里每一块 KV 在主机 DRAM 里建 inode。
+| 问题 | 谁答 | 谁不答 |
+|------|------|--------|
+| 这个请求去哪张 GPU？overlap 多少？ | Dynamo **Router** | DOCA / 盘框 |
+| Prefill / Decode 怎么拆、worker 放哪柜？ | Dynamo + **Grove**（拓扑感知） | DOCA |
+| 这块 KV 现在该在 G1 / G2 / G3 / G3.5 / G4？何时预取进 HBM？ | Dynamo **KVBM** | DOCA 不决定冷热策略 |
+| 字节怎么从这张 GPU 搬到那张 GPU / 搬到存储？ | **NIXL** | Dynamo 下指令，自己不发 RDMA |
+| `store(key)` / `retrieve(key)` 怎么变成对闪存的 I/O？ | **DOCA Memos** | Dynamo 不讲 NVMe-KV |
+| 这个 key 去哪台 CMX 柜？线速加密 / CRC？ | 计算侧 **BF4** 上的 DOCA | 主机 CPU |
+| NAND packing、对 SSD 发 block？ | 存储侧 **BF4** 上的 DOCA | Dynamo / 引擎 |
+| 算 attention、KV 张量长什么样？ | **GPU + 引擎** | CMX 存不透明字节 |
+| 介质、容量、功耗底盘 | **CMX 盘框** + Spectrum-X | 软件栈 |
+
+要点：**应用保持无状态**。主机不要维护「每个 KV 在哪、还在不在」的全量闪存目录；介质布局在 DPU / CMX 一侧。Dynamo 仍然要知道 **block 的逻辑身份和层级**（否则没法选路），但那是编排索引，不是给 18 PB 里每一块 KV 在主机 DRAM 里建 inode。
+
+### 3.1 一次命中请求怎么走完
+
+以「前缀已在 CMX、Prefill 要 attend」为例（GTC + NVIDIA 技术博客的 prestaging 叙事）：
+
+1. **Router** 用链式 block hash（`ExternalSequenceBlockHash`，u64）算 overlap，选 Prefill worker。G3.5 命中的语义是 POD 内可调度，不再把请求钉在「本地 SSD 有这份前缀」的那张 GPU 上。
+2. **KVBM** 认定这些 block 在共享层，发 **onboard / prestage**：在 attend 之前把它们搬进 G2 或 G1。博客原话：KV managers prestage KV blocks from CMX into G2 or G1 ahead of decode（Prefill 同理，只是消费点是 attend）。
+3. **NIXL** 走 `DOCA_MEMOS` 插件：本机对 KV 设备做 retrieve，bounce buffer **必须在 CPU**（`nixl_buffer_device=cpu`），再进 GPU。
+4. **DOCA Memos** 在计算侧 BF4 上把 128-bit key 映射到正确的 CMX 柜，RDMA 过去；存储侧 BF4 按约定 layout 从 SSD 读 block，原样返回字节。
+5. **引擎** 把字节解释成自己的 KV 布局，在 GPU 上算。CMX 全程不看 MLA / SWA / dtype。
+6. 新算出来的 unique KV：**KVBM** 决定是否写回 CMX；写回再走 3→4 的反方向 `store`。
+7. **KV events**（NATS / ZMQ）广播 Store/Remove，给 Router 下一次 overlap 用。这是编排可见性，不是闪存 inode。
+
+Retrieve miss 或中间缺一块（context hole）：DOCA 立刻返回没有；**Dynamo / 引擎**负责只重算缺的，不能把「缺一块」当成「后缀全灭」。这是 CMX 语义的一部分，GTC 说 vLLM 和 Dynamo 都在做 partial KV retrieval。
+
+### 3.2 Dynamo 在这里干什么
+
+产品页原话：Dynamo 让 CMX 和底下那些 context 层在 POD 里**看起来是一层**，把请求送到 KV 已经在的地方；在 serving 层做 KV-aware placement 和 reuse。
+
+拆开是三个平面（Dynamo 自己的 architecture.md）：
+
+| 平面 | 组件 | 在 CMX 路径上的具体工作 |
+|------|------|------------------------|
+| 请求面 | Frontend、**Router**、Prefill/Decode worker | KV-aware 选 worker；PD 分离后 Decode 经 NIXL 拿 KV；G3.5 命中后路由函数必须改（任意节点可 retrieve） |
+| 控制面 | Planner、Operator、**Grove** | Grove 按 KV 局部性把 workload 放到已有 context 的机柜/节点，减少再搬 |
+| 状态面 | **KVBM**、KV events、NIXL | block 生命周期（allocate → register → match）；G1↔G2↔G3↔G4 的 offload / onboard；向 NIXL 下 get/put |
+
+KVBM 今天在开源树里的层模型（`lib/kvbm-engine/docs/architecture.md`、`docs/design-docs/kvbm-design.md`）：
+
+| KVBM 层 | 介质 | 传输 | 和 CMX 的关系 |
+|---------|------|------|----------------|
+| G1 Device | GPU HBM | CUDA | 引擎正在用的 KV |
+| G2 Host | pinned DRAM | CUDA / RDMA | 预取缓冲；NIXL `DOCA_MEMOS` 的 bounce 也在 CPU 侧 |
+| G3 Disk | 本地 NVMe | POSIX / GDS | 单机暖 KV。VAST 今天接在这一档（Anat：currently integrated at G3 as local storage） |
+| G4 Remote | S3 / NFS / 对象 | NIXL OBJ / POSIX | KVBM 把它当 **不透明 blob**（`ObjectStorage` 的 key 还是 **u64**） |
+| **G3.5 CMX** | STX 以太网闪存 | NIXL `DOCA_MEMOS` | **开源枚举还没有这一档**。VAST / Dynamo 博客写的是 upcoming releases |
+
+Router 的 `StorageTier`（`lib/kv-router/src/protocols.rs`）只有 `Device | HostPinned | Disk | External`。`from_kv_medium` 把 `SHARED` / `NETWORK` / `REMOTE` 都映射成 `External`。`cache_hit_weight_for_tier` 里 **Disk 和 External 用同一档 `disk_cache_hit_weight`**（`scheduling/overlap.rs`）。硬件上多出来的 G3.5，控制面先当「非本机、非 HBM 的共享层」打分。这是能钉到代码的衔接缝，不是已经一对一映射。
+
+KVBM 对存储后端的契约（kvbm-design，API 仍标 finalized 中）：
+
+- 对 NIXL Storage Agent：`registerVolume` / `get()` / `put()`，不挂主机文件系统。
+- 对存储伙伴：Event Plane 发 `StoreEvent` / `RemoveEvent`（`sequence_hash`、`prefix_hash`、`storage_location`），伙伴自己建树、做冷热。**放置策略可以在存储侧**，Dynamo 不指挥盘怎么排。
+
+Dynamo **不做**的事（边界）：
+
+- 不解释张量，不转换 P/D 布局。
+- 不在主机给 18 PB 闪存建 per-object inode（那是 DOCA / DPU 的 Exist）。
+- 不跑 NVMe-KV 命令、不给 NAND packing。
+- 不保证块还在：CMX 不是 100% 耐久，miss / hole 是正常控制流。
+- 今天的 OffloadManager 主路径仍是 G1→G2→G3（可 `device_to_disk` 旁路 G2）。G3.5 作为一等目标还没长进这个状态机。
+
+### 3.3 DOCA 在这里干什么
+
+DOCA 是 **BlueField 上的系统软件**。CMX 用到的那一块叫 **DOCA Memos**（DOCA 4.0 SDK）：给推理框架一个 KV 通信/存储层，把以太网闪存变成 POD 级 cache。产品页：暴露简单 KV API；硬件加速完整性和加密；**应用保持无状态**，由 CMX 做 KV 的 routing 和 reuse。
+
+这里的「routing」和 Dynamo Router **不是同一件事**：
+
+| | Dynamo Router | DOCA Memos「KV routing」 |
+|--|---------------|-------------------------|
+| 输入 | 请求、block hash overlap、worker 负载 | 一个 128-bit key |
+| 输出 | 哪张 GPU / 哪个 Prefill 或 Decode worker | 这个对象在哪台 CMX 柜、哪组盘 |
+| 状态 | 调度用的 overlap 索引 + KV events | DPU 上的 KV 设备映射，主机不持全量目录 |
+| 失败 | 换 worker、重算 | retrieve miss / hole → 立刻告诉上层 |
+
+Memos 在双端 BF4 上切开 I/O 管道（S81773；下一节展开硬件）：
+
+- **主机**：看见模拟出来的 KV 设备（会话类比 DOCA SNAP：主机看到的不是真盘，编排在 DPU 上）。API 是 Store / Retrieve / Delete / Exist / List，对上 NVMe Key Value Command Set（in-command key ≤ 16 B）。
+- **计算侧 BF4**：隔离、线速加密/CRC、把 key 映射到正确的 CMX 柜、RDMA 发出去。
+- **存储侧 BF4**：按约定 format/layout 把 value 写到 SSD——**这里才出现 block API**。盘上 packing 是 NAND 布局，不是张量布局。
+- **存储伙伴**：Memos 提供开放接口，让 VAST 这类软件把 G3.5 做成自己的命名空间（CNode 跑在计算侧 BF4），而不是只能当 G4。
+
+主机侧三条硬约束是 **DOCA 强加给 Dynamo / 引擎的契约**，不是 Dynamo 自己发明的：禁止在主机攒全量 KV 元数据、禁止 exist-then-retrieve、必须处理 context hole。NIXL 插件里的 `ignore_read_not_found`、`queryMem` 的 `assume_success` 快路径，就是在落实「别把 query 当租约」。
+
+DOCA **不做**的事：
+
+- 不选 GPU、不拆 PD、不算 overlap。
+- 不决定这块 KV 该升到 HBM 还是降到 G4（那是 KVBM）。
+- 不解释 value 里的张量。key 默认是 prefix hash，不含 dtype / TP / page 布局。
+- SDK 文档未随 DOCA 4.0 公开前，placement / GC / 跨柜映射函数都还没有可引用的算法。
+
+### 3.4 NIXL 是胶水
+
+NIXL 不是第三套策略。Dynamo / 引擎说「搬这些 block」；NIXL 选后端。CMX 对应的后端是 `DOCA_MEMOS`（`ai-dynamo/nixl` #1717）：
+
+- **local-only**：不是 NIXL agent 之间的 P2P，是本机对 KV 设备。
+- key：32 个小写 hex → 设备侧 decode 成 16 字节 `docaMemosKey`。和 Dynamo Router 的 u64 链式 hash、KVBM G4 `ObjectStorage` 的 u64 key **不是同一个名字空间**。谁把调度身份压进 16 字节，公开材料没钉。
+- bounce：**必须 CPU**。GDS 可以 cuda 的那条路，这条不走。
+
+东西向（P→D GPU↔GPU）和南北向（GPU↔CMX）收成一套 API，所以 PD 分离和 CMX 预取能在同一个 transfer 层里编排。细节见 §8。
+
+### 3.5 GPU、DPU、盘框、织物
+
+| 件 | 在 CMX 方案里的角色 |
+|----|---------------------|
+| **GPU（Rubin）** | G1：正在算的 KV + attention。288 GB HBM4 @ 22 TB/s。引擎管 page-in/out 和张量布局。CMX 省的是「HBM 装不下 / 本地盘不能共享」那一段，不是代替 HBM 扫描。 |
+| **计算节点 BF4** | DOCA Memos 的 initiator。64 核 Grace + CX-9，公开口径最高 800 Gb/s。主机 CPU 不进 KV 热路径。 |
+| **存储侧 BF4** | STX 柜里的 target：Vera CPU + ConnectX-9。协议落地、闪存控制。 |
+| **CMX / STX 盘框** | G3.5 介质。Jensen CES：4×BF4 / 柜、150 TB / BF4 → **600 TB/柜**；均摊 **16 TB/GPU** → 1152 GPU ≈ **18.4 PB/POD**。AIC F2032-G6（32×E3.S）对得上这个外形；Quanta/Supermicro 展过 24 盘 STX。 |
+| **Spectrum-X** | 计算柜到 STX 的南北向 RDMA。自适应路由、拥塞控制、无损 RoCE。KV 会打满统计复用型网络；没有可预期织物，§3.1 的预取窗口盖不住 attend。 |
+
+两端 BF4 **不是同一张规格表上的同一颗芯片**，是同一代 DPU 家族的 initiator / target。缺一端，Memos 管道不成立。硬件展开见下一节。
 
 ## 4. 核心机制：双端 BlueField 切开 I/O 管道
 
-计算节点和存储柜 **两边都要有 BlueField-4**。会话原话：pipeline 拆到两端，因为各有各该靠近的东西。
+角色总表见 §3.5。这里展开 **DOCA Memos 为什么必须双端**。计算节点和存储柜 **两边都要有 BlueField-4**。会话原话：pipeline 拆到两端，因为各有各该靠近的东西。
 
 ```
 ┌─ 计算柜 ─────────────────────────────────────────┐
@@ -164,7 +287,7 @@ KV 在 CMX volume 里，**任意计算节点都能 retrieve**。路由函数不�
 
 ## 8. NIXL：异构传输 + prestaging
 
-NIXL 不是「CMX 的驱动」。它是推理数据路径的 **统一传输库**：一次请求会同时碰到
+胶水角色见 §3.4。NIXL 不是「CMX 的驱动」，也不是第二套编排。它是推理数据路径的 **统一传输库**：一次请求会同时碰到
 
 - **东西向**：Prefill → Decode 的 GPU↔GPU KV（PD 分离）；
 - **南北向**：GPU/主机 ↔ CMX / 本地盘 / 对象。
@@ -197,7 +320,7 @@ Vera Rubin POD ≈ 40 柜、1152 Rubin GPU，五类机柜：NVL72、Groq 3 LPX�
 
 NVL72：72 Rubin + 36 Vera；单柜约 20.7 TB HBM；NVFP4 inf 50 PFLOPS/GPU。时间点：2026 H2 经制造/存储伙伴出货。
 
-NVIDIA **自己的编排**把层写成 Dynamo `StorageTier`（`lib/kv-router/src/protocols.rs`）：
+NVIDIA **自己的编排**把层写成 Dynamo `StorageTier`（详见 §3.2）。这里只钉和 Rubin 机柜的对齐：
 
 | `StorageTier` | `from_kv_medium` | 和 G 层怎么对齐（NVIDIA 栈内部） |
 |---------------|------------------|----------------------------------|
@@ -336,6 +459,7 @@ V4-Pro 9.62 GiB 钉在 vLLM 2026-04-24 附录。不要用「V3.2 的 10%」或 S
 3. **把非 100% 耐久做成一等契约。** 不是「尽量别丢」，而是框架必须处理 miss 和 **context hole**（中间缺一块，只重算缺的）。这换来写放大≈1、不做副本/scrub。
 4. **主机不做 per-object 元数据。** 对象规模按 PB 计时，inode 式索引会先把 DRAM 吃光。Exist/位置由 Memos 答；Dynamo 只留调度用的 block 身份，不是闪存目录。
 5. **用 POD 级共享解开「KV 绑本地盘 → 请求绑 GPU」。** G3.5 命中的语义是任意计算节点可 retrieve，路由函数必须改。没有这一条，G3.5 只是更大的本地盘。
+6. **编排平面和 I/O 平面切开。** Dynamo 答「哪张 GPU、哪一层、何时预取」；DOCA 答「这个 key 怎么落到哪组盘」。混在一起要么在主机堆闪存目录，要么让存储软件去选 GPU。
 
 NIXL 把 PD 东西向和 CMX 南北向收成一套传输 API，是这条栈能落地的胶水，本身不是 CMX 闪存的创新。
 
@@ -402,8 +526,13 @@ NIXL 不在本仓库 submodule。沿符号回溯：
 | 机制 | 位置 |
 |------|------|
 | Dynamo 层枚举（无独立 G3.5） | `3rdparty/dynamo/lib/kv-router/src/protocols.rs`::`StorageTier` / `from_kv_medium` |
-| 链式 block hash（Router overlap，64-bit） | 同文件 `ExternalSequenceBlockHash` / `LocalBlockHash` |
-| Disk vs External 同一档命中权重 | `3rdparty/dynamo/lib/kv-router/src/scheduling/overlap.rs` |
+| Disk vs External 同一档命中权重 | `3rdparty/dynamo/lib/kv-router/src/scheduling/overlap.rs`::`cache_hit_weight_for_tier` |
+| 链式 block hash（Router overlap，64-bit） | `protocols.rs`::`ExternalSequenceBlockHash` / `LocalBlockHash` |
+| KVBM 四层（尚无 G3.5） | `3rdparty/dynamo/lib/kvbm-engine/docs/architecture.md`；`docs/design-docs/kvbm-design.md` |
+| Offload / onboard 状态机 | `3rdparty/dynamo/lib/llm/src/block_manager/offload.rs`::`OffloadManager` |
+| G4 不透明 blob、u64 key | `3rdparty/dynamo/lib/llm/src/block_manager/storage/object.rs`::`ObjectStorage` |
+| NIXL get/put + Event Plane | `3rdparty/dynamo/docs/design-docs/kvbm-design.md`（`registerVolume` / StoreEvent） |
+| 请求/控制/状态三平面 | `3rdparty/dynamo/docs/design-docs/architecture.md` |
 | NIXL DOCA_MEMOS 后端 | `ai-dynamo/nixl` `src/plugins/doca_memos/doca_memos_backend.{h,cpp}`::`nixlDocaMemosEngine` / `docaMemosKey` |
 | KV 设备进度与 `doca_kvdev_io_set_conf` | `src/plugins/doca_memos/doca_memos_progress_engine.cpp` |
 | 128-bit hex 对象名、cpu bounce | LMCache docs：NIXL `DOCA_MEMOS` backend |
@@ -424,8 +553,9 @@ NIXL 不在本仓库 submodule。沿符号回溯：
 - [HPCwire：VAST sizing 表 320 TB / 1.6–4.8 PB / 48 PB](https://www.hpcwire.com/2026/03/02/blasting-through-the-gpu-memory-wall-with-nvidias-new-cmx-platform/)
 - [Blocks & Files：伙伴 KV 扩展 / VAST virtio-fs、G3.5→G2 旁路 G3](https://www.blocksandfiles.com/ai-ml/2026/03/30/nvidia-and-its-partners-kv-cache-extenders/5209284)
 - [Glenn Lockwood：CMX / ICMS 笔记](https://glennklockwood.com/garden/icms)（Jensen 4×BF4 / 600 TB / 16 TB/GPU；virtio-fs vs DOCA KV）
-- [NVIDIA CMX 产品页](https://www.nvidia.com/en-us/data-center/ai-storage/cmx/)（DOCA Memos SDK 定义）
-- [NVIDIA：BlueField-4-powered CMX](https://developer.nvidia.com/blog/introducing-nvidia-bluefield-4-powered-inference-context-memory-storage-platform-for-the-next-frontier-of-ai/)
+- [NVIDIA CMX 产品页](https://www.nvidia.com/en-us/data-center/ai-storage/cmx/)（Dynamo：KV-aware placement；DOCA Memos：KV API + 无状态应用）
+- [NVIDIA：BlueField-4-powered CMX](https://developer.nvidia.com/blog/introducing-nvidia-bluefield-4-powered-inference-context-memory-storage-platform-for-the-next-frontier-of-ai/)（KVBM+NIXL 编排层间移动；Grove 拓扑放置；Memos 开放给存储伙伴）
+- Dynamo 源码：`docs/design-docs/{architecture,kvbm-design}.md`；`lib/kv-router/src/protocols.rs`；`lib/llm/src/block_manager/offload.rs`
 - [NVIDIA：Vera Rubin POD](https://developer.nvidia.com/blog/nvidia-vera-rubin-pod-seven-chips-five-rack-scale-systems-one-ai-supercomputer/)
 - [NVIDIA：Inside Vera Rubin](https://developer.nvidia.com/blog/inside-the-nvidia-rubin-platform-six-new-chips-one-ai-supercomputer/)
 - [NVIDIA Newsroom：STX](https://nvidianews.nvidia.com/news/nvidia-launches-bluefield-4-stx-storage-architecture-with-broad-industry-adoption)
