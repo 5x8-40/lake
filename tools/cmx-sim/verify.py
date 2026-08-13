@@ -44,6 +44,8 @@ def main() -> None:
     assert glm_fp8_bpt == 48408, glm_fp8_bpt
     glm_gib = N * glm_fp8_bpt / GiB
     assert abs(glm_gib - 47.27) < 0.05, glm_gib
+    glm_packed = N * (79 * 656 + 22 * 132)
+    assert abs(glm_packed / GiB - 53.45) < 0.05, glm_packed / GiB
 
     k3_mla_fp8 = 24 * 576 * N
     kda = 221.55 * 1024 * 1024

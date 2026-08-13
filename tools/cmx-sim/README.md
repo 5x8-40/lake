@@ -14,6 +14,19 @@ Vera Rubin 上、PD 分离、**Prefill GPU 算力打满**。每人一条 ~1M tok
 
 不是 Decode 每步用 HBM 扫完整 KV。那个口径会把吞吐写成 `22 TB/s / KV_size`，和 Prefill 跑满不是一回事。
 
+## KV dtype
+
+侧栏独立可选，**切模型不会改精度**。
+
+| 选项 | 含义 |
+|---|---|
+| BF16 | 对上 V4-Pro 附录 9.62 GiB |
+| FP8 | attn KV 1 byte/elem；GLM indexer 132 B（含 scale） |
+| FP8 + FP4 indexer | V4 serving 常用，约再小一半 |
+| GLM 逻辑 576 / 引擎 656 | 仅 GLM + FP8：架构 latent vs vLLM `fp8_ds_mla` 页 |
+
+图里可选「dtype → KV / 读写」。
+
 ## V4-Pro 为什么是 9.62 GiB
 
 vLLM 2026-04-24 附录（BF16，`N = 1,048,576`）：

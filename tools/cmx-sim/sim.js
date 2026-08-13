@@ -115,11 +115,14 @@
     return m.nC4 * (kvB / 4 + idxB / 4) + m.nC128 * (kvB / 128);
   }
 
-  function glmKv(N, m, dt) {
-    var mlaB = m.nLayers * m.mlaElems * dt.kv;
-    var idxB =
+  function glmKv(N, m, dt, packed) {
+    var mlaBpt =
+      packed && (dt.id === "fp8" || dt.id === "fp8_fp4")
+        ? m.nLayers * 656
+        : m.nLayers * m.mlaElems * dt.kv;
+    var idxBpt =
       m.nIndexer * (dt.id === "fp8" || dt.id === "fp8_fp4" ? m.idxBytesFp8 : INDEX_DIM * dt.idx);
-    return { bytes: N * (mlaB + idxB), bpt: mlaB + idxB, mlaB: mlaB, idxBpt: idxB };
+    return { bytes: N * (mlaBpt + idxBpt), bpt: mlaBpt + idxBpt, mlaB: mlaBpt, idxBpt: idxBpt };
   }
 
   function k3Kv(N, m, dt) {
@@ -127,20 +130,20 @@
     return { bytes: N * mlaBpt + m.kdaBytes, bpt: mlaBpt, kda: m.kdaBytes };
   }
 
-  function kvAt(modelId, N, dtypeId) {
+  function kvAt(modelId, N, dtypeId, packed) {
     var m = MODELS[modelId];
     var dt = dtypeOf(dtypeId);
     N = Math.max(0, Number(N) || 0);
     if (m.kind === "v4") return v4Kv(N, m, dt);
-    if (m.kind === "glm") return glmKv(N, m, dt);
+    if (m.kind === "glm") return glmKv(N, m, dt, packed);
     return k3Kv(N, m, dt);
   }
 
-  function incBpt(modelId, dtypeId) {
+  function incBpt(modelId, dtypeId, packed) {
     var m = MODELS[modelId];
     var dt = dtypeOf(dtypeId);
     if (m.kind === "v4") return v4IncBpt(m, dt);
-    if (m.kind === "glm") return glmKv(1, m, dt).bpt;
+    if (m.kind === "glm") return glmKv(1, m, dt, packed).bpt;
     return k3Kv(1, m, dt).bpt;
   }
 
@@ -196,9 +199,10 @@
     var uniqueTok = ctx * (1 - hit) + extra;
     if (uniqueTok < 1) uniqueTok = 1;
 
-    var kv = kvAt(modelId, ctx, p.dtypeId);
-    var kvHit = kvAt(modelId, ctx * hit, p.dtypeId);
-    var bpt = incBpt(modelId, p.dtypeId);
+    var packed = !!p.mlaPacked;
+    var kv = kvAt(modelId, ctx, p.dtypeId, packed);
+    var kvHit = kvAt(modelId, ctx * hit, p.dtypeId, packed);
+    var bpt = incBpt(modelId, p.dtypeId, packed);
     var flops = flopsPerUniqueToken(modelId, ctx, p.flopsOverride);
 
     var uniqueTpsGpu = (peakFlops * util) / flops.total;
@@ -247,7 +251,15 @@
       util: util,
       extraSess: extraSess,
       kvHitBytes: kvHit.bytes,
+      mlaPacked: packed,
     };
+  }
+
+  function dtypeSweep(p, ids) {
+    ids = ids || ["bf16", "fp8", "fp8_fp4"];
+    return ids.map(function (id) {
+      return simulate(Object.assign({}, p, { dtypeId: id, mlaPacked: false }));
+    });
   }
 
   function hitSweep(p, hits) {
@@ -305,6 +317,7 @@
     simulate: simulate,
     hitSweep: hitSweep,
     ctxSweep: ctxSweep,
+    dtypeSweep: dtypeSweep,
     fmtGiB: fmtGiB,
     fmtGBs: fmtGBs,
     fmtTps: fmtTps,
