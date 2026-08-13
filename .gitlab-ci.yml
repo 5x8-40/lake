@@ -67,6 +67,8 @@ python:
     # torch 依赖测试用 importorskip 守卫、Qwen3 模型依赖测试用 requires_qwen3/模块级 skip 守卫,
     # CI 无 torch 无模型缓存时自动跳过。
     - PYTHONPATH=. python -m pytest lake/ -q
+    # bench/ 成本模型钉测试入门禁(P7 校准声称回归锚):纯函数无 torch 依赖,回仓库根跑。
+    - python -m pytest ../bench/ -q
 
 # stub drift:重生成 Go/Python stub 后 git diff --exit-code。
 # 拦「proto 改了没重生成 stub」与「工具版本漂移致生成物变」。
