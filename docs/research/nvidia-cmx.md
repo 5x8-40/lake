@@ -1,8 +1,8 @@
 # NVIDIA CMX（Inference Context Memory Storage）
 
-> 公开材料 + GTC 2026 S81773（DOCA for Storage）+ NIXL `DOCA_MEMOS` 插件。  
+> 公开材料 + GTC 2026 S81773（DOCA for Storage）+ GTC 2026 S82255 / VAST Forward「Breaking Through the GPU Memory Wall」（VAST × Dynamo 架构师）+ NIXL `DOCA_MEMOS` 插件。  
 > DOCA Memos 的正式 SDK 文档尚未随 DOCA 4.0 公开（LMCache 维护者 2026-06 称要等秋季 SDK）。下面能钉到会话/插件/规范的钉，其余标成定性口径。  
-> 不对照其它推理系统或存储方案。
+> 不对照其它推理系统。VAST 是 NVIDIA 点名的 CMX 软件落法，单独成节。
 
 可调公式与图在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)。
 
@@ -212,13 +212,87 @@ G1/G2 的 page-in/out、抢占，GTC 明确说 **主要仍由推理框架管**�
 
 Spectrum-X 在这条路径上不是普通以太网：自适应路由、拥塞控制、无损 RoCE，用来压 **全 POD 并发 RDMA KV** 的抖动和尾延迟。KV 访问模式会打满统计复用型存储网络；没有可预期的 RDMA 织物，预取窗口就盖不住 attend。
 
+## VAST 在 GTC 上的 CMX 落法（大容量长上下文）
+
+NVIDIA 的 CMX 是参考架构；公开材料里把「PB 级长上下文」画成可部署系统、并且给了 sizing 表的，是 **VAST**。只读 S81773（DOCA Memos）会漏这一半。
+
+主会话：
+
+- GTC 2026 **S82255**（3 月 19 日）：*The Physics of Long-Context Inference: Breaking the Memory Wall With NVIDIA Dynamo*（Presented by VAST；Alon Horev / Anat Heilper）
+- VAST Forward 2026：同题深化 *Breaking Through the GPU Memory Wall*（Anat Heilper + Dynamo 架构师 Vikram Sharma Mailthody）
+
+### 和参考栈怎么接
+
+VAST 不是另做一套 G3.5 硬件品牌，是把 **自己的存储软件塞进 NVIDIA 已经画好的双端 BF4**：
+
+| 角色 | VAST 名称 | 跑在哪 | 干什么 |
+|------|-----------|--------|--------|
+| 计算侧 BF4 | **CNode** | 每台 GPU 服务器的 BlueField-4 | 放置、准入、快路径元数据；取消一排 x86 存储头 |
+| 存储侧 BF4 | **DNode** | CMX / STX JBOF（G3.5） | 管盘。VAST 从 BF-1/BF-3 就把 DNode 卸到 DPU，BF4 是同一条线加马力 |
+| 架构 | **DASE**（Disaggregated Shared-Everything） | 每个 CNode 看见 **全部** SSD 命名空间 | 无东西向协调、每主机一份专用带宽；这是他们解决「KV 全并发打满客户端–服务器」的办法 |
+
+数据面：GPUDirect Storage + RDMA/NVMe-oF，**远端 SSD → GPU 零拷贝**，不经过主机 CPU。Blocks & Files 按 VAST 图读：G3.5 JBOF → G2 DRAM，**不经过 G3 本地盘**。NVIDIA 技术博客的口径是「典型 G1↔G2↔G3.5」；G3 在 CMX 叙事里经常被旁路（热插拔要停 GPU 柜）。Q&A 里 Anat 说本地 SSD 仍然更快，只是容量不够才上 G3.5。
+
+控制面有一条和 S81773 **对不上的缝**：VAST 公开图是 DPU 上 **virtio-fs** 把命名空间呈给主机（文件接口），NIXL 走这个文件面；NVIDIA 产品页 / DOCA Memos 说的是 **KV API**（Vikram 在 VAST Forward 上也讲「新的 key-value NVMe API」）。Glenn Lockwood 的公开笔记标了这条不一致。两种都可能并存（文件给现有 Dynamo/NFS-oRDMA，KV 给 DOCA 4.0），**不能当成已经统一**。
+
+VAST 自己的时间线要分开读，不要把数字糊到 Rubin CMX 上：
+
+| 阶段 | 落点 | 数字从哪来 |
+|------|------|------------|
+| **今天** | Dynamo KVBM 把 VAST 当 **G3**（Anat 原话：currently integrated at G3 as local storage） | Llama-3 405B、128K ctx、8× Hopper、**2×100 Gb/s**：整段 prefill 重算 **65 s** vs 从 VAST 拉 **3 s** → **20× TTFT**；GPU 计算时间省约 **90%**；打满线速；混合 KV **1.4×** 数据缩减。这是 **现网 NFS-oRDMA / GDS**，不是 Rubin CMX |
+| **下一步** | 同一套平台进 **G4**（S3 over RDMA），生命周期对引擎不透明 | 未给独立测试 |
+| **CMX / G3.5** | 「upcoming Dynamo/VAST releases」把 VAST 做成 G3.5 本身，而不是只当 G4 底下那层慢存储 | 没有单独的 Rubin 实测。NVIDIA 官方 5× TPS 仍是 vs traditional storage |
+
+所以：**20× / 90% 不是 CMX 的 SLA**，是 VAST×Dynamo 在 Hopper + 200G 上「拉缓存 vs 重算 128K prefill」的实验。CMX 要证明的是同一条路径在 POD 级以太网闪存、全并发下还能预取进 G1/G2。
+
+BF4 相对 BF3 的口径也不要混：Anat 说 **2× 网络、4× ARM、4× RAM**；Vikram 说 **2× 网络、5× compute、3× 内存带宽**。Spectrum-X 在他们和 NVIDIA 的存储测试里大约 **+20% 吞吐**，外加拥塞控制 / 无损 RoCE。
+
+### 大容量怎么算（会话里的 sizing 表）
+
+这是 VAST 方案真正多出来的内容：把长上下文 × 高并发 × 多轮保留写成可部署容量，而不是停在「PB / GPU POD」。
+
+假设 **1 万并发用户**、每条完整会话 KV **32 GB**。Anat 说这是保守数：他们自己的实验一条会话要卸 **65 GB**，表上留了约 50% 余量。32 GB 是 **容量规划旋钮**，不是某个模型在 1M token 上的 KV 公式。
+
+| 档 | 留什么 | 容量 | 算法 |
+|----|--------|------|------|
+| Instant resume | 只留当前会话，暂停后免重算 | **320 TB** | 10k × 32 GB × 1 |
+| Multi-turn / 一周 | 最近 5～15 个会话 | **1.6 PB ～ 4.8 PB** | ×5 / ×15 |
+| Agentic memory | 最多约 150 个会话，「终身」上下文 | **48 PB** | ×150 |
+
+VAST 2026-03 博客只写到 320 TB 和「多会话进 PB」；5 / 15 / 150 这一档来自 VAST Forward 幻灯 + HPCwire 对同一张 sizing 表的转述（台上把 1.6 PB 口误成 TB，算术和 HPCwire 都是 PB）。
+
+这和 CES 上 Jensen 的 SuperPOD 口径是另一笔账，可以对上、不要当成 VAST SKU：
+
+- 每柜 **4× BF4**，每 BF4 后 **150 TB** → **600 TB / 柜**
+- **16 TB CMX / GPU** × 1152 GPU → **18,432 TB ≈ 18.4 PB / POD**
+- S81773 随口说的「约 18 PB」（用来讲「别在主机上堆 per-object 元数据」）就是这个数
+
+单柜硬件公开锚点：Jensen 的 4×BF4 + 600 TB 和 AIC F2032-G6（32× E3.S）对得上；Quanta / Supermicro 在 GTC 展的是 24 盘 STX 柜。Lockwood 的判断：量产软件落法里，把 CNode 跑在 **客户端** BF、DNode 跑在 BF 前端 JBOF 上的，公开讲清楚的主要是 VAST。
+
+### VAST 多出来的、NVIDIA 参考栈故意拿掉的
+
+- **可选数据服务**：纠删码可以关（KV 可重算），监管场景可以打开加密、多租户、审计、保留期。会话设想未来 Dynamo API 按数据集告诉存储「这份当缓存、这份要耐久」。
+- **同一套软件跨 G3.5 和 G4**：热 KV 和冷历史 / 日志不必两套阵列。这和 Memos「G3.5 不做企业耐久」可以共存——耐久放 G4，VAST 两头都做。
+- **1.4× 缩减**：共享 system prompt / 常见上下文的去重。Memos 的 128-bit 不透明对象默认没有这层。
+- **功率**：VAST Forward 开场是 **70% lower storage power**。未经 Rubin 生产环境验证。
+
+Q&A 里几条对难点有用：
+
+- CMX **不必**做成 HA；要不要做，取决于 GPU 重算成本和 SSD 成本谁更贵。
+- 加密走 BF4↔BF4 线速（计算侧和存储侧都有 inline crypto）。
+- 拥塞靠 DASE（无东西向协调）+ Spectrum-X。
+- GDS 经 **DOCA**；东西向还是南北向挂 CMX，台上说是部署方选择（NVIDIA 过去最佳实践是南北向存储）。
+- 现有 BF3 集群再加 CMX / BF4，**没有**台上给出的混部方案。
+
 ## 10. 公开数字 vs 没公布的
 
 | 有 | 没有（不要当成数据表） |
 |----|------------------------|
-| NVL72 / HBM4 288 GB @ 22 TB/s / 50 PFLOPS NVFP4；POD ≈ 1152 GPU；CX-9 1.6 Tb/s 端点（部分表）；BF4 800 Gb/s | CMX 每柜闪存 TB、保证带宽/GPU、prestaging SLA、副本因子（设计上接近无副本）、故障后重算预算 |
-| 「PB / GPU POD」；GTC 口头 ~18 PB（用来讲元数据） | 5× 的对照负载（模型、ctx、命中、batch） |
-| KV volume + max block size；128-bit key；双端 Memos | Memos 的 placement/GC/hot 算法、跨 CMX 柜的具体映射函数 |
+| NVL72 / HBM4 288 GB @ 22 TB/s / 50 PFLOPS NVFP4；POD ≈ 1152 GPU；CX-9 1.6 Tb/s 端点（部分表）；BF4 800 Gb/s | CMX 保证带宽/GPU、prestaging SLA、副本因子（设计上接近无副本）、故障后重算预算 |
+| Jensen CES：4×BF4 / 柜、150 TB / BF4 → **600 TB/柜**；**16 TB/GPU** → 1152 GPU ≈ **18.4 PB/POD**（S81773 口头 ~18 PB 即此） | 5× TPS 的对照负载（模型、ctx、命中、batch） |
+| VAST sizing：1 万用户 × 32 GB/会话 → 320 TB / 1.6–4.8 PB / **48 PB**（1 / 5–15 / 150 会话） | Rubin + CMX 的 20× 实测（20× 是 Hopper+VAST G3 实验） |
+| VAST×Dynamo：128K Llama-3 405B，65 s 重算 vs 3 s 拉取；1.4× 缩减；200G 线速 | Memos 的 placement/GC；virtio-fs 与 DOCA KV API 如何收口 |
+| KV volume + max block size；128-bit key；双端 Memos | 跨 CMX 柜的具体映射函数 |
 | NIXL `DOCA_MEMOS` 插件形态 | 正式 DOCA 4.0 API 手册（尚未公开） |
 
 出柜带宽仿真默认按 CX-9 1.6 Tb/s 单向 ≈ **200 GB/s/GPU**。若采用「0.4 TB/s/GPU」那种机柜汇总，按双向或不同口径理解，不要和 200 GB/s 混用。
@@ -334,10 +408,22 @@ NIXL 不在本仓库 submodule。沿符号回溯：
 | KV 设备进度与 `doca_kvdev_io_set_conf` | `src/plugins/doca_memos/doca_memos_progress_engine.cpp` |
 | 128-bit hex 对象名、cpu bounce | LMCache docs：NIXL `DOCA_MEMOS` backend |
 | NVMe-KV 16 B in-command key | NVM Express Key Value Command Set；SPDK `SPDK_NVME_KV_KEY_MAX_LEN = 16` |
+| 单引擎层 spec 必须相同 | `3rdparty/vllm/vllm/v1/kv_cache_interface.py`::`KVCacheSpec.merge` / `MLAAttentionSpec` |
+| block hash extra keys（不含 TP/layout） | `3rdparty/vllm/vllm/v1/core/kv_cache_utils.py`::`generate_block_hash_extra_keys` |
+| 异构 TP 切 key | `3rdparty/sglang/python/sglang/srt/managers/cache_controller.py`::`_generate_storage_config`（`tp_lcm_size` / `should_split_heads`） |
+| PD 握手拒 dtype 不一致 | `3rdparty/tilert/tilert/pd_vllm/`（`--kv-cache-dtype`；`profiles/*.py`::`extract`/`convert`） |
+| VAST CNode / DASE / virtio-fs | 无 submodule。公开博客 + GTC S82255 / VAST Forward 会话；Lockwood `garden/icms` |
 
 ## 来源
 
 - [GTC 2026 S81773 — Accelerate AI Inference Using DOCA for Storage](https://www.nvidia.com/en-us/on-demand/session/gtc26-s81773/)（双端 Memos、KV volume、128-bit key、禁止 exist-then-get、context hole、SNAP 类比）
+- [GTC 2026 S82255 — The Physics of Long-Context Inference（VAST × Dynamo）](https://www.nvidia.com/en-us/on-demand/session/gtc26-s82255/)
+- [VAST：How NVIDIA Dynamo and VAST Unlock Context Reuse at Scale](https://www.vastdata.com/blog/how-nvidia-dynamo-vast-unlock-context-reuse-at-scale)（20× 实验；10k×32 GB → 320 TB；CMX G3.5 未来发布）
+- [VAST：More Inference, Less Infrastructure](https://www.vastdata.com/blog/more-inference-less-infrastructure-vast-nvidia)（CNode 上 GPU 服务器 BF4、DASE、零东西向）
+- [VAST：Right-Sizing KV Cache](https://www.vastdata.com/blog/stop-wasting-gpu-cycles-a-practical-guide-to-right-sizing-kv-cache)（G3.5 落 Dynamo/VAST upcoming；同一平台跨 G3.5 和 G4）
+- [HPCwire：VAST sizing 表 320 TB / 1.6–4.8 PB / 48 PB](https://www.hpcwire.com/2026/03/02/blasting-through-the-gpu-memory-wall-with-nvidias-new-cmx-platform/)
+- [Blocks & Files：伙伴 KV 扩展 / VAST virtio-fs、G3.5→G2 旁路 G3](https://www.blocksandfiles.com/ai-ml/2026/03/30/nvidia-and-its-partners-kv-cache-extenders/5209284)
+- [Glenn Lockwood：CMX / ICMS 笔记](https://glennklockwood.com/garden/icms)（Jensen 4×BF4 / 600 TB / 16 TB/GPU；virtio-fs vs DOCA KV）
 - [NVIDIA CMX 产品页](https://www.nvidia.com/en-us/data-center/ai-storage/cmx/)（DOCA Memos SDK 定义）
 - [NVIDIA：BlueField-4-powered CMX](https://developer.nvidia.com/blog/introducing-nvidia-bluefield-4-powered-inference-context-memory-storage-platform-for-the-next-frontier-of-ai/)
 - [NVIDIA：Vera Rubin POD](https://developer.nvidia.com/blog/nvidia-vera-rubin-pod-seven-chips-five-rack-scale-systems-one-ai-supercomputer/)
