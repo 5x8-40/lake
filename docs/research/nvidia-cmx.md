@@ -253,6 +253,74 @@ V4-Pro 9.62 GiB 钉在 vLLM 2026-04-24 附录。不要用「V3.2 的 10%」或 S
 
 这些数字决定 **KV volume 的 max block size 和预取字节数**。CMX 本身不读模型结构；引擎切多大块，卷就要按那个粒度建。K3 的 KDA 是每会话固定态，高命中预取必须带完整 KDA snapshot，不能只传 MLA 前缀。
 
+## 创新点
+
+相对「本地 SSD + 文件系统 / 企业共享盘扛 KV」，能站住的切口就这几条。RDMA、NVMe-oF、DPU 做加密、分层缓存——都不是新的。
+
+1. **按 KV 数据类裁协议，而不是把 KV 塞进通用存储。** 固定块、不可变、可重算、大 IO、必须共享——五条一起决定：对上 KV、对下 block、中间不挂 DFS。这是产品定义，不是介质升级。
+2. **双端 BlueField 切开 I/O 管道。** SNAP 那套「主机看见模拟设备、编排在 DPU」第一次用在 KV 设备上：计算侧 BF4 做隔离/映射/线速完整性，存储侧 BF4 做盘上 packing。缺一端这条路径不成立。
+3. **把非 100% 耐久做成一等契约。** 不是「尽量别丢」，而是框架必须处理 miss 和 **context hole**（中间缺一块，只重算缺的）。这换来写放大≈1、不做副本/scrub。
+4. **主机不做 per-object 元数据。** 对象规模按 PB 计时，inode 式索引会先把 DRAM 吃光。Exist/位置由 Memos 答；Dynamo 只留调度用的 block 身份，不是闪存目录。
+5. **用 POD 级共享解开「KV 绑本地盘 → 请求绑 GPU」。** G3.5 命中的语义是任意计算节点可 retrieve，路由函数必须改。没有这一条，G3.5 只是更大的本地盘。
+
+NIXL 把 PD 东西向和 CMX 南北向收成一套传输 API，是这条栈能落地的胶水，本身不是 CMX 闪存的创新。
+
+## 难点
+
+难的不是「把 SSD 插到 STX 柜里」。
+
+| 难点 | 为什么难 |
+|------|----------|
+| **预取窗口** | 1M 前缀一次是数 GB 到几十 GB。attend 之前必须进 G1/G2。以太网闪存没有公开 prestaging SLA；窗口盖不住，GPU 空转，5× 叙事塌掉。 |
+| **全 POD 并发** | KV 不是企业盘那种统计复用。所有 GPU 同时 RDMA 读写，拥塞和尾延迟是织物问题（Spectrum-X 要解决的），不是 SSD 带宽表问题。 |
+| **key → 柜 的映射** | 主机不持全量元数据，计算侧 BF4 仍要把请求送到「正确的 CMX 柜」。映射/一致性哈希/故障改向 **没有公开算法**。 |
+| **引擎契约** | 禁止 exist-then-retrieve、huge page、hole 重算、路由不再钉本地盘——现有引擎大量反模式。CMX 的语义要引擎改，不是插上就能用。 |
+| **值的身份 / 布局** | Memos 存不透明字节。key 默认是 prefix hash，**不含** dtype、TP、page 布局。同一模型 P/D 布局不同会直接踩坑，见下一节。 |
+| **两套哈希** | Router `ExternalSequenceBlockHash` 是 u64 链；CMX 对象名是 128 bit。谁负责把调度身份压进 16 字节、会不会碰撞，公开材料没钉。 |
+| **CPU bounce** | NIXL `DOCA_MEMOS` 要求 `nixl_buffer_device=cpu`。热路径多一跳主机/DPU 内存，不是 GPU 直接当 NVMe initiator。 |
+| **双 DPU 故障域** | 计算侧 BF4 挂了，主机看到的模拟 KV 设备就没了；存储侧 BF4 挂了，卷不可达。块可重算，但 prestaging 中断仍会打 TTFT。 |
+| **控制面没有 G3.5 档** | Dynamo `StorageTier` 只有 Device/HostPinned/Disk/External，Disk 与 External 同一档命中权重。硬件多出来的层，软件还当「非本机共享」打分。 |
+| **能效账** | 省下的是耐久服务功耗；花掉的是 miss 重算 + 双 BF4 基线功耗。没有公开负载，这本账算不完。 |
+
+盘上 packing（GTC：「按我们定的 format and layout 写到盘上」）是 **NAND 布局**，不是张量布局。两件事不要混。
+
+## 同一模型、Prefill / Decode KV 布局不一样
+
+CMX **不转换**张量布局。它按 key 存一段字节，retrieve 原样还给你。GTC 按模型建 volume、配一个 `max KV block size`，隐含假设：**跑这个模型的计算节点，写出的块大小（因而布局家族）是一样的。**
+
+「同一个模型」在引擎里仍然可以不是同一种 KV：
+
+| 轴 | 例子 | 对 CMX 的后果 |
+|----|------|----------------|
+| token 分页 | `block_size` 16 vs 64 vs 256 | 每 key 的 value 长度变了；对不上 volume 的 max block，或 retrieve 长度错 |
+| 内存排布 | SGLang `layer_first` / `page_first` / `page_first_direct` | 字节数可能相同，attention 读出来是垃圾 |
+| 精度 | BF16 vs FP8 vs `fp8_ds_mla` 656 B/层 | 块大小和内容都变 |
+| TP / 头切分 | P 侧 TP=8、D 侧 TP=4；MLA 每 rank 一份副本 vs 切头 | 每 rank 写入的切片不是同一对象 |
+| MLA / 混合注意力 | per-layer 连续 view vs cross-layer 打包；indexer / SWA / KDA 是否打进同一块 | 一块里装的平面不同 |
+| 引擎 | vLLM paged vs SGLang page；TileRT decode 还要 FP8 反量化、NSA 平面 | 必须在边界 convert，CMX 不会做 |
+
+三种结局：
+
+1. **P 和 D 用同一个 128-bit key（纯 prefix hash），value 布局不同。**  
+   Retrieve「成功」。若长度仍落在 volume 上限内，Memos 不会报错——它不解释张量。Decode 用错误布局做 attention，属于静默损坏。这是最坏情况。
+2. **块大小已经对不上。**  
+   按 GTC 该开两个 KV volume（两个 max block size）。P 写入的对象 D 根本不在那个卷上，表现为 miss → 重算。共享前缀这条路断了，G3.5 对 PD 没用。
+3. **长度碰巧一样、内容不一样。**  
+   还是（1）。CMX 没有 checksum-of-layout。
+
+正确做法都在 **CMX 之外**，NVIDIA 公开栈也是这么处理 PD 的，只是对象从「对端 GPU」换成了「CMX 卷」：
+
+| 策略 | 谁做 | 效果 |
+|------|------|------|
+| **强制 P/D 同一份 KV spec** | 部署/握手 | TileRT：两端 `--kv-cache-dtype` 必须一致，握手失败即拒。这是 CMX volume「一个模型一个 max block」能成立的前提。 |
+| **key 绑定布局身份** | 引擎在写 128-bit 名之前 | 把 dtype、TP、`page_size`、mem-layout、MLA pack、revision 混进 key（再 hash 到 16 字节）。不同布局变成不同对象，不会串味，但 **跨布局不复用**。vLLM 的 `generate_block_hash_extra_keys` 今天混的是 LoRA / 多模态 / `cache_salt` / prompt embeds，**不是** TP 和 mem-layout；`make_block_hash_with_group_id` 只隔离 KV-cache group（full vs MLA）。SGLang 用 `tp_lcm_size` + `should_split_heads` 把不同 TP 切成可拼接的多 key（`cache_controller.py::_generate_storage_config`），这是异构 TP 复用，不是任意布局转换。 |
+| **边界转换** | 写 CMX 前或读 CMX 后，在引擎/NIXL bounce buffer | 收成规范布局再 store；retrieve 后再 convert 成 D 侧 HBM 布局。Memos / `DOCA_MEMOS` 插件不做这件事。代价是 CPU 上的 gather/scatter，和 vLLM connector 逐层 load、TileRT `extract`/`convert` 是同一类税。 |
+| **两个 volume、两份拷贝** | 存储配置 | P 写 P 卷、D 读 D 卷，中间仍要一次布局转换或放弃共享。容量和预取带宽都 ×2。 |
+
+所以：同一个权重、PD 分离、KV 布局不同时，**CMX 不会帮你对齐**。要么部署上把 P/D 的 `KVCacheSpec`（vLLM：`block_size` + `page_size_bytes` + MLA `cache_dtype_str`/`compress_ratio`）做成同一份，要么在 key 或 bounce buffer 上自己做身份/转换。否则不是 miss，就是静默读错。
+
+vLLM 进程内 `KVCacheSpec.merge` 要求同一 cache group 的层 spec 完全相等——那是单引擎约束。Prefill 进程和 Decode 进程各有一份 spec，CMX 看不到这两份是否相等。
+
 ## 代码索引
 
 NIXL 不在本仓库 submodule。沿符号回溯：
