@@ -51,7 +51,7 @@
 - **SGLang**: RadixAttention 前缀复用，本系统 radix tree 索引的来源。其 **HiCache**(L1 GPU / L2 host / L3 distributed 分层)是本系统 L0-L3 分层的主要参考;**源码已引入** `3rdparty/sglang`,对应与差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
 - **LMCache**: 跨请求/跨实例 KV 复用,多存储后端(CPU/disk/Redis)。**源码已引入** `3rdparty/lmcache`,对应见 [`3rdparty-reference.md`](3rdparty-reference.md)。
 - **DualPath** (DeepSeek-AI/PKU/THU, arXiv:2602.21548v2): 双网络(compute/storage NIC 隔离)下的双路径 KV 加载——借 decode 闲置 storage NIC 从存储加载 KV,再经 compute network RDMA 回传 prefill。针对 agentic 多轮(KV 命中 ≥95%,瓶颈是存储 I/O 而非计算)。本系统**原生支持**(D→P 流,见 [`../architecture/data-flow.md`](../architecture/data-flow.md) §3.4)且更彻底:NIC 带宽归池统一分配,非引擎"借用";并有 D 侧 KV 已在 HBM 的零存储读取特例。分析见 [`dualpath.md`](dualpath.md)。
-- **NVIDIA CMX** (Inference Context Memory Storage / ICMS): 完整 KV cache 存储方案 = GPU + Dynamo（Router/KVBM/Grove）+ NIXL + DOCA Memos（双端 BF4 上的 KV I/O）+ STX 盘框，不是「一块更快的企业盘」。伙伴落法以 **VAST** 最完整（CNode 上计算侧 BF4 + DASE + 长上下文 sizing：10k 用户 × 32 GB → 320 TB / 数 PB / 48 PB）。公开材料分析见 [`nvidia-cmx.md`](nvidia-cmx.md)；定量仿真见 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)。
+- **NVIDIA CMX** (Context Memory Storage；原 Inference Context Memory Storage / ICMS): NVIDIA 公布的完整 KV cache 存储**目标栈** = GPU + Dynamo + NIXL + DOCA Memos + 双端 BF4 + STX；当前公开 Dynamo 没有一等 G3.5，NIXL Memos 后端仍是 open PR。VAST 给出 CNode/DNode/DASE 和 10k 用户容量方法，但其 20× 结果是当前 G3 路径，不是 CMX benchmark。证据分级见 [`nvidia-cmx.md`](nvidia-cmx.md)；分析计算器见 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)。
 
 ## 弹性与冷启动
 

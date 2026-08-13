@@ -3,473 +3,470 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Prefill 跑满 · CMX</title>
-  <link rel="stylesheet" href="app.css" />
+  <title>CMX 流量需求分析</title>
+  <link rel="stylesheet" href="app.css?v=4" />
 </head>
 <body>
-<nav class="topnav">
-  <a href="index.html" class="on">Prefill 跑满</a>
-  <a href="capacity.html">容量驻留</a>
-  <span class="navdoc">分析见 <a href="../../docs/research/nvidia-cmx.md">docs/research/nvidia-cmx.md</a></span>
-</nav>
+  <nav class="topnav" aria-label="CMX 分析页面">
+    <a href="index.html" class="on" aria-current="page">流量需求</a>
+    <a href="capacity.html">容量场景</a>
+    <span class="navdoc">分析见 <a href="../../docs/research/nvidia-cmx.md">docs/research/nvidia-cmx.md</a></span>
+  </nav>
+
   <header>
-    <h1>Vera Rubin × CMX · PD 分离 Prefill 跑满</h1>
+    <h1>CMX 长上下文流量需求</h1>
     <p>
-      负载：每人一条约 1M token 会话，前缀命中可调。工作点是 <b>Prefill 池 GPU 算力打满</b>，不是 Decode 每步用 HBM 扫完整 KV。
-      高命中时 Prefill 几乎不产新 KV，但要把前缀从 CMX 预取到 Prefill GPU 才能 attend——读远大于写。
+      给定模型布局、可复用前缀和 <em>用户提供</em> 的有效 Prefill 吞吐，计算 PD 分离下需要从 CMX
+      读取、写入多少数据。这里输出的是 offered load，不是 CMX 实测性能。
     </p>
-    <div class="warn">
-      V4-Pro 在 1,048,576 token、BF16 下是 <b>9.62 GiB</b>（vLLM 附录：30×c4a + 31×c128a，共享 KV 1024 B/entry）。
-      先前用「论文 10% of V3.2」或「平均 5.2 KB/token」会得到 ~5 GiB，那是错的。
+    <div class="warn" role="note">
+      分析模型，不是 benchmark，也不是 NVIDIA/VAST sizing 工具。公开材料没有给出可复现的 CMX
+      持续带宽、延迟或队列模型；因此默认不设带宽上限。只有填写“链路预算”后，页面才计算该假设下的上限。
     </div>
   </header>
 
   <div class="layout">
     <aside>
-      <h2>模型 / 精度</h2>
+      <h2>模型与布局</h2>
       <label for="model">模型</label>
       <select id="model">
-        <option value="v4pro" selected>DeepSeek V4-Pro（1.6T / 49B）</option>
-        <option value="v4flash">DeepSeek V4-Flash（284B / 13B）</option>
-        <option value="glm52">GLM-5.2（744B / 40B）</option>
-        <option value="k3">Kimi K3（2.8T / 104B）</option>
+        <option value="v4pro">DeepSeek V4-Pro</option>
+        <option value="v4flash">DeepSeek V4-Flash</option>
+        <option value="glm52">GLM-5.2</option>
+        <option value="k3">Kimi K3</option>
       </select>
-      <label>KV dtype（可选，不跟模型绑定）</label>
-      <div class="chips" id="dtypeChips">
-        <button type="button" data-dtype="bf16" class="on">BF16</button>
-        <button type="button" data-dtype="fp8">FP8</button>
-        <button type="button" data-dtype="fp8_fp4">FP8 + FP4 indexer</button>
-      </div>
-      <p id="dtypeHint" style="font-size:12px;color:var(--muted);margin:8px 0 0;"></p>
-      <div id="glmLayoutWrap" hidden>
-        <label>GLM MLA 页布局（仅 FP8，可选）</label>
-        <div class="chips" id="glmLayoutChips">
-          <button type="button" data-layout="logical" class="on">逻辑 576 B/层</button>
-          <button type="button" data-layout="fp8_ds_mla">引擎 656 B/层</button>
-        </div>
-      </div>
-      <p id="modelNote" style="font-size:12px;color:var(--muted);margin:8px 0 0;"></p>
 
-      <h2>会话</h2>
-      <label>上下文长度 <span id="ctxVal"></span></label>
-      <input id="ctx" type="range" min="8192" max="1048576" step="8192" value="1048576" />
-      <input id="ctxNum" type="number" min="1024" max="1048576" step="1024" value="1048576" />
-      <label>前缀命中率 <span id="hitVal"></span></label>
-      <input id="hit" type="range" min="80" max="99.5" step="0.5" value="99" />
-      <div class="chips" id="hitChips">
-        <button type="button" data-hit="90">90%</button>
-        <button type="button" data-hit="95">95%</button>
-        <button type="button" data-hit="99" class="on">99%</button>
-      </div>
-      <label for="extra">额外 unique token / 请求（本轮新输入）</label>
-      <input id="extra" type="number" min="0" step="1" value="0" />
+      <label for="profile">KV / 状态布局</label>
+      <select id="profile"></select>
+      <p id="profileNote" class="hint"></p>
 
-      <h2>Prefill 池（跑满）</h2>
-      <label for="gpus">Prefill GPU 数</label>
-      <input id="gpus" type="number" min="1" step="1" value="72" />
-      <div class="chips" id="gpuChips">
-        <button type="button" data-gpus="8">8</button>
-        <button type="button" data-gpus="72" class="on">NVL72</button>
-        <button type="button" data-gpus="1152">POD 1152</button>
+      <div id="mtpWrap" class="checkrow" hidden>
+        <input id="includeMtp" type="checkbox" />
+        <label for="includeMtp">把可选 MTP 层计入 GLM KV</label>
       </div>
+
+      <h2>请求</h2>
+      <label for="context">既有上下文 token <span id="contextValue"></span></label>
+      <input id="context" type="range" min="8192" max="1048576" step="8192" value="1048576" />
+      <label class="sr-only" for="contextNumber">既有上下文 token 数值</label>
+      <input id="contextNumber" type="number" min="8192" max="1048576" step="1" value="1048576" />
+
+      <label for="hit">可复用前缀比例 <span id="hitValue"></span></label>
+      <input id="hit" type="range" min="0" max="100" step="0.5" value="99" />
+
       <div class="row2">
         <div>
-          <label for="pflops">PFLOPS / GPU</label>
-          <input id="pflops" type="number" min="1" step="0.1" value="50" />
+          <label for="blockTokens">匹配块 token</label>
+          <input id="blockTokens" type="number" min="1" step="1" value="256" />
         </div>
         <div>
-          <label for="util">算力利用率</label>
-          <input id="util" type="number" min="0.05" max="1" step="0.05" value="0.40" />
+          <label for="extraTokens">本轮新增 token</label>
+          <input id="extraTokens" type="number" min="0" step="1" value="0" />
         </div>
       </div>
-      <label for="nic">出柜 NIC GB/s / GPU（默认 CX-9 1.6 Tb/s 单向 ≈ 200）</label>
-      <input id="nic" type="number" min="10" step="10" value="200" />
+
+      <label for="remoteFraction">命中数据需从 CMX 拉取的比例 q</label>
+      <input id="remoteFraction" type="number" min="0" max="1" step="0.05" value="1" />
+
+      <label for="admissionFraction">新状态写入 CMX 的比例 a</label>
+      <input id="admissionFraction" type="number" min="0" max="1" step="0.05" value="1" />
+
+      <div class="checkrow">
+        <input id="writeState" type="checkbox" checked />
+        <label for="writeState">写最终续算状态快照（V4/K3）</label>
+      </div>
+
+      <h2>Offered load</h2>
+      <label for="gpus">Prefill GPU 数</label>
+      <input id="gpus" type="number" min="1" step="1" value="72" />
+
+      <label for="uniqueTps">有效 unique token/s/GPU（用户假设或实测）</label>
+      <input id="uniqueTps" type="number" min="0" step="100" value="10000" />
+
+      <label for="linkGBs">可用传输预算 GB/s/GPU（0 = 未知）</label>
+      <input id="linkGBs" type="number" min="0" step="10" value="0" />
+
+      <label for="linkMode">预算口径</label>
+      <select id="linkMode">
+        <option value="shared">读写共享</option>
+        <option value="full-duplex">读写各自全双工</option>
+      </select>
 
       <h2>图</h2>
+      <label for="chartKind">横轴与指标</label>
       <select id="chartKind">
-        <option value="hitIo">命中率 → CMX 读/写</option>
-        <option value="hitNic">命中率 → NIC 占用</option>
-        <option value="hitTps">命中率 → 请求率</option>
-        <option value="ctxKv">上下文 → KV 体积</option>
-        <option value="ctxFlops">上下文 → unique tok/s</option>
-        <option value="models">四模型对照（当前命中）</option>
-        <option value="dtypeKv">dtype → KV / 读写</option>
+        <option value="hitIo">命中率 → 所需读写</option>
+        <option value="hitReq">命中率 → offered / 链路上限</option>
+        <option value="ctxBytes">上下文 → 会话字节</option>
       </select>
     </aside>
 
     <main>
-      <div class="stats" id="stats"></div>
+      <div class="stats" id="stats" aria-live="polite"></div>
 
-      <div class="panel">
-        <h3>当前工作点公式</h3>
+      <section class="panel" aria-labelledby="formulaHeading">
+        <h2 id="formulaHeading">当前工作点</h2>
         <pre class="formula" id="formula"></pre>
-      </div>
+      </section>
 
-      <div class="panel">
-        <h3 id="chartTitle">图</h3>
-        <div class="tabs" id="legend"></div>
-        <div class="chart-wrap"><svg class="chart" id="chart" viewBox="0 0 900 340"></svg></div>
-      </div>
+      <section class="panel" aria-labelledby="chartHeading">
+        <h2 id="chartHeading">图</h2>
+        <div class="tabs" id="legend" aria-label="图例"></div>
+        <div class="chart-wrap">
+          <svg
+            class="chart"
+            id="chart"
+            viewBox="0 0 900 340"
+            role="img"
+            aria-labelledby="chartSvgTitle chartSvgDesc"
+          ></svg>
+        </div>
+      </section>
 
-      <div class="panel">
-        <h3>四模型对照（同一会话 / 硬件）</h3>
-        <table id="cmp"></table>
-      </div>
+      <section class="panel table-panel" aria-labelledby="anchorsHeading">
+        <h2 id="anchorsHeading">1 Mi-token 校验锚点</h2>
+        <table id="anchors">
+          <caption>固定模型布局在 1,048,576 token 下的会话状态体积</caption>
+        </table>
+      </section>
 
-      <div class="panel">
-        <h3>假设与口径</h3>
-        <ul style="margin:0;padding-left:18px;color:var(--muted);font-size:13px;">
-          <li>PD 分离：Prefill GPU 只做 unique token 的前向。前缀 KV 从 CMX 预取到 Prefill HBM（NIXL prestaging 这条路径）。</li>
-          <li>跑满 = <code>unique_tok/s = (peak_FLOPS × util) / FLOPs_per_unique_token(C)</code>。默认 Rubin NVFP4 50 PFLOPS、util 40%，两者都可改。</li>
-          <li>写 CMX = 新 KV（unique × 增量字节）。读 CMX = 每个请求把命中前缀拉到 Prefill。99% @ 1M 时读/写 ≈ 99。</li>
-          <li>dtype 是独立选项：切模型不会改精度。V4 附录 9.62 GiB 用 BF16；GLM/K3 的 1M serving 常用 FP8。GLM 还可选逻辑 576 B/层或 vLLM <code>fp8_ds_mla</code> 656 B/层。</li>
-          <li>V4 体积用压缩后的 entry 数，不是 SGLang <code>DeepSeekV4SingleKVPool.get_bytes_per_token</code> 的 584 B 未压缩页布局。</li>
-          <li>没有对照 lake / Mooncake / 其它集群。数字只描述这条 Prefill→CMX 管道。</li>
+      <section class="panel" aria-labelledby="scopeHeading">
+        <h2 id="scopeHeading">口径</h2>
+        <ul class="notes">
+          <li><code>C</code> 是请求到来前的既有上下文；<code>E</code> 是本轮新增 token；最终长度为 <code>C+E</code>。</li>
+          <li>命中 token 按块向下取整。<code>q</code> 把“前缀命中”和“确实从 CMX 远程读取”分开。</li>
+          <li><code>a</code> 是写入 CMX 的新状态比例；它不是 gateway 准入率。</li>
+          <li>V4 的 128-token SWA 页与 FP32 compressor residual、K3 的 KDA 状态按每会话计；是否写最终续算状态可关闭。</li>
+          <li>V4-Pro 的 9.62 GiB 是 BF16 paged KV（含 SWA）锚点；可移交会话总量还要加 17.84 MiB compressor residual。</li>
+          <li>布局包含逻辑公式、引擎页和 payload 估算三类，不能互相冒充。CMX 最终序列化契约尚未公开。</li>
         </ul>
-        <details>
-          <summary>对照：若误用「Decode 每步 HBM 扫 1M KV」</summary>
-          <p id="wrongModel"></p>
-        </details>
-      </div>
+      </section>
 
       <footer>
-        KV：<a href="https://vllm-project.github.io/2026/04/24/deepseek-v4.html">vLLM DeepSeek V4 附录</a>
-        · 层配置：DeepSeek-V4 论文 §4.2.1（arXiv:2606.19348）
-        · Rubin：288 GB HBM4 @ 22 TB/s，50 PFLOPS NVFP4/GPU，NVL72=72 GPU，POD≈1152
-        · GLM-5.2：78+MTP 层 MLA 576-d + 22 indexer；K3：24 MLA + 69 KDA 固定态
+        参考实现：
+        vLLM <code>MLAAttentionSpec.real_page_size_bytes</code>、
+        <code>CompressorStateCache.get_kv_cache_spec</code>、
+        <code>MambaStateDtypeCalculator.kda_state_dtype</code>、
+        <code>MambaStateShapeCalculator.kda_state_shape</code>；
+        SGLang <code>DeepSeekV4SingleKVPool.get_bytes_per_token</code>。
       </footer>
     </main>
   </div>
 
-  <script src="sim.js"></script>
+  <script src="sim.js?v=4"></script>
   <script>
+    "use strict";
+
     const S = window.CmxSim;
     const $ = (id) => document.getElementById(id);
-    let dtypeId = "bf16";
-    let mlaPacked = false;
+
+    function finiteNumber(id, fallback) {
+      const value = Number($(id).value);
+      return Number.isFinite(value) ? value : fallback;
+    }
+
+    function syncProfiles() {
+      const modelId = $("model").value;
+      const previous = $("profile").value;
+      const profiles = S.profileOptions(modelId);
+      $("profile").innerHTML = profiles
+        .map((profile) => `<option value="${profile.id}">${profile.label}</option>`)
+        .join("");
+      if (profiles.some((profile) => profile.id === previous)) {
+        $("profile").value = previous;
+      }
+      $("mtpWrap").hidden = modelId !== "glm52";
+    }
 
     function params() {
       return {
         modelId: $("model").value,
-        dtypeId: dtypeId,
-        mlaPacked: $("model").value === "glm52" && dtypeId !== "bf16" && mlaPacked,
-        ctx: Number($("ctxNum").value),
-        hit: Number($("hit").value) / 100,
-        extraUnique: Number($("extra").value) || 0,
-        gpus: Number($("gpus").value) || 1,
-        pflops: Number($("pflops").value) || 50,
-        util: Number($("util").value) || 0.4,
-        nicGBs: Number($("nic").value) || 200,
+        profileId: $("profile").value,
+        includeMtp: $("includeMtp").checked,
+        contextTokens: finiteNumber("contextNumber", 0),
+        extraTokens: finiteNumber("extraTokens", 0),
+        hitRate: finiteNumber("hit", 0) / 100,
+        blockTokens: finiteNumber("blockTokens", 1),
+        remoteFraction: finiteNumber("remoteFraction", 0),
+        admissionFraction: finiteNumber("admissionFraction", 0),
+        writeState: $("writeState").checked,
+        gpus: finiteNumber("gpus", 1),
+        uniqueTpsGpu: finiteNumber("uniqueTps", 0),
+        linkGBsGpu: finiteNumber("linkGBs", 0),
+        linkMode: $("linkMode").value,
       };
     }
 
-    function setDtype(id) {
-      dtypeId = id;
-      document.querySelectorAll("#dtypeChips button").forEach((b) => {
-        b.classList.toggle("on", b.dataset.dtype === id);
-      });
+    function stat(key, value, detail, className = "") {
+      return `<div class="stat ${className}">
+        <div class="k">${key}</div>
+        <div class="v">${value}</div>
+        <div class="s">${detail}</div>
+      </div>`;
     }
 
-    function setLayout(packed) {
-      mlaPacked = packed;
-      document.querySelectorAll("#glmLayoutChips button").forEach((b) => {
-        b.classList.toggle("on", (b.dataset.layout === "fp8_ds_mla") === packed);
-      });
-    }
-
-    function setHit(pct) {
-      $("hit").value = pct;
-      document.querySelectorAll("#hitChips button").forEach((b) => {
-        b.classList.toggle("on", Number(b.dataset.hit) === Number(pct));
-      });
-    }
-
-    $("ctx").addEventListener("input", () => { $("ctxNum").value = $("ctx").value; render(); });
-    $("ctxNum").addEventListener("input", () => {
-      $("ctx").value = Math.min(1048576, Math.max(8192, $("ctxNum").value));
-      render();
-    });
-    $("hit").addEventListener("input", () => { setHit($("hit").value); render(); });
-    $("hitChips").addEventListener("click", (e) => {
-      if (e.target.dataset.hit) { setHit(e.target.dataset.hit); render(); }
-    });
-    $("gpuChips").addEventListener("click", (e) => {
-      if (e.target.dataset.gpus) {
-        $("gpus").value = e.target.dataset.gpus;
-        document.querySelectorAll("#gpuChips button").forEach((b) => {
-          b.classList.toggle("on", b.dataset.gpus === e.target.dataset.gpus);
-        });
-        render();
-      }
-    });
-    $("dtypeChips").addEventListener("click", (e) => {
-      if (e.target.dataset.dtype) { setDtype(e.target.dataset.dtype); render(); }
-    });
-    $("glmLayoutChips").addEventListener("click", (e) => {
-      if (e.target.dataset.layout) {
-        setLayout(e.target.dataset.layout === "fp8_ds_mla");
-        render();
-      }
-    });
-    ["model", "extra", "gpus", "pflops", "util", "nic", "chartKind"].forEach((id) => {
-      $(id).addEventListener("input", render);
-      $(id).addEventListener("change", render);
-    });
-
-    function stat(k, v, s, cls) {
-      return `<div class="stat ${cls || ""}"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s || ""}</div></div>`;
-    }
-
-    function renderStats(r) {
-      const nicCls = r.nicPct >= 100 ? "bad" : r.nicPct >= 70 ? "hot" : "ok";
+    function renderStats(result) {
+      const hasLinkBudget = result.linkReqCeiling != null;
+      const linkText = hasLinkBudget
+        ? `${S.fmtRate(result.linkReqCeiling)} req/s`
+        : "未设置";
+      const linkDetail = hasLinkBudget
+        ? `${result.linkMode} · ceiling；限幅后 offered ${
+            result.cappedReqsPool == null
+              ? "N/A"
+              : `${S.fmtRate(result.cappedReqsPool)} req/s`
+          }`
+        : "无公开 CMX 持续带宽默认值";
+      const offeredDetail = result.offeredReqsPool == null
+        ? "U=0；需另给请求到达率"
+        : `${result.gpus} GPU；不是可达吞吐`;
       $("stats").innerHTML = [
-        stat("KV / 会话", r.kvGiB.toFixed(2) + " GiB", r.dtype.label, "hot"),
-        stat("unique / 请求", Math.round(r.uniqueTok).toLocaleString(), `ctx×(1−hit)+extra`),
-        stat("unique tok/s · GPU", S.fmtTps(r.uniqueTpsGpu), `${r.gpus} GPU 合计 ${S.fmtTps(r.uniqueTps)}`),
-        stat("请求/s · 池", S.fmtNum(r.reqs, 2), `${r.reqsGpu.toFixed(2)} / GPU`),
-        stat("CMX 读（前缀预取）", S.fmtGBs(r.read), `${S.fmtGBs(r.readGpu)} / GPU · ${(r.readTBh).toFixed(1)} TB/h`),
-        stat("CMX 写（新 KV）", S.fmtGBs(r.write), `${S.fmtGBs(r.writeGpu)} / GPU · ${(r.writeTBh).toFixed(1)} TB/h`),
-        stat("读 / 写", (r.write > 0 ? r.read / r.write : Infinity).toFixed(1) + "×", "高命中 → 读主导"),
-        stat("NIC 占用 / GPU", r.nicPct.toFixed(0) + "%", r.bottleneck === "nic" ? "打满：NIC" : "打满：算力", nicCls),
+        stat("KV / 最终会话", S.fmtGiB(result.finalLayout.totalBytes), result.profile.label, "hot"),
+        stat("命中 / unique", `${result.matchedTokens.toLocaleString()} / ${result.uniqueTokens.toLocaleString()}`, `block=${result.blockTokens}`),
+        stat("读 / 请求", S.fmtGiB(result.readPerRequest), `q=${result.remoteFraction}`),
+        stat("写 / 请求", S.fmtGiB(result.writePerRequest), `a=${result.admissionFraction}`),
+        stat("Compute-offered", `${S.fmtRate(result.offeredReqsPool)} req/s`, offeredDetail),
+        stat("所需 CMX 读", S.fmtGBs(result.requiredRead), "池级 offered load"),
+        stat("所需 CMX 写", S.fmtGBs(result.requiredWrite), "池级 offered load"),
+        stat("用户链路 ceiling", linkText, linkDetail, hasLinkBudget ? "ok" : ""),
       ].join("");
     }
 
-    function renderFormula(r) {
-      const C = r.ctx;
-      const h = r.hit;
-      const m = r.model;
-      let kvLine = "";
-      if (m.kind === "v4") {
-        const d = r.kvDetail;
-        kvLine =
-`dtype = ${r.dtype.id}  (${r.dtype.label})
-KV(C) = n_c4a·[(128 + C/4)·${d.kvB} + (C/4)·${d.idxB}] + n_c128a·[(128 + C/128)·${d.kvB}] + n_swa·128·${d.kvB}
-      = ${m.nC4}×c4a + ${m.nC128}×c128a + ${m.nSwaOnly}×SWA
-      = ${S.fmtGiB(r.kvBytes)}   // BF16 @ 1,048,576 → V4-Pro 9.62 GiB；当前 dtype 按上式缩放`;
-      } else if (m.kind === "glm") {
-        const mlaB = r.kvDetail.mlaB;
-        kvLine =
-`dtype = ${r.dtype.id}  (${r.dtype.label}${r.mlaPacked ? " · fp8_ds_mla 656 B/层" : ""})
-KV(C) = C · (MLA_bpt + indexer_bpt) = C · (${mlaB} + ${r.kvDetail.idxBpt})
-      = ${S.fmtGiB(r.kvBytes)}`;
-      } else {
-        kvLine =
-`dtype = ${r.dtype.id}  (${r.dtype.label})
-KV(C) = C · (24×576×${r.dtype.kv} B) + KDA_fixed
-      = ${S.fmtGiB(r.kvBytes)}   // KDA ≈ 221.55 MiB/会话，与 C、dtype 无关（按 bf16 计）`;
-      }
+    function renderFormula(result) {
+      const stateRead = result.matchedTokens > 0
+        ? result.matchedLayout.stateBytes * result.remoteFraction
+        : 0;
       $("formula").textContent =
-`${kvLine}
+`M = floor(C × hit / block) × block
+  = floor(${result.contextTokens} × ${result.hitRate.toFixed(4)} / ${result.blockTokens}) × ${result.blockTokens}
+  = ${result.matchedTokens.toLocaleString()} matched tokens
 
-unique = C·(1 − h) + extra = ${C}·(1 − ${h}) + ${Number($("extra").value) || 0} = ${Math.round(r.uniqueTok)}
+U = C − M + E
+  = ${result.contextTokens} − ${result.matchedTokens} + ${result.extraTokens}
+  = ${result.uniqueTokens.toLocaleString()} unique tokens/request
 
-FLOPs/unique_token(C) = 2·N_active + attn(C)
-                      = 2·${S.fmtNum(m.nActive, 0)} + ${S.fmtNum(r.flops.attn, 2)}
-                      = ${S.fmtNum(r.flops.total, 2)}   // GEMM ${S.fmtNum(r.flops.gemm, 2)} + attn ${S.fmtNum(r.flops.attn, 2)}
+read/request  = q × [growing(M) + state(M)]
+              = ${S.fmtGiB(result.readPerRequest)}
+                其中固定状态 ${S.fmtGiB(stateRead)}
 
-unique_tok/s/GPU = (peak_FLOPS · util) / FLOPs
-                 = (${(r.peakFlops/1e15).toFixed(0)} PFLOPS · ${r.util}) / ${S.fmtNum(r.flops.total, 2)}
-                 = ${S.fmtTps(r.uniqueTpsGpu)} tok/s
+write/request = a × [growing(C+E) − growing(M) + final_state]
+              = ${S.fmtGiB(result.writePerRequest)}
+                其中最终状态 ${S.fmtGiB(result.stateWriteBytes)}
 
-req/s/GPU = unique_tok/s / unique = ${r.reqsGpu.toFixed(3)}
+compute-offered req/s
+  = unique_tok/s/GPU × GPU / U
+  = ${result.uniqueTpsGpu.toLocaleString()} × ${result.gpus} / ${result.uniqueTokens.toLocaleString()}
+  = ${S.fmtRate(result.offeredReqsPool)} req/s${result.offeredReqsPool == null
+    ? "（U=0，unique token/s 无法推出请求到达率）"
+    : ""}
 
-write/GPU = unique_tok/s · ΔB/token = ${S.fmtTps(r.uniqueTpsGpu)} · ${r.bpt.toFixed(0)} B = ${S.fmtGBs(r.writeGpu)}
-read/GPU  = req/s · KV(h·C)         = ${r.reqsGpu.toFixed(3)} · ${S.fmtGiB(r.kvHitBytes)} = ${S.fmtGBs(r.readGpu)}
+required read  = offered_req/s × read/request  = ${S.fmtGBs(result.requiredRead)}
+required write = offered_req/s × write/request = ${S.fmtGBs(result.requiredWrite)}
 
-瓶颈 = max(算力饱和, (read+write)/NIC) → ${r.bottleneck === "nic" ? "NIC " + r.nicPct.toFixed(0) + "%" : "算力（NIC " + r.nicPct.toFixed(0) + "%）"}`;
+transfer ceiling = ${result.linkReqCeiling == null
+  ? "未计算（链路预算为 0）"
+  : `${S.fmtRate(result.linkReqCeiling)} req/s（用户假设，不是 CMX 公布值）`}`;
     }
 
-    function niceTicks(min, max, n) {
+    function ticks(min, max, count) {
       const span = max - min || 1;
-      const step = Math.pow(10, Math.floor(Math.log10(span / n)));
-      const err = (n * step) / span;
-      const mul = err <= 0.15 ? 10 : err <= 0.35 ? 5 : err <= 0.75 ? 2 : 1;
-      const s = step * mul;
-      const t0 = Math.ceil(min / s) * s;
-      const ticks = [];
-      for (let x = t0; x <= max + s * 0.01; x += s) ticks.push(x);
-      return ticks;
+      const raw = span / count;
+      const power = 10 ** Math.floor(Math.log10(raw));
+      const ratio = raw / power;
+      const step = (ratio <= 1 ? 1 : ratio <= 2 ? 2 : ratio <= 5 ? 5 : 10) * power;
+      const values = [];
+      for (let value = Math.ceil(min / step) * step; value <= max + step * 0.01; value += step) {
+        values.push(value);
+      }
+      return values;
     }
 
     function drawChart(spec) {
       const svg = $("chart");
-      const W = 900, H = 340, L = 64, R = 18, T = 16, B = 42;
-      const iw = W - L - R, ih = H - T - B;
-      const xs = spec.series.flatMap((s) => s.pts.map((p) => p.x));
-      const ys = spec.series.flatMap((s) => s.pts.map((p) => p.y));
-      let xmin = Math.min(...xs), xmax = Math.max(...xs);
-      let ymin = 0, ymax = Math.max(...ys, 1e-9);
-      if (spec.ymin != null) ymin = spec.ymin;
-      if (spec.ymax != null) ymax = spec.ymax;
-      const xmap = (x) => L + ((x - xmin) / (xmax - xmin || 1)) * iw;
-      const ymap = (y) => T + ih - ((y - ymin) / (ymax - ymin || 1)) * ih;
-      const xt = niceTicks(xmin, xmax, 6);
-      const yt = niceTicks(ymin, ymax, 5);
-      const grid = yt.map((y) => {
-        const yy = ymap(y);
-        return `<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="#2e2a24" />
-          <text x="${L-8}" y="${yy+4}" fill="#9a917f" font-size="11" text-anchor="end">${spec.yfmt(y)}</text>`;
+      const width = 900, height = 340, left = 72, right = 18, top = 28, bottom = 44;
+      const innerWidth = width - left - right;
+      const innerHeight = height - top - bottom;
+      const xs = spec.series.flatMap((series) => series.points.map((point) => point.x));
+      const ys = spec.series.flatMap((series) => series.points.map((point) => point.y)).filter(Number.isFinite);
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const maxY = Math.max(...ys, 1);
+      const x = (value) => left + ((value - minX) / (maxX - minX || 1)) * innerWidth;
+      const y = (value) => top + innerHeight - (value / maxY) * innerHeight;
+      const grid = ticks(0, maxY, 5).map((value) => {
+        const yy = y(value);
+        return `<line x1="${left}" y1="${yy}" x2="${width-right}" y2="${yy}" stroke="#2e2a24" />
+          <text x="${left-8}" y="${yy+4}" fill="#9a917f" font-size="11" text-anchor="end">${spec.yFormat(value)}</text>`;
       }).join("");
-      const xlabels = xt.map((x) =>
-        `<text x="${xmap(x)}" y="${H-14}" fill="#9a917f" font-size="11" text-anchor="middle">${spec.xfmt(x)}</text>`
+      const xLabels = ticks(minX, maxX, 6).map((value) =>
+        `<text x="${x(value)}" y="${height-14}" fill="#9a917f" font-size="11" text-anchor="middle">${spec.xFormat(value)}</text>`
       ).join("");
-      const lines = spec.kind === "bar" ? "" : spec.series.map((s) => {
-        const d = s.pts.map((p, i) => `${i ? "L" : "M"}${xmap(p.x)},${ymap(p.y)}`).join(" ");
-        const dash = s.dash ? `stroke-dasharray="${s.dash}"` : "";
-        return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.2" ${dash} />`;
+      const paths = spec.series.map((series) => {
+        const path = series.points
+          .filter((point) => Number.isFinite(point.y))
+          .map((point, index) => `${index ? "L" : "M"}${x(point.x)},${y(point.y)}`)
+          .join(" ");
+        const dash = series.dash
+          ? ` stroke-dasharray="${series.dash}"`
+          : "";
+        return `<path d="${path}" fill="none" stroke="${series.color}" stroke-width="2.2"${dash} />`;
       }).join("");
-      let bars = "";
-      if (spec.kind === "bar") {
-        const n = spec.series[0].pts.length;
-        const groups = spec.series.length;
-        const bw = iw / n * 0.72;
-        spec.series.forEach((s, si) => {
-          s.pts.forEach((p, i) => {
-            const gw = bw / groups;
-            const x = L + (i + 0.14) * (iw / n) + si * gw;
-            const y = ymap(p.y);
-            bars += `<rect x="${x}" y="${y}" width="${gw - 2}" height="${Math.max(0, ymap(0) - y)}" fill="${s.color}" />`;
-          });
-        });
-      }
-      svg.innerHTML = `${grid}${xlabels}<line x1="${L}" y1="${T+ih}" x2="${W-R}" y2="${T+ih}" stroke="#5a5246"/>${lines}${bars}
-        <text x="${W/2}" y="${H-2}" fill="#9a917f" font-size="11" text-anchor="middle">${spec.xlabel}</text>`;
-      $("legend").innerHTML = spec.series.map((s) =>
-        `<span style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#cfc6b6">
-          <i style="width:18px;height:3px;background:${s.color};display:inline-block;${s.dash ? "opacity:.8" : ""}"></i>${s.name}</span>`
+      svg.innerHTML =
+        `<title id="chartSvgTitle">${spec.title}</title>
+         <desc id="chartSvgDesc">${spec.description}</desc>
+         ${grid}${xLabels}
+         <line x1="${left}" y1="${top+innerHeight}" x2="${width-right}" y2="${top+innerHeight}" stroke="#5a5246" />
+         ${paths}`;
+      $("legend").innerHTML = spec.series.map((series) =>
+        `<span class="legend-item"><i style="background:transparent;border-top:3px ${
+          series.dash ? "dashed" : "solid"
+        } ${series.color}"></i>${series.name}</span>`
       ).join("");
-      $("chartTitle").textContent = spec.title;
+      $("chartHeading").textContent = spec.title;
     }
 
     function renderChart(p) {
       const kind = $("chartKind").value;
+      if (kind === "ctxBytes") {
+        const contexts = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+        const points = contexts.map((tokens) => ({
+          x: tokens,
+          y: S.sessionLayout({
+            modelId: p.modelId,
+            profileId: p.profileId,
+            tokens,
+            includeMtp: p.includeMtp,
+          }).totalBytes,
+        }));
+        drawChart({
+          title: "上下文长度 → 会话状态字节",
+          description: "当前模型和布局下，最终会话状态体积随上下文长度变化。",
+          xFormat: (value) => value >= 1048576 ? "1Mi" : `${Math.round(value / 1024)}Ki`,
+          yFormat: (value) => `${(value / S.GiB).toFixed(value >= 10 * S.GiB ? 0 : 1)} GiB`,
+          series: [{ name: "会话状态", color: "#e08a3c", points }],
+        });
+        return;
+      }
+
       const hits = [];
-      for (let h = 80; h <= 99.5; h += 0.5) hits.push(h / 100);
-      const ctxs = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
-      if (kind === "hitIo") {
-        const rows = S.hitSweep(p, hits);
+      for (let percent = 0; percent <= 100; percent += 0.5) hits.push(percent / 100);
+      const rows = hits.map((hitRate) => S.trafficScenario({ ...p, hitRate }));
+      if (kind === "hitReq") {
+        const series = [{
+          name: "compute-offered req/s",
+          color: "#7cb87a",
+          points: rows.map((row) => ({ x: row.hitRate, y: row.offeredReqsPool })),
+        }];
+        if (p.linkGBsGpu > 0) {
+          series.push({
+            name: "用户链路预算下限幅",
+            color: "#d46a5c",
+            dash: "8 5",
+            points: rows.map((row) => ({ x: row.hitRate, y: row.cappedReqsPool })),
+          });
+        }
         drawChart({
-          title: "前缀命中率 ↑ 时，Prefill 侧 CMX 从写主导变成读主导",
-          xlabel: "hit",
-          xfmt: (x) => (x * 100).toFixed(0) + "%",
-          yfmt: (y) => (y / 1e9 >= 10 ? (y / 1e9).toFixed(0) : (y / 1e9).toFixed(1)) + " GB/s",
+          title: "前缀比例 → offered request load",
+          description: "计算侧 offered request rate；若设置链路预算，同时显示该用户假设下的限幅。",
+          xFormat: (value) => `${(value * 100).toFixed(0)}%`,
+          yFormat: (value) => S.fmtRate(value),
+          series,
+        });
+      } else {
+        drawChart({
+          title: "前缀比例 → 所需 CMX 流量",
+          description: "计算侧 offered load 对 CMX 读写带宽的需求，不代表系统可达到该流量。",
+          xFormat: (value) => `${(value * 100).toFixed(0)}%`,
+          yFormat: (value) => S.fmtGBs(value),
           series: [
-            { name: "读（前缀预取）· 池", color: "#4aa3d9", pts: rows.map((r) => ({ x: r.hit, y: r.read })) },
-            { name: "写（新 KV）· 池", color: "#e08a3c", pts: rows.map((r) => ({ x: r.hit, y: r.write })) },
-            { name: "NIC 上限 · 池", color: "#7a7264", dash: "6 5", pts: rows.map((r) => ({ x: r.hit, y: r.nic * r.gpus })) },
-          ],
-        });
-      } else if (kind === "hitNic") {
-        const rows = S.hitSweep(p, hits);
-        drawChart({
-          title: "单 GPU NIC 占用（读+写）/ 200 GB/s",
-          xlabel: "hit",
-          ymax: Math.max(120, ...rows.map((r) => r.nicPct)),
-          xfmt: (x) => (x * 100).toFixed(0) + "%",
-          yfmt: (y) => y.toFixed(0) + "%",
-          series: [{ name: "NIC % / GPU", color: "#d46a5c", pts: rows.map((r) => ({ x: r.hit, y: r.nicPct })) }],
-        });
-      } else if (kind === "hitTps") {
-        const rows = S.hitSweep(p, hits);
-        drawChart({
-          title: "Prefill 跑满时的请求率（unique 变少 → 请求变密 → 预取更猛）",
-          xlabel: "hit",
-          xfmt: (x) => (x * 100).toFixed(0) + "%",
-          yfmt: (y) => S.fmtNum(y, 1),
-          series: [{ name: "req/s · 池", color: "#7cb87a", pts: rows.map((r) => ({ x: r.hit, y: r.reqs })) }],
-        });
-      } else if (kind === "ctxKv") {
-        const rows = S.ctxSweep(p, ctxs);
-        drawChart({
-          title: "KV 体积随上下文（V4 因 1/4 与 1/128 压缩，斜率远小于 GLM）",
-          xlabel: "context tokens",
-          xfmt: (x) => (x >= 1e6 ? "1M" : x >= 1e3 ? (x / 1024).toFixed(0) + "K" : String(x)),
-          yfmt: (y) => (y / S.GiB).toFixed(y / S.GiB >= 10 ? 0 : 1) + " GiB",
-          series: [{ name: "KV / 会话", color: "#e08a3c", pts: rows.map((r) => ({ x: r.ctx, y: r.kvBytes })) }],
-        });
-      } else if (kind === "ctxFlops") {
-        const rows = S.ctxSweep(p, ctxs);
-        drawChart({
-          title: "unique tok/s / GPU（长上下文 indexer 变贵，V4 仍远好于对全量 C 打分）",
-          xlabel: "context tokens",
-          xfmt: (x) => (x >= 1e6 ? "1M" : (x / 1024).toFixed(0) + "K"),
-          yfmt: (y) => S.fmtTps(y),
-          series: [{ name: "unique tok/s / GPU", color: "#4aa3d9", pts: rows.map((r) => ({ x: r.ctx, y: r.uniqueTpsGpu })) }],
-        });
-      } else if (kind === "models") {
-        const ids = ["v4pro", "v4flash", "glm52", "k3"];
-        const rows = ids.map((id) => S.simulate(Object.assign({}, p, { modelId: id })));
-        drawChart({
-          kind: "bar",
-          title: "四模型 · 池级 CMX 读（蓝）/ 写（橙），GiB 会话体积见表",
-          xlabel: "模型",
-          xfmt: (x) => rows[x] ? rows[x].model.name.replace("DeepSeek ", "") : "",
-          yfmt: (y) => (y / 1e9).toFixed(0) + " GB/s",
-          series: [
-            { name: "读 GB/s", color: "#4aa3d9", pts: rows.map((r, i) => ({ x: i, y: r.read })) },
-            { name: "写 GB/s", color: "#e08a3c", pts: rows.map((r, i) => ({ x: i, y: r.write })) },
-          ],
-        });
-      } else if (kind === "dtypeKv") {
-        const ids = ["bf16", "fp8", "fp8_fp4"];
-        const rows = S.dtypeSweep(p, ids);
-        const names = { bf16: "BF16", fp8: "FP8", fp8_fp4: "FP8+FP4" };
-        drawChart({
-          kind: "bar",
-          title: "同一模型 · 三种 dtype 的 KV（左轴 GiB 见表）与池级 CMX 读/写",
-          xlabel: "dtype",
-          xfmt: (x) => names[ids[x]] || "",
-          yfmt: (y) => (y / 1e9).toFixed(0) + " GB/s",
-          series: [
-            { name: "读 GB/s", color: "#4aa3d9", pts: rows.map((r, i) => ({ x: i, y: r.read })) },
-            { name: "写 GB/s", color: "#e08a3c", pts: rows.map((r, i) => ({ x: i, y: r.write })) },
+            {
+              name: "所需读",
+              color: "#4aa3d9",
+              points: rows.map((row) => ({ x: row.hitRate, y: row.requiredRead })),
+            },
+            {
+              name: "所需写",
+              color: "#e08a3c",
+              dash: "8 5",
+              points: rows.map((row) => ({ x: row.hitRate, y: row.requiredWrite })),
+            },
           ],
         });
       }
     }
 
-    function renderCmp(p) {
-      const ids = ["v4pro", "v4flash", "glm52", "k3"];
-      const rows = ids.map((id) => S.simulate(Object.assign({}, p, { modelId: id })));
-      $("cmp").innerHTML =
-        `<tr><th>模型（${p.dtypeId}${p.mlaPacked ? " · 656" : ""}）</th><th>KV</th><th>ΔB/tok</th><th>unique tok/s/GPU</th><th>req/s 池</th><th>读 池</th><th>写 池</th><th>NIC/GPU</th></tr>` +
-        rows.map((r) => `<tr>
-          <td>${r.model.name}</td>
-          <td>${r.kvGiB.toFixed(2)} GiB</td>
-          <td>${r.bpt.toFixed(0)}</td>
-          <td>${S.fmtTps(r.uniqueTpsGpu)}</td>
-          <td>${S.fmtNum(r.reqs, 2)}</td>
-          <td>${S.fmtGBs(r.read)}</td>
-          <td>${S.fmtGBs(r.write)}</td>
-          <td>${r.nicPct.toFixed(0)}%</td>
-        </tr>`).join("");
+    function anchorRow(label, modelId, profileId, includeMtp = false) {
+      const layout = S.sessionLayout({
+        modelId,
+        profileId,
+        tokens: 1048576,
+        includeMtp,
+      });
+      return `<tr>
+        <th scope="row">${label}</th>
+        <td>${layout.profile.label}</td>
+        <td>${S.fmtGiB(layout.growingBytes)}</td>
+        <td>${S.fmtGiB(layout.pagedKvBytes)}</td>
+        <td>${S.fmtGiB(layout.totalBytes - layout.pagedKvBytes)}</td>
+        <td>${S.fmtGiB(layout.totalBytes)}</td>
+        <td>${layout.profile.confidence}</td>
+      </tr>`;
+    }
+
+    function renderAnchors() {
+      $("anchors").innerHTML =
+        `<caption>固定模型布局在 1,048,576 token 下的会话状态体积</caption>
+         <thead><tr>
+           <th scope="col">模型</th><th scope="col">布局</th><th scope="col">随 token 增长</th>
+           <th scope="col">Paged KV</th><th scope="col">额外续算状态</th>
+           <th scope="col">可移交合计</th><th scope="col">证据等级</th>
+         </tr></thead>
+         <tbody>
+           ${anchorRow("V4-Pro", "v4pro", "bf16-logical")}
+           ${anchorRow("V4-Flash", "v4flash", "bf16-logical")}
+           ${anchorRow("GLM-5.2 base", "glm52", "fp8-logical")}
+           ${anchorRow("GLM-5.2 + MTP", "glm52", "fp8-logical", true)}
+           ${anchorRow("Kimi K3", "k3", "fp8-vllm-state")}
+         </tbody>`;
     }
 
     function render() {
       const p = params();
-      $("ctxVal").textContent = Number(p.ctx).toLocaleString();
-      $("hitVal").textContent = (p.hit * 100).toFixed(1) + "%";
-      const hints = {
-        v4pro: "附录 9.62 GiB 用 BF16。线上常用 FP8+FP4，大约再小一半。切模型不会改你选的 dtype。",
-        v4flash: "Flash BF16 @ 1M ≈ 6.73 GiB。线上常用 FP8+FP4。切模型不会改 dtype。",
-        glm52: "1M serving 常用 FP8（逻辑 47.3 GiB）。BF16 是理论上限 ~94 GiB。FP8 下可再选引擎 656 B/层。",
-        k3: "1M serving 常用 FP8（MLA 13.5 GiB + KDA 0.22 GiB）。BF16 MLA 为 27 GiB。切模型不会改 dtype。",
-      };
-      $("dtypeHint").textContent = hints[p.modelId] || "";
-      $("modelNote").textContent = S.MODELS[p.modelId].note;
-      const showLayout = p.modelId === "glm52" && dtypeId !== "bf16";
-      $("glmLayoutWrap").hidden = !showLayout;
-      const r = S.simulate(p);
-      renderStats(r);
-      renderFormula(r);
+      $("contextValue").textContent = Number(p.contextTokens).toLocaleString();
+      $("hitValue").textContent = `${(p.hitRate * 100).toFixed(1)}%`;
+      const profile = S.profileFor(p.modelId, p.profileId);
+      $("profileNote").textContent =
+        `${profile.note} 证据：${profile.confidence}；模型锚点：${S.MODELS[p.modelId].evidence}。`;
+      const result = S.trafficScenario(p);
+      renderStats(result);
+      renderFormula(result);
       renderChart(p);
-      renderCmp(p);
-      const hbm = 22e12;
-      const decodeTps = hbm / r.kvBytes;
-      $("wrongModel").textContent =
-        `HBM 22 TB/s / KV = ${S.fmtTps(decodeTps)} decode tok/s/GPU。这是「每步扫完整 1M KV」的带宽上限，不是 Prefill 跑满。V4-Pro 9.62 GiB 时这个数看起来很亮，但 PD 分离的 Prefill 瓶颈是 GEMM+indexer FLOPs 以及把前缀从 CMX 拉到 Prefill GPU 的 NIC。`;
     }
 
+    $("model").addEventListener("change", () => {
+      syncProfiles();
+      render();
+    });
+    $("context").addEventListener("input", () => {
+      $("contextNumber").value = $("context").value;
+      render();
+    });
+    $("contextNumber").addEventListener("input", () => {
+      const value = Math.max(8192, Math.min(1048576, finiteNumber("contextNumber", 8192)));
+      $("contextNumber").value = value;
+      $("context").value = value;
+      render();
+    });
+    [
+      "profile", "includeMtp", "hit", "blockTokens", "extraTokens",
+      "remoteFraction", "admissionFraction", "writeState", "gpus",
+      "uniqueTps", "linkGBs", "linkMode", "chartKind",
+    ].forEach((id) => {
+      $(id).addEventListener("input", render);
+      $(id).addEventListener("change", render);
+    });
+
+    syncProfiles();
+    renderAnchors();
     render();
   </script>
 </body>

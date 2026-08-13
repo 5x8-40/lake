@@ -3,262 +3,320 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>仿真 · 容量驻留 · CMX</title>
-  <link rel="stylesheet" href="app.css" />
+  <title>CMX 容量场景分析</title>
+  <link rel="stylesheet" href="app.css?v=4" />
 </head>
 <body>
-  <nav class="topnav">
-    <a href="index.html">Prefill 跑满</a>
-    <a href="capacity.html" class="on">容量驻留</a>
+  <nav class="topnav" aria-label="CMX 分析页面">
+    <a href="index.html">流量需求</a>
+    <a href="capacity.html" class="on" aria-current="page">容量场景</a>
     <span class="navdoc">分析见 <a href="../../docs/research/nvidia-cmx.md">docs/research/nvidia-cmx.md</a></span>
   </nav>
+
   <header>
-    <h1>1M 会话在 G1 / G2 / CMX 能住多少</h1>
+    <h1>长上下文会话容量场景</h1>
     <p>
-      Agent 在工具上等待的会话不占算力，但占容量。活会话一旦超过 HBM（再超过柜内 DRAM），多出来的 1M 上下文只能在 CMX。
-      读写数字仍按 <a href="index.html">Prefill 跑满</a> 同一套公式，方便对照「容量满了」和「算力满了」不是一件事。
+      用明确的可用容量假设，计算一个 GPU、一个 rack 和一个 POD 分别可驻留多少条完整会话。
+      三个结果的物理范围不同，不应横向当成同一层级的产品规格。
     </p>
+    <div class="warn" role="note">
+      原始字节除法，不是可部署容量承诺。默认值仅用于演示；未建模 TP/CP 分片与复制、页取整、allocator
+      碎片、元数据、故障冗余、队列/运行时 reserve、去重和实际 flash usable/raw 比。
+    </div>
   </header>
+
   <div class="layout">
     <aside>
-      <h2>模型 / 精度</h2>
+      <h2>模型与布局</h2>
       <label for="model">模型</label>
       <select id="model">
-        <option value="v4pro" selected>DeepSeek V4-Pro</option>
+        <option value="v4pro">DeepSeek V4-Pro</option>
         <option value="v4flash">DeepSeek V4-Flash</option>
         <option value="glm52">GLM-5.2</option>
         <option value="k3">Kimi K3</option>
       </select>
-      <label>KV dtype</label>
-      <div class="chips" id="dtypeChips">
-        <button type="button" data-dtype="bf16" class="on">BF16</button>
-        <button type="button" data-dtype="fp8">FP8</button>
-        <button type="button" data-dtype="fp8_fp4">FP8+FP4</button>
+
+      <label for="profile">KV / 状态布局</label>
+      <select id="profile"></select>
+      <p id="profileNote" class="hint"></p>
+
+      <div id="mtpWrap" class="checkrow" hidden>
+        <input id="includeMtp" type="checkbox" />
+        <label for="includeMtp">把可选 MTP 层计入 GLM KV</label>
       </div>
+
       <h2>会话</h2>
-      <label>上下文 <span id="ctxVal"></span></label>
-      <input id="ctx" type="range" min="8192" max="1048576" step="8192" value="1048576" />
-      <input id="ctxNum" type="number" min="1024" max="1048576" step="1024" value="1048576" />
-      <label>前缀命中 <span id="hitVal"></span>（只影响 Prefill 读写，不影响驻留条数）</label>
-      <input id="hit" type="range" min="80" max="99.5" step="0.5" value="99" />
-      <h2>介质</h2>
-      <label>HBM 扣给权重的比例</label>
-      <input id="weight" type="number" min="0" max="0.8" step="0.05" value="0.25" />
-      <label>CMX 容量（PB / POD，官方只有「数 PB」）</label>
-      <input id="cmxPB" type="number" min="0.1" max="20" step="0.1" value="1" />
-      <label>Prefill GPU 数（算读写时用）</label>
-      <input id="gpus" type="number" min="1" step="1" value="72" />
-      <div class="row2">
-        <div>
-          <label>PFLOPS</label>
-          <input id="pflops" type="number" min="1" step="0.1" value="50" />
-        </div>
-        <div>
-          <label>util</label>
-          <input id="util" type="number" min="0.05" max="1" step="0.05" value="0.40" />
-        </div>
-      </div>
-      <h2>图</h2>
-      <select id="chartKind">
-        <option value="sess">四模型 · 驻留条数</option>
-        <option value="hitIo">命中率 → Prefill 侧 CMX 读写</option>
-      </select>
+      <label for="tokens">会话 token <span id="tokensValue"></span></label>
+      <input id="tokens" type="range" min="8192" max="1048576" step="8192" value="1048576" />
+      <label class="sr-only" for="tokensNumber">会话 token 数值</label>
+      <input id="tokensNumber" type="number" min="8192" max="1048576" step="1" value="1048576" />
+
+      <h2>可用容量假设</h2>
+      <label for="hbmGB">会话可用 HBM GB / GPU</label>
+      <input id="hbmGB" type="number" min="0" step="1" value="216" />
+      <p class="hint">216 GB = 288 GB raw 的 75%；这是用户假设，不是官方 reserve。</p>
+
+      <label for="g2TB">会话可用 G2 TB / rack</label>
+      <input id="g2TB" type="number" min="0" step="0.1" value="43.2" />
+      <p class="hint">43.2 TB = 54 TB aggregate 的 80%；实际内存有拓扑/本地性约束。</p>
+
+      <label for="cmxPB">CMX raw PB / POD</label>
+      <input id="cmxPB" type="number" min="0" step="0.1" value="18.432" />
+      <p class="hint">18.432 PB = 16 TB/GPU × 1152 GPU 的发布会算术，不是可购 SKU 保证。</p>
+
+      <label for="cmxUsable">CMX usable/raw 比例</label>
+      <input id="cmxUsable" type="number" min="0" max="1" step="0.05" value="0.8" />
     </aside>
+
     <main>
-      <div class="stats" id="stats"></div>
-      <div class="panel">
-        <h3>公式</h3>
+      <div class="stats" id="stats" aria-live="polite"></div>
+
+      <section class="panel" aria-labelledby="formulaHeading">
+        <h2 id="formulaHeading">当前场景</h2>
         <pre class="formula" id="formula"></pre>
-      </div>
-      <div class="panel">
-        <h3 id="chartTitle">图</h3>
-        <div class="tabs" id="legend"></div>
-        <div class="chart-wrap"><svg class="chart" id="chart" viewBox="0 0 900 340"></svg></div>
-      </div>
-      <div class="panel">
-        <h3>四模型对照（同一 dtype / 上下文 / CMX PB）</h3>
-        <table id="cmp"></table>
-      </div>
+      </section>
+
+      <section class="panel" aria-labelledby="chartHeading">
+        <h2 id="chartHeading">上下文长度 → CMX 会话数</h2>
+        <div class="tabs" id="legend" aria-label="图例"></div>
+        <div class="chart-wrap">
+          <svg
+            class="chart"
+            id="chart"
+            viewBox="0 0 900 340"
+            role="img"
+            aria-labelledby="capacityChartTitle capacityChartDesc"
+          ></svg>
+        </div>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="comparisonHeading">
+        <h2 id="comparisonHeading">模型锚点对照</h2>
+        <table id="comparison">
+          <caption>当前容量假设下，四个模型锚点布局的会话驻留数</caption>
+        </table>
+      </section>
+
+      <section class="panel" aria-labelledby="limitationsHeading">
+        <h2 id="limitationsHeading">在生产 sizing 前还缺什么</h2>
+        <ul class="notes">
+          <li>确认 CMX 传输/落盘的是逻辑 payload、引擎完整页，还是另一种 canonical layout。</li>
+          <li>按 TP/CP/DP/EP 部署确定每 rank 分片、复制和 scale-up broadcast。</li>
+          <li>加入 block/page 向上取整、元数据、运行时 reserve、碎片、冗余/EC 和故障域。</li>
+          <li>把 raw flash、格式化容量、可承诺容量和已用容量分开。</li>
+          <li>只有拿到实现的放置、去重和生命周期策略，才能估计池级有效复用率。</li>
+          <li>V4-Pro 的 9.62 GiB 是 BF16 paged KV 锚点；本页会话总量还计入 17.84 MiB FP32 compressor residual。</li>
+        </ul>
+      </section>
+
       <footer>
-        HBM 288 GB/GPU、柜 20.7 TB、DRAM 54 TB/柜、POD 1152 GPU。CMX PB 是滑块，不是 NVIDIA 数据表。
-        Decode HBM 扫描上限单独列出，避免和 Prefill 跑满混淆。
+        公开材料给出的是架构目标和参考算术，不是可复现的容量数据表。页面中的 18.432 PB
+        来自 <code>16 TB/GPU × 1152 GPU/POD</code>；usable 比例由用户提供。
       </footer>
     </main>
   </div>
-  <script src="sim.js"></script>
+
+  <script src="sim.js?v=4"></script>
   <script>
+    "use strict";
+
     const S = window.CmxSim;
     const $ = (id) => document.getElementById(id);
-    let dtypeId = "bf16";
+
+    function finiteNumber(id, fallback) {
+      const value = Number($(id).value);
+      return Number.isFinite(value) ? value : fallback;
+    }
+
+    function syncProfiles() {
+      const modelId = $("model").value;
+      const previous = $("profile").value;
+      const profiles = S.profileOptions(modelId);
+      $("profile").innerHTML = profiles
+        .map((profile) => `<option value="${profile.id}">${profile.label}</option>`)
+        .join("");
+      if (profiles.some((profile) => profile.id === previous)) {
+        $("profile").value = previous;
+      }
+      $("mtpWrap").hidden = modelId !== "glm52";
+    }
 
     function params() {
       return {
         modelId: $("model").value,
-        dtypeId,
-        ctx: Number($("ctxNum").value),
-        hit: Number($("hit").value) / 100,
-        extraUnique: 0,
-        gpus: Number($("gpus").value) || 72,
-        pflops: Number($("pflops").value) || 50,
-        util: Number($("util").value) || 0.4,
-        nicGBs: 200,
-        weightFrac: Number($("weight").value) || 0.25,
-        cmxPB: Number($("cmxPB").value) || 1,
+        profileId: $("profile").value,
+        includeMtp: $("includeMtp").checked,
+        tokens: finiteNumber("tokensNumber", 0),
+        usableHbmGB: finiteNumber("hbmGB", 0),
+        usableG2TB: finiteNumber("g2TB", 0),
+        rawCmxPB: finiteNumber("cmxPB", 0),
+        cmxUsableFraction: finiteNumber("cmxUsable", 0),
       };
     }
-    function setDtype(id) {
-      dtypeId = id;
-      document.querySelectorAll("#dtypeChips button").forEach((b) => {
-        b.classList.toggle("on", b.dataset.dtype === id);
-      });
-    }
-    $("ctx").addEventListener("input", () => { $("ctxNum").value = $("ctx").value; render(); });
-    $("ctxNum").addEventListener("input", () => {
-      $("ctx").value = Math.min(1048576, Math.max(8192, $("ctxNum").value));
-      render();
-    });
-    $("hit").addEventListener("input", render);
-    $("dtypeChips").addEventListener("click", (e) => {
-      if (e.target.dataset.dtype) { setDtype(e.target.dataset.dtype); render(); }
-    });
-    ["model", "weight", "cmxPB", "gpus", "pflops", "util", "chartKind"].forEach((id) => {
-      $(id).addEventListener("input", render);
-      $(id).addEventListener("change", render);
-    });
 
-    function stat(k, v, s, cls) {
-      return `<div class="stat ${cls || ""}"><div class="k">${k}</div><div class="v">${v}</div><div class="s">${s || ""}</div></div>`;
+    function stat(key, value, detail, className = "") {
+      return `<div class="stat ${className}">
+        <div class="k">${key}</div>
+        <div class="v">${value}</div>
+        <div class="s">${detail}</div>
+      </div>`;
     }
 
-    function niceTicks(min, max, n) {
+    function fmtCount(value) {
+      return value == null ? "N/A" : value.toLocaleString();
+    }
+
+    function renderStats(result) {
+      $("stats").innerHTML = [
+        stat("KV / 会话", S.fmtGiB(result.layout.totalBytes), result.layout.profile.label, "hot"),
+        stat("HBM / GPU", fmtCount(result.hbmSessionsPerGpu), `${result.usableHbmGB} GB 可用于会话`),
+        stat("G2 / rack", fmtCount(result.g2SessionsPerRack), `${result.usableG2TB} TB 可用于会话`),
+        stat("CMX raw / POD", fmtCount(result.rawCmxSessionsPerPod), `${result.rawCmxPB} PB raw`),
+        stat("CMX usable / POD", fmtCount(result.usableCmxSessionsPerPod), `${(result.cmxUsableFraction * 100).toFixed(0)}% usable/raw`, "ok"),
+      ].join("");
+    }
+
+    function renderFormula(result) {
+      $("formula").textContent =
+`session_bytes = paged_KV + extra_continuation_state
+              = ${S.fmtGiB(result.layout.pagedKvBytes)} + ${S.fmtGiB(result.layout.totalBytes - result.layout.pagedKvBytes)}
+              = ${S.fmtGiB(result.layout.totalBytes)}
+
+HBM sessions / GPU
+  = floor(${result.usableHbmGB} GB / session_bytes)
+  = ${fmtCount(result.hbmSessionsPerGpu)}
+
+G2 sessions / rack
+  = floor(${result.usableG2TB} TB / session_bytes)
+  = ${fmtCount(result.g2SessionsPerRack)}
+
+CMX usable sessions / POD
+  = floor(${result.rawCmxPB} PB × ${result.cmxUsableFraction} / session_bytes)
+  = ${fmtCount(result.usableCmxSessionsPerPod)}
+
+注意：这是原始字节除法；三个结果的 scope 分别是 GPU、rack、POD。`;
+    }
+
+    function niceTicks(min, max, count) {
       const span = max - min || 1;
-      const step = Math.pow(10, Math.floor(Math.log10(span / n)));
-      const err = (n * step) / span;
-      const mul = err <= 0.15 ? 10 : err <= 0.35 ? 5 : err <= 0.75 ? 2 : 1;
-      const s = step * mul;
-      const t0 = Math.ceil(min / s) * s;
-      const ticks = [];
-      for (let x = t0; x <= max + s * 0.01; x += s) ticks.push(x);
-      return ticks;
+      const raw = span / count;
+      const power = 10 ** Math.floor(Math.log10(raw));
+      const ratio = raw / power;
+      const step = (ratio <= 1 ? 1 : ratio <= 2 ? 2 : ratio <= 5 ? 5 : 10) * power;
+      const values = [];
+      for (let value = Math.ceil(min / step) * step; value <= max + step * 0.01; value += step) {
+        values.push(value);
+      }
+      return values;
     }
 
-    function drawChart(spec) {
+    function drawChart(points) {
       const svg = $("chart");
-      const W = 900, H = 340, L = 72, R = 18, T = 16, B = 42;
-      const iw = W - L - R, ih = H - T - B;
-      const xs = spec.series.flatMap((s) => s.pts.map((p) => p.x));
-      const ys = spec.series.flatMap((s) => s.pts.map((p) => p.y));
-      const xmin = Math.min(...xs), xmax = Math.max(...xs);
-      const ymin = 0, ymax = Math.max(...ys, 1e-9);
-      const xmap = (x) => L + ((x - xmin) / (xmax - xmin || 1)) * iw;
-      const ymap = (y) => T + ih - ((y - ymin) / (ymax - ymin || 1)) * ih;
-      const grid = niceTicks(ymin, ymax, 5).map((y) => {
-        const yy = ymap(y);
-        return `<line x1="${L}" y1="${yy}" x2="${W-R}" y2="${yy}" stroke="#2e2a24" />
-          <text x="${L-8}" y="${yy+4}" fill="#9a917f" font-size="11" text-anchor="end">${spec.yfmt(y)}</text>`;
-      }).join("");
-      const xlabels = niceTicks(xmin, xmax, 6).map((x) =>
-        `<text x="${xmap(x)}" y="${H-14}" fill="#9a917f" font-size="11" text-anchor="middle">${spec.xfmt(x)}</text>`
-      ).join("");
-      let body = "";
-      if (spec.kind === "bar") {
-        const n = spec.series[0].pts.length;
-        const groups = spec.series.length;
-        const bw = iw / n * 0.72;
-        spec.series.forEach((s, si) => {
-          s.pts.forEach((p, i) => {
-            const gw = bw / groups;
-            const x = L + (i + 0.14) * (iw / n) + si * gw;
-            const y = ymap(p.y);
-            body += `<rect x="${x}" y="${y}" width="${gw-2}" height="${Math.max(0, ymap(0)-y)}" fill="${s.color}" />`;
-          });
-        });
-      } else {
-        body = spec.series.map((s) => {
-          const d = s.pts.map((p, i) => `${i ? "L" : "M"}${xmap(p.x)},${ymap(p.y)}`).join(" ");
-          return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.2" />`;
-        }).join("");
+      const width = 900, height = 340, left = 82, right = 18, top = 28, bottom = 44;
+      const innerWidth = width - left - right;
+      const innerHeight = height - top - bottom;
+      const validPoints = points.filter(
+        (point) => Number.isFinite(point.x) && Number.isFinite(point.y)
+      );
+      if (validPoints.length === 0) {
+        svg.innerHTML =
+          `<title id="capacityChartTitle">上下文长度与 CMX 会话数</title>
+           <desc id="capacityChartDesc">当前输入没有可绘制的有限结果。</desc>`;
+        $("legend").textContent = "当前输入没有可绘制的有限结果";
+        return;
       }
-      svg.innerHTML = `${grid}${xlabels}<line x1="${L}" y1="${T+ih}" x2="${W-R}" y2="${T+ih}" stroke="#5a5246"/>${body}`;
-      $("legend").innerHTML = spec.series.map((s) =>
-        `<span style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#cfc6b6">
-          <i style="width:18px;height:3px;background:${s.color};display:inline-block"></i>${s.name}</span>`
+      const minX = Math.min(...validPoints.map((point) => point.x));
+      const maxX = Math.max(...validPoints.map((point) => point.x));
+      const maxY = Math.max(...validPoints.map((point) => point.y), 1);
+      const x = (value) => left + ((value - minX) / (maxX - minX || 1)) * innerWidth;
+      const y = (value) => top + innerHeight - (value / maxY) * innerHeight;
+      const grid = niceTicks(0, maxY, 5).map((value) => {
+        const yy = y(value);
+        const label = value >= 1e6 ? `${(value / 1e6).toFixed(1)}M` : value >= 1e3 ? `${(value / 1e3).toFixed(0)}k` : `${Math.round(value)}`;
+        return `<line x1="${left}" y1="${yy}" x2="${width-right}" y2="${yy}" stroke="#2e2a24" />
+          <text x="${left-8}" y="${yy+4}" fill="#9a917f" font-size="11" text-anchor="end">${label}</text>`;
+      }).join("");
+      const xLabels = niceTicks(minX, maxX, 6).map((value) =>
+        `<text x="${x(value)}" y="${height-14}" fill="#9a917f" font-size="11" text-anchor="middle">${value >= 1048576 ? "1Mi" : `${Math.round(value / 1024)}Ki`}</text>`
       ).join("");
-      $("chartTitle").textContent = spec.title;
+      const path = validPoints
+        .map((point, index) => `${index ? "L" : "M"}${x(point.x)},${y(point.y)}`)
+        .join(" ");
+      svg.innerHTML =
+        `<title id="capacityChartTitle">上下文长度与 CMX usable 会话数</title>
+         <desc id="capacityChartDesc">在当前 raw PB 和 usable 比例假设下，当前模型可驻留会话数随上下文增长而下降。</desc>
+         ${grid}${xLabels}
+         <line x1="${left}" y1="${top+innerHeight}" x2="${width-right}" y2="${top+innerHeight}" stroke="#5a5246" />
+         <path d="${path}" fill="none" stroke="#4aa3d9" stroke-width="2.2" />`;
+      $("legend").innerHTML =
+        `<span class="legend-item"><i style="background:#4aa3d9"></i>CMX usable sessions / POD</span>`;
+    }
+
+    const anchors = [
+      ["V4-Pro BF16", "v4pro", "bf16-logical", false],
+      ["V4-Flash BF16", "v4flash", "bf16-logical", false],
+      ["GLM-5.2 FP8 base", "glm52", "fp8-logical", false],
+      ["GLM-5.2 FP8 + MTP", "glm52", "fp8-logical", true],
+      ["Kimi K3 FP8", "k3", "fp8-vllm-state", false],
+    ];
+
+    function renderComparison(p) {
+      const rows = anchors.map(([label, modelId, profileId, includeMtp]) => {
+        const result = S.capacityScenario({ ...p, modelId, profileId, includeMtp });
+        return `<tr>
+          <th scope="row">${label}</th>
+          <td>${S.fmtGiB(result.layout.totalBytes)}</td>
+          <td>${fmtCount(result.hbmSessionsPerGpu)}</td>
+          <td>${fmtCount(result.g2SessionsPerRack)}</td>
+          <td>${fmtCount(result.usableCmxSessionsPerPod)}</td>
+        </tr>`;
+      }).join("");
+      $("comparison").innerHTML =
+        `<caption>当前容量假设下，四个模型锚点布局的会话驻留数</caption>
+         <thead><tr>
+           <th scope="col">模型 / 布局</th><th scope="col">会话字节</th>
+           <th scope="col">HBM / GPU</th><th scope="col">G2 / rack</th>
+           <th scope="col">CMX usable / POD</th>
+         </tr></thead><tbody>${rows}</tbody>`;
     }
 
     function render() {
       const p = params();
-      $("ctxVal").textContent = Number(p.ctx).toLocaleString();
-      $("hitVal").textContent = (p.hit * 100).toFixed(1) + "%";
-      const r = S.capacity(p);
-      $("stats").innerHTML = [
-        stat("KV / 会话", r.kvGiB.toFixed(2) + " GiB", r.dtype.label, "hot"),
-        stat("G1 会话 / GPU", String(r.sessGpu), `HBM ${(288*(1-r.weightFrac)).toFixed(0)} GB 可用`),
-        stat("G1 会话 / 柜", String(r.sessRackHbm), "20.7 TB × (1−权重)"),
-        stat("G2 会话 / 柜", String(r.sessDram), "54 TB LPDDR5X"),
-        stat("CMX 会话 / POD", r.sessCmx.toLocaleString(), `${p.cmxPB} PB 滑块`),
-        stat("Prefill 读 · 池", S.fmtGBs(r.read), "算力打满时的前缀预取"),
-        stat("Prefill 写 · 池", S.fmtGBs(r.write), `${r.writeTBh.toFixed(1)} TB/h`),
-        stat("对照：HBM 扫 KV", S.fmtTps(r.hbmBwDecodeTps) + " tok/s", "不是 Prefill 跑满", "bad"),
-      ].join("");
-      $("formula").textContent =
-`sessions_G1/GPU = floor( HBM_GPU × (1 − weight) / KV(C, dtype) )
-                 = floor( 288 GB × (1 − ${r.weightFrac}) / ${r.kvGiB.toFixed(2)} GiB ) = ${r.sessGpu}
-
-sessions_G2/柜  = floor( 54 TB / KV ) = ${r.sessDram}
-sessions_CMX    = floor( ${p.cmxPB} PB / KV ) = ${r.sessCmx}   // PB 是滑块；NVIDIA 只说「数 PB / POD」
-
-Prefill 跑满（与另一页相同）：
-  unique = C·(1−h) = ${Math.round(r.uniqueTok)}
-  write  = unique_tok/s × ΔB = ${S.fmtGBs(r.write)}
-  read   = req/s × KV(h·C)  = ${S.fmtGBs(r.read)}
-
-HBM 扫描上限（对照，勿当 CMX 模型）：
-  22 TB/s / KV = ${S.fmtTps(r.hbmBwDecodeTps)} tok/s/GPU`;
-
-      const ids = ["v4pro", "v4flash", "glm52", "k3"];
-      const rows = ids.map((id) => S.capacity(Object.assign({}, p, { modelId: id })));
-      if ($("chartKind").value === "sess") {
-        drawChart({
-          kind: "bar",
-          title: "同一介质下能同时驻留多少条当前长度的会话",
-          xlabel: "模型",
-          xfmt: (x) => rows[x] ? rows[x].model.name.replace("DeepSeek ", "") : "",
-          yfmt: (y) => y >= 1e3 ? (y/1e3).toFixed(1)+"k" : String(Math.round(y)),
-          series: [
-            { name: "G1 / 柜", color: "#e08a3c", pts: rows.map((x, i) => ({ x: i, y: x.sessRackHbm })) },
-            { name: "G2 / 柜", color: "#4aa3d9", pts: rows.map((x, i) => ({ x: i, y: x.sessDram })) },
-          ],
-        });
-      } else {
-        const hits = [];
-        for (let h = 80; h <= 99.5; h += 0.5) hits.push(h / 100);
-        const sweep = S.hitSweep(p, hits);
-        drawChart({
-          title: "Prefill 跑满时 CMX 读写随命中率（驻留条数与命中无关）",
-          xlabel: "hit",
-          xfmt: (x) => (x * 100).toFixed(0) + "%",
-          yfmt: (y) => (y / 1e9).toFixed(y / 1e9 >= 10 ? 0 : 1) + " GB/s",
-          series: [
-            { name: "读 · 池", color: "#4aa3d9", pts: sweep.map((x) => ({ x: x.hit, y: x.read })) },
-            { name: "写 · 池", color: "#e08a3c", pts: sweep.map((x) => ({ x: x.hit, y: x.write })) },
-          ],
-        });
-      }
-      $("cmp").innerHTML =
-        `<tr><th>模型</th><th>KV</th><th>G1/GPU</th><th>G1/柜</th><th>G2/柜</th><th>CMX/${p.cmxPB}PB</th><th>读 池</th><th>写 池</th></tr>` +
-        rows.map((x) => `<tr>
-          <td>${x.model.name}</td>
-          <td>${x.kvGiB.toFixed(2)} GiB</td>
-          <td>${x.sessGpu}</td>
-          <td>${x.sessRackHbm}</td>
-          <td>${x.sessDram}</td>
-          <td>${x.sessCmx.toLocaleString()}</td>
-          <td>${S.fmtGBs(x.read)}</td>
-          <td>${S.fmtGBs(x.write)}</td>
-        </tr>`).join("");
+      $("tokensValue").textContent = Number(p.tokens).toLocaleString();
+      const profile = S.profileFor(p.modelId, p.profileId);
+      $("profileNote").textContent =
+        `${profile.note} 证据：${profile.confidence}；模型锚点：${S.MODELS[p.modelId].evidence}。`;
+      const result = S.capacityScenario(p);
+      renderStats(result);
+      renderFormula(result);
+      const contexts = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+      drawChart(contexts.map((tokens) => ({
+        x: tokens,
+        y: S.capacityScenario({ ...p, tokens }).usableCmxSessionsPerPod,
+      })));
+      renderComparison(p);
     }
+
+    $("model").addEventListener("change", () => {
+      syncProfiles();
+      render();
+    });
+    $("tokens").addEventListener("input", () => {
+      $("tokensNumber").value = $("tokens").value;
+      render();
+    });
+    $("tokensNumber").addEventListener("input", () => {
+      const value = Math.max(8192, Math.min(1048576, finiteNumber("tokensNumber", 8192)));
+      $("tokensNumber").value = value;
+      $("tokens").value = value;
+      render();
+    });
+    ["profile", "includeMtp", "hbmGB", "g2TB", "cmxPB", "cmxUsable"].forEach((id) => {
+      $(id).addEventListener("input", render);
+      $(id).addEventListener("change", render);
+    });
+
+    syncProfiles();
     render();
   </script>
 </body>
