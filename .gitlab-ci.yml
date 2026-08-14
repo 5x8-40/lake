@@ -16,6 +16,8 @@ workflow:
     - when: never
 
 # 代码路径:仅当这些路径变化才跑三语言构建/验证/冒烟;纯文档 MR 只跑 docs-check,省 runner 分钟。
+# 注意:.gitmodules / 3rdparty 不在列——CI 不拉 submodule(无 GIT_SUBMODULE_STRATEGY),
+# 构建用的是 rust/vendor 在树副本,submodule 指针变化不影响构建结果。
 .code-paths: &code_paths
   - rust/**/*
   - go/**/*
@@ -25,7 +27,6 @@ workflow:
   - deploy/**/*
   - bench/**/*
   - .gitlab-ci.yml
-  - .gitmodules
 
 # apt 镜像(可选):runner 经 environment 注入 APT_MIRROR 时,先把 debian 源换到镜像站,
 # 防 deb.debian.org 抖动打挂 before_script;共享 runner 不注入则保持默认源。附带 apt 重试 3 次。
