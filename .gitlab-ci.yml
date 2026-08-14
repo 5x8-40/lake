@@ -15,6 +15,29 @@ workflow:
     - if: '$CI_COMMIT_BRANCH == "main"'
     - when: never
 
+# 代码路径:仅当这些路径变化才跑三语言构建/验证/冒烟;纯文档 MR 只跑 docs-check,省 runner 分钟。
+.code-paths: &code_paths
+  - rust/**/*
+  - go/**/*
+  - python/**/*
+  - proto/**/*
+  - scripts/**/*
+  - deploy/**/*
+  - bench/**/*
+  - .gitlab-ci.yml
+  - .gitmodules
+
+# apt 镜像(可选):runner 经 environment 注入 APT_MIRROR 时,先把 debian 源换到镜像站,
+# 防 deb.debian.org 抖动打挂 before_script;共享 runner 不注入则保持默认源。附带 apt 重试 3 次。
+.apt-mirror: &apt_mirror |
+  echo 'Acquire::Retries "3";' > /etc/apt/apt.conf.d/80retries
+  if [ -n "$APT_MIRROR" ]; then
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.sources; do
+      [ -f "$f" ] || continue
+      sed -i "s|security.debian.org/debian-security|$APT_MIRROR/debian-security|g; s|deb.debian.org|$APT_MIRROR|g" "$f"
+    done
+  fi
+
 default:
   cache:
     key: "$CI_COMMIT_REF_SLUG"
@@ -28,7 +51,10 @@ default:
 rust:
   stage: build
   image: rust:1.96.1
+  rules:
+    - changes: *code_paths
   before_script:
+    - *apt_mirror
     - apt-get update && apt-get install -y protobuf-compiler
   script:
     - cd rust
@@ -47,6 +73,8 @@ rust:
 go:
   stage: build
   image: golang:1.22
+  rules:
+    - changes: *code_paths
   script:
     - cd go
     - go build ./...
@@ -57,6 +85,8 @@ go:
 python:
   stage: build
   image: python:3.12
+  rules:
+    - changes: *code_paths
   before_script:
     - pip install "grpcio>=1.82.1" "protobuf>=7.35.0" "transformers" pytest
   script:
@@ -75,9 +105,12 @@ python:
 stub-drift:
   stage: build
   image: golang:1.22
+  rules:
+    - changes: *code_paths
   variables:
     GOTOOLCHAIN: auto  # protoc-gen-go v1.36.11 需 go>=1.23,自动切到所需 toolchain
   before_script:
+    - *apt_mirror
     - apt-get update && apt-get install -y protobuf-compiler python3 python3-pip
     - go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.36.11
     - go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@v1.6.2
@@ -87,14 +120,25 @@ stub-drift:
     - bash scripts/gen_stubs.sh
     - git diff --exit-code
 
+# 文档门禁:每条流水线都跑(约 10s)——纯文档 MR 的唯一任务,保证合并门禁
+# (only_allow_merge_if_pipeline_succeeds)下流水线恒存在;校验 docs 内部相对链接不断。
+docs-check:
+  stage: build
+  image: python:3.12-alpine
+  script:
+    - python scripts/check_doc_links.py
+
 # ---------- verify / smoke (p3.yml) ----------
 
 # P3 编译门禁(不含起全栈冒烟)。rust:1.96.1 自带 rust,apt 装 python3,Go 用官方二进制。
 verify-p3:
   stage: verify
   image: rust:1.96.1
+  rules:
+    - changes: *code_paths
   needs: []
   before_script:
+    - *apt_mirror
     - apt-get update && apt-get install -y protobuf-compiler python3 python3-pip curl
     - curl -fsSL https://go.dev/dl/go1.22.12.linux-amd64.tar.gz | tar -C /usr/local -xz
     - export PATH="/usr/local/go/bin:$PATH"
@@ -107,8 +151,11 @@ verify-p3:
 smoke:
   stage: smoke
   image: rust:1.96.1
+  rules:
+    - changes: *code_paths
   needs: ["verify-p3"]
   before_script:
+    - *apt_mirror
     - apt-get update && apt-get install -y protobuf-compiler python3 python3-pip curl
     - curl -fsSL https://go.dev/dl/go1.22.12.linux-amd64.tar.gz | tar -C /usr/local -xz
     - export PATH="/usr/local/go/bin:$PATH"
