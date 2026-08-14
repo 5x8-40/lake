@@ -4,7 +4,7 @@
 >
 > 核心结论：CMX 是 NVIDIA 公布的一套完整 KV cache 存储**目标架构**，不是一块盘；但公开软件尚未组成可复现的端到端实现。Dynamo 已有通用 KV-aware routing / tiering，NIXL 的 `DOCA_MEMOS` 仍是 open PR，Dynamo 也没有一等 G3.5/CMX 类型。VAST 给出了目前公开材料中较具体的伙伴落法和容量方法，但它的 20× 实验是现有 G3 路径，不是 Rubin + CMX benchmark。
 
-可调公式与校验在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)。
+可调公式与校验在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)；项目成员可通过 private GitLab Pages 直接查看 [`index`](https://lake-13d9f7.gitlab.io/)、[`capacity`](https://lake-13d9f7.gitlab.io/capacity.html) 和 [`economics`](https://lake-13d9f7.gitlab.io/economics.html)。
 
 ## 0. 证据标签与范围
 

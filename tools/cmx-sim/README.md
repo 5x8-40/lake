@@ -16,6 +16,15 @@ node tools/cmx-sim/verify.js
 | [`capacity.html`](capacity.html) | 用户给定可用容量后，按 GPU / rack / POD 分别计算会话数 |
 | [`economics.html`](economics.html) | 匿名 Cursor trace、provider cache 留存证据，以及 Cache 成本换算力的阈值模型 |
 
+## GitLab Pages
+
+三个 HTML 文件属于**同一个静态网站、同一个 Pages deployment**，不是三个独立部署：
+
+- 站点入口：<https://lake-13d9f7.gitlab.io/>
+- 路由：`/index.html`、`/capacity.html`、`/economics.html`
+- 访问控制：沿用 GitLab 项目的 private Pages 设置，只有已登录的项目成员可查看
+- MR !7 pipeline 先发布当前版本；合并后由 `main` pipeline 覆盖为主分支版本
+
 核心口径：
 
 ```text
