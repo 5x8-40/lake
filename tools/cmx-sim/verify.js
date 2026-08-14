@@ -314,6 +314,59 @@ assert.equal(
   Math.floor(1e9 / positiveCapacity.layout.totalBytes)
 );
 
+// Cache economics keeps token hit, prefill compute share, and cache cost on
+// separate denominators. A 20% compute saving is not implied by hit rate alone.
+const economics = S.economicsScenario({
+  hitRate: 0.9229385582485566,
+  prefillComputeShare: 0.22,
+  avoidEfficiency: 1,
+  cacheCostShare: 0.05,
+  targetComputeSavings: 0.2,
+});
+close(
+  economics.grossComputeSavings,
+  0.22 * 0.9229385582485566,
+  1e-15,
+  "gross compute savings"
+);
+close(
+  economics.netSavings,
+  economics.grossComputeSavings - 0.05,
+  1e-15,
+  "net savings"
+);
+close(
+  economics.requiredPrefillComputeShare,
+  0.2 / 0.9229385582485566,
+  1e-15,
+  "required prefill share"
+);
+close(
+  economics.grossBenefitCostRatio,
+  economics.grossComputeSavings / 0.05,
+  1e-15,
+  "gross benefit/cost"
+);
+close(
+  economics.netRoi,
+  economics.netSavings / 0.05,
+  1e-15,
+  "net ROI"
+);
+
+const zeroEconomics = S.economicsScenario({
+  hitRate: 0,
+  prefillComputeShare: 2,
+  avoidEfficiency: 1,
+  cacheCostShare: 0,
+  targetComputeSavings: 0.2,
+});
+assert.equal(zeroEconomics.prefillComputeShare, 1);
+assert.equal(zeroEconomics.grossComputeSavings, 0);
+assert.equal(zeroEconomics.requiredPrefillComputeShare, null);
+assert.equal(zeroEconomics.grossBenefitCostRatio, null);
+assert.equal(zeroEconomics.netRoi, null);
+
 // Formatter edge cases distinguish unknown/invalid from an unbounded ceiling.
 assert.equal(S.fmtGiB(null), "N/A");
 assert.equal(S.fmtGiB(NaN), "N/A");

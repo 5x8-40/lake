@@ -383,6 +383,32 @@
     };
   }
 
+  function economicsScenario(p) {
+    var hitRate = clamp(p.hitRate, 0, 1);
+    var prefillComputeShare = clamp(p.prefillComputeShare, 0, 1);
+    var avoidEfficiency = clamp(p.avoidEfficiency, 0, 1);
+    var cacheCostShare = clamp(p.cacheCostShare, 0, 1);
+    var targetComputeSavings = clamp(p.targetComputeSavings, 0, 1);
+    var grossComputeSavings =
+      prefillComputeShare * hitRate * avoidEfficiency;
+    var netSavings = grossComputeSavings - cacheCostShare;
+    var effectiveHit = hitRate * avoidEfficiency;
+    return {
+      hitRate: hitRate,
+      prefillComputeShare: prefillComputeShare,
+      avoidEfficiency: avoidEfficiency,
+      cacheCostShare: cacheCostShare,
+      targetComputeSavings: targetComputeSavings,
+      grossComputeSavings: grossComputeSavings,
+      netSavings: netSavings,
+      requiredPrefillComputeShare:
+        effectiveHit > 0 ? targetComputeSavings / effectiveHit : null,
+      grossBenefitCostRatio:
+        cacheCostShare > 0 ? grossComputeSavings / cacheCostShare : null,
+      netRoi: cacheCostShare > 0 ? netSavings / cacheCostShare : null,
+    };
+  }
+
   function fmtGiB(bytes) {
     if (bytes == null) return "N/A";
     if (Number.isNaN(bytes)) return "N/A";
@@ -426,6 +452,7 @@
     matchedTokens: matchedTokens,
     trafficScenario: trafficScenario,
     capacityScenario: capacityScenario,
+    economicsScenario: economicsScenario,
     fmtGiB: fmtGiB,
     fmtGBs: fmtGBs,
     fmtRate: fmtRate,

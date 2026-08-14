@@ -14,6 +14,7 @@ node tools/cmx-sim/verify.js
 |---|---|
 | [`index.html`](index.html) | PD 分离下的 compute-offered 请求率，以及它要求的 CMX 读/写 |
 | [`capacity.html`](capacity.html) | 用户给定可用容量后，按 GPU / rack / POD 分别计算会话数 |
+| [`economics.html`](economics.html) | 匿名 Cursor trace、provider cache 留存证据，以及 Cache 成本换算力的阈值模型 |
 
 核心口径：
 
@@ -35,6 +36,14 @@ required_write = offered_req/s × write/request
 - 当 `U=0`（100% 块对齐命中且无新增 token）时，unique token/s 不能推出请求到达率；页面把 offered req/s 和非零所需流量标成 `N/A`，而不是伪造 `Infinity`。
 - 链路预算默认是 `0`（未知）。填写后只得到该用户假设下的传输上限，不是 CMX 可达吞吐。
 - 容量页是原始字节除法；布局、分片/复制、页取整、冗余、reserve 和 usable/raw 必须在生产 sizing 前另行确认。
+- 经济页把 `cache hit`、Prefill 算力占比、命中避免效率与 Cache 总成本分开：
+
+  ```text
+  compute_saved = prefill_compute_share × cache_hit × avoid_efficiency
+  net_saved     = compute_saved − cache_total_cost_share
+  ```
+
+  Cursor CSV 没有 GPU 时间或 CMX 成本，因此只给阈值，不把“5% 成本换 20% 算力”写成实测结论。匿名 trace 的 input/output 是每个 Cursor usage event 的聚合 token，不是单次底层模型调用长度。
 
 校验锚点：
 

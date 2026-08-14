@@ -1,0 +1,314 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agentic Cache 用量与经济分析</title>
+  <link rel="stylesheet" href="app.css?v=4" />
+</head>
+<body>
+  <nav class="topnav" aria-label="CMX 分析页面">
+    <a href="index.html">流量需求</a>
+    <a href="capacity.html">容量场景</a>
+    <a href="economics.html" class="on" aria-current="page">Trace 与经济</a>
+    <span class="navdoc">分析见 <a href="../../docs/research/nvidia-cmx.md">docs/research/nvidia-cmx.md</a></span>
+  </nav>
+
+  <header>
+    <h1>Agentic Cache：真实用量与经济边界</h1>
+    <p>
+      用匿名 Cursor team usage 汇总观察单用户小时峰值、模型 mix 和 token-weighted cache hit；
+      再把命中率、Prefill 算力占比与 Cache 总成本拆开，计算“花 5% 换 20% 算力”的成立条件。
+    </p>
+    <div class="warn" role="note">
+      Cursor usage event 可聚合多次底层模型调用。单条事件最高 22.05M prompt token，不能把这里的
+      input p50/p95 当成单次 API context，也不能用本 CSV 推断 provider TTL。
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside>
+      <h2>经济假设</h2>
+
+      <label for="hitRate">Token-weighted cache hit %</label>
+      <input id="hitRate" type="number" min="0" max="100" step="0.1" value="92.2939" />
+      <p class="hint">Trace：Cache Read / prompt token。</p>
+
+      <label for="prefillShare">Prefill 占总算力 %</label>
+      <input id="prefillShare" type="number" min="0" max="100" step="0.1" value="21.67" />
+
+      <label for="avoidEfficiency">命中避免 Prefill 的效率 %</label>
+      <input id="avoidEfficiency" type="number" min="0" max="100" step="0.1" value="100" />
+
+      <label for="cacheCost">Cache 总成本 / 基线成本 %</label>
+      <input id="cacheCost" type="number" min="0" max="100" step="0.1" value="5" />
+      <p class="hint">应包含容量、传输、控制面和 keepalive；CSV 本身没有该成本。</p>
+
+      <label for="targetSavings">目标总算力节省 %</label>
+      <input id="targetSavings" type="number" min="0" max="100" step="0.1" value="20" />
+
+      <h2>Trace 图</h2>
+      <label for="chartKind">模型指标</label>
+      <select id="chartKind">
+        <option value="total">总 token</option>
+        <option value="hit">Cache hit</option>
+        <option value="peak">最大小时 token</option>
+      </select>
+    </aside>
+
+    <main>
+      <div class="stats" id="stats" aria-live="polite"></div>
+
+      <section class="panel" aria-labelledby="formulaHeading">
+        <h2 id="formulaHeading">经济公式</h2>
+        <pre class="formula" id="formula"></pre>
+      </section>
+
+      <section class="panel" aria-labelledby="traceHeading">
+        <h2 id="traceHeading">Cursor trace 范围与完整性</h2>
+        <ul class="notes">
+          <li>2026-07-20 16:03 至 2026-08-14 10:46（UTC+8）；单用户、553 events、8 models。</li>
+          <li>731.04M total token；726.43M prompt；670.45M cache read；55.98M miss/write。</li>
+          <li>96 个活跃小时：token/h p50 4.11M、p95 20.95M、峰值 60.30M。</li>
+          <li>296 条有数值 Cost，共 $502.65；243 条为 “-”，14 条为 “Free”，不能把 $502.65 当完整经济价值。</li>
+          <li>逐行 Total Tokens 与四个 token 分项求和完全一致；原始 CSV 与用户标识不入仓。</li>
+        </ul>
+      </section>
+
+      <section class="panel" aria-labelledby="chartHeading">
+        <h2 id="chartHeading">按模型的匿名用量</h2>
+        <div class="chart-wrap">
+          <svg
+            class="chart"
+            id="chart"
+            viewBox="0 0 900 360"
+            role="img"
+            aria-labelledby="usageChartTitle usageChartDesc"
+          ></svg>
+        </div>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="modelTableHeading">
+        <h2 id="modelTableHeading">完整匿名分模型汇总</h2>
+        <table>
+          <caption>Input / Output 是每个 Cursor usage event 的聚合 token，不是单次模型 API 调用。</caption>
+          <thead>
+            <tr>
+              <th scope="col">模型</th>
+              <th scope="col">Events</th>
+              <th scope="col">Total</th>
+              <th scope="col">Hit</th>
+              <th scope="col">Input p50</th>
+              <th scope="col">Input p95</th>
+              <th scope="col">Output p50</th>
+              <th scope="col">Output p95</th>
+              <th scope="col">Peak token/h</th>
+              <th scope="col">数值 Cost</th>
+            </tr>
+          </thead>
+          <tbody id="modelRows"></tbody>
+        </table>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="peakHeading">
+        <h2 id="peakHeading">单用户最高 token 小时</h2>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">小时（UTC+8）</th>
+              <th scope="col">Events</th>
+              <th scope="col">Prompt</th>
+              <th scope="col">Cache read</th>
+              <th scope="col">Output</th>
+              <th scope="col">Total</th>
+              <th scope="col">数值 Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>2026-08-13 17:00</td><td>5</td><td>60.05M</td><td>56.66M</td><td>254.2K</td><td>60.30M</td><td>$66.58</td></tr>
+            <tr><td>2026-08-13 16:00</td><td>13</td><td>44.80M</td><td>41.12M</td><td>287.4K</td><td>45.09M</td><td>$47.25</td></tr>
+            <tr><td>2026-07-30 15:00</td><td>11</td><td>27.03M</td><td>24.71M</td><td>181.5K</td><td>27.21M</td><td>$27.83</td></tr>
+            <tr><td>2026-07-27 16:00</td><td>27</td><td>24.77M</td><td>23.78M</td><td>135.5K</td><td>24.90M</td><td>未标价</td></tr>
+            <tr><td>2026-08-05 15:00</td><td>5</td><td>21.22M</td><td>20.13M</td><td>116.7K</td><td>21.33M</td><td>$15.53</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="ttlHeading">
+        <h2 id="ttlHeading">Provider cache 留存：官方合同与实测</h2>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Provider</th>
+              <th scope="col">官方口径</th>
+              <th scope="col">mempko 100K-prefix 实测</th>
+              <th scope="col">规划语义</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Anthropic</td>
+              <td>默认 5m；可选 1h</td>
+              <td>5–6m 断崖</td>
+              <td>5m 是合同；4m keepalive 是该实验策略</td>
+            </tr>
+            <tr>
+              <td>OpenAI</td>
+              <td>旧模型 in-memory 通常 5–10m、最长 1h；另有 extended / 新模型策略</td>
+              <td>GPT-5.1：20m 约半数，30m 全冷</td>
+              <td>特定模型/时点观测，不能概括当前全部 GPT</td>
+            </tr>
+            <tr>
+              <td>DeepSeek</td>
+              <td>Best-effort；官方称闲置后通常数小时至数天清理</td>
+              <td>V3.2 在 10m 全冷</td>
+              <td>相互冲突；只能记路径实测，不能写成 10m TTL</td>
+            </tr>
+            <tr>
+              <td>Google Gemini</td>
+              <td>Implicit 无 TTL 保证；explicit 默认 1h</td>
+              <td>33%–83% 随机波动</td>
+              <td>实验针对 implicit，不能外推 explicit cache</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" aria-labelledby="quotaHeading">
+        <h2 id="quotaHeading">100 GB 的正确口径</h2>
+        <p>
+          OpenAI Help Center 当前写明 ChatGPT Pro 用户有 100 GB File Library storage。
+          这是上传/生成文件库，不是 prompt cache、KV cache、GPU-local cache 或 CMX per-user quota；
+          只能作为终端产品存储配额参照，不能直接代入 KV sizing。
+        </p>
+      </section>
+
+      <footer>
+        Trace：用户提供的 Cursor team usage CSV（2026-08-14 导出，匿名聚合）。
+        TTL：mempko / arXiv:2607.19214，并以 Anthropic、OpenAI、DeepSeek、Google 官方文档交叉核对。
+        100 GB：OpenAI Help Center “File storage and Library in ChatGPT”。
+      </footer>
+    </main>
+  </div>
+
+  <script src="sim.js?v=5"></script>
+  <script>
+    const S = window.CmxSim;
+    const $ = (id) => document.getElementById(id);
+    const models = [
+      ["Composer 2.5 Fast", 4, 9.223, 93.91, 1335156, 5255843, 11416, 16165, 5.949, 0],
+      ["Grok 4.5 High Fast", 253, 209.077, 95.02, 445879, 2624487, 1860, 18575, 18.877, 73.65],
+      ["Grok 4.6 XHigh", 18, 25.177, 93.69, 1392691, 2902934, 11366, 38473, 13.756, 0],
+      ["GPT-5.5 Medium", 85, 93.311, 87.34, 585549, 3687522, 2647, 22681, 26.474, 67.28],
+      ["GPT-5.6 Sol Max", 14, 104.705, 92.71, 6193823, 19033712, 38207, 67197, 60.302, 124.20],
+      ["GPT-5.6 Sol Medium", 11, 6.205, 80.94, 84867, 1829133, 1934, 7581, 2.307, 10.76],
+      ["GPT-5.6 Terra Medium", 4, 3.752, 86.41, 803787, 1389568, 6788, 7694, 1.620, 0],
+      ["Kimi K3 Max", 164, 279.593, 91.90, 584848, 7817654, 5591, 50207, 21.332, 226.76],
+    ];
+
+    function finiteNumber(id, fallback) {
+      const value = Number($(id).value);
+      return Number.isFinite(value) ? value : fallback;
+    }
+
+    function fmtPct(value) {
+      return `${(value * 100).toFixed(2)}%`;
+    }
+
+    function fmtTokens(value) {
+      if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+      if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
+      return value.toFixed(0);
+    }
+
+    function stat(label, value, detail, cls = "") {
+      return `<div class="stat ${cls}"><div class="k">${label}</div><div class="v">${value}</div><div class="s">${detail}</div></div>`;
+    }
+
+    function drawChart(kind) {
+      const svg = $("chart");
+      const metric = kind === "hit" ? 3 : kind === "peak" ? 8 : 2;
+      const unit = kind === "hit" ? "%" : "M token";
+      const title = kind === "hit"
+        ? "各模型 token-weighted cache hit"
+        : kind === "peak"
+          ? "各模型单用户最大小时 token"
+          : "各模型总 token";
+      const values = models.map((row) => row[metric]);
+      const max = Math.max(...values) * 1.08 || 1;
+      const width = 900;
+      const height = 360;
+      const left = 190;
+      const right = 55;
+      const top = 32;
+      const rowHeight = 38;
+      const plotWidth = width - left - right;
+      const bars = models.map((row, index) => {
+        const value = row[metric];
+        const y = top + index * rowHeight;
+        const barWidth = (value / max) * plotWidth;
+        return `
+          <text x="${left - 10}" y="${y + 17}" fill="#9a917f" text-anchor="end" font-size="11">${row[0]}</text>
+          <rect x="${left}" y="${y + 4}" width="${barWidth}" height="18" fill="#4aa3d9" />
+          <text x="${left + barWidth + 6}" y="${y + 17}" fill="#ece6d8" font-size="11">${value.toFixed(2)}${unit === "%" ? "%" : "M"}</text>`;
+      }).join("");
+      svg.innerHTML = `
+        <title id="usageChartTitle">${title}</title>
+        <desc id="usageChartDesc">横轴为 ${unit}，纵轴为 Cursor 模型；来源为匿名 Cursor team usage 汇总。</desc>
+        <text x="${left + plotWidth / 2}" y="${height - 8}" fill="#9a917f" text-anchor="middle" font-size="11">${unit}</text>
+        ${bars}`;
+    }
+
+    function render() {
+      const scenario = S.economicsScenario({
+        hitRate: finiteNumber("hitRate", 0) / 100,
+        prefillComputeShare: finiteNumber("prefillShare", 0) / 100,
+        avoidEfficiency: finiteNumber("avoidEfficiency", 0) / 100,
+        cacheCostShare: finiteNumber("cacheCost", 0) / 100,
+        targetComputeSavings: finiteNumber("targetSavings", 0) / 100,
+      });
+      const ratio = scenario.grossBenefitCostRatio == null
+        ? "N/A"
+        : `${scenario.grossBenefitCostRatio.toFixed(2)}×`;
+      const roi = scenario.netRoi == null ? "N/A" : `${scenario.netRoi.toFixed(2)}×`;
+      $("stats").innerHTML = [
+        stat("估算总算力节省", fmtPct(scenario.grossComputeSavings), "Prefill share × hit × efficiency", "hot"),
+        stat("同基准净节省", fmtPct(scenario.netSavings), "总算力节省 − Cache 总成本", scenario.netSavings >= 0 ? "ok" : "bad"),
+        stat("达到目标所需 Prefill 占比", scenario.requiredPrefillComputeShare == null ? "N/A" : fmtPct(scenario.requiredPrefillComputeShare), "超过 100% 表示当前 hit/efficiency 下不可达"),
+        stat("毛收益 / Cache 成本", ratio, `净 ROI ${roi}`),
+      ].join("");
+      $("formula").textContent =
+`compute_saved = prefill_compute_share × cache_hit × avoid_efficiency
+              = ${(scenario.prefillComputeShare * 100).toFixed(2)}% × ${(scenario.hitRate * 100).toFixed(2)}% × ${(scenario.avoidEfficiency * 100).toFixed(2)}%
+              = ${fmtPct(scenario.grossComputeSavings)}
+
+net_saved = compute_saved − cache_total_cost_share
+          = ${fmtPct(scenario.grossComputeSavings)} − ${fmtPct(scenario.cacheCostShare)}
+          = ${fmtPct(scenario.netSavings)}
+
+required_prefill_share(target=${fmtPct(scenario.targetComputeSavings)})
+          = target / (cache_hit × avoid_efficiency)
+          = ${scenario.requiredPrefillComputeShare == null ? "N/A" : fmtPct(scenario.requiredPrefillComputeShare)}
+
+“花 5% 换 20%”若使用同一成本基准：
+净节省 = 15%；毛收益/成本 = 4×；净 ROI = 3×。`;
+      drawChart($("chartKind").value);
+    }
+
+    $("modelRows").innerHTML = models.map((row) => `
+      <tr>
+        <td>${row[0]}</td><td>${row[1]}</td><td>${row[2].toFixed(2)}M</td>
+        <td>${row[3].toFixed(2)}%</td><td>${fmtTokens(row[4])}</td>
+        <td>${fmtTokens(row[5])}</td><td>${fmtTokens(row[6])}</td>
+        <td>${fmtTokens(row[7])}</td><td>${row[8].toFixed(2)}M</td>
+        <td>${row[9] ? `$${row[9].toFixed(2)}` : "未标价"}</td>
+      </tr>`).join("");
+
+    ["hitRate", "prefillShare", "avoidEfficiency", "cacheCost", "targetSavings", "chartKind"].forEach((id) => {
+      $(id).addEventListener("input", render);
+      $(id).addEventListener("change", render);
+    });
+    render();
+  </script>
+</body>
+</html>
