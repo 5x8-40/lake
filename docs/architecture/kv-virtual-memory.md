@@ -86,7 +86,7 @@ PagedAttention 解耦了“逻辑 token 序列 ↔ 物理 block”，但只在�
 
 ## 业界停在哪一站
 
-在 lake 之前，“KV 与引擎解耦”这条路上已经站着不少系统。一个一个看它们的设计，能看清每一站停在了哪。逐层对应与代码索引见 [`../research/3rdparty-reference.md`](../research/3rdparty-reference.md)。
+在 lake 之前，“KV 与引擎解耦”这条路上已经站着不少系统；与 lake 同期，还有人独立走到了同一个方向。一个一个看它们的设计，能看清每一站停在了哪。逐层对应与代码索引见 [`../research/3rdparty-reference.md`](../research/3rdparty-reference.md)。
 
 - **vLLM：发明了分页，停在实例内。** 设计核心是每个 sequence 一张 block table，加一套读散落 block 的 paged attention kernel。跨实例留了 `KVConnectorBase_V1` 接口，例如 NIXL、Mooncake 的 connector 都从这里接入。但接入的是传输，不是所有权：前缀索引（APC）仍是引擎自维护的易失结构，实例死了，索引和 KV 一起死（见 [`../research/vllm/compute.md`](../research/vllm/compute.md)）。
 - **SGLang HiCache：单机内把分层做全了，索引停在实例私有。** 它的 `HiRadixTree` 节点同时记录 L1（device）位置、L2（host）位置和链式哈希（当 L3 key）——已经是“带位置的页表项”的形状。例如它的 prefetch 有三个终止策略（best_effort / wait_complete / timeout，按 token 数给超时预算），write-back 也分三档（命中即回写 / 命中两次才回写 / 驱逐时才回写）。但这棵树长在每个引擎实例内；L3 命中靠实时向后端查询，没有全局权威（见 [`../research/sglang/hicache.md`](../research/sglang/hicache.md)）。
@@ -94,8 +94,9 @@ PagedAttention 解耦了“逻辑 token 序列 ↔ 物理 block”，但只在�
 - **LMCache：有中央协调器，匹配也不慢——但谱系不长在池里。** 内容寻址、多后端、实例间直传都有；匹配机制本身也没问题：每 256 个 token 算一个链式哈希当 key，算 key 是纯本地计算，存在性一次批量点查就能探到断链——这和 vLLM 前缀缓存的哈希表探测是同一个形状（vLLM 同样没有树），要快也可以从后往前跳着探。真正断的地方有两个：一是匹配由每个引擎各自驱动，协调器只回答“这个 key 在不在、在谁手上”，池侧手里没有展开的前缀谱系；二是没有谱系，池就做不了按前缀亲和的驱逐、按模型的级联删除、按序列的共置与预放置——这些管理决策要遍历结构，一串点查给不出来。账还靠消息加心跳对账，任何时候都可能对不上（见 [`../research/lmcache/sharing-and-backends.md`](../research/lmcache/sharing-and-backends.md)）。
 - **Dynamo KVBM：离“KV 虚拟内存”最近，但 KV 仍归引擎。** 设计上分三层：逻辑层管“有哪些块、块的身份与变更事件”，物理层管“块怎么排布、怎么搬运”，引擎层管运行时与对接推理引擎，offload 路径从 GPU 一路到远端对象存储；它的 `StorageTier` 按介质分（Device / HostPinned / Disk / External）——即“层”按介质划，不按“在本机还是远端”划，同一块 DRAM 放哪台机器都算同一层。例如 1.0 版本加了集群级 KV 事件，让 router 能看到全集群的缓存分布。但 KVBM 的定位是引擎缓存的 offload 层：KV 归 engine 持有，事件走 NATS，没有强一致位置视图（见 [`../research/dynamo/overview.md`](../research/dynamo/overview.md)）。lake 参考了这套分层，并且在代码层直接 vendor 了它的逻辑层：`rust/vendor/` 里 in-tree 拷贝了 kvbm-logical（块/池管理与事件）和 dynamo-tokens（token 块化），控制面 crate 直接依赖，约五百个单测作每 PR 门禁；物理层（布局与传输）与引擎层（运行时）则自研。它缺的仍是 lake 的核心：全局副本一致性（目录）与写回屏障——dynamo 不需要（KV 归引擎），lake 必须自补（见 [`consistency.md`](consistency.md) §8.6）。
 - **Ascend MemCache / UCM：同层的另两种形态。** 前者是昇腾的分布式 KV 对象池，MetaService 管元数据、LocalService 管本机介质；后者是可插拔缓存框架，KVStore 后端可换，挂在引擎插件层。两者都不是以前缀树为权威的设计（见 [`../research/memcache/overview.md`](../research/memcache/overview.md)、[`../research/ucm/overview.md`](../research/ucm/overview.md)）。
+- **TensorCast：状态层建全了，停在前缀门外。** 与 lake 最像的一家，同期独立提出（北大 × 阶跃星辰 × 北邮，2026 年中）。它把权重、KV、checkpoint 一律抽离引擎进程，收进独立的张量状态层：daemon 持有张量内存，引擎经 CUDA IPC 零拷贝 attach，跨机 RDMA 直传——worker 无状态这一点，和 lake 一样彻底，引擎自己的显存还能按租约原地入池。但它的 KV 只是“又一种 artifact”：身份是整块内容的平哈希，不带前缀谱系，前缀匹配仍归引擎；元数据靠心跳对账收敛，是最终一致。车管所建起来了，账却不按前缀记；而且给引擎当后端时，这个所只开“按牌查车”一个窗口——实测与 Mooncake 打平，它的成色要到权重分发、主动搬运那些场景才看得出来（见 [`../research/tensorcast/overview.md`](../research/tensorcast/overview.md)）。
 
-五站看下来，问题收敛成一个：谁来当那个全局的、懂前缀的、管生死的车管所？这正是 lake 要建的东西。
+六站看下来，问题收敛成一个：谁来当那个全局的、懂前缀的、管生死的车管所？TensorCast 把车管所建起来了，账却不按前缀记；其余各家连所都还没建。这正是 lake 要建的东西。
 
 ## lake 把谎言讲到集群级
 
@@ -155,6 +156,8 @@ flowchart TB
 
 计算机科学里有条老话：借由一层间接层，可以解决绝大多数问题。虚拟内存是它最著名的注脚——解耦程序与物理内存，进程于是可换出、可杀、可迁移。多核一致性补上了“私有副本与全局真相”的一课，内存池化补上了“内存与机器解绑”的一课。
 
+同一个判断，别处也独立长了出来。TensorCast 团队把今天的张量管理比作“操作系统诞生前”：每个应用自己管理内存、磁盘与 IO。它把权重、KV、checkpoint 收进一层独立的张量状态服务，与 lake 同走一条定理；它没走到的最后一步——前缀权威与请求级选路——正是 lake 的主线。
+
 lake 把同一层间接用在了推理系统的状态上：解耦 KV 与 GPU，算力节点于是可销毁、可拉起。隔了六十多年，管理对象是新的，定理还是那一条。
 
 ## 参考与回溯
@@ -165,4 +168,5 @@ lake 把同一层间接用在了推理系统的状态上：解耦 KV 与 GPU，�
 - Mooncake：[`../research/mooncake/transfer-engine.md`](../research/mooncake/transfer-engine.md)、[`../research/mooncake/kv-store.md`](../research/mooncake/kv-store.md)；源码锚点 `TransferEngine::registerLocalMemory` / `openSegment`、`master_service.h`。
 - LMCache：[`../research/lmcache/sharing-and-backends.md`](../research/lmcache/sharing-and-backends.md)；源码锚点 `cache_controller/utils.py::RegistryTree`、`StorageBackendInterface::batched_contains`。
 - Dynamo：[`../research/dynamo/overview.md`](../research/dynamo/overview.md)；源码锚点 `lib/kvbm-{logical,physical,engine}/`、`lib/kv-router/src/protocols.rs::StorageTier`；代码级复用：`rust/vendor/{kvbm-logical, dynamo-tokens}`（in-tree vendor，约定见 `rust/vendor/UPSTREAM.md`）。
+- TensorCast：[`../research/tensorcast/overview.md`](../research/tensorcast/overview.md)（与 lake 最像的一家；架构、实验深挖与全部参考链接都收在那里）；源码锚点 `tensorcast/global_store/grpc_service.py`、`core/store/replica/unified_memory_authority.h`。
 - lake 侧落地：[`kv-cache-pool.md`](kv-cache-pool.md)（block 寻址 / radix / 传输 / 生命周期）、[`storage-layer.md`](storage-layer.md)（L0–L3 统一编址）、[`control-plane.md`](control-plane.md)（位置视图权威）、[`compute-layer.md`](compute-layer.md)（引擎零地址契约）、[`execution-modes.md`](execution-modes.md) / [`data-flow.md`](data-flow.md)（三模式与 KV 流转）、[`../features/slo.md`](../features/slo.md)（5ms 模式选择预算）。

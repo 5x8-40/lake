@@ -11,6 +11,7 @@
 - [`tilert/`](tilert/) — TileRT:[总览](tilert/overview.md) · [vLLM PD 插件](tilert/pd-vllm.md) · [痛点与 lake 对照](tilert/pain-points.md)
 - [`memcache/`](memcache/) — Ascend MemCache:[总览](memcache/overview.md) · [架构](memcache/architecture.md) · [痛点与 lake 对照](memcache/pain-points.md)
 - [`ucm/`](ucm/) — UCM(ModelEngine):[总览](ucm/overview.md) · [架构](ucm/architecture.md) · [痛点与 lake 对照](ucm/pain-points.md)
+- [`tensorcast/`](tensorcast/) — TensorCast:[总览](tensorcast/overview.md) · [运行时架构](tensorcast/architecture.md) · [论文实验详录](tensorcast/evaluation.md) · 张量状态基础设施层(权重/KV/checkpoint 抽离进程 + Global Store/Store Daemon + CUDA IPC + RDMA/TCP P2P + policy 放置契约 + binding 热替换)
 - [guided-decoding.md](guided-decoding.md) — **Guided / structured decoding**(SGLang × vLLM):xgrammar/llguidance 库边界、overlap/async 下能否消同步、spec+grammar 硬缺口
 - [sampling-params.md](sampling-params.md) — **Sampling 参数对照**(SGLang × vLLM):核心/独有字段、`n`≠beam、spec 禁 min_p/logit_bias；penalty 空泡与 V2；采样状态归属 / Spec 兼容矩阵 / `n` 与前缀 KV 共享
 - [scheduler-worker-interface.md](scheduler-worker-interface.md) — **Scheduler→Worker 字段全集**(SGLang × vLLM):`SchedulerOutput` vs `ScheduleBatch`/`ForwardBatch`、差异表、架构根因、对 lake D1 含义
@@ -30,6 +31,7 @@
 | `3rdparty/tilert` | [tile-ai/TileRT](https://github.com/tile-ai/TileRT) | main HEAD (`a8368a6`, v0.1.5) | **超低延迟 decode** + **vLLM PD 插件**(`TileRTConnector`);见 [tilert/](tilert/) |
 | `3rdparty/memcache` | [Ascend/memcache](https://github.com/Ascend/memcache) | master HEAD (`14b4e35`) | **昇腾 KV 对象池** Meta/Local + MemFabric;见 [memcache/](memcache/) |
 | `3rdparty/ucm` | [ModelEngine-Group/unified-cache-management](https://github.com/modelengine-group/unified-cache-management) | main HEAD (`37af15e`) | **统一缓存框架** store+connector+PD-via-pool;见 [ucm/](ucm/) |
+| `3rdparty/tensorcast` | [tensorcast-ai/tensorcast](https://github.com/tensorcast-ai/tensorcast) | main HEAD (`19f54d60`, v0.1.0+6) | **张量状态基础设施层** artifact + Global Store/Store Daemon + CUDA IPC + RDMA/TCP P2P + policy 放置契约 + binding 热替换;见 [tensorcast/](tensorcast/) |
 
 > 生态相连:vLLM `KVConnectorBase_V1` 被 LMCache/Mooncake/NIXL/FlexKV/**TileRT**/**UCM** 等实现;vLLM-Ascend 另将 **MemCache** 列为 KV Pool backend;SGLang HiCache 把 Mooncake 作 L3;Dynamo 编排 vLLM/SGLang;UCM 主推经统一池做 PD;TileRT 做低延迟 decode。我们站在其上做更彻底的存算分离。
 
@@ -359,4 +361,4 @@ Dynamo 跨 **P4(存储)** 与 **控制面(选路/通信)**,不进上面"抄源�
 
 ## 非 submodule 文献参考
 
-除上述五个源码 submodule 外,本系统还参考了 **DualPath**(论文 arXiv:2602.21548v2,非 submodule,未引入源码)——双网络隔离下的双路径 KV 加载,直接对应 [`../architecture/kv-cache-pool.md`](../architecture/kv-cache-pool.md) "双网络路径"与 [`../architecture/data-flow.md`](../architecture/data-flow.md) §3.4 D→P 流。分析(机制/借鉴点/关键差异)见 [`dualpath.md`](dualpath.md),文献总览见 [`references.md`](references.md)。
+除上述源码 submodule 外,本系统还参考了 **DualPath**(论文 arXiv:2602.21548v2,非 submodule,未引入源码)——双网络隔离下的双路径 KV 加载,直接对应 [`../architecture/kv-cache-pool.md`](../architecture/kv-cache-pool.md) "双网络路径"与 [`../architecture/data-flow.md`](../architecture/data-flow.md) §3.4 D→P 流。分析(机制/借鉴点/关键差异)见 [`dualpath.md`](dualpath.md),文献总览见 [`references.md`](references.md)。

@@ -40,6 +40,7 @@
 - **TileRT** (Tile-AI): 超低延迟 tile runtime + **vLLM prefill → TileRT decode** PD 插件。**源码 submodule** `3rdparty/tilert`,见 [`tilert/`](tilert/)。
 - **DistServe** (OSDI'24): Disaggregating prefill and decoding，物理隔离 Prefill/Decode 以分别优化吞吐与延迟。
 - **Splitwise** (ISCA'24): Efficient generative LLM inference with phase-based disaggregation，按 phase 分离并建模资源。
+- **TensorCast** (tensorcast-ai): 张量状态基础设施层——把权重/KV/checkpoint/RL 参数从应用进程抽取为分布式 artifact,Global Store(控制面)规划放置与 fanout,Store Daemon(数据面)持本地张量内存 + CUDA IPC 同机零拷贝 + RDMA/TCP P2P 跨机;policy 预设(cache/durable/ha/cold/warm/pinned)定放置与持久化,retrieval source(local/disk/p2p)定取数路径。**源码已引入** `3rdparty/tensorcast`,与 lake 存储层 + 权重缓存同构,见 [`tensorcast/overview.md`](tensorcast/overview.md)。
 
 ## KV Cache 复用与传输
 

@@ -37,6 +37,10 @@ message BlockMeta { KVBlockID id; BlockKind block_kind; repeated Location locati
 
 **模型无关**:池内命名空间是 `(model_id, revision)`(P4.5 显式 `RegisterModel`),Pool 不解释张量布局(层数、头维、dtype),按不透明字节块存取。接入新模型/revision 只需注册命名空间,无需新建池。`BlockSpec` 挂 `ModelDescriptor`,不进 `KVBlockID`。
 
+不透明 ≠ 不管布局:**布局一致性是命名空间级约定,不是池的职责**。注册时 `ModelDescriptor` 声明 `num_layers` / `BlockSpec`(block_tokens、bytes_per_block)/ `hash_algo`,接入同一命名空间的所有 worker 必须按同一布局生产/消费 block;同一模型换布局(FP8↔BF16 KV、改 block 大小、变头配置)→ 注册新 revision(= 新命名空间,KV 本就不跨 revision 复用)。池只按 `bytes_per_block` 校验块大小,块内字节怎么排永远不看;布局误接(同 hash 不同字节)由接入方自律,池不替检。
+
+注意区分两种"布局不一致":**排布不同**(引擎内部 layer-first vs 池流通 page-first)数学内容相同,在 worker↔池边界转换(见「布局转换」节),PD 两侧 kernel 排布各异不影响共享;**内容/规格不同**(dtype、头数、block 大小)则不可转、不可共享,必须分命名空间。
+
 **drafter / r-type 不物理分池**:`pool_kind`(TARGET|DRAFT)与 `block_kind`(T_TYPE|R_TYPE_STATE|R_TYPE_TRAILING)是 `BlockMeta` 元数据字段,区分命名空间与 block 内布局,不改物理池结构——L1–L3 统一按 block 不透明存(参考 SGLang `PoolName.DRAFT` 命名区分但 lake 不分物理池、vLLM `kv_cache_spec_kind`)。block 内装逐 token KV 还是紧凑 state 快照由 `block_kind` 声明,Pool 不解释。
 
 **多租户预留(不实现)**:`KVBlockID.scope` 字段已在 schema,**当前不入寻址**——默认 `"public"`,寻址/分片仍按 `(model_id, revision, block_hash, pool_kind)`(**忽略 scope**),同一命名空间内 KV 全局共享复用,不做租户间私有隔离(多租户归外部控制面,见 [`../features/features.md`](../features/features.md) F8)。未来 F8 启用时把 `scope` 纳入 hash + 寻址过滤,**不改 KVBlockID 结构**(字段已在),只改寻址语义——向后兼容。
