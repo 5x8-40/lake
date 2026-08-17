@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CMX 流量需求分析</title>
+  <title>CMX offered load</title>
   <link rel="stylesheet" href="app.css?v=4" />
 </head>
 <body>
@@ -15,14 +15,12 @@
   </nav>
 
   <header>
-    <h1>CMX 长上下文流量需求</h1>
+    <h1>CMX 长上下文 offered load</h1>
     <p>
-      给定模型布局、可复用前缀和 <em>用户提供</em> 的有效 Prefill 吞吐，计算 PD 分离下需要从 CMX
-      读取、写入多少数据。这里输出的是 offered load，不是 CMX 实测性能。
+      按布局、前缀命中和用户给定的 Prefill 吞吐，计算 PD 下的 CMX 与 P→D 流量。
     </p>
     <div class="warn" role="note">
-      分析模型，不是 benchmark，也不是 NVIDIA/VAST sizing 工具。公开材料没有给出可复现的 CMX
-      持续带宽、延迟或队列模型；因此默认不设带宽上限。只有填写“链路预算”后，页面才计算该假设下的上限。
+      非 benchmark。默认无带宽上限；填写链路预算后才计算用户假设下的 ceiling。
     </div>
   </header>
 
@@ -43,17 +41,17 @@
 
       <label for="byteMode">流量字节口径</label>
       <select id="byteMode">
-        <option value="payload">当前 profile payload</option>
-        <option value="engine-pages">vLLM engine page allocation</option>
-        <option value="custom-wire">自定义 wire = payload × factor</option>
+        <option value="payload">当前 profile 载荷</option>
+        <option value="engine-pages">vLLM engine pages</option>
+        <option value="custom-wire">自定义 wire（payload × factor）</option>
       </select>
       <div id="wireFactorWrap" hidden>
-        <label for="customWireFactor">Wire / payload factor</label>
+        <label for="customWireFactor">Wire / payload 倍数</label>
         <input id="customWireFactor" type="number" min="0" step="0.01" value="1" />
       </div>
 
       <div id="compressorPolicyWrap" hidden>
-        <label for="compressorPolicy">V4 compressor state policy</label>
+        <label for="compressorPolicy">V4 compressor state</label>
         <select id="compressorPolicy">
           <option value="base">Base ring（C4=8 / C128=128）</option>
           <option value="speculative">SGLang spec ring（16 / 256）</option>
@@ -86,10 +84,10 @@
         </div>
       </div>
 
-      <label for="remoteFraction">命中数据需从 CMX 拉取的比例 q</label>
+      <label for="remoteFraction">CMX 远程读比例 q</label>
       <input id="remoteFraction" type="number" min="0" max="1" step="0.05" value="1" />
 
-      <label for="admissionFraction">新状态写入 CMX 的比例 a</label>
+      <label for="admissionFraction">CMX 写入比例 a</label>
       <input id="admissionFraction" type="number" min="0" max="1" step="0.05" value="1" />
 
       <div class="checkrow">
@@ -100,8 +98,8 @@
       <h2>Offered load</h2>
       <label for="loadMode">到达率来源</label>
       <select id="loadMode">
-        <option value="compute">GPU-saturated：unique token/s ÷ U</option>
-        <option value="arrival">外部 λ：直接输入 pool req/s</option>
+        <option value="compute">GPU-saturated（unique token/s ÷ U）</option>
+        <option value="arrival">外部 λ（pool req/s）</option>
       </select>
 
       <div id="computeLoadWrap">
@@ -120,9 +118,9 @@
       <h2>P→D handoff</h2>
       <label for="handoffMode">最终状态路径</label>
       <select id="handoffMode">
-        <option value="direct">P→D direct（独立 fabric）</option>
-        <option value="via-cmx">P→CMX→D（增加 CMX read）</option>
-        <option value="local">P/D local（无额外 handoff）</option>
+        <option value="direct">P→D direct（单独预算）</option>
+        <option value="via-cmx">P→CMX→D</option>
+        <option value="local">P/D local</option>
       </select>
 
       <label for="linkGBs">CMX 链路预算 GB/s/GPU（0 = 未知）</label>
@@ -181,11 +179,10 @@
           <li><code>C</code> 是请求到来前的既有上下文；<code>E</code> 是本轮新增 token；最终长度为 <code>C+E</code>。</li>
           <li>命中 token 按块向下取整。<code>q</code> 把“前缀命中”和“确实从 CMX 远程读取”分开。</li>
           <li><code>a</code> 是写入 CMX 的新状态比例；它不是 gateway 准入率。</li>
-          <li><code>GPU-saturated</code> 用 unique-token 吞吐反推 λ；<code>U=0</code> 时无定义，必须使用外部到达率。外部 λ 不随命中率自动增长。</li>
-          <li>P→D direct、via-CMX、local 是不同数据路径：via-CMX 增加一次完整 Decode 读，direct 计入独立 fabric，local 不增加 handoff。</li>
-          <li>V4 的 SWA、MTP 和 compressor ring、K3 的 KDA state 都是可移交 component；base/speculative/online-C128 不是同一种表示。</li>
-          <li>V4-Pro 的 9.62 GiB 是 BF16 payload paged KV（含 SWA）；加 base FP32 compressor residual 后是 9.642 GiB。vLLM page allocation 是另一口径。</li>
-          <li>logical payload、engine entry payload、engine page allocation、custom wire 不能互相冒充。CMX wire/object serialization 尚未公开。</li>
+          <li><code>GPU-saturated</code> 用 unique-token 吞吐反推 λ；<code>U=0</code> 时必须使用外部 λ。</li>
+          <li>via-CMX 增加一次完整 Decode 读；direct 使用单独链路预算；local 无额外 handoff。</li>
+          <li>V4 SWA/MTP/compressor 与 K3 KDA 都是可移交 component；不同 compressor policy 是不同表示。</li>
+          <li>logical payload、engine entry payload、engine pages 和 custom wire 是不同口径。</li>
           <li>Engine page 目前只对审计过的 V4 vLLM base-ring profile 给结果；N/A 表示合同未知，不回退成 payload。</li>
         </ul>
       </section>
@@ -201,7 +198,7 @@
     </main>
   </div>
 
-  <script src="sim.js?v=6"></script>
+  <script src="sim.js?v=7"></script>
   <script>
     "use strict";
 
@@ -303,15 +300,15 @@
           ? "U=0；必须切换到外部 λ"
           : `${result.gpus} Prefill GPU 饱和假设；不是可达吞吐`;
       $("stats").innerHTML = [
-        stat("Payload / 最终会话", S.fmtGiB(result.finalLayout.totalBytes), result.profile.label),
-        stat("流量口径 / 最终会话", S.fmtGiB(result.finalLayout.selectedTotalBytes), basisLabel(result.finalLayout), "hot"),
+        stat("Payload 会话", S.fmtGiB(result.finalLayout.totalBytes), result.profile.label),
+        stat("所选口径会话", S.fmtGiB(result.finalLayout.selectedTotalBytes), basisLabel(result.finalLayout), "hot"),
         stat("命中 / unique", `${result.matchedTokens.toLocaleString()} / ${result.uniqueTokens.toLocaleString()}`, `block=${result.blockTokens}`),
         stat("CMX 读 / 请求", S.fmtGiB(result.cmxReadPerRequest), `prefix=${S.fmtGiB(result.readPerRequest)} · D=${S.fmtGiB(result.decodeReadPerRequest)}`),
         stat("CMX 写 / 请求", S.fmtGiB(result.writePerRequest), `a=${result.admissionFraction} · effective=${result.effectiveAdmissionFraction}`),
         stat("P→D direct / 请求", S.fmtGiB(result.directPerRequest), result.handoffMode),
         stat("Offered λ", `${S.fmtRate(result.offeredReqsPool)} req/s`, offeredDetail),
-        stat("CMX read offered", S.fmtGBs(result.requiredRead), "pool aggregate，不是可达带宽"),
-        stat("CMX write offered", S.fmtGBs(result.requiredWrite), "pool aggregate，不是可达带宽"),
+        stat("CMX 读 offered", S.fmtGBs(result.requiredRead), "pool aggregate"),
+        stat("CMX 写 offered", S.fmtGBs(result.requiredWrite), "pool aggregate"),
         stat("P→D direct offered", S.fmtGBs(result.requiredDirect), "仅 direct handoff 非零"),
         stat("用户链路 ceiling", linkText, linkDetail, hasLinkBudget ? "ok" : ""),
       ].join("");
@@ -353,8 +350,8 @@ P→D handoff = ${result.handoffMode}
   total CMX read/request  = ${S.fmtGiB(result.cmxReadPerRequest)}
 
 write/request = effective_a × [growing(C+E) − growing(M) + final_state]
-              effective_a = ${result.effectiveAdmissionFraction}${result.handoffMode === "via-cmx" ? "（via-CMX 强制 materialize）" : ""}
-              write_final_state = ${result.effectiveWriteState}${result.handoffMode === "via-cmx" && !result.writeState ? "（handoff 覆盖 UI cache-policy 开关）" : ""}
+              effective_a = ${result.effectiveAdmissionFraction}${result.handoffMode === "via-cmx" ? "（via-CMX：固定为 1）" : ""}
+              write_final_state = ${result.effectiveWriteState}${result.handoffMode === "via-cmx" && !result.writeState ? "（via-CMX：强制写 final_state）" : ""}
               = ${S.fmtGiB(result.writePerRequest)}
                 其中最终状态 ${S.fmtGiB(result.stateWriteBytes)}
 
@@ -475,7 +472,7 @@ overall ceiling = ${result.overallLinkReqCeiling == null
           });
         }
         drawChart({
-          title: "前缀比例 → offered request load",
+          title: "命中率 → offered λ",
           description: "外部 λ 与 hit 无关；GPU-saturated λ 由 unique token 分母推导。若设置链路预算，同时显示限幅。",
           xFormat: (value) => `${(value * 100).toFixed(0)}%`,
           yFormat: (value) => S.fmtRate(value),
@@ -483,8 +480,8 @@ overall ceiling = ${result.overallLinkReqCeiling == null
         });
       } else {
         drawChart({
-          title: "前缀比例 → offered transfer load",
-          description: "给定 λ 对 CMX 与 P→D direct fabric 的 offered load，不代表系统可达到该流量。",
+          title: "命中率 → offered 流量",
+          description: "给定 λ 下的 CMX 与 P→D offered load，不代表可达吞吐。",
           xFormat: (value) => `${(value * 100).toFixed(0)}%`,
           yFormat: (value) => S.fmtGBs(value),
           series: [
@@ -558,7 +555,7 @@ overall ceiling = ${result.overallLinkReqCeiling == null
         p.byteMode === "engine-pages" &&
         result.finalLayout.engineAllocation == null;
       $("profileNote").textContent =
-        `${profile.note} Class：${profile.byteClass}；证据：${profile.confidence}；模型锚点：${S.MODELS[p.modelId].evidence}。` +
+        `${profile.note} · ${profile.byteClass} · ${profile.confidence} · ${S.MODELS[p.modelId].evidence}` +
         (unsupportedEngine
           ? " 当前 profile 没有可审计的 engine-page 合同，结果显示 N/A。"
           : "");

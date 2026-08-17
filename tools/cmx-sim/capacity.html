@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CMX 容量场景分析</title>
+  <title>CMX 会话容量</title>
   <link rel="stylesheet" href="app.css?v=4" />
 </head>
 <body>
@@ -15,14 +15,12 @@
   </nav>
 
   <header>
-    <h1>长上下文会话容量场景</h1>
+    <h1>CMX 长上下文会话容量</h1>
     <p>
-      用明确的可用容量假设，计算一个 GPU、一个 rack 和一个 POD 分别可驻留多少条完整会话。
-      三个结果的物理范围不同，不应横向当成同一层级的产品规格。
+      按用户给定容量计算 GPU、rack 和 POD 的完整会话数。三者属于不同 scope。
     </p>
     <div class="warn" role="note">
-      字节除法，不是可部署容量承诺。页面只执行用户输入的 growing/state 分片和 pool 副本；
-      未提供 HBM 容量/拓扑时不显示 HBM 会话数。仍未建模 allocator 碎片、元数据、故障冗余、队列 reserve 和实际介质行为。
+      未建模 allocator 碎片、元数据、故障冗余、queue reserve 和实际介质行为。
     </div>
   </header>
 
@@ -43,17 +41,17 @@
 
       <label for="byteMode">容量字节口径</label>
       <select id="byteMode">
-        <option value="payload">当前 profile payload</option>
-        <option value="engine-pages">vLLM engine page allocation</option>
-        <option value="custom-wire">自定义 wire = payload × factor</option>
+        <option value="payload">当前 profile 载荷</option>
+        <option value="engine-pages">vLLM engine pages</option>
+        <option value="custom-wire">自定义 wire（payload × factor）</option>
       </select>
       <div id="wireFactorWrap" hidden>
-        <label for="customWireFactor">Wire / payload factor</label>
+        <label for="customWireFactor">Wire / payload 倍数</label>
         <input id="customWireFactor" type="number" min="0" step="0.01" value="1" />
       </div>
 
       <div id="compressorPolicyWrap" hidden>
-        <label for="compressorPolicy">V4 compressor state policy</label>
+        <label for="compressorPolicy">V4 compressor state</label>
         <select id="compressorPolicy">
           <option value="base">Base ring（C4=8 / C128=128）</option>
           <option value="speculative">SGLang spec ring（16 / 256）</option>
@@ -95,14 +93,14 @@
       <input id="cmxUsable" type="number" min="0" max="1" step="0.05" value="0.8" />
 
       <h2>分片与副本</h2>
-      <label for="growingShardRanks">Growing KV shard ranks</label>
+      <label for="growingShardRanks">Growing KV 分片数</label>
       <input id="growingShardRanks" type="number" min="1" step="1" value="1" />
       <p class="hint">按实际 TP×CP/engine layout 填；页面不从 GPU 数猜分片。</p>
 
-      <label for="stateShardRanks">Fixed state shard ranks（1 = 每 GPU 完整副本）</label>
+      <label for="stateShardRanks">Fixed state 分片数（1 = 每 GPU 完整副本）</label>
       <input id="stateShardRanks" type="number" min="1" step="1" value="1" />
 
-      <label for="poolCopies">G2/CMX representation copies</label>
+      <label for="poolCopies">G2/CMX representation 副本数</label>
       <input id="poolCopies" type="number" min="1" step="1" value="1" />
     </aside>
 
@@ -136,25 +134,23 @@
       </section>
 
       <section class="panel" aria-labelledby="limitationsHeading">
-        <h2 id="limitationsHeading">在生产 sizing 前还缺什么</h2>
+        <h2 id="limitationsHeading">未建模项</h2>
         <ul class="notes">
-          <li>确认 CMX 传输/落盘的是 logical payload、engine entry payload、engine page allocation，还是另一种 wire layout。</li>
-          <li>按 TP/CP/DP/EP 部署填写 growing/state shard ranks；不同 component 的复制若不同，应拆成 manifest，而不是取平均。</li>
-          <li>V4 engine-page 口径含已知 block/alignment 和 sliding-window admission；仍不含全局 allocator 碎片、packed-pool sharing、元数据和 reserve。</li>
-          <li>把 raw flash、格式化容量、可承诺容量和已用容量分开。</li>
-          <li>只有拿到实现的放置、去重和生命周期策略，才能估计池级有效复用率。</li>
-          <li>V4-Pro 的 9.62 GiB 是 BF16 payload paged KV；可移交 payload 再计 compressor residual，engine allocation 是另一列口径。</li>
+          <li>CMX wire layout 尚未公开，不能由 payload 或 engine pages 代替。</li>
+          <li>分片和副本必须来自实际 TP/CP/DP/EP 部署。</li>
+          <li>V4 engine pages 不含全局 allocator 碎片、packed-pool sharing、元数据和 reserve。</li>
+          <li>raw、formatted、usable 和已用容量需要分别计量。</li>
+          <li>池级复用率还取决于放置、去重和生命周期策略。</li>
         </ul>
       </section>
 
       <footer>
-        公开材料给出的是架构目标和参考算术，不是可复现的容量数据表。页面中的 18.432 PB
-        来自 <code>16 TB/GPU × 1152 GPU/POD</code>；usable 比例由用户提供。
+        18.432 PB 来自 <code>16 TB/GPU × 1152 GPU/POD</code>；usable 比例由用户提供。
       </footer>
     </main>
   </div>
 
-  <script src="sim.js?v=6"></script>
+  <script src="sim.js?v=7"></script>
   <script>
     "use strict";
 
@@ -233,8 +229,8 @@
         ? ["GiB", "TiB", "PiB"]
         : ["GB", "TB", "PB"];
       $("stats").innerHTML = [
-        stat("Payload / 会话", S.fmtGiB(result.layout.totalBytes), result.layout.profile.label),
-        stat("所选口径 / 会话", S.fmtGiB(result.layout.selectedTotalBytes), basisLabel(result.layout), "hot"),
+        stat("Payload 会话", S.fmtGiB(result.layout.totalBytes), result.layout.profile.label),
+        stat("所选口径会话", S.fmtGiB(result.layout.selectedTotalBytes), basisLabel(result.layout), "hot"),
         stat("HBM bytes / GPU / 会话", S.fmtGiB(result.hbmSessionBytes), `growing÷${result.growingShardRanks} + state÷${result.stateShardRanks}`),
         stat("Pool bytes / 会话", S.fmtGiB(result.poolSessionBytes), `${result.poolCopies} representation copies`),
         stat("HBM / GPU", result.usableHbmGB > 0 ? fmtCount(result.hbmSessionsPerGpu) : "未设置", `${result.usableHbmGB} ${units[0]}；需显式拓扑`),
@@ -274,9 +270,7 @@ G2 sessions / rack
 
 CMX usable sessions / POD
   = floor(${result.rawCmxPB} ${units[2]} × ${result.cmxUsableFraction} / pool_bytes_per_session)
-  = ${fmtCount(result.usableCmxSessionsPerPod)}
-
-注意：HBM、rack、POD 是不同 scope；分片/副本必须来自实际 engine deployment。`;
+  = ${fmtCount(result.usableCmxSessionsPerPod)}`;
     }
 
     function niceTicks(min, max, count) {
@@ -374,7 +368,7 @@ CMX usable sessions / POD
         p.byteMode === "engine-pages" &&
         result.layout.engineAllocation == null;
       $("profileNote").textContent =
-        `${profile.note} Class：${profile.byteClass}；证据：${profile.confidence}；模型锚点：${S.MODELS[p.modelId].evidence}。` +
+        `${profile.note} · ${profile.byteClass} · ${profile.confidence} · ${S.MODELS[p.modelId].evidence}` +
         (unsupportedEngine
           ? " 当前 profile 没有可审计的 engine-page 合同，容量显示 N/A。"
           : "");

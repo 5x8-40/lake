@@ -1,12 +1,12 @@
 # NVIDIA CMX（Context Memory Storage；原 ICMS）
 
-> 状态快照：**2026-08-14**。本文把“已经公开实现”“厂商宣布的目标架构”“伙伴自报结果”“本文推导”严格分开。
+> 状态快照：**2026-08-14**。证据标签区分公开代码、厂商公告、伙伴声明、推导和未知项。
 >
-> 核心结论：CMX 是 NVIDIA 公布的一套完整 KV cache 存储**目标架构**，不是一块盘，也不是与 lake 平级的软件。它包含 GPU、Dynamo/KVBM、NIXL、DOCA Memos、双端 BlueField-4、Spectrum-X、STX/伙伴介质；lake 可以把其中的共享 flash 数据路径作为一个 L2 backend，但不能与整套 CMX 一一对照。公开软件尚未组成可复现的端到端实现：Dynamo 已有通用 KV-aware routing/tiering，NIXL 的 `DOCA_MEMOS` 仍是 open PR，Dynamo 也没有一等 G3.5/CMX 生命周期。VAST 给出了目前公开材料中较具体的伙伴落法和容量方法，但它的 20× 实验是现有 G3 路径，不是 Rubin + CMX benchmark。
+> CMX 是 NVIDIA 公布的 KV cache 存储目标架构，覆盖 GPU、Dynamo/KVBM、NIXL、DOCA Memos、BlueField-4、Spectrum-X 和共享 flash。公开软件尚未形成可复现的端到端实现。lake 只把共享 flash 数据路径映射为候选 L2 backend。
 
 可调公式与校验在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)；项目成员可通过 private GitLab Pages 直接查看 [`index`](https://lake-13d9f7.gitlab.io/)、[`capacity`](https://lake-13d9f7.gitlab.io/capacity.html) 和 [`economics`](https://lake-13d9f7.gitlab.io/economics.html)。
 
-后续已拆成两个决策 issue：lake 内部的 [#22 可移交 Context 合同](https://gitlab.com/BeeBreeze/lake/-/issues/22)，以及 [#23 Portable Context ABI 独立项目孵化](https://gitlab.com/BeeBreeze/lake/-/issues/23)。MR !7 只修正研究、仿真和页面，不在这里改核心 proto/runtime。
+后续工作见 [#22 可移交 Context 合同和数据面能力](https://gitlab.com/BeeBreeze/lake/-/issues/22) 与 [#23 Portable Context ABI](https://gitlab.com/BeeBreeze/lake/-/issues/23)。MR !7 不修改核心 proto/runtime。
 
 ## 0. 证据标签与范围
 
@@ -21,9 +21,9 @@
 | **[分析]** | 为补齐契约而提出的设计判断，不代表产品现状 |
 | **[未知]** | 公开材料没有给出实现、协议或性能数据 |
 
-本文不做同类系统横向比较。vLLM、SGLang 和 Dynamo 只用于核对布局、接口和当前代码状态。
+vLLM、SGLang 和 Dynamo 用于核对布局、接口和公开代码状态。
 
-## 1. 先看成熟度：完整目标栈，不是完整已发布栈
+## 1. 公开成熟度
 
 | 组成 | 公开状态 | 能确认什么 | 不能确认什么 |
 |---|---|---|---|
@@ -34,11 +34,7 @@
 | VAST 当前 Dynamo 集成 | **[伙伴声明]** | G3/NFS-oRDMA/GDS 路径及自报测试 | Rubin CMX 性能 |
 | VAST G3.5/CMX 集成 | **[伙伴声明：upcoming]** | CNode/DNode/DASE 方向和容量方法 | virtio-fs 与 Memos KV API 最终如何收口 |
 
-最重要的边界是：
-
-- “GPU + Dynamo + NIXL + DOCA Memos + 双端 BlueField-4 + STX”是**目标架构图**。
-- “今天可以从公开仓库构建并验证这条完整路径”不成立。
-- 任何性能数字必须说明来自哪一段路径，不能把 VAST G3 测试、STX 声明和 Rubin CMX 目标混成一个 benchmark。
+上述组件不能从公开仓库拼成完整 CMX 路径。性能数字必须注明数据路径，不能混用 VAST G3 测试、STX 声明和 Rubin CMX 目标。
 
 ## 2. 目标架构与组件职责
 
@@ -71,7 +67,7 @@ DOCA Memos target on storage-side BlueField-4
 STX / CMX enclosure + NVMe flash
 ```
 
-这是**目标关系**，不是当前开源调用栈的时序图。特别是：
+这是目标关系，不是当前开源调用时序：
 
 - Grove 当前公开能力是 Kubernetes workload 的拓扑感知放置，不是从 KVBM 实时位置图做逐请求 CMX 柜亲和。
 - 官方材料同时把 recall/pre-staging 归给 KV manager 和存储处理器；最终“谁决定、谁排队、谁执行”的边界仍未公开。
@@ -89,7 +85,7 @@ STX / CMX enclosure + NVMe flash
 | value 中的 tensor/page/layout | 推理引擎 | CMX 只存 opaque bytes |
 | key 到柜/盘、介质队列、数据保护 | BlueField 上的软件 / 存储伙伴 | 功能方向已宣布，算法未公开 |
 
-CMX 优化的是 KV fast path。它意味着通用 POSIX、对象元数据和企业级耐久服务**不是必需条件**，不意味着所有伙伴实现都必须彻底删除文件、对象、NVMe-oF 或可选数据服务。
+CMX 的 fast path 不要求完整的 POSIX、对象元数据和企业耐久服务；伙伴实现仍可保留文件、对象、NVMe-oF 或其他数据服务。
 
 ## 3. Dynamo 在 CMX 中的角色
 
@@ -192,7 +188,7 @@ PR 中可以确认：
 
 ### 5.1 VAST 提供的不是新 DPU，而是存储软件
 
-在已审阅的公开材料里，VAST 给出了较完整的伙伴实现叙事：
+VAST 公开材料给出了以下组件分工：
 
 | 名称 | 位置/角色 | 可确认的职责 |
 |---|---|---|
@@ -211,7 +207,7 @@ PR 中可以确认：
 - 自报 benchmark：Llama 3.1 405B、约 128K context、8× Hopper、2×100 Gb/s；约 62 s 重算与约 3–3.5 s retrieve 对比，由此宣传约 20× TTFT、约 90% GPU compute time avoided。
 - `1.4×` KV data reduction 是同一篇伙伴文章里的另一项声明，没有公开该缩减测试的 workload，不能归入上面的 Llama/NFS benchmark。
 
-这说明“读回 KV 可比重算 prompt 快”，不等于 CMX 系统在 Rubin POD 级并发下达到 20×。
+该 20× 结果只适用于上述 G3 测试配置。
 
 **未来 G3.5 [伙伴声明：upcoming]**
 
@@ -222,7 +218,7 @@ PR 中可以确认：
 
 ### 5.3 大容量长上下文 sizing
 
-VAST 的价值之一是把“会话保留数”写成容量公式。公开会话/报道使用：
+VAST 公开材料使用以下会话容量公式：
 
 ```text
 users = 10,000
@@ -252,7 +248,7 @@ capacity = users × 32 GB × sessions retained per user
 
 ### 5.4 VAST 额外提供的服务
 
-**[伙伴声明]** VAST 还讨论了去重/缩减、可选纠删码、加密、多租户、审计和跨热/冷层的数据服务。它们说明伙伴可以在 CMX fast path 外增加企业能力；不能反推“CMX 标准本身已经定义了这些功能”。
+**[伙伴声明]** VAST 还讨论了去重/缩减、可选纠删码、加密、多租户、审计和冷热层服务。这些是伙伴能力，不是 CMX 标准能力。
 
 ## 6. 数字证据账本
 
@@ -267,7 +263,7 @@ capacity = users × 32 GB × sessions retained per user
 | ConnectX-9 1.6 Tb/s | endpoint peak | 不能直接当成每 GPU 独占、持续的 CMX 200 GB/s |
 | CMX 持续 read/write、p99 latency、queue depth | **未知** | 公开材料没有可用于仿真的数据表 |
 
-因此计算器不再默认“200 GB/s/GPU”，也不再把需求超过 NIC 后仍显示的 offered request rate叫作可达吞吐。
+计算器不预设“200 GB/s/GPU”，并将需求统一标为 offered load，而非可达吞吐。
 
 ## 7. 四个模型的会话状态体积
 
@@ -298,7 +294,7 @@ capacity = users × 32 GB × sessions retained per user
 
 对 V4，`paged KV = growing KV + SWA`：V4-Pro BF16 的锚点仍是 **9.6246 GiB**，V4-Flash 是 **6.7240 GiB**。上表“可移交合计”另外加入继续压缩下一批 token 所需的 FP32 compressor residual；把 paged KV 锚点直接当成完整 P→D/CMX 会话状态会少算。
 
-关键修正：
+口径说明：
 
 - DeepSeek V4-Pro BF16 的 9.62 GiB 保留为 **paged KV** 硬锚点；完整续算状态是 9.6421 GiB。
 - V4 的 FP8 不能简单把 1024 B 除二；vLLM `fp8_ds_mla` main entry 是 584 B。
@@ -351,7 +347,7 @@ state           = 69 × (recurrent + conv)
 
 ## 8. “GPU 跑满”下应该怎么算 CMX 流量
 
-旧版用不完整的模型 FLOPs 公式推 unique token/s，尤其漏掉 Kimi K3 的 query heads 和 QK/AV 两部分，结果不能用于跨模型性能比较。新版要求用户输入实测或明确假设的 `effective_unique_tok/s/GPU`。
+流量计算使用用户输入的 `effective_unique_tok/s/GPU`，不通过不完整的模型 FLOPs 公式比较跨模型性能。
 
 定义：
 
@@ -406,15 +402,7 @@ direct_offered_B/s
 
 边界条件不能写成 `Infinity`：当 `U=0`（100% 块对齐命中且 `E=0`）时，GPU-saturated 公式无法推出 `λ`，页面要求切换到外部请求到达率。外部 `λ` 不会因为 hit 上升而自动增加。若某方向 bytes/request 为 0，该方向 offered load 严格为 0；若字节口径未知则为 `N/A`，不能回退成 0。
 
-这套公式刻意拆开：
-
-- prefix hit 与 CMX-resident fraction；
-- cache admission 与请求准入；
-- growing KV 与固定状态；
-- logical/entry payload、engine page 与 custom wire；
-- external arrival 与 GPU-saturated offered load；
-- CMX read/write 与 P→D direct fabric；
-- offered load 与 storage-achieved throughput。
+模型分别处理 prefix hit 与远程读取比例、cache admission、字节口径、`λ` 来源，以及 CMX 与 P→D 流量。
 
 只有用户提供可用 transfer budget 时，才计算：
 
@@ -425,7 +413,7 @@ direct ceiling      = B_pd/direct_transfer
 overall ceiling     = min(CMX ceiling, direct ceiling)
 ```
 
-这个 ceiling 仍只是用户链路假设；没有 DPU、fabric、flash、queue 和 tail-latency 数据，就不是完整 CMX 性能模型。页面输出统一称为 **offered load**，不再用“所需带宽”暗示它一定可达。
+ceiling 只反映用户输入的链路预算；缺少 DPU、fabric、flash、queue 和 tail-latency 数据时，不能视为 CMX 性能结果。
 
 容量页也采用同样的表示口径，并把 `growing shard ranks`、`fixed-state shard ranks`、pool representation copies 和十进制/二进制单位显式化。`state shard ranks=1` 表示每个 GPU 持有完整 fixed-state 副本。未提供 HBM 容量和部署拓扑时，页面不把发布会算术展示成可部署 HBM 会话数。
 
@@ -471,17 +459,17 @@ P/D 建链时先交换 `layout_id`：
 
 布局 descriptor 应按 volume/version 保存，不应在主机为每个 object 复制一份大元数据。
 
-## 10. 真正的创新点与难点
+## 10. 架构价值与公开缺口
 
-### 10.1 能站住的创新点
+### 10.1 架构价值
 
-1. **把 KV 当成独立数据类。** 允许为 immutable、recomputable、large-I/O cache 裁掉不必要的 durable fast-path 服务。
-2. **POD 级共享。** KV 不再因为本地 SSD 位置把请求永久绑到某张 GPU。
-3. **双端 DPU 数据路径。** initiator 与 storage target 都靠近网络/介质，主机不承担完整存储数据面。
-4. **编排与 I/O 分层。** Dynamo 决定计算/生命周期，NIXL/DOCA 执行搬运和存储。
-5. **非 100% 耐久成为上层契约。** miss/hole 是正常控制流，而不是异常兜底。
+1. KV 成为 immutable、recomputable、large-I/O 的独立数据类，fast path 可裁掉不需要的 durable services。
+2. POD 级共享解除本地 SSD 对请求和 GPU 的长期绑定。
+3. 双端 DPU 将 initiator 和 storage target 放到网络与介质侧。
+4. Dynamo 管编排和生命周期，NIXL/DOCA 管数据移动与存储。
+5. miss/hole 成为上层正常控制流，而非系统异常。
 
-### 10.2 仍未解决的难点
+### 10.2 未公开的关键能力
 
 | 难点 | 当前缺口 |
 |---|---|
@@ -495,9 +483,7 @@ P/D 建链时先交换 `layout_id`：
 | raw/usable capacity | 冗余、reserve、GC、metadata、fragmentation 未公开 |
 | 功耗账 | 省掉 durable services，但增加 DPU 基线和 miss 重算；无公开 workload 无法闭合 |
 
-## 11. 软件切口与 DPU/盘侧算法
-
-必须把“公开能力”和“可研究算法”分开。
+## 11. 软件边界
 
 ### 11.1 已有或已宣布
 
@@ -508,18 +494,18 @@ P/D 建链时先交换 `layout_id`：
 | DASE 全局 namespace、CNode/DNode 分工 | VAST 伙伴架构声明 |
 | Dynamo overlap、offload filter、generic external tier | 当前代码 |
 
-### 11.2 可直接落在软件扩展点的工作
+### 11.2 可实现的扩展
 
-- 给 CMX 独立 tier、命中权重、带宽/延迟预算和失效事件。
-- 用 `OffloadFilter` 类扩展点做“值得写入共享层”的 admission。
+- NVIDIA/Dynamo 目标栈可增加 CMX serving/cost class；lake 仅增加 L2 backend profile 和 path capability。
+- 用 `OffloadFilter` 类扩展点控制 shared-tier admission。
 - 为 prefetch 加 `best_effort / wait_complete / timeout` 语义和 deadline accounting。
 - 定义 per-block batch retrieve result，而不是靠 `ignore_read_not_found` 猜测。
 - 定义 layout descriptor、canonical serialization 和 P/D handshake。
 - 把 storage-side placement、queueing 和 tenant policy 暴露成可观测指标。
 
-### 11.3 不应冒充已公开实现的算法
+### 11.3 尚未公开的算法
 
-以下问题合理、也适合在 DPU/storage software 上研究，但 NVIDIA/VAST 没有公开具体算法：
+NVIDIA/VAST 没有公开以下实现：
 
 - key 到 enclosure/drive 的一致性映射和故障改向；
 - placement/eviction/GC 的数据结构；
@@ -527,22 +513,13 @@ P/D 建链时先交换 `layout_id`：
 - raw flash 的数据保护策略；
 - 物理 NAND packing、FTL、erase-block 共置和 SSD GC。
 
-尤其不能从“按 KV format/layout 写盘”推导出“已实现 prefix-aware NAND packing 或专用 FTL”。公开材料只支持 KV-aware I/O 和靠近介质的服务，未暴露 NAND 算法。
+“按 KV format/layout 写盘”不能证明已实现 prefix-aware NAND packing 或专用 FTL。
 
-### 11.4 CMX 与 lake：不是平级替代关系
+### 11.4 与 lake 的关系
 
-CMX 是从 GPU 到共享 flash appliance 的硬件+软件 target stack；lake 是一套“所有有状态物归 Pool、计算节点可销毁”的推理系统架构。正确关系是：
+CMX 是 GPU 到共享 flash 的目标栈；lake 是 Pool 管理全部状态的推理系统。CMX 在 lake 中对应 L2 backend capability，不是第五个介质层。
 
-```text
-lake Router / Rust storage authority / Worker
-                    │
-                    ├─ L0 HBM / L1 DRAM / L2 NVMe / L3 object
-                    │
-                    └─ L2 backend capability
-                         └─ NIXL/Memos → BF4 → CMX/STX/partner flash
-```
-
-对 lake 而言，CMX 共享 flash 仍映射到 **L2/NVMe 介质层**；`G3.5` 是 NVIDIA 对 GPU 距离/产品路径的命名，不应变成 lake 的第五个介质 tier。DPU、local/remote topology、direct path、持续带宽和 latency 应表达成 `Location/backend capability`，由 Router 计成本。
+lake 不固化 CNIC/SNIC 双网拓扑。NIXL、Memos、BF4 和其他数据路径通过 endpoint、transport、backend、path capability 描述；位置仍由 Rust control plane 单点权威管理。
 
 | 维度 | CMX 目标栈 | lake | 采用方式 |
 |---|---|---|---|
@@ -553,33 +530,27 @@ lake Router / Rust storage authority / Worker
 | failure | Memos/DPU/backend 细节未公开 | F4 失败后按最新状态重跑 Router | backend error 上报 F4，不在 worker 降级 |
 | overload | Dynamo/存储 queue 能暴露信号 | gateway 管准入/shedding | Pool 只回报容量/背压 |
 
-值得直接借鉴：
+lake 需要补充：
 
-1. **Context object/API 成为一等边界。** Memos 的 key/query/read 思路适合 lake Transfer Bus，但必须补逐 block/component 的 `found | missing | error`。
-2. **DPU 卸载数据面。** 在硬件到位时，BF4 可承担注册、传输、integrity 和靠近介质的进度引擎，减少 host 路径。
-3. **拓扑与 deadline-aware prestaging。** Dynamo overlap 与 CMX 位置/成本信号可进入 lake Router 的代价函数，但必须守住 D-direct 选择总预算 `<5ms`。
-4. **编排与 I/O 分层。** Router 决策、Pool authority、Transfer backend 分开，符合 lake 已有职责边界。
+- Context API 的逐 block/component `found | missing | error`；
+- 可选 DPU endpoint，以及注册、integrity 和进度引擎能力；
+- 拓扑、带宽、延迟和 deadline-aware prestaging 信号；D-direct 选路总预算仍须 `<5ms`；
+- Router、Pool authority 与 transfer backend 的明确分层。
 
-不能照搬：
+以下内容不进入 lake 合同：
 
 - 把 `External/G3.5` 同时当介质、位置和产品层；
-- 让 Dynamo event index 和 lake Rust CP 同时成为位置权威；
-- 用某一 vLLM/SGLang HBM layout 充当通用 wire ABI；
-- 把 VAST G3 benchmark、ConnectX endpoint peak 或页面默认值当作 CMX SKU/SLA。
+- 第二套位置权威；
+- 将某个引擎的 HBM layout 设为通用 wire ABI；
+- 将伙伴 benchmark、端点峰值或页面默认值当作 CMX SLA。
 
-### 11.5 后续立项边界
+### 11.5 后续工作
 
-本轮把工作分成两个 issue：
-
-- [#22：P5 可移交 Context 合同](https://gitlab.com/BeeBreeze/lake/-/issues/22)：留在 lake，先做 semantic identity / representation identity、multi-component manifest、partial hole、compatibility handshake、128-bit object key 和 backend capability。保持 pool-owned L0–L3、opaque bytes、Rust 单一权威；CMX 只作为候选 L2 backend。
-- [#23：Portable Context ABI + Conformance + Engine Adapters](https://gitlab.com/BeeBreeze/lake/-/issues/23)：独立仓库孵化，做 versioned schema、Rust/C/Python bindings、vLLM/SGLang adapter、backend SPI、golden vectors、hole/corruption/failure conformance 和 benchmark；lake 是首个消费者，不把 Router/Authority 带进通用协议。
-
-当前决策：
-
-- **做独立 ABI/conformance/adapters：go。** 真正缺的是中立、fail-closed、可验证的 Context 交换合同。
-- **另做 commodity Context Store：defer。** 只有相对 Mooncake/LMCache 等出现至少 20% 可复现优势再启动。
-- **做 DPU/NVMe target：partner-gated。** 没有硬件和厂商 API 不声称 Memos/CMX 兼容。
-- **复刻完整 CMX appliance：no-go。** BF4/STX firmware、Spectrum-X 验证、FTL/EC/media placement 不是当前纯软件仓库可可信完成的范围。
+- [#22：可移交 Context 合同和数据面能力](https://gitlab.com/BeeBreeze/lake/-/issues/22)：定义 identity、representation、component、partial result、P/D handshake、object key 和 capability。
+- [#23：Portable Context ABI](https://gitlab.com/BeeBreeze/lake/-/issues/23)：孵化跨引擎 schema、bindings、adapters 和 conformance。
+- 通用 Context Store 暂缓，需先证明相对现有方案有至少 20% 的可复现收益。
+- DPU/NVMe target 依赖真实硬件和厂商 API。
+- 当前不实现完整 CMX appliance。
 
 ## 12. 尚待厂商回答的问题
 
@@ -594,7 +565,7 @@ lake Router / Rust storage authority / Worker
 9. 一柜/一 POD 的 sustained read/write、p99 latency、failure-domain 和 usable/raw 是多少？
 10. 5× 的模型、context、hit rate、batch、对照存储和功耗边界是什么？
 
-## 13. Agentic trace、cache 留存与经济边界
+## 13. Agentic 用量、cache 留存与成本
 
 ### 13.1 匿名 Cursor usage trace
 
@@ -607,7 +578,7 @@ lake Router / Rust storage authority / Worker
 - 296 行有数值 Cost，合计 `$502.65`；243 行为 `-`、14 行为 `Free`，所以该金额不是全部事件的经济价值；
 - Cloud Agent ID / Automation ID 均为空，原始用户标识和 CSV 不入仓。
 
-**关键限制：这里的 event 不是单次模型 API 请求。** 单个 event 最高包含 `22.0526M` prompt token，超过相关模型的单请求 context window，证明 Cursor 会把多次底层调用聚合为一个 usage event。因此下面的 input/output 分位数只能描述“每个 Cursor usage event 的聚合量”，不能用来反推单请求 KV 容量、并发数、TTFT 或 provider TTL。
+Cursor event 不是单次模型 API 请求。单个 event 最高包含 `22.0526M` prompt token，说明 Cursor 会聚合多次底层调用。input/output 分位数只能描述 event 聚合量，不能反推单请求 KV 容量、并发数、TTFT 或 provider TTL。
 
 整体 token-weighted cache hit 定义为：
 
@@ -632,9 +603,9 @@ h = Cache Read / (Cache Write + uncached input + Cache Read)
 | GPT-5.6 Terra Medium | 4 | 3.752M | 86.41% | 803.8K | 1.390M | 6.8K | 7.7K | 1.620M | — |
 | Kimi K3 Max | 164 | 279.593M | 91.90% | 584.8K | 7.818M | 5.6K | 50.2K | 21.332M | $226.76 |
 
-这份 trace 能支撑 CMX workload 的三个输入：**单用户 token/h 峰值、token-weighted cache hit、模型 mix**。它不能直接给出 request arrival rate、单请求 context、KV bytes、GPU time 或存储成本；这些仍需底层 request trace 和模型布局。
+这份 trace 可提供单用户 token/h 峰值、token-weighted cache hit 和模型 mix。request arrival rate、单请求 context、KV bytes、GPU time 和存储成本仍需底层 request trace 与模型布局。
 
-### 13.2 Provider cache 留存：合同与实测不可混写
+### 13.2 Provider cache 留存：合同与实测
 
 Mempko / arXiv:2607.19214 使用 100K prefix 测量 Anthropic Sonnet 4.5、OpenAI GPT-5.1、DeepSeek V3.2、Gemini 2.5 Pro 的空闲存活与 keepalive。其结果适合做 agent pause workload 的**测量样本**，不等于 provider 的统一 TTL 合同：
 
@@ -655,11 +626,11 @@ I_max ≈ τ × (w / r − 1)
 
 同样不能把 Dynamo `router_ttl_secs` 当成真实 KV TTL：该字段只在不消费 KV events 的 approximate indexer 中清理 Router 的预测条目，物理 KV 是否仍在 worker/storage 是另一件事。
 
-### 13.3 “每用户 100 GB”已核实，但不是 KV quota
+### 13.3 ChatGPT Pro 100 GB 是 File Library，不是 KV quota
 
 OpenAI Help Center 当前明确写明：ChatGPT Pro 用户拥有 **100 GB File Library storage**。这个额度承载上传文件和 ChatGPT 生成文件；它不是 prompt cache、KV cache、GPU-local cache、API context retention，也不是 OpenAI 给每个用户预留 100 GB KV。
 
-因此本文只把 `100 GB/user` 放在**终端产品存储配额参照**中，不把它代入 CMX sizing。若要把 100 GB 设为 CMX 业务 quota，必须另给：
+`100 GB/user` 仅作为终端产品存储配额参照，不代入 CMX sizing。若将 100 GB 设为 CMX 业务 quota，还需给出：
 
 - 每用户要保留多少会话/前缀；
 - 每份 session 的模型、layout、token 长度和共享比例；
@@ -668,7 +639,7 @@ OpenAI Help Center 当前明确写明：ChatGPT Pro 用户拥有 **100 GB File L
 
 参考实现上，LMCache `QuotaManager` 提供按 `cache_salt` 动态设置 byte limit 的形态，但没有默认 100 GB，也不证明任何产品级 quota 应该取该值。
 
-### 13.4 “花 5% 换 20% 算力”的可审计公式
+### 13.4 Cache 成本公式
 
 先把 token 记账命中与 GPU work 分开：
 
@@ -706,13 +677,13 @@ gross benefit/cost   = 20% / 5% = 4×
 net ROI              = (20% − 5%) / 5% = 3×
 ```
 
-这回答了“能不能算”：**能算阈值和反事实，不能仅凭 token cache hit 宣布真实省了 20% 算力。** 当前 CSV 没有 GPU time、Prefill/Decode 分解或 CMX 成本，257 行 Cost 也不是数值；实际结论必须补模型/硬件实测。可调计算见 [`../../tools/cmx-sim/economics.html`](../../tools/cmx-sim/economics.html)。
+该公式可计算阈值和假设场景，不能仅凭 token cache hit 得出 20% 算力节省。当前 CSV 没有 GPU time、Prefill/Decode 分解或 CMX 成本，且 257 行 Cost 不是数值；实际结论仍需模型与硬件实测。可调计算见 [`../../tools/cmx-sim/economics.html`](../../tools/cmx-sim/economics.html)。
 
 ## 14. 参考实现与代码回溯
 
 ### 14.1 本次直接参考的实现
 
-| 机制 | 代码锚点 | 值得参考的点 | 对 CMX 分析的限制 |
+| 机制 | 代码锚点 | 采用内容 | 限制 |
 |---|---|---|---|
 | Dynamo tier/routing | `3rdparty/dynamo/lib/kv-router/src/protocols.rs::StorageTier`；`scheduling/overlap.rs::cache_hit_weight_for_tier` | 当前层枚举与成本函数的真实形态 | 没有 G3.5；不能把目标架构写成现状 |
 | Dynamo shared cache | `scheduling/config.rs::SharedCacheType` | 可核对当前 Router 支持类型 | 只有 `None/Hicache` |
@@ -737,7 +708,7 @@ submodule revisions：
 - vLLM：`f3e9497e921a16741401c5e93af0c2c29ea74907`
 - SGLang：`37f94cb7a0abd2577006c196444786ddfbe9d1e0`
 
-### 14.2 关键差异
+### 14.2 使用边界
 
 - 参考引擎给出的是 HBM page/状态布局；CMX 需要一个跨进程、跨 P/D 的序列化合同，不能直接照搬某个引擎的 allocator。
 - Dynamo 当前 generic `External` 能复用控制面骨架，但 CMX 的共享性、延迟、可丢和 hole 语义需要独立建模。

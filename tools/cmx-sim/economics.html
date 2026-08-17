@@ -15,14 +15,12 @@
   </nav>
 
   <header>
-    <h1>Agentic Cache：真实用量与经济边界</h1>
+    <h1>Agentic Cache 用量与经济分析</h1>
     <p>
-      用匿名 Cursor team usage 汇总观察单用户小时峰值、模型 mix 和 token-weighted cache hit；
-      再把 token 记账命中与真正避免的 Prefill GPU work 分开，计算“花 5% 换 20% 算力”的 what-if 条件。
+      汇总匿名 Cursor 用量，并将 token hit、可避免的 Prefill work 和 Cache 成本分开计算。
     </p>
     <div class="warn" role="note">
-      Cursor usage event 可聚合多次底层模型调用。单条事件最高 22.05M prompt token，不能把这里的
-      input p50/p95 当成单次 API context，也不能用本 CSV 推断 provider TTL、Prefill GPU 时间或 Cache 基础设施成本。
+      Cursor event 可聚合多次调用；p50/p95 不是单次 API context。CSV 不含 Prefill 时间或 Cache 成本。
     </div>
   </header>
 
@@ -69,7 +67,7 @@
       </section>
 
       <section class="panel" aria-labelledby="traceHeading">
-        <h2 id="traceHeading">Cursor trace 范围与完整性</h2>
+        <h2 id="traceHeading">Trace 范围</h2>
         <ul class="notes">
           <li>2026-07-20 16:03 至 2026-08-14 10:46（UTC+8）；单用户、553 events、8 models。</li>
           <li>731.04M total token；726.43M prompt；670.45M cache read；55.98M miss/write。</li>
@@ -93,7 +91,7 @@
       </section>
 
       <section class="panel table-panel" aria-labelledby="modelTableHeading">
-        <h2 id="modelTableHeading">完整匿名分模型汇总</h2>
+        <h2 id="modelTableHeading">匿名分模型汇总</h2>
         <table>
           <caption>Input / Output 是每个 Cursor usage event 的聚合 token，不是单次模型 API 调用。</caption>
           <thead>
@@ -179,11 +177,10 @@
       </section>
 
       <section class="panel" aria-labelledby="quotaHeading">
-        <h2 id="quotaHeading">100 GB 的正确口径</h2>
+        <h2 id="quotaHeading">100 GB File Library ≠ KV quota</h2>
         <p>
           OpenAI Help Center 当前写明 ChatGPT Pro 用户有 100 GB File Library storage。
-          这是上传/生成文件库，不是 prompt cache、KV cache、GPU-local cache 或 CMX per-user quota；
-          只能作为终端产品存储配额参照，不能直接代入 KV sizing。
+          该额度用于上传和生成文件，不是 prompt cache、KV cache、GPU-local cache 或 CMX quota，不用于 KV sizing。
         </p>
       </section>
 
@@ -195,7 +192,7 @@
     </main>
   </div>
 
-  <script src="sim.js?v=6"></script>
+  <script src="sim.js?v=7"></script>
   <script>
     const S = window.CmxSim;
     const $ = (id) => document.getElementById(id);
@@ -298,8 +295,8 @@ required_prefill_share(target=${fmtPct(scenario.targetComputeSavings)})
           = target / (avoided_prefill_work × path_efficiency)
           = ${scenario.requiredPrefillComputeShare == null ? "N/A" : fmtPct(scenario.requiredPrefillComputeShare)}
 
-所有百分比必须换算到同一个“基线 GPU 成本”分母。
-当前输入只是 what-if；Cursor trace 没有 avoided work 或 Cache cost。
+所有百分比使用同一个基线 GPU 成本分母。
+Cursor trace 不含 avoided work 或 Cache cost。
 若 gross=${fmtPct(scenario.targetComputeSavings)} 且 Cache cost=${fmtPct(scenario.cacheCostShare)}：
 目标净节省=${fmtPct(scenario.targetComputeSavings - scenario.cacheCostShare)}。`;
       drawChart($("chartKind").value);

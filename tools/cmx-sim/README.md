@@ -1,33 +1,32 @@
 # NVIDIA CMX 分析计算器
 
-技术分析在 [`docs/research/nvidia-cmx.md`](../../docs/research/nvidia-cmx.md)。页面只实现可审计的字节、容量、offered-load 和经济阈值公式；它不是 benchmark，也不包含 NVIDIA/VAST 未公开的 CMX 性能模型。VAST 当前 G3 的 20× 实验、`16 TB/GPU × 1152 GPU` 发布会算术和页面默认值都不是 CMX SKU/SLA。
-
-后续决策见 [lake #22：可移交 Context 合同](https://gitlab.com/BeeBreeze/lake/-/issues/22) 与 [#23：Portable Context ABI 独立项目孵化](https://gitlab.com/BeeBreeze/lake/-/issues/23)。本工具不修改 lake proto/runtime。
+三个页面提供字节、容量、offered load 和成本假设计算，不代表 CMX benchmark 或 SKU。技术依据见 [`docs/research/nvidia-cmx.md`](../../docs/research/nvidia-cmx.md)。
 
 ```bash
-# 从仓库根目录启动，文档链接才能正确解析
+# 从仓库根目录启动
 python3 -m http.server --directory .
 # 打开 http://127.0.0.1:8000/tools/cmx-sim/
 
 node tools/cmx-sim/verify.js
 ```
 
-| 页 | 内容 |
+| 页面 | 内容 |
 |---|---|
-| [`index.html`](index.html) | 外部 `λ` 或 GPU-saturated `λ` 下，local/direct/via-CMX handoff 的 CMX 与 P→D offered load |
-| [`capacity.html`](capacity.html) | 按 byte basis、growing/state 分片、pool 副本和 GB/GiB 口径计算 GPU/rack/POD 会话数 |
-| [`economics.html`](economics.html) | 匿名 Cursor trace、provider cache 留存证据，以及 token hit 与 avoided Prefill work 分离后的阈值模型 |
+| [`index.html`](index.html) | CMX 与 P→D offered load；支持外部或 GPU-saturated `λ` |
+| [`capacity.html`](capacity.html) | GPU、rack、POD 会话容量；支持分片、副本和 GB/GiB |
+| [`economics.html`](economics.html) | 匿名 Cursor 用量、provider cache 留存和成本假设 |
 
 ## GitLab Pages
 
-三个 HTML 文件属于**同一个静态网站、同一个 Pages deployment**，不是三个独立部署：
+同一 private Pages 站点包含三个页面：
 
-- 站点入口：<https://lake-13d9f7.gitlab.io/>
-- 路由：`/index.html`、`/capacity.html`、`/economics.html`
-- 访问控制：沿用 GitLab 项目的 private Pages 设置，只有已登录的项目成员可查看
-- MR !7 pipeline 先发布当前版本；合并后由 `main` pipeline 覆盖为主分支版本
+- <https://lake-13d9f7.gitlab.io/>
+- `/capacity.html`
+- `/economics.html`
 
-核心口径：
+只有已登录的项目成员可访问。MR !7 发布分支版本；合并后由 `main` 更新。
+
+## 流量公式
 
 ```text
 M = floor(C × hit / block) × block
@@ -50,29 +49,30 @@ cmx_write_offered = λ × cmx_write/request
 direct_offered    = λ × direct/request
 ```
 
-- Byte basis 分四类：logical payload、engine entry payload、engine page allocation、custom wire。CMX 序列化未公开；不支持的 engine-page profile 返回 `N/A`。
-- V4 engine-page estimate 按 vLLM block/alignment 和 settled sliding-window admission（`max_in_flight=0`）计算，不含全局 allocator fragmentation、packed-pool sharing 和 runtime reserve。
-- V4 base/speculative/online-C128 compressor ring 是不同 representation；V4/GLM MTP 是显式可选 component。
-- `q` 把“前缀命中”与“命中字节确实从 CMX 远程读取”分开。
-- `a` 是长期 cache admission；via-CMX handoff 必须强制写出最终 continuation state。
-- 有效 unique token/s 由用户输入，应来自实测或明确假设。当 `U=0` 时只能使用外部 `λ`；外部 `λ` 不随 hit 自动增长。
-- CMX 和 P→D 链路预算默认是 `0`（未知）。填写后只得到用户假设下的 ceiling，不是 CMX 可达吞吐。
-- 容量页不从 GPU 数猜 TP/CP：`growing shard ranks` 和 `fixed-state shard ranks` 分开，`state=1` 表示每 GPU 完整副本；G2/CMX 另乘 representation copies。未提供 HBM 容量/拓扑时不展示 HBM 会话数。
-- 经济页把 trace token hit、可避免的 Prefill work、路径效率与 Cache 总成本分开：
+- Byte basis：logical payload、engine entry payload、engine page allocation、custom wire。未知 engine-page profile 返回 `N/A`。
+- V4 base/speculative/online-C128 是不同 representation；V4/GLM MTP 是可选 component。
+- `q` 表示命中字节中实际从 CMX 读取的比例；`a` 表示写入 CMX 的比例。
+- `U=0` 时只能使用外部 `λ`。外部 `λ` 不随命中率变化。
+- 链路预算默认为未知；填写后得到用户假设下的 ceiling，不是实测吞吐。
+- 容量计算要求显式填写 growing/state 分片和 Pool representation 副本。
 
-  ```text
-  gpu_cost_saved
-    = prefill_gpu_cost_share × avoidable_prefill_work_fraction × path_efficiency
-  net_saved
-    = gpu_cost_saved − cache_total_cost_share
-  ```
+## 成本公式
 
-  Cursor CSV 的 `92.2939%` 只是 token 记账命中，没有 GPU time 或 CMX 成本，因此只给 what-if，不把“5% 成本换 20% 算力”写成 trace 结论。页面默认例子是 `25% × 80% × 100% = 20%` gross；若 Cache 成本在同一基线上为 `5%`，net 才是 `15%`。
+```text
+gpu_cost_saved
+  = prefill_gpu_cost_share × avoidable_prefill_work_fraction × path_efficiency
+net_saved
+  = gpu_cost_saved − cache_total_cost_share
+```
 
-校验锚点：
+Cursor CSV 的 `92.2939%` 是 token 记账命中，不包含 GPU time 或 CMX 成本。默认 `25% × 80% × 100% = 20%` 仅为假设场景。
 
-- V4-Pro BF16 @ 1,048,576：paged KV `9.6246 GiB`；加 vLLM FP32 compressor residual 后，可移交会话状态 `9.6421 GiB`。
-- V4-Pro BF16 vLLM engine-page estimate：`9.6479 GiB`；FP8 entry profile payload `5.4039 GiB`，engine pages `5.5038 GiB`。
-- V4-Flash BF16 @ 1,048,576：paged KV `6.7240 GiB`；加 compressor residual 后 `6.7354 GiB`。
-- GLM-5.2 base FP8 logical：`46.5820 GiB`；计入 MTP：`47.2734 GiB`。
-- Kimi K3 FP8 MLA + vLLM 默认 KDA state：`13.9185 GiB`，其中固定 state `428.5547 MiB`。
+## 校验点
+
+- V4-Pro BF16 @ 1,048,576：paged KV `9.6246 GiB`；含 compressor state `9.6421 GiB`；vLLM engine pages `9.6479 GiB`。
+- V4-Pro FP8：entry payload `5.4039 GiB`；engine pages `5.5038 GiB`。
+- V4-Flash BF16：paged KV `6.7240 GiB`；含 compressor state `6.7354 GiB`。
+- GLM-5.2 FP8 logical：base `46.5820 GiB`；含 MTP `47.2734 GiB`。
+- Kimi K3 FP8 MLA + KDA state：`13.9185 GiB`，其中 fixed state `428.5547 MiB`。
+
+后续合同见 [#22](https://gitlab.com/BeeBreeze/lake/-/issues/22) 和 [#23](https://gitlab.com/BeeBreeze/lake/-/issues/23)。

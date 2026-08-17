@@ -67,12 +67,12 @@
     v4pro: [
       {
         id: "bf16-logical",
-        label: "BF16 公式布局（1024 B main / 256 B index）",
+        label: "BF16 logical（1024 B main / 256 B index）",
         mainEntryBytes: 1024,
         indexEntryBytes: 256,
         byteClass: "logical-payload",
         confidence: "published",
-        note: "BF16 paged-KV 公式布局；可继续会话还需 vLLM FP32 compressor state。",
+        note: "BF16 paged KV；续算需额外计入 FP32 compressor state。",
       },
       {
         id: "fp8-vllm",
@@ -81,7 +81,7 @@
         indexEntryBytes: 132,
         byteClass: "engine-entry-payload",
         confidence: "implementation",
-        note: "引擎 entry payload；allocator page 还需按 block/alignment 向上取整，不等于 CMX 序列化格式。",
+        note: "Entry payload；pages 另计；不代表 CMX wire。",
       },
       {
         id: "fp8-fp4-payload",
@@ -90,7 +90,7 @@
         indexEntryBytes: 68,
         byteClass: "payload-estimate",
         confidence: "estimate",
-        note: "有效 payload 估算；vLLM 当前仍按 132 B FP8 index entry 分配页，实际 allocation 不会减半。",
+        note: "Payload estimate；vLLM pages 仍按 132 B index 分配。",
       },
     ],
     v4flash: null,
@@ -120,7 +120,7 @@
         indexEntryBytes: 132,
         byteClass: "engine-entry-payload",
         confidence: "implementation",
-        note: "vLLM MLAAttentionSpec 的 entry payload；未计 page alignment/allocator reserve。",
+        note: "vLLM entry payload；未计 page alignment 和 allocator reserve。",
       },
     ],
     k3: [
@@ -274,7 +274,7 @@
       pagedKvBytes: growing + swa,
       totalBytes: growing + swa + compressor,
       note:
-        "vLLM page/alignment + sliding-window admission estimate; excludes global allocator fragmentation and packed-pool sharing.",
+        "vLLM page/alignment 与 sliding-window admission estimate；不含全局碎片和 packed-pool sharing。",
     };
   }
 
