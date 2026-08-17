@@ -18,11 +18,11 @@
     <h1>Agentic Cache：真实用量与经济边界</h1>
     <p>
       用匿名 Cursor team usage 汇总观察单用户小时峰值、模型 mix 和 token-weighted cache hit；
-      再把命中率、Prefill 算力占比与 Cache 总成本拆开，计算“花 5% 换 20% 算力”的成立条件。
+      再把 token 记账命中与真正避免的 Prefill GPU work 分开，计算“花 5% 换 20% 算力”的 what-if 条件。
     </p>
     <div class="warn" role="note">
       Cursor usage event 可聚合多次底层模型调用。单条事件最高 22.05M prompt token，不能把这里的
-      input p50/p95 当成单次 API context，也不能用本 CSV 推断 provider TTL。
+      input p50/p95 当成单次 API context，也不能用本 CSV 推断 provider TTL、Prefill GPU 时间或 Cache 基础设施成本。
     </div>
   </header>
 
@@ -30,19 +30,23 @@
     <aside>
       <h2>经济假设</h2>
 
-      <label for="hitRate">Token-weighted cache hit %</label>
-      <input id="hitRate" type="number" min="0" max="100" step="0.1" value="92.2939" />
-      <p class="hint">Trace：Cache Read / prompt token。</p>
+      <label for="traceHitRate">Trace token-weighted cache hit %（观察值）</label>
+      <input id="traceHitRate" type="number" value="92.2939" readonly />
+      <p class="hint">Cache Read / prompt token；不进入 GPU work 公式。</p>
 
-      <label for="prefillShare">Prefill 占总算力 %</label>
-      <input id="prefillShare" type="number" min="0" max="100" step="0.1" value="21.67" />
+      <label for="prefillShare">Prefill 占基线 GPU 成本 %</label>
+      <input id="prefillShare" type="number" min="0" max="100" step="0.1" value="25" />
 
-      <label for="avoidEfficiency">命中避免 Prefill 的效率 %</label>
+      <label for="avoidedWork">可由 Cache 避免的 Prefill work %</label>
+      <input id="avoidedWork" type="number" min="0" max="100" step="0.1" value="80" />
+      <p class="hint">需由 GPU time / recompute 实测；不能用 token hit 直接替代。</p>
+
+      <label for="avoidEfficiency">避免路径兑现效率 %</label>
       <input id="avoidEfficiency" type="number" min="0" max="100" step="0.1" value="100" />
 
-      <label for="cacheCost">Cache 总成本 / 基线成本 %</label>
+      <label for="cacheCost">Cache 总成本 / 基线 GPU 成本 %</label>
       <input id="cacheCost" type="number" min="0" max="100" step="0.1" value="5" />
-      <p class="hint">应包含容量、传输、控制面和 keepalive；CSV 本身没有该成本。</p>
+      <p class="hint">容量、传输、控制面、keepalive 都换算到同一基线；CSV 没有该成本。</p>
 
       <label for="targetSavings">目标总算力节省 %</label>
       <input id="targetSavings" type="number" min="0" max="100" step="0.1" value="20" />
@@ -191,7 +195,7 @@
     </main>
   </div>
 
-  <script src="sim.js?v=5"></script>
+  <script src="sim.js?v=6"></script>
   <script>
     const S = window.CmxSim;
     const $ = (id) => document.getElementById(id);
@@ -261,8 +265,8 @@
 
     function render() {
       const scenario = S.economicsScenario({
-        hitRate: finiteNumber("hitRate", 0) / 100,
         prefillComputeShare: finiteNumber("prefillShare", 0) / 100,
+        avoidedPrefillWorkFraction: finiteNumber("avoidedWork", 0) / 100,
         avoidEfficiency: finiteNumber("avoidEfficiency", 0) / 100,
         cacheCostShare: finiteNumber("cacheCost", 0) / 100,
         targetComputeSavings: finiteNumber("targetSavings", 0) / 100,
@@ -271,27 +275,33 @@
         ? "N/A"
         : `${scenario.grossBenefitCostRatio.toFixed(2)}×`;
       const roi = scenario.netRoi == null ? "N/A" : `${scenario.netRoi.toFixed(2)}×`;
+      const traceHit = finiteNumber("traceHitRate", 0) / 100;
       $("stats").innerHTML = [
-        stat("估算总算力节省", fmtPct(scenario.grossComputeSavings), "Prefill share × hit × efficiency", "hot"),
-        stat("同基准净节省", fmtPct(scenario.netSavings), "总算力节省 − Cache 总成本", scenario.netSavings >= 0 ? "ok" : "bad"),
-        stat("达到目标所需 Prefill 占比", scenario.requiredPrefillComputeShare == null ? "N/A" : fmtPct(scenario.requiredPrefillComputeShare), "超过 100% 表示当前 hit/efficiency 下不可达"),
+        stat("Trace token cache hit", fmtPct(traceHit), "观察值，不进入经济公式"),
+        stat("估算 GPU 成本节省", fmtPct(scenario.grossComputeSavings), "Prefill share × avoided work × efficiency", "hot"),
+        stat("同基准净节省", fmtPct(scenario.netSavings), "GPU 成本节省 − Cache 总成本", scenario.netSavings >= 0 ? "ok" : "bad"),
+        stat("达到目标所需 Prefill 占比", scenario.requiredPrefillComputeShare == null ? "N/A" : fmtPct(scenario.requiredPrefillComputeShare), "超过 100% 表示当前 avoided-work/efficiency 下不可达"),
         stat("毛收益 / Cache 成本", ratio, `净 ROI ${roi}`),
       ].join("");
       $("formula").textContent =
-`compute_saved = prefill_compute_share × cache_hit × avoid_efficiency
-              = ${(scenario.prefillComputeShare * 100).toFixed(2)}% × ${(scenario.hitRate * 100).toFixed(2)}% × ${(scenario.avoidEfficiency * 100).toFixed(2)}%
+`trace_token_hit = ${fmtPct(traceHit)}  # 仅观察，不代入
+
+gpu_cost_saved = prefill_gpu_cost_share × avoided_prefill_work × path_efficiency
+              = ${(scenario.prefillComputeShare * 100).toFixed(2)}% × ${(scenario.avoidedPrefillWorkFraction * 100).toFixed(2)}% × ${(scenario.avoidEfficiency * 100).toFixed(2)}%
               = ${fmtPct(scenario.grossComputeSavings)}
 
-net_saved = compute_saved − cache_total_cost_share
+net_saved = gpu_cost_saved − cache_total_cost_share
           = ${fmtPct(scenario.grossComputeSavings)} − ${fmtPct(scenario.cacheCostShare)}
           = ${fmtPct(scenario.netSavings)}
 
 required_prefill_share(target=${fmtPct(scenario.targetComputeSavings)})
-          = target / (cache_hit × avoid_efficiency)
+          = target / (avoided_prefill_work × path_efficiency)
           = ${scenario.requiredPrefillComputeShare == null ? "N/A" : fmtPct(scenario.requiredPrefillComputeShare)}
 
-“花 5% 换 20%”若使用同一成本基准：
-净节省 = 15%；毛收益/成本 = 4×；净 ROI = 3×。`;
+所有百分比必须换算到同一个“基线 GPU 成本”分母。
+当前输入只是 what-if；Cursor trace 没有 avoided work 或 Cache cost。
+若 gross=${fmtPct(scenario.targetComputeSavings)} 且 Cache cost=${fmtPct(scenario.cacheCostShare)}：
+目标净节省=${fmtPct(scenario.targetComputeSavings - scenario.cacheCostShare)}。`;
       drawChart($("chartKind").value);
     }
 
@@ -304,7 +314,7 @@ required_prefill_share(target=${fmtPct(scenario.targetComputeSavings)})
         <td>${row[9] ? `$${row[9].toFixed(2)}` : "未标价"}</td>
       </tr>`).join("");
 
-    ["hitRate", "prefillShare", "avoidEfficiency", "cacheCost", "targetSavings", "chartKind"].forEach((id) => {
+    ["prefillShare", "avoidedWork", "avoidEfficiency", "cacheCost", "targetSavings", "chartKind"].forEach((id) => {
       $(id).addEventListener("input", render);
       $(id).addEventListener("change", render);
     });

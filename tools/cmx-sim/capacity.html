@@ -21,8 +21,8 @@
       三个结果的物理范围不同，不应横向当成同一层级的产品规格。
     </p>
     <div class="warn" role="note">
-      原始字节除法，不是可部署容量承诺。默认值仅用于演示；未建模 TP/CP 分片与复制、页取整、allocator
-      碎片、元数据、故障冗余、队列/运行时 reserve、去重和实际 flash usable/raw 比。
+      字节除法，不是可部署容量承诺。页面只执行用户输入的 growing/state 分片和 pool 副本；
+      未提供 HBM 容量/拓扑时不显示 HBM 会话数。仍未建模 allocator 碎片、元数据、故障冗余、队列 reserve 和实际介质行为。
     </div>
   </header>
 
@@ -41,9 +41,29 @@
       <select id="profile"></select>
       <p id="profileNote" class="hint"></p>
 
+      <label for="byteMode">容量字节口径</label>
+      <select id="byteMode">
+        <option value="payload">当前 profile payload</option>
+        <option value="engine-pages">vLLM engine page allocation</option>
+        <option value="custom-wire">自定义 wire = payload × factor</option>
+      </select>
+      <div id="wireFactorWrap" hidden>
+        <label for="customWireFactor">Wire / payload factor</label>
+        <input id="customWireFactor" type="number" min="0" step="0.01" value="1" />
+      </div>
+
+      <div id="compressorPolicyWrap" hidden>
+        <label for="compressorPolicy">V4 compressor state policy</label>
+        <select id="compressorPolicy">
+          <option value="base">Base ring（C4=8 / C128=128）</option>
+          <option value="speculative">SGLang spec ring（16 / 256）</option>
+          <option value="online-c128">SGLang online C128（1×3D）</option>
+        </select>
+      </div>
+
       <div id="mtpWrap" class="checkrow" hidden>
         <input id="includeMtp" type="checkbox" />
-        <label for="includeMtp">把可选 MTP 层计入 GLM KV</label>
+        <label id="mtpLabel" for="includeMtp">把可选 MTP 状态计入会话</label>
       </div>
 
       <h2>会话</h2>
@@ -53,9 +73,15 @@
       <input id="tokensNumber" type="number" min="8192" max="1048576" step="1" value="1048576" />
 
       <h2>可用容量假设</h2>
+      <label for="capacityUnitMode">输入单位</label>
+      <select id="capacityUnitMode">
+        <option value="decimal">十进制 GB / TB / PB</option>
+        <option value="binary">二进制 GiB / TiB / PiB</option>
+      </select>
+
       <label for="hbmGB">会话可用 HBM GB / GPU</label>
-      <input id="hbmGB" type="number" min="0" step="1" value="216" />
-      <p class="hint">216 GB = 288 GB raw 的 75%；这是用户假设，不是官方 reserve。</p>
+      <input id="hbmGB" type="number" min="0" step="1" value="0" />
+      <p class="hint">0 = 未提供部署拓扑，不展示可部署 HBM 会话数。</p>
 
       <label for="g2TB">会话可用 G2 TB / rack</label>
       <input id="g2TB" type="number" min="0" step="0.1" value="43.2" />
@@ -67,6 +93,17 @@
 
       <label for="cmxUsable">CMX usable/raw 比例</label>
       <input id="cmxUsable" type="number" min="0" max="1" step="0.05" value="0.8" />
+
+      <h2>分片与副本</h2>
+      <label for="growingShardRanks">Growing KV shard ranks</label>
+      <input id="growingShardRanks" type="number" min="1" step="1" value="1" />
+      <p class="hint">按实际 TP×CP/engine layout 填；页面不从 GPU 数猜分片。</p>
+
+      <label for="stateShardRanks">Fixed state shard ranks（1 = 每 GPU 完整副本）</label>
+      <input id="stateShardRanks" type="number" min="1" step="1" value="1" />
+
+      <label for="poolCopies">G2/CMX representation copies</label>
+      <input id="poolCopies" type="number" min="1" step="1" value="1" />
     </aside>
 
     <main>
@@ -101,12 +138,12 @@
       <section class="panel" aria-labelledby="limitationsHeading">
         <h2 id="limitationsHeading">在生产 sizing 前还缺什么</h2>
         <ul class="notes">
-          <li>确认 CMX 传输/落盘的是逻辑 payload、引擎完整页，还是另一种 canonical layout。</li>
-          <li>按 TP/CP/DP/EP 部署确定每 rank 分片、复制和 scale-up broadcast。</li>
-          <li>加入 block/page 向上取整、元数据、运行时 reserve、碎片、冗余/EC 和故障域。</li>
+          <li>确认 CMX 传输/落盘的是 logical payload、engine entry payload、engine page allocation，还是另一种 wire layout。</li>
+          <li>按 TP/CP/DP/EP 部署填写 growing/state shard ranks；不同 component 的复制若不同，应拆成 manifest，而不是取平均。</li>
+          <li>V4 engine-page 口径含已知 block/alignment 和 sliding-window admission；仍不含全局 allocator 碎片、packed-pool sharing、元数据和 reserve。</li>
           <li>把 raw flash、格式化容量、可承诺容量和已用容量分开。</li>
           <li>只有拿到实现的放置、去重和生命周期策略，才能估计池级有效复用率。</li>
-          <li>V4-Pro 的 9.62 GiB 是 BF16 paged KV 锚点；本页会话总量还计入 17.84 MiB FP32 compressor residual。</li>
+          <li>V4-Pro 的 9.62 GiB 是 BF16 payload paged KV；可移交 payload 再计 compressor residual，engine allocation 是另一列口径。</li>
         </ul>
       </section>
 
@@ -117,7 +154,7 @@
     </main>
   </div>
 
-  <script src="sim.js?v=5"></script>
+  <script src="sim.js?v=6"></script>
   <script>
     "use strict";
 
@@ -139,7 +176,16 @@
       if (profiles.some((profile) => profile.id === previous)) {
         $("profile").value = previous;
       }
-      $("mtpWrap").hidden = modelId !== "glm52";
+      const isV4 = modelId === "v4pro" || modelId === "v4flash";
+      $("mtpWrap").hidden = !(isV4 || modelId === "glm52");
+      $("compressorPolicyWrap").hidden = !isV4;
+      $("mtpLabel").textContent = isV4
+        ? "计入 V4 的 1 层 MTP SWA 状态"
+        : "计入 GLM 的 1 层 MTP KV/index";
+    }
+
+    function syncConditionalInputs() {
+      $("wireFactorWrap").hidden = $("byteMode").value !== "custom-wire";
     }
 
     function params() {
@@ -147,11 +193,18 @@
         modelId: $("model").value,
         profileId: $("profile").value,
         includeMtp: $("includeMtp").checked,
+        compressorPolicy: $("compressorPolicy").value,
+        byteMode: $("byteMode").value,
+        customWireFactor: finiteNumber("customWireFactor", 1),
         tokens: finiteNumber("tokensNumber", 0),
         usableHbmGB: finiteNumber("hbmGB", 0),
         usableG2TB: finiteNumber("g2TB", 0),
         rawCmxPB: finiteNumber("cmxPB", 0),
         cmxUsableFraction: finiteNumber("cmxUsable", 0),
+        capacityUnitMode: $("capacityUnitMode").value,
+        growingShardRanks: finiteNumber("growingShardRanks", 1),
+        stateShardRanks: finiteNumber("stateShardRanks", 1),
+        poolCopies: finiteNumber("poolCopies", 1),
       };
     }
 
@@ -167,35 +220,63 @@
       return value == null ? "N/A" : value.toLocaleString();
     }
 
+    function basisLabel(layout) {
+      if (layout.byteMode === "engine-pages") return "engine page allocation";
+      if (layout.byteMode === "custom-wire") {
+        return `custom wire ×${layout.customWireFactor}`;
+      }
+      return layout.profile.byteClass;
+    }
+
     function renderStats(result) {
+      const units = result.capacityUnitMode === "binary"
+        ? ["GiB", "TiB", "PiB"]
+        : ["GB", "TB", "PB"];
       $("stats").innerHTML = [
-        stat("KV / 会话", S.fmtGiB(result.layout.totalBytes), result.layout.profile.label, "hot"),
-        stat("HBM / GPU", fmtCount(result.hbmSessionsPerGpu), `${result.usableHbmGB} GB 可用于会话`),
-        stat("G2 / rack", fmtCount(result.g2SessionsPerRack), `${result.usableG2TB} TB 可用于会话`),
-        stat("CMX raw / POD", fmtCount(result.rawCmxSessionsPerPod), `${result.rawCmxPB} PB raw`),
+        stat("Payload / 会话", S.fmtGiB(result.layout.totalBytes), result.layout.profile.label),
+        stat("所选口径 / 会话", S.fmtGiB(result.layout.selectedTotalBytes), basisLabel(result.layout), "hot"),
+        stat("HBM bytes / GPU / 会话", S.fmtGiB(result.hbmSessionBytes), `growing÷${result.growingShardRanks} + state÷${result.stateShardRanks}`),
+        stat("Pool bytes / 会话", S.fmtGiB(result.poolSessionBytes), `${result.poolCopies} representation copies`),
+        stat("HBM / GPU", result.usableHbmGB > 0 ? fmtCount(result.hbmSessionsPerGpu) : "未设置", `${result.usableHbmGB} ${units[0]}；需显式拓扑`),
+        stat("G2 / rack", fmtCount(result.g2SessionsPerRack), `${result.usableG2TB} ${units[1]} 可用于会话`),
+        stat("CMX raw / POD", fmtCount(result.rawCmxSessionsPerPod), `${result.rawCmxPB} ${units[2]} raw`),
         stat("CMX usable / POD", fmtCount(result.usableCmxSessionsPerPod), `${(result.cmxUsableFraction * 100).toFixed(0)}% usable/raw`, "ok"),
       ].join("");
     }
 
     function renderFormula(result) {
+      const units = result.capacityUnitMode === "binary"
+        ? ["GiB", "TiB", "PiB"]
+        : ["GB", "TB", "PB"];
       $("formula").textContent =
-`session_bytes = paged_KV + extra_continuation_state
+`payload_bytes = paged_KV + extra_continuation_state
               = ${S.fmtGiB(result.layout.pagedKvBytes)} + ${S.fmtGiB(result.layout.totalBytes - result.layout.pagedKvBytes)}
               = ${S.fmtGiB(result.layout.totalBytes)}
 
+selected basis = ${basisLabel(result.layout)}
+selected_bytes = ${S.fmtGiB(result.layout.selectedTotalBytes)}
+
+HBM bytes/session/GPU
+  = selected_growing / ${result.growingShardRanks} + selected_state / ${result.stateShardRanks}
+  = ${S.fmtGiB(result.hbmSessionBytes)}
+
 HBM sessions / GPU
-  = floor(${result.usableHbmGB} GB / session_bytes)
-  = ${fmtCount(result.hbmSessionsPerGpu)}
+  = floor(${result.usableHbmGB} ${units[0]} / HBM_bytes_per_session)
+  = ${result.usableHbmGB > 0 ? fmtCount(result.hbmSessionsPerGpu) : "N/A（未提供 HBM 容量/拓扑）"}
+
+pool bytes/session
+  = selected_bytes × ${result.poolCopies} copies
+  = ${S.fmtGiB(result.poolSessionBytes)}
 
 G2 sessions / rack
-  = floor(${result.usableG2TB} TB / session_bytes)
+  = floor(${result.usableG2TB} ${units[1]} / pool_bytes_per_session)
   = ${fmtCount(result.g2SessionsPerRack)}
 
 CMX usable sessions / POD
-  = floor(${result.rawCmxPB} PB × ${result.cmxUsableFraction} / session_bytes)
+  = floor(${result.rawCmxPB} ${units[2]} × ${result.cmxUsableFraction} / pool_bytes_per_session)
   = ${fmtCount(result.usableCmxSessionsPerPod)}
 
-注意：这是原始字节除法；三个结果的 scope 分别是 GPU、rack、POD。`;
+注意：HBM、rack、POD 是不同 scope；分片/副本必须来自实际 engine deployment。`;
     }
 
     function niceTicks(min, max, count) {
@@ -255,6 +336,7 @@ CMX usable sessions / POD
 
     const anchors = [
       ["V4-Pro BF16", "v4pro", "bf16-logical", false],
+      ["V4-Pro BF16 + MTP", "v4pro", "bf16-logical", true],
       ["V4-Flash BF16", "v4flash", "bf16-logical", false],
       ["GLM-5.2 FP8 base", "glm52", "fp8-logical", false],
       ["GLM-5.2 FP8 + MTP", "glm52", "fp8-logical", true],
@@ -266,28 +348,36 @@ CMX usable sessions / POD
         const result = S.capacityScenario({ ...p, modelId, profileId, includeMtp });
         return `<tr>
           <th scope="row">${label}</th>
-          <td>${S.fmtGiB(result.layout.totalBytes)}</td>
-          <td>${fmtCount(result.hbmSessionsPerGpu)}</td>
+          <td>${result.layout.profile.byteClass}</td>
+          <td>${S.fmtGiB(result.layout.selectedTotalBytes)}</td>
+          <td>${result.usableHbmGB > 0 ? fmtCount(result.hbmSessionsPerGpu) : "N/A"}</td>
           <td>${fmtCount(result.g2SessionsPerRack)}</td>
           <td>${fmtCount(result.usableCmxSessionsPerPod)}</td>
         </tr>`;
       }).join("");
       $("comparison").innerHTML =
-        `<caption>当前容量假设下，四个模型锚点布局的会话驻留数</caption>
+        `<caption>当前容量、字节口径、分片和副本假设下的会话驻留数</caption>
          <thead><tr>
-           <th scope="col">模型 / 布局</th><th scope="col">会话字节</th>
+           <th scope="col">模型 / 布局</th><th scope="col">Profile class</th><th scope="col">所选会话字节</th>
            <th scope="col">HBM / GPU</th><th scope="col">G2 / rack</th>
            <th scope="col">CMX usable / POD</th>
          </tr></thead><tbody>${rows}</tbody>`;
     }
 
     function render() {
+      syncConditionalInputs();
       const p = params();
       $("tokensValue").textContent = Number(p.tokens).toLocaleString();
       const profile = S.profileFor(p.modelId, p.profileId);
-      $("profileNote").textContent =
-        `${profile.note} 证据：${profile.confidence}；模型锚点：${S.MODELS[p.modelId].evidence}。`;
       const result = S.capacityScenario(p);
+      const unsupportedEngine =
+        p.byteMode === "engine-pages" &&
+        result.layout.engineAllocation == null;
+      $("profileNote").textContent =
+        `${profile.note} Class：${profile.byteClass}；证据：${profile.confidence}；模型锚点：${S.MODELS[p.modelId].evidence}。` +
+        (unsupportedEngine
+          ? " 当前 profile 没有可审计的 engine-page 合同，容量显示 N/A。"
+          : "");
       renderStats(result);
       renderFormula(result);
       const contexts = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
@@ -312,12 +402,17 @@ CMX usable sessions / POD
       $("tokens").value = value;
       render();
     });
-    ["profile", "includeMtp", "hbmGB", "g2TB", "cmxPB", "cmxUsable"].forEach((id) => {
+    [
+      "profile", "byteMode", "customWireFactor", "compressorPolicy",
+      "includeMtp", "capacityUnitMode", "hbmGB", "g2TB", "cmxPB",
+      "cmxUsable", "growingShardRanks", "stateShardRanks", "poolCopies",
+    ].forEach((id) => {
       $(id).addEventListener("input", render);
       $(id).addEventListener("change", render);
     });
 
     syncProfiles();
+    syncConditionalInputs();
     render();
   </script>
 </body>

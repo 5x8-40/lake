@@ -16,6 +16,10 @@ function layout(modelId, profileId, tokens = ONE_MI_TOKEN, includeMtp = false) {
   return S.sessionLayout({ modelId, profileId, tokens, includeMtp });
 }
 
+function roundUp(value, alignment) {
+  return Math.ceil(value / alignment) * alignment;
+}
+
 // Published/derived paged-KV anchors, plus continuation state required by
 // the implementation.
 close(
@@ -79,7 +83,19 @@ close(
   "Kimi K3 FP8 MLA + vLLM KDA state"
 );
 
-// V4 emits compressed rows only at complete C4/C128 group boundaries.
+// Independent golden formula: this does not call sessionLayout for any
+// intermediate term.
+const v4ProBf16PagedGolden =
+  30 * (ONE_MI_TOKEN / 4) * (1024 + 256) +
+  31 * (ONE_MI_TOKEN / 128) * 1024 +
+  61 * 128 * 1024;
+assert.equal(
+  layout("v4pro", "bf16-logical").pagedKvBytes,
+  v4ProBf16PagedGolden
+);
+
+// V4 emits compressed rows only at complete C4/C128 group boundaries; SWA
+// retains only the available suffix for short contexts.
 assert.equal(layout("v4pro", "bf16-logical", 1).growingBytes, 0);
 assert.equal(layout("v4pro", "bf16-logical", 3).growingBytes, 0);
 assert.equal(
@@ -89,6 +105,109 @@ assert.equal(
 assert.equal(
   layout("v4pro", "bf16-logical", 128).growingBytes,
   30 * 32 * (1024 + 256) + 31 * 1024
+);
+assert.equal(
+  layout("v4pro", "bf16-logical", 127).swaStateBytes,
+  61 * 127 * 1024
+);
+assert.equal(
+  layout("v4pro", "bf16-logical", 128).swaStateBytes,
+  61 * 128 * 1024
+);
+assert.equal(
+  layout("v4pro", "bf16-logical", 129).swaStateBytes,
+  61 * 128 * 1024
+);
+assert.equal(layout("v4pro", "bf16-logical", 0).totalBytes, 0);
+assert.equal(layout("k3", "fp8-vllm-state", 0).totalBytes, 0);
+
+// MTP is a real model-specific component: V4 adds one SWA state layer, while
+// GLM adds one growing MLA+index layer.
+const v4Base = layout("v4pro", "bf16-logical");
+const v4Mtp = layout("v4pro", "bf16-logical", ONE_MI_TOKEN, true);
+assert.equal(v4Mtp.growingBytes, v4Base.growingBytes);
+assert.equal(v4Mtp.swaStateBytes - v4Base.swaStateBytes, 128 * 1024);
+const glmBase = layout("glm52", "fp8-logical");
+const glmMtp = layout("glm52", "fp8-logical", ONE_MI_TOKEN, true);
+assert.equal(
+  glmMtp.totalBytes - glmBase.totalBytes,
+  ONE_MI_TOKEN * (576 + 132)
+);
+
+// Compressor ring policies are separate representations, not a generic
+// multiplier. Speculative doubles both rings; online C128 keeps one
+// (max,sum,kv) FP32 row.
+const v4Spec = S.sessionLayout({
+  modelId: "v4pro",
+  profileId: "bf16-logical",
+  tokens: ONE_MI_TOKEN,
+  compressorPolicy: "speculative",
+});
+assert.equal(v4Spec.compressorStateBytes, 2 * v4Base.compressorStateBytes);
+const v4Online = S.sessionLayout({
+  modelId: "v4pro",
+  profileId: "bf16-logical",
+  tokens: ONE_MI_TOKEN,
+  compressorPolicy: "online-c128",
+});
+assert.equal(
+  v4Online.compressorStateBytes,
+  30 * 8 * ((2 * 2 * 512) + (2 * 2 * 128)) * 4 +
+    31 * (3 * 512) * 4
+);
+
+// Engine allocation is page/alignment-aware. At a settled snapshot
+// (max_in_flight=0), SlidingWindowSpec admits one extra potentially
+// misaligned page. The FP4 index profile still allocates 132-byte FP8 rows.
+const v4Engine = S.sessionLayout({
+  modelId: "v4pro",
+  profileId: "fp8-vllm",
+  tokens: ONE_MI_TOKEN,
+  byteMode: "engine-pages",
+});
+const fp8GrowingPages =
+  (ONE_MI_TOKEN / 256) *
+  (30 * (roundUp(64 * 584, 576) + roundUp(64 * 132, 576)) +
+    31 * roundUp(2 * 584, 576));
+const fp8SwaPages = 61 * 3 * roundUp(64 * 584, 576);
+const fp8CompressorPages =
+  30 *
+    3 *
+    (roundUp(4 * (2 * 2 * 512) * 4, 576) +
+      roundUp(4 * (2 * 2 * 128) * 4, 576)) +
+  31 * 17 * roundUp(8 * (2 * 512) * 4, 576);
+assert.equal(v4Engine.selectedGrowingBytes, fp8GrowingPages);
+assert.equal(
+  v4Engine.selectedTotalBytes,
+  fp8GrowingPages + fp8SwaPages + fp8CompressorPages
+);
+const v4Fp4Engine = S.sessionLayout({
+  modelId: "v4pro",
+  profileId: "fp8-fp4-payload",
+  tokens: ONE_MI_TOKEN,
+  byteMode: "engine-pages",
+});
+assert.equal(v4Fp4Engine.selectedTotalBytes, v4Engine.selectedTotalBytes);
+assert.equal(
+  S.sessionLayout({
+    modelId: "glm52",
+    profileId: "fp8-logical",
+    tokens: ONE_MI_TOKEN,
+    byteMode: "engine-pages",
+  }).selectedTotalBytes,
+  null
+);
+close(
+  S.sessionLayout({
+    modelId: "k3",
+    profileId: "fp8-vllm-state",
+    tokens: ONE_MI_TOKEN,
+    byteMode: "custom-wire",
+    customWireFactor: 1.25,
+  }).selectedTotalBytes,
+  layout("k3", "fp8-vllm-state").totalBytes * 1.25,
+  0,
+  "custom wire factor"
 );
 
 // Prefix matching is block-aligned and never exceeds the context.
@@ -111,6 +230,8 @@ const baseTraffic = {
   gpus: 1,
   uniqueTpsGpu: 10_000,
   linkGBsGpu: 0,
+  handoffMode: "local",
+  loadMode: "compute",
 };
 
 // KDA state is transferred once, not double-counted.
@@ -159,6 +280,25 @@ assert.equal(fullHit.cappedRead, null);
 assert.equal(fullHit.cappedWrite, 0);
 assert.ok(Number.isFinite(fullHit.readPerRequest));
 
+// An external arrival rate is the only defined way to size U=0 offered load.
+const fullHitArrival = S.trafficScenario({
+  ...fullHit,
+  modelId: baseTraffic.modelId,
+  profileId: baseTraffic.profileId,
+  contextTokens: 1024,
+  hitRate: 1,
+  blockTokens: 256,
+  loadMode: "arrival",
+  arrivalReqsPool: 37,
+});
+assert.equal(fullHitArrival.offeredReqsPool, 37);
+close(
+  fullHitArrival.requiredRead,
+  37 * fullHitArrival.cmxReadPerRequest,
+  0,
+  "external lambda at U=0"
+);
+
 // With q=0 and no writes, bandwidth is exactly zero even though request rate
 // cannot be inferred.
 const localFullHit = S.trafficScenario({
@@ -175,6 +315,47 @@ assert.equal(localFullHit.writePerRequest, 0);
 assert.equal(localFullHit.requiredRead, 0);
 assert.equal(localFullHit.requiredWrite, 0);
 assert.equal(localFullHit.linkReqCeiling, Infinity);
+
+// P->D handoff paths conserve the final representation: direct puts it on the
+// P-D fabric, via-CMX adds the same bytes to CMX reads, and local adds neither.
+const pdCommon = {
+  ...baseTraffic,
+  contextTokens: 4096,
+  extraTokens: 64,
+  hitRate: 0.5,
+  blockTokens: 256,
+  loadMode: "arrival",
+  arrivalReqsPool: 2,
+};
+const pdLocal = S.trafficScenario({ ...pdCommon, handoffMode: "local" });
+const pdDirect = S.trafficScenario({ ...pdCommon, handoffMode: "direct" });
+const pdViaCmx = S.trafficScenario({ ...pdCommon, handoffMode: "via-cmx" });
+assert.equal(pdLocal.directPerRequest, 0);
+assert.equal(pdLocal.decodeReadPerRequest, 0);
+assert.equal(
+  pdDirect.directPerRequest,
+  pdDirect.finalLayout.selectedTotalBytes
+);
+assert.equal(pdDirect.cmxReadPerRequest, pdLocal.cmxReadPerRequest);
+assert.equal(
+  pdViaCmx.decodeReadPerRequest,
+  pdViaCmx.finalLayout.selectedTotalBytes
+);
+assert.equal(
+  pdViaCmx.cmxReadPerRequest,
+  pdLocal.cmxReadPerRequest + pdViaCmx.decodeReadPerRequest
+);
+assert.equal(pdLocal.writePerRequest, pdDirect.writePerRequest);
+assert.equal(pdDirect.writePerRequest, pdViaCmx.writePerRequest);
+const forcedViaCmx = S.trafficScenario({
+  ...pdCommon,
+  handoffMode: "via-cmx",
+  admissionFraction: 0,
+  writeState: false,
+});
+assert.equal(forcedViaCmx.effectiveAdmissionFraction, 1);
+assert.equal(forcedViaCmx.effectiveWriteState, true);
+assert.ok(forcedViaCmx.writePerRequest > 0);
 
 // Disabling state writes still writes only newly generated growing KV.
 const noStateWrite = S.trafficScenario({
@@ -314,18 +495,53 @@ assert.equal(
   Math.floor(1e9 / positiveCapacity.layout.totalBytes)
 );
 
-// Cache economics keeps token hit, prefill compute share, and cache cost on
-// separate denominators. A 20% compute saving is not implied by hit rate alone.
+// HBM sharding and pool replication have different denominators. Fixed KDA
+// state can stay replicated while growing MLA is sharded.
+const shardedCapacity = S.capacityScenario({
+  modelId: "k3",
+  profileId: "fp8-vllm-state",
+  tokens: ONE_MI_TOKEN,
+  usableHbmGB: 80,
+  usableG2TB: 1,
+  rawCmxPB: 1,
+  cmxUsableFraction: 0.8,
+  growingShardRanks: 8,
+  stateShardRanks: 1,
+  poolCopies: 2,
+  capacityUnitMode: "binary",
+});
+close(
+  shardedCapacity.hbmSessionBytes,
+  shardedCapacity.layout.selectedGrowingBytes / 8 +
+    shardedCapacity.layout.selectedStateBytes,
+  0,
+  "HBM sharded growing plus replicated state"
+);
+assert.equal(
+  shardedCapacity.poolSessionBytes,
+  2 * shardedCapacity.layout.selectedTotalBytes
+);
+assert.equal(
+  shardedCapacity.hbmSessionsPerGpu,
+  Math.floor(80 * S.GiB / shardedCapacity.hbmSessionBytes)
+);
+assert.equal(
+  shardedCapacity.g2SessionsPerRack,
+  Math.floor(1024 ** 4 / shardedCapacity.poolSessionBytes)
+);
+
+// Cache economics uses avoided Prefill GPU work, not the trace's token cache
+// hit. All percentages share the same baseline-GPU-cost denominator.
 const economics = S.economicsScenario({
-  hitRate: 0.9229385582485566,
-  prefillComputeShare: 0.22,
+  prefillComputeShare: 0.25,
+  avoidedPrefillWorkFraction: 0.8,
   avoidEfficiency: 1,
   cacheCostShare: 0.05,
   targetComputeSavings: 0.2,
 });
 close(
   economics.grossComputeSavings,
-  0.22 * 0.9229385582485566,
+  0.25 * 0.8,
   1e-15,
   "gross compute savings"
 );
@@ -337,7 +553,7 @@ close(
 );
 close(
   economics.requiredPrefillComputeShare,
-  0.2 / 0.9229385582485566,
+  0.2 / 0.8,
   1e-15,
   "required prefill share"
 );
@@ -355,8 +571,8 @@ close(
 );
 
 const zeroEconomics = S.economicsScenario({
-  hitRate: 0,
   prefillComputeShare: 2,
+  avoidedPrefillWorkFraction: 0,
   avoidEfficiency: 1,
   cacheCostShare: 0,
   targetComputeSavings: 0.2,
@@ -366,6 +582,16 @@ assert.equal(zeroEconomics.grossComputeSavings, 0);
 assert.equal(zeroEconomics.requiredPrefillComputeShare, null);
 assert.equal(zeroEconomics.grossBenefitCostRatio, null);
 assert.equal(zeroEconomics.netRoi, null);
+assert.equal(
+  S.economicsScenario({
+    prefillComputeShare: 0,
+    avoidedPrefillWorkFraction: 0,
+    avoidEfficiency: 0,
+    cacheCostShare: 0,
+    targetComputeSavings: 0,
+  }).requiredPrefillComputeShare,
+  0
+);
 
 // Formatter edge cases distinguish unknown/invalid from an unbounded ceiling.
 assert.equal(S.fmtGiB(null), "N/A");

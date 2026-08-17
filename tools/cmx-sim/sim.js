@@ -5,7 +5,7 @@
  * model. It separates:
  *   1. model/layout bytes,
  *   2. compute-offered request load,
- *   3. required CMX traffic,
+ *   3. CMX and P->D offered traffic,
  *   4. an optional user-supplied transfer ceiling.
  *
  * Browser and Node share this file. Storage uses bytes/GiB; bandwidth uses
@@ -28,6 +28,7 @@
       nC4: 30,
       nC128: 31,
       nSwaOnly: 0,
+      hasMtp: true,
       evidence: "vLLM 2026-04-24 appendix + DeepSeek-V4 §4.2.1",
     },
     v4flash: {
@@ -37,6 +38,7 @@
       nC4: 21,
       nC128: 20,
       nSwaOnly: 2,
+      hasMtp: true,
       evidence: "DeepSeek-V4 §4.2.1; derived layer arithmetic",
     },
     glm52: {
@@ -45,6 +47,7 @@
       kind: "glm",
       nLayers: 78,
       nIndexer: 21,
+      hasMtp: true,
       evidence: "GLM-5.2 config/blog; MTP is an explicit optional layer",
     },
     k3: {
@@ -67,24 +70,27 @@
         label: "BF16 公式布局（1024 B main / 256 B index）",
         mainEntryBytes: 1024,
         indexEntryBytes: 256,
+        byteClass: "logical-payload",
         confidence: "published",
         note: "BF16 paged-KV 公式布局；可继续会话还需 vLLM FP32 compressor state。",
       },
       {
         id: "fp8-vllm",
-        label: "vLLM fp8_ds_mla + FP8 index（584 / 132 B）",
+        label: "vLLM FP8 entry payload（584 / 132 B）",
         mainEntryBytes: 584,
         indexEntryBytes: 132,
+        byteClass: "engine-entry-payload",
         confidence: "implementation",
-        note: "引擎页布局，另计 FP32 compressor state；不等于 CMX 序列化格式。",
+        note: "引擎 entry payload；allocator page 还需按 block/alignment 向上取整，不等于 CMX 序列化格式。",
       },
       {
         id: "fp8-fp4-payload",
         label: "FP8 main + FP4 index payload（584 / 68 B）",
         mainEntryBytes: 584,
         indexEntryBytes: 68,
+        byteClass: "payload-estimate",
         confidence: "estimate",
-        note: "payload 估算，另计 FP32 compressor state；实际页分配可更大。",
+        note: "有效 payload 估算；vLLM 当前仍按 132 B FP8 index entry 分配页，实际 allocation 不会减半。",
       },
     ],
     v4flash: null,
@@ -94,6 +100,7 @@
         label: "BF16 逻辑布局（1152 B MLA / 256 B index）",
         mainEntryBytes: 1152,
         indexEntryBytes: 256,
+        byteClass: "logical-payload",
         confidence: "derived",
         note: "按 576 个 BF16 元素；不含页对齐。",
       },
@@ -102,16 +109,18 @@
         label: "FP8 逻辑 MLA + 132 B index",
         mainEntryBytes: 576,
         indexEntryBytes: 132,
+        byteClass: "logical-payload",
         confidence: "implementation",
         note: "MLA 是逻辑 576 B；index entry 按实现 132 B。",
       },
       {
         id: "fp8-ds-mla",
-        label: "vLLM fp8_ds_mla（656 B MLA / 132 B index）",
+        label: "vLLM FP8 entry payload（656 B MLA / 132 B index）",
         mainEntryBytes: 656,
         indexEntryBytes: 132,
+        byteClass: "engine-entry-payload",
         confidence: "implementation",
-        note: "vLLM MLAAttentionSpec 的 656 B 引擎布局。",
+        note: "vLLM MLAAttentionSpec 的 entry payload；未计 page alignment/allocator reserve。",
       },
     ],
     k3: [
@@ -119,6 +128,7 @@
         id: "bf16-vllm-state",
         label: "BF16 MLA + vLLM KDA state",
         mainEntryBytes: 1152,
+        byteClass: "engine-entry-payload",
         confidence: "implementation",
         note: "KDA conv 跟模型 dtype；recurrent 固定 FP32。",
       },
@@ -126,6 +136,7 @@
         id: "fp8-vllm-state",
         label: "FP8 MLA + vLLM 默认 KDA state",
         mainEntryBytes: 576,
+        byteClass: "mixed-payload",
         confidence: "mixed",
         note: "MLA 按 FP8；KDA conv 默认仍按 BF16，recurrent 为 FP32。",
       },
@@ -151,6 +162,15 @@
       : Math.floor(value);
   }
 
+  function roundUp(value, alignment) {
+    if (alignment <= 0) return value;
+    return Math.ceil(value / alignment) * alignment;
+  }
+
+  function ceilDiv(value, divisor) {
+    return Math.ceil(value / divisor);
+  }
+
   function profileFor(modelId, profileId) {
     var profiles = PROFILES[modelId];
     if (!profiles) throw new Error("unknown model: " + modelId);
@@ -163,7 +183,7 @@
     return (PROFILES[modelId] || []).slice();
   }
 
-  function kdaStateBytes(model, profile) {
+  function kdaStateBytes(model) {
     var recurrentPerLayer =
       model.kdaHeads * model.kdaDim * model.kdaDim * 4; // FP32 in vLLM
     var convElemsPerLayer =
@@ -174,18 +194,88 @@
     return model.nKda * (recurrentPerLayer + convElemsPerLayer * convBytesPerElem);
   }
 
-  function v4CompressorStateBytes(model) {
-    // vLLM CompressorStateCache is FP32. For C4, both the main compressor
-    // (head=512) and indexer compressor (head=128) retain 8 rows. For C128,
-    // the main compressor retains 128 rows. These residuals are required to
-    // continue compression after a P/D or storage handoff.
-    var c4MainPerLayer = 8 * (2 * 2 * 512) * 4;
-    var c4IndexerPerLayer = 8 * (2 * 2 * 128) * 4;
-    var c128MainPerLayer = 128 * (2 * 1 * 512) * 4;
+  function v4CompressorStateBytes(model, policy) {
+    // Base vLLM/SGLang retains 8 C4 rows and 128 C128 rows. SGLang's
+    // speculative policy doubles those rings. Online C128 instead keeps one
+    // (max, sum, kv) FP32 row and is not the same layout as the raw-token ring.
+    var speculative = policy === "speculative";
+    var onlineC128 = policy === "online-c128";
+    var c4Rows = speculative ? 16 : 8;
+    var c128Rows = speculative ? 256 : onlineC128 ? 1 : 128;
+    var c4MainPerLayer = c4Rows * (2 * 2 * 512) * 4;
+    var c4IndexerPerLayer = c4Rows * (2 * 2 * 128) * 4;
+    var c128StateDim = onlineC128 ? 3 * 512 : 2 * 1 * 512;
+    var c128MainPerLayer = c128Rows * c128StateDim * 4;
     return (
       model.nC4 * (c4MainPerLayer + c4IndexerPerLayer) +
       model.nC128 * c128MainPerLayer
     );
+  }
+
+  function slidingAdmissionPages(tokens, windowTokens, blockTokens, inFlightTokens) {
+    if (tokens <= 0) return 0;
+    var heldTokens = Math.min(
+      tokens,
+      Math.max(0, windowTokens - 1 + inFlightTokens)
+    );
+    // Mirrors SlidingWindowSpec.max_admission_blocks_per_request: an extra
+    // block is required because the window can begin mid-block.
+    return ceilDiv(heldTokens, blockTokens) + 1;
+  }
+
+  function v4EngineAllocation(model, profile, tokens, includeMtp, policy, inFlight) {
+    // Only the audited vLLM base-ring layouts have a reproducible page model.
+    // Speculative/online policies are SGLang-specific representations.
+    if (policy !== "base") return null;
+
+    var isBf16 = profile.id === "bf16-logical";
+    var isFp8 =
+      profile.id === "fp8-vllm" || profile.id === "fp8-fp4-payload";
+    if (!isBf16 && !isFp8) return null;
+
+    var mainEntryBytes = isBf16 ? 1024 : 584;
+    // vLLM allocates the FP4 index cache at the FP8 132-byte entry size and
+    // uses only the first half of the data region.
+    var indexEntryBytes = isBf16 ? 256 : 132;
+    var alignment = isBf16 ? 512 : 576;
+    var sourceBlocks = tokens > 0 ? ceilDiv(tokens, 256) : 0;
+    var c4MainPage = roundUp(64 * mainEntryBytes, alignment);
+    var c4IndexPage = roundUp(64 * indexEntryBytes, alignment);
+    var c128MainPage = roundUp(2 * mainEntryBytes, alignment);
+    var growing =
+      sourceBlocks *
+      (model.nC4 * (c4MainPage + c4IndexPage) +
+        model.nC128 * c128MainPage);
+
+    var swaPage = roundUp(64 * mainEntryBytes, alignment);
+    var swaLayers =
+      model.nC4 + model.nC128 + model.nSwaOnly + (includeMtp ? 1 : 0);
+    var swa =
+      swaLayers *
+      slidingAdmissionPages(tokens, SWA_TOKENS, 64, inFlight) *
+      swaPage;
+
+    var c4MainStatePage = roundUp(4 * (2 * 2 * 512) * 4, alignment);
+    var c4IndexerStatePage = roundUp(4 * (2 * 2 * 128) * 4, alignment);
+    var c128MainStatePage = roundUp(8 * (2 * 1 * 512) * 4, alignment);
+    var compressor =
+      model.nC4 *
+        slidingAdmissionPages(tokens, 8, 4, inFlight) *
+        (c4MainStatePage + c4IndexerStatePage) +
+      model.nC128 *
+        slidingAdmissionPages(tokens, 128, 8, inFlight) *
+        c128MainStatePage;
+
+    return {
+      growingBytes: growing,
+      swaStateBytes: swa,
+      compressorStateBytes: compressor,
+      stateBytes: swa + compressor,
+      pagedKvBytes: growing + swa,
+      totalBytes: growing + swa + compressor,
+      note:
+        "vLLM page/alignment + sliding-window admission estimate; excludes global allocator fragmentation and packed-pool sharing.",
+    };
   }
 
   function sessionLayout(p) {
@@ -193,7 +283,21 @@
     if (!model) throw new Error("unknown model: " + p.modelId);
     var profile = profileFor(p.modelId, p.profileId);
     var tokens = Math.max(0, Math.floor(numberOr(p.tokens, 0)));
-    var includeMtp = !!p.includeMtp && model.kind === "glm";
+    var includeMtp = !!p.includeMtp && !!model.hasMtp;
+    var compressorPolicy =
+      p.compressorPolicy === "speculative" ||
+      p.compressorPolicy === "online-c128"
+        ? p.compressorPolicy
+        : "base";
+    var byteMode =
+      p.byteMode === "engine-pages" || p.byteMode === "custom-wire"
+        ? p.byteMode
+        : "payload";
+    var customWireFactor = Math.max(0, numberOr(p.customWireFactor, 1));
+    var inFlightTokens = Math.max(
+      0,
+      Math.floor(numberOr(p.inFlightTokens, 0))
+    );
     var growingBytes = 0;
     var stateBytes = 0;
     var swaStateBytes = 0;
@@ -209,10 +313,14 @@
         model.nC4 * c4Entries * (profile.mainEntryBytes + profile.indexEntryBytes) +
         model.nC128 * c128Entries * profile.mainEntryBytes;
       swaStateBytes =
-        (model.nC4 + model.nC128 + model.nSwaOnly) *
-        SWA_TOKENS *
+        (model.nC4 +
+          model.nC128 +
+          model.nSwaOnly +
+          (includeMtp ? 1 : 0)) *
+        Math.min(tokens, SWA_TOKENS) *
         profile.mainEntryBytes;
-      compressorStateBytes = v4CompressorStateBytes(model);
+      compressorStateBytes =
+        tokens > 0 ? v4CompressorStateBytes(model, compressorPolicy) : 0;
       stateBytes = swaStateBytes + compressorStateBytes;
       growingBytesPerToken =
         model.nC4 * (profile.mainEntryBytes + profile.indexEntryBytes) / 4 +
@@ -226,7 +334,45 @@
     } else {
       growingBytesPerToken = model.nMla * profile.mainEntryBytes;
       growingBytes = tokens * growingBytesPerToken;
-      stateBytes = kdaStateBytes(model, profile);
+      stateBytes = tokens > 0 ? kdaStateBytes(model) : 0;
+    }
+
+    var engineAllocation =
+      model.kind === "v4"
+        ? v4EngineAllocation(
+            model,
+            profile,
+            tokens,
+            includeMtp,
+            compressorPolicy,
+            inFlightTokens
+          )
+        : null;
+    var selectedGrowingBytes = growingBytes;
+    var selectedStateBytes = stateBytes;
+    var selectedPagedKvBytes = growingBytes + swaStateBytes;
+    var selectedTotalBytes = growingBytes + stateBytes;
+    var selectedBasis = profile.byteClass;
+    if (byteMode === "engine-pages") {
+      selectedGrowingBytes = engineAllocation
+        ? engineAllocation.growingBytes
+        : null;
+      selectedStateBytes = engineAllocation
+        ? engineAllocation.stateBytes
+        : null;
+      selectedPagedKvBytes = engineAllocation
+        ? engineAllocation.pagedKvBytes
+        : null;
+      selectedTotalBytes = engineAllocation
+        ? engineAllocation.totalBytes
+        : null;
+      selectedBasis = "engine-page-allocation";
+    } else if (byteMode === "custom-wire") {
+      selectedGrowingBytes *= customWireFactor;
+      selectedStateBytes *= customWireFactor;
+      selectedPagedKvBytes *= customWireFactor;
+      selectedTotalBytes *= customWireFactor;
+      selectedBasis = "custom-wire";
     }
 
     return {
@@ -234,6 +380,10 @@
       profile: profile,
       tokens: tokens,
       includeMtp: includeMtp,
+      compressorPolicy: compressorPolicy,
+      byteMode: byteMode,
+      customWireFactor: customWireFactor,
+      inFlightTokens: inFlightTokens,
       growingBytes: growingBytes,
       stateBytes: stateBytes,
       swaStateBytes: swaStateBytes,
@@ -241,6 +391,12 @@
       pagedKvBytes: growingBytes + swaStateBytes,
       totalBytes: growingBytes + stateBytes,
       growingBytesPerToken: growingBytesPerToken,
+      engineAllocation: engineAllocation,
+      selectedBasis: selectedBasis,
+      selectedGrowingBytes: selectedGrowingBytes,
+      selectedStateBytes: selectedStateBytes,
+      selectedPagedKvBytes: selectedPagedKvBytes,
+      selectedTotalBytes: selectedTotalBytes,
     };
   }
 
@@ -253,8 +409,13 @@
   }
 
   function bytesAtRate(requestRate, bytesPerRequest) {
+    if (bytesPerRequest == null) return null;
     if (bytesPerRequest === 0) return 0;
     return requestRate == null ? null : requestRate * bytesPerRequest;
+  }
+
+  function addBytes(left, right) {
+    return left == null || right == null ? null : left + right;
   }
 
   function trafficScenario(p) {
@@ -273,29 +434,72 @@
       modelId: p.modelId,
       profileId: p.profileId,
       includeMtp: !!p.includeMtp,
+      compressorPolicy: p.compressorPolicy,
+      byteMode: p.byteMode,
+      customWireFactor: p.customWireFactor,
+      inFlightTokens: p.inFlightTokens,
     };
     var matchedLayout = sessionLayout(Object.assign({}, common, { tokens: matched }));
     var finalLayout = sessionLayout(Object.assign({}, common, { tokens: finalTokens }));
 
     var readPerRequest =
-      matched > 0 ? remoteFraction * matchedLayout.totalBytes : 0;
-    var growingDelta = Math.max(
-      0,
-      finalLayout.growingBytes - matchedLayout.growingBytes
-    );
+      matched > 0 && matchedLayout.selectedTotalBytes != null
+        ? remoteFraction * matchedLayout.selectedTotalBytes
+        : matched > 0
+          ? null
+          : 0;
+    var growingDelta =
+      finalLayout.selectedGrowingBytes == null ||
+      matchedLayout.selectedGrowingBytes == null
+        ? null
+        : Math.max(
+            0,
+            finalLayout.selectedGrowingBytes -
+              matchedLayout.selectedGrowingBytes
+          );
+    var handoffMode =
+      p.handoffMode === "via-cmx" || p.handoffMode === "local"
+        ? p.handoffMode
+        : "direct";
+    // A via-CMX P->D handoff must materialize the computed final state even if
+    // the long-term cache admission policy would otherwise reject it.
+    var effectiveAdmissionFraction =
+      handoffMode === "via-cmx" ? 1 : admissionFraction;
+    var effectiveWriteState = writeState || handoffMode === "via-cmx";
     var stateWrite =
-      writeState && uniqueTokens > 0 ? finalLayout.stateBytes : 0;
+      effectiveWriteState && uniqueTokens > 0
+        ? finalLayout.selectedStateBytes
+        : 0;
     var writePerRequest =
-      admissionFraction * (growingDelta + stateWrite);
+      growingDelta == null || stateWrite == null
+        ? null
+        : effectiveAdmissionFraction * (growingDelta + stateWrite);
+    var decodeReadPerRequest =
+      handoffMode === "via-cmx" ? finalLayout.selectedTotalBytes : 0;
+    var directPerRequest =
+      handoffMode === "direct" ? finalLayout.selectedTotalBytes : 0;
+    var cmxReadPerRequest = addBytes(readPerRequest, decodeReadPerRequest);
 
-    // U=0 means this input cannot derive an arrival rate: the request is not
-    // bounded by unique-token compute. Represent that as unknown, not infinity.
-    var offeredReqsGpu =
-      uniqueTokens > 0 ? uniqueTpsGpu / uniqueTokens : null;
+    var loadMode = p.loadMode === "arrival" ? "arrival" : "compute";
+    var arrivalReqsPool = Math.max(0, numberOr(p.arrivalReqsPool, 0));
+    // U=0 cannot derive request rate from unique-token throughput. An explicit
+    // external arrival rate remains valid for full-hit requests.
     var offeredReqsPool =
-      offeredReqsGpu == null ? null : offeredReqsGpu * gpus;
-    var requiredRead = bytesAtRate(offeredReqsPool, readPerRequest);
+      loadMode === "arrival"
+        ? arrivalReqsPool
+        : uniqueTokens > 0
+          ? (uniqueTpsGpu * gpus) / uniqueTokens
+          : null;
+    var offeredReqsGpu =
+      offeredReqsPool == null ? null : offeredReqsPool / gpus;
+    var prefixRequiredRead = bytesAtRate(offeredReqsPool, readPerRequest);
+    var decodeRequiredRead = bytesAtRate(
+      offeredReqsPool,
+      decodeReadPerRequest
+    );
+    var requiredRead = bytesAtRate(offeredReqsPool, cmxReadPerRequest);
     var requiredWrite = bytesAtRate(offeredReqsPool, writePerRequest);
+    var requiredDirect = bytesAtRate(offeredReqsPool, directPerRequest);
 
     var linkGBsGpu = Math.max(0, numberOr(p.linkGBsGpu, 0));
     var linkBudgetPool = linkGBsGpu * GB * gpus;
@@ -304,20 +508,54 @@
     if (linkBudgetPool > 0) {
       if (linkMode === "full-duplex") {
         var readCeiling =
-          readPerRequest > 0 ? linkBudgetPool / readPerRequest : Infinity;
+          cmxReadPerRequest > 0
+            ? linkBudgetPool / cmxReadPerRequest
+            : cmxReadPerRequest === 0
+              ? Infinity
+              : null;
         var writeCeiling =
-          writePerRequest > 0 ? linkBudgetPool / writePerRequest : Infinity;
-        linkReqCeiling = Math.min(readCeiling, writeCeiling);
-      } else {
-        var bytesPerRequest = readPerRequest + writePerRequest;
+          writePerRequest > 0
+            ? linkBudgetPool / writePerRequest
+            : writePerRequest === 0
+              ? Infinity
+              : null;
         linkReqCeiling =
-          bytesPerRequest > 0 ? linkBudgetPool / bytesPerRequest : Infinity;
+          readCeiling == null || writeCeiling == null
+            ? null
+            : Math.min(readCeiling, writeCeiling);
+      } else {
+        var bytesPerRequest = addBytes(cmxReadPerRequest, writePerRequest);
+        linkReqCeiling =
+          bytesPerRequest == null
+            ? null
+            : bytesPerRequest > 0
+              ? linkBudgetPool / bytesPerRequest
+              : Infinity;
       }
     }
+    var pdLinkGBsGpu = Math.max(0, numberOr(p.pdLinkGBsGpu, 0));
+    var pdLinkBudgetPool = pdLinkGBsGpu * GB * gpus;
+    var pdLinkReqCeiling =
+      pdLinkBudgetPool > 0
+        ? directPerRequest == null
+          ? null
+          : directPerRequest > 0
+            ? pdLinkBudgetPool / directPerRequest
+            : Infinity
+        : null;
+    var overallLinkCeilings = [linkReqCeiling, pdLinkReqCeiling].filter(
+      function (value) {
+        return value != null;
+      }
+    );
+    var overallLinkReqCeiling =
+      overallLinkCeilings.length > 0
+        ? Math.min.apply(null, overallLinkCeilings)
+        : null;
     var cappedReqsPool =
-      linkReqCeiling == null || offeredReqsPool == null
+      overallLinkReqCeiling == null || offeredReqsPool == null
         ? null
-        : Math.min(offeredReqsPool, linkReqCeiling);
+        : Math.min(offeredReqsPool, overallLinkReqCeiling);
 
     return {
       model: finalLayout.model,
@@ -331,25 +569,42 @@
       blockTokens: Math.max(1, Math.floor(numberOr(p.blockTokens, 1))),
       remoteFraction: remoteFraction,
       admissionFraction: admissionFraction,
+      effectiveAdmissionFraction: effectiveAdmissionFraction,
       writeState: writeState,
+      effectiveWriteState: effectiveWriteState,
+      handoffMode: handoffMode,
+      loadMode: loadMode,
+      arrivalReqsPool: arrivalReqsPool,
       gpus: gpus,
       uniqueTpsGpu: uniqueTpsGpu,
       matchedLayout: matchedLayout,
       finalLayout: finalLayout,
       readPerRequest: readPerRequest,
+      decodeReadPerRequest: decodeReadPerRequest,
+      cmxReadPerRequest: cmxReadPerRequest,
+      directPerRequest: directPerRequest,
       writePerRequest: writePerRequest,
-      stateWriteBytes: admissionFraction * stateWrite,
+      stateWriteBytes:
+        stateWrite == null ? null : effectiveAdmissionFraction * stateWrite,
       offeredReqsGpu: offeredReqsGpu,
       offeredReqsPool: offeredReqsPool,
+      prefixRequiredRead: prefixRequiredRead,
+      decodeRequiredRead: decodeRequiredRead,
       requiredRead: requiredRead,
       requiredWrite: requiredWrite,
+      requiredDirect: requiredDirect,
       linkGBsGpu: linkGBsGpu,
       linkBudgetPool: linkBudgetPool,
       linkMode: linkMode,
       linkReqCeiling: linkReqCeiling,
+      pdLinkGBsGpu: pdLinkGBsGpu,
+      pdLinkBudgetPool: pdLinkBudgetPool,
+      pdLinkReqCeiling: pdLinkReqCeiling,
+      overallLinkReqCeiling: overallLinkReqCeiling,
       cappedReqsPool: cappedReqsPool,
-      cappedRead: bytesAtRate(cappedReqsPool, readPerRequest),
+      cappedRead: bytesAtRate(cappedReqsPool, cmxReadPerRequest),
       cappedWrite: bytesAtRate(cappedReqsPool, writePerRequest),
+      cappedDirect: bytesAtRate(cappedReqsPool, directPerRequest),
     };
   }
 
@@ -359,50 +614,94 @@
       profileId: p.profileId,
       tokens: p.tokens,
       includeMtp: p.includeMtp,
+      compressorPolicy: p.compressorPolicy,
+      byteMode: p.byteMode,
+      customWireFactor: p.customWireFactor,
+      inFlightTokens: p.inFlightTokens,
     });
-    var bytes = layout.totalBytes;
+    var bytes = layout.selectedTotalBytes;
     var usableHbmGB = Math.max(0, numberOr(p.usableHbmGB, 0));
     var usableG2TB = Math.max(0, numberOr(p.usableG2TB, 0));
     var rawCmxPB = Math.max(0, numberOr(p.rawCmxPB, 0));
     var cmxUsableFraction = clamp(p.cmxUsableFraction, 0, 1);
-    var hbmBytes = usableHbmGB * GB;
-    var g2Bytes = usableG2TB * 1e12;
-    var rawCmxBytes = rawCmxPB * 1e15;
+    var binaryUnits = p.capacityUnitMode === "binary";
+    var hbmBytes = usableHbmGB * (binaryUnits ? GiB : GB);
+    var g2Bytes = usableG2TB * (binaryUnits ? 1024 ** 4 : 1e12);
+    var rawCmxBytes = rawCmxPB * (binaryUnits ? 1024 ** 5 : 1e15);
     var usableCmxBytes = rawCmxBytes * cmxUsableFraction;
+    var growingShardRanks = Math.max(
+      1,
+      Math.floor(numberOr(p.growingShardRanks, 1))
+    );
+    var stateShardRanks = Math.max(
+      1,
+      Math.floor(numberOr(p.stateShardRanks, 1))
+    );
+    var poolCopies = Math.max(
+      1,
+      Math.floor(numberOr(p.poolCopies, 1))
+    );
+    var hbmSessionBytes =
+      layout.selectedGrowingBytes == null || layout.selectedStateBytes == null
+        ? null
+        : layout.selectedGrowingBytes / growingShardRanks +
+          layout.selectedStateBytes / stateShardRanks;
+    var poolSessionBytes = bytes == null ? null : bytes * poolCopies;
     return {
       layout: layout,
       usableHbmGB: usableHbmGB,
       usableG2TB: usableG2TB,
       rawCmxPB: rawCmxPB,
       cmxUsableFraction: cmxUsableFraction,
-      hbmSessionsPerGpu: bytes > 0 ? Math.floor(hbmBytes / bytes) : null,
-      g2SessionsPerRack: bytes > 0 ? Math.floor(g2Bytes / bytes) : null,
-      rawCmxSessionsPerPod: bytes > 0 ? Math.floor(rawCmxBytes / bytes) : null,
+      capacityUnitMode: binaryUnits ? "binary" : "decimal",
+      growingShardRanks: growingShardRanks,
+      stateShardRanks: stateShardRanks,
+      poolCopies: poolCopies,
+      hbmSessionBytes: hbmSessionBytes,
+      poolSessionBytes: poolSessionBytes,
+      hbmSessionsPerGpu:
+        hbmSessionBytes > 0 ? Math.floor(hbmBytes / hbmSessionBytes) : null,
+      g2SessionsPerRack:
+        poolSessionBytes > 0 ? Math.floor(g2Bytes / poolSessionBytes) : null,
+      rawCmxSessionsPerPod:
+        poolSessionBytes > 0
+          ? Math.floor(rawCmxBytes / poolSessionBytes)
+          : null,
       usableCmxSessionsPerPod:
-        bytes > 0 ? Math.floor(usableCmxBytes / bytes) : null,
+        poolSessionBytes > 0
+          ? Math.floor(usableCmxBytes / poolSessionBytes)
+          : null,
     };
   }
 
   function economicsScenario(p) {
-    var hitRate = clamp(p.hitRate, 0, 1);
     var prefillComputeShare = clamp(p.prefillComputeShare, 0, 1);
+    var avoidedPrefillWorkFraction = clamp(
+      p.avoidedPrefillWorkFraction,
+      0,
+      1
+    );
     var avoidEfficiency = clamp(p.avoidEfficiency, 0, 1);
     var cacheCostShare = clamp(p.cacheCostShare, 0, 1);
     var targetComputeSavings = clamp(p.targetComputeSavings, 0, 1);
     var grossComputeSavings =
-      prefillComputeShare * hitRate * avoidEfficiency;
+      prefillComputeShare * avoidedPrefillWorkFraction * avoidEfficiency;
     var netSavings = grossComputeSavings - cacheCostShare;
-    var effectiveHit = hitRate * avoidEfficiency;
+    var effectiveAvoidance = avoidedPrefillWorkFraction * avoidEfficiency;
     return {
-      hitRate: hitRate,
       prefillComputeShare: prefillComputeShare,
+      avoidedPrefillWorkFraction: avoidedPrefillWorkFraction,
       avoidEfficiency: avoidEfficiency,
       cacheCostShare: cacheCostShare,
       targetComputeSavings: targetComputeSavings,
       grossComputeSavings: grossComputeSavings,
       netSavings: netSavings,
       requiredPrefillComputeShare:
-        effectiveHit > 0 ? targetComputeSavings / effectiveHit : null,
+        targetComputeSavings === 0
+          ? 0
+          : effectiveAvoidance > 0
+            ? targetComputeSavings / effectiveAvoidance
+            : null,
       grossBenefitCostRatio:
         cacheCostShare > 0 ? grossComputeSavings / cacheCostShare : null,
       netRoi: cacheCostShare > 0 ? netSavings / cacheCostShare : null,
