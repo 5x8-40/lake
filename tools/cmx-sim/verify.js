@@ -459,90 +459,195 @@ assert.equal(agenticLocal.requiredRead, 0);
   "pdLinkReqCeiling",
 ].forEach((field) => assert.ok(!(field in agenticKimi), `${field} removed`));
 
-// Explicit zeros stay zero in the capacity model.
-const zeroCapacity = S.capacityScenario({
-  modelId: "v4pro",
-  profileId: "bf16-logical",
-  tokens: ONE_MI_TOKEN,
-  usableHbmGB: 0,
-  usableG2TB: 0,
-  rawCmxPB: 0,
-  cmxUsableFraction: 0,
-});
-assert.equal(zeroCapacity.hbmSessionsPerGpu, 0);
-assert.equal(zeroCapacity.g2SessionsPerRack, 0);
-assert.equal(zeroCapacity.usableCmxSessionsPerPod, 0);
-
-// A genuinely zero-byte layout is undefined for capacity division.
-const emptyCapacity = S.capacityScenario({
-  modelId: "glm52",
-  profileId: "fp8-logical",
-  tokens: 0,
-  usableHbmGB: 100,
-  usableG2TB: 1,
-  rawCmxPB: 1,
-  cmxUsableFraction: 1,
-});
-assert.equal(emptyCapacity.hbmSessionsPerGpu, null);
-assert.equal(emptyCapacity.g2SessionsPerRack, null);
-assert.equal(emptyCapacity.usableCmxSessionsPerPod, null);
-
-// Positive session sizes retain exact floor-division semantics.
-const positiveCapacity = S.capacityScenario({
-  modelId: "glm52",
-  profileId: "fp8-logical",
-  tokens: 1024,
-  usableHbmGB: 1,
-  usableG2TB: 0,
-  rawCmxPB: 0,
-  cmxUsableFraction: 0,
-});
-assert.equal(
-  positiveCapacity.hbmSessionsPerGpu,
-  Math.floor(1e9 / positiveCapacity.layout.totalBytes)
-);
-
-// HBM sharding and pool replication have different denominators. Fixed KDA
-// state can stay replicated while growing MLA is sharded.
-const shardedCapacity = S.capacityScenario({
+// Capacity retention starts with one shared cache lineage per user. Prefix-hit
+// bytes are anchored once, while only newly-computed growing KV accumulates
+// during the 5/30/60-minute windows.
+const capacity90 = S.capacityScenario({
   modelId: "k3",
   profileId: "fp8-vllm-state",
-  tokens: ONE_MI_TOKEN,
-  usableHbmGB: 80,
-  usableG2TB: 1,
-  rawCmxPB: 1,
-  cmxUsableFraction: 0.8,
-  growingShardRanks: 8,
-  stateShardRanks: 1,
+  contextTokens: ONE_MI_TOKEN,
+  extraTokens: 0,
+  blockTokens: 256,
+  hitRate: 0.9,
+  gpus: 72,
+  uniqueTpsGpu: 10_000,
+  retainedUsers: 1_000,
   poolCopies: 2,
-  activePrefixes: 3,
-  capacityUnitMode: "binary",
+  usableFraction: 0.8,
+});
+const capacity95 = S.capacityScenario({
+  modelId: "k3",
+  profileId: "fp8-vllm-state",
+  contextTokens: ONE_MI_TOKEN,
+  extraTokens: 0,
+  blockTokens: 256,
+  hitRate: 0.95,
+  gpus: 72,
+  uniqueTpsGpu: 10_000,
+  retainedUsers: 1_000,
+  poolCopies: 2,
+  usableFraction: 0.8,
+});
+assert.equal(capacity90.matchedTokens, 943_616);
+assert.equal(capacity95.matchedTokens, 996_096);
+assert.equal(capacity90.uniqueTokens, 104_960);
+assert.equal(capacity95.uniqueTokens, 52_480);
+close(
+  capacity90.requestRate,
+  720_000 / 104_960,
+  1e-12,
+  "90% capacity request rate"
+);
+close(
+  capacity95.requestRate,
+  720_000 / 52_480,
+  1e-12,
+  "95% capacity request rate"
+);
+assert.equal(
+  capacity90.sharedGrowingBytesPerUser,
+  capacity90.matchedLayout.selectedGrowingBytes
+);
+assert.equal(
+  capacity90.latestStateBytesPerUser,
+  capacity90.finalLayout.selectedStateBytes
+);
+close(
+  capacity90.anchorBytesPerUser,
+  capacity90.sharedGrowingBytesPerUser +
+    capacity90.latestStateBytesPerUser,
+  0,
+  "one shared growing prefix plus one latest state per user"
+);
+close(
+  capacity90.userAnchorBytes,
+  1_000 * capacity90.anchorBytesPerUser,
+  0,
+  "user-count anchor scaling"
+);
+close(
+  capacity90.userAnchorBytes -
+    1_000 * capacity90.sharedGrowingBytesPerUser,
+  1_000 * capacity90.latestStateBytesPerUser,
+  0,
+  "fixed state retained once per user"
+);
+close(
+  capacity90.newGrowingBytesPerRequest,
+  capacity90.finalLayout.selectedGrowingBytes -
+    capacity90.matchedLayout.selectedGrowingBytes,
+  0,
+  "only non-hit growing KV is new"
+);
+close(
+  capacity90.newGrowingBytesPerSecond,
+  capacity90.requestRate * capacity90.newGrowingBytesPerRequest,
+  1e-12,
+  "new growing KV rate"
+);
+close(
+  capacity90.newGrowingBytesPerSecond,
+  720_000 * 24 * 576,
+  1e-12,
+  "linear Kimi growing bytes at GPU saturation"
+);
+close(
+  capacity95.newGrowingBytesPerSecond,
+  capacity90.newGrowingBytesPerSecond,
+  1e-12,
+  "linear growing rate independent of hit rate"
+);
+assert.deepEqual(
+  capacity90.windows.map((window) => window.seconds),
+  [300, 1800, 3600]
+);
+close(
+  capacity90.windows[1].newGrowingBytes,
+  6 * capacity90.windows[0].newGrowingBytes,
+  1e-12,
+  "30-minute growth is six times 5-minute growth"
+);
+close(
+  capacity90.windows[2].newGrowingBytes,
+  12 * capacity90.windows[0].newGrowingBytes,
+  1e-12,
+  "1-hour growth is twelve times 5-minute growth"
+);
+capacity90.windows.forEach((window) => {
+  close(
+    window.logicalBytes,
+    capacity90.userAnchorBytes + window.newGrowingBytes,
+    0,
+    "logical capacity does not duplicate hit bytes"
+  );
+  close(
+    window.rawBytes,
+    (window.logicalBytes * 2) / 0.8,
+    0,
+    "raw conversion applied exactly once"
+  );
+});
+
+const twiceTheUsers = S.capacityScenario({
+  modelId: "k3",
+  profileId: "fp8-vllm-state",
+  contextTokens: ONE_MI_TOKEN,
+  blockTokens: 256,
+  hitRate: 0.9,
+  gpus: 72,
+  uniqueTpsGpu: 10_000,
+  retainedUsers: 2_000,
+  poolCopies: 2,
+  usableFraction: 0.8,
 });
 close(
-  shardedCapacity.hbmSessionBytes,
-  shardedCapacity.layout.selectedGrowingBytes / 8 +
-    shardedCapacity.layout.selectedStateBytes,
+  twiceTheUsers.userAnchorBytes,
+  2 * capacity90.userAnchorBytes,
   0,
-  "HBM sharded growing plus replicated state"
-);
-assert.equal(
-  shardedCapacity.poolSessionBytes,
-  2 * shardedCapacity.layout.selectedTotalBytes
-);
-assert.equal(
-  shardedCapacity.hbmSessionsPerGpu,
-  Math.floor(80 * S.GiB / shardedCapacity.hbmSessionBytes)
-);
-assert.equal(
-  shardedCapacity.g2SessionsPerRack,
-  Math.floor(1024 ** 4 / shardedCapacity.poolSessionBytes)
+  "doubling users doubles the starting anchor"
 );
 close(
-  shardedCapacity.rawWorkingSetBytes,
-  (3 * shardedCapacity.poolSessionBytes) / 0.8,
+  twiceTheUsers.windows[0].newGrowingBytes,
+  capacity90.windows[0].newGrowingBytes,
   0,
-  "active-prefix raw working set"
+  "fixed GPU fleet keeps aggregate new KV unchanged"
 );
+
+const fullHitCapacity = S.capacityScenario({
+  modelId: "k3",
+  profileId: "fp8-vllm-state",
+  contextTokens: ONE_MI_TOKEN,
+  blockTokens: 256,
+  hitRate: 1,
+  gpus: 72,
+  uniqueTpsGpu: 10_000,
+  retainedUsers: 1_000,
+  poolCopies: 1,
+  usableFraction: 0.8,
+});
+assert.equal(fullHitCapacity.uniqueTokens, 0);
+assert.equal(fullHitCapacity.requestRate, null);
+assert.equal(fullHitCapacity.newGrowingBytesPerSecond, 0);
+assert.equal(
+  fullHitCapacity.windows[0].logicalBytes,
+  fullHitCapacity.userAnchorBytes
+);
+
+const unknownCapacityUsable = S.capacityScenario({
+  modelId: "k3",
+  profileId: "fp8-vllm-state",
+  contextTokens: ONE_MI_TOKEN,
+  blockTokens: 256,
+  hitRate: 0.9,
+  gpus: 72,
+  uniqueTpsGpu: 10_000,
+  retainedUsers: 1_000,
+  poolCopies: 1,
+  usableFraction: 0,
+});
+assert.ok(Number.isFinite(unknownCapacityUsable.windows[0].logicalBytes));
+assert.equal(unknownCapacityUsable.rawUserAnchorBytes, null);
+assert.equal(unknownCapacityUsable.windows[0].rawBytes, null);
 
 // Hit comparison keeps Prefill GPUs saturated. The default Agentic view sizes
 // one Kimi hot prefix and leaves unmeasured retained writes disabled.

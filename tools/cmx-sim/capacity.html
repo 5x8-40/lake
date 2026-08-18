@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CMX 会话容量</title>
+  <title>GPU 满载 KV 容量</title>
   <link rel="stylesheet" href="app.css?v=4" />
 </head>
 <body>
@@ -15,12 +15,12 @@
   </nav>
 
   <header>
-    <h1>CMX 长上下文会话容量</h1>
+    <h1>GPU 满载下的 KV 容量</h1>
     <p>
-      默认按 Kimi K3 计算每个 retained prefix 的 KV 容量，再由 active prefix 数扩展工作集。
+      按可变用户数计算 5 分钟、30 分钟和 1 小时内需要保留的唯一 KV。
     </p>
     <div class="warn" role="note">
-      本页由已有容量反推会话数，不从命中率推导所需容量；未建模 allocator 碎片、元数据和实际介质行为。
+      每个 retained user 只有一段共享缓存；命中部分不重复写入。窗口内不驱逐，新算 growing KV 全部保留。
     </div>
   </header>
 
@@ -61,63 +61,74 @@
 
       <div id="mtpWrap" class="checkrow" hidden>
         <input id="includeMtp" type="checkbox" />
-        <label id="mtpLabel" for="includeMtp">把可选 MTP 状态计入会话</label>
+        <label id="mtpLabel" for="includeMtp">把可选 MTP 状态计入容量</label>
       </div>
 
-      <h2>会话</h2>
-      <label for="tokens">会话 token <span id="tokensValue"></span></label>
+      <h2>请求与命中</h2>
+      <label for="tokens">每请求上下文 token <span id="tokensValue"></span></label>
       <input id="tokens" type="range" min="8192" max="1048576" step="8192" value="1048576" />
-      <label class="sr-only" for="tokensNumber">会话 token 数值</label>
+      <label class="sr-only" for="tokensNumber">每请求上下文 token 数值</label>
       <input id="tokensNumber" type="number" min="8192" max="1048576" step="1" value="1048576" />
 
-      <h2>可用容量假设</h2>
-      <label for="capacityUnitMode">输入单位</label>
-      <select id="capacityUnitMode">
-        <option value="decimal">十进制 GB / TB / PB</option>
-        <option value="binary">二进制 GiB / TiB / PiB</option>
-      </select>
+      <div class="row2">
+        <div>
+          <label for="hitA">场景 A 命中率 %</label>
+          <input id="hitA" type="number" min="0" max="100" step="0.1" value="90" />
+        </div>
+        <div>
+          <label for="hitB">场景 B 命中率 %</label>
+          <input id="hitB" type="number" min="0" max="100" step="0.1" value="95" />
+        </div>
+      </div>
 
-      <label for="hbmGB">会话可用 HBM GB / GPU</label>
-      <input id="hbmGB" type="number" min="0" step="1" value="0" />
-      <p class="hint">0 = 未提供部署拓扑，不展示可部署 HBM 会话数。</p>
+      <label for="blockTokens">匹配块 token</label>
+      <input id="blockTokens" type="number" min="1" step="1" value="256" />
 
-      <label for="g2TB">会话可用 G2 TB / rack</label>
-      <input id="g2TB" type="number" min="0" step="0.1" value="43.2" />
-      <p class="hint">43.2 TB = 54 TB aggregate 的 80%；实际内存有拓扑/本地性约束。</p>
+      <h2>GPU 满载预算</h2>
+      <label for="gpus">Prefill GPU 数</label>
+      <input id="gpus" type="number" min="1" step="1" value="72" />
 
-      <label for="cmxPB">CMX raw PB / POD</label>
-      <input id="cmxPB" type="number" min="0" step="0.1" value="18.432" />
-      <p class="hint">18.432 PB = 16 TB/GPU × 1152 GPU 的发布会算术，不是可购 SKU 保证。</p>
+      <label for="uniqueTps">有效 unique token/s/GPU</label>
+      <input id="uniqueTps" type="number" min="0" step="100" value="10000" />
 
-      <label for="cmxUsable">CMX usable/raw 比例</label>
-      <input id="cmxUsable" type="number" min="0" max="1" step="0.05" value="0.8" />
+      <h2>用户与 Pool</h2>
+      <label for="retainedUsers">Retained user 数</label>
+      <input id="retainedUsers" type="number" min="1" step="1" value="1000" />
+      <p class="hint">每个用户保留一段独立 KV；同一用户的请求复用该段。</p>
 
-      <h2>分片与副本</h2>
-      <label for="growingShardRanks">Growing KV 分片数</label>
-      <input id="growingShardRanks" type="number" min="1" step="1" value="1" />
-      <p class="hint">按实际 TP×CP/engine layout 填；页面不从 GPU 数猜分片。</p>
-
-      <label for="stateShardRanks">Fixed state 分片数（1 = 每 GPU 完整副本）</label>
-      <input id="stateShardRanks" type="number" min="1" step="1" value="1" />
-
-      <label for="poolCopies">G2/CMX representation 副本数</label>
+      <label for="poolCopies">Pool representation 副本数</label>
       <input id="poolCopies" type="number" min="1" step="1" value="1" />
 
-      <label for="activePrefixes">Active retained prefix 数</label>
-      <input id="activePrefixes" type="number" min="0" step="1" value="1" />
-      <p class="hint">默认 1 是归一化单位，不是 Cursor trace 实测并发。</p>
+      <label for="usableFraction">Pool usable/raw %</label>
+      <input id="usableFraction" type="number" min="0" max="100" step="1" value="80" />
     </aside>
 
     <main>
       <div class="stats" id="stats" aria-live="polite"></div>
 
-      <section class="panel" aria-labelledby="formulaHeading">
-        <h2 id="formulaHeading">当前场景</h2>
-        <pre class="formula" id="formula"></pre>
+      <section class="panel table-panel" aria-labelledby="capacityTableHeading">
+        <h2 id="capacityTableHeading">5 分钟 / 30 分钟 / 1 小时</h2>
+        <table>
+          <caption>命中 KV 每用户只计一次；窗口新增只包含新算 growing KV。</caption>
+          <thead>
+            <tr>
+              <th scope="col">场景</th>
+              <th scope="col">命中</th>
+              <th scope="col">时长</th>
+              <th scope="col">请求数</th>
+              <th scope="col">请求/用户</th>
+              <th scope="col">用户锚点</th>
+              <th scope="col">新增 KV</th>
+              <th scope="col">逻辑容量</th>
+              <th scope="col">Raw 容量</th>
+            </tr>
+          </thead>
+          <tbody id="capacityRows"></tbody>
+        </table>
       </section>
 
       <section class="panel" aria-labelledby="chartHeading">
-        <h2 id="chartHeading">上下文长度 → CMX 会话数</h2>
+        <h2 id="chartHeading">运行时间 → Raw KV 容量</h2>
         <div class="tabs" id="legend" aria-label="图例"></div>
         <div class="chart-wrap">
           <svg
@@ -130,31 +141,30 @@
         </div>
       </section>
 
-      <section class="panel table-panel" aria-labelledby="comparisonHeading">
-        <h2 id="comparisonHeading">模型锚点对照</h2>
-        <table id="comparison">
-          <caption>当前容量假设下，四个模型锚点布局的会话驻留数</caption>
-        </table>
+      <section class="panel" aria-labelledby="formulaHeading">
+        <h2 id="formulaHeading">当前场景公式</h2>
+        <pre class="formula" id="formula"></pre>
       </section>
 
       <section class="panel" aria-labelledby="limitationsHeading">
-        <h2 id="limitationsHeading">未建模项</h2>
+        <h2 id="limitationsHeading">边界</h2>
         <ul class="notes">
-          <li>CMX wire layout 尚未公开，不能由 payload 或 engine pages 代替。</li>
-          <li>分片和副本必须来自实际 TP/CP/DP/EP 部署。</li>
-          <li>V4 engine pages 不含全局 allocator 碎片、packed-pool sharing、元数据和 reserve。</li>
-          <li>raw、formatted、usable 和已用容量需要分别计量。</li>
-          <li>池级复用率还取决于放置、去重和生命周期策略。</li>
+          <li>窗口开始时，每个 retained user 已有一段可命中的热缓存。</li>
+          <li>窗口内不驱逐、不覆盖；所有新算 growing KV 保留到窗口结束。</li>
+          <li>每用户只保留一份最新 continuation state，不按请求重复累计。</li>
+          <li>不同用户之间不去重；若多个用户共享系统前缀，结果会偏高。</li>
+          <li>未计 allocator 碎片、元数据、介质格式和后台整理余量。</li>
+          <li>若 `U=0`，GPU 无 unique token 可计算，GPU 满载 req/s 无定义。</li>
         </ul>
       </section>
 
       <footer>
-        默认模型来自 Kimi K3 Agentic workload；active prefix、容量和 usable 比例仍需用户提供。
+        参考：vLLM BLOCK_LEVEL offload 只保存新计算 block；SGLang RadixCache 会释放重复前缀 block。
       </footer>
     </main>
   </div>
 
-  <script src="sim.js?v=9"></script>
+  <script src="sim.js?v=10"></script>
   <script>
     "use strict";
 
@@ -164,6 +174,44 @@
     function finiteNumber(id, fallback) {
       const value = Number($(id).value);
       return Number.isFinite(value) ? value : fallback;
+    }
+
+    function fmtNumber(value) {
+      if (value == null || Number.isNaN(value)) return "N/A";
+      if (!Number.isFinite(value)) return "∞";
+      return value.toLocaleString(undefined, {
+        maximumFractionDigits: value < 100 ? 2 : 0,
+      });
+    }
+
+    function fmtTokenRate(value) {
+      const formatted = S.fmtRate(value);
+      return formatted === "N/A" || formatted === "∞"
+        ? formatted
+        : `${formatted} token/s`;
+    }
+
+    function durationLabel(seconds) {
+      if (seconds === 300) return "5 min";
+      if (seconds === 1800) return "30 min";
+      if (seconds === 3600) return "1 h";
+      return `${seconds} s`;
+    }
+
+    function stat(key, value, detail, className = "") {
+      return `<div class="stat ${className}">
+        <div class="k">${key}</div>
+        <div class="v">${value}</div>
+        <div class="s">${detail}</div>
+      </div>`;
+    }
+
+    function basisLabel(layout) {
+      if (layout.byteMode === "engine-pages") return "engine page allocation";
+      if (layout.byteMode === "custom-wire") {
+        return `custom wire ×${layout.customWireFactor}`;
+      }
+      return layout.profile.byteClass;
     }
 
     function syncProfiles() {
@@ -188,7 +236,7 @@
       $("wireFactorWrap").hidden = $("byteMode").value !== "custom-wire";
     }
 
-    function params() {
+    function baseParams() {
       return {
         modelId: $("model").value,
         profileId: $("profile").value,
@@ -196,201 +244,185 @@
         compressorPolicy: $("compressorPolicy").value,
         byteMode: $("byteMode").value,
         customWireFactor: finiteNumber("customWireFactor", 1),
-        tokens: finiteNumber("tokensNumber", 0),
-        usableHbmGB: finiteNumber("hbmGB", 0),
-        usableG2TB: finiteNumber("g2TB", 0),
-        rawCmxPB: finiteNumber("cmxPB", 0),
-        cmxUsableFraction: finiteNumber("cmxUsable", 0),
-        capacityUnitMode: $("capacityUnitMode").value,
-        growingShardRanks: finiteNumber("growingShardRanks", 1),
-        stateShardRanks: finiteNumber("stateShardRanks", 1),
+        contextTokens: finiteNumber("tokensNumber", 0),
+        extraTokens: 0,
+        blockTokens: finiteNumber("blockTokens", 1),
+        gpus: finiteNumber("gpus", 1),
+        uniqueTpsGpu: finiteNumber("uniqueTps", 0),
+        retainedUsers: finiteNumber("retainedUsers", 1),
         poolCopies: finiteNumber("poolCopies", 1),
-        activePrefixes: finiteNumber("activePrefixes", 1),
+        usableFraction: finiteNumber("usableFraction", 0) / 100,
       };
     }
 
-    function stat(key, value, detail, className = "") {
-      return `<div class="stat ${className}">
-        <div class="k">${key}</div>
-        <div class="v">${value}</div>
-        <div class="s">${detail}</div>
-      </div>`;
-    }
-
-    function fmtCount(value) {
-      return value == null ? "N/A" : value.toLocaleString();
-    }
-
-    function basisLabel(layout) {
-      if (layout.byteMode === "engine-pages") return "engine page allocation";
-      if (layout.byteMode === "custom-wire") {
-        return `custom wire ×${layout.customWireFactor}`;
-      }
-      return layout.profile.byteClass;
-    }
-
-    function renderStats(result) {
-      const units = result.capacityUnitMode === "binary"
-        ? ["GiB", "TiB", "PiB"]
-        : ["GB", "TB", "PB"];
+    function renderStats(a, b) {
+      const sameNewRate =
+        a.newGrowingBytesPerSecond != null &&
+        b.newGrowingBytesPerSecond != null &&
+        Math.abs(a.newGrowingBytesPerSecond - b.newGrowingBytesPerSecond) < 1;
       $("stats").innerHTML = [
-        stat("Payload 会话", S.fmtGiB(result.layout.totalBytes), result.layout.profile.label),
-        stat("所选口径会话", S.fmtGiB(result.layout.selectedTotalBytes), basisLabel(result.layout), "hot"),
-        stat("HBM bytes / GPU / 会话", S.fmtGiB(result.hbmSessionBytes), `growing÷${result.growingShardRanks} + state÷${result.stateShardRanks}`),
-        stat("Pool bytes / 会话", S.fmtGiB(result.poolSessionBytes), `${result.poolCopies} representation copies`),
-        stat("Raw working set", S.fmtCapacity(result.rawWorkingSetBytes), `${result.activePrefixes} active prefixes ÷ ${(result.cmxUsableFraction * 100).toFixed(0)}% usable`, "hot"),
-        stat("HBM / GPU", result.usableHbmGB > 0 ? fmtCount(result.hbmSessionsPerGpu) : "未设置", `${result.usableHbmGB} ${units[0]}；需显式拓扑`),
-        stat("G2 / rack", fmtCount(result.g2SessionsPerRack), `${result.usableG2TB} ${units[1]} 可用于会话`),
-        stat("CMX raw / POD", fmtCount(result.rawCmxSessionsPerPod), `${result.rawCmxPB} ${units[2]} raw`),
-        stat("CMX usable / POD", fmtCount(result.usableCmxSessionsPerPod), `${(result.cmxUsableFraction * 100).toFixed(0)}% usable/raw`, "ok"),
+        stat("Retained users", a.retainedUsers.toLocaleString(), "每用户一段共享 KV"),
+        stat("GPU unique 预算", fmtTokenRate(a.uniqueTpsPool), `${a.gpus} GPU × ${fmtNumber(a.uniqueTpsGpu)}`),
+        stat("A compute req/s", S.fmtRate(a.requestRate), `${(a.hitRate * 100).toFixed(1)}% hit`, "hot"),
+        stat("B compute req/s", S.fmtRate(b.requestRate), `${(b.hitRate * 100).toFixed(1)}% hit`, "hot"),
+        stat("A 用户锚点", S.fmtCapacity(a.userAnchorBytes), "命中 growing KV + 每用户一份最新 state"),
+        stat("B 用户锚点", S.fmtCapacity(b.userAnchorBytes), "命中 growing KV + 每用户一份最新 state"),
+        stat(
+          "窗口新增速率",
+          sameNewRate
+            ? S.fmtGBs(a.newGrowingBytesPerSecond)
+            : `A ${S.fmtGBs(a.newGrowingBytesPerSecond)} / B ${S.fmtGBs(b.newGrowingBytesPerSecond)}`,
+          sameNewRate ? "线性 growing KV 下与命中率无关" : "由所选布局的净新增决定",
+          "ok"
+        ),
       ].join("");
     }
 
-    function renderFormula(result) {
-      const units = result.capacityUnitMode === "binary"
-        ? ["GiB", "TiB", "PiB"]
-        : ["GB", "TB", "PB"];
+    function scenarioRows(label, result) {
+      return result.windows.map((window) => `<tr>
+        <th scope="row">${label}</th>
+        <td>${(result.hitRate * 100).toFixed(1)}%</td>
+        <td>${durationLabel(window.seconds)}</td>
+        <td>${fmtNumber(window.requestCount)}</td>
+        <td>${fmtNumber(window.requestsPerUser)}</td>
+        <td>${S.fmtCapacity(result.userAnchorBytes)}</td>
+        <td>${S.fmtCapacity(window.newGrowingBytes)}</td>
+        <td>${S.fmtCapacity(window.logicalBytes)}</td>
+        <td>${S.fmtCapacity(window.rawBytes)}</td>
+      </tr>`).join("");
+    }
+
+    function renderFormula(a, b) {
       $("formula").textContent =
-`payload_bytes = paged_KV + extra_continuation_state
-              = ${S.fmtGiB(result.layout.pagedKvBytes)} + ${S.fmtGiB(result.layout.totalBytes - result.layout.pagedKvBytes)}
-              = ${S.fmtGiB(result.layout.totalBytes)}
+`Q = GPUs × unique_token/s/GPU
+  = ${a.gpus} × ${fmtNumber(a.uniqueTpsGpu)}
+  = ${fmtTokenRate(a.uniqueTpsPool)}
 
-selected basis = ${basisLabel(result.layout)}
-selected_bytes = ${S.fmtGiB(result.layout.selectedTotalBytes)}
+M = floor(C × hit / block) × block
+U = C − M
+req/s = Q ÷ U
 
-HBM bytes/session/GPU
-  = selected_growing / ${result.growingShardRanks} + selected_state / ${result.stateShardRanks}
-  = ${S.fmtGiB(result.hbmSessionBytes)}
+每用户锚点 = growing_KV(M) + latest_continuation_state
+用户锚点总量 = retained_users × 每用户锚点
+窗口新增 = req/s × duration × [growing_KV(C) − growing_KV(M)]
+逻辑容量 = 用户锚点总量 + 窗口新增
+raw 容量 = 逻辑容量 × copies ÷ usable_fraction
 
-HBM sessions / GPU
-  = floor(${result.usableHbmGB} ${units[0]} / HBM_bytes_per_session)
-  = ${result.usableHbmGB > 0 ? fmtCount(result.hbmSessionsPerGpu) : "N/A（未提供 HBM 容量/拓扑）"}
+A: M=${a.matchedTokens.toLocaleString()}, U=${a.uniqueTokens.toLocaleString()}, req/s=${S.fmtRate(a.requestRate)}
+   每用户锚点=${S.fmtCapacity(a.anchorBytesPerUser)}
+   用户锚点总量=${S.fmtCapacity(a.userAnchorBytes)}
+   新增速率=${S.fmtGBs(a.newGrowingBytesPerSecond)}
 
-pool bytes/session
-  = selected_bytes × ${result.poolCopies} copies
-  = ${S.fmtGiB(result.poolSessionBytes)}
+B: M=${b.matchedTokens.toLocaleString()}, U=${b.uniqueTokens.toLocaleString()}, req/s=${S.fmtRate(b.requestRate)}
+   每用户锚点=${S.fmtCapacity(b.anchorBytesPerUser)}
+   用户锚点总量=${S.fmtCapacity(b.userAnchorBytes)}
+   新增速率=${S.fmtGBs(b.newGrowingBytesPerSecond)}
 
-raw working set
-  = active_prefixes × pool_bytes/session ÷ usable_fraction
-  = ${result.activePrefixes} × ${S.fmtGiB(result.poolSessionBytes)} ÷ ${result.cmxUsableFraction}
-  = ${S.fmtCapacity(result.rawWorkingSetBytes)}
-
-G2 sessions / rack
-  = floor(${result.usableG2TB} ${units[1]} / pool_bytes_per_session)
-  = ${fmtCount(result.g2SessionsPerRack)}
-
-CMX usable sessions / POD
-  = floor(${result.rawCmxPB} ${units[2]} × ${result.cmxUsableFraction} / pool_bytes_per_session)
-  = ${fmtCount(result.usableCmxSessionsPerPod)}`;
+selected basis = ${basisLabel(a.finalLayout)}
+latest state / user = ${S.fmtCapacity(a.latestStateBytesPerUser)}
+copies = ${a.poolCopies}, usable = ${(a.usableFraction * 100).toFixed(0)}%`;
     }
 
-    function niceTicks(min, max, count) {
-      const span = max - min || 1;
-      const raw = span / count;
-      const power = 10 ** Math.floor(Math.log10(raw));
-      const ratio = raw / power;
-      const step = (ratio <= 1 ? 1 : ratio <= 2 ? 2 : ratio <= 5 ? 5 : 10) * power;
-      const values = [];
-      for (let value = Math.ceil(min / step) * step; value <= max + step * 0.01; value += step) {
-        values.push(value);
-      }
-      return values;
+    function chartSeries(label, result, color) {
+      return {
+        label,
+        color,
+        points: [
+          { minutes: 0, bytes: result.rawUserAnchorBytes },
+          ...result.windows.map((window) => ({
+            minutes: window.seconds / 60,
+            bytes: window.rawBytes,
+          })),
+        ],
+      };
     }
 
-    function drawChart(points) {
+    function drawChart(a, b) {
       const svg = $("chart");
-      const width = 900, height = 340, left = 82, right = 18, top = 28, bottom = 44;
-      const innerWidth = width - left - right;
-      const innerHeight = height - top - bottom;
-      const validPoints = points.filter(
-        (point) => Number.isFinite(point.x) && Number.isFinite(point.y)
+      const series = [
+        chartSeries(`A ${(a.hitRate * 100).toFixed(1)}%`, a, "#4aa3d9"),
+        chartSeries(`B ${(b.hitRate * 100).toFixed(1)}%`, b, "#e08a3c"),
+      ];
+      const values = series.flatMap((item) =>
+        item.points.map((point) => point.bytes).filter(Number.isFinite)
       );
-      if (validPoints.length === 0) {
+      if (values.length === 0) {
         svg.innerHTML =
-          `<title id="capacityChartTitle">上下文长度与 CMX 会话数</title>
+          `<title id="capacityChartTitle">运行时间与 Raw KV 容量</title>
            <desc id="capacityChartDesc">当前输入没有可绘制的有限结果。</desc>`;
         $("legend").textContent = "当前输入没有可绘制的有限结果";
         return;
       }
-      const minX = Math.min(...validPoints.map((point) => point.x));
-      const maxX = Math.max(...validPoints.map((point) => point.x));
-      const maxY = Math.max(...validPoints.map((point) => point.y), 1);
-      const x = (value) => left + ((value - minX) / (maxX - minX || 1)) * innerWidth;
-      const y = (value) => top + innerHeight - (value / maxY) * innerHeight;
-      const grid = niceTicks(0, maxY, 5).map((value) => {
-        const yy = y(value);
-        const label = value >= 1e6 ? `${(value / 1e6).toFixed(1)}M` : value >= 1e3 ? `${(value / 1e3).toFixed(0)}k` : `${Math.round(value)}`;
+
+      const width = 900, height = 340, left = 82, right = 24, top = 28, bottom = 44;
+      const innerWidth = width - left - right;
+      const innerHeight = height - top - bottom;
+      const maxBytes = Math.max(...values, 1);
+      const unit = maxBytes >= S.PiB
+        ? { bytes: S.PiB, label: "PiB" }
+        : maxBytes >= S.TiB
+          ? { bytes: S.TiB, label: "TiB" }
+          : { bytes: S.GiB, label: "GiB" };
+      const maxValue = maxBytes / unit.bytes;
+      const x = (minutes) => left + (minutes / 60) * innerWidth;
+      const y = (bytes) => top + innerHeight - (bytes / unit.bytes / maxValue) * innerHeight;
+      const yTicks = [0, 0.25, 0.5, 0.75, 1].map((ratio) => {
+        const value = maxValue * ratio;
+        const yy = top + innerHeight - ratio * innerHeight;
         return `<line x1="${left}" y1="${yy}" x2="${width-right}" y2="${yy}" stroke="#2e2a24" />
-          <text x="${left-8}" y="${yy+4}" fill="#9a917f" font-size="11" text-anchor="end">${label}</text>`;
+          <text x="${left-8}" y="${yy+4}" fill="#9a917f" font-size="11" text-anchor="end">${value.toFixed(value >= 10 ? 0 : 1)}</text>`;
       }).join("");
-      const xLabels = niceTicks(minX, maxX, 6).map((value) =>
-        `<text x="${x(value)}" y="${height-14}" fill="#9a917f" font-size="11" text-anchor="middle">${value >= 1048576 ? "1Mi" : `${Math.round(value / 1024)}Ki`}</text>`
+      const xTicks = [0, 5, 30, 60].map((minutes) =>
+        `<text x="${x(minutes)}" y="${height-14}" fill="#9a917f" font-size="11" text-anchor="middle">${minutes === 60 ? "1h" : `${minutes}m`}</text>`
       ).join("");
-      const path = validPoints
-        .map((point, index) => `${index ? "L" : "M"}${x(point.x)},${y(point.y)}`)
-        .join(" ");
-      svg.innerHTML =
-        `<title id="capacityChartTitle">上下文长度与 CMX usable 会话数</title>
-         <desc id="capacityChartDesc">在当前 raw PB 和 usable 比例假设下，当前模型可驻留会话数随上下文增长而下降。</desc>
-         ${grid}${xLabels}
-         <line x1="${left}" y1="${top+innerHeight}" x2="${width-right}" y2="${top+innerHeight}" stroke="#5a5246" />
-         <path d="${path}" fill="none" stroke="#4aa3d9" stroke-width="2.2" />`;
-      $("legend").innerHTML =
-        `<span class="legend-item"><i style="background:#4aa3d9"></i>CMX usable sessions / POD</span>`;
-    }
-
-    const anchors = [
-      ["V4-Pro BF16", "v4pro", "bf16-logical", false],
-      ["V4-Pro BF16 + MTP", "v4pro", "bf16-logical", true],
-      ["V4-Flash BF16", "v4flash", "bf16-logical", false],
-      ["GLM-5.2 FP8 base", "glm52", "fp8-logical", false],
-      ["GLM-5.2 FP8 + MTP", "glm52", "fp8-logical", true],
-      ["Kimi K3 FP8", "k3", "fp8-vllm-state", false],
-    ];
-
-    function renderComparison(p) {
-      const rows = anchors.map(([label, modelId, profileId, includeMtp]) => {
-        const result = S.capacityScenario({ ...p, modelId, profileId, includeMtp });
-        return `<tr>
-          <th scope="row">${label}</th>
-          <td>${result.layout.profile.byteClass}</td>
-          <td>${S.fmtGiB(result.layout.selectedTotalBytes)}</td>
-          <td>${result.usableHbmGB > 0 ? fmtCount(result.hbmSessionsPerGpu) : "N/A"}</td>
-          <td>${fmtCount(result.g2SessionsPerRack)}</td>
-          <td>${fmtCount(result.usableCmxSessionsPerPod)}</td>
-        </tr>`;
+      const lines = series.map((item) => {
+        const valid = item.points.filter((point) => Number.isFinite(point.bytes));
+        const path = valid.map((point, index) =>
+          `${index ? "L" : "M"}${x(point.minutes)},${y(point.bytes)}`
+        ).join(" ");
+        const dots = valid.map((point) =>
+          `<circle cx="${x(point.minutes)}" cy="${y(point.bytes)}" r="3.5" fill="${item.color}" />`
+        ).join("");
+        return `<path d="${path}" fill="none" stroke="${item.color}" stroke-width="2.2" />${dots}`;
       }).join("");
-      $("comparison").innerHTML =
-        `<caption>当前容量、字节口径、分片和副本假设下的会话驻留数</caption>
-         <thead><tr>
-           <th scope="col">模型 / 布局</th><th scope="col">Profile class</th><th scope="col">所选会话字节</th>
-           <th scope="col">HBM / GPU</th><th scope="col">G2 / rack</th>
-           <th scope="col">CMX usable / POD</th>
-         </tr></thead><tbody>${rows}</tbody>`;
+      svg.innerHTML =
+        `<title id="capacityChartTitle">运行时间与 Raw KV 容量</title>
+         <desc id="capacityChartDesc">两种 APC 命中率下，用户锚点与窗口新增 KV 形成的 Raw 容量。</desc>
+         ${yTicks}${xTicks}
+         <text x="16" y="${top + innerHeight / 2}" fill="#9a917f" font-size="11" transform="rotate(-90 16 ${top + innerHeight / 2})">${unit.label}</text>
+         <line x1="${left}" y1="${top+innerHeight}" x2="${width-right}" y2="${top+innerHeight}" stroke="#5a5246" />
+         ${lines}`;
+      $("legend").innerHTML = series.map((item) =>
+        `<span class="legend-item"><i style="background:${item.color}"></i>${item.label}</span>`
+      ).join("");
     }
 
     function render() {
       syncConditionalInputs();
-      const p = params();
-      $("tokensValue").textContent = Number(p.tokens).toLocaleString();
-      const profile = S.profileFor(p.modelId, p.profileId);
-      const result = S.capacityScenario(p);
+      const base = baseParams();
+      $("tokensValue").textContent = Number(base.contextTokens).toLocaleString();
+      const a = S.capacityScenario({
+        ...base,
+        hitRate: finiteNumber("hitA", 0) / 100,
+      });
+      const b = S.capacityScenario({
+        ...base,
+        hitRate: finiteNumber("hitB", 0) / 100,
+      });
+      const profile = S.profileFor(base.modelId, base.profileId);
       const unsupportedEngine =
-        p.byteMode === "engine-pages" &&
-        result.layout.engineAllocation == null;
+        base.byteMode === "engine-pages" &&
+        a.finalLayout.engineAllocation == null;
       $("profileNote").textContent =
-        `${profile.note} · ${profile.byteClass} · ${profile.confidence} · ${S.MODELS[p.modelId].evidence}` +
+        `${profile.note} · ${profile.byteClass} · ${profile.confidence} · ${S.MODELS[base.modelId].evidence}` +
         (unsupportedEngine
           ? " 当前 profile 没有可审计的 engine-page 合同，容量显示 N/A。"
           : "");
-      renderStats(result);
-      renderFormula(result);
-      const contexts = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
-      drawChart(contexts.map((tokens) => ({
-        x: tokens,
-        y: S.capacityScenario({ ...p, tokens }).usableCmxSessionsPerPod,
-      })));
-      renderComparison(p);
+      renderStats(a, b);
+      $("capacityRows").innerHTML =
+        scenarioRows("A", a) + scenarioRows("B", b);
+      drawChart(a, b);
+      renderFormula(a, b);
     }
 
     $("model").addEventListener("change", () => {
@@ -409,9 +441,8 @@ CMX usable sessions / POD
     });
     [
       "profile", "byteMode", "customWireFactor", "compressorPolicy",
-      "includeMtp", "capacityUnitMode", "hbmGB", "g2TB", "cmxPB",
-      "cmxUsable", "growingShardRanks", "stateShardRanks", "poolCopies",
-      "activePrefixes",
+      "includeMtp", "hitA", "hitB", "blockTokens", "gpus", "uniqueTps",
+      "retainedUsers", "poolCopies", "usableFraction",
     ].forEach((id) => {
       $(id).addEventListener("input", render);
       $(id).addEventListener("change", render);

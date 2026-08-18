@@ -27,19 +27,19 @@ CMX 架构证据见 [`docs/research/nvidia-cmx.md`](../../docs/research/nvidia-c
 
 它不回答“多少容量能放多少会话”或“90% 到 95% 要多花多少容量”。
 
-### 2. [`capacity.html`](capacity.html)：给定容量能放多少完整会话
+### 2. [`capacity.html`](capacity.html)：GPU 跑满后需要多少 KV 容量
 
 适合回答：
 
-- 一张 GPU、一组 G2 内存或一个 CMX POD 能放多少份指定 representation；
-- growing KV 与 fixed state 使用不同分片数时，单 GPU HBM 占用是多少；
-- Pool 副本、active prefix 和 usable/raw 如何改变容量。
+- 给定用户数和 APC 命中率，Prefill GPU 跑满 5 分钟、30 分钟、1 小时会保留多少 KV；
+- 同一用户的请求复用一段 KV 时，命中部分与新算部分分别占多少空间；
+- Pool 副本和 usable/raw 如何放大物理容量。
 
-主要输入：模型 representation、session token、HBM/G2/CMX 容量、分片、副本、usable/raw 和 GB/GiB 单位。
+主要输入：模型 representation、每请求 context、两个命中率、Prefill GPU 数、`unique token/s/GPU`、retained user 数、副本和 usable/raw。
 
-主要输出：每个 prefix/session 字节、active-prefix raw working set，以及每 GPU、rack、POD 的完整会话数。
+主要输出：两个命中率下的 compute req/s、每用户共享锚点、新 KV 生成速率，以及 5/30/60 分钟的 logical/raw 容量。
 
-它从“已有容量”反推会话数，不从命中率推导所需容量。
+它假设窗口开始时每个 retained user 已有一段热缓存，窗口内不驱逐；不同用户之间不去重。
 
 ### 3. [`economics.html`](economics.html)：比较 90% 与 95%
 
@@ -163,18 +163,44 @@ KDA fixed state 不是 token-proportional。没有底层 request/resume rate 时
 ## 容量页公式
 
 ```text
-hbm_session
-  = selected_growing / growing_shard_ranks
-  + selected_state / state_shard_ranks
+M = floor(C × hit / block) × block
+U = C − M + E
+Q = GPUs × effective_unique_token/s/GPU
+compute_req/s = Q / U
 
-pool_session = selected_total × pool_copies
-raw_working_set
-  = active_prefixes × pool_session / usable_fraction
-usable_cmx   = raw_cmx × usable_fraction
-sessions     = floor(usable_capacity / session_bytes)
+anchor/user
+  = selected_growing(M) + latest_continuation_state
+user_anchor
+  = retained_users × anchor/user
+
+new_growing(T)
+  = compute_req/s × T × [selected_growing(C + E) − selected_growing(M)]
+
+logical_capacity(T)
+  = user_anchor + new_growing(T)
+raw_capacity(T)
+  = logical_capacity(T) × pool_copies / usable_fraction
 ```
 
-分片和副本必须来自实际 TP/CP/engine deployment，页面不从 GPU 数猜测。
+含义：
+
+- 一个用户只有一段共享 KV，命中块只在 `user_anchor` 中计一次，不按请求重复写；
+- 窗口内所有新算 growing KV 都保留；5/30/60 分钟分别使用 `T=300/1800/3600s`；
+- continuation state 只保留每用户最新一份，不乘请求数；
+- 对 Kimi K3 的线性 growing KV，GPU 满载时 `new_growing/s = Q × bytes/token`，与命中率无关；高命中率会提高 req/s，并扩大每用户起始热锚点；
+- `usable_fraction=0` 表示未知，raw 容量显示 `N/A`；
+- 若 `U=0`，没有 unique token 可让 GPU 跑满，compute req/s 无定义。
+
+默认示例：Kimi K3 FP8、`C=1,048,576`、72 GPU、10k unique token/s/GPU、1000 retained users、1 副本、80% usable。
+
+| 指标 | 90% | 95% |
+|---|---:|---:|
+| compute req/s | 6.86 | 13.72 |
+| 用户锚点 | 12.27 TiB | 12.93 TiB |
+| 新 KV 生成速率 | 9.95 GB/s | 9.95 GB/s |
+| 5 min raw | 18.74 TiB | 19.56 TiB |
+| 30 min raw | 35.71 TiB | 36.53 TiB |
+| 1 h raw | 56.08 TiB | 56.90 TiB |
 
 ## 90% / 95% 对比公式
 
@@ -221,6 +247,9 @@ performance_increase
 ## 实现锚点
 
 - vLLM `vllm/v1/core/kv_cache_manager.py::KVCacheManager.get_computed_blocks`：APC 将命中 block 与待计算 token 分开。
+- vLLM `vllm/v1/kv_offload/base.py::OffloadPolicy.BLOCK_LEVEL`：只 offload 新计算 block，跳过已存的 prefix-hit block。
+- SGLang `python/sglang/srt/mem_cache/radix_cache.py::RadixCache.cache_finished_req`：插入完成请求后释放树中已有的重复 KV。
+- LMCache `lmcache/v1/token_database.py::ChunkedTokenDatabase._prefix_hash/process_tokens`：链式内容哈希使相同前缀块共用 key。
 - SGLang `python/sglang/srt/mem_cache/hiradix_cache.py::prefetch_from_storage` + `cache_controller.py::_page_get_zero_copy`：P 侧从外部存储加载 KV。
 - vLLM `vllm/v1/kv_cache_interface.py::MLAAttentionSpec.real_page_size_bytes`：V4 `fp8_ds_mla` main entry 为 584 B。
 - vLLM `vllm/v1/kv_cache_interface.py::SlidingWindowSpec.max_admission_blocks_per_request`：sliding-window admission 需额外处理跨 block 窗口。

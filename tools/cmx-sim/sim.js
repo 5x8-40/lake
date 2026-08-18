@@ -7,7 +7,7 @@
  *   2. Agentic token demand or compute-constrained request throughput,
  *   3. Prefill-side KV load bandwidth,
  *   4. an optional user-supplied storage-read ceiling,
- *   5. a GPU-saturated hit-rate capacity comparison.
+ *   5. GPU-saturated KV retention by user and time window.
  *
  * Browser and Node share this file. Storage uses bytes/GiB; bandwidth uses
  * decimal GB/s.
@@ -619,78 +619,120 @@
   }
 
   function capacityScenario(p) {
-    var layout = sessionLayout({
+    var context = Math.max(0, Math.floor(numberOr(p.contextTokens, 0)));
+    var extra = Math.max(0, Math.floor(numberOr(p.extraTokens, 0)));
+    var matched = matchedTokens(context, p.hitRate, p.blockTokens);
+    var uniqueTokens = context - matched + extra;
+    var finalTokens = context + extra;
+    var common = {
       modelId: p.modelId,
       profileId: p.profileId,
-      tokens: p.tokens,
       includeMtp: p.includeMtp,
       compressorPolicy: p.compressorPolicy,
       byteMode: p.byteMode,
       customWireFactor: p.customWireFactor,
       inFlightTokens: p.inFlightTokens,
-    });
-    var bytes = layout.selectedTotalBytes;
-    var usableHbmGB = Math.max(0, numberOr(p.usableHbmGB, 0));
-    var usableG2TB = Math.max(0, numberOr(p.usableG2TB, 0));
-    var rawCmxPB = Math.max(0, numberOr(p.rawCmxPB, 0));
-    var cmxUsableFraction = clamp(p.cmxUsableFraction, 0, 1);
-    var binaryUnits = p.capacityUnitMode === "binary";
-    var hbmBytes = usableHbmGB * (binaryUnits ? GiB : GB);
-    var g2Bytes = usableG2TB * (binaryUnits ? 1024 ** 4 : 1e12);
-    var rawCmxBytes = rawCmxPB * (binaryUnits ? 1024 ** 5 : 1e15);
-    var usableCmxBytes = rawCmxBytes * cmxUsableFraction;
-    var growingShardRanks = Math.max(
-      1,
-      Math.floor(numberOr(p.growingShardRanks, 1))
+    };
+    var matchedLayout = sessionLayout(
+      Object.assign({}, common, { tokens: matched })
     );
-    var stateShardRanks = Math.max(
-      1,
-      Math.floor(numberOr(p.stateShardRanks, 1))
+    var finalLayout = sessionLayout(
+      Object.assign({}, common, { tokens: finalTokens })
     );
+    var retainedUsers = Math.max(
+      1,
+      Math.floor(numberOr(p.retainedUsers, 1))
+    );
+    var gpus = Math.max(1, Math.floor(numberOr(p.gpus, 1)));
+    var uniqueTpsGpu = Math.max(0, numberOr(p.uniqueTpsGpu, 0));
+    var uniqueTpsPool = gpus * uniqueTpsGpu;
     var poolCopies = Math.max(
       1,
       Math.floor(numberOr(p.poolCopies, 1))
     );
-    var activePrefixes = Math.max(
-      0,
-      Math.floor(numberOr(p.activePrefixes, 1))
+    var usableFraction = clamp(p.usableFraction, 0, 1);
+    var requestRate =
+      uniqueTokens > 0 ? uniqueTpsPool / uniqueTokens : null;
+    var sharedGrowingBytesPerUser =
+      matchedLayout.selectedGrowingBytes == null
+        ? null
+        : matchedLayout.selectedGrowingBytes;
+    // A user's requests share one cache lineage. The latest continuation
+    // state replaces the prior state instead of accumulating per request.
+    var latestStateBytesPerUser = finalLayout.selectedStateBytes;
+    var anchorBytesPerUser = addBytes(
+      sharedGrowingBytesPerUser,
+      latestStateBytesPerUser
     );
-    var hbmSessionBytes =
-      layout.selectedGrowingBytes == null || layout.selectedStateBytes == null
+    var userAnchorBytes =
+      anchorBytesPerUser == null ? null : retainedUsers * anchorBytesPerUser;
+    var rawUserAnchorBytes =
+      userAnchorBytes == null || usableFraction === 0
         ? null
-        : layout.selectedGrowingBytes / growingShardRanks +
-          layout.selectedStateBytes / stateShardRanks;
-    var poolSessionBytes = bytes == null ? null : bytes * poolCopies;
-    var rawWorkingSetBytes =
-      poolSessionBytes == null || cmxUsableFraction === 0
+        : (userAnchorBytes * poolCopies) / usableFraction;
+    var newGrowingBytesPerRequest =
+      matchedLayout.selectedGrowingBytes == null ||
+      finalLayout.selectedGrowingBytes == null
         ? null
-        : (activePrefixes * poolSessionBytes) / cmxUsableFraction;
+        : Math.max(
+            0,
+            finalLayout.selectedGrowingBytes -
+              matchedLayout.selectedGrowingBytes
+          );
+    var newGrowingBytesPerSecond = bytesAtRate(
+      requestRate,
+      newGrowingBytesPerRequest
+    );
+    var windows = [300, 1800, 3600].map(function (seconds) {
+      var requestCount =
+        requestRate == null ? null : requestRate * seconds;
+      var requestsPerUser =
+        requestCount == null ? null : requestCount / retainedUsers;
+      var newGrowingBytes =
+        newGrowingBytesPerSecond == null
+          ? null
+          : newGrowingBytesPerSecond * seconds;
+      var logicalBytes = addBytes(userAnchorBytes, newGrowingBytes);
+      var rawBytes =
+        logicalBytes == null || usableFraction === 0
+          ? null
+          : (logicalBytes * poolCopies) / usableFraction;
+      return {
+        seconds: seconds,
+        requestCount: requestCount,
+        requestsPerUser: requestsPerUser,
+        newGrowingBytes: newGrowingBytes,
+        logicalBytes: logicalBytes,
+        rawBytes: rawBytes,
+      };
+    });
     return {
-      layout: layout,
-      usableHbmGB: usableHbmGB,
-      usableG2TB: usableG2TB,
-      rawCmxPB: rawCmxPB,
-      cmxUsableFraction: cmxUsableFraction,
-      capacityUnitMode: binaryUnits ? "binary" : "decimal",
-      growingShardRanks: growingShardRanks,
-      stateShardRanks: stateShardRanks,
+      model: finalLayout.model,
+      profile: finalLayout.profile,
+      contextTokens: context,
+      extraTokens: extra,
+      finalTokens: finalTokens,
+      hitRate: clamp(p.hitRate, 0, 1),
+      blockTokens: Math.max(1, Math.floor(numberOr(p.blockTokens, 1))),
+      matchedTokens: matched,
+      uniqueTokens: uniqueTokens,
+      matchedLayout: matchedLayout,
+      finalLayout: finalLayout,
+      retainedUsers: retainedUsers,
+      gpus: gpus,
+      uniqueTpsGpu: uniqueTpsGpu,
+      uniqueTpsPool: uniqueTpsPool,
       poolCopies: poolCopies,
-      activePrefixes: activePrefixes,
-      hbmSessionBytes: hbmSessionBytes,
-      poolSessionBytes: poolSessionBytes,
-      rawWorkingSetBytes: rawWorkingSetBytes,
-      hbmSessionsPerGpu:
-        hbmSessionBytes > 0 ? Math.floor(hbmBytes / hbmSessionBytes) : null,
-      g2SessionsPerRack:
-        poolSessionBytes > 0 ? Math.floor(g2Bytes / poolSessionBytes) : null,
-      rawCmxSessionsPerPod:
-        poolSessionBytes > 0
-          ? Math.floor(rawCmxBytes / poolSessionBytes)
-          : null,
-      usableCmxSessionsPerPod:
-        poolSessionBytes > 0
-          ? Math.floor(usableCmxBytes / poolSessionBytes)
-          : null,
+      usableFraction: usableFraction,
+      requestRate: requestRate,
+      sharedGrowingBytesPerUser: sharedGrowingBytesPerUser,
+      latestStateBytesPerUser: latestStateBytesPerUser,
+      anchorBytesPerUser: anchorBytesPerUser,
+      userAnchorBytes: userAnchorBytes,
+      rawUserAnchorBytes: rawUserAnchorBytes,
+      newGrowingBytesPerRequest: newGrowingBytesPerRequest,
+      newGrowingBytesPerSecond: newGrowingBytesPerSecond,
+      windows: windows,
     };
   }
 
