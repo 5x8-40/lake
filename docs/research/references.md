@@ -52,6 +52,7 @@
 - **LMCache**: 跨请求/跨实例 KV 复用,多存储后端(CPU/disk/Redis)。**源码已引入** `3rdparty/lmcache`,对应见 [`3rdparty-reference.md`](3rdparty-reference.md)。
 - **DualPath** (DeepSeek-AI/PKU/THU, arXiv:2602.21548v2): 双网络(compute/storage NIC 隔离)下的双路径 KV 加载——借 decode 闲置 storage NIC 从存储加载 KV,再经 compute network RDMA 回传 prefill。针对 agentic 多轮(KV 命中 ≥95%,瓶颈是存储 I/O 而非计算)。本系统**原生支持**(D→P 流,见 [`../architecture/data-flow.md`](../architecture/data-flow.md) §3.4)且更彻底:NIC 带宽归池统一分配,非引擎"借用";并有 D 侧 KV 已在 HBM 的零存储读取特例。分析见 [`dualpath.md`](dualpath.md)。
 - **NVIDIA CMX** (Context Memory Storage): GPU、Dynamo、NIXL、Memos、BF4 和共享 flash 的目标架构。研究文档区分公开实现、伙伴声明和未知项；lake 将相关路径映射为 L2 backend。见 [`nvidia-cmx.md`](nvidia-cmx.md)、[`tools/cmx-sim/`](../../tools/cmx-sim/)、[#22](https://gitlab.com/BeeBreeze/lake/-/issues/22) 和 [#23](https://gitlab.com/BeeBreeze/lake/-/issues/23)。
+- **Agentic cache workload**: 匿名 Cursor 用量、provider cache 留存、ChatGPT File Library 与 Pool quota 的边界，以及 90%/95% 仿真所需输入。见 [`agentic-cache-workload.md`](agentic-cache-workload.md)。
 
 ## 弹性与冷启动
 

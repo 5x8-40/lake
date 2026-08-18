@@ -203,7 +203,9 @@ pages:
     - cp tools/cmx-sim/economics.html public/economics.html
     - cp tools/cmx-sim/app.css public/app.css
     - cp tools/cmx-sim/sim.js public/sim.js
+    - cp tools/cmx-sim/README.md public/README.md
     - cp docs/research/nvidia-cmx.md public/docs/research/nvidia-cmx.md
+    - cp docs/research/agentic-cache-workload.md public/docs/research/agentic-cache-workload.md
     - cp docs/research/references.md public/docs/research/references.md
   pages:
     publish: public

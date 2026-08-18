@@ -6,7 +6,8 @@
  *   1. model/layout bytes,
  *   2. compute-offered request load,
  *   3. CMX and P->D offered traffic,
- *   4. an optional user-supplied transfer ceiling.
+ *   4. an optional user-supplied transfer ceiling,
+ *   5. a GPU-saturated hit-rate capacity comparison.
  *
  * Browser and Node share this file. Storage uses bytes/GiB; bandwidth uses
  * decimal GB/s.
@@ -17,6 +18,8 @@
   var KiB = 1024;
   var MiB = 1024 * KiB;
   var GiB = 1024 * MiB;
+  var TiB = 1024 * GiB;
+  var PiB = 1024 * TiB;
   var GB = 1e9;
   var SWA_TOKENS = 128;
 
@@ -72,7 +75,7 @@
         indexEntryBytes: 256,
         byteClass: "logical-payload",
         confidence: "published",
-        note: "BF16 paged KV；续算需额外计入 FP32 compressor state。",
+        note: "BF16 growing + SWA；续算需额外计入 FP32 compressor state。",
       },
       {
         id: "fp8-vllm",
@@ -674,37 +677,81 @@
     };
   }
 
-  function economicsScenario(p) {
-    var prefillComputeShare = clamp(p.prefillComputeShare, 0, 1);
-    var avoidedPrefillWorkFraction = clamp(
-      p.avoidedPrefillWorkFraction,
+  function relativeIncrease(before, after) {
+    if (before == null || after == null) return null;
+    if (before === 0) return after === 0 ? 0 : Infinity;
+    return after / before - 1;
+  }
+
+  function hitComparisonScenario(p) {
+    var activeSessions = Math.max(
       0,
-      1
+      Math.floor(numberOr(p.activeSessions, 0))
     );
-    var avoidEfficiency = clamp(p.avoidEfficiency, 0, 1);
-    var cacheCostShare = clamp(p.cacheCostShare, 0, 1);
-    var targetComputeSavings = clamp(p.targetComputeSavings, 0, 1);
-    var grossComputeSavings =
-      prefillComputeShare * avoidedPrefillWorkFraction * avoidEfficiency;
-    var netSavings = grossComputeSavings - cacheCostShare;
-    var effectiveAvoidance = avoidedPrefillWorkFraction * avoidEfficiency;
+    var retentionSeconds = Math.max(0, numberOr(p.retentionSeconds, 0));
+    var poolCopies = Math.max(
+      1,
+      Math.floor(numberOr(p.poolCopies, 1))
+    );
+    var usableFraction = clamp(p.usableFraction, 0, 1);
+
+    function atHit(hitRate) {
+      var traffic = trafficScenario(
+        Object.assign({}, p, {
+          hitRate: hitRate,
+          loadMode: "compute",
+        })
+      );
+      var hotPrefixBytes =
+        traffic.matchedLayout.selectedTotalBytes == null
+          ? null
+          : activeSessions * traffic.matchedLayout.selectedTotalBytes;
+      var retainedWriteBytes =
+        traffic.requiredWrite == null
+          ? null
+          : traffic.requiredWrite * retentionSeconds;
+      var logicalRetainedBytes = addBytes(
+        hotPrefixBytes,
+        retainedWriteBytes
+      );
+      var rawStorageBytes =
+        logicalRetainedBytes == null || usableFraction === 0
+          ? null
+          : (logicalRetainedBytes * poolCopies) / usableFraction;
+      return {
+        traffic: traffic,
+        hotPrefixBytes: hotPrefixBytes,
+        retainedWriteBytes: retainedWriteBytes,
+        logicalRetainedBytes: logicalRetainedBytes,
+        rawStorageBytes: rawStorageBytes,
+      };
+    }
+
+    var low = atHit(clamp(p.hitRateLow, 0, 1));
+    var high = atHit(clamp(p.hitRateHigh, 0, 1));
     return {
-      prefillComputeShare: prefillComputeShare,
-      avoidedPrefillWorkFraction: avoidedPrefillWorkFraction,
-      avoidEfficiency: avoidEfficiency,
-      cacheCostShare: cacheCostShare,
-      targetComputeSavings: targetComputeSavings,
-      grossComputeSavings: grossComputeSavings,
-      netSavings: netSavings,
-      requiredPrefillComputeShare:
-        targetComputeSavings === 0
-          ? 0
-          : effectiveAvoidance > 0
-            ? targetComputeSavings / effectiveAvoidance
-            : null,
-      grossBenefitCostRatio:
-        cacheCostShare > 0 ? grossComputeSavings / cacheCostShare : null,
-      netRoi: cacheCostShare > 0 ? netSavings / cacheCostShare : null,
+      activeSessions: activeSessions,
+      retentionSeconds: retentionSeconds,
+      poolCopies: poolCopies,
+      usableFraction: usableFraction,
+      low: low,
+      high: high,
+      storageCostIncrease: relativeIncrease(
+        low.rawStorageBytes,
+        high.rawStorageBytes
+      ),
+      computeReqIncrease: relativeIncrease(
+        low.traffic.offeredReqsPool,
+        high.traffic.offeredReqsPool
+      ),
+      readIncrease: relativeIncrease(
+        low.traffic.requiredRead,
+        high.traffic.requiredRead
+      ),
+      writeIncrease: relativeIncrease(
+        low.traffic.requiredWrite,
+        high.traffic.requiredWrite
+      ),
     };
   }
 
@@ -724,9 +771,18 @@
     if (Number.isNaN(bytesPerSecond)) return "N/A";
     if (!Number.isFinite(bytesPerSecond)) return "∞";
     var value = bytesPerSecond / GB;
-    if (Math.abs(value) >= 100) return value.toFixed(0) + " GB/s";
-    if (Math.abs(value) >= 10) return value.toFixed(1) + " GB/s";
+    if (Math.abs(value) >= 10000) return value.toFixed(0) + " GB/s";
+    if (Math.abs(value) >= 1000) return value.toFixed(1) + " GB/s";
     return value.toFixed(2) + " GB/s";
+  }
+
+  function fmtCapacity(bytes) {
+    if (bytes == null) return "N/A";
+    if (Number.isNaN(bytes)) return "N/A";
+    if (!Number.isFinite(bytes)) return "∞";
+    if (Math.abs(bytes) >= PiB) return (bytes / PiB).toFixed(3) + " PiB";
+    if (Math.abs(bytes) >= TiB) return (bytes / TiB).toFixed(2) + " TiB";
+    return fmtGiB(bytes);
   }
 
   function fmtRate(value) {
@@ -742,6 +798,8 @@
     KiB: KiB,
     MiB: MiB,
     GiB: GiB,
+    TiB: TiB,
+    PiB: PiB,
     GB: GB,
     MODELS: MODELS,
     PROFILES: PROFILES,
@@ -751,9 +809,10 @@
     matchedTokens: matchedTokens,
     trafficScenario: trafficScenario,
     capacityScenario: capacityScenario,
-    economicsScenario: economicsScenario,
+    hitComparisonScenario: hitComparisonScenario,
     fmtGiB: fmtGiB,
     fmtGBs: fmtGBs,
+    fmtCapacity: fmtCapacity,
     fmtRate: fmtRate,
   };
 

@@ -3,24 +3,24 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CMX offered load</title>
+  <title>CMX 单工作点流量</title>
   <link rel="stylesheet" href="app.css?v=4" />
 </head>
 <body>
   <nav class="topnav" aria-label="CMX 分析页面">
-    <a href="index.html" class="on" aria-current="page">流量需求</a>
-    <a href="capacity.html">容量场景</a>
-    <a href="economics.html">Trace 与经济</a>
-    <span class="navdoc">分析见 <a href="../../docs/research/nvidia-cmx.md">docs/research/nvidia-cmx.md</a></span>
+    <a href="index.html" class="on" aria-current="page">流量工作点</a>
+    <a href="capacity.html">容量换算</a>
+    <a href="economics.html">命中率对比</a>
+    <span class="navdoc">方法见 <a href="README.md">README</a></span>
   </nav>
 
   <header>
-    <h1>CMX 长上下文 offered load</h1>
+    <h1>CMX 单工作点 offered load</h1>
     <p>
       按布局、前缀命中和用户给定的 Prefill 吞吐，计算 PD 下的 CMX 与 P→D 流量。
     </p>
     <div class="warn" role="note">
-      非 benchmark。默认无带宽上限；填写链路预算后才计算用户假设下的 ceiling。
+      本页算一个工作点的流量，不算容量成本。默认无带宽上限；填写预算后才计算用户假设下的 ceiling。
     </div>
   </header>
 
@@ -198,7 +198,7 @@
     </main>
   </div>
 
-  <script src="sim.js?v=7"></script>
+  <script src="sim.js?v=8"></script>
   <script>
     "use strict";
 

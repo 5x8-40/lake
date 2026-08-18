@@ -4,7 +4,7 @@
 >
 > CMX 是 NVIDIA 公布的 KV cache 存储目标架构，覆盖 GPU、Dynamo/KVBM、NIXL、DOCA Memos、BlueField-4、Spectrum-X 和共享 flash。公开软件尚未形成可复现的端到端实现。lake 只把共享 flash 数据路径映射为候选 L2 backend。
 
-可调公式与校验在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)；项目成员可通过 private GitLab Pages 直接查看 [`index`](https://lake-13d9f7.gitlab.io/)、[`capacity`](https://lake-13d9f7.gitlab.io/capacity.html) 和 [`economics`](https://lake-13d9f7.gitlab.io/economics.html)。
+模型字节、容量、offered load 和 90%/95% 命中率对比在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)；Agentic trace 与 provider cache 留存见 [`agentic-cache-workload.md`](agentic-cache-workload.md)。
 
 后续工作见 [#22 可移交 Context 合同和数据面能力](https://gitlab.com/BeeBreeze/lake/-/issues/22) 与 [#23 Portable Context ABI](https://gitlab.com/BeeBreeze/lake/-/issues/23)。MR !7 不修改核心 proto/runtime。
 
@@ -261,163 +261,12 @@ capacity = users × 32 GB × sessions retained per user
 | VAST “70% power/footprint reduction” | 2024 BlueField-3 伙伴声明 | 相对其原 x86-backed VAST infrastructure；同文称端到端系统净节能超过 5%。这不是 CMX/BF4 benchmark |
 | 600 TB/enclosure、16 TB/GPU、1.152 PB/rack、18.432 PB/POD | 发布会参数 + 推导 | reference-capacity arithmetic；材料未把它定义成 raw、formatted 或 usable SKU |
 | ConnectX-9 1.6 Tb/s | endpoint peak | 不能直接当成每 GPU 独占、持续的 CMX 200 GB/s |
+| DeepSeek V4-Pro BF16 9.62 GiB | vLLM blog + 代码核对 | `1,048,576 token` 的 paged KV 为 9.6246 GiB，含 7.625 MiB SWA；不含 compressor、engine page 或 CMX wire |
 | CMX 持续 read/write、p99 latency、queue depth | **未知** | 公开材料没有可用于仿真的数据表 |
 
-计算器不预设“200 GB/s/GPU”，并将需求统一标为 offered load，而非可达吞吐。
+计算器不预设“200 GB/s/GPU”，并将需求统一标为 offered load，而非可达吞吐。字节公式和校验点以 [`../../tools/cmx-sim/README.md`](../../tools/cmx-sim/README.md) 为准。
 
-## 7. 四个模型的会话状态体积
-
-### 7.1 必须区分四种字节口径
-
-1. **Logical payload**：模型公式需要的有效元素，例如 V4 BF16 main/index 的 `1024/256 B`。
-2. **Engine entry payload**：引擎每个有效 entry 的实际结构，包含 scale/pad 字段，例如 V4 `fp8_ds_mla=584 B`、FP8 index `132 B`。它还不是 allocator 占用。
-3. **Engine page allocation**：entry 按 block/page/alignment 向上取整，并计 sliding-window admission page；还不含全局 pool packing、allocator fragmentation 和 runtime reserve。
-4. **Custom wire / CMX serialization**：跨 P/D 或写入 Memos 的对象格式，可能去 padding、重排或转换。
-
-第四种尚未公开，不能用 logical payload、某个引擎的 HBM page 或“FP8 大约减半”代替。计算器把 profile 自带的 payload class、V4 可核对的 vLLM engine-page estimate 和用户输入的 `wire = payload × factor` 分开；不支持的 engine-page profile返回 `N/A`，不静默回退。
-
-### 7.2 1 Mi-token 校验点
-
-以下 `1 Mi-token = 1,048,576 token`。十进制 `1,000,000` 与它相差 4.86%，不能都写成模糊的“1M”。
-
-| 模型/profile | growing payload | paged/window state | 额外续算 state | payload 合计 | vLLM engine pages |
-|---|---:|---:|---:|---:|---:|
-| V4-Pro BF16 公式布局 | 9.6172 GiB | 7.6250 MiB SWA | 17.8438 MiB compressor | **9.6421 GiB** | **9.6479 GiB** |
-| V4-Pro vLLM `fp8_ds_mla` + FP8 index entry | 5.3823 GiB | 4.3486 MiB SWA | 17.8438 MiB compressor | 5.4039 GiB | **5.5038 GiB** |
-| V4-Pro FP8 main + FP4 index有效 payload estimate | 4.9135 GiB | 4.3486 MiB SWA | 17.8438 MiB compressor | 4.9352 GiB | **5.5038 GiB** |
-| V4-Flash BF16 公式布局 | 6.7188 GiB | 5.3750 MiB SWA | 11.6406 MiB compressor | **6.7354 GiB** | **6.7394 GiB** |
-| GLM-5.2 base FP8 logical（78 + 21 indexer） | **46.5820 GiB** | 0 | 0 | 46.5820 GiB | N/A |
-| GLM-5.2 + MTP FP8 logical（79 + 22） | **47.2734 GiB** | 0 | 0 | 47.2734 GiB | N/A |
-| GLM-5.2 base vLLM entry payload `fp8_ds_mla` | **52.6758 GiB** | 0 | 0 | 52.6758 GiB | N/A |
-| Kimi K3 BF16 MLA + vLLM KDA state payload | 27.0000 GiB | 0 | 428.5547 MiB KDA | **27.4185 GiB** | N/A |
-| Kimi K3 FP8 MLA + vLLM KDA state payload | 13.5000 GiB | 0 | 428.5547 MiB KDA | **13.9185 GiB** | N/A |
-
-对 V4，`paged KV = growing KV + SWA`：V4-Pro BF16 的锚点仍是 **9.6246 GiB**，V4-Flash 是 **6.7240 GiB**。上表“可移交合计”另外加入继续压缩下一批 token 所需的 FP32 compressor residual；把 paged KV 锚点直接当成完整 P→D/CMX 会话状态会少算。
-
-口径说明：
-
-- DeepSeek V4-Pro BF16 的 9.62 GiB 保留为 **paged KV** 硬锚点；完整续算状态是 9.6421 GiB。
-- V4 的 FP8 不能简单把 1024 B 除二；vLLM `fp8_ds_mla` main entry 是 584 B。
-- V4 的 FP4 index `68 B` 是有效 payload；vLLM 当前 allocator 仍按 `132 B` FP8 index entry 构页，所以 FP8-index 与 FP4-index profile 的 engine-page 结果相同。
-- vLLM `CompressorStateCache` 用 FP32 保存 C4/C128 residual。SGLang 的状态导出也显式枚举 compressor/indexer-compressor buffers，说明它们不能从会话移交中省略。
-- V4 的 base ring 是 `C4=8/C128=128`；SGLang speculative 是 `16/256`，online C128 则是单个 `3×head_dim` 状态。三者是不同 representation，不应只乘一个“spec factor”。V4 MTP 还增加一层 SWA state。
-- GLM base 是 78 层 + 21 个 indexer；MTP 是可选的第 79 层 + 第 22 个 indexer，不能默认混入。
-- Kimi K3 的 vLLM recurrent state 是 FP32，conv state 跟 cache/model dtype；默认 BF16 conv 时固定 state 是 428.5547 MiB，不是 221.55 MiB。
-- K3 state 每个前缀 snapshot 只读一次；若写回最终状态，也只写一次，不能把它重复算进 growing KV。
-
-表中 V4 engine-page 数字按 vLLM `page_size_bytes`、alignment 和 `SlidingWindowSpec.max_admission_blocks_per_request(max_in_flight_tokens=0)` 推导，是“settled snapshot 的逐请求 admission estimate”。它不是部署期 HBM pool 容量；生产容量还依赖 max-in-flight、packed group sharing、TP/CP、fragmentation 和 reserve。GLM/K3 当前缺完整公开 allocator topology，因此保留 `N/A` 比伪造精确值更正确。
-
-### 7.3 公式锚点
-
-V4-Pro BF16：
-
-```text
-swa = 61 layers × 128 entries × 1024 B
-growing/token = 30 × (1024 + 256)/4 + 31 × 1024/128
-              = 9,848 B/token
-paged_KV(1,048,576) = growing + swa
-                      = 9.624633789 GiB
-
-C4 compressor/layer
-  = [8 × (2 × 2 × 512) + 8 × (2 × 2 × 128)] × 4 B
-  = 80 KiB                    # main + indexer, FP32
-C128 compressor/layer
-  = 128 × (2 × 1 × 512) × 4 B
-  = 512 KiB
-compressor = 30 × 80 KiB + 31 × 512 KiB
-           = 17.84375 MiB
-transferable_total = paged_KV + compressor
-                   = 9.642059326 GiB
-
-vLLM BF16 engine pages (settled, max_in_flight=0)
-  = full-cache pages + SWA admission pages + compressor admission pages
-  = 9.647872925 GiB
-```
-
-同理，V4-Flash 的 compressor residual 是 `21 × 80 KiB + 20 × 512 KiB = 11.640625 MiB`，所以 BF16 可移交总量为 `6.735366821 GiB`。
-
-Kimi K3 的 vLLM KDA state（跨 TP ranks 汇总）：
-
-```text
-recurrent/layer = 96 × 128 × 128 × 4 B          # FP32
-conv/layer      = (3 × 96 × 128) × (4 − 1) × 2 B
-state           = 69 × (recurrent + conv)
-                = 428.5546875 MiB
-```
-
-## 8. “GPU 跑满”下应该怎么算 CMX 流量
-
-流量计算使用用户输入的 `effective_unique_tok/s/GPU`，不通过不完整的模型 FLOPs 公式比较跨模型性能。
-
-定义：
-
-- `C`：请求到来前的既有上下文；
-- `E`：本轮新增 token；
-- `h`：可复用前缀比例；
-- `block`：匹配粒度；
-- `M = floor(C × h / block) × block`：真正命中的 token；
-- `U = C − M + E`：Prefill 要计算的 unique token；
-- `q`：命中 bytes 中确实要从 CMX 远程拉取的比例；
-- `a`：新状态长期 admission 到 CMX 的比例；
-- `S(L)`：按选定 byte basis 计算的长度 `L` 完整可移交表示；
-- `λ`：请求到达率，来源必须显式选择为外部 trace，或 GPU-saturated 假设；
-- `handoff ∈ {direct, via-CMX, local}`：Prefill 完成后状态到 Decode 的路径。
-
-```text
-prefix_cmx_read/request
-  = q × S(M)
-
-P→D local:
-  decode_cmx_read = 0
-  direct_transfer = 0
-
-P→D direct:
-  decode_cmx_read = 0
-  direct_transfer = S(C+E)
-
-P→CMX→D:
-  decode_cmx_read = S(C+E)
-  direct_transfer = 0
-  effective_a = 1              # handoff 必须 materialize
-
-cmx_write/request
-  = effective_a × [selected_growing(C+E) − selected_growing(M)
-                   + final_state_snapshot]
-
-external:
-  λ = user_supplied_req/s
-
-GPU-saturated:
-  λ = effective_unique_tok/s/GPU × GPUs / U
-
-cmx_read_offered_B/s
-  = λ × (prefix_cmx_read + decode_cmx_read)
-
-cmx_write_offered_B/s
-  = λ × cmx_write/request
-
-direct_offered_B/s
-  = λ × direct_transfer/request
-```
-
-边界条件不能写成 `Infinity`：当 `U=0`（100% 块对齐命中且 `E=0`）时，GPU-saturated 公式无法推出 `λ`，页面要求切换到外部请求到达率。外部 `λ` 不会因为 hit 上升而自动增加。若某方向 bytes/request 为 0，该方向 offered load 严格为 0；若字节口径未知则为 `N/A`，不能回退成 0。
-
-模型分别处理 prefix hit 与远程读取比例、cache admission、字节口径、`λ` 来源，以及 CMX 与 P→D 流量。
-
-只有用户提供可用 transfer budget 时，才计算：
-
-```text
-shared-link ceiling = B / (cmx_read/request + cmx_write/request)
-full-duplex ceiling = min(B_rx/cmx_read/request, B_tx/cmx_write/request)
-direct ceiling      = B_pd/direct_transfer
-overall ceiling     = min(CMX ceiling, direct ceiling)
-```
-
-ceiling 只反映用户输入的链路预算；缺少 DPU、fabric、flash、queue 和 tail-latency 数据时，不能视为 CMX 性能结果。
-
-容量页也采用同样的表示口径，并把 `growing shard ranks`、`fixed-state shard ranks`、pool representation copies 和十进制/二进制单位显式化。`state shard ranks=1` 表示每个 GPU 持有完整 fixed-state 副本。未提供 HBM 容量和部署拓扑时，页面不把发布会算术展示成可部署 HBM 会话数。
-
-## 9. 同一模型 P/D KV 布局不同怎么办
+## 7. 同一模型 P/D KV 布局不同怎么办
 
 CMX 不解释 value。相同 prefix hash 对应不同布局时，retrieve 甚至可能“成功”但产生静默错误。
 
@@ -459,9 +308,9 @@ P/D 建链时先交换 `layout_id`：
 
 布局 descriptor 应按 volume/version 保存，不应在主机为每个 object 复制一份大元数据。
 
-## 10. 架构价值与公开缺口
+## 8. 架构价值与公开缺口
 
-### 10.1 架构价值
+### 8.1 架构价值
 
 1. KV 成为 immutable、recomputable、large-I/O 的独立数据类，fast path 可裁掉不需要的 durable services。
 2. POD 级共享解除本地 SSD 对请求和 GPU 的长期绑定。
@@ -469,7 +318,7 @@ P/D 建链时先交换 `layout_id`：
 4. Dynamo 管编排和生命周期，NIXL/DOCA 管数据移动与存储。
 5. miss/hole 成为上层正常控制流，而非系统异常。
 
-### 10.2 未公开的关键能力
+### 8.2 未公开的关键能力
 
 | 难点 | 当前缺口 |
 |---|---|
@@ -483,9 +332,9 @@ P/D 建链时先交换 `layout_id`：
 | raw/usable capacity | 冗余、reserve、GC、metadata、fragmentation 未公开 |
 | 功耗账 | 省掉 durable services，但增加 DPU 基线和 miss 重算；无公开 workload 无法闭合 |
 
-## 11. 软件边界
+## 9. 软件边界
 
-### 11.1 已有或已宣布
+### 9.1 已有或已宣布
 
 | 能力 | 状态 |
 |---|---|
@@ -494,7 +343,7 @@ P/D 建链时先交换 `layout_id`：
 | DASE 全局 namespace、CNode/DNode 分工 | VAST 伙伴架构声明 |
 | Dynamo overlap、offload filter、generic external tier | 当前代码 |
 
-### 11.2 可实现的扩展
+### 9.2 可实现的扩展
 
 - NVIDIA/Dynamo 目标栈可增加 CMX serving/cost class；lake 仅增加 L2 backend profile 和 path capability。
 - 用 `OffloadFilter` 类扩展点控制 shared-tier admission。
@@ -503,7 +352,7 @@ P/D 建链时先交换 `layout_id`：
 - 定义 layout descriptor、canonical serialization 和 P/D handshake。
 - 把 storage-side placement、queueing 和 tenant policy 暴露成可观测指标。
 
-### 11.3 尚未公开的算法
+### 9.3 尚未公开的算法
 
 NVIDIA/VAST 没有公开以下实现：
 
@@ -515,7 +364,7 @@ NVIDIA/VAST 没有公开以下实现：
 
 “按 KV format/layout 写盘”不能证明已实现 prefix-aware NAND packing 或专用 FTL。
 
-### 11.4 与 lake 的关系
+### 9.4 与 lake 的关系
 
 CMX 是 GPU 到共享 flash 的目标栈；lake 是 Pool 管理全部状态的推理系统。CMX 在 lake 中对应 L2 backend capability，不是第五个介质层。
 
@@ -544,7 +393,7 @@ lake 需要补充：
 - 将某个引擎的 HBM layout 设为通用 wire ABI；
 - 将伙伴 benchmark、端点峰值或页面默认值当作 CMX SLA。
 
-### 11.5 后续工作
+### 9.5 后续工作
 
 - [#22：可移交 Context 合同和数据面能力](https://gitlab.com/BeeBreeze/lake/-/issues/22)：定义 identity、representation、component、partial result、P/D handshake、object key 和 capability。
 - [#23：Portable Context ABI](https://gitlab.com/BeeBreeze/lake/-/issues/23)：孵化跨引擎 schema、bindings、adapters 和 conformance。
@@ -552,7 +401,7 @@ lake 需要补充：
 - DPU/NVMe target 依赖真实硬件和厂商 API。
 - 当前不实现完整 CMX appliance。
 
-## 12. 尚待厂商回答的问题
+## 10. 尚待厂商回答的问题
 
 1. `DOCA_MEMOS` 何时合并、对应哪个公开 DOCA SDK/version？
 2. 最终 key 是任意 1–16 bytes，还是某个上层强制 16-byte digest？
@@ -565,123 +414,11 @@ lake 需要补充：
 9. 一柜/一 POD 的 sustained read/write、p99 latency、failure-domain 和 usable/raw 是多少？
 10. 5× 的模型、context、hit rate、batch、对照存储和功耗边界是什么？
 
-## 13. Agentic 用量、cache 留存与成本
+Agentic trace、provider cache 留存和 File Library quota 的证据已拆到 [`agentic-cache-workload.md`](agentic-cache-workload.md)，不再与 CMX 产品架构混写。
 
-### 13.1 匿名 Cursor usage trace
+## 11. 参考实现与代码回溯
 
-**[用户提供数据 + 推导]** 数据窗口为 `2026-07-20 16:03` 至 `2026-08-14 10:46`（UTC+8），来自单用户 Cursor team usage CSV：
-
-- 553 个 usage events、8 个模型、19 个活跃日、96 个活跃小时；
-- `731.0422M` total token，其中 prompt `726.4252M`、output `4.6170M`；
-- prompt 中 `670.4458M` 是 Cache Read，`6.4455M` 是 Input with Cache Write，`49.5338M` 是 Input without Cache Write；
-- 每行 `Total Tokens = Cache Write + uncached input + Cache Read + Output`，553 行全部一致；
-- 296 行有数值 Cost，合计 `$502.65`；243 行为 `-`、14 行为 `Free`，所以该金额不是全部事件的经济价值；
-- Cloud Agent ID / Automation ID 均为空，原始用户标识和 CSV 不入仓。
-
-Cursor event 不是单次模型 API 请求。单个 event 最高包含 `22.0526M` prompt token，说明 Cursor 会聚合多次底层调用。input/output 分位数只能描述 event 聚合量，不能反推单请求 KV 容量、并发数、TTFT 或 provider TTL。
-
-整体 token-weighted cache hit 定义为：
-
-```text
-h = Cache Read / (Cache Write + uncached input + Cache Read)
-  = 670.4458M / 726.4252M
-  = 92.2939%
-```
-
-活跃小时 total token 的 `p50/p95/max` 分别为 `4.1143M / 20.9452M / 60.3019M token/h`。最大小时发生在 `2026-08-13 17:00`（UTC+8）：5 个 events、`60.0477M` prompt、`254.2K` output、`56.6650M` Cache Read、数值 Cost `$66.58`。
-
-完整匿名分模型汇总：
-
-| 模型 | events | total token | cache hit | input/event p50 | input/event p95 | output/event p50 | output/event p95 | peak token/h | 数值 Cost |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| Composer 2.5 Fast | 4 | 9.223M | 93.91% | 1.335M | 5.256M | 11.4K | 16.2K | 5.949M | — |
-| Cursor Grok 4.5 High Fast | 253 | 209.077M | 95.02% | 445.9K | 2.624M | 1.9K | 18.6K | 18.877M | $73.65 |
-| Cursor Grok 4.6 XHigh | 18 | 25.177M | 93.69% | 1.393M | 2.903M | 11.4K | 38.5K | 13.756M | — |
-| GPT-5.5 Medium | 85 | 93.311M | 87.34% | 585.5K | 3.688M | 2.6K | 22.7K | 26.474M | $67.28 |
-| GPT-5.6 Sol Max | 14 | 104.705M | 92.71% | 6.194M | 19.034M | 38.2K | 67.2K | 60.302M | $124.20 |
-| GPT-5.6 Sol Medium | 11 | 6.205M | 80.94% | 84.9K | 1.829M | 1.9K | 7.6K | 2.307M | $10.76 |
-| GPT-5.6 Terra Medium | 4 | 3.752M | 86.41% | 803.8K | 1.390M | 6.8K | 7.7K | 1.620M | — |
-| Kimi K3 Max | 164 | 279.593M | 91.90% | 584.8K | 7.818M | 5.6K | 50.2K | 21.332M | $226.76 |
-
-这份 trace 可提供单用户 token/h 峰值、token-weighted cache hit 和模型 mix。request arrival rate、单请求 context、KV bytes、GPU time 和存储成本仍需底层 request trace 与模型布局。
-
-### 13.2 Provider cache 留存：合同与实测
-
-Mempko / arXiv:2607.19214 使用 100K prefix 测量 Anthropic Sonnet 4.5、OpenAI GPT-5.1、DeepSeek V3.2、Gemini 2.5 Pro 的空闲存活与 keepalive。其结果适合做 agent pause workload 的**测量样本**，不等于 provider 的统一 TTL 合同：
-
-| Provider | 官方口径（2026-08-14 快照） | 该实验观测 | 本文采用方式 |
-|---|---|---|---|
-| Anthropic | 默认 5 分钟；可选 1 小时 | 5–6 分钟断崖 | 5 分钟可作为合同；4 分钟 keepalive 是实验策略 |
-| OpenAI | 旧模型 in-memory 通常 5–10 分钟、最长 1 小时；另有 extended 24h / 新模型策略 | GPT-5.1 在 20 分钟约一半存活，30 分钟全冷 | 只记为 GPT-5.1/该时点实测，不能概括当前全部 GPT |
-| DeepSeek | best-effort；官方称闲置后通常数小时至数天清理 | V3.2 在 10 分钟全冷 | 与官方范围冲突，只能保留为路径实测，不能写成“TTL=10 分钟” |
-| Google Gemini | implicit cache 无 TTL 保证；explicit cache 默认 1 小时 | implicit 命中率在 33%–83% 波动 | 说明隐式路由/驻留不可预测，不能外推 explicit cache |
-
-文章给出的 client-side keepalive break-even：
-
-```text
-I_max ≈ τ × (w / r − 1)
-```
-
-其中 `τ` 是 ping 间隔，`w` 是冷 re-prefill/cache-write 相对成本，`r` 是一次 cache-read ping 相对成本。这个公式用于 API 客户端的“是否续租”，不是 CMX 物理 block TTL；它对 CMX 的价值是生成 pause/resume workload 和 retention-policy 输入。
-
-同样不能把 Dynamo `router_ttl_secs` 当成真实 KV TTL：该字段只在不消费 KV events 的 approximate indexer 中清理 Router 的预测条目，物理 KV 是否仍在 worker/storage 是另一件事。
-
-### 13.3 ChatGPT Pro 100 GB 是 File Library，不是 KV quota
-
-OpenAI Help Center 当前明确写明：ChatGPT Pro 用户拥有 **100 GB File Library storage**。这个额度承载上传文件和 ChatGPT 生成文件；它不是 prompt cache、KV cache、GPU-local cache、API context retention，也不是 OpenAI 给每个用户预留 100 GB KV。
-
-`100 GB/user` 仅作为终端产品存储配额参照，不代入 CMX sizing。若将 100 GB 设为 CMX 业务 quota，还需给出：
-
-- 每用户要保留多少会话/前缀；
-- 每份 session 的模型、layout、token 长度和共享比例；
-- TTL/热度、去重、增量快照、冗余与 usable/raw；
-- quota 是 soft、hard 还是可借用。
-
-参考实现上，LMCache `QuotaManager` 提供按 `cache_salt` 动态设置 byte limit 的形态，但没有默认 100 GB，也不证明任何产品级 quota 应该取该值。
-
-### 13.4 Cache 成本公式
-
-先把 token 记账命中与 GPU work 分开：
-
-```text
-gpu_cost_saved
-  = prefill_gpu_cost_share
-    × avoidable_prefill_work_fraction
-    × path_efficiency
-
-net_saved
-  = gpu_cost_saved − cache_total_cost_share
-```
-
-- `trace_token_hit`：Cursor `Cache Read / prompt token`，只描述账单 token；不进入公式。
-- `prefill_gpu_cost_share`：无 cache 基线中 Prefill 占总 GPU time/成本的比例。
-- `avoidable_prefill_work_fraction`：Prefill work 中可由可复用 Context 消除的比例，需由 kernel/GPU time 或重算实验得到；不能直接用 token hit 替代。
-- `path_efficiency`：transfer、layout conversion、context hole、等待和重复读之后真正兑现的比例。
-- `cache_total_cost_share`：容量、传输、DPU/控制面、keepalive 和运维成本，换算为同一个“基线 GPU 成本”分母。
-
-Cursor trace 只能提供 `trace_token_hit=92.2939%`，没有 GPU time，不能推导 `avoidable_prefill_work_fraction`。一个明确的 what-if 是：
-
-```text
-prefill_gpu_cost_share          = 25%
-avoidable_prefill_work_fraction = 80%
-path_efficiency                 = 100%
-gross GPU cost saving           = 25% × 80% × 100% = 20%
-```
-
-若 Cache 总成本确为同一基线 GPU 成本的 `5%`，则：
-
-```text
-gross GPU cost saving = 20%
-net saving            = 20% − 5% = 15%
-gross benefit/cost   = 20% / 5% = 4×
-net ROI              = (20% − 5%) / 5% = 3×
-```
-
-该公式可计算阈值和假设场景，不能仅凭 token cache hit 得出 20% 算力节省。当前 CSV 没有 GPU time、Prefill/Decode 分解或 CMX 成本，且 257 行 Cost 不是数值；实际结论仍需模型与硬件实测。可调计算见 [`../../tools/cmx-sim/economics.html`](../../tools/cmx-sim/economics.html)。
-
-## 14. 参考实现与代码回溯
-
-### 14.1 本次直接参考的实现
+### 11.1 本次直接参考的实现
 
 | 机制 | 代码锚点 | 采用内容 | 限制 |
 |---|---|---|---|
@@ -690,17 +427,10 @@ net ROI              = (20% − 5%) / 5% = 3×
 | KVBM offload/admission | `lib/llm/src/block_manager/offload.rs::OffloadManager`；`offload/filter.rs::FrequencyFilter` | 生命周期与写入过滤扩展点 | 当前主状态机不是 CMX 专用 |
 | KVBM Event Plane | `lib/llm/src/block_manager/events.rs::{EventManager,DynamoEventManager}`；`kv_consolidator/publisher.rs::KvEventConsolidatorPublisher` | store/remove 事件与聚合发布已有可运行骨架 | 外部 storage advisor/provider schema 仍在演进 |
 | NIXL Memos | PR #1717 `nixlDocaMemosEngine::{parseInitParams,registerMem,queryMem,prepXfer}`、`resolveMemosKey`、`doca_memos_progress_engine.cpp::{taskErrorCallback,collectQueryResults}` | key、segment、progress、QUERY/READ miss 的候选 API | open PR，且 READ 无 per-key result，不能作为稳定 partial-prefix 接口 |
-| MLA physical layout | `3rdparty/vllm/vllm/v1/kv_cache_interface.py::{MLAAttentionSpec.real_page_size_bytes,_apply_alignment_padding,SlidingWindowSpec.max_admission_blocks_per_request}` | entry payload、page alignment、sliding-window extra admission page 是不同口径 | engine allocation 不等于 CMX serialization；还缺全局 allocator/packing |
 | vLLM canonical refs | `distributed/kv_transfer/kv_connector/v1/offloading/worker.py::register_kv_caches`；`CanonicalKVCaches` / `CanonicalKVCacheRef` | tensor、group 和 ref 显式注册，可作为 adapter descriptor 参考 | vLLM 进程内 canonical，不是稳定跨引擎 wire ABI |
-| V4 continuation state | `3rdparty/vllm/vllm/models/deepseek_v4/compressor.py::CompressorStateCache.get_kv_cache_spec`；SGLang `deepseek_v4_memory_pool.py::{get_state_buf_infos,get_c128_state_buf_infos}` | C4/C128 FP32 residual 的 shape、window 与移交 buffer | 引擎状态合同仍需映射到 CMX object/layout |
-| V4 ring/MTP policy | `deepseek_v4_memory_pool.py::{get_compress_state_ring_size,ONLINE_C128}` | base `8/128`、spec `16/256`、online C128 `1×3D` 是不同 representation | 不能把 speculative state 当统一倍数；online 与 vLLM page 不同 |
-| V4 FP8/FP4 payload | `3rdparty/sglang/python/sglang/srt/mem_cache/deepseek_v4_memory_pool.py::{DeepSeekV4SingleKVPool,DeepSeekV4IndexerPool}.get_bytes_per_token` | 584 B main、132/68 B index有效 payload | SGLang page format不是标准交换格式；vLLM FP4 index仍按132 B页分配 |
-| Kimi K3 state | `3rdparty/vllm/vllm/model_executor/layers/mamba/mamba_utils.py::{MambaStateDtypeCalculator.kda_state_dtype,MambaStateShapeCalculator.kda_state_shape}` | recurrent FP32、conv/state shape | TP 汇总和 checkpoint policy仍要部署定义 |
 | SGLang component/hole | `hicache_storage.py::{PoolTransfer,PoolHitPolicy,batch_exists_v2}` | main/index/SWA/Mamba component 与 `ALL_PAGES/TRAILING_PAGES` 命中语义 | HiCache L1/L2 实例私有，不能照搬为全局权威 |
 | LMCache 128-bit key | `lmcache/v1/storage_backend/nixl_storage_backend.py::_format_object_key_b128` | Memos 16-byte/32-hex key adapter 形态 | key 仍从 LMCache 自身 identity hash，未标准化 layout/component |
 | Prefetch stop policy | `3rdparty/sglang/python/sglang/srt/mem_cache/hiradix_cache.py::can_terminate_prefetch` | best-effort/wait/timeout 的控制语义 | 只作为软件设计参考，不是 CMX 已实现能力 |
-| Dynamo approximate TTL | `3rdparty/dynamo/lib/llm/src/kv_router/indexer/mod.rs::KvIndexer::new`（`PruneConfig.ttl`） | 无事件时用 TTL 清理预测位置的最小形态 | Router metadata TTL，不是物理 KV/provider cache TTL |
-| LMCache per-user quota | `3rdparty/lmcache/lmcache/v1/distributed/quota_manager.py::QuotaManager` | `cache_salt → byte limit`、动态 CRUD、下一 eviction cycle 生效 | 没有默认 100 GB；L2 adapter quota 也不是终端产品 File Library |
 
 submodule revisions：
 
@@ -708,15 +438,13 @@ submodule revisions：
 - vLLM：`f3e9497e921a16741401c5e93af0c2c29ea74907`
 - SGLang：`37f94cb7a0abd2577006c196444786ddfbe9d1e0`
 
-### 14.2 使用边界
+### 11.2 使用边界
 
 - 参考引擎给出的是 HBM page/状态布局；CMX 需要一个跨进程、跨 P/D 的序列化合同，不能直接照搬某个引擎的 allocator。
 - Dynamo 当前 generic `External` 能复用控制面骨架，但 CMX 的共享性、延迟、可丢和 hole 语义需要独立建模。
 - SGLang 的 prefetch policy 可借鉴终止语义，不能拿来证明 DOCA/NIXL 已实现同样行为。
-- API provider 的 cache survival 和 Dynamo Router 的预测 TTL 都不能直接当作 CMX block lifecycle；三者分别属于外部服务观测、控制面 metadata、物理存储状态。
-- LMCache 的 byte quota API 形态可借鉴，但 quota 数值必须从 workload/sizing 推导，不能从 ChatGPT File Library 的 100 GB 照搬。
 
-## 15. 来源
+## 12. 来源
 
 ### NVIDIA 一手材料
 
@@ -738,28 +466,12 @@ submodule revisions：
 - [VAST：2024 BlueField-3 AI Factory architecture（70% claim 的实际 scope）](https://www.vastdata.com/press-releases/vast-nvidia-bluefield-architecture-for-ai-factory)
 - [VAST Forward：CNode-X / CMX cluster configuration](https://www.vastdata.com/press-releases/vast-data-introduces-end-to-end-fully-accelerated-ai-data-stack-with-nvidia)
 
-### 代码、规范与模型
+### 代码与规范
 
 - [NIXL PR #1717 — DOCA MEMOS backend](https://github.com/ai-dynamo/nixl/pull/1717)
 - [LMCache NIXL / DOCA_MEMOS](https://docs.lmcache.ai/kv_cache/storage_backends/nixl.html)
 - [NVMe Key Value Command Set](https://nvmexpress.org/specification/key-value-command-set-specification/)
-- [vLLM DeepSeek V4 appendix](https://vllm-project.github.io/2026/04/24/deepseek-v4.html)
-- [DeepSeek-V4 paper](https://arxiv.org/abs/2606.19348)
-- [DeepSeek-V4-Pro model card](https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro)
-- [DeepSeek-V4-Flash model card](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
-- [GLM-5.2 official model article](https://huggingface.co/blog/zai-org/glm-52-blog)
-- [Kimi K3 official model card](https://huggingface.co/moonshotai/Kimi-K3)
-
-### Workload、留存与经济
-
-- 用户提供的 Cursor team usage CSV（2026-08-14 导出；本文只入仓匿名聚合，不入仓原始文件和用户标识）
-- [Mempko：Your Agentic Workflow's Cache Keepalive Costs 8x Too Much（v2）](https://blog.mempko.com/your-agentic-workflows-cache-keepalive-costs-8x-too-much-v2-the-interval-frontier/)
-- [Keeping the Cache Warm Pays: Keepalive Economics for Agentic Workloads（arXiv:2607.19214）](https://arxiv.org/abs/2607.19214)
-- [Anthropic Prompt Caching：默认 5m / 可选 1h](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
-- [OpenAI Prompt Caching：in-memory / extended retention](https://developers.openai.com/api/docs/guides/prompt-caching)
-- [DeepSeek Context Caching：best-effort、通常数小时至数天清理](https://api-docs.deepseek.com/guides/kv_cache)
-- [Google Gemini Context Caching：implicit 与 explicit TTL](https://ai.google.dev/gemini-api/docs/generate-content/caching)
-- [OpenAI Help：ChatGPT File Library storage limits](https://help.openai.com/en/articles/20001052-file-storage-and-library-in-chatgpt/)
+- [vLLM DeepSeek V4 blog](https://vllm.ai/blog/2026-04-24-deepseek-v4)
 
 ### 二手材料（只用于会话记录/交叉核对）
 

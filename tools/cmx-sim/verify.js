@@ -20,13 +20,36 @@ function roundUp(value, alignment) {
   return Math.ceil(value / alignment) * alignment;
 }
 
-// Published/derived paged-KV anchors, plus continuation state required by
-// the implementation.
+// Decompose the vLLM blog's 9.62 GiB BF16 paged-KV anchor at 1 Mi-token.
+// Continuation state and allocator pages are separate byte classes.
+close(
+  layout("v4pro", "bf16-logical").growingBytes / S.GiB,
+  9.6171875,
+  1e-12,
+  "V4-Pro BF16 growing KV"
+);
+const v32Bf16GiB =
+  (ONE_MI_TOKEN * 61 * ((512 + 64) * 2 + 128 * 2)) / S.GiB;
+close(v32Bf16GiB, 83.875, 1e-12, "V3.2-style BF16 KV");
+close(
+  v32Bf16GiB / 9.6246337890625,
+  8.71461728708225,
+  1e-12,
+  "V3.2/V4 blog reduction ratio"
+);
+close(
+  layout("v4pro", "bf16-logical", 1_000_000).pagedKvBytes / S.GiB,
+  9.179096221923828,
+  1e-12,
+  "V4-Pro decimal one-million paged KV"
+);
+
+// Published/derived paged-KV anchors and continuation state.
 close(
   layout("v4pro", "bf16-logical").pagedKvBytes / S.GiB,
   9.6246337890625,
   1e-12,
-  "V4-Pro BF16 paged KV"
+  "V4-Pro BF16 blog paged KV"
 );
 close(
   layout("v4flash", "bf16-logical").pagedKvBytes / S.GiB,
@@ -530,78 +553,124 @@ assert.equal(
   Math.floor(1024 ** 4 / shardedCapacity.poolSessionBytes)
 );
 
-// Cache economics uses avoided Prefill GPU work, not the trace's token cache
-// hit. All percentages share the same baseline-GPU-cost denominator.
-const economics = S.economicsScenario({
-  prefillComputeShare: 0.25,
-  avoidedPrefillWorkFraction: 0.8,
-  avoidEfficiency: 1,
-  cacheCostShare: 0.05,
-  targetComputeSavings: 0.2,
+// Hit comparison keeps Prefill GPUs saturated. Storage consists of one hot
+// matched prefix per active session plus admitted writes retained for a
+// user-supplied time window.
+const comparison = S.hitComparisonScenario({
+  modelId: "v4pro",
+  profileId: "bf16-logical",
+  contextTokens: ONE_MI_TOKEN,
+  extraTokens: 0,
+  blockTokens: 256,
+  remoteFraction: 1,
+  admissionFraction: 1,
+  writeState: true,
+  handoffMode: "direct",
+  gpus: 72,
+  uniqueTpsGpu: 10_000,
+  hitRateLow: 0.9,
+  hitRateHigh: 0.95,
+  activeSessions: 10_000,
+  retentionSeconds: 600,
+  poolCopies: 1,
+  usableFraction: 0.8,
 });
+assert.equal(comparison.low.traffic.matchedTokens, 943_616);
+assert.equal(comparison.high.traffic.matchedTokens, 996_096);
+assert.equal(comparison.low.traffic.uniqueTokens, 104_960);
+assert.equal(comparison.high.traffic.uniqueTokens, 52_480);
 close(
-  economics.grossComputeSavings,
-  0.25 * 0.8,
-  1e-15,
-  "gross compute savings"
+  comparison.low.traffic.offeredReqsPool,
+  6.859756097560975,
+  1e-12,
+  "90% compute-constrained request rate"
 );
 close(
-  economics.netSavings,
-  economics.grossComputeSavings - 0.05,
-  1e-15,
-  "net savings"
+  comparison.high.traffic.offeredReqsPool,
+  13.71951219512195,
+  1e-12,
+  "95% compute-constrained request rate"
 );
 close(
-  economics.requiredPrefillComputeShare,
-  0.2 / 0.8,
-  1e-15,
-  "required prefill share"
+  comparison.low.rawStorageBytes / S.TiB,
+  110.91130606761973,
+  1e-12,
+  "90% raw storage"
 );
 close(
-  economics.grossBenefitCostRatio,
-  economics.grossComputeSavings / 0.05,
-  1e-15,
-  "gross benefit/cost"
+  comparison.high.rawStorageBytes / S.TiB,
+  116.91186568563485,
+  1e-12,
+  "95% raw storage"
 );
 close(
-  economics.netRoi,
-  economics.netSavings / 0.05,
-  1e-15,
-  "net ROI"
+  comparison.storageCostIncrease,
+  0.054102325820207575,
+  1e-12,
+  "storage capacity cost increase"
+);
+assert.equal(comparison.computeReqIncrease, 1);
+close(
+  comparison.readIncrease,
+  1.110912940231262,
+  1e-12,
+  "read bandwidth increase"
+);
+close(
+  comparison.writeIncrease,
+  0.025185900531144334,
+  1e-12,
+  "write bandwidth increase"
 );
 
-const zeroEconomics = S.economicsScenario({
-  prefillComputeShare: 2,
-  avoidedPrefillWorkFraction: 0,
-  avoidEfficiency: 1,
-  cacheCostShare: 0,
-  targetComputeSavings: 0.2,
+const zeroRetention = S.hitComparisonScenario({
+  modelId: "v4pro",
+  profileId: "bf16-logical",
+  contextTokens: ONE_MI_TOKEN,
+  blockTokens: 256,
+  remoteFraction: 1,
+  admissionFraction: 1,
+  gpus: 1,
+  uniqueTpsGpu: 1,
+  hitRateLow: 0.9,
+  hitRateHigh: 0.95,
+  activeSessions: 1,
+  retentionSeconds: 0,
+  poolCopies: 2,
+  usableFraction: 1,
 });
-assert.equal(zeroEconomics.prefillComputeShare, 1);
-assert.equal(zeroEconomics.grossComputeSavings, 0);
-assert.equal(zeroEconomics.requiredPrefillComputeShare, null);
-assert.equal(zeroEconomics.grossBenefitCostRatio, null);
-assert.equal(zeroEconomics.netRoi, null);
 assert.equal(
-  S.economicsScenario({
-    prefillComputeShare: 0,
-    avoidedPrefillWorkFraction: 0,
-    avoidEfficiency: 0,
-    cacheCostShare: 0,
-    targetComputeSavings: 0,
-  }).requiredPrefillComputeShare,
-  0
+  zeroRetention.low.rawStorageBytes,
+  2 * zeroRetention.low.hotPrefixBytes
 );
+
+const unknownUsable = S.hitComparisonScenario({
+  modelId: "v4pro",
+  profileId: "bf16-logical",
+  contextTokens: ONE_MI_TOKEN,
+  blockTokens: 256,
+  gpus: 1,
+  uniqueTpsGpu: 1,
+  hitRateLow: 0.9,
+  hitRateHigh: 0.95,
+  activeSessions: 1,
+  retentionSeconds: 0,
+  usableFraction: 0,
+});
+assert.equal(unknownUsable.low.rawStorageBytes, null);
 
 // Formatter edge cases distinguish unknown/invalid from an unbounded ceiling.
 assert.equal(S.fmtGiB(null), "N/A");
 assert.equal(S.fmtGiB(NaN), "N/A");
 assert.equal(S.fmtGBs(NaN), "N/A");
+assert.equal(S.fmtGBs(63.929059902439015 * S.GB), "63.93 GB/s");
+assert.equal(S.fmtCapacity(S.TiB), "1.00 TiB");
 assert.equal(S.fmtRate(NaN), "N/A");
 assert.equal(S.fmtRate(Infinity), "∞");
 
 console.log("ok");
-console.log("  V4-Pro BF16 paged KV  =", S.fmtGiB(layout("v4pro", "bf16-logical").pagedKvBytes));
+console.log("  V4-Pro growing KV     =", S.fmtGiB(layout("v4pro", "bf16-logical").growingBytes));
+console.log("  V4-Pro blog paged KV  =", S.fmtGiB(layout("v4pro", "bf16-logical").pagedKvBytes));
 console.log("  V4-Pro + comp. state  =", S.fmtGiB(layout("v4pro", "bf16-logical").totalBytes));
 console.log("  GLM-5.2 base FP8      =", S.fmtGiB(layout("glm52", "fp8-logical").totalBytes));
 console.log("  Kimi K3 FP8 + state   =", S.fmtGiB(layout("k3", "fp8-vllm-state").totalBytes));
