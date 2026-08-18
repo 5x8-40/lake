@@ -3,24 +3,24 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>CMX 单工作点流量</title>
+  <title>Agentic APC：Prefill KV 加载</title>
   <link rel="stylesheet" href="app.css?v=4" />
 </head>
 <body>
   <nav class="topnav" aria-label="CMX 分析页面">
-    <a href="index.html" class="on" aria-current="page">流量工作点</a>
+    <a href="index.html" class="on" aria-current="page">KV 加载</a>
     <a href="capacity.html">容量换算</a>
     <a href="economics.html">命中率对比</a>
     <span class="navdoc">方法见 <a href="README.md">README</a></span>
   </nav>
 
   <header>
-    <h1>CMX 单工作点 offered load</h1>
+    <h1>Agentic APC：请求吞吐与 KV 加载</h1>
     <p>
-      按布局、前缀命中和用户给定的 Prefill 吞吐，计算 PD 下的 CMX 与 P→D 流量。
+      计算 Prefill 侧的访问请求吞吐和外部 KV 加载带宽，不包含 Decode 或 P→D handoff。
     </p>
     <div class="warn" role="note">
-      本页算一个工作点的流量，不算容量成本。默认无带宽上限；填写预算后才计算用户假设下的 ceiling。
+      默认使用 Kimi K3 单用户峰值小时和长期平均命中率。Cursor usage event 不是 API request，因此默认 req/s 为 N/A。
     </div>
   </header>
 
@@ -32,14 +32,14 @@
         <option value="v4pro">DeepSeek V4-Pro</option>
         <option value="v4flash">DeepSeek V4-Flash</option>
         <option value="glm52">GLM-5.2</option>
-        <option value="k3">Kimi K3</option>
+        <option value="k3" selected>Kimi K3</option>
       </select>
 
       <label for="profile">KV / 状态布局</label>
       <select id="profile"></select>
       <p id="profileNote" class="hint"></p>
 
-      <label for="byteMode">流量字节口径</label>
+      <label for="byteMode">KV 加载字节口径</label>
       <select id="byteMode">
         <option value="payload">当前 profile 载荷</option>
         <option value="engine-pages">vLLM engine pages</option>
@@ -71,7 +71,7 @@
       <input id="contextNumber" type="number" min="8192" max="1048576" step="1" value="1048576" />
 
       <label for="hit">可复用前缀比例 <span id="hitValue"></span></label>
-      <input id="hit" type="range" min="0" max="100" step="0.5" value="99" />
+      <input id="hit" type="range" min="0" max="100" step="any" value="91.90280535566157" />
 
       <div class="row2">
         <div>
@@ -87,59 +87,41 @@
       <label for="remoteFraction">CMX 远程读比例 q</label>
       <input id="remoteFraction" type="number" min="0" max="1" step="0.05" value="1" />
 
-      <label for="admissionFraction">CMX 写入比例 a</label>
-      <input id="admissionFraction" type="number" min="0" max="1" step="0.05" value="1" />
-
-      <div class="checkrow">
-        <input id="writeState" type="checkbox" checked />
-        <label for="writeState">写最终续算状态快照（V4/K3）</label>
-      </div>
-
-      <h2>Offered load</h2>
-      <label for="loadMode">到达率来源</label>
+      <h2>Workload</h2>
+      <label for="loadMode">负载来源</label>
       <select id="loadMode">
+        <option value="agentic" selected>Kimi K3 单用户峰值 token/h</option>
         <option value="compute">GPU-saturated（unique token/s ÷ U）</option>
-        <option value="arrival">外部 λ（pool req/s）</option>
+        <option value="arrival">外部访问请求率（req/s）</option>
       </select>
 
-      <div id="computeLoadWrap">
-      <label for="gpus">Prefill GPU 数</label>
-      <input id="gpus" type="number" min="1" step="1" value="72" />
+      <div id="agenticLoadWrap">
+        <label for="agenticPromptTokensHour">峰值 prompt token/h</label>
+        <input id="agenticPromptTokensHour" type="number" min="0" step="1" value="21215355" />
+        <p class="hint">2026-08-05 15:00 UTC+8；5 个 usage events，不是 5 个 requests。</p>
+      </div>
 
-      <label for="uniqueTps">有效 unique token/s/GPU（用户假设或实测）</label>
-      <input id="uniqueTps" type="number" min="0" step="100" value="10000" />
+      <div id="computeLoadWrap" hidden>
+        <label for="gpus">Prefill GPU 数</label>
+        <input id="gpus" type="number" min="1" step="1" value="72" />
+
+        <label for="uniqueTps">有效 unique token/s/GPU（假设或实测）</label>
+        <input id="uniqueTps" type="number" min="0" step="100" value="10000" />
       </div>
 
       <div id="arrivalLoadWrap" hidden>
-        <label for="arrivalReqs">外部 λ（pool req/s）</label>
+        <label for="arrivalReqs">外部访问请求率（req/s）</label>
         <input id="arrivalReqs" type="number" min="0" step="0.1" value="10" />
       </div>
 
-      <h2>P→D handoff</h2>
-      <label for="handoffMode">最终状态路径</label>
-      <select id="handoffMode">
-        <option value="direct">P→D direct（单独预算）</option>
-        <option value="via-cmx">P→CMX→D</option>
-        <option value="local">P/D local</option>
-      </select>
-
-      <label for="linkGBs">CMX 链路预算 GB/s/GPU（0 = 未知）</label>
-      <input id="linkGBs" type="number" min="0" step="10" value="0" />
-
-      <label for="linkMode">预算口径</label>
-      <select id="linkMode">
-        <option value="shared">读写共享</option>
-        <option value="full-duplex">读写各自全双工</option>
-      </select>
-
-      <label for="pdLinkGBs">P→D direct 预算 GB/s/GPU（0 = 未知）</label>
-      <input id="pdLinkGBs" type="number" min="0" step="10" value="0" />
+      <label for="readBudgetGBs">Pool KV 读取预算 GB/s（0 = 未知）</label>
+      <input id="readBudgetGBs" type="number" min="0" step="1" value="0" />
 
       <h2>图</h2>
       <label for="chartKind">横轴与指标</label>
       <select id="chartKind">
-        <option value="hitIo">命中率 → offered 读写</option>
-        <option value="hitReq">命中率 → offered / 链路上限</option>
+        <option value="hitIo">命中率 → P 侧 KV 加载带宽</option>
+        <option value="hitReq">命中率 → compute req/s</option>
         <option value="ctxBytes">上下文 → 会话字节</option>
       </select>
     </aside>
@@ -178,10 +160,9 @@
         <ul class="notes">
           <li><code>C</code> 是请求到来前的既有上下文；<code>E</code> 是本轮新增 token；最终长度为 <code>C+E</code>。</li>
           <li>命中 token 按块向下取整。<code>q</code> 把“前缀命中”和“确实从 CMX 远程读取”分开。</li>
-          <li><code>a</code> 是写入 CMX 的新状态比例；它不是 gateway 准入率。</li>
-          <li><code>GPU-saturated</code> 用 unique-token 吞吐反推 λ；<code>U=0</code> 时必须使用外部 λ。</li>
-          <li>via-CMX 增加一次完整 Decode 读；direct 使用单独链路预算；local 无额外 handoff。</li>
-          <li>V4 SWA/MTP/compressor 与 K3 KDA 都是可移交 component；不同 compressor policy 是不同表示。</li>
+          <li><code>GPU-saturated</code> 用 unique-token 吞吐反推 req/s；<code>U=0</code> 时必须使用外部请求率。</li>
+          <li>Agentic preset 只有 token/h，没有底层 request 数，因此不能推导 req/s。</li>
+          <li>K3 KDA 与 V4 compressor 是每次续算所需的固定状态；没有 request/resume rate 时，其加载带宽显示 N/A。</li>
           <li>logical payload、engine entry payload、engine pages 和 custom wire 是不同口径。</li>
           <li>Engine page 目前只对审计过的 V4 vLLM base-ring profile 给结果；N/A 表示合同未知，不回退成 payload。</li>
         </ul>
@@ -189,16 +170,14 @@
 
       <footer>
         参考实现：
-        vLLM <code>MLAAttentionSpec.real_page_size_bytes</code>、
-        <code>CompressorStateCache.get_kv_cache_spec</code>、
-        <code>MambaStateDtypeCalculator.kda_state_dtype</code>、
+        vLLM <code>KVCacheManager.get_computed_blocks</code>、
         <code>MambaStateShapeCalculator.kda_state_shape</code>；
-        SGLang <code>DeepSeekV4SingleKVPool.get_bytes_per_token</code>。
+        SGLang <code>prefetch_from_storage</code>、<code>_page_get_zero_copy</code>。
       </footer>
     </main>
   </div>
 
-  <script src="sim.js?v=8"></script>
+  <script src="sim.js?v=9"></script>
   <script>
     "use strict";
 
@@ -230,12 +209,12 @@
 
     function syncConditionalInputs() {
       const customWire = $("byteMode").value === "custom-wire";
+      const agentic = $("loadMode").value === "agentic";
       const externalArrival = $("loadMode").value === "arrival";
-      const directHandoff = $("handoffMode").value === "direct";
       $("wireFactorWrap").hidden = !customWire;
-      $("computeLoadWrap").hidden = externalArrival;
+      $("agenticLoadWrap").hidden = !agentic;
+      $("computeLoadWrap").hidden = agentic || externalArrival;
       $("arrivalLoadWrap").hidden = !externalArrival;
-      $("pdLinkGBs").disabled = !directHandoff;
     }
 
     function params() {
@@ -251,16 +230,15 @@
         hitRate: finiteNumber("hit", 0) / 100,
         blockTokens: finiteNumber("blockTokens", 1),
         remoteFraction: finiteNumber("remoteFraction", 0),
-        admissionFraction: finiteNumber("admissionFraction", 0),
-        writeState: $("writeState").checked,
+        admissionFraction: 0,
+        writeState: false,
         gpus: finiteNumber("gpus", 1),
         uniqueTpsGpu: finiteNumber("uniqueTps", 0),
         loadMode: $("loadMode").value,
         arrivalReqsPool: finiteNumber("arrivalReqs", 0),
-        handoffMode: $("handoffMode").value,
-        linkGBsGpu: finiteNumber("linkGBs", 0),
-        pdLinkGBsGpu: finiteNumber("pdLinkGBs", 0),
-        linkMode: $("linkMode").value,
+        agenticPromptTokensPerSecond:
+          finiteNumber("agenticPromptTokensHour", 0) / 3600,
+        readBudgetGBsPool: finiteNumber("readBudgetGBs", 0),
       };
     }
 
@@ -283,50 +261,85 @@
     }
 
     function renderStats(result) {
-      const hasLinkBudget = result.overallLinkReqCeiling != null;
-      const linkText = hasLinkBudget
-        ? `${S.fmtRate(result.overallLinkReqCeiling)} req/s`
+      const agenticBudget = result.loadMode === "agentic";
+      const hasReadBudget = agenticBudget
+        ? result.agenticReadBudgetRatio != null
+        : result.readReqCeiling != null;
+      const ceilingText = hasReadBudget
+        ? agenticBudget
+          ? `${result.agenticReadBudgetRatio.toFixed(2)}×`
+          : `${S.fmtRate(result.readReqCeiling)} req/s`
         : "未设置";
-      const linkDetail = hasLinkBudget
-        ? `CMX=${S.fmtRate(result.linkReqCeiling)} / P→D=${S.fmtRate(result.pdLinkReqCeiling)}；限幅后 ${
+      const ceilingDetail = hasReadBudget
+        ? agenticBudget
+          ? "读取预算 / growing-KV load"
+          : `KV 读取预算限幅后 ${
             result.cappedReqsPool == null
               ? "N/A"
               : `${S.fmtRate(result.cappedReqsPool)} req/s`
           }`
-        : "两类链路都未设置公开/实测预算";
-      const offeredDetail = result.loadMode === "arrival"
-        ? "外部 λ；与 GPU 是否饱和无关"
+        : "没有公开或实测的 Pool 读取预算";
+      const offeredDetail = result.loadMode === "agentic"
+        ? "usage event 不提供底层 request 数"
+        : result.loadMode === "arrival"
+        ? "用户提供的外部访问请求率"
         : result.offeredReqsPool == null
-          ? "U=0；必须切换到外部 λ"
-          : `${result.gpus} Prefill GPU 饱和假设；不是可达吞吐`;
+          ? "U=0；必须切换到外部请求率"
+          : `${result.gpus} Prefill GPU 满载计算约束`;
+      const workloadStat = result.loadMode === "agentic"
+        ? stat(
+            "Agentic 峰值 prompt",
+            `${S.fmtRate(result.agenticPromptTokensPerSecond)} token/s`,
+            "Kimi K3 单用户峰值小时"
+          )
+        : stat(
+            "负载来源",
+            result.loadMode === "arrival" ? "外部 req/s" : "GPU-saturated",
+            "非 Cursor usage-event 推导"
+          );
       $("stats").innerHTML = [
         stat("Payload 会话", S.fmtGiB(result.finalLayout.totalBytes), result.profile.label),
         stat("所选口径会话", S.fmtGiB(result.finalLayout.selectedTotalBytes), basisLabel(result.finalLayout), "hot"),
         stat("命中 / unique", `${result.matchedTokens.toLocaleString()} / ${result.uniqueTokens.toLocaleString()}`, `block=${result.blockTokens}`),
-        stat("CMX 读 / 请求", S.fmtGiB(result.cmxReadPerRequest), `prefix=${S.fmtGiB(result.readPerRequest)} · D=${S.fmtGiB(result.decodeReadPerRequest)}`),
-        stat("CMX 写 / 请求", S.fmtGiB(result.writePerRequest), `a=${result.admissionFraction} · effective=${result.effectiveAdmissionFraction}`),
-        stat("P→D direct / 请求", S.fmtGiB(result.directPerRequest), result.handoffMode),
-        stat("Offered λ", `${S.fmtRate(result.offeredReqsPool)} req/s`, offeredDetail),
-        stat("CMX 读 offered", S.fmtGBs(result.requiredRead), "pool aggregate"),
-        stat("CMX 写 offered", S.fmtGBs(result.requiredWrite), "pool aggregate"),
-        stat("P→D direct offered", S.fmtGBs(result.requiredDirect), "仅 direct handoff 非零"),
-        stat("用户链路 ceiling", linkText, linkDetail, hasLinkBudget ? "ok" : ""),
+        workloadStat,
+        stat("访问请求吞吐", result.offeredReqsPool == null ? "N/A" : `${S.fmtRate(result.offeredReqsPool)} req/s`, offeredDetail),
+        stat("Growing KV 加载", S.fmtGBs(result.requiredGrowingRead), "P 侧 Pool read", "hot"),
+        stat("Fixed state 加载", S.fmtGBs(result.requiredStateRead), result.requiredStateRead == null ? "缺少 request/resume rate" : "P 侧 Pool read"),
+        stat("完整 KV 加载", S.fmtGBs(result.requiredRead), result.requiredRead == null ? "至少一项加载率未知" : "P 侧 Pool read"),
+        stat("KV 读取 ceiling", ceilingText, ceilingDetail, hasReadBudget ? "ok" : ""),
       ].join("");
     }
 
     function renderFormula(result) {
-      const stateRead = result.matchedTokens > 0
-        ? result.matchedLayout.selectedStateBytes == null
-          ? null
-          : result.matchedLayout.selectedStateBytes * result.remoteFraction
-        : 0;
-      const offeredFormula = result.loadMode === "arrival"
-        ? `external λ = ${S.fmtRate(result.arrivalReqsPool)} req/s`
+      const reqFormula = result.loadMode === "agentic"
+        ? `observed req/s = N/A
+Cursor usage event 是聚合账单行，不能当模型 API request。`
+        : result.loadMode === "arrival"
+        ? `external req/s = ${S.fmtRate(result.arrivalReqsPool)}`
         : `GPU-saturated λ = unique_tok/s/GPU × GPU / U
                 = ${result.uniqueTpsGpu.toLocaleString()} × ${result.gpus} / ${result.uniqueTokens.toLocaleString()}
                 = ${S.fmtRate(result.offeredReqsPool)} req/s${result.offeredReqsPool == null
-          ? "（U=0：此公式无定义，切换到外部 λ）"
+          ? "（U=0：此公式无定义，切换到外部请求率）"
           : ""}`;
+      const loadFormula = result.loadMode === "agentic"
+        ? `peak prompt token/s = ${S.fmtRate(result.agenticPromptTokensPerSecond)} token/s
+cache-read token/s = peak_prompt × hit
+                   = ${S.fmtRate(result.agenticCacheReadTokensPerSecond)} token/s
+growing bytes/token = ${result.selectedGrowingBytesPerToken == null
+          ? "N/A"
+          : result.selectedGrowingBytesPerToken.toFixed(2)}
+growing KV load = cache-read token/s × growing bytes/token × q
+                = ${S.fmtGBs(result.requiredGrowingRead)}
+fixed-state load = N/A（缺少真实 request/resume rate）
+complete KV load = ${S.fmtGBs(result.requiredRead)}`
+        : `growing KV load/request = ${S.fmtGiB(result.growingReadPerRequest)}
+fixed-state load/request = ${S.fmtGiB(result.stateReadPerRequest)}
+complete KV load/request = ${S.fmtGiB(result.readPerRequest)}
+
+growing KV load bandwidth = req/s × growing load/request
+                          = ${S.fmtGBs(result.requiredGrowingRead)}
+fixed-state load bandwidth = ${S.fmtGBs(result.requiredStateRead)}
+complete KV load bandwidth = ${S.fmtGBs(result.requiredRead)}`;
       $("formula").textContent =
 `M = floor(C × hit / block) × block
   = floor(${result.contextTokens} × ${result.hitRate.toFixed(4)} / ${result.blockTokens}) × ${result.blockTokens}
@@ -340,36 +353,17 @@ byte basis = ${basisLabel(result.finalLayout)}
 payload/session = ${S.fmtGiB(result.finalLayout.totalBytes)}
 selected/session = ${S.fmtGiB(result.finalLayout.selectedTotalBytes)}
 
-prefix CMX read/request = q × selected(M)
-                        = ${S.fmtGiB(result.readPerRequest)}
-                          其中固定/续算状态 ${S.fmtGiB(stateRead)}
+${reqFormula}
 
-P→D handoff = ${result.handoffMode}
-  decode CMX read/request = ${S.fmtGiB(result.decodeReadPerRequest)}
-  direct fabric/request   = ${S.fmtGiB(result.directPerRequest)}
-  total CMX read/request  = ${S.fmtGiB(result.cmxReadPerRequest)}
+${loadFormula}
 
-write/request = effective_a × [growing(C+E) − growing(M) + final_state]
-              effective_a = ${result.effectiveAdmissionFraction}${result.handoffMode === "via-cmx" ? "（via-CMX：固定为 1）" : ""}
-              write_final_state = ${result.effectiveWriteState}${result.handoffMode === "via-cmx" && !result.writeState ? "（via-CMX：强制写 final_state）" : ""}
-              = ${S.fmtGiB(result.writePerRequest)}
-                其中最终状态 ${S.fmtGiB(result.stateWriteBytes)}
-
-${offeredFormula}
-
-CMX read offered  = λ × total CMX read/request = ${S.fmtGBs(result.requiredRead)}
-CMX write offered = λ × write/request          = ${S.fmtGBs(result.requiredWrite)}
-P→D direct offered = λ × direct/request        = ${S.fmtGBs(result.requiredDirect)}
-
-CMX ceiling = ${result.linkReqCeiling == null
-  ? "未计算"
-  : `${S.fmtRate(result.linkReqCeiling)} req/s`}
-P→D ceiling = ${result.pdLinkReqCeiling == null
-  ? "未计算"
-  : `${S.fmtRate(result.pdLinkReqCeiling)} req/s`}
-overall ceiling = ${result.overallLinkReqCeiling == null
-  ? "未计算（预算为 0/未知）"
-  : `${S.fmtRate(result.overallLinkReqCeiling)} req/s（用户输入预算，不是 CMX 公布值）`}`;
+Pool read budget = ${result.loadMode === "agentic"
+  ? result.agenticReadBudgetRatio == null
+    ? "未计算（读取预算为 0/未知）"
+    : `${result.agenticReadBudgetRatio.toFixed(2)}× growing-KV load`
+  : result.readReqCeiling == null
+    ? "未计算（读取预算为 0/未知）"
+    : `${S.fmtRate(result.readReqCeiling)} req/s ceiling（用户输入预算）`}`;
     }
 
     function ticks(min, max, count) {
@@ -456,51 +450,49 @@ overall ceiling = ${result.overallLinkReqCeiling == null
 
       const hits = [];
       for (let percent = 0; percent <= 100; percent += 0.5) hits.push(percent / 100);
-      const rows = hits.map((hitRate) => S.trafficScenario({ ...p, hitRate }));
+      const rows = hits.map((hitRate) => S.prefillScenario({ ...p, hitRate }));
       if (kind === "hitReq") {
         const series = [{
-          name: p.loadMode === "arrival" ? "external λ" : "GPU-saturated λ",
+          name: p.loadMode === "arrival"
+            ? "外部 req/s"
+            : p.loadMode === "agentic"
+              ? "req/s（trace 未提供）"
+              : "GPU-saturated req/s",
           color: "#7cb87a",
           points: rows.map((row) => ({ x: row.hitRate, y: row.offeredReqsPool })),
         }];
-        if (p.linkGBsGpu > 0 || p.pdLinkGBsGpu > 0) {
+        if (p.readBudgetGBsPool > 0) {
           series.push({
-            name: "用户链路预算下限幅",
+            name: "Pool 读取预算下限幅",
             color: "#d46a5c",
             dash: "8 5",
             points: rows.map((row) => ({ x: row.hitRate, y: row.cappedReqsPool })),
           });
         }
         drawChart({
-          title: "命中率 → offered λ",
-          description: "外部 λ 与 hit 无关；GPU-saturated λ 由 unique token 分母推导。若设置链路预算，同时显示限幅。",
+          title: "命中率 → 访问请求吞吐",
+          description: "外部 req/s 与 hit 无关；GPU-saturated req/s 由 unique token 分母推导；usage trace 不提供 req/s。",
           xFormat: (value) => `${(value * 100).toFixed(0)}%`,
-          yFormat: (value) => S.fmtRate(value),
+          yFormat: (value) => `${S.fmtRate(value)} req/s`,
           series,
         });
       } else {
         drawChart({
-          title: "命中率 → offered 流量",
-          description: "给定 λ 下的 CMX 与 P→D offered load，不代表可达吞吐。",
+          title: "命中率 → P 侧 KV 加载带宽",
+          description: "Agentic 模式按峰值 prompt token/s；其他模式按 req/s 计算。只含 Prefill 侧 Pool read。",
           xFormat: (value) => `${(value * 100).toFixed(0)}%`,
           yFormat: (value) => S.fmtGBs(value),
           series: [
             {
-              name: "CMX read offered",
+              name: "Growing KV load",
               color: "#4aa3d9",
-              points: rows.map((row) => ({ x: row.hitRate, y: row.requiredRead })),
+              points: rows.map((row) => ({ x: row.hitRate, y: row.requiredGrowingRead })),
             },
             {
-              name: "CMX write offered",
+              name: "Complete KV load",
               color: "#e08a3c",
               dash: "8 5",
-              points: rows.map((row) => ({ x: row.hitRate, y: row.requiredWrite })),
-            },
-            {
-              name: "P→D direct offered",
-              color: "#7cb87a",
-              dash: "3 4",
-              points: rows.map((row) => ({ x: row.hitRate, y: row.requiredDirect })),
+              points: rows.map((row) => ({ x: row.hitRate, y: row.requiredRead })),
             },
           ],
         });
@@ -548,9 +540,9 @@ overall ceiling = ${result.overallLinkReqCeiling == null
       syncConditionalInputs();
       const p = params();
       $("contextValue").textContent = Number(p.contextTokens).toLocaleString();
-      $("hitValue").textContent = `${(p.hitRate * 100).toFixed(1)}%`;
+      $("hitValue").textContent = `${(p.hitRate * 100).toFixed(4)}%`;
       const profile = S.profileFor(p.modelId, p.profileId);
-      const result = S.trafficScenario(p);
+      const result = S.prefillScenario(p);
       const unsupportedEngine =
         p.byteMode === "engine-pages" &&
         result.finalLayout.engineAllocation == null;
@@ -581,15 +573,15 @@ overall ceiling = ${result.overallLinkReqCeiling == null
     [
       "profile", "byteMode", "customWireFactor", "compressorPolicy",
       "includeMtp", "hit", "blockTokens", "extraTokens",
-      "remoteFraction", "admissionFraction", "writeState", "gpus",
-      "uniqueTps", "loadMode", "arrivalReqs", "handoffMode",
-      "linkGBs", "pdLinkGBs", "linkMode", "chartKind",
+      "remoteFraction", "gpus", "uniqueTps", "loadMode", "arrivalReqs",
+      "agenticPromptTokensHour", "readBudgetGBs", "chartKind",
     ].forEach((id) => {
       $(id).addEventListener("input", render);
       $(id).addEventListener("change", render);
     });
 
     syncProfiles();
+    $("profile").value = S.AGENTIC_PRESETS.kimiK3SingleUserPeak.profileId;
     syncConditionalInputs();
     renderAnchors();
     render();

@@ -4,7 +4,7 @@
 >
 > CMX 是 NVIDIA 公布的 KV cache 存储目标架构，覆盖 GPU、Dynamo/KVBM、NIXL、DOCA Memos、BlueField-4、Spectrum-X 和共享 flash。公开软件尚未形成可复现的端到端实现。lake 只把共享 flash 数据路径映射为候选 L2 backend。
 
-模型字节、容量、offered load 和 90%/95% 命中率对比在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)；Agentic trace 与 provider cache 留存见 [`agentic-cache-workload.md`](agentic-cache-workload.md)。
+模型字节、容量、Prefill KV 加载带宽和 90%/95% 命中率对比在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)；Agentic trace 与 provider cache 留存见 [`agentic-cache-workload.md`](agentic-cache-workload.md)。
 
 后续工作见 [#22 可移交 Context 合同和数据面能力](https://gitlab.com/BeeBreeze/lake/-/issues/22) 与 [#23 Portable Context ABI](https://gitlab.com/BeeBreeze/lake/-/issues/23)。MR !7 不修改核心 proto/runtime。
 
@@ -264,7 +264,7 @@ capacity = users × 32 GB × sessions retained per user
 | DeepSeek V4-Pro BF16 9.62 GiB | vLLM blog + 代码核对 | `1,048,576 token` 的 paged KV 为 9.6246 GiB，含 7.625 MiB SWA；不含 compressor、engine page 或 CMX wire |
 | CMX 持续 read/write、p99 latency、queue depth | **未知** | 公开材料没有可用于仿真的数据表 |
 
-计算器不预设“200 GB/s/GPU”，并将需求统一标为 offered load，而非可达吞吐。字节公式和校验点以 [`../../tools/cmx-sim/README.md`](../../tools/cmx-sim/README.md) 为准。
+计算器不预设“200 GB/s/GPU”。req/s 表示访问请求吞吐，GB/s 只表示 Prefill 侧 Pool KV 加载需求，不代表可达吞吐。字节公式和校验点以 [`../../tools/cmx-sim/README.md`](../../tools/cmx-sim/README.md) 为准。
 
 ## 7. 同一模型 P/D KV 布局不同怎么办
 

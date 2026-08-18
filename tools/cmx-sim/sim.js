@@ -4,9 +4,9 @@
  * This is not a benchmark and does not contain a published CMX performance
  * model. It separates:
  *   1. model/layout bytes,
- *   2. compute-offered request load,
- *   3. CMX and P->D offered traffic,
- *   4. an optional user-supplied transfer ceiling,
+ *   2. Agentic token demand or compute-constrained request throughput,
+ *   3. Prefill-side KV load bandwidth,
+ *   4. an optional user-supplied storage-read ceiling,
  *   5. a GPU-saturated hit-rate capacity comparison.
  *
  * Browser and Node share this file. Storage uses bytes/GiB; bandwidth uses
@@ -146,6 +146,27 @@
     ],
   };
   PROFILES.v4flash = PROFILES.v4pro;
+
+  var AGENTIC_PRESETS = {
+    kimiK3SingleUserPeak: {
+      id: "kimi-k3-single-user-peak",
+      name: "Kimi K3 单用户峰值小时",
+      modelId: "k3",
+      profileId: "fp8-vllm-state",
+      averageHitRate: 0.9190280535566157,
+      peakHourHitRate: 0.9489291128995956,
+      peakHour: "2026-08-05 15:00 UTC+8",
+      usageEvents: 5,
+      cacheWriteTokensHour: 0,
+      uncachedInputTokensHour: 1083487,
+      cacheReadTokensHour: 20131868,
+      outputTokensHour: 116710,
+      promptTokensHour: 21215355,
+      totalTokensHour: 21332065,
+      evidence:
+        "匿名 Cursor usage trace；event 是聚合账单行，不是模型 API request。",
+    },
+  };
 
   function numberOr(value, fallback) {
     var n = Number(value);
@@ -421,7 +442,7 @@
     return left == null || right == null ? null : left + right;
   }
 
-  function trafficScenario(p) {
+  function prefillScenario(p) {
     var context = Math.max(0, Math.floor(numberOr(p.contextTokens, 0)));
     var extra = Math.max(0, Math.floor(numberOr(p.extraTokens, 0)));
     var matched = matchedTokens(context, p.hitRate, p.blockTokens);
@@ -445,12 +466,22 @@
     var matchedLayout = sessionLayout(Object.assign({}, common, { tokens: matched }));
     var finalLayout = sessionLayout(Object.assign({}, common, { tokens: finalTokens }));
 
-    var readPerRequest =
+    var growingReadPerRequest =
       matched > 0 && matchedLayout.selectedTotalBytes != null
-        ? remoteFraction * matchedLayout.selectedTotalBytes
+        ? remoteFraction * matchedLayout.selectedGrowingBytes
         : matched > 0
           ? null
           : 0;
+    var stateReadPerRequest =
+      matched > 0 && matchedLayout.selectedStateBytes != null
+        ? remoteFraction * matchedLayout.selectedStateBytes
+        : matched > 0
+          ? null
+          : 0;
+    var readPerRequest = addBytes(
+      growingReadPerRequest,
+      stateReadPerRequest
+    );
     var growingDelta =
       finalLayout.selectedGrowingBytes == null ||
       matchedLayout.selectedGrowingBytes == null
@@ -460,105 +491,89 @@
             finalLayout.selectedGrowingBytes -
               matchedLayout.selectedGrowingBytes
           );
-    var handoffMode =
-      p.handoffMode === "via-cmx" || p.handoffMode === "local"
-        ? p.handoffMode
-        : "direct";
-    // A via-CMX P->D handoff must materialize the computed final state even if
-    // the long-term cache admission policy would otherwise reject it.
-    var effectiveAdmissionFraction =
-      handoffMode === "via-cmx" ? 1 : admissionFraction;
-    var effectiveWriteState = writeState || handoffMode === "via-cmx";
     var stateWrite =
-      effectiveWriteState && uniqueTokens > 0
+      writeState && uniqueTokens > 0
         ? finalLayout.selectedStateBytes
         : 0;
     var writePerRequest =
       growingDelta == null || stateWrite == null
         ? null
-        : effectiveAdmissionFraction * (growingDelta + stateWrite);
-    var decodeReadPerRequest =
-      handoffMode === "via-cmx" ? finalLayout.selectedTotalBytes : 0;
-    var directPerRequest =
-      handoffMode === "direct" ? finalLayout.selectedTotalBytes : 0;
-    var cmxReadPerRequest = addBytes(readPerRequest, decodeReadPerRequest);
+        : admissionFraction * (growingDelta + stateWrite);
 
-    var loadMode = p.loadMode === "arrival" ? "arrival" : "compute";
+    var loadMode =
+      p.loadMode === "arrival" || p.loadMode === "agentic"
+        ? p.loadMode
+        : "compute";
     var arrivalReqsPool = Math.max(0, numberOr(p.arrivalReqsPool, 0));
-    // U=0 cannot derive request rate from unique-token throughput. An explicit
-    // external arrival rate remains valid for full-hit requests.
+    var agenticPromptTokensPerSecond = Math.max(
+      0,
+      numberOr(p.agenticPromptTokensPerSecond, 0)
+    );
+    var agenticCacheReadTokensPerSecond =
+      agenticPromptTokensPerSecond * clamp(p.hitRate, 0, 1);
+    var selectedGrowingBytesPerToken =
+      finalTokens > 0 && finalLayout.selectedGrowingBytes != null
+        ? finalLayout.selectedGrowingBytes / finalTokens
+        : finalTokens > 0
+          ? null
+          : 0;
+    // Cursor usage events do not expose API request counts. Agentic mode
+    // therefore computes token-proportional growing-KV demand but no req/s or
+    // fixed-state load rate.
     var offeredReqsPool =
-      loadMode === "arrival"
+      loadMode === "agentic"
+        ? null
+        : loadMode === "arrival"
         ? arrivalReqsPool
         : uniqueTokens > 0
           ? (uniqueTpsGpu * gpus) / uniqueTokens
           : null;
     var offeredReqsGpu =
       offeredReqsPool == null ? null : offeredReqsPool / gpus;
-    var prefixRequiredRead = bytesAtRate(offeredReqsPool, readPerRequest);
-    var decodeRequiredRead = bytesAtRate(
-      offeredReqsPool,
-      decodeReadPerRequest
-    );
-    var requiredRead = bytesAtRate(offeredReqsPool, cmxReadPerRequest);
-    var requiredWrite = bytesAtRate(offeredReqsPool, writePerRequest);
-    var requiredDirect = bytesAtRate(offeredReqsPool, directPerRequest);
-
-    var linkGBsGpu = Math.max(0, numberOr(p.linkGBsGpu, 0));
-    var linkBudgetPool = linkGBsGpu * GB * gpus;
-    var linkMode = p.linkMode === "full-duplex" ? "full-duplex" : "shared";
-    var linkReqCeiling = null;
-    if (linkBudgetPool > 0) {
-      if (linkMode === "full-duplex") {
-        var readCeiling =
-          cmxReadPerRequest > 0
-            ? linkBudgetPool / cmxReadPerRequest
-            : cmxReadPerRequest === 0
-              ? Infinity
-              : null;
-        var writeCeiling =
-          writePerRequest > 0
-            ? linkBudgetPool / writePerRequest
-            : writePerRequest === 0
-              ? Infinity
-              : null;
-        linkReqCeiling =
-          readCeiling == null || writeCeiling == null
-            ? null
-            : Math.min(readCeiling, writeCeiling);
-      } else {
-        var bytesPerRequest = addBytes(cmxReadPerRequest, writePerRequest);
-        linkReqCeiling =
-          bytesPerRequest == null
-            ? null
-            : bytesPerRequest > 0
-              ? linkBudgetPool / bytesPerRequest
-              : Infinity;
-      }
-    }
-    var pdLinkGBsGpu = Math.max(0, numberOr(p.pdLinkGBsGpu, 0));
-    var pdLinkBudgetPool = pdLinkGBsGpu * GB * gpus;
-    var pdLinkReqCeiling =
-      pdLinkBudgetPool > 0
-        ? directPerRequest == null
+    var requiredGrowingRead =
+      loadMode === "agentic"
+        ? selectedGrowingBytesPerToken == null
           ? null
-          : directPerRequest > 0
-            ? pdLinkBudgetPool / directPerRequest
+          : agenticCacheReadTokensPerSecond *
+            selectedGrowingBytesPerToken *
+            remoteFraction
+        : bytesAtRate(offeredReqsPool, growingReadPerRequest);
+    var requiredStateRead =
+      loadMode === "agentic"
+        ? stateReadPerRequest === 0
+          ? 0
+          : null
+        : bytesAtRate(offeredReqsPool, stateReadPerRequest);
+    var requiredRead = addBytes(requiredGrowingRead, requiredStateRead);
+    var requiredWrite =
+      loadMode === "agentic"
+        ? null
+        : bytesAtRate(offeredReqsPool, writePerRequest);
+
+    var readBudgetGBsPool = Math.max(
+      0,
+      numberOr(p.readBudgetGBsPool, 0)
+    );
+    var readBudgetPool = readBudgetGBsPool * GB;
+    var readReqCeiling =
+      loadMode !== "agentic" && readBudgetPool > 0
+        ? readPerRequest == null
+          ? null
+          : readPerRequest > 0
+            ? readBudgetPool / readPerRequest
             : Infinity
         : null;
-    var overallLinkCeilings = [linkReqCeiling, pdLinkReqCeiling].filter(
-      function (value) {
-        return value != null;
-      }
-    );
-    var overallLinkReqCeiling =
-      overallLinkCeilings.length > 0
-        ? Math.min.apply(null, overallLinkCeilings)
-        : null;
     var cappedReqsPool =
-      overallLinkReqCeiling == null || offeredReqsPool == null
+      readReqCeiling == null || offeredReqsPool == null
         ? null
-        : Math.min(offeredReqsPool, overallLinkReqCeiling);
+        : Math.min(offeredReqsPool, readReqCeiling);
+    var agenticReadBudgetRatio =
+      loadMode === "agentic" &&
+      readBudgetPool > 0 &&
+      requiredGrowingRead != null &&
+      requiredGrowingRead > 0
+        ? readBudgetPool / requiredGrowingRead
+        : null;
 
     return {
       model: finalLayout.model,
@@ -572,42 +587,34 @@
       blockTokens: Math.max(1, Math.floor(numberOr(p.blockTokens, 1))),
       remoteFraction: remoteFraction,
       admissionFraction: admissionFraction,
-      effectiveAdmissionFraction: effectiveAdmissionFraction,
       writeState: writeState,
-      effectiveWriteState: effectiveWriteState,
-      handoffMode: handoffMode,
       loadMode: loadMode,
       arrivalReqsPool: arrivalReqsPool,
+      agenticPromptTokensPerSecond: agenticPromptTokensPerSecond,
+      agenticCacheReadTokensPerSecond: agenticCacheReadTokensPerSecond,
       gpus: gpus,
       uniqueTpsGpu: uniqueTpsGpu,
       matchedLayout: matchedLayout,
       finalLayout: finalLayout,
+      selectedGrowingBytesPerToken: selectedGrowingBytesPerToken,
+      growingReadPerRequest: growingReadPerRequest,
+      stateReadPerRequest: stateReadPerRequest,
       readPerRequest: readPerRequest,
-      decodeReadPerRequest: decodeReadPerRequest,
-      cmxReadPerRequest: cmxReadPerRequest,
-      directPerRequest: directPerRequest,
       writePerRequest: writePerRequest,
       stateWriteBytes:
-        stateWrite == null ? null : effectiveAdmissionFraction * stateWrite,
+        stateWrite == null ? null : admissionFraction * stateWrite,
       offeredReqsGpu: offeredReqsGpu,
       offeredReqsPool: offeredReqsPool,
-      prefixRequiredRead: prefixRequiredRead,
-      decodeRequiredRead: decodeRequiredRead,
+      requiredGrowingRead: requiredGrowingRead,
+      requiredStateRead: requiredStateRead,
       requiredRead: requiredRead,
       requiredWrite: requiredWrite,
-      requiredDirect: requiredDirect,
-      linkGBsGpu: linkGBsGpu,
-      linkBudgetPool: linkBudgetPool,
-      linkMode: linkMode,
-      linkReqCeiling: linkReqCeiling,
-      pdLinkGBsGpu: pdLinkGBsGpu,
-      pdLinkBudgetPool: pdLinkBudgetPool,
-      pdLinkReqCeiling: pdLinkReqCeiling,
-      overallLinkReqCeiling: overallLinkReqCeiling,
+      readBudgetGBsPool: readBudgetGBsPool,
+      readBudgetPool: readBudgetPool,
+      readReqCeiling: readReqCeiling,
+      agenticReadBudgetRatio: agenticReadBudgetRatio,
       cappedReqsPool: cappedReqsPool,
-      cappedRead: bytesAtRate(cappedReqsPool, cmxReadPerRequest),
-      cappedWrite: bytesAtRate(cappedReqsPool, writePerRequest),
-      cappedDirect: bytesAtRate(cappedReqsPool, directPerRequest),
+      cappedRead: bytesAtRate(cappedReqsPool, readPerRequest),
     };
   }
 
@@ -644,12 +651,20 @@
       1,
       Math.floor(numberOr(p.poolCopies, 1))
     );
+    var activePrefixes = Math.max(
+      0,
+      Math.floor(numberOr(p.activePrefixes, 1))
+    );
     var hbmSessionBytes =
       layout.selectedGrowingBytes == null || layout.selectedStateBytes == null
         ? null
         : layout.selectedGrowingBytes / growingShardRanks +
           layout.selectedStateBytes / stateShardRanks;
     var poolSessionBytes = bytes == null ? null : bytes * poolCopies;
+    var rawWorkingSetBytes =
+      poolSessionBytes == null || cmxUsableFraction === 0
+        ? null
+        : (activePrefixes * poolSessionBytes) / cmxUsableFraction;
     return {
       layout: layout,
       usableHbmGB: usableHbmGB,
@@ -660,8 +675,10 @@
       growingShardRanks: growingShardRanks,
       stateShardRanks: stateShardRanks,
       poolCopies: poolCopies,
+      activePrefixes: activePrefixes,
       hbmSessionBytes: hbmSessionBytes,
       poolSessionBytes: poolSessionBytes,
+      rawWorkingSetBytes: rawWorkingSetBytes,
       hbmSessionsPerGpu:
         hbmSessionBytes > 0 ? Math.floor(hbmBytes / hbmSessionBytes) : null,
       g2SessionsPerRack:
@@ -694,22 +711,25 @@
       Math.floor(numberOr(p.poolCopies, 1))
     );
     var usableFraction = clamp(p.usableFraction, 0, 1);
+    var includeRetainedWrites = !!p.includeRetainedWrites;
 
     function atHit(hitRate) {
-      var traffic = trafficScenario(
+      var prefill = prefillScenario(
         Object.assign({}, p, {
           hitRate: hitRate,
           loadMode: "compute",
         })
       );
       var hotPrefixBytes =
-        traffic.matchedLayout.selectedTotalBytes == null
+        prefill.matchedLayout.selectedTotalBytes == null
           ? null
-          : activeSessions * traffic.matchedLayout.selectedTotalBytes;
+          : activeSessions * prefill.matchedLayout.selectedTotalBytes;
       var retainedWriteBytes =
-        traffic.requiredWrite == null
+        !includeRetainedWrites
+          ? 0
+          : prefill.requiredWrite == null
           ? null
-          : traffic.requiredWrite * retentionSeconds;
+          : prefill.requiredWrite * retentionSeconds;
       var logicalRetainedBytes = addBytes(
         hotPrefixBytes,
         retainedWriteBytes
@@ -719,7 +739,7 @@
           ? null
           : (logicalRetainedBytes * poolCopies) / usableFraction;
       return {
-        traffic: traffic,
+        prefill: prefill,
         hotPrefixBytes: hotPrefixBytes,
         retainedWriteBytes: retainedWriteBytes,
         logicalRetainedBytes: logicalRetainedBytes,
@@ -734,6 +754,7 @@
       retentionSeconds: retentionSeconds,
       poolCopies: poolCopies,
       usableFraction: usableFraction,
+      includeRetainedWrites: includeRetainedWrites,
       low: low,
       high: high,
       storageCostIncrease: relativeIncrease(
@@ -741,16 +762,16 @@
         high.rawStorageBytes
       ),
       computeReqIncrease: relativeIncrease(
-        low.traffic.offeredReqsPool,
-        high.traffic.offeredReqsPool
+        low.prefill.offeredReqsPool,
+        high.prefill.offeredReqsPool
       ),
       readIncrease: relativeIncrease(
-        low.traffic.requiredRead,
-        high.traffic.requiredRead
+        low.prefill.requiredRead,
+        high.prefill.requiredRead
       ),
       writeIncrease: relativeIncrease(
-        low.traffic.requiredWrite,
-        high.traffic.requiredWrite
+        includeRetainedWrites ? low.prefill.requiredWrite : null,
+        includeRetainedWrites ? high.prefill.requiredWrite : null
       ),
     };
   }
@@ -773,6 +794,7 @@
     var value = bytesPerSecond / GB;
     if (Math.abs(value) >= 10000) return value.toFixed(0) + " GB/s";
     if (Math.abs(value) >= 1000) return value.toFixed(1) + " GB/s";
+    if (Math.abs(value) < 1) return value.toFixed(5) + " GB/s";
     return value.toFixed(2) + " GB/s";
   }
 
@@ -803,11 +825,12 @@
     GB: GB,
     MODELS: MODELS,
     PROFILES: PROFILES,
+    AGENTIC_PRESETS: AGENTIC_PRESETS,
     profileFor: profileFor,
     profileOptions: profileOptions,
     sessionLayout: sessionLayout,
     matchedTokens: matchedTokens,
-    trafficScenario: trafficScenario,
+    prefillScenario: prefillScenario,
     capacityScenario: capacityScenario,
     hitComparisonScenario: hitComparisonScenario,
     fmtGiB: fmtGiB,

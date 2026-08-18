@@ -113,7 +113,7 @@ docs/
  - **模型定义(Transformers)**:Qwen3 `nn.Module`/HF config/decoder/model/causal-lm 分层 → `docs/research/transformers/overview.md`
    - **vLLM Q3 KV/Session 调度**(#48168 agent prefix · #48501 `session_id`/`continuation_id` · retention) → `docs/research/vllm/kv-session-roadmap.md`
    - **编排层/控制面**:KV-aware router(overlap 量化) + KVBM logical/physical/engine 三层 offload + Placement/StorageTier(介质非位置) + 链式 block 哈希 + 多后端通信(etcd/nats/tcp/zmq) → `docs/research/dynamo/overview.md`
-   - **NVIDIA CMX**：目标栈、公开成熟度、VAST G3/G3.5 边界与 lake 映射 → `docs/research/nvidia-cmx.md`；模型字节、容量与 offered load 计算器 → `tools/cmx-sim/`
+   - **NVIDIA CMX**：目标栈、公开成熟度、VAST G3/G3.5 边界与 lake 映射 → `docs/research/nvidia-cmx.md`；模型字节、容量与 Prefill KV 加载计算器 → `tools/cmx-sim/`
    - **Agentic cache workload**：匿名 Cursor 用量、provider cache 留存、File Library 边界与 90%/95% 仿真输入 → `docs/research/agentic-cache-workload.md`
    - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）
    - 跨项目逐层对应与借鉴顺序 → `docs/research/3rdparty-reference.md`

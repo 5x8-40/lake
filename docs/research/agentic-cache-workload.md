@@ -27,6 +27,8 @@ h = Cache Read / (Cache Write + uncached input + Cache Read)
 
 活跃小时 total token 的 `p50/p95/max` 分别为 `4.1143M / 20.9452M / 60.3019M token/h`。最大小时发生在 `2026-08-13 17:00`（UTC+8）：5 个 events、`60.0477M` prompt、`254.2K` output、`56.6650M` Cache Read、数值 Cost `$66.58`。
 
+仿真默认使用 trace 中占 token 最多且已有 KV 布局模型的 Kimi K3。其长期聚合为 164 个 events、`255.158901M` Cache Read、`22.481047M` uncached input，token-weighted hit 为 `91.902805%`。Kimi 峰值小时是 `2026-08-05 15:00`（UTC+8）：5 个 events、`1.083487M` uncached input、`20.131868M` Cache Read、`116.710K` output、`21.332065M` total token。5 个 events 仍不能解释为 5 个模型请求。
+
 完整匿名分模型汇总：
 
 | 模型 | events | total token | cache hit | input/event p50 | input/event p95 | output/event p50 | output/event p95 | peak token/h | 数值 Cost |
@@ -78,23 +80,37 @@ LMCache `QuotaManager` 提供 `cache_salt → byte limit` 的动态配额接口�
 
 ## 4. 仿真可用输入与缺口
 
-90%/95% 页面使用以下 workload 输入：
+仿真把可核实的 trace 数据与场景假设分开：
+
+- **Trace preset**：Kimi K3、平均 hit `91.902805%`、峰值 `21.215355M prompt token/h`；
+- **模型假设**：默认 1 Mi-token context、Kimi FP8 MLA + vLLM KDA state；
+- **部署假设**：GPU 数、unique token/s/GPU、active prefix、Pool 副本和 usable/raw。
+
+KV 加载页可以直接用峰值 prompt token/s 和平均 hit 计算 token-proportional growing-KV load：
+
+```text
+cache_read_token/s = peak_prompt_token/s × average_hit
+growing_KV_load = cache_read_token/s × growing_bytes/token
+```
+
+该口径不需要 request 数，但也不能计算 KDA fixed-state load。固定状态每次 resume/load 计一次，必须有底层 request/resume rate；因此默认完整 KV load 和 observed req/s 显示 `N/A`。
+
+90%/95% 页面使用以下场景输入：
 
 - `active_sessions`：同时保留一份热前缀的 session 数；
-- `retention`：新写入不可变版本的保留时间；
 - `hit`：每个请求可复用的 token 前缀比例，按 block 向下取整；
 - `effective_unique_tok/s/GPU × GPUs`：GPU-saturated Prefill 计算预算；
 - 模型 representation、Pool 副本和 usable/raw。
 
-页面不从 `92.2939%` token 账单命中率推导工作集。当前 CSV 没有 prefix ID 和 reuse distance，无法计算“达到 90%/95% 命中所需的最小容量”。页面采用显式工作集假设：
+页面不从 `91.902805%` 或整体 `92.2939%` token 账单命中率推导工作集。当前 CSV 没有 prefix ID 和 reuse distance，无法计算“达到 90%/95% 命中所需的最小容量”。页面默认采用 per-prefix 工作集：
 
 ```text
 hot_prefix = active_sessions × representation(matched_tokens)
-retained_writes = compute_req/s × retention × write_bytes/request
+retained_writes = 0
 raw_storage = copies × (hot_prefix + retained_writes) / usable_fraction
 ```
 
-该公式假设每个活跃 session 保留一份命中前缀，新写入后缀在 retention 窗口内互不去重。它用于比较容量、读写 offered load 和 compute-constrained req/s，不代表真实 cache-size/hit-rate 曲线。
+默认 `active_sessions=1` 只表示 per-prefix 归一化，不是 trace 实测并发。用户可选择计入 retention 窗口内的新写入；启用后才假设窗口内版本互不去重。该模型用于比较容量、P 侧 KV load 和 compute-constrained req/s，不代表真实 cache-size/hit-rate 曲线。
 
 ## 5. 参考实现与边界
 

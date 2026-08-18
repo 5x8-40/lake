@@ -6,17 +6,24 @@ CMX 架构证据见 [`docs/research/nvidia-cmx.md`](../../docs/research/nvidia-c
 
 ## 先打开哪个页面
 
-### 1. [`index.html`](index.html)：一个工作点需要多少流量
+### 1. [`index.html`](index.html)：Prefill 需要加载多少 KV
 
 适合回答：
 
-- 某模型、context、命中率和 GPU 数下，CMX read/write offered load 是多少；
-- P→D direct、P→CMX→D、P/D local 三种 handoff 如何改变流量；
-- 用户给定链路预算后，链路最多承载多少 req/s。
+- Kimi K3 单用户峰值 workload 对应多少 growing-KV load GB/s；
+- 给定真实 req/s 或 GPU 计算预算时，每请求与总 KV load 是多少；
+- 用户给定 Pool 读取预算后，最多能承载多少 req/s。
 
-主要输入：模型 representation、`C/E/hit`、`q/a`、GPU 数、unique token/s/GPU、handoff 和可选链路预算。
+主要输入：模型 representation、`C/E/hit`、远程读取比例 `q`，以及 Agentic peak token/h、GPU 计算预算或外部 req/s 三种负载来源。
 
-主要输出：bytes/request、GPU-saturated 或外部 `λ`、CMX/P→D GB/s、可选 link ceiling。
+主要输出：访问请求吞吐 req/s、P 侧 growing/fixed/complete KV load GB/s，以及可选 Pool-read ceiling。
+
+默认 preset 使用 Kimi K3：
+
+- 长期 token-weighted hit：`91.9028%`；
+- 单用户峰值小时：`21.215355M prompt token/h`、`21.332065M total token/h`；
+- 同小时有 5 个 Cursor usage events；event 是聚合账单行，不是 5 个模型请求；
+- trace 没有真实 request/resume rate，所以 req/s 和 KDA fixed-state load bandwidth 显示 `N/A`。
 
 它不回答“多少容量能放多少会话”或“90% 到 95% 要多花多少容量”。
 
@@ -26,11 +33,11 @@ CMX 架构证据见 [`docs/research/nvidia-cmx.md`](../../docs/research/nvidia-c
 
 - 一张 GPU、一组 G2 内存或一个 CMX POD 能放多少份指定 representation；
 - growing KV 与 fixed state 使用不同分片数时，单 GPU HBM 占用是多少；
-- Pool 副本和 usable/raw 如何改变会话数。
+- Pool 副本、active prefix 和 usable/raw 如何改变容量。
 
 主要输入：模型 representation、session token、HBM/G2/CMX 容量、分片、副本、usable/raw 和 GB/GiB 单位。
 
-主要输出：每 GPU、rack、POD 的完整会话数。
+主要输出：每个 prefix/session 字节、active-prefix raw working set，以及每 GPU、rack、POD 的完整会话数。
 
 它从“已有容量”反推会话数，不从命中率推导所需容量。
 
@@ -38,13 +45,13 @@ CMX 架构证据见 [`docs/research/nvidia-cmx.md`](../../docs/research/nvidia-c
 
 适合回答：
 
-- Prefill GPU 持续跑满时，两个命中率分别需要多少 hot-prefix 和近期写入容量；
-- compute-constrained req/s、CMX read/write offered load 分别增加多少；
+- Prefill GPU 持续跑满时，两个命中率分别需要多少 hot-prefix 容量；
+- compute-constrained req/s 和 P 侧 KV load bandwidth 分别增加多少；
 - 相同介质单价和副本策略下，raw 容量成本增加多少。
 
-主要输入：两个命中率、活跃 session 数、写入保留时间、GPU 计算预算、usable/raw 和副本数。
+主要输入：两个命中率、活跃 prefix 数、GPU 计算预算、usable/raw 和副本数。未实测的 retained writes 是可选高级项，默认关闭。
 
-主要输出：A/B 两组 selected-basis working set、raw 容量、read/write GB/s、compute req/s 及增幅。页面下半部分保留匿名 Cursor trace、provider 留存和 100 GB File Library 的证据。
+主要输出：A/B 两组 hot-prefix/raw 容量、KV load GB/s、compute req/s 及增幅。页面下半部分保留匿名 Cursor trace、provider 留存和 100 GB File Library 的证据。
 
 它不包含 CMX 采购价，也不把 token 命中直接换算成 GPU 美元成本。
 
@@ -75,7 +82,7 @@ node tools/cmx-sim/verify.js
 1. **Logical payload**：模型公式要求的有效元素。
 2. **Engine entry payload**：每个有效 entry 的实际结构，可能包含 scale/pad。
 3. **Engine page allocation**：entry 经 block/page/alignment 和 sliding-window admission 后的分配量。
-4. **Custom wire / CMX serialization**：P/D 或 Memos 对象格式。
+4. **Custom wire / CMX serialization**：Pool / Memos 对象格式。
 
 CMX wire 尚未公开，不能用 logical payload 或 HBM page 代替。当前 engine-page 结果只覆盖审计过的 V4 vLLM base-ring profile；其他 profile 返回 `N/A`。
 
@@ -120,33 +127,38 @@ V4-Flash 的绝对 GiB 是根据 21 个 c4a、20 个 c128a 和 2 个 SWA-only la
 
 V4 base/speculative/online-C128 compressor 是不同 representation；V4/GLM MTP 是可选 component。K3 KDA recurrent state 是 FP32，不能只算 growing MLA。
 
-## 流量页公式
+## KV 加载页公式
 
 ```text
 M = floor(C × hit / block) × block
 U = C − M + E
 
-prefix_cmx_read/request = q × selected_representation(M)
+growing_load/request = q × selected_growing(M)
+state_load/request   = q × selected_state(M)
+complete_load/request = growing_load + state_load
 
-P→D local:    decode_cmx_read=0, direct=0
-P→D direct:   decode_cmx_read=0, direct=selected_representation(C+E)
-P→CMX→D:      decode_cmx_read=selected_representation(C+E), effective_a=1
+external req/s      = user_supplied_req/s
+GPU-saturated req/s = effective_unique_tok/s/GPU × GPUs / U
 
-cmx_write/request
-  = effective_a × [selected_growing(C+E) − selected_growing(M) + final_state]
-
-external λ      = user_supplied_req/s
-GPU-saturated λ = effective_unique_tok/s/GPU × GPUs / U
-
-cmx_read_offered  = λ × (prefix_cmx_read + decode_cmx_read)
-cmx_write_offered = λ × cmx_write/request
-direct_offered    = λ × direct/request
+KV_load_bandwidth = req/s × complete_load/request
 ```
 
-- `q` 是命中字节中实际从 CMX 读取的比例；`a` 是写入 CMX 的比例。
-- `U=0` 时 GPU-saturated `λ` 无定义，只能使用外部到达率。
-- 外部 `λ` 不随命中率变化。
-- 链路预算为 0 表示未知；填写后得到用户假设下的 ceiling，不是实测吞吐。
+- `q` 是命中字节中实际从 Pool 读取的比例。
+- `U=0` 时 GPU-saturated req/s 无定义，只能使用外部请求率。
+- 外部 req/s 不随命中率变化。
+- Pool 读取预算为 0 表示未知；填写后得到用户假设下的 ceiling，不是实测吞吐。
+
+Agentic preset 没有 request 数，直接按 token demand 计算：
+
+```text
+peak_prompt_token/s = 21,215,355 / 3600
+cache_read_token/s  = peak_prompt_token/s × 91.9028%
+growing_KV_load     = cache_read_token/s × selected_growing_bytes/token × q
+```
+
+Kimi K3 FP8 的 `selected_growing_bytes/token = 24 × 576 = 13,824 B`，默认 growing-KV load 为 `0.07487 GB/s`。原始峰值小时实际 Cache Read 为 `20,131,868 token/h`，对应 `0.07731 GB/s`。两者不同，是因为 preset 组合了长期平均 hit 与峰值 prompt demand。
+
+KDA fixed state 不是 token-proportional。没有底层 request/resume rate 时，完整 KV load 不能计算，页面明确显示 `N/A`。
 
 ## 容量页公式
 
@@ -156,6 +168,8 @@ hbm_session
   + selected_state / state_shard_ranks
 
 pool_session = selected_total × pool_copies
+raw_working_set
+  = active_prefixes × pool_session / usable_fraction
 usable_cmx   = raw_cmx × usable_fraction
 sessions     = floor(usable_capacity / session_bytes)
 ```
@@ -164,7 +178,7 @@ sessions     = floor(usable_capacity / session_bytes)
 
 ## 90% / 95% 对比公式
 
-该页固定使用 GPU-saturated `λ`：
+该页固定使用 GPU-saturated req/s：
 
 ```text
 compute_req/s = effective_unique_tok/s/GPU × GPUs / U
@@ -173,7 +187,8 @@ hot_prefix
   = active_sessions × selected_representation(M)
 
 retained_writes
-  = compute_req/s × retention_seconds × cmx_write/request
+  = 0                                      # default
+  = compute_req/s × retention × write/request  # optional
 
 raw_storage
   = pool_copies × (hot_prefix + retained_writes) / usable_fraction
@@ -188,23 +203,25 @@ performance_increase
 假设：
 
 - 每个活跃 session 保留一份命中前缀；
-- 每次请求的新写入版本在 retention 窗口内互不去重；
+- active session/prefix 数不是 Cursor trace 实测值，默认 `1` 表示 per-prefix 归一化；
+- retained writes 默认关闭；启用后才假设窗口内新版本互不去重；
 - 相同介质单价、usable/raw 和副本策略下，容量成本与 raw bytes 成正比；
-- req/s 是计算约束值。若 offered read/write 超过真实链路，GPU 无法持续跑满。
+- req/s 是计算约束值。若 KV load 超过真实 Pool 读取能力，GPU 无法持续跑满。
 
-默认 V4-Pro BF16 示例：`C=1,048,576`、72 GPU、10k unique token/s/GPU、10k 活跃 session、10 分钟 retention、80% usable、1 副本。
+默认 Kimi K3 FP8 示例：`C=1,048,576`、72 GPU、10k unique token/s/GPU、1 个 active prefix、retained writes 关闭、80% usable、1 副本。
 
 | 指标 | 90% | 95% | 增幅 |
 |---|---:|---:|---:|
 | compute req/s | 6.86 | 13.72 | 100.00% |
-| CMX read | 63.93 GB/s | 134.95 GB/s | 111.09% |
-| CMX write | 7.27 GB/s | 7.46 GB/s | 2.52% |
-| raw storage | 110.91 TiB | 116.91 TiB | 5.41% |
+| P 侧 KV load | 92.56 GB/s | 195.08 GB/s | 110.75% |
+| raw storage / active prefix | 15.71 GiB | 16.55 GiB | 5.38% |
 
-95% 时 unique token 减半，所以计算约束 req/s 约翻倍；每请求写入后缀也约减半，因此 growing-write throughput 基本抵消，而 prefix read 随请求率明显上升。
+95% 时 unique token 减半，所以计算约束 req/s 约翻倍；每请求加载的前缀更长，因此 KV load bandwidth 增幅超过 100%。Kimi 的固定 KDA state 不随 prefix token 线性增长，所以结果略低于理想化的 `111.11%`。
 
 ## 实现锚点
 
+- vLLM `vllm/v1/core/kv_cache_manager.py::KVCacheManager.get_computed_blocks`：APC 将命中 block 与待计算 token 分开。
+- SGLang `python/sglang/srt/mem_cache/hiradix_cache.py::prefetch_from_storage` + `cache_controller.py::_page_get_zero_copy`：P 侧从外部存储加载 KV。
 - vLLM `vllm/v1/kv_cache_interface.py::MLAAttentionSpec.real_page_size_bytes`：V4 `fp8_ds_mla` main entry 为 584 B。
 - vLLM `vllm/v1/kv_cache_interface.py::SlidingWindowSpec.max_admission_blocks_per_request`：sliding-window admission 需额外处理跨 block 窗口。
 - vLLM `vllm/models/deepseek_v4/compressor.py::CompressorStateCache`：C4/C128 residual 是 FP32 sliding state。
@@ -212,7 +229,7 @@ performance_increase
 - SGLang `deepseek_v4_memory_pool.py::{DeepSeekV4SingleKVPool,DeepSeekV4IndexerPool,get_compress_state_ring_size}`：584 B main、132/68 B index 和不同 compressor representation。
 - vLLM `vllm/model_executor/layers/mamba/mamba_utils.py::{MambaStateDtypeCalculator.kda_state_dtype,MambaStateShapeCalculator.kda_state_shape}`：K3 recurrent/conv state dtype 与 shape。
 
-这些实现给出 engine payload/page/state，不给出 CMX wire。计算器保留这一区别。
+这些实现给出 APC 匹配、P 侧加载和 engine payload/page/state，不给出用户 request trace 或 CMX wire。计算器保留这些区别。
 
 来源：
 

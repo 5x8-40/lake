@@ -252,13 +252,12 @@ const baseTraffic = {
   writeState: true,
   gpus: 1,
   uniqueTpsGpu: 10_000,
-  linkGBsGpu: 0,
-  handoffMode: "local",
+  readBudgetGBsPool: 0,
   loadMode: "compute",
 };
 
 // KDA state is transferred once, not double-counted.
-const k3 = S.trafficScenario(baseTraffic);
+const k3 = S.prefillScenario(baseTraffic);
 close(
   k3.readPerRequest,
   k3.matchedLayout.growingBytes + k3.matchedLayout.stateBytes,
@@ -268,27 +267,27 @@ close(
 close(k3.stateWriteBytes, k3.finalLayout.stateBytes, 0, "K3 write state count");
 
 // A zero hit never reads a fixed state snapshot.
-const miss = S.trafficScenario({ ...baseTraffic, hitRate: 0 });
+const miss = S.prefillScenario({ ...baseTraffic, hitRate: 0 });
 assert.equal(miss.matchedTokens, 0);
 assert.equal(miss.readPerRequest, 0);
 assert.equal(miss.requiredRead, 0);
 
 // A link budget caps request throughput only when explicitly supplied.
-const uncapped = S.trafficScenario(baseTraffic);
-assert.equal(uncapped.linkReqCeiling, null);
+const uncapped = S.prefillScenario(baseTraffic);
+assert.equal(uncapped.readReqCeiling, null);
 assert.equal(uncapped.cappedReqsPool, null);
-const capped = S.trafficScenario({ ...baseTraffic, linkGBsGpu: 1 });
+const capped = S.prefillScenario({ ...baseTraffic, readBudgetGBsPool: 1 });
 close(
-  capped.linkReqCeiling,
-  1e9 / (capped.readPerRequest + capped.writePerRequest),
+  capped.readReqCeiling,
+  1e9 / capped.readPerRequest,
   1e-12,
-  "shared-link ceiling"
+  "storage-read ceiling"
 );
 assert.ok(capped.cappedReqsPool < capped.offeredReqsPool);
 
 // A full hit with no new input has an unknown arrival rate: unique-token
 // throughput cannot be used as its denominator. It must never produce NaN.
-const fullHit = S.trafficScenario({
+const fullHit = S.prefillScenario({
   ...baseTraffic,
   contextTokens: 1024,
   hitRate: 1,
@@ -300,11 +299,10 @@ assert.equal(fullHit.requiredRead, null);
 assert.equal(fullHit.requiredWrite, 0);
 assert.equal(fullHit.cappedReqsPool, null);
 assert.equal(fullHit.cappedRead, null);
-assert.equal(fullHit.cappedWrite, 0);
 assert.ok(Number.isFinite(fullHit.readPerRequest));
 
-// An external arrival rate is the only defined way to size U=0 offered load.
-const fullHitArrival = S.trafficScenario({
+// An external request rate is the only defined way to size U=0 load.
+const fullHitArrival = S.prefillScenario({
   ...fullHit,
   modelId: baseTraffic.modelId,
   profileId: baseTraffic.profileId,
@@ -317,71 +315,30 @@ const fullHitArrival = S.trafficScenario({
 assert.equal(fullHitArrival.offeredReqsPool, 37);
 close(
   fullHitArrival.requiredRead,
-  37 * fullHitArrival.cmxReadPerRequest,
+  37 * fullHitArrival.readPerRequest,
   0,
   "external lambda at U=0"
 );
 
 // With q=0 and no writes, bandwidth is exactly zero even though request rate
 // cannot be inferred.
-const localFullHit = S.trafficScenario({
+const localFullHit = S.prefillScenario({
   ...baseTraffic,
   contextTokens: 1024,
   hitRate: 1,
   blockTokens: 256,
   remoteFraction: 0,
-  linkGBsGpu: 1,
+  readBudgetGBsPool: 1,
 });
 assert.equal(localFullHit.offeredReqsPool, null);
 assert.equal(localFullHit.readPerRequest, 0);
 assert.equal(localFullHit.writePerRequest, 0);
 assert.equal(localFullHit.requiredRead, 0);
 assert.equal(localFullHit.requiredWrite, 0);
-assert.equal(localFullHit.linkReqCeiling, Infinity);
-
-// P->D handoff paths conserve the final representation: direct puts it on the
-// P-D fabric, via-CMX adds the same bytes to CMX reads, and local adds neither.
-const pdCommon = {
-  ...baseTraffic,
-  contextTokens: 4096,
-  extraTokens: 64,
-  hitRate: 0.5,
-  blockTokens: 256,
-  loadMode: "arrival",
-  arrivalReqsPool: 2,
-};
-const pdLocal = S.trafficScenario({ ...pdCommon, handoffMode: "local" });
-const pdDirect = S.trafficScenario({ ...pdCommon, handoffMode: "direct" });
-const pdViaCmx = S.trafficScenario({ ...pdCommon, handoffMode: "via-cmx" });
-assert.equal(pdLocal.directPerRequest, 0);
-assert.equal(pdLocal.decodeReadPerRequest, 0);
-assert.equal(
-  pdDirect.directPerRequest,
-  pdDirect.finalLayout.selectedTotalBytes
-);
-assert.equal(pdDirect.cmxReadPerRequest, pdLocal.cmxReadPerRequest);
-assert.equal(
-  pdViaCmx.decodeReadPerRequest,
-  pdViaCmx.finalLayout.selectedTotalBytes
-);
-assert.equal(
-  pdViaCmx.cmxReadPerRequest,
-  pdLocal.cmxReadPerRequest + pdViaCmx.decodeReadPerRequest
-);
-assert.equal(pdLocal.writePerRequest, pdDirect.writePerRequest);
-assert.equal(pdDirect.writePerRequest, pdViaCmx.writePerRequest);
-const forcedViaCmx = S.trafficScenario({
-  ...pdCommon,
-  handoffMode: "via-cmx",
-  admissionFraction: 0,
-  writeState: false,
-});
-assert.equal(forcedViaCmx.effectiveAdmissionFraction, 1);
-assert.equal(forcedViaCmx.effectiveWriteState, true);
-assert.ok(forcedViaCmx.writePerRequest > 0);
+assert.equal(localFullHit.readReqCeiling, Infinity);
 
 // Disabling state writes still writes only newly generated growing KV.
-const noStateWrite = S.trafficScenario({
+const noStateWrite = S.prefillScenario({
   ...baseTraffic,
   contextTokens: 1024,
   hitRate: 0.5,
@@ -398,7 +355,7 @@ close(
 );
 
 // Fractional residency/admission factors scale bytes exactly once.
-const fractional = S.trafficScenario({
+const fractional = S.prefillScenario({
   ...baseTraffic,
   contextTokens: 1024,
   hitRate: 0.5,
@@ -428,52 +385,79 @@ close(
   "fractional write admission"
 );
 
-// Full-duplex budgets cap on the tighter direction, not read+write.
-const fullDuplex = S.trafficScenario({
+// The Kimi Agentic preset is trace-backed at token/hour granularity. It does
+// not invent API req/s or amortize KDA fixed state over unknown requests.
+const kimiPreset = S.AGENTIC_PRESETS.kimiK3SingleUserPeak;
+assert.equal(kimiPreset.modelId, "k3");
+assert.equal(kimiPreset.profileId, "fp8-vllm-state");
+assert.equal(kimiPreset.usageEvents, 5);
+assert.equal(kimiPreset.promptTokensHour, 21_215_355);
+assert.equal(kimiPreset.cacheReadTokensHour, 20_131_868);
+close(
+  kimiPreset.averageHitRate,
+  255_158_901 / (255_158_901 + 22_481_047),
+  1e-15,
+  "Kimi average token-weighted hit"
+);
+const agenticKimi = S.prefillScenario({
   ...baseTraffic,
-  linkGBsGpu: 1,
-  linkMode: "full-duplex",
+  loadMode: "agentic",
+  hitRate: kimiPreset.averageHitRate,
+  agenticPromptTokensPerSecond: kimiPreset.promptTokensHour / 3600,
 });
 close(
-  fullDuplex.linkReqCeiling,
-  Math.min(
-    1e9 / fullDuplex.readPerRequest,
-    1e9 / fullDuplex.writePerRequest
-  ),
+  agenticKimi.agenticCacheReadTokensPerSecond,
+  (kimiPreset.promptTokensHour / 3600) * kimiPreset.averageHitRate,
   1e-12,
-  "full-duplex ceiling"
+  "Kimi peak prompt with average hit"
 );
-
-// A zero-byte full-duplex direction does not cap the other direction.
-const readOnlyFullDuplex = S.trafficScenario({
-  ...baseTraffic,
-  contextTokens: 1024,
-  hitRate: 1,
-  blockTokens: 256,
-  remoteFraction: 1,
-  linkGBsGpu: 1,
-  linkMode: "full-duplex",
-});
 close(
-  readOnlyFullDuplex.linkReqCeiling,
-  1e9 / readOnlyFullDuplex.readPerRequest,
-  1e-12,
-  "read-only full-duplex ceiling"
+  agenticKimi.selectedGrowingBytesPerToken,
+  24 * 576,
+  0,
+  "Kimi FP8 growing bytes/token"
 );
-const writeOnlyFullDuplex = S.trafficScenario({
+close(
+  agenticKimi.requiredGrowingRead / S.GB,
+  0.07487042461886444,
+  1e-12,
+  "Kimi Agentic growing-KV load GB/s"
+);
+assert.equal(agenticKimi.offeredReqsPool, null);
+assert.equal(agenticKimi.requiredStateRead, null);
+assert.equal(agenticKimi.requiredRead, null);
+assert.equal(agenticKimi.requiredWrite, null);
+const agenticBudget = S.prefillScenario({
   ...baseTraffic,
-  contextTokens: 1024,
-  hitRate: 0,
+  loadMode: "agentic",
+  hitRate: kimiPreset.averageHitRate,
+  agenticPromptTokensPerSecond: kimiPreset.promptTokensHour / 3600,
+  readBudgetGBsPool: 1,
+});
+assert.equal(agenticBudget.readReqCeiling, null);
+close(
+  agenticBudget.agenticReadBudgetRatio,
+  1e9 / agenticBudget.requiredGrowingRead,
+  1e-12,
+  "Agentic read-budget headroom"
+);
+const agenticLocal = S.prefillScenario({
+  ...baseTraffic,
+  loadMode: "agentic",
+  hitRate: kimiPreset.averageHitRate,
+  agenticPromptTokensPerSecond: kimiPreset.promptTokensHour / 3600,
   remoteFraction: 0,
-  linkGBsGpu: 1,
-  linkMode: "full-duplex",
 });
-close(
-  writeOnlyFullDuplex.linkReqCeiling,
-  1e9 / writeOnlyFullDuplex.writePerRequest,
-  1e-12,
-  "write-only full-duplex ceiling"
-);
+assert.equal(agenticLocal.requiredGrowingRead, 0);
+assert.equal(agenticLocal.requiredStateRead, 0);
+assert.equal(agenticLocal.requiredRead, 0);
+[
+  "handoffMode",
+  "decodeReadPerRequest",
+  "directPerRequest",
+  "requiredDirect",
+  "pdLinkReqCeiling",
+].forEach((field) => assert.ok(!(field in agenticKimi), `${field} removed`));
 
 // Explicit zeros stay zero in the capacity model.
 const zeroCapacity = S.capacityScenario({
@@ -531,6 +515,7 @@ const shardedCapacity = S.capacityScenario({
   growingShardRanks: 8,
   stateShardRanks: 1,
   poolCopies: 2,
+  activePrefixes: 3,
   capacityUnitMode: "binary",
 });
 close(
@@ -552,76 +537,102 @@ assert.equal(
   shardedCapacity.g2SessionsPerRack,
   Math.floor(1024 ** 4 / shardedCapacity.poolSessionBytes)
 );
+close(
+  shardedCapacity.rawWorkingSetBytes,
+  (3 * shardedCapacity.poolSessionBytes) / 0.8,
+  0,
+  "active-prefix raw working set"
+);
 
-// Hit comparison keeps Prefill GPUs saturated. Storage consists of one hot
-// matched prefix per active session plus admitted writes retained for a
-// user-supplied time window.
+// Hit comparison keeps Prefill GPUs saturated. The default Agentic view sizes
+// one Kimi hot prefix and leaves unmeasured retained writes disabled.
 const comparison = S.hitComparisonScenario({
-  modelId: "v4pro",
-  profileId: "bf16-logical",
+  modelId: "k3",
+  profileId: "fp8-vllm-state",
   contextTokens: ONE_MI_TOKEN,
   extraTokens: 0,
   blockTokens: 256,
   remoteFraction: 1,
   admissionFraction: 1,
   writeState: true,
-  handoffMode: "direct",
   gpus: 72,
   uniqueTpsGpu: 10_000,
   hitRateLow: 0.9,
   hitRateHigh: 0.95,
-  activeSessions: 10_000,
+  activeSessions: 1,
   retentionSeconds: 600,
+  includeRetainedWrites: false,
   poolCopies: 1,
   usableFraction: 0.8,
 });
-assert.equal(comparison.low.traffic.matchedTokens, 943_616);
-assert.equal(comparison.high.traffic.matchedTokens, 996_096);
-assert.equal(comparison.low.traffic.uniqueTokens, 104_960);
-assert.equal(comparison.high.traffic.uniqueTokens, 52_480);
+assert.equal(comparison.low.prefill.matchedTokens, 943_616);
+assert.equal(comparison.high.prefill.matchedTokens, 996_096);
+assert.equal(comparison.low.prefill.uniqueTokens, 104_960);
+assert.equal(comparison.high.prefill.uniqueTokens, 52_480);
 close(
-  comparison.low.traffic.offeredReqsPool,
+  comparison.low.prefill.offeredReqsPool,
   6.859756097560975,
   1e-12,
   "90% compute-constrained request rate"
 );
 close(
-  comparison.high.traffic.offeredReqsPool,
+  comparison.high.prefill.offeredReqsPool,
   13.71951219512195,
   1e-12,
   "95% compute-constrained request rate"
 );
 close(
-  comparison.low.rawStorageBytes / S.TiB,
-  110.91130606761973,
+  comparison.low.rawStorageBytes / S.GiB,
+  15.708990097045898,
   1e-12,
   "90% raw storage"
 );
 close(
-  comparison.high.rawStorageBytes / S.TiB,
-  116.91186568563485,
+  comparison.high.rawStorageBytes / S.GiB,
+  16.553564071655273,
   1e-12,
   "95% raw storage"
 );
 close(
   comparison.storageCostIncrease,
-  0.054102325820207575,
+  0.05376373461258965,
   1e-12,
   "storage capacity cost increase"
 );
 assert.equal(comparison.computeReqIncrease, 1);
 close(
   comparison.readIncrease,
-  1.110912940231262,
+  1.1075274692251793,
   1e-12,
   "read bandwidth increase"
 );
-close(
-  comparison.writeIncrease,
-  0.025185900531144334,
-  1e-12,
-  "write bandwidth increase"
+assert.equal(comparison.writeIncrease, null);
+assert.equal(comparison.low.retainedWriteBytes, 0);
+assert.equal(comparison.high.retainedWriteBytes, 0);
+
+const withRetainedWrites = S.hitComparisonScenario({
+  modelId: "k3",
+  profileId: "fp8-vllm-state",
+  contextTokens: ONE_MI_TOKEN,
+  blockTokens: 256,
+  remoteFraction: 1,
+  admissionFraction: 1,
+  writeState: true,
+  gpus: 72,
+  uniqueTpsGpu: 10_000,
+  hitRateLow: 0.9,
+  hitRateHigh: 0.95,
+  activeSessions: 1,
+  retentionSeconds: 600,
+  includeRetainedWrites: true,
+  poolCopies: 1,
+  usableFraction: 0.8,
+});
+assert.ok(
+  withRetainedWrites.low.rawStorageBytes > comparison.low.rawStorageBytes
 );
+assert.ok(withRetainedWrites.low.retainedWriteBytes > 0);
+assert.ok(withRetainedWrites.writeIncrease != null);
 
 const zeroRetention = S.hitComparisonScenario({
   modelId: "v4pro",
@@ -664,6 +675,7 @@ assert.equal(S.fmtGiB(null), "N/A");
 assert.equal(S.fmtGiB(NaN), "N/A");
 assert.equal(S.fmtGBs(NaN), "N/A");
 assert.equal(S.fmtGBs(63.929059902439015 * S.GB), "63.93 GB/s");
+assert.equal(S.fmtGBs(0.07487042461886444 * S.GB), "0.07487 GB/s");
 assert.equal(S.fmtCapacity(S.TiB), "1.00 TiB");
 assert.equal(S.fmtRate(NaN), "N/A");
 assert.equal(S.fmtRate(Infinity), "∞");

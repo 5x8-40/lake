@@ -8,7 +8,7 @@
 </head>
 <body>
   <nav class="topnav" aria-label="CMX 分析页面">
-    <a href="index.html">流量工作点</a>
+    <a href="index.html">KV 加载</a>
     <a href="capacity.html" class="on" aria-current="page">容量换算</a>
     <a href="economics.html">命中率对比</a>
     <span class="navdoc">方法见 <a href="README.md">README</a></span>
@@ -17,7 +17,7 @@
   <header>
     <h1>CMX 长上下文会话容量</h1>
     <p>
-      按用户给定容量计算 GPU、rack 和 POD 的完整会话数。三者属于不同 scope。
+      默认按 Kimi K3 计算每个 retained prefix 的 KV 容量，再由 active prefix 数扩展工作集。
     </p>
     <div class="warn" role="note">
       本页由已有容量反推会话数，不从命中率推导所需容量；未建模 allocator 碎片、元数据和实际介质行为。
@@ -32,7 +32,7 @@
         <option value="v4pro">DeepSeek V4-Pro</option>
         <option value="v4flash">DeepSeek V4-Flash</option>
         <option value="glm52">GLM-5.2</option>
-        <option value="k3">Kimi K3</option>
+        <option value="k3" selected>Kimi K3</option>
       </select>
 
       <label for="profile">KV / 状态布局</label>
@@ -102,6 +102,10 @@
 
       <label for="poolCopies">G2/CMX representation 副本数</label>
       <input id="poolCopies" type="number" min="1" step="1" value="1" />
+
+      <label for="activePrefixes">Active retained prefix 数</label>
+      <input id="activePrefixes" type="number" min="0" step="1" value="1" />
+      <p class="hint">默认 1 是归一化单位，不是 Cursor trace 实测并发。</p>
     </aside>
 
     <main>
@@ -145,12 +149,12 @@
       </section>
 
       <footer>
-        18.432 PB 来自 <code>16 TB/GPU × 1152 GPU/POD</code>；usable 比例由用户提供。
+        默认模型来自 Kimi K3 Agentic workload；active prefix、容量和 usable 比例仍需用户提供。
       </footer>
     </main>
   </div>
 
-  <script src="sim.js?v=8"></script>
+  <script src="sim.js?v=9"></script>
   <script>
     "use strict";
 
@@ -201,6 +205,7 @@
         growingShardRanks: finiteNumber("growingShardRanks", 1),
         stateShardRanks: finiteNumber("stateShardRanks", 1),
         poolCopies: finiteNumber("poolCopies", 1),
+        activePrefixes: finiteNumber("activePrefixes", 1),
       };
     }
 
@@ -233,6 +238,7 @@
         stat("所选口径会话", S.fmtGiB(result.layout.selectedTotalBytes), basisLabel(result.layout), "hot"),
         stat("HBM bytes / GPU / 会话", S.fmtGiB(result.hbmSessionBytes), `growing÷${result.growingShardRanks} + state÷${result.stateShardRanks}`),
         stat("Pool bytes / 会话", S.fmtGiB(result.poolSessionBytes), `${result.poolCopies} representation copies`),
+        stat("Raw working set", S.fmtCapacity(result.rawWorkingSetBytes), `${result.activePrefixes} active prefixes ÷ ${(result.cmxUsableFraction * 100).toFixed(0)}% usable`, "hot"),
         stat("HBM / GPU", result.usableHbmGB > 0 ? fmtCount(result.hbmSessionsPerGpu) : "未设置", `${result.usableHbmGB} ${units[0]}；需显式拓扑`),
         stat("G2 / rack", fmtCount(result.g2SessionsPerRack), `${result.usableG2TB} ${units[1]} 可用于会话`),
         stat("CMX raw / POD", fmtCount(result.rawCmxSessionsPerPod), `${result.rawCmxPB} ${units[2]} raw`),
@@ -263,6 +269,11 @@ HBM sessions / GPU
 pool bytes/session
   = selected_bytes × ${result.poolCopies} copies
   = ${S.fmtGiB(result.poolSessionBytes)}
+
+raw working set
+  = active_prefixes × pool_bytes/session ÷ usable_fraction
+  = ${result.activePrefixes} × ${S.fmtGiB(result.poolSessionBytes)} ÷ ${result.cmxUsableFraction}
+  = ${S.fmtCapacity(result.rawWorkingSetBytes)}
 
 G2 sessions / rack
   = floor(${result.usableG2TB} ${units[1]} / pool_bytes_per_session)
@@ -400,12 +411,14 @@ CMX usable sessions / POD
       "profile", "byteMode", "customWireFactor", "compressorPolicy",
       "includeMtp", "capacityUnitMode", "hbmGB", "g2TB", "cmxPB",
       "cmxUsable", "growingShardRanks", "stateShardRanks", "poolCopies",
+      "activePrefixes",
     ].forEach((id) => {
       $(id).addEventListener("input", render);
       $(id).addEventListener("change", render);
     });
 
     syncProfiles();
+    $("profile").value = S.AGENTIC_PRESETS.kimiK3SingleUserPeak.profileId;
     syncConditionalInputs();
     render();
   </script>
