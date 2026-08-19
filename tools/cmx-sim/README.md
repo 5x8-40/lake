@@ -80,16 +80,16 @@ node tools/cmx-sim/verify.js
 node tools/cmx-sim/verify-measured.js
 ```
 
-## GitLab Pages
+## GitHub Pages
 
-同一 private Pages 站点包含四个页面：
+同一站点包含四个页面（仓库公开，站点也公开）：
 
-- <https://lake-13d9f7.gitlab.io/>
-- <https://lake-13d9f7.gitlab.io/capacity.html>
-- <https://lake-13d9f7.gitlab.io/economics.html>
-- <https://lake-13d9f7.gitlab.io/measured.html>
+- <https://5x8-40.github.io/lake/>
+- <https://5x8-40.github.io/lake/capacity.html>
+- <https://5x8-40.github.io/lake/economics.html>
+- <https://5x8-40.github.io/lake/measured.html>
 
-只有已登录的项目成员可访问。MR !7 发布分支版本；合并后由 `main` 更新。
+由 `.github/workflows/pages.yml` 在 `main` 更新。
 
 ## 字节口径
 
