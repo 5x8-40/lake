@@ -1,6 +1,6 @@
 # NVIDIA CMX 分析计算器
 
-这三个页面回答不同问题，不能把结果互换。它们都是参数化分析，不是 CMX benchmark、SKU 或厂商 SLA。
+这四个页面回答不同问题，不能把结果互换。前三页是参数化分析；实测页是两组用户提供数据的回归。它们都不是 CMX benchmark、SKU 或厂商 SLA。
 
 CMX 架构证据见 [`docs/research/nvidia-cmx.md`](../../docs/research/nvidia-cmx.md)；Agentic trace、provider cache 留存和 File Library 边界见 [`docs/research/agentic-cache-workload.md`](../../docs/research/agentic-cache-workload.md)。
 
@@ -55,6 +55,20 @@ CMX 架构证据见 [`docs/research/nvidia-cmx.md`](../../docs/research/nvidia-c
 
 它不包含 CMX 采购价，也不把 token 命中直接换算成 GPU 美元成本。
 
+### 4. [`measured.html`](measured.html)：查看实测点与拟合
+
+适合回答：
+
+- 两组设备、三个模型在 56%/90%/99% APC 命中率下的 TTFT、KV 量和带宽是多少；
+- 给定 hit 与序列长度时，各指标的回归预测是多少；
+- 每条拟合的 R² 和相对 RMSE 是否足以支持当前用途。
+
+主要输入：设备 A/B、模型、指标，以及任意 APC 命中率和 K-token 序列长度。
+
+主要输出：实测点、拟合曲线、当前点预测、系数和误差。页面下方保留两张完整原始表，并链接到 MR !7 comment `3702930653`、`3702931264`。
+
+原 comment 未提供 GPU 型号和测试方法。Qwen3-235B 无 Cache TTFT/TPS 只展示，不参与拟合；范围外预测属于外推。
+
 ## 本地运行
 
 ```bash
@@ -63,15 +77,17 @@ python3 -m http.server --directory .
 # 打开 http://127.0.0.1:8000/tools/cmx-sim/
 
 node tools/cmx-sim/verify.js
+node tools/cmx-sim/verify-measured.js
 ```
 
 ## GitLab Pages
 
-同一 private Pages 站点包含三个页面：
+同一 private Pages 站点包含四个页面：
 
 - <https://lake-13d9f7.gitlab.io/>
 - <https://lake-13d9f7.gitlab.io/capacity.html>
 - <https://lake-13d9f7.gitlab.io/economics.html>
+- <https://lake-13d9f7.gitlab.io/measured.html>
 
 只有已登录的项目成员可访问。MR !7 发布分支版本；合并后由 `main` 更新。
 
@@ -244,9 +260,30 @@ performance_increase
 
 95% 时 unique token 减半，所以计算约束 req/s 约翻倍；每请求加载的前缀更长，因此 KV load bandwidth 增幅超过 100%。Kimi 的固定 KDA state 不随 prefix token 线性增长，所以结果略低于理想化的 `111.11%`。
 
+## 实测页拟合公式
+
+`N` 使用原表的 K-token 单位。每个设备、每个模型独立拟合：
+
+```text
+TTFT       = c + (1-h) × (aN + bN²)
+单层读KV   = k × h × N
+读带宽      = d_read × h × N / fitted_TTFT
+写带宽      = d_write × (1-h) × N / fitted_TTFT
+1H新增KV    = 写带宽 × 3600 / 1024
+1H处理总量  = 1H新增KV / (1-h)
+```
+
+- TTFT 使用相对误差加权最小二乘，避免 1M 序列完全支配短序列；
+- 单层读 KV 的 `k` 使用过原点最小二乘；
+- `d_read`、`d_write` 分别最小化相对带宽误差。V4 的读写 representation 不对称，不能套用 `写=读×(1-h)/h`；
+- 页面公开每个指标的普通 R² 和相对 RMSE；小时量沿用原表的 `1024 GB = 1 TB` 口径；
+- 两张原始表的小时量已四舍五入，拟合预测中的小时换算保持精确恒等；
+- 无 Cache 列、OOM 和空值不进入拟合。
+
 ## 实现锚点
 
 - vLLM `vllm/v1/core/kv_cache_manager.py::KVCacheManager.get_computed_blocks`：APC 将命中 block 与待计算 token 分开。
+- SGLang `python/sglang/srt/mem_cache/radix_cache.py::RadixCache.match_prefix`：APC hit 表示连续前缀命中，不是任意 KV 字节命中。
 - vLLM `vllm/v1/kv_offload/base.py::OffloadPolicy.BLOCK_LEVEL`：只 offload 新计算 block，跳过已存的 prefix-hit block。
 - SGLang `python/sglang/srt/mem_cache/radix_cache.py::RadixCache.cache_finished_req`：插入完成请求后释放树中已有的重复 KV。
 - LMCache `lmcache/v1/token_database.py::ChunkedTokenDatabase._prefix_hash/process_tokens`：链式内容哈希使相同前缀块共用 key。

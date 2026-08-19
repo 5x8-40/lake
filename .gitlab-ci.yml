@@ -130,6 +130,16 @@ docs-check:
   script:
     - python scripts/check_doc_links.py
 
+cmx-sim-check:
+  stage: build
+  image: node:22-alpine
+  rules:
+    - changes:
+        - tools/cmx-sim/**/*
+  script:
+    - node tools/cmx-sim/verify.js
+    - node tools/cmx-sim/verify-measured.js
+
 # ---------- verify / smoke (p3.yml) ----------
 
 # P3 编译门禁(不含起全栈冒烟)。rust:1.96.1 自带 rust,apt 装 python3,Go 用官方二进制。
@@ -201,8 +211,10 @@ pages:
     - cp tools/cmx-sim/index.html public/index.html
     - cp tools/cmx-sim/capacity.html public/capacity.html
     - cp tools/cmx-sim/economics.html public/economics.html
+    - cp tools/cmx-sim/measured.html public/measured.html
     - cp tools/cmx-sim/app.css public/app.css
     - cp tools/cmx-sim/sim.js public/sim.js
+    - cp tools/cmx-sim/measured.js public/measured.js
     - cp tools/cmx-sim/README.md public/README.md
     - cp docs/research/nvidia-cmx.md public/docs/research/nvidia-cmx.md
     - cp docs/research/agentic-cache-workload.md public/docs/research/agentic-cache-workload.md

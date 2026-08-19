@@ -4,7 +4,7 @@
 >
 > CMX 是 NVIDIA 公布的 KV cache 存储目标架构，覆盖 GPU、Dynamo/KVBM、NIXL、DOCA Memos、BlueField-4、Spectrum-X 和共享 flash。公开软件尚未形成可复现的端到端实现。lake 只把共享 flash 数据路径映射为候选 L2 backend。
 
-模型字节、容量、Prefill KV 加载带宽和 90%/95% 命中率对比在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)；Agentic trace 与 provider cache 留存见 [`agentic-cache-workload.md`](agentic-cache-workload.md)。
+模型字节、容量、Prefill KV 加载带宽、90%/95% 命中率对比和用户提供的 APC 实测拟合在 [`../../tools/cmx-sim/`](../../tools/cmx-sim/)；Agentic trace 与 provider cache 留存见 [`agentic-cache-workload.md`](agentic-cache-workload.md)。
 
 后续工作见 [#22 可移交 Context 合同和数据面能力](https://gitlab.com/BeeBreeze/lake/-/issues/22) 与 [#23 Portable Context ABI](https://gitlab.com/BeeBreeze/lake/-/issues/23)。MR !7 不修改核心 proto/runtime。
 
