@@ -159,7 +159,7 @@ SLO 数值是 draft（待 P7 校准），但**约束关系是硬的**：TTFT/ITL
 - 推送:`git push github <branch>`(HTTPS,凭据由 git credential 管理)。
 - 用户尚未配置全局 git 身份,仓库本地配置为 `witcher` / `witcher@users.noreply.github.com`,提交时用 `git -c commit.gpgsign=false commit`。
 - PR/issue/流水线操作用 `gh` CLI(账号 `5x8-40`):`gh pr create` / `gh issue list` / `gh run list`;合并由用户决定,不自行合并。
-- CI:GitHub Actions(`.github/workflows/build.yml` + `p3.yml` + `pages.yml`),main push 与 PR 触发。CMX 计算器静态页发到 `https://5x8-40.github.io/lake/`。`.gitlab-ci.yml` 与 `.gitcode/workflows/` 为历史遗留,勿当作主 CI。
+- CI:GitHub Actions(`.github/workflows/build.yml` + `p3.yml`),main push 与 PR 触发。CMX 计算器静态页在 `gh-pages` 分支,地址 `https://5x8-40.github.io/lake/`；改完 `tools/cmx-sim` 后跑 `bash scripts/publish-pages.sh`。`.gitlab-ci.yml` 与 `.gitcode/workflows/` 为历史遗留,勿当作主 CI。
 
 ## 原型运行
 

@@ -89,7 +89,7 @@ node tools/cmx-sim/verify-measured.js
 - <https://5x8-40.github.io/lake/economics.html>
 - <https://5x8-40.github.io/lake/measured.html>
 
-由 `.github/workflows/pages.yml` 在 `main` 更新。
+由 `gh-pages` 分支发布；更新计算器后在仓库根目录跑 `bash scripts/publish-pages.sh`。
 
 ## 字节口径
 
