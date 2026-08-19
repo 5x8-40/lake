@@ -1,16 +1,27 @@
 name: p3
 
+# 路径与 .gitlab-ci.yml 的 code_paths 对齐：纯文档改动不跑 P3。
 on:
   push:
     branches: [main]
-  pull_request:
     paths:
-      - "proto/**"
       - "rust/**"
       - "go/**"
       - "python/**"
+      - "proto/**"
+      - "scripts/**"
       - "deploy/**"
-      - "scripts/verify-p3.sh"
+      - "bench/**"
+      - ".github/workflows/p3.yml"
+  pull_request:
+    paths:
+      - "rust/**"
+      - "go/**"
+      - "python/**"
+      - "proto/**"
+      - "scripts/**"
+      - "deploy/**"
+      - "bench/**"
       - ".github/workflows/p3.yml"
 
 jobs:
