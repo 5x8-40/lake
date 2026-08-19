@@ -1,0 +1,476 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>命中率容量与吞吐对比</title>
+  <link rel="stylesheet" href="app.css?v=4" />
+</head>
+<body>
+  <nav class="topnav" aria-label="CMX 分析页面">
+    <a href="index.html">KV 加载</a>
+    <a href="capacity.html">容量换算</a>
+    <a href="economics.html" class="on" aria-current="page">命中率对比</a>
+    <a href="measured.html">实测数据</a>
+    <span class="navdoc">方法见 <a href="README.md">README</a></span>
+  </nav>
+
+  <header>
+    <h1>90% / 95% 命中率：容量、带宽与 req/s</h1>
+    <p>
+      假设 Prefill GPU 持续跑满，比较两个命中率下的 hot-prefix 容量、P 侧 KV 加载带宽和计算约束 req/s。
+    </p>
+    <div class="warn" role="note">
+      Kimi K3 trace 的长期平均命中率为 91.90%，位于 90%/95% 两个目标之间；trace 不提供真实 req/s。
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside>
+      <h2>模型与请求</h2>
+      <label for="model">模型</label>
+      <select id="model">
+        <option value="v4pro">DeepSeek V4-Pro</option>
+        <option value="v4flash">DeepSeek V4-Flash</option>
+        <option value="glm52">GLM-5.2</option>
+        <option value="k3" selected>Kimi K3</option>
+      </select>
+
+      <label for="profile">KV / 状态布局</label>
+      <select id="profile"></select>
+      <p id="profileNote" class="hint"></p>
+
+      <label for="byteMode">容量与 KV 加载字节口径</label>
+      <select id="byteMode">
+        <option value="payload">当前 profile 载荷</option>
+        <option value="engine-pages">vLLM engine pages</option>
+      </select>
+
+      <div id="mtpWrap" class="checkrow" hidden>
+        <input id="includeMtp" type="checkbox" />
+        <label for="includeMtp">计入可选 MTP 状态</label>
+      </div>
+
+      <label for="context">既有上下文 token</label>
+      <input id="context" type="number" min="1" step="1" value="1048576" />
+
+      <div class="row2">
+        <div>
+          <label for="hitLow">场景 A 命中率 %</label>
+          <input id="hitLow" type="number" min="0" max="100" step="0.1" value="90" />
+        </div>
+        <div>
+          <label for="hitHigh">场景 B 命中率 %</label>
+          <input id="hitHigh" type="number" min="0" max="100" step="0.1" value="95" />
+        </div>
+      </div>
+      <p class="hint">Kimi K3 trace 平均：91.9028%；A/B 仍是容量规划目标。</p>
+
+      <label for="blockTokens">匹配块 token</label>
+      <input id="blockTokens" type="number" min="1" step="1" value="256" />
+
+      <h2>GPU-saturated</h2>
+      <label for="gpus">Prefill GPU 数</label>
+      <input id="gpus" type="number" min="1" step="1" value="72" />
+
+      <label for="uniqueTps">有效 unique token/s/GPU</label>
+      <input id="uniqueTps" type="number" min="0" step="100" value="10000" />
+
+      <h2>Pool 工作集</h2>
+      <label for="activeSessions">活跃 session / prefix 数</label>
+      <input id="activeSessions" type="number" min="0" step="1" value="1" />
+      <p class="hint">默认 1 是 per-prefix 归一化，不是 trace 实测并发。</p>
+
+      <div class="checkrow">
+        <input id="includeRetainedWrites" type="checkbox" />
+        <label for="includeRetainedWrites">额外计入 retention 窗口内的新写入</label>
+      </div>
+
+      <div id="retainedWriteWrap" hidden>
+        <label for="retentionMinutes">新版本保留时间（分钟）</label>
+        <input id="retentionMinutes" type="number" min="0" step="1" value="10" />
+
+        <label for="admissionFraction">Pool 写入比例 a</label>
+        <input id="admissionFraction" type="number" min="0" max="1" step="0.05" value="1" />
+      </div>
+
+      <label for="remoteFraction">CMX 远程读比例 q</label>
+      <input id="remoteFraction" type="number" min="0" max="1" step="0.05" value="1" />
+
+      <label for="usableFraction">usable / raw %</label>
+      <input id="usableFraction" type="number" min="0.1" max="100" step="0.1" value="80" />
+
+      <label for="poolCopies">Pool representation 副本数</label>
+      <input id="poolCopies" type="number" min="1" step="1" value="1" />
+
+      <h2>Trace 图</h2>
+      <label for="chartKind">模型指标</label>
+      <select id="chartKind">
+        <option value="total">总 token</option>
+        <option value="hit">Cache hit</option>
+        <option value="peak">最大小时 token</option>
+      </select>
+    </aside>
+
+    <main>
+      <div class="stats" id="stats" aria-live="polite"></div>
+
+      <section class="panel" aria-labelledby="formulaHeading">
+        <h2 id="formulaHeading">当前对比</h2>
+        <pre class="formula" id="formula"></pre>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="scenarioHeading">
+        <h2 id="scenarioHeading">场景 A / B</h2>
+        <table>
+          <caption>GPU 持续跑满；带宽只包含 Prefill 侧 Pool KV load。</caption>
+          <thead>
+            <tr>
+              <th scope="col">场景</th>
+              <th scope="col">命中</th>
+              <th scope="col">M / U token</th>
+              <th scope="col">compute req/s</th>
+              <th scope="col">KV load / request</th>
+              <th scope="col">KV load bandwidth</th>
+              <th scope="col">Hot prefix</th>
+              <th scope="col">Raw 容量</th>
+            </tr>
+          </thead>
+          <tbody id="scenarioRows"></tbody>
+        </table>
+      </section>
+
+      <section class="panel" aria-labelledby="traceHeading">
+        <h2 id="traceHeading">Trace 范围</h2>
+        <ul class="notes">
+          <li>2026-07-20 16:03 至 2026-08-14 10:46（UTC+8）；单用户、553 events、8 models。</li>
+          <li>731.04M total token；726.43M prompt；670.45M cache read；55.98M miss/write。</li>
+          <li>96 个活跃小时：token/h p50 4.11M、p95 20.95M、峰值 60.30M。</li>
+          <li>Kimi K3：平均 hit 91.9028%；峰值小时 21.332M total、20.132M cache-read token，5 个 usage events。</li>
+          <li>296 条有数值 Cost，共 $502.65；243 条为 “-”，14 条为 “Free”，不能把 $502.65 当完整经济价值。</li>
+          <li>逐行 Total Tokens 与四个 token 分项求和完全一致；原始 CSV 与用户标识不入仓。</li>
+        </ul>
+      </section>
+
+      <section class="panel" aria-labelledby="chartHeading">
+        <h2 id="chartHeading">按模型的匿名用量</h2>
+        <div class="chart-wrap">
+          <svg
+            class="chart"
+            id="chart"
+            viewBox="0 0 900 360"
+            role="img"
+            aria-labelledby="usageChartTitle usageChartDesc"
+          ></svg>
+        </div>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="modelTableHeading">
+        <h2 id="modelTableHeading">匿名分模型汇总</h2>
+        <table>
+          <caption>Input / Output 是每个 Cursor usage event 的聚合 token，不是单次模型 API 调用。</caption>
+          <thead>
+            <tr>
+              <th scope="col">模型</th>
+              <th scope="col">Events</th>
+              <th scope="col">Total</th>
+              <th scope="col">Hit</th>
+              <th scope="col">Input p50</th>
+              <th scope="col">Input p95</th>
+              <th scope="col">Output p50</th>
+              <th scope="col">Output p95</th>
+              <th scope="col">Peak token/h</th>
+              <th scope="col">数值 Cost</th>
+            </tr>
+          </thead>
+          <tbody id="modelRows"></tbody>
+        </table>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="peakHeading">
+        <h2 id="peakHeading">单用户最高 token 小时</h2>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">小时（UTC+8）</th>
+              <th scope="col">Events</th>
+              <th scope="col">Prompt</th>
+              <th scope="col">Cache read</th>
+              <th scope="col">Output</th>
+              <th scope="col">Total</th>
+              <th scope="col">数值 Cost</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>2026-08-13 17:00</td><td>5</td><td>60.05M</td><td>56.66M</td><td>254.2K</td><td>60.30M</td><td>$66.58</td></tr>
+            <tr><td>2026-08-13 16:00</td><td>13</td><td>44.80M</td><td>41.12M</td><td>287.4K</td><td>45.09M</td><td>$47.25</td></tr>
+            <tr><td>2026-07-30 15:00</td><td>11</td><td>27.03M</td><td>24.71M</td><td>181.5K</td><td>27.21M</td><td>$27.83</td></tr>
+            <tr><td>2026-07-27 16:00</td><td>27</td><td>24.77M</td><td>23.78M</td><td>135.5K</td><td>24.90M</td><td>未标价</td></tr>
+            <tr><td>2026-08-05 15:00</td><td>5</td><td>21.22M</td><td>20.13M</td><td>116.7K</td><td>21.33M</td><td>$15.53</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="ttlHeading">
+        <h2 id="ttlHeading">Provider cache 留存：官方合同与实测</h2>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col">Provider</th>
+              <th scope="col">官方口径</th>
+              <th scope="col">mempko 100K-prefix 实测</th>
+              <th scope="col">规划语义</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Anthropic</td>
+              <td>默认 5m；可选 1h</td>
+              <td>5–6m 断崖</td>
+              <td>5m 是合同；4m keepalive 是该实验策略</td>
+            </tr>
+            <tr>
+              <td>OpenAI</td>
+              <td>旧模型 in-memory 通常 5–10m、最长 1h；另有 extended / 新模型策略</td>
+              <td>GPT-5.1：20m 约半数，30m 全冷</td>
+              <td>特定模型/时点观测，不能概括当前全部 GPT</td>
+            </tr>
+            <tr>
+              <td>DeepSeek</td>
+              <td>Best-effort；官方称闲置后通常数小时至数天清理</td>
+              <td>V3.2 在 10m 全冷</td>
+              <td>相互冲突；只能记路径实测，不能写成 10m TTL</td>
+            </tr>
+            <tr>
+              <td>Google Gemini</td>
+              <td>Implicit 无 TTL 保证；explicit 默认 1h</td>
+              <td>33%–83% 随机波动</td>
+              <td>实验针对 implicit，不能外推 explicit cache</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <section class="panel" aria-labelledby="quotaHeading">
+        <h2 id="quotaHeading">100 GB File Library ≠ KV quota</h2>
+        <p>
+          OpenAI Help Center 当前写明 ChatGPT Pro 用户有 100 GB File Library storage。
+          该额度用于上传和生成文件，不是 prompt cache、KV cache、GPU-local cache 或 CMX quota，不用于 KV sizing。
+        </p>
+      </section>
+
+      <footer>
+        Trace：用户提供的 Cursor team usage CSV（2026-08-14 导出，匿名聚合）。
+        TTL：mempko / arXiv:2607.19214，并以 Anthropic、OpenAI、DeepSeek、Google 官方文档交叉核对。
+        100 GB：OpenAI Help Center “File storage and Library in ChatGPT”。
+        证据与限制见 <a href="docs/research/agentic-cache-workload.md">agentic-cache-workload.md</a>。
+      </footer>
+    </main>
+  </div>
+
+  <script src="sim.js?v=9"></script>
+  <script>
+    "use strict";
+
+    const S = window.CmxSim;
+    const $ = (id) => document.getElementById(id);
+    const traceModels = [
+      ["Composer 2.5 Fast", 4, 9.223, 93.91, 1335156, 5255843, 11416, 16165, 5.949, 0],
+      ["Grok 4.5 High Fast", 253, 209.077, 95.02, 445879, 2624487, 1860, 18575, 18.877, 73.65],
+      ["Grok 4.6 XHigh", 18, 25.177, 93.69, 1392691, 2902934, 11366, 38473, 13.756, 0],
+      ["GPT-5.5 Medium", 85, 93.311, 87.34, 585549, 3687522, 2647, 22681, 26.474, 67.28],
+      ["GPT-5.6 Sol Max", 14, 104.705, 92.71, 6193823, 19033712, 38207, 67197, 60.302, 124.20],
+      ["GPT-5.6 Sol Medium", 11, 6.205, 80.94, 84867, 1829133, 1934, 7581, 2.307, 10.76],
+      ["GPT-5.6 Terra Medium", 4, 3.752, 86.41, 803787, 1389568, 6788, 7694, 1.620, 0],
+      ["Kimi K3 Max", 164, 279.593, 91.90, 584848, 7817654, 5591, 50207, 21.332, 226.76],
+    ];
+
+    function finiteNumber(id, fallback) {
+      const value = Number($(id).value);
+      return Number.isFinite(value) ? value : fallback;
+    }
+
+    function fmtDelta(value) {
+      if (value == null || Number.isNaN(value)) return "N/A";
+      if (!Number.isFinite(value)) return "∞";
+      const sign = value > 0 ? "+" : "";
+      return `${sign}${(value * 100).toFixed(2)}%`;
+    }
+
+    function fmtTokens(value) {
+      if (value >= 1e6) return `${(value / 1e6).toFixed(2)}M`;
+      if (value >= 1e3) return `${(value / 1e3).toFixed(1)}K`;
+      return value.toFixed(0);
+    }
+
+    function stat(label, value, detail, cls = "") {
+      return `<div class="stat ${cls}"><div class="k">${label}</div><div class="v">${value}</div><div class="s">${detail}</div></div>`;
+    }
+
+    function syncProfiles() {
+      const modelId = $("model").value;
+      const previous = $("profile").value;
+      const profiles = S.profileOptions(modelId);
+      $("profile").innerHTML = profiles
+        .map((profile) => `<option value="${profile.id}">${profile.label}</option>`)
+        .join("");
+      if (profiles.some((profile) => profile.id === previous)) {
+        $("profile").value = previous;
+      }
+      const hasMtp = Boolean(S.MODELS[modelId].hasMtp);
+      $("mtpWrap").hidden = !hasMtp;
+      if (!hasMtp) $("includeMtp").checked = false;
+    }
+
+    function syncConditionalInputs() {
+      $("retainedWriteWrap").hidden = !$("includeRetainedWrites").checked;
+    }
+
+    function scenarioRow(label, hitRate, row) {
+      const prefill = row.prefill;
+      return `<tr>
+        <td>${label}</td>
+        <td>${(hitRate * 100).toFixed(1)}%</td>
+        <td>${fmtTokens(prefill.matchedTokens)} / ${fmtTokens(prefill.uniqueTokens)}</td>
+        <td>${S.fmtRate(prefill.offeredReqsPool)}</td>
+        <td>${S.fmtGiB(prefill.readPerRequest)}</td>
+        <td>${S.fmtGBs(prefill.requiredRead)}</td>
+        <td>${S.fmtCapacity(row.hotPrefixBytes)}</td>
+        <td>${S.fmtCapacity(row.rawStorageBytes)}</td>
+      </tr>`;
+    }
+
+    function drawChart(kind) {
+      const svg = $("chart");
+      const metric = kind === "hit" ? 3 : kind === "peak" ? 8 : 2;
+      const unit = kind === "hit" ? "%" : "M token";
+      const title = kind === "hit"
+        ? "各模型 token-weighted cache hit"
+        : kind === "peak"
+          ? "各模型单用户最大小时 token"
+          : "各模型总 token";
+      const values = traceModels.map((row) => row[metric]);
+      const max = Math.max(...values) * 1.08 || 1;
+      const width = 900;
+      const height = 360;
+      const left = 190;
+      const right = 55;
+      const top = 32;
+      const rowHeight = 38;
+      const plotWidth = width - left - right;
+      const bars = traceModels.map((row, index) => {
+        const value = row[metric];
+        const y = top + index * rowHeight;
+        const barWidth = (value / max) * plotWidth;
+        return `
+          <text x="${left - 10}" y="${y + 17}" fill="#9a917f" text-anchor="end" font-size="11">${row[0]}</text>
+          <rect x="${left}" y="${y + 4}" width="${barWidth}" height="18" fill="#4aa3d9" />
+          <text x="${left + barWidth + 6}" y="${y + 17}" fill="#ece6d8" font-size="11">${value.toFixed(2)}${unit === "%" ? "%" : "M"}</text>`;
+      }).join("");
+      svg.innerHTML = `
+        <title id="usageChartTitle">${title}</title>
+        <desc id="usageChartDesc">横轴为 ${unit}，纵轴为 Cursor 模型；来源为匿名 Cursor team usage 汇总。</desc>
+        <text x="${left + plotWidth / 2}" y="${height - 8}" fill="#9a917f" text-anchor="middle" font-size="11">${unit}</text>
+        ${bars}`;
+    }
+
+    function render() {
+      syncConditionalInputs();
+      const hitLow = finiteNumber("hitLow", 0) / 100;
+      const hitHigh = finiteNumber("hitHigh", 0) / 100;
+      const scenario = S.hitComparisonScenario({
+        modelId: $("model").value,
+        profileId: $("profile").value,
+        byteMode: $("byteMode").value,
+        includeMtp: $("includeMtp").checked,
+        compressorPolicy: "base",
+        contextTokens: finiteNumber("context", 0),
+        extraTokens: 0,
+        blockTokens: finiteNumber("blockTokens", 1),
+        remoteFraction: finiteNumber("remoteFraction", 0),
+        admissionFraction: finiteNumber("admissionFraction", 0),
+        writeState: true,
+        gpus: finiteNumber("gpus", 1),
+        uniqueTpsGpu: finiteNumber("uniqueTps", 0),
+        hitRateLow: hitLow,
+        hitRateHigh: hitHigh,
+        activeSessions: finiteNumber("activeSessions", 0),
+        retentionSeconds: finiteNumber("retentionMinutes", 0) * 60,
+        includeRetainedWrites: $("includeRetainedWrites").checked,
+        poolCopies: finiteNumber("poolCopies", 1),
+        usableFraction: finiteNumber("usableFraction", 0) / 100,
+      });
+      const storageClass =
+        scenario.storageCostIncrease == null || scenario.computeReqIncrease == null
+          ? ""
+          : scenario.storageCostIncrease <= scenario.computeReqIncrease
+            ? "ok"
+            : "bad";
+      $("stats").innerHTML = [
+        stat("Raw 容量成本增幅", fmtDelta(scenario.storageCostIncrease), "假设介质单价与副本策略不变", storageClass),
+        stat("Compute req/s 增幅", fmtDelta(scenario.computeReqIncrease), "GPU 持续跑满；不是链路实测", "hot"),
+        stat("KV 加载带宽增幅", fmtDelta(scenario.readIncrease), "只含 Prefill 侧 Pool read"),
+        stat("Kimi 实测平均 hit", "91.90%", "Cursor usage trace；不是工作集曲线"),
+      ].join("");
+
+      $("scenarioRows").innerHTML =
+        scenarioRow("A", hitLow, scenario.low) +
+        scenarioRow("B", hitHigh, scenario.high);
+
+      const profile = scenario.low.prefill.profile;
+      $("profileNote").textContent =
+        `${profile.note} byte class=${profile.byteClass}；confidence=${profile.confidence}。`;
+      $("formula").textContent =
+`M = floor(C × hit / block) × block
+U = C − M + E
+compute_req/s = GPUs × unique_token/s/GPU ÷ U
+
+hot_prefix = active_sessions × selected_representation(M)
+retained_writes = ${scenario.includeRetainedWrites
+  ? "compute_req/s × retention × write_bytes/request"
+  : "0（默认关闭）"}
+raw_storage = pool_copies × (hot_prefix + retained_writes) ÷ usable_fraction
+
+A: M=${scenario.low.prefill.matchedTokens}, U=${scenario.low.prefill.uniqueTokens}, req/s=${S.fmtRate(scenario.low.prefill.offeredReqsPool)}
+   raw=${S.fmtCapacity(scenario.low.rawStorageBytes)}, KV load=${S.fmtGBs(scenario.low.prefill.requiredRead)}
+B: M=${scenario.high.prefill.matchedTokens}, U=${scenario.high.prefill.uniqueTokens}, req/s=${S.fmtRate(scenario.high.prefill.offeredReqsPool)}
+   raw=${S.fmtCapacity(scenario.high.rawStorageBytes)}, KV load=${S.fmtGBs(scenario.high.prefill.requiredRead)}
+
+容量成本 ${fmtDelta(scenario.storageCostIncrease)}
+compute req/s ${fmtDelta(scenario.computeReqIncrease)}
+
+假设：每个活跃 session 保留一份命中前缀；active session 数不是 trace 实测。
+若 KV load 超出真实 Pool 读取能力，GPU-saturated 假设不成立。`;
+      drawChart($("chartKind").value);
+    }
+
+    $("modelRows").innerHTML = traceModels.map((row) => `
+      <tr>
+        <td>${row[0]}</td><td>${row[1]}</td><td>${row[2].toFixed(2)}M</td>
+        <td>${row[3].toFixed(2)}%</td><td>${fmtTokens(row[4])}</td>
+        <td>${fmtTokens(row[5])}</td><td>${fmtTokens(row[6])}</td>
+        <td>${fmtTokens(row[7])}</td><td>${row[8].toFixed(2)}M</td>
+        <td>${row[9] ? `$${row[9].toFixed(2)}` : "未标价"}</td>
+      </tr>`).join("");
+
+    $("model").addEventListener("change", () => {
+      syncProfiles();
+      render();
+    });
+    [
+      "profile", "byteMode", "includeMtp", "context", "hitLow", "hitHigh",
+      "blockTokens", "gpus", "uniqueTps", "activeSessions", "retentionMinutes",
+      "includeRetainedWrites", "remoteFraction", "admissionFraction",
+      "usableFraction", "poolCopies",
+      "chartKind",
+    ].forEach((id) => {
+      $(id).addEventListener("input", render);
+      $(id).addEventListener("change", render);
+    });
+    syncProfiles();
+    $("profile").value = S.AGENTIC_PRESETS.kimiK3SingleUserPeak.profileId;
+    syncConditionalInputs();
+    render();
+  </script>
+</body>
+</html>
