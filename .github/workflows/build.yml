@@ -1,5 +1,6 @@
 # 三语言空壳编译/生成验证(见 PR #17 review follow-up:加 CI 防 drift)。
-# Rust workspace 编译(tonic 在线生成 stub);Go module 编译;Python stub + worker 包 import。
+# 门禁与 .gitlab-ci.yml 对齐：docs-check 每条流水线都跑；rust/go/python/stub-drift
+# 仅代码路径变化时跑；cmx-sim-check 仅 tools/cmx-sim 变化时跑。
 name: build
 
 on:
@@ -9,7 +10,73 @@ on:
     branches: [main]
 
 jobs:
+  filter:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+      cmx: ${{ steps.filter.outputs.cmx }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+      - id: filter
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_EVENT_NAME}" = "pull_request" ]; then
+            git fetch --no-tags origin "${{ github.base_ref }}"
+            RANGE="origin/${{ github.base_ref }}...HEAD"
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ -z "$BEFORE" ] || [[ "$BEFORE" =~ ^0+$ ]]; then
+              echo "code=true" >> "$GITHUB_OUTPUT"
+              echo "cmx=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            RANGE="${BEFORE}...HEAD"
+          fi
+          files="$(git diff --name-only "$RANGE" || true)"
+          echo "$files"
+          code=false
+          cmx=false
+          if echo "$files" | grep -qE '^(rust|go|python|proto|scripts|deploy|bench)/|^\.github/workflows/build\.yml'; then
+            code=true
+          fi
+          if echo "$files" | grep -qE '^tools/cmx-sim/'; then
+            cmx=true
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "cmx=$cmx" >> "$GITHUB_OUTPUT"
+
+  # 文档门禁:每条流水线都跑——纯文档 PR 的唯一必跑任务。
+  docs-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/check_doc_links.py
+
+  cmx-sim-check:
+    needs: filter
+    if: needs.filter.outputs.cmx == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node tools/cmx-sim/verify.js
+      - run: node tools/cmx-sim/verify-measured.js
+
   rust:
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -42,6 +109,8 @@ jobs:
       - run: cargo test --workspace
 
   go:
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -60,6 +129,8 @@ jobs:
       - run: go test ./...
 
   python:
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -87,7 +158,12 @@ jobs:
   # 拦「proto 改了没重生成 stub」与「工具版本漂移致生成物变」(见 PR #17 review #4)。
   # 插件版本钉到 gen_stubs.sh 头注释一致;protoc 用 apt,靠 git diff 检测输出一致性。
   stub-drift:
+    needs: filter
+    if: needs.filter.outputs.code == 'true'
     runs-on: ubuntu-latest
+    env:
+      # protoc-gen-go v1.36.11 需 go>=1.23;go.mod 仍是 1.22,与 GitLab GOTOOLCHAIN: auto 对齐。
+      GOTOOLCHAIN: auto
     steps:
       - uses: actions/checkout@v4
       - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler

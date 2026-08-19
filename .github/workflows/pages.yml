@@ -1,0 +1,54 @@
+# 对齐 .gitlab-ci.yml 的 pages job：把 tools/cmx-sim 拷到站点根并发布。
+# GitHub 项目站走 gh-pages 分支（当前已在 https://5x8-40.github.io/lake/ 生效），
+# 由本 workflow 在 main 上更新，不另做本地发布脚本。
+name: pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  pages:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assemble site
+        run: |
+          mkdir -p public/docs/research
+          cp tools/cmx-sim/index.html public/index.html
+          cp tools/cmx-sim/capacity.html public/capacity.html
+          cp tools/cmx-sim/economics.html public/economics.html
+          cp tools/cmx-sim/measured.html public/measured.html
+          cp tools/cmx-sim/app.css public/app.css
+          cp tools/cmx-sim/sim.js public/sim.js
+          cp tools/cmx-sim/measured.js public/measured.js
+          cp tools/cmx-sim/README.md public/README.md
+          cp docs/research/nvidia-cmx.md public/docs/research/nvidia-cmx.md
+          cp docs/research/agentic-cache-workload.md public/docs/research/agentic-cache-workload.md
+          cp docs/research/references.md public/docs/research/references.md
+          # 仓库内 ../../docs/research 在 /tools/cmx-sim/ 与 GitLab 根域名都能解析；
+          # GitHub 项目站在 /lake/ 下，多一层 ../ 会跳出站点，部署时改成站点相对路径。
+          sed -i 's|href="../../docs/research/|href="docs/research/|g' public/*.html
+          sed -i 's|](../../docs/research/|](docs/research/|g' public/README.md
+          touch public/.nojekyll
+      - name: Publish gh-pages
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd public
+          git init
+          git checkout -b gh-pages
+          git add -A
+          git -c user.name='github-actions[bot]' \
+              -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+              -c commit.gpgsign=false \
+              commit -m "docs: 发布 CMX 计算器静态页"
+          git push -f "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" gh-pages
