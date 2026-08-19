@@ -7,6 +7,7 @@ stages:
   - build
   - verify
   - smoke
+  - deploy
 
 # 只创建 main push 与 MR 的流水线;其余分支 push 不跑 CI。
 workflow:
@@ -129,6 +130,16 @@ docs-check:
   script:
     - python scripts/check_doc_links.py
 
+cmx-sim-check:
+  stage: build
+  image: node:22-alpine
+  rules:
+    - changes:
+        - tools/cmx-sim/**/*
+  script:
+    - node tools/cmx-sim/verify.js
+    - node tools/cmx-sim/verify-measured.js
+
 # ---------- verify / smoke (p3.yml) ----------
 
 # P3 编译门禁(不含起全栈冒烟)。rust:1.96.1 自带 rust,apt 装 python3,Go 用官方二进制。
@@ -185,3 +196,36 @@ smoke:
     - pkill -f lake-kv-pool 2>/dev/null || true
     - pkill -f lake-storage-agent 2>/dev/null || true
     - pkill -f lake-router 2>/dev/null || true
+
+# ---------- GitLab Pages ----------
+
+# GitLab Free 只支持一个 Pages deployment。MR !7 先发布当前静态分析页；
+# 合并后 main pipeline 会覆盖为主分支版本。Pages access 继续沿用项目的
+# private 设置，不在 CI 中改变可见性。
+pages:
+  stage: deploy
+  image: alpine:3.21
+  needs: []
+  script:
+    - mkdir -p public/docs/research
+    - cp tools/cmx-sim/index.html public/index.html
+    - cp tools/cmx-sim/capacity.html public/capacity.html
+    - cp tools/cmx-sim/economics.html public/economics.html
+    - cp tools/cmx-sim/measured.html public/measured.html
+    - cp tools/cmx-sim/app.css public/app.css
+    - cp tools/cmx-sim/sim.js public/sim.js
+    - cp tools/cmx-sim/measured.js public/measured.js
+    - cp tools/cmx-sim/README.md public/README.md
+    - cp docs/research/nvidia-cmx.md public/docs/research/nvidia-cmx.md
+    - cp docs/research/agentic-cache-workload.md public/docs/research/agentic-cache-workload.md
+    - cp docs/research/references.md public/docs/research/references.md
+  pages:
+    publish: public
+  environment:
+    name: GitLab Pages
+    url: $CI_PAGES_URL
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+      when: always
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event" && $CI_MERGE_REQUEST_IID == "7"'
+      when: always
