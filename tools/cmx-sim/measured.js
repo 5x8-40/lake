@@ -1,8 +1,8 @@
 /**
  * User-provided APC measurements and interpretable regression helpers.
  *
- * Device names were not included in the source comments, so they remain
- * device-a/device-b. N is measured in K tokens, exactly as in the tables.
+ * Devices retain the A/B labels used for these source tables. N is measured
+ * in K tokens, exactly as in the tables.
  */
 (function (root) {
   "use strict";
@@ -470,8 +470,8 @@
       },
       "readGBs"
     );
-    // V4 has a different write representation, so read and write factors
-    // are fitted separately instead of assuming symmetric bytes/token.
+    // The V4 source data, especially device B, have asymmetric read/write
+    // factors. Fit them separately without attributing an unpublished cause.
     var dWrite = fitRelativeScale(
       points,
       function (point) {

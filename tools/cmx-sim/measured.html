@@ -21,7 +21,7 @@
       展示 MR !7 中两组设备数据，并按设备、模型分别拟合 TTFT、KV 量和带宽。
     </p>
     <div class="warn" role="note">
-      原 comment 未写 GPU 型号，因此仅标为设备 A/B。数据由用户提供，未独立复测；拟合不是 CMX benchmark 或硬件 SLA。
+      设备沿用 A/B 标识；每个设备、模型独立拟合，具体异常和误差见 README。
     </div>
   </header>
 
@@ -84,10 +84,10 @@
         <ul class="notes">
           <li><code>N</code> 使用原表的 K-token 单位，不是 token 原值。</li>
           <li>TTFT 使用相对误差加权拟合，避免 1M 序列完全支配短序列。</li>
-          <li>V4 的读写 representation 不对称，读、写带宽系数分别拟合。</li>
+          <li>V4 实测读写系数不对称；原因未公开，读、写带宽分别拟合。</li>
           <li>表中 TB 沿用原 comment 的 <code>GB/s × 3600 / 1024</code> 换算。</li>
           <li>Qwen3-235B 无 Cache TTFT/TPS 只展示原值，不进入任何拟合。</li>
-          <li>设备型号、测试方法、并发细节和误差条带未知，禁止将曲线外推为 SLA。</li>
+          <li>拟合只覆盖表中的 hit 与序列长度范围；具体残差见 README。</li>
         </ul>
       </section>
 
@@ -356,7 +356,7 @@ k 使用过原点最小二乘；d_read/d_write 分别最小化相对带宽误差
         return `<tr>${hitCell}<th scope="row">${coordinate[1]}</th>${cells}</tr>`;
       }).join("");
       return `<table>
-        <caption>${device.label} · <a href="${device.sourceUrl}">MR comment ${device.noteId}</a> · GPU 型号未提供</caption>
+        <caption>${device.label} · <a href="${device.sourceUrl}">MR comment ${device.noteId}</a></caption>
         <thead>
           <tr>
             <th scope="col" rowspan="2">APC hit</th>
