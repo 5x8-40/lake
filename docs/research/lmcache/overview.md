@@ -108,4 +108,4 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 | KV 归属 | 实例(rank)私有 + 可共享:`kv_rank` 入 key,同 chunk 不同 rank 是不同对象 | KV 不绑定 rank |
 | 存算分离程度 | 部分:MP 模式 cache daemon 与引擎分离,但 KV 仍按引擎的 rank/格式组织 | 格式无关的 KV 抽象 |
 
-**本质**:LMCache 是"KV cache 的缓存层 + 跨实例协调器",仍依附推理引擎的 KV 切分与格式;不是"以 KV 为一等公民的存算分离存储系统"。详见 [3rdparty-reference.md](../3rdparty-reference.md)。与 Dynamo G1 句柄、HiCache、vLLM `kv_offload` 的卸载对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
+**本质**:LMCache 是"KV cache 的缓存层 + 跨实例协调器",仍依附推理引擎的 KV 切分与格式;不是"以 KV 为一等公民的存算分离存储系统"。详见 [3rdparty-reference.md](../3rdparty-reference.md)。卸载路径对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。

@@ -144,7 +144,7 @@ vLLM 是本系统**计算层(Python + Triton)**的直接参考。SGLang/LMCache/
 
 ## 5. Dynamo → 我们的编排层 / 控制面 / KVBM 分层
 
-源码入口:`3rdparty/dynamo/lib/`(Rust 核心)、`components/`、`lib/runtime/`。Dynamo 是 NVIDIA 的"推理引擎之上的编排层",把 vLLM/SGLang/TRT-LLM 作为可插拔 worker 协调成多节点系统。**Rust 写核心性能路径 + 控制面**,是 lake 三语言分层(Rust 存储/Go 控制/Python 计算)中 Rust 控制面/编排的直接参照系。深度分析见 [`dynamo/overview.md`](dynamo/overview.md)。HBM/G1 句柄、event 选路与各家卸载对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
+源码入口:`3rdparty/dynamo/lib/`(Rust 核心)、`components/`、`lib/runtime/`。Dynamo 是 NVIDIA 的"推理引擎之上的编排层",把 vLLM/SGLang/TRT-LLM 作为可插拔 worker 协调成多节点系统。**Rust 写核心性能路径 + 控制面**,是 lake 三语言分层(Rust 存储/Go 控制/Python 计算)中 Rust 控制面/编排的直接参照系。深度分析见 [`dynamo/overview.md`](dynamo/overview.md)。卸载路径对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 
 ### 借鉴点
 

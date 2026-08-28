@@ -88,7 +88,7 @@ PD 分离为"独立可伸缩的 GPU 池",三后端(vLLM/SGLang/TRT-LLM)都支持
 
 ## 关键差异(lake 更彻底)
 
-G1/HBM、KV event 与本机 G2/G3 的职责拆分（G1 是外拥句柄、Router 不靠 NIXL 注册感知命中）见 [`../hbm-tier-and-offload.md`](../hbm-tier-and-offload.md)。
+G1、KV event 与本机 G2/G3 的分工见 [`../hbm-tier-and-offload.md`](../hbm-tier-and-offload.md)。
 
 - **存算分离彻底度**:Dynamo 的 KV 仍由 engine(vLLM/SGLang)持有,KVBM 是"offload 层"(把 engine 的 KV 卸到 CPU/SSD/远端);G1 无 `BlockManager`。lake **HBM 归池、worker 不拥有任何内存**,KVBM 式 offload 在 lake 是池的统一放置(方案 Z),非引擎私有缓存的延伸。
 - **控制面一致性**:Dynamo KV 事件走 NATS(best-effort 事件流)、discovery 多后端,无全局强一致位置视图;lake 位置视图进 etcd 强一致,Router 一跳命中(比 LMCache/Mooncake 都强,见 [`../architecture/consistency.md`](../../architecture/consistency.md) §1 参考对照)。Dynamo 更偏"事件流编排",lake 更偏"强一致权威 + 镜像"。
