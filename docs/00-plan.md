@@ -80,7 +80,7 @@ P7  性能建模与验证   → 量化各假设，回填设计
   - **Router 命中视图访问(B3 闭环)**：Router 持**本地命中视图镜像**(全局位置视图的本地副本,与 in-process agent 同机制),模式选择 = 本地读镜像 + 本地纯函数决策,**零 RPC**,守 5ms。镜像内容是全局的(本地命中判定需知"哪个节点 HBM 有"),副本存本地。刷新由控制面**推送**(gRPC stream 主方案,同机走共享内存直读;etcd 只存降频 checkpoint,非推送源),触发=位置视图权威变更(放置/驱逐覆写/迁移/满块注册);ref 归 0 不推(未驱逐不摘视图)。陈旧由 miss→控制面确认→从池(L1/L2)回填兜底,只影响命中率不影响正确性。统一了 overview/scheduling/data-flow 里"Router 查池/一次 RPC"的措辞。详见 [`architecture/scheduling.md`](architecture/scheduling.md) §1 前缀解析。
   - **选路形态倾向 External 式(本轮固化)**：KV 感知下选路权威收束到 Router 一层(逻辑单一选路面,实例可水平扩展);计算节点按部署独立或 TP/PP 联合执行,**默认不在引擎内做 Internal/Hybrid 式二次 DP LB**。对齐 vLLM External + 强化 SGLang 层 B(`sgl-model-gateway`/`cache_aware`)方向,用存储池命中视图替换近似树;拒绝 SGLang 层 A(`DataParallelController`)与 vLLM head `DPLBAsyncMPClient` 作第二权威。详见 [`architecture/scheduling.md`](architecture/scheduling.md) §1.1、[`research/sglang/model-runner.md`](research/sglang/model-runner.md)「SGLang 双层管理模式」。
   - **计算引擎结构(本轮固化)**：Python 计算层对齐 vLLM Model Runner V2 目录形态 + 薄 `model_runner.py`;节点调度落 `lake.runtime.node_scheduler`;`lake.engine` 取代 prefill/decode/draft 三包,执行形态由角色配置 + `SchedulerOutput` 选择。**DP step 信息同步(token 数/mode/IDLE)落 Scheduler**,不进 ModelRunner。**Host `Req` 权威完全在 `node_scheduler`**(引擎无长期 RequestState);**默认启用 overlap**;请求结束 → `agent.on_request_finished`(引擎不 free KV)。详见 [`architecture/compute-layer.md`](architecture/compute-layer.md)「计算引擎结构」、[`architecture/scheduling.md`](architecture/scheduling.md) §3。
-- **技术选型已定**（P2 落地）：存储 + 存储控制面 Rust / 请求控制面 Go / 计算 Python+Triton；元数据 etcd；SSOT 用 S3/MinIO；跨语言 gRPC+Protobuf（大块 KV 走 RDMA 旁路）。3rdparty 五个 submodule（sglang/lmcache/mooncake/vllm/dynamo）作实现参考。
+- **技术选型已定**（P2 落地）：存储 + 存储控制面 Rust / 请求控制面 Go / 计算 Python+Triton；元数据 etcd；SSOT 用 S3/MinIO；跨语言 gRPC+Protobuf（大块 KV 走 RDMA 旁路）。3rdparty submodule（sglang/lmcache/mooncake/vllm/dynamo 等）作实现参考。
 - **KV 类型 t-type / r-type + 投机解码机制（本轮新增）**：
   - **KV 类型**：按 HBM 存储形态分 t-type(逐 token 完整 KV,paged block,full attention/MLA)与 r-type(紧凑表示——窗口最近 W token / Mamba 定长 state,sliding window/Mamba/卷积)。**两类复用条件一致**:都需命中全部前缀才能复用;区别**仅在 HBM(L0)存储形态**,目的是降低 r-type 的 HBM 占用。HBM 两类并存、分 arena 管理(r-type 另设固定状态 arena 入图);L1–L3 统一按 block(128 token)组织(两类复用条件一致、不区分类型),r-type 落下层在 block 边界 checkpoint 紧凑状态(trailing pages / state 快照)——相对 SGLang multi-pool 物理分池,我们把类型差异收敛到 L0 存储形态 + block 内布局,而非物理分池。详见 [`architecture/storage-layer.md`](architecture/storage-layer.md) "KV 类型"节、[`architecture/kv-cache-pool.md`](architecture/kv-cache-pool.md) "t-type / r-type"。
   - **block 粒度 128 token**：缓存命中/复用/传输/写回最小单位(P7.3 已校准:有效复用率 94.6%,优于 256 的 89.2%;维持 128)。
@@ -219,7 +219,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 
 ## P4 — KV Pool 原型（Rust）(done 2026-07-30)
 
-> 实现参考:`3rdparty/` 五个 submodule 逐层对应见 [`research/3rdparty-reference.md`](research/3rdparty-reference.md)。  
+> 实现参考:`3rdparty/` submodule 逐层对应见 [`research/3rdparty-reference.md`](research/3rdparty-reference.md)。  
 > **代码级复用（两模块正交）**：  
 > - **A** Mooncake transfer-engine → `rust/transfer`（字节搬迁；P4 抄设计 + TCP，真 RDMA 推后）  
 > - **B** Dynamo kvbm-logical → **P4.1** vendor（[PR #21](https://github.com/chengda-wu/lake/pull/21)）；**P4.2** 起 `lake-controlplane` 链依赖 + `BlockRegistry`/`InactiveIndex` 薄驱动（见 #20）  

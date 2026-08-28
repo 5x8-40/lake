@@ -1,7 +1,7 @@
 # HBM 归属与 KV 卸载对照
 
-> 2026-08-28。对照 Dynamo KVBM、LMCache 及其它卸载栈；不改方案 Z。  
-> 相关：[`dynamo/overview.md`](dynamo/overview.md)、[`lmcache/overview.md`](lmcache/overview.md)、[`sglang/hicache.md`](sglang/hicache.md)、[`vllm/overview.md`](vllm/overview.md)、[`ucm/overview.md`](ucm/overview.md)、[`../features/features.md`](../features/features.md) F1–F5。
+> 2026-08-28。对照 Dynamo KVBM、LMCache、FlexKV 及其它卸载栈；不改方案 Z。  
+> 相关：[`dynamo/overview.md`](dynamo/overview.md)、[`lmcache/overview.md`](lmcache/overview.md)、[`flexkv/overview.md`](flexkv/overview.md)、[`sglang/hicache.md`](sglang/hicache.md)、[`vllm/overview.md`](vllm/overview.md)、[`ucm/overview.md`](ucm/overview.md)、[`../features/features.md`](../features/features.md) F1–F5。
 
 ## 1. 前缀位置为什么要合一
 
@@ -67,6 +67,7 @@ Router 不靠 GPU 内存注册判断命中。本机 G2/G3 不靠 Router 做 look
 | SGLang HiCache | 引擎 | L1 实例私有；树节点记 L1/L2 槽 | `write_backup` / `write_back` / write_through | 同一棵 `HiRadixTree` | L3 不记位置，`batch_exists` | 实例 radix；L3 只有 key | L1/L2 丢失；独立 L3 可供新实例 prefetch |
 | LMCache | vLLM | 不作为一层；`register_kv_caches` 提供拷贝基址 | 前向 `save_kv_layer` | chunk key + CPU/disk 后端 | `RegistryTree` 或共享 L2 | 引擎 APC + 顺序 `contains` | 引擎页丢失；daemon / 远程 L2 可保留 |
 | Dynamo KVBM | vLLM | G1 句柄，无 `BlockManager<G1>` | 结束后 delay-free，再 G1→G2 | 本实例 `g2_manager` / `g3_manager` | Device 事件多来自引擎；Host/Disk 来自 KVBM `BlockRegistry` | APC + KVBM hash + Router 索引 | 本机 G1/G2/G3 随实例；G4 可保留；Router 索引可能过期 |
+| FlexKV | vLLM/SGLang/TRT | 注册端点，无 GPU cache engine | 结束后 delay-free，再 D2H | 本实例 CPU/SSD/REMOTE 各一棵 radix | Redis 快照或 Dynamo events（默认 medium=`CPU`）；二者文档互斥 | 引擎 APC + FlexKV 层树 | 本机 GPU/CPU/SSD 随进程；远端/Mooncake store 可保留 |
 | UCM | 引擎 | 不作为一层；dump/load | `UcmKVStoreBaseV1.dump` | store key（多为 vLLM block hash） | 无全局 radix | 引擎 APC + store `lookup` | 引擎页丢失；store 可保留 |
 | Mooncake store | 不参与 | 不解释 HBM | 调用方 put | master exact-key | master | 无 radix | 对象可保留；前缀不在 store |
 | MemCache | 引擎/对接 | HBM/DRAM/SSD 对象池，exact-key | 池 put/get | Meta/Local | MetaService | 无前缀 radix | 池可保留 |
@@ -74,12 +75,13 @@ Router 不靠 GPU 内存注册判断命中。本机 G2/G3 不靠 Router 做 look
 
 - HiCache：L1/L2 在同一棵树上，但树在实例内，L3 位置不在树上。新实例靠探测 L3，没有全局位置视图。
 - vLLM `kv_offload` 也是引擎内降层，没有 Dynamo 那套集群 Router event。`OffloadingConnector` 把它暴露成 connector。
-- LMCache / UCM 是引擎外的 cache 插件，不把 GPU 编进自己的分层。
+- LMCache / UCM / FlexKV 都是引擎旁的卸载插件。FlexKV 自管 CPU/SSD radix，GPU 只 IPC 映射，结束时 delay-free，接近 KVBM G2/G3 而不是 LMCache 的前向 `save_kv_layer`。
+- LMCache / UCM 不把 GPU 编进自己的分层。
 - Mooncake / MemCache 是对象池；前缀和位置由上层处理。lake 用 Mooncake 传输，不用它的 store 做控制面。
 
 ## 7. 对 lake
 
-前缀命中、按 cache 所在 worker 选路、分层卸载，Dynamo / LMCache / HiCache 都能做。P7.6 里本地命中主要来自亲和选路，池侧预放置是补充。这些不能单独用来论证必须把 HBM 划归池。
+前缀命中、按 cache 所在 worker 选路、分层卸载，Dynamo / LMCache / HiCache / FlexKV 都能做。P7.6 里本地命中主要来自亲和选路，池侧预放置是补充。这些不能单独用来论证必须把 HBM 划归池。
 
 lake 文档里的 D-direct 是：前缀已由存储池放到某节点 HBM，位置在控制面元数据中。Dynamo 的 Device overlap 是该 worker 曾经算过、引擎页还在。请求侧可以少传或不传，但不能在请求到达前，把前缀放到一台尚未计算过它的 GPU 上。
 
@@ -102,3 +104,6 @@ HBM 归池对应的是：worker 退出后仍能从 L2 续推；控制面能把 L
 | vLLM 进程内 offload | `vllm/v1/kv_offload/base.py`::`OffloadingManager` / `OffloadKey` |
 | HiCache L1/L2 | `radix_cache.py`::`TreeNode.value` / `host_value`；`hiradix_cache.py`::`write_backup` |
 | UCM dump/load | `ucm/store/ucmstore_v1.py`::`UcmKVStoreBaseV1` |
+| FlexKV delay-free / 无前向 save | `3rdparty/flexkv/flexkv/integration/vllm/vllm_v1_adapter.py`::`request_finished` / `save_kv_layer` |
+| FlexKV GPU 只映射 | `…/storage/storage_engine.py`::`register_gpu_blocks`；`GPUAllocator.from_raw_data` |
+| FlexKV 无 GPU 层树 | `cache/cache_engine.py`::`GlobalCacheEngine` |
