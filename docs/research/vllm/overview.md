@@ -109,6 +109,18 @@ AsyncLLM(引擎入口)
 | `Executor` | `vllm/v1/executor/abstract.py` | worker 编排与 execute_model 派发 |
 | `DefaultModelLoader` | `vllm/model_executor/model_loader/default_loader.py` | 权重加载(safetensors/HF) |
 
+## 分布式模型
+
+> 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md);roadmap 细节见 [kv-session-roadmap.md](kv-session-roadmap.md)。
+
+- **拓扑**:单实例引擎为体,分布式能力靠事件外发 + 外部控制面。引擎内 `Executor` 管 TP/PP(多进程/Ray),但 KV/调度账本(`KVCacheManager`/`BlockPool`/`Scheduler`)全部 per-instance;集群级 KV 视图由外部(Dynamo/llm-d)消费引擎事件后自建。
+- **元数据权威**:引擎进程内强一致(单写者 Scheduler);集群级无权威。这是 vLLM 与存储类项目(Mooncake/MemCache/lake)的根本区别:它不是存储系统,分布式语义由外部补充。
+- **同步机制**:KV Events(`vllm/distributed/kv_events.py`)——`BlockStored`/`BlockRemoved`/`AllBlocksCleared` 经 zmq 发布,`KVEventAggregator` 跨 TP rank 聚合去重,事件带 `ExternalBlockHash`(内容寻址键)+ `medium`(介质标记)+ `group_idx`。为引擎到外部控制面的单向可见性通道,外部 indexer 据此构建集群索引。
+- **一致性**:实例内强一致;集群级最终一致(事件流,丢事件即索引陈旧,引擎侧无回查权威)。`kv_offload` 多层(CPU/FS/Obj)亦为 per-instance 私有级联。
+- **HA 与故障**:worker 有状态(加载的模型 + HBM KV),崩溃丢 KV,靠 connector 外部备份;扩缩容非秒级。
+- **演进方向(#48501,RFC 未落地)**:引擎退化为无策略机制(物化 KV、上报行为、执行无意图指令),控制面 indexer 成为集群内存图,与 lake 的"引擎=执行、池/控制面=权威"拆分同构。
+- **与 lake 对照**:两点参考——① 引擎事件外发(KV Events)是构建集群 KV 视图的最小耦合方式,lake 的 agent 异步上报同形;② 事件流 + 外部索引只能最终一致,lake 的 D-direct 5ms 预算要求保留可同步查询的权威(CP)。
+
 ## 技术栈
 
 - **语言**:Python 主体(~1906 `.py`)。**性能关键路径是 C++/CUDA**:`csrc/`(~231 文件,attention/quantization/moe 核),经 `vllm/_custom_ops.py` 绑定。Triton kernel 散布且较少(`vllm/kernels/triton/` 仅 2 文件,另 LoRA/各模型 `ops/`)——**vLLM 的 attention 不是 Triton,是 C++/CUDA(FlashAttention)为主,Triton 是补充**。这正是本系统选"Python + **Triton**"需注意的差异:本系统倾向 Triton 自定义核,vLLM 倾向 C++/CUDA。

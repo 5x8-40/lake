@@ -44,6 +44,18 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 
 详见 [sharing-and-backends.md](sharing-and-backends.md)。
 
+## 分布式模型
+
+> 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md);细节见 [sharing-and-backends.md](sharing-and-backends.md)。
+
+- **拓扑**:两种并存。(a)共享存储为中心:多实例共用 Redis/Mooncake/S3 等 L2 adapter,`chunk_hash` 内容寻址天然去重,实例间无协调;(b)controller 星型:`LMCacheControllerManager`(中心)+ 每实例 `LMCacheWorker`(代理),ZMQ 通信,维护"谁有哪些 chunk"的元数据(`RegistryTree`:(instance,worker)→location→set[chunk_hash]),仅协调元数据,不在数据路径上。
+- **元数据权威**:中心 controller 全内存 `RegistryTree`,定位为 best-effort 协调器而非权威:心跳 + 序列号追踪(`WorkerNode.seq_tracker`),full sync 完成阈值 0.8、超时 300s。
+- **同步机制**:worker 心跳上报 + 命令通道(lookup/pin/move/clear/compress/health/full_sync);P2P 直传路径(`P2PBackend` 经 NIXL/socket)需 controller 元数据定位对等端。
+- **一致性**:无全局强一致。多实例并发写同 key 无锁/事务;数据层靠内容寻址去重;失效靠 TTL + 显式 clear/evict。`KVController` lookup 在实例增多时退化 O(n²)(源码注释自承认)。
+- **HA 与故障**:MP daemon 模式下引擎崩溃 KV 不丢(无 fate-sharing);controller 本身无 HA,元数据丢失后靠 full sync 重建。
+- **扩展性**:共享存储路径随后端扩展;controller 路径受全内存 `RegistryTree` 与 O(n²) lookup 限制。
+- **与 lake 对照**:LMCache 的 controller+worker 形态最接近 lake 的 CP+agent,但一致性立场不同——LMCache 为 best-effort(允许错误,周期 full sync 收敛),lake CP 为单写者权威(线性一致查询 + 镜像推送 + miss 回查)。此外 LMCache 的 KV 按 rank 入 key(部分实例私有),lake KV 不绑定 rank。
+
 ## 技术栈
 
 - **语言**:Python(主体)+ C++/CUDA(`csrc/`,高性能后端 + CacheGen/内存 kernel,带 SYCL 后端支持 AMD/Intel)+ **Rust**(`rust/raw_block/`)。
