@@ -31,6 +31,19 @@ Mooncake 是 **KVCache-centric 的存算分离架构**:将 prefill/decode 集群
 
 详见 [transfer-engine.md](transfer-engine.md) 与 [kv-store.md](kv-store.md)。
 
+## 分布式模型
+
+> 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md);实现细节见 [kv-store.md](kv-store.md)。
+
+- **拓扑**:**典型星型**。中心 `MasterService`(leader)管全部元数据与分配;每节点 `Client`(`RealClient`)贡献 DRAM/SSD segment(`MountSegment`/`UnmountSegment` 动态加减),`DummyClient` 无资源纯转发。**控制流/数据流分离**:Master 不经手数据,数据 Client↔Client 经 Transfer Engine RDMA 直传。
+- **元数据权威**:leader 进程内存,`std::array<MetadataShard,1024>` 分片 + 每 shard SharedMutex——单写者内存权威;etcd **不存**主元数据(只做选主与 OpLog)。
+- **同步机制**:客户端**每次操作 RPC 问权威**(`PutStart`/`PutEnd`/`GetReplicaList`/`Remove`),无镜像、无订阅推送;leader 切换由客户端 `LeaderMonitorThreadMain` 自动重连。
+- **一致性**:单对象强一致——`PutStart`→`PutEnd` 两阶段写,`Get` 只读 `COMPLETE` 副本,对象写后 immutable;per-object lease(默认 TTL 5s)防读写竞争。但无跨对象事务,object group 是 best-effort 生命周期提示,副本数也 best-effort(空间不足可少于 `replica_num`)。
+- **HA 与故障**:etcd/redis/k8s 三后端选主(`LeaderCoordinator`)+ OpLog 复制(`EtcdOpLogStore`)standby 热备 + fork-COW 周期快照;最后一次快照后的变更在恢复窗口内丢失。client 死亡(`client_live_ttl_sec` 10s)→ `ClearInvalidHandles` 清其副本。
+- **扩展性**:元数据全在 leader 内存(1024 shard),规模受单机内存限制——中心内存权威星型的典型瓶颈,与 lake CP 同构。
+- **附:另一种拓扑**:`mooncake-p2p-store`(Go)**无中心 master**,元数据存 etcd,`Register`/`GetReplica` BitTorrent 式 seeding——用于 checkpoint 分发,与 store 的星型成对照。
+- **与 lake 对照**:同为星型 + 内存权威;差异在 ① Mooncake 客户端每次 RPC 问 Master,lake 的 Router/agent 持推送镜像(热路径零 RPC),只在搬 KV 时同步查 CP;② Mooncake 无内容寻址/radix(前缀索引在外部 Conductor),lake 索引内建于 CP;③ Mooncake 池化 DRAM/SSD,lake 连 HBM(L0)也归池。
+
 ## 技术栈与语言分布
 
 | 子项目 | 主语言 | 备注 |

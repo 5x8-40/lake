@@ -18,6 +18,7 @@
 - [scheduler-worker-interface.md](scheduler-worker-interface.md) — **Scheduler→Worker 字段全集**(SGLang × vLLM):`SchedulerOutput` vs `ScheduleBatch`/`ForwardBatch`、差异表、架构根因、对 lake D1 含义
 - [nvidia-cmx.md](nvidia-cmx.md) — **NVIDIA CMX**：目标栈、公开成熟度、VAST G3/G3.5 边界及 lake 映射；模型字节、容量和 Prefill KV 加载计算见 [`tools/cmx-sim/`](../../tools/cmx-sim/)
 - [agentic-cache-workload.md](agentic-cache-workload.md) — **Agentic cache workload**：匿名 Cursor 用量、provider 留存、File Library 边界及仿真输入
+- [distributed-models.md](distributed-models.md) — **分布式模型对比**：各项目拓扑/元数据权威/同步机制/一致性分级/HA/扩展性总表与四类归纳；各 overview 有「分布式模型」详节
 
 本文把它们的关键组件与本系统(`docs/architecture/`)逐层对应,并标注**借鉴点**与**关键差异**(我们的设计更彻底)。
 
@@ -385,6 +386,7 @@ Dynamo 跨 **P4(存储)** 与 **控制面(选路/通信)**,不进上面"抄源�
 
 - **PD 分离的控制机制**:vLLM(KVConnector 插件 + 外部 proxy)vs SGLang(固定角色 + 内建队列状态机)对比——角色划分、配对握手、KV 传输推进、失败处理,及与 lake"KV 归池 + 逐请求选模式"的差异。见 [`pd-disaggregation.md`](pd-disaggregation.md)。
 - **HBM 归属与 KV 卸载**:谁发 GPU 槽、GPU 是否编进传输图、Dynamo G1 句柄 vs 池；覆盖 HiCache / vLLM offload / LMCache / KVBM / FlexKV / UCM / Mooncake store+TE / MemCache / TileRT / TensorCast / CMX。见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
+- **分布式模型**:全部参考项目的拓扑/元数据权威/同步机制/一致性分级/HA/扩展性对比,四类归纳(中心权威星型/分片租约/事件流最终一致/弱协调)与对 lake 的印证警示。见 [`distributed-models.md`](distributed-models.md)。
 
 ## 非 submodule 文献参考
 

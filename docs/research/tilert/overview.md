@@ -60,6 +60,17 @@ PD 拓扑（v0.1.5）
 | `MooncakeTransport` / `NixlTransport` | `tilert/pd_vllm/transport.py` | GPU 直传适配 |
 | `Pool`（router） | `tilert/pd_vllm/pd_router.py` | 进程内忙闲，满则 429 |
 
+## 分布式模型
+
+> 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md)。
+
+- **拓扑**：**无分布式模型——单请求单槽的点对点 PD**。`Client → pd_router → vLLM prefill → RDMA 直传 → ReceiveServer（单一 GPU 接收 arena）→ decode_server`。decode 侧 `max_batch_size=1`，进程锁互斥。
+- **元数据权威**：无。`pd_router.Pool` 只是进程内忙闲标志表，无队列深度、无集群视图；KV 位置概念不存在（KV 生命周期止于"一次 P→D 灌入"）。
+- **同步机制**：控制面 TCP/HTTP 定长帧握手（host/port/transport/max_seq_len/wire layout），数据面 RDMA（NIXL/Mooncake）；控制/数据面拆分干净，但控制面无任何一致性机制——点对点一次性握手。
+- **一致性**：不适用（无共享状态）。MLA 去重只 rank 0 发送，引入单点但无故障模型。
+- **HA 与故障**：无。接收槽被占/故障即 429 或失败，重试归客户端。
+- **与 lake 对照**：TileRT 证明**超低延迟专用场景可以不要分布式 KV 层**——bs=1、单槽、引擎私有 HBM，省掉全部协调成本。这是专用引擎的取舍，不是通用答案；lake 借鉴其 connector 握手与传输拆分（见 [pd-vllm.md](pd-vllm.md)），拒绝其无池模型。
+
 ## 技术栈
 
 - **公开语言**：Python（API / 权重转换 / PD 胶水）。**性能关键路径在闭源 `.so`**（CUDA/C++ tile runtime），经 `torch.ops.tilert.*` 调用。

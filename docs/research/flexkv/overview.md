@@ -52,6 +52,18 @@ vLLM / SGLang / TRT-LLM / Dynamo worker
 | **GlobalCacheEngine** | 规划 get/put 方向与物理 block id；不建 GPU 层 cache engine |
 | **TransferEngine** | 执行传输图；`set_gpu_blocks` 把引擎 slot 填进图 |
 
+## 分布式模型
+
+> 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md)；细节见 [architecture.md](architecture.md)。
+
+- **拓扑**：**本机自治 + 可选中心快照**。默认单实例（库内直调）；DP>1 或多实例走 ZMQ server-client；跨节点复用（P2P）需 `FLEXKV_ENABLE_P2P=1` + Redis。
+- **元数据权威**：本机每层一棵 `CRadixTreeIndex`（CPU/SSD/REMOTE）+ mempool——**索引在 connector 进程内，不是集群权威**；GPU（HBM）不进索引（引擎 APC 管）。集群级只有 Redis GMS 存的**全局快照**。
+- **同步机制**：各节点**周期 upload/rebuild** 快照到/自 Redis；查询读本地快照不打中心；lease 保证传输窗口内块有效（只保传输，不保位置权威）。或选 Dynamo `KVEventCollector` 事件推送——但文档声明与 P2P 分布式复用**互斥**，二选一。
+- **一致性**：快照最终一致，无单写者权威；快照陈旧 → 拉到已驱逐块靠 lease/重试兜底。无"问到底"的权威点。
+- **HA 与故障**：worker/进程退出，本机树通常一起没；Redis 快照在 lease/TTL 过期后无效。**不存在"worker 没了仍指向有效 L2、可供续推"的集群位置权威**（[architecture.md](architecture.md) §5）——这正是 lake F4 要解的问题。
+- **扩展性**：本机索引 + 周期快照水平扩展无协调成本；代价是全局视图的时效与准确性。
+- **与 lake 对照**：FlexKV 的"本机索引 + Redis 周期快照"是 lake"CP 权威 + 镜像推送"的弱化版——lake 的镜像由 CP 权威变更触发推送（增量 + gap replay），误判可回查 CP；FlexKV 快照无权威可回查。且 lake L0（HBM）在控制面索引内，FlexKV 不索引 HBM。
+
 ## 技术栈
 
 - **语言**：Python（集成、任务、控制面编排）+ C++（`CRadixTreeIndex`、io_uring SSD、GDS、P2P/Redis）。

@@ -38,6 +38,18 @@ HiCache 是在 RadixAttention 之上构建的三层(GPU HBM / 主机内存 / 分
 - **prefetch from L3**:对未命中部分查 L3,命中超阈值则异步拉到 L2,与计算重叠。
 - **write-back**:L1→L2(DMA)→ L3(后端写),按策略触发。
 
+## 分布式模型
+
+> 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md)。本节回答"HiCache 在集群里怎么协调";选路双层细节见 [model-runner.md](model-runner.md)「双层管理模式」。
+
+- **拓扑**:**无中心权威的"实例自治 + 共享 L3 + 旁路索引"**。每实例一棵独立 HiRadixTree(L1/L2 私有),L3 分布式存储集群共享;跨实例可见性靠旁路,不经任何中心权威。
+- **元数据权威**:不存在全局权威。L1/L2 位置记在每实例树节点(`radix_cache.py::TreeNode`);L3 命中**实时查后端**(`cache_controller.py::_storage_hit_query` → `batch_exists`),另有 `MetadataCache` TTL 缓存(可能陈旧)。
+- **同步机制**:① 跨实例事件旁路 `disaggregation/kv_events.py`(`BlockStored`/`BlockRemoved`,zmq 发布);② 选路侧层 B gateway `cache_aware` 用**请求文本历史**维护近似 radix 树猜前缀亲和(`sgl-model-gateway/src/policies/cache_aware.rs::CacheAwarePolicy`),非真实 KV 视图;演进方向是事件进 router(`experimental/sgl-router` 的 `cache_aware_zmq`:`KvEventIndex`/`HashTree`)与独立目录服务([#31458](https://github.com/sgl-project/sglang/issues/31458) KV Indexer,RFC)。
+- **一致性**:L1/L2 索引实例内强一致、集群级无;L3 数据与元数据最终一致(刚写入的页他实例可能未命中)。PP×L3 下多棵 host 树会发散,需 gloo all_reduce + `_pp_sync` 定向广播补偿(#22607)——弱一致多树的组合成本。
+- **HA 与故障**:引擎崩溃 L1/L2 即丢,靠 L3 回填重算;无控制面可 HA(本来就没有)。
+- **扩展性**:实例间零协调 → 天然水平扩展;代价是跨实例命中靠猜(近似树)或付 RPC(实时查后端)。
+- **与 lake 对照**:lake 把旁路收束为单一权威——CP 单写者位置视图 + Router 本地镜像(误判回查 CP);SGLang 的 #21846 方向(UnifiedRadix、`buffer_only` 放大 L3、KV orchestrator hint)在向"共享层更大、私有层更小"走,但 L1/L2 私有与旁路索引的基调未变(见 [agentic-kv-roadmap.md](agentic-kv-roadmap.md))。
+
 ## 技术栈
 
 - **语言**:Python(主体)+ C++/CUDA(sgl-kernel 的 kvcacheio,125+ 文件;JIT 核)。**HiCache 无 Rust**(Rust 仅用于 sglang 的 router/gateway,与 HiCache 无关)。

@@ -48,6 +48,18 @@ MemCache 是面向 **LLM / GR 推理** 的**高性能分布式 KVCache 对象存
 
 配置模板：`config/mmc-meta.conf`、`config/mmc-local.conf`（键前缀 `ock.mmc.*`）。
 
+## 分布式模型
+
+> 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md)；细节见 [architecture.md](architecture.md)。
+
+- **拓扑**：**星型，且是"节点贡献内存进池"的星型**——与 lake 形态最近的一家。`MetaService`（独立进程）中心管池空间分配、LocalService 加入/退出、对象元数据、多层淘汰；`LocalService`（进程内库）双重角色：客户端 API + 内存提供者（贡献连续 HBM/DRAM/SSD 进全局池，他节点经 MemFabric **按地址**访问）。
+- **元数据权威**：MetaService 集中管（key→副本位置/介质/GVA）；exact-key 对象模型，无内容寻址/radix（前缀语义在引擎侧）。
+- **同步机制**：客户端 RPC 问 Meta（`MmcMetaMgrProxy::Get/BatchGet`）；无镜像/订阅推送。数据面 MemFabric OneCopy（RH2D/D2RH/host_rdma/host_shm 等）跨机跨介质直传，不过 Meta。
+- **一致性**：元数据集中，但强度依赖部署形态；对象 exact-key 读写，无跨对象事务的公开语义。
+- **HA 与故障**：单点或 K8s ClusterIP + Lease 多活 + 元数据恢复，文档自承**尽力而为**（`doc/memcache_metaservice_HA.md`）——非 etcd 强一致选主。
+- **扩展性**：中心 Meta 管全集群池空间与对象元数据，规模上限与 Mooncake leader 同构；多层淘汰（高低水位）由 Meta 触发协调。
+- **与 lake 对照**：证明"元数据服务 + 节点贡献 HBM/DRAM + 异构直传"在昇腾上可量产——lake 的 CP+agent 星型与此同形，且 lake 更彻底（HBM 归池权威而非仅贡献）。差异：MemCache 是 exact-key 字节池（无 radix/配额/强一致 HA），lake 索引强一致 + 内容寻址 + per-model 配额。
+
 ## 技术栈
 
 - **语言**：C++ 主体（`src/memcache/csrc/`）+ C API + Python 绑定（`python_wrapper` / `memcache_hybrid`）+ RESTful 管理面。
