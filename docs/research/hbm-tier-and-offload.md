@@ -1,109 +1,178 @@
 # HBM 归属与 KV 卸载对照
 
-> 2026-08-28。对照 Dynamo KVBM、LMCache、FlexKV 及其它卸载栈；不改方案 Z。  
-> 相关：[`dynamo/overview.md`](dynamo/overview.md)、[`lmcache/overview.md`](lmcache/overview.md)、[`flexkv/overview.md`](flexkv/overview.md)、[`sglang/hicache.md`](sglang/hicache.md)、[`vllm/overview.md`](vllm/overview.md)、[`ucm/overview.md`](ucm/overview.md)、[`../features/features.md`](../features/features.md) F1–F5。
+> 2026-08-29。对照 `3rdparty/` 里所有会碰到 GPU HBM 或 KV 卸载的项目。不改方案 Z。  
+> 分目录：[`sglang/hicache.md`](sglang/hicache.md) · [`sglang/elastic-memory-pool.md`](sglang/elastic-memory-pool.md) · [`vllm/overview.md`](vllm/overview.md) · [`lmcache/overview.md`](lmcache/overview.md) · [`dynamo/overview.md`](dynamo/overview.md) · [`flexkv/architecture.md`](flexkv/architecture.md) · [`ucm/architecture.md`](ucm/architecture.md) · [`mooncake/kv-store.md`](mooncake/kv-store.md) · [`mooncake/transfer-engine.md`](mooncake/transfer-engine.md) · [`memcache/architecture.md`](memcache/architecture.md) · [`tilert/pd-vllm.md`](tilert/pd-vllm.md) · [`tensorcast/overview.md`](tensorcast/overview.md) · [`nvidia-cmx.md`](nvidia-cmx.md)。  
+> lake：[F1–F5](../features/features.md)、[`../architecture/storage-layer.md`](../architecture/storage-layer.md)。
 
-## 1. 前缀位置为什么要合一
+本文只回答四件事：**谁发 GPU 槽**、**卸载栈把 HBM 编成什么**、**Dynamo 为什么要单独注册 G1**、**worker 退出后前缀位置还在不在**。
 
-F4 要求：GPU worker 挂了之后，未完成请求换到新节点，从 Pool 里已有的 KV 续推。前提是系统能回答：这段前缀的字节在哪一层、哪台机器，而且这个答案在进程退出后仍然有效。
+---
 
-Dynamo 接 vLLM 时，同一段前缀通常有三套记录：
+## 1. 先分清三件事
 
-| 记录 | 内容 | worker 进程退出后 |
-|------|------|-------------------|
-| 引擎 APC | 本进程 GPU 上哪些 `block_hash` 还在（`KVCacheManager.get_computed_blocks`） | 没有。页和哈希表都在引擎里。 |
-| 本实例 KVBM | 本机 DRAM/SSD 上哪些 `sequence_hash` 在 G2/G3（`match_sequence_hashes`） | 通常没有。G2/G3 跟 `InstanceLeader` 走。已写到 G4 对象存储的除外。 |
-| Router 的 KV event 索引 | 某 worker 在 Device / HostPinned / Disk 上有过这些 hash（NATS/ZMQ，best-effort） | 索引还在，但可能过期，仍指向已退出的 worker。 |
+同一段前缀，各家往往记三本不同的账。混在一起就会觉得「没注册 G1 就不能卸载」。
 
-进程退出后：APC 没了，本机 G2/G3 通常也没了。Router 仍可能按旧的 Device overlap 把请求送到那台机器。这时没有一份仍有效的位置记录，续推只能退回从 prompt 重算。
+| 账 | 管什么 | 典型落点 |
+|----|--------|----------|
+| **分配** | 谁 `alloc`/`free` HBM 页，attention 读哪 | 几乎全是引擎：`KVCacheManager.allocate_slots`、HiCache `value` |
+| **传输端点** | 卸载/PD 能不能按 `block_id` 对 GPU 做 DMA/RDMA | 把 GPU 编进自己的 layout / IPC / `registerLocalMemory` |
+| **索引** | 前缀命中查哪棵树 / 哪张表 | 引擎 APC、实例 radix、对象 exact-key、lake 控制面 |
 
-lake 的做法是：前缀树和 L0–L3 位置只放在存储控制面（进程内存为权威，etcd 存降频 checkpoint）。Router 读镜像选路；搬 KV 和 F4 查权威树。引擎不再另持一套 APC 当前缀真相。worker 退出后，L2 仍在池里，位置视图仍指向对应 KV Node，新 worker 按视图拉取。
+「注册一层」说的是第二本账：GPU 成为卸载栈里的**具名端点**。不等于第三本账（GPU 上有 radix），更不等于第一本账（卸载栈发槽）。
 
-Router 用不用 event 推送镜像，和「有没有一份进程退出后仍有效的位置」是两件事。event 可以做推送；GPU 前缀也不该再有一份只活在引擎里的账。
+进程退出后：第一本账（引擎页）没了；第二本账若只是本进程 MR，也没了；第三本账只有写在进程外的权威里才还在。F4 要的是第三本。
 
-## 2. GPU 槽仍由引擎分配
+---
 
-接 vLLM 时，Dynamo 和 LMCache 都走 `KVConnectorBase_V1`：调度器 `allocate_slots` → `update_state_after_alloc` → 结束时 `request_finished` 再 `free`。
+## 2. Dynamo G1：句柄，不是池
 
-KVBM 不管理 HBM free-list。`ExternallyManagedDeviceSlot` 只接收引擎给的 `block_ids`（`append_mutable_device_blocks`）。UCM、vLLM `kv_offload`、SGLang HiCache 同样：HBM 页由引擎分配和释放。
+### 代码里 G1 是什么
 
-## 3. Dynamo 的 G1 是句柄，不是池
+`LogicalLayoutHandle::G1` 注释写明：固定大小，**由框架或本机 KVBM 管理**。`OffloadEngine` 只有 `BlockManager<G2>` / `BlockManager<G3>`，没有 `BlockManager<G1>`。`InstanceLeader` 只持 `g2_manager` / `g3_manager`。
 
-`OffloadEngine` 写明：G1 是 vLLM 的 GPU cache，没有 `BlockManager<G1>`。卸载管线用 `ExternalBlock<G1>`（`block_id` + `sequence_hash`）。`InstanceLeader` 只持 `g2_manager` / `g3_manager`。G1 用来把 G1↔G2 接进和 G2/G3 相同的 transfer 路径，并不替代 GPU 分配器。
+卸载入队用 `ExternalBlock<G1>`：`block_id`（引擎已经分好的槽）+ `sequence_hash`（卸到 G2 后登记用）+ 类型参数。注释：*block is held elsewhere*。Worker 上另有 `g1_handle`：这块 GPU 内存的 NIXL/物理 layout，供 `TransferManager` 知道本进程 G1 在哪。
 
-若只需「引擎管 HBM，插件把 KV 卸到 DRAM/SSD 再拉回」，LMCache、UCM、vLLM `kv_offload` 即可。KVBM 把 G1 标成一层，是为了：请求结束后再卸、写入引擎已分好的页、按 `block_id` 做 GPU 直连。没有这三项，不必单独设 G1。
+所以 G1 是：
 
-## 4. 选路、本机命中、内存注册
+- **有**：逻辑层枚举、物理 layout、`Pipeline<G1, G2>`、G2→G1 onboard 的 `dst_block_ids`。
+- **无**：GPU free-list、GPU 上的 radix、进程退出后仍有效的 GPU 位置。
 
-| | 依据 | 作用 |
-|--|--------|------|
-| Router | KV event（worker + hash + `StorageTier`） | 选 worker |
-| 本实例 KVBM | `host()` / `disk().match_sequence_hashes_blocking`（`acquire_local_matches`） | 本机 DRAM/SSD 是否命中、是否 onboard |
-| NIXL 注册 | `layout.nixl_register` | 搬字节 |
+GPU 前缀命中仍是 vLLM APC / `num_computed_tokens`。Router 上的 `StorageTier::Device` 多来自引擎 KV event（`EventSource::Vllm`），不是 KVBM 往 G1 池里 insert。
 
-Router 不靠 GPU 内存注册判断命中。本机 G2/G3 不靠 Router 做 lookup。注册只服务传输。
+### 为什么要注册这一层
 
-本机 GPU 命中先看 vLLM APC / `num_computed_tokens`。KVBM 从 GPU 未命中的后缀起查 host/disk。Router 上的 `StorageTier::Device` overlap 主要来自引擎 KV event（`EventSource::Vllm`），不是 KVBM 的 G1 池事件。
+KVBM 的 worker 用**同一套** layout + `TransferManager` 做所有层间搬运（`kvbm-engine/docs/onboarding.md`：leader 只说「把 block 1,2,3 从 Gx 转到 Gy」）。要把 GPU 接进这套机器，必须有一个 G1 句柄，否则 G1→G2、G2→G1、G1→G1 都没有源/目描述符。
 
-## 5. 同机卸载：拷贝相近，时间不同
+注册之后，同一条路径能做：
 
-同机 GPU→host：LMCache 用 `GPUConnector.from_gpu` 写入 `MemoryObj`；Dynamo 从已注册的 `DeviceStorage` 做 G1→G2。都是把页内字节拷走。
+1. **G1→G2 offload**：`enqueue_g1_to_g2(SourceBlocks::External)`；`request_finished` 返回 `True`，settlement 完再 `free`，避免页被引擎复用。
+2. **G2/G3→G1 onboard**：写入引擎已分配的 `dst_block_ids`（layer-wise 也走这条）。
+3. **G1→G1**：PD / 本机复制；多 rank 时 rank 0 有 G2/G3，其余 rank **只有 G1**，靠 NCCL 从 rank 0 的 G1 广播（`physical/replicated.rs`）。
+4. **远端 RDMA**：peer 导入 G1 layout，按 `block_id` 直连引擎页，不必先落 host。
 
-差别在拷贝时机和 GPU 页何时可回收：
+`layout.nixl_register` 服务的是这四条，不是「KVBM 拥有 HBM」。
 
-- LMCache：attention 中 `save_kv_layer`，forward 结束 `wait_for_save`。`get_num_new_matched_tokens` 第二项为 `False`。`request_finished` 返回 `False`，GPU 页可立即 `free`。
-- Dynamo：请求结束后 `enqueue_g1_to_g2`，`request_finished` 返回 `True`，等卸完再 `free`，避免页被复用。可用 `OffloadFilter` 选择卸哪些块。GPU 页会多占一段时间。
+### 不注册 G1，哪些仍做得到，哪些要另写一套
 
-跨 worker / PD 时，已注册的引擎页可按 `block_id` 直连。LMCache P2P 主路径是 CPU 内存，PD 走 `NixlStorageBackend`。若卸载路径是 GPU→host 再进远程 store，不必把 GPU 叫做 G1。
+**仍做得到**（别的卸载都在做）：把 KV 从 GPU **拷走**存到 DRAM/SSD/对象；命中后再拷回引擎页；PD 走 NIXL / Mooncake TE / UCM「HBM 直传」等**另一条** GPU 路径。
 
-## 6. 各家对照
+**没有 G1 句柄时，KVBM 自己做不到**的是：用 **G2/G3 那套 worker 协议** 把 GPU 当源或目。缺了就要：
 
-下表只比：谁发 GPU 槽、HBM 在卸载栈中的角色、何时离 GPU、DRAM/SSD 谁索引、集群如何看见、进程退出后 KV 是否还在。
+| 缺口 | 别人怎么补 |
+|------|------------|
+| 同机 D2H/H2D | LMCache `GPUConnector.from_gpu` / `to_gpu`；UCM `dump`/`load`；vLLM `swap_blocks_triton` |
+| 请求结束再卸、页先别 `free` | FlexKV 同样 delay-free；LMCache 选择前向就拷完，`request_finished`→`False` |
+| GPU↔GPU PD | TileRT / Mooncake TE / UCM HBM 直传 / vLLM NIXL connector，**不经过 KVBM G1** |
+| 多 rank 只给 rank 0 配 host/disk | 没有 G1 layout 就无法「卸到 G2 再广播到各 rank G1」 |
 
-| | GPU 槽 | HBM 角色 | 何时离开 GPU | DRAM/SSD 索引 | 集群可见性 | 前缀记录 | 该 GPU 进程退出后 |
-|--|--------|----------|--------------|---------------|------------|----------|-------------------|
-| vLLM APC | `KVCacheManager` | 引擎私有，不卸载 | 不离 | 无 | 可选 `kv_events`（`BlockStored` + `medium`） | 进程内 hash 表 | GPU KV 丢失 |
-| vLLM `kv_offload` | 同上 | 引擎内 CPU→FS/Obj | Scheduler 进程内 cascade / promotion | 同进程 `OffloadingManager` | 事件可带 medium | APC hash + `OffloadKey` | CPU/FS 随进程；Obj 另计 |
-| SGLang HiCache | 引擎 | L1 实例私有；树节点记 L1/L2 槽 | `write_backup` / `write_back` / write_through | 同一棵 `HiRadixTree` | L3 不记位置，`batch_exists` | 实例 radix；L3 只有 key | L1/L2 丢失；独立 L3 可供新实例 prefetch |
-| LMCache | vLLM | 不作为一层；`register_kv_caches` 提供拷贝基址 | 前向 `save_kv_layer` | chunk key + CPU/disk 后端 | `RegistryTree` 或共享 L2 | 引擎 APC + 顺序 `contains` | 引擎页丢失；daemon / 远程 L2 可保留 |
-| Dynamo KVBM | vLLM | G1 句柄，无 `BlockManager<G1>` | 结束后 delay-free，再 G1→G2 | 本实例 `g2_manager` / `g3_manager` | Device 事件多来自引擎；Host/Disk 来自 KVBM `BlockRegistry` | APC + KVBM hash + Router 索引 | 本机 G1/G2/G3 随实例；G4 可保留；Router 索引可能过期 |
-| FlexKV | vLLM/SGLang/TRT | 注册端点，无 GPU cache engine | 结束后 delay-free，再 D2H | 本实例 CPU/SSD/REMOTE 各一棵 radix | Redis 快照或 Dynamo events（默认 medium=`CPU`）；二者文档互斥 | 引擎 APC + FlexKV 层树 | 本机 GPU/CPU/SSD 随进程；远端/Mooncake store 可保留 |
-| UCM | 引擎 | 不作为一层；dump/load | `UcmKVStoreBaseV1.dump` | store key（多为 vLLM block hash） | 无全局 radix | 引擎 APC + store `lookup` | 引擎页丢失；store 可保留 |
-| Mooncake store | 不参与 | 不解释 HBM | 调用方 put | master exact-key | master | 无 radix | 对象可保留；前缀不在 store |
-| MemCache | 引擎/对接 | HBM/DRAM/SSD 对象池，exact-key | 池 put/get | Meta/Local | MetaService | 无前缀 radix | 池可保留 |
-| lake（目标） | 池分配 L0 | L0 由池放置 | 池写回 / 预放置 / 驱逐 | 控制面 radix + 位置视图 | 控制面内存；Router 读镜像 | 仅控制面 | 该卡 HBM 丢失；L2 作 F4 恢复点，位置仍在 |
+结论：G1 **不是**「能卸载」的前提，是「GPU 参与 KVBM 自己的分层搬运与 collectives」。只做引擎旁 CPU 缓存，不必设 G1。FlexKV 注册的是 **IPC 映射 + 传输图里的 GPU 端点**（`register_gpu_blocks`），语义接近 G1 句柄，只是不叫 G1、也不进 `BlockRegistry`。
 
-- HiCache：L1/L2 在同一棵树上，但树在实例内，L3 位置不在树上。新实例靠探测 L3，没有全局位置视图。
-- vLLM `kv_offload` 也是引擎内降层，没有 Dynamo 那套集群 Router event。`OffloadingConnector` 把它暴露成 connector。
-- LMCache / UCM / FlexKV 都是引擎旁的卸载插件。FlexKV 自管 CPU/SSD radix，GPU 只 IPC 映射，结束时 delay-free，接近 KVBM G2/G3 而不是 LMCache 的前向 `save_kv_layer`。
-- LMCache / UCM 不把 GPU 编进自己的分层。
-- Mooncake / MemCache 是对象池；前缀和位置由上层处理。lake 用 Mooncake 传输，不用它的 store 做控制面。
+---
 
-## 7. 对 lake
+## 3. 各家怎么处理 HBM
 
-前缀命中、按 cache 所在 worker 选路、分层卸载，Dynamo / LMCache / HiCache / FlexKV 都能做。P7.6 里本地命中主要来自亲和选路，池侧预放置是补充。这些不能单独用来论证必须把 HBM 划归池。
+按角色写。Transformers 只有模型定义，不进本对照。
 
-lake 文档里的 D-direct 是：前缀已由存储池放到某节点 HBM，位置在控制面元数据中。Dynamo 的 Device overlap 是该 worker 曾经算过、引擎页还在。请求侧可以少传或不传，但不能在请求到达前，把前缀放到一台尚未计算过它的 GPU 上。
+### 引擎自己的 GPU 池
 
-HBM 归池对应的是：worker 退出后仍能从 L2 续推；控制面能把 L0 放到尚未计算该前缀的 GPU（方案 Z / warmup）；引擎不再维护私有 APC。这些要用弹性和故障场景验证，而不是说「没有 HBM 归池就做不了 D-direct」。
+**vLLM APC** — `KVCacheManager` / `BlockPool` 发槽、hash 表做本进程前缀。不卸载。可选 `kv_events.BlockStored(medium=GPU)` 给 Router 看，进程一没事件就指向幽灵 worker。
 
-## 8. 代码索引
+**vLLM `vllm/v1/kv_offload/`** — 引擎内 GPU→CPU→FS/Obj。槽仍是 APC 的。CPU 是网关层，secondary 做 cascade/promotion。无集群位置视图。`OffloadingConnector` 只是把这套暴露成 connector。
+
+**SGLang HiCache** — 命名：它的 L1 = GPU（lake L0），L2 = host DRAM（lake L1）。`TreeNode.value` / `host_value` 记两套槽。GPU 页仍引擎分配，但树把 GPU 当**本实例的一层**，不是外部句柄。`load_back` 拷回 GPU，保留 `host_value`。L3 不记位置，`batch_exists`。进程退出则 L1/L2 没了。
+
+**SGLang Elastic Memory Pool** — 同卡 HBM 上 KV 池与 Mamba 池再切分（VMM / `UnifiedKVPool`），**不是**跨介质卸载。与 HiCache 正交。
+
+### 引擎旁卸载：GPU 是端点
+
+**Dynamo KVBM** — 上节。G2/G3 本实例 `BlockManager`；G4 外部对象。
+
+**FlexKV** — `GlobalCacheEngine` 只建 CPU/SSD/REMOTE 树。GPU：`GPUAllocator.from_raw_data` + `register_gpu_blocks`（CUDA IPC / fabric）。`save_kv_layer` 为空；结束 delay-free D2H。`TransferOpGraph.set_gpu_blocks` 把引擎 `block_id` 填进 H2D/D2H。文档：GPU 不进 FlexKV 驱逐范围。
+
+### 引擎旁卸载：GPU 只当拷贝源/目，不进分层
+
+**LMCache** — `register_kv_caches` 拿 paged tensor 基址。attention 里 `save_kv_layer` → `from_gpu` 进 `MemoryObj`。`get_num_new_matched_tokens` 第二项 `False`；`request_finished`→`False`，GPU 可立即 `free`。索引是 chunk key + 后端，不是 GPU 层 radix。P2P 主路径多走 CPU；PD 可另挂 `NixlStorageBackend`。
+
+**UCM** — store `dump`/`load` 对设备指针搬字节。Store 元数据是 key，不是 G1。PD 三种拓扑（HBM 直传 / DRAM 中介 / 统一池）都是 **connector 怎么走**，HBM 权威仍在引擎。无 D-direct。
+
+### 对象池：HBM 不是引擎 paged KV 的账
+
+**Mooncake store** — 池化 Client 贡献的 DRAM/SSD，exact-key，无 radix。HBM 仍实例私有。Store 不解释 HBM。
+
+**Mooncake Transfer Engine** — `registerLocalMemory` 可注册 CUDA 指针（DMA-BUF / nvidia-peermem），PD 可 HBM→HBM。这是**传输**，不是 store 把 GPU 编成一层。lake Transfer Bus 对标这里。
+
+**Ascend MemCache** — `LocalService` 贡献连续 **HBM/DRAM**（及 SSD），Meta 记 `MEDIA_HBM` 等。对象 exact-key，`GetInto` / `RegisterBuffer`。这是「池介质含 HBM」，最接近 lake「HBM 进池」的工业形态，但：无前缀 radix；引擎计算用 KV 与池对象是否同一 arena，集成在 vllm-ascend，不在本 submodule。放置/D-direct 仍不是方案 Z。
+
+### 专用 decode / 张量层 / 目标栈
+
+**TileRT** — `TileRTConnector` 从 vLLM `block_id` 抽 KV，NIXL/Mooncake **GPU 直传** 进 decode 单请求 arena，`inject_cache`。无卸载分层、无池化 L0。
+
+**TensorCast** — `publish` 把 KV **拷出**引擎 HBM，管的是 worker 侧副本。引擎内 KV 仍引擎自留地（LIP 原地租借 v1 不用在 KV 上）。无「G1 层」。
+
+**NVIDIA CMX** — 目标路径含 GPU + KVBM + 共享 flash。公开仓库拼不出端到端。不当作已实现对照。
+
+---
+
+## 4. 总表
+
+| | GPU 槽 | HBM 在卸载/存储栈里 | 自管索引 | 该 GPU 进程退出后 |
+|--|--------|---------------------|----------|-------------------|
+| vLLM APC | 引擎 | 不卸载 | 进程内 hash | GPU KV 丢失；event 可能过期 |
+| vLLM `kv_offload` | 引擎 | 引擎内级联 | 同进程 `OffloadingManager` | CPU/FS 随进程；Obj 另计 |
+| HiCache | 引擎 | 树节点记 GPU 槽 | 实例 `HiRadixTree` | L1/L2 丢失；L3 可 prefetch |
+| Elastic Memory Pool | 引擎（同卡多子池） | 不卸载 | 同 HiCache / 各 pool | 同实例私有 |
+| LMCache | 引擎 | 拷贝基址，非一层 | chunk + 后端 | 引擎页丢失；daemon/远程 L2 可留 |
+| Dynamo KVBM | 引擎 | **G1 句柄**，无 `BlockManager<G1>` | 本实例 G2/G3 | G1/G2/G3 随实例；G4 可留；Router 可能过期 |
+| FlexKV | 引擎 | IPC 端点，无 GPU cache engine | CPU/SSD/REMOTE 各树 | 本机随进程；远端/Mooncake store 可留 |
+| UCM | 引擎 | dump/load，非一层 | store key | 引擎页丢失；store 可留 |
+| Mooncake store | 不参与 | 不解释 HBM | master exact-key | 对象可留；前缀不在 store |
+| Mooncake TE | 调用方注册 | 传输 MR，非池 | 无 | MR 随进程 |
+| MemCache | 对接引擎；池贡献 HBM 段 | 对象可在 `MEDIA_HBM` | Meta exact-key | 池对象可留；无 radix 位置视图 |
+| TileRT | vLLM 抽、decode 单槽 | 不卸载 | 无 | 槽随 decode 请求 |
+| TensorCast | 引擎 | 只管 publish 之后的副本 | GS/daemon 副本账 | 引擎内 KV 丢失；已 publish 的 artifact 可留 |
+| CMX | 目标栈 | 未公开落地 | — | — |
+| **lake（目标）** | **池分配 L0** | L0 是位置视图里的一层 | 仅控制面 radix + `locations` | 该卡 HBM 丢失；L2 为 F4；视图仍指向 KV Node |
+
+---
+
+## 5. 对 lake
+
+前缀命中、按 cache 所在 worker 选路、把 KV 卸到 DRAM/SSD，上表里多数系统都能做。P7.6 本地命中主要来自亲和选路，池侧预放置是补充。这些不能单独论证「必须把 HBM 划归池」。
+
+lake 的 D-direct：前缀**已由池放到**某节点 HBM，坐标在控制面。Dynamo Device overlap 是「这台 worker 算过、引擎页还在」。请求侧可以少传，但不能在到达前把前缀放到一台**从未算过它**的 GPU 上。
+
+HBM 归池要验证的是：worker 退出后从 L2 续推；控制面能把 L0 放到尚未计算该前缀的 GPU（方案 Z / warmup）；引擎不再另持 APC 当前缀真相。MemCache 证明「HBM 可以当池介质」；Mooncake 证明「传输可以打 GPU、store 仍不管 HBM」。lake 要的是两者合一：L0 既是池介质，又进同一份 radix/`locations`。
+
+G1 对 lake 的借鉴是 **传输图把 L0 当端点**（agent 按 `block_id`/slot 做 RDMA），不是再引入「引擎发槽 + 卸载栈注册句柄」的双轨。方案 Z 下槽的分配也归池，句柄与池是同一套。
+
+---
+
+## 6. 代码索引
 
 | 机制 | 文件:符号 |
 |------|-----------|
-| G1 无 BlockManager | `3rdparty/dynamo/lib/kvbm-engine/src/offload/engine.rs`；`ExternalBlock` |
-| 本机 G2/G3 命中 | `…/kvbm/src/block_manager/vllm/connector/leader/slot.rs`::`acquire_local_matches` |
-| 推迟释放 GPU 页 | `…/connector/leader.rs`::`request_finished` |
-| NIXL 注册 | `…/llm/src/block_manager/state/local.rs`::`layout.nixl_register` |
-| Router 层枚举 | `…/kv-router/src/protocols.rs`::`StorageTier` |
-| G2/G3 注册发 event | `…/llm/src/block_manager/block/registry.rs`::`BlockRegistry` |
-| LMCache 前向保存 | `lmcache/integration/vllm/lmcache_connector_v1.py`::`get_num_new_matched_tokens`；adapter `request_finished` |
-| LMCache GPU 拷贝 | `lmcache/v1/gpu_connector/gpu_connectors.py`::`from_gpu` / `to_gpu` |
-| vLLM 分配后再通知 | `vllm/v1/core/sched/scheduler.py`::`allocate_slots` → `update_state_after_alloc` |
+| G1 枚举（框架管 GPU） | `3rdparty/dynamo/lib/kvbm-common/src/lib.rs`::`LogicalLayoutHandle::G1` |
+| G1 无 BlockManager；G1→G2 | `kvbm-engine/src/offload/engine.rs`::`OffloadEngine` / `enqueue_g1_to_g2` |
+| 外部槽位 | `kvbm-engine/src/offload/source.rs`::`ExternalBlock` |
+| Worker G1 layout | `kvbm-engine/src/worker/physical.rs`::`g1_handle`；`docs/onboarding.md` |
+| 仅 rank 0 有 G2/G3 | `kvbm-engine/src/worker/physical/replicated.rs` |
+| 本机 G2/G3 命中 | `dynamo/.../kvbm/.../connector/leader/slot.rs`::`acquire_local_matches` |
+| delay-free | `.../connector/leader.rs`::`request_finished` |
+| NIXL 注册 | `lib/llm/src/block_manager/state/local.rs`::`LocalBlockDataFactories` / `layout.nixl_register` |
+| Router 介质 | `lib/kv-router/src/protocols.rs`::`StorageTier` |
+| vLLM 槽 + 通知 connector | `vllm/v1/core/sched/scheduler.py`::`allocate_slots` → `update_state_after_alloc` |
 | vLLM APC / 事件 | `KVCacheManager.get_computed_blocks`；`vllm/distributed/kv_events.py`::`BlockStored` |
 | vLLM 进程内 offload | `vllm/v1/kv_offload/base.py`::`OffloadingManager` / `OffloadKey` |
-| HiCache L1/L2 | `radix_cache.py`::`TreeNode.value` / `host_value`；`hiradix_cache.py`::`write_backup` |
-| UCM dump/load | `ucm/store/ucmstore_v1.py`::`UcmKVStoreBaseV1` |
-| FlexKV delay-free / 无前向 save | `3rdparty/flexkv/flexkv/integration/vllm/vllm_v1_adapter.py`::`request_finished` / `save_kv_layer` |
-| FlexKV GPU 只映射 | `…/storage/storage_engine.py`::`register_gpu_blocks`；`GPUAllocator.from_raw_data` |
-| FlexKV 无 GPU 层树 | `cache/cache_engine.py`::`GlobalCacheEngine` |
+| HiCache GPU/host 槽 | `radix_cache.py`::`TreeNode.value` / `host_value`；`hiradix_cache.py`::`load_back` / `write_backup` |
+| Elastic 同卡多池 | `unified_memory_pool.py`::`UnifiedKVPool`；`kv_vmm_backing.py`::`KvVmmArena` |
+| LMCache 前向保存 | `lmcache/.../lmcache_connector_v1.py`::`get_num_new_matched_tokens` / `request_finished` |
+| LMCache GPU 拷贝 | `lmcache/v1/gpu_connector/gpu_connectors.py`::`from_gpu` / `to_gpu` |
+| FlexKV 无 GPU 层树 | `flexkv/cache/cache_engine.py`::`GlobalCacheEngine` |
+| FlexKV GPU 映射 | `storage/storage_engine.py`::`register_gpu_blocks`；`GPUAllocator.from_raw_data` |
+| FlexKV delay-free | `integration/vllm/vllm_v1_adapter.py`::`request_finished` / `save_kv_layer` |
+| UCM dump/load | `ucm/store/ucmstore_v1.py`::`UcmKVStoreBaseV1`；PD 拓扑 `docs/source/user-guide/pd-disaggregation/` |
+| Mooncake store | `mooncake-store` `MasterService` / `ObjectKey`（无 HBM 层） |
+| Mooncake GPU MR | `transfer_engine.h`::`registerLocalMemory`；`rdma_transport.cpp` DMA-BUF |
+| MemCache HBM 介质 | `mmc_bm_proxy.cpp`::`MmcBmProxy`（`MEDIA_HBM` / `MEDIA_DRAM`） |
+| TileRT 灌入 decode HBM | `tilert/pd_vllm/prefill_connector.py`::`TileRTConnector`；`decode_server` `inject_cache` |
+| TensorCast 不管引擎内 KV | `publish` / `hydrate`（见 [`tensorcast/overview.md`](tensorcast/overview.md)） |

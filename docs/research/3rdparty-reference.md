@@ -384,7 +384,7 @@ Dynamo 跨 **P4(存储)** 与 **控制面(选路/通信)**,不进上面"抄源�
 跨多个 submodule 的机制专题(非单项目分目录):
 
 - **PD 分离的控制机制**:vLLM(KVConnector 插件 + 外部 proxy)vs SGLang(固定角色 + 内建队列状态机)对比——角色划分、配对握手、KV 传输推进、失败处理,及与 lake"KV 归池 + 逐请求选模式"的差异。见 [`pd-disaggregation.md`](pd-disaggregation.md)。
-- **HBM 归属与 KV 卸载**:Dynamo G1、LMCache、FlexKV、HiCache、vLLM `kv_offload`、UCM。见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
+- **HBM 归属与 KV 卸载**:谁发 GPU 槽、GPU 是否编进传输图、Dynamo G1 句柄 vs 池；覆盖 HiCache / vLLM offload / LMCache / KVBM / FlexKV / UCM / Mooncake store+TE / MemCache / TileRT / TensorCast / CMX。见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 
 ## 非 submodule 文献参考
 
