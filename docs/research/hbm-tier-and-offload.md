@@ -114,18 +114,20 @@ GPU 页仍由引擎分配。组件维护 DRAM/SSD/远端索引；访问 GPU 靠�
 
 ## 5. lake
 
-上表多数系统具备：本机/远端前缀命中、按 overlap 选 worker、HBM→DRAM/SSD 卸载。P7.6 本地命中以亲和选路为主，池预放置为补充。以上不构成「HBM 必须归池」的充分条件。
+前缀命中、按 overlap 选 worker、HBM→DRAM/SSD 卸载、本机 HBM 已有前缀则不跨机传（D-direct），上表多数系统都能做。D-direct 是执行模式，与卸载不是同一条路径；引擎持 HBM 时靠 APC / Device overlap 判定本地命中。lake 用 `locations` 里是否有该节点 L0 判定，因为没有 APC。
 
-| | 含义 |
-|--|------|
-| Dynamo Device overlap | 该 worker 曾计算该前缀，引擎页仍在 |
-| lake D-direct | 控制面 `locations` 已记录目标节点 L0；允许该节点从未计算过该前缀（方案 Z 预放置） |
+L0 归池，是把 HBM 收成与 L1/L2 相同的一层缓存，不是为了独占 D-direct。
 
-F4 / 方案 Z 需验证：worker 退出后从 L2 续推；控制面可将 L0 放到未计算过该前缀的 GPU；引擎无独立 APC 作为位置权威。
+| | 引擎持 HBM | L0 归池 |
+|--|----------|---------|
+| 往 GPU 装 KV | 请求到达后 `allocate_slots`，再 H2D / G2→G1 onboard | 后台按热度 promotion / 预取到 L0，请求路径只读视图（方案 Z） |
+| L0 坐标 | APC + KV event，随引擎进程 | 与 L1/L2 同在控制面 `locations` |
+| 计算进程退出（节点还在） | 引擎页与 APC 失效 | slot 仍由池 agent 管，视图不必作废 |
+| 整机退出 | 两边 L0 都没了，靠 L2/L3 | 同左；F4 从 L2，视图仍指向 KV Node |
 
-MemCache：对象介质可含 HBM。Mooncake：TE 可注册 GPU，store 不管理引擎 `BlockPool`。lake：L0 同时是池介质与 radix 节点上的位置。
+对 lake 要验证的是：热块能否在请求前落到目标 L0；Router 读到的 L0 与权威一致；计算进程重启不丢未驱逐的 L0 位置。D-direct 本身不在这份清单里。
 
-G1 可借鉴处：对 L0 slot 做 RDMA 需要 layout 注册。方案 Z 下分配与注册同属池，不再拆成「引擎 `allocate_slots` + 外部 G1 句柄」。
+L0→L0 RDMA 仍要注册 GPU 内存（对照 KVBM `g1_handle`）。归池后注册的是池 slot，不是引擎 `BlockPool` 再挂一层句柄。
 
 ## 6. 代码索引
 
