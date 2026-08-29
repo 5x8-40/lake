@@ -45,13 +45,13 @@ vLLM / Ascend / SGLang / MindIE
 
 > 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md)。
 
-- **拓扑**：**无自有分布式控制面**。UCM 是引擎插件框架（connector + store 抽象 + 稀疏插件），集群级语义全部**继承自所挂 store 后端**：挂 Mooncake store 则拓扑/一致性/HA 是 Mooncake 的（星型 + leader 内存权威），挂 NFS/DS3FS 则是文件系统语义。UCM 自己只有引擎侧的 `UCMConnector` 与 store 侧的 `UcmKVStoreBaseV1` 两点。
+- **拓扑**：无自有分布式控制面。UCM 是引擎插件框架（connector + store 抽象 + 稀疏插件），集群级语义全部继承自所挂 store 后端：挂 Mooncake store 则拓扑/一致性/HA 是 Mooncake 的（星型 + leader 内存权威），挂 NFS/DS3FS 则为文件系统语义。UCM 自身只有引擎侧的 `UCMConnector` 与 store 侧的 `UcmKVStoreBaseV1` 两点。
 - **元数据权威**：无。前缀命中靠引擎 APC/block hash + store `lookup_on_prefix` 探测；无全局位置视图。
 - **同步机制**：无自有机制；PD 场景下 P dump → 池 → D lookup/load，同步语义即后端 store 的读写可见性。
 - **一致性**：继承后端。多引擎并发写同前缀块的去重/覆盖语义由后端决定，UCM 不介入。
-- **HA 与故障**：继承后端；引擎崩溃则引擎侧状态丢（KV 在后端的留存由后端策略决定）。
-- **集群级唯一的设计选择**：PD 三拓扑（HBM 直传 / DRAM 中介 / 统一池，主推池）——这是**传输拓扑**选择，不是元数据权威设计（见 [architecture.md](architecture.md) §4）。
-- **与 lake 对照**：UCM 的 PD-via-pool 叙事（实例无状态、池作中间态）与 lake 同向，但它把权威问题整体推给后端；lake 的池**自带**控制面权威（radix + 位置视图 + 配额/GC），不依赖后端提供这些语义。
+- **HA 与故障**：继承后端；引擎崩溃则引擎侧状态丢失（KV 在后端的留存由后端策略决定）。
+- **集群级唯一的设计选择**：PD 三拓扑（HBM 直传 / DRAM 中介 / 统一池，主推池），属传输拓扑选择，不是元数据权威设计（见 [architecture.md](architecture.md) §4）。
+- **与 lake 对照**：UCM 的 PD-via-pool 叙事（实例无状态、池作中间态）与 lake 同向，但权威问题交由后端处理；lake 的池自带控制面权威（radix + 位置视图 + 配额/GC），不依赖后端提供这些语义。
 
 ## 技术栈
 

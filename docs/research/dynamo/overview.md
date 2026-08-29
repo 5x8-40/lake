@@ -73,13 +73,13 @@ KVBM offload 路径:`GPU → CPU → SSD → 远端存储(S3/Azure blob)`,1.0 �
 
 > 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md);与 lake 一致性对照另见 [`../../architecture/consistency.md`](../../architecture/consistency.md) §8.6。
 
-- **拓扑**:**编排层星型 + 事件流**。`Frontend → Router(KV-aware)→ workers(vLLM/SGLang/TRT-LLM)`;Router 内置 indexer(`lib/kv-router/`)维护各 worker 的 KV block 哈希集合(radix 副本)。KVBM 三层(logical/physical/engine)管 offload,KV 仍归引擎。
-- **元数据权威**:**分层分离**——服务发现/权威元数据走 etcd(或 K8s CRD/EndpointSlices);**高频 KV 位置事件走 NATS JetStream**,不进 etcd。这是"etcd 不扛高频位置写"的工业印证,与 lake"权威在 CP 内存、etcd 只存降频 checkpoint"结论同向、实现不同位。
-- **同步机制**:KV 事件经 NATS 推送(`PlacementEvent` 位置变更),Router indexer 消费事件流更新本地 radix(`ListenerLoop::apply_live_batch`,带 gap/replay);无 NATS 时降级"预测式路由"(按负载猜)。事件 best-effort——`distributed.rs` 明示 approximate mode 丢了即跳过。
-- **一致性**:**无全局强一致位置视图**。Router 的索引是事件流构建的最终一致副本;kvbm-engine 的 leader 搬 KV 时查本地视图(`find_matches`),是 flat memory 式 pull,但无全局目录(无副本失效)、无 release 屏障(无写回屏障)——见 consistency.md §8.6 三范式对照。
+- **拓扑**:编排层星型 + 事件流。`Frontend → Router(KV-aware)→ workers(vLLM/SGLang/TRT-LLM)`;Router 内置 indexer(`lib/kv-router/`)维护各 worker 的 KV block 哈希集合(radix 副本)。KVBM 三层(logical/physical/engine)管 offload,KV 仍归引擎。
+- **元数据权威**:分层分离——服务发现与权威元数据走 etcd(或 K8s CRD/EndpointSlices);高频 KV 位置事件走 NATS JetStream,不进 etcd。说明"高频位置写不进 etcd"是常见工程取舍,与 lake"权威在 CP 内存、etcd 只存降频 checkpoint"结论同向、实现不同位。
+- **同步机制**:KV 事件经 NATS 推送(`PlacementEvent` 位置变更),Router indexer 消费事件流更新本地 radix(`ListenerLoop::apply_live_batch`,带 gap/replay);无 NATS 时降级为预测式路由(按负载)。事件 best-effort,`distributed.rs` 明示 approximate mode 允许丢事件。
+- **一致性**:无全局强一致位置视图。Router 索引为事件流构建的最终一致副本;kvbm-engine 的 leader 搬 KV 时查本地视图(`find_matches`),属 flat memory 式 pull,但无全局目录(无副本失效)、无 release 屏障(无写回屏障),见 consistency.md §8.6。
 - **HA 与故障**:canary 健康检查 + 在途请求迁移;worker 存活经 etcd lease 绑定自动收敛(`transports/etcd/lease.rs`)。
-- **扩展性**:事件流天然高频友好,Router 可水平扩展(无状态 + 索引副本);代价是索引永远"大概准",误判靠重算兜底。
-- **与 lake 对照**:Dynamo 偏"事件流编排",lake 偏"内存强一致权威 + 镜像推送 + 回查兜底"。两家都承认 etcd 不适合高频位置写;分叉在于 lake 把权威放进 CP 进程内存(单写者线性一致),Dynamo 没有这一跳权威,选错 worker 的代价是重算 prefill。
+- **扩展性**:事件流适合高频更新,Router 可水平扩展(无状态 + 索引副本);代价是索引最终一致,误判以重算兜底。
+- **与 lake 对照**:Dynamo 为事件流编排,lake 为内存强一致权威 + 镜像推送 + 回查兜底。两家均不将高频位置写压入 etcd;分叉在于 lake 将权威放进 CP 进程内存(单写者线性一致),Dynamo 无可同步查询的权威,选错 worker 的代价是重算 prefill。
 
 ## PD 分离 / E/P/D
 
