@@ -106,6 +106,8 @@ P7  性能建模与验证   → 量化各假设，回填设计
 - **seed hidden 是否跨请求缓存(遗留)**:默认 SGLang 重算式(hidden 不进 radix、命中后 draft-extend 重建);备选按 token 存 hidden 进池换跨请求复用(省重算、费存储)。drafter KV 本身已定为进池复用。
 - **DP 间在途再均衡(未来特性,框架预留分析)**:抢占重算式(仿 vLLM v1 `_preempt_request`),控制态硬核仅 RNG state + 结构化解码 FSM 游标,drafter KV 随池迁移、seed 由 `post_forward` 重建 → **框架无需特别预留**。多次迁移防抖/防饿死、imbalance 源(attn vs MoE/EPLB)、归存算分离整体细化 = 遗留问题。详见 [`architecture/scheduling.md`](architecture/scheduling.md) "DP 间在途再均衡"。
 
+- **镜像规模上限（P8 候选，是否立新阶段待定）**：全量镜像（Router/agent 各持全局只读副本）在 PB 级单一超大模型集群撞线——800 台 × 30TB、20KB/token 薄 KV 时 block ~94 亿、镜像 ~1.2TB/节点，不可行；且 CP 单写者与推送扇出更早撞线。演进方向 = 热集镜像（共享前缀 + L0 预放置 + 本机会话链）+ 冷 miss 回源查权威（复用 P6.3 权威回退路径）+ CP 按哈希范围分片；最坏情况退化为 Mooncake/MemCache 式集中查询，系统不死。现阶段全量镜像定稿不变。详见 [`architecture/control-plane.md`](architecture/control-plane.md)「镜像的规模上限与演进」。
+
 ### P1 下一步（收尾，按此顺序）
 
 1. ~~`architecture/data-flow.md`~~ ✅（done 2026-07-15）：请求生命周期详图 + 模式选择决策树 mermaid + 三模式执行段 + F4 分支；清掉 [`scheduling.md`](architecture/scheduling.md) ⚠️ 固定 P→D 残留（注解改为指向 data-flow）。

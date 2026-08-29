@@ -129,6 +129,52 @@ Dynamo router 维护**本地 radix 树副本**（每 router 实例一份），�
 
 主方案依赖控制面在线 → **控制面单点**。归 #3 待讨论 #4（单 leader + etcd，多副本留 P7）。#4 声明"假设控制面 HA 由 #3 解决"。
 
+## 镜像的规模上限与演进（现阶段不启用）
+
+> 全量镜像（Router/计算 agent 各持一份全局只读副本）是现阶段定稿，P6.1–P6.3 已落地。本节记录它的**规模上限**与撞线后的演进方向——是已知边界的备案，不是设计变更。
+
+### 量级模型
+
+镜像大小 ≈ block 数 × ~130B/条（block_hash 32B + 哈希表/arena 开销 + radix 父子链 + 位置项（平均 1.5 副本）+ ref/热度）。block 数 = 池字节 ÷（每 token KV × 128 token/block）——**镜像由 block 数决定，不由字节数决定**：
+
+| 集群 L0–L3 聚合 | 每 token KV | block 大小 | block 数 | 镜像大小 |
+|---|---|---|---|---|
+| 100 TB | 150 KB（胖 GQA） | ~19 MB | ~5 M（5 百万） | ~0.7 GB |
+| 1 PB | 20 KB（薄 KV / MLA 类） | 2.56 MB | ~390 M（3.9 亿） | ~50 GB |
+| 24 PB（800 台 × 30TB，单一超大模型多套部署） | 20 KB | 2.56 MB | ~9.4 G（94 亿） | ~1.2 TB（不可行） |
+
+两个敏感性：①同样字节数，KV 越薄的模型 block 越多、镜像越大（20KB/token 是不利情形；300KB/token 的胖 GQA 同样 1PB 只有 ~26M block、~3.4GB）；②radix 节点只存 hash 不存 token 序列（对齐 vLLM `ExternalBlockHash` 链式哈希查找）是上述数字成立的前提——若像 SGLang `TreeNode` 边上存 token id（+512B/block），1PB 薄 KV 场景涨到 ~250GB。
+
+**触发条件**：单一超大模型 + 多实例部署（一套 8 台 64 卡、集群上百套）——每个节点都是同一 `(model_id, revision)`，"节点只订阅自己服务的命名空间"帮不上，这是全量镜像真正撞线的场景。多模型集群可靠命名空间订阅续命更久。
+
+注意先坏的并不是镜像内存：**CP 单写者吞吐/内存与推送扇出**（事件率 × 订阅者数）更早撞线；镜像内存是第三个约束。
+
+### 对照：星型有中心索引为何不爆炸
+
+reference 实现全是"有中心"的，但它们的索引不爆炸，机制分三派：
+
+| 派别 | 代表 | 索引形态 | 不爆炸的原因 | 代价 |
+|---|---|---|---|---|
+| 星型集中查询 | Mooncake master / MemCache `MetaService` / LMCache controller | 全集群**一份**，中心内存；spoke 零索引，每操作 RPC | 不乘节点数；中心垂直堆内存 + 进程内锁分片（Mooncake `std::array<MetadataShard,1024>`，`master_service.h`）；**跟踪集合小**——只跟踪缓存层，lease/TTL 持续清理（per-object lease 默认 5s、`client_live_ttl_sec` 10s） | 每操作一跳 RPC；中心内存仍是天花板——LMCache 源码自承认 `RegistryTree` 全内存 + `KVController` lookup O(n²) 是规模瓶颈 |
+| 实例私有 | SGLang / FlexKV | 只覆盖本机介质 | 规模 ∝ 单实例容量，天然有界 | 无全局权威（FlexKV `CRadixTreeIndex` 在 connector 进程内、不索引 HBM，集群级只有 Redis 周期快照，无权威可回查） |
+| 近似副本 | Dynamo router | 全量副本但 lossy | 允许丢事件 + prune 校正；只跟踪 worker 上报的缓存集（非持久池） | 一致性打折 |
+
+**"星型不爆炸"是有条件的**：比"每节点一份"晚到，不是不到（LMCache 已撞）。
+
+**lake 与三派的差异**：①lake radix 覆盖 L0–L3 **含持久层**（L2 = F4 恢复点每块必注册、L3 SSOT），跟踪集合天然比"只跟踪缓存层"的系统大一个量级——这是 durable-first + 统一编址的设计代价；②选路热路径 µs 级（5ms 预算，见 [`cost-model.md`](cost-model.md)），付不起星型派的每操作 RPC；③D-direct 要答"哪个节点 HBM 有这段前缀"，实例私有派答不了。
+
+### 演进方向（撞线时启用）
+
+本质是**混合**：热路径保持镜像优势（不付 RPC），冷尾退化到星型工作点（付 RPC）。
+
+1. **镜像瘦身**：只推 ①共享热前缀（产品化部署的 system prompt/工具定义/文件库，复用价值的九成在此，见 [`../research/agentic-cache-workload.md`](../research/agentic-cache-workload.md)，账单命中率 91.9%）+ ②L0 预放置块（方案 Z 本来就发布）+ ③路由到本机的会话链（会话到达一次性预取，之后新块本机自产自知）。冷长尾（各会话历史块）不推送。镜像大小与集群规模脱钩。
+2. **冷 miss 同步查权威**：复用现成的权威回退路径（P6.3 已有镜像 total-miss 回退权威的先例；`LookupPrefix`/`Locate`），一跳 ~0.5ms 在 5ms 预算内。一致性语义不变——权威查询本就线性一致（见 [`consistency.md`](consistency.md) §1），只是选路查询的分布从"全本地"变成"热本地 + 冷回源"。
+3. **CP 按 block 哈希范围分片**撑查询 QPS：比 Mooncake 进程内 1024 锁分片更进一步，做跨实例分片；shard ring（join/drain/remove）地基已有，与控制面多副本（下「控制面 HA」）同属规模化议程。
+4. **会话局部性是设计内假设**：亲和路由（session id + HRW 钉家节点，`go/router/affinity.go::pickNodeForRequest`）使会话历史大概率在家节点本机（local overlay 可知，无需全局镜像）；负载均衡/扩缩容导致的漂移是少数，漂移走冷查询 + 池内拉取（durable-first 保证数据不依赖原节点存活）。行业同向押注：vLLM #48501 `session_id`/`continuation_id`（[`../research/vllm/kv-session-roadmap.md`](../research/vllm/kv-session-roadmap.md)）、SGLang #21846 agent hints（[`../research/sglang/agentic-kv-roadmap.md`](../research/sglang/agentic-kv-roadmap.md)）。
+5. **附带收益**：推送事件率从"每块注册"降到"热集变更"，扇出问题顺带缓解。
+
+**兜底**：共享/局部性假设全失效（裸多租户 API + 会话随机漂移）时，退化为"每请求问一次 CP"——即 Mooncake/MemCache 的常规工作点，系统不死，只是热路径优势消失。镜像是优化层，不是正确性依赖。
+
 ## 控制面 HA（对应 #3 待讨论 #4，已定）
 
 主方案 gRPC stream 依赖控制面在线，控制面是单点。HA 机制照搬 Mooncake（单 leader + 元数据在 leader 内存 + 选主 + 快照重建 + 客户端重连），lake 在重建对象与重建源上不同。
@@ -155,7 +201,7 @@ flowchart TB
 - **搬 KV 重试**：agent 同步查权威失败 → 退避重试，等新 leader 重建完。搬 KV 本就 ms 级，容忍秒级抖动一次（故障罕见）。
 - **stream 断**：Router/agent 用 #4 定的 "resume from seq N" + gap replay 重连新 leader。
 
-**多副本留 P7**：active-active 需复制控制面内存权威，复杂度高；规模到了再做。P7 前单 leader + etcd 选主/重建足够。
+**多副本留 P7**：active-active 需复制控制面内存权威，复杂度高；规模到了再做。P7 前单 leader + etcd 选主/重建足够。规模触发时的镜像瘦身与 CP 分片见上「镜像的规模上限与演进」。
 
 **与 Mooncake 的区别**（机制照搬，内容与源不同）：
 
