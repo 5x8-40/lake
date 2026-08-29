@@ -260,11 +260,11 @@ FlexKV 与 **LMCache / UCM 同层**（引擎 connector），本机索引接近 *
 
 | FlexKV 设计 | 我们对应 | 说明 |
 |-------------|----------|------|
-| **`KVConnectorBase_V1` 调度侧 launch** | worker↔池 client | match → alloc → 填 GPU slot → 异步传输 |
-| **`TensorSharedHandle` / `register_gpu_blocks`** | L0 句柄 vs 池所有权 | 划清「映射引擎页」和「池分配 HBM」 |
-| **每层 `CRadixTreeIndex` + mempool + ready/lock** | 控制面 radix + 层内块 | 结构可对照 B；lake 合成一份树 + `locations` |
-| **SWA 挂 Full 节点** | t/r-type 元数据 | 避免两棵树漂移 |
-| **Mooncake TE / GDS / store adapter** | Transfer Bus / L2 后端 | 传输与远端字节层；不替代位置权威 |
+| 调度器侧 `get_match` → 引擎分槽 → `set_gpu_blocks` → 异步传输 | worker↔池 client | 引擎先给出 GPU `block_id`，FlexKV 再往这些槽灌入或从这些槽卸出。P5 对接按这个顺序；FlexKV 自己不分 GPU 槽。 |
+| `register_gpu_blocks`（CUDA IPC / fabric handle） | 不照搬成 L0 | 只把引擎已有的 HBM 页映射进传输进程，用来拷贝。lake 由池分配 HBM，不是去映射引擎页。 |
+| 每层一棵 `CRadixTreeIndex` + mempool（ready / lock / evict） | 控制面 radix + 层内块池 | 和 Dynamo kvbm-logical 一样：前缀树管命中，mempool 管该层物理块。FlexKV 按 CPU/SSD/REMOTE 拆成三棵进程内树；lake 只要一份树，块在哪一层写在 `locations`。 |
+| SWA 状态挂在 Full-KV 节点上 | t/r-type 记在布局元数据 | Full 和滑动窗口共用一棵树，避免两套索引对不齐。 |
+| Mooncake TE / GDS / Mooncake store | Transfer Bus / L2–L3 介质 | 只借鉴怎么搬字节、远端怎么存对象。谁命中、KV 在哪，仍归控制面。 |
 
 ### 关键差异
 

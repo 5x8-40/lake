@@ -49,7 +49,7 @@
 
 1. **connector 时序**：match → alloc → `set_gpu_blocks` → 异步传输；结束 delay-free。P5 对接引擎时要对齐「引擎槽已有、再填传输图」。
 2. **GPU 只映射**：IPC/fabric handle，不自建 HBM 池。和 lake「计算不拥有 HBM」方向相反，但把「句柄 vs 池」划清了，可对照 Dynamo G1。
-3. **每层 radix + mempool + lock/ready**：`CRadixTreeIndex` 的 ready/lock/evict 可对照 B 复用路径；lake 要合成一层树 + 多层 location，不要三套进程内树。
+3. **每层 radix + mempool + lock/ready**：`CRadixTreeIndex` 的 ready/lock/evict 和 Dynamo kvbm-logical（前缀树 + 每层块池）同类。lake 合成一份树 + 多层 `locations`，不要按介质拆三套进程内树。
 4. **布局探测**：从 GPU tensor shape 推 LAYERFIRST / LAYERBLOCK，避免写死 vLLM 版本布局。
 5. **SWA 挂在 Full 节点上**：与 HiCache 同思路，避免 Full/SWA 两棵树漂移。
 
