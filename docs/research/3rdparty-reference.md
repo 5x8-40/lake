@@ -12,6 +12,7 @@
 - [`memcache/`](memcache/) — Ascend MemCache:[总览](memcache/overview.md) · [架构](memcache/architecture.md) · [痛点与 lake 对照](memcache/pain-points.md)
 - [`ucm/`](ucm/) — UCM(ModelEngine):[总览](ucm/overview.md) · [架构](ucm/architecture.md) · [痛点与 lake 对照](ucm/pain-points.md)
 - [`tensorcast/`](tensorcast/) — TensorCast:[总览](tensorcast/overview.md) · [运行时架构](tensorcast/architecture.md) · [论文实验详录](tensorcast/evaluation.md) · 张量状态基础设施层(权重/KV/checkpoint 抽离进程 + Global Store/Store Daemon + CUDA IPC + RDMA/TCP P2P + policy 放置契约 + binding 热替换)
+- [`flexkv/`](flexkv/) — FlexKV(TACO):[总览](flexkv/overview.md) · [架构与 HBM](flexkv/architecture.md) · [痛点与 lake 对照](flexkv/pain-points.md) · 引擎旁 CPU/SSD/远端卸载(GPU 由引擎持有,IPC 映射)
 - [guided-decoding.md](guided-decoding.md) — **Guided / structured decoding**(SGLang × vLLM):xgrammar/llguidance 库边界、overlap/async 下能否消同步、spec+grammar 硬缺口
 - [sampling-params.md](sampling-params.md) — **Sampling 参数对照**(SGLang × vLLM):核心/独有字段、`n`≠beam、spec 禁 min_p/logit_bias；penalty 空泡与 V2；采样状态归属 / Spec 兼容矩阵 / `n` 与前缀 KV 共享
 - [scheduler-worker-interface.md](scheduler-worker-interface.md) — **Scheduler→Worker 字段全集**(SGLang × vLLM):`SchedulerOutput` vs `ScheduleBatch`/`ForwardBatch`、差异表、架构根因、对 lake D1 含义
@@ -34,8 +35,9 @@
 | `3rdparty/memcache` | [Ascend/memcache](https://github.com/Ascend/memcache) | master HEAD (`14b4e35`) | **昇腾 KV 对象池** Meta/Local + MemFabric;见 [memcache/](memcache/) |
 | `3rdparty/ucm` | [ModelEngine-Group/unified-cache-management](https://github.com/modelengine-group/unified-cache-management) | main HEAD (`37af15e`) | **统一缓存框架** store+connector+PD-via-pool;见 [ucm/](ucm/) |
 | `3rdparty/tensorcast` | [tensorcast-ai/tensorcast](https://github.com/tensorcast-ai/tensorcast) | main HEAD (`19f54d60`, v0.1.0+6) | **张量状态基础设施层** artifact + Global Store/Store Daemon + CUDA IPC + RDMA/TCP P2P + policy 放置契约 + binding 热替换;见 [tensorcast/](tensorcast/) |
+| `3rdparty/flexkv` | [taco-project/FlexKV](https://github.com/taco-project/FlexKV) | main HEAD (`a5c8f12`, 2026-08-27) | **引擎旁多层 KV 卸载** CPU/SSD/REMOTE radix + GPU IPC 映射 + vLLM/SGLang/Dynamo/TRT connector;见 [flexkv/](flexkv/) |
 
-> 生态相连:vLLM `KVConnectorBase_V1` 被 LMCache/Mooncake/NIXL/FlexKV/**TileRT**/**UCM** 等实现;vLLM-Ascend 另将 **MemCache** 列为 KV Pool backend;SGLang HiCache 把 Mooncake 作 L3;Dynamo 编排 vLLM/SGLang;UCM 主推经统一池做 PD;TileRT 做低延迟 decode。我们站在其上做更彻底的存算分离。
+> 生态相连:vLLM `KVConnectorBase_V1` 被 LMCache/Mooncake/NIXL/**FlexKV**/**TileRT**/**UCM** 等实现;vLLM-Ascend 另将 **MemCache** 列为 KV Pool backend;SGLang HiCache 把 Mooncake 作 L3,另有 `--enable-flexkv`;Dynamo 编排 vLLM/SGLang,可把 FlexKV 当 connector;UCM 主推经统一池做 PD;TileRT 做低延迟 decode。我们站在其上做更彻底的存算分离。
 
 ---
 
@@ -144,7 +146,7 @@ vLLM 是本系统**计算层(Python + Triton)**的直接参考。SGLang/LMCache/
 
 ## 5. Dynamo → 我们的编排层 / 控制面 / KVBM 分层
 
-源码入口:`3rdparty/dynamo/lib/`(Rust 核心)、`components/`、`lib/runtime/`。Dynamo 是 NVIDIA 的"推理引擎之上的编排层",把 vLLM/SGLang/TRT-LLM 作为可插拔 worker 协调成多节点系统。**Rust 写核心性能路径 + 控制面**,是 lake 三语言分层(Rust 存储/Go 控制/Python 计算)中 Rust 控制面/编排的直接参照系。深度分析见 [`dynamo/overview.md`](dynamo/overview.md)。
+源码入口:`3rdparty/dynamo/lib/`(Rust 核心)、`components/`、`lib/runtime/`。Dynamo 是 NVIDIA 的"推理引擎之上的编排层",把 vLLM/SGLang/TRT-LLM 作为可插拔 worker 协调成多节点系统。**Rust 写核心性能路径 + 控制面**,是 lake 三语言分层(Rust 存储/Go 控制/Python 计算)中 Rust 控制面/编排的直接参照系。深度分析见 [`dynamo/overview.md`](dynamo/overview.md)。卸载路径对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 
 ### 借鉴点
 
@@ -220,7 +222,7 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 | 我们的设计层 | 主要参考 | 我们多做的(更彻底) |
 |--------------|----------|---------------------|
 | **计算层**(worker/attention/runner) | **vLLM**(PagedAttention/`GPUModelRunner`/spec decode) | worker 无状态化(模型/KV 从存储池读写);attention 核用 Triton |
-| **worker↔存储池接入** | **vLLM `KVConnectorBase_V1`** + **UCM connector** 集成样板 | connector 从可选插件升为存储池必经路径;集群级权威。注:`SupportsHMA`(HMA,多 KV group)≠ 方案 Z,方案 Z 为本系统增量 |
+| **worker↔存储池接入** | **vLLM `KVConnectorBase_V1`** + **UCM / FlexKV connector** 集成样板 | connector 从可选插件升为存储池必经路径;集群级权威。注:`SupportsHMA`(HMA,多 KV group)≠ 方案 Z,方案 Z 为本系统增量 |
 | L0-L3 分层 | SGLang HiCache | L1/L2 也归存储池(非实例私有);统一冷热/生命周期 |
 | KV Pool 数据面 | Mooncake transfer-engine + store；**Ascend MemCache**(异构对照) | 内容寻址 + radix + 多模型配额/GC/碎片整理；MemCache 作 Meta/Local·多层·OneCopy 对照(exact-key,非 radix) |
 | 前缀复用 | SGLang RadixAttention + LMCache | radix 归存储池 + 位置视图一跳 + 反向回传生长 |
@@ -247,6 +249,28 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 - TileRT **核闭源**、钉 8×B200、公开树无 radix/分层池/`bs>1`——**不是**存储面或通用计算层蓝图。
 - PD 是 **vLLM block_id → 单槽 inject**；lake 是池权威 + 混合执行（含 D-direct）。
 - 过载 429 在小路由器内；lake 过载归 gateway。
+
+## 9. FlexKV → 引擎旁 CPU/SSD/远端卸载
+
+源码入口:`3rdparty/flexkv/`。深度分析见 [`flexkv/`](flexkv/)。卸载路径对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
+
+FlexKV 与 **LMCache / UCM 同层**（引擎 connector），本机索引接近 **KVBM G2/G3**：CPU/SSD/REMOTE 各有 radix + mempool，GPU 只做 IPC 映射。请求结束后 D2H，`request_finished` delay-free。跨节点 Redis 快照或 Dynamo KV events（文档声明勿与 P2P 复用同开）。
+
+### 借鉴点
+
+| FlexKV 设计 | 我们对应 | 说明 |
+|-------------|----------|------|
+| 调度器侧 `get_match` → 引擎分槽 → `set_gpu_blocks` → 异步传输 | worker↔池 client | 引擎先给出 GPU `block_id`，FlexKV 再往这些槽灌入或从这些槽卸出。P5 对接按这个顺序；FlexKV 自己不分 GPU 槽。 |
+| `register_gpu_blocks`（CUDA IPC / fabric handle） | 不照搬成 L0 | 只把引擎已有的 HBM 页映射进传输进程，用来拷贝。lake 由池分配 HBM，不是去映射引擎页。 |
+| 每层一棵 `CRadixTreeIndex` + mempool（ready / lock / evict） | 控制面 radix + 层内块池 | 和 Dynamo kvbm-logical 一样：前缀树管命中，mempool 管该层物理块。FlexKV 按 CPU/SSD/REMOTE 拆成三棵进程内树；lake 只要一份树，块在哪一层写在 `locations`。 |
+| SWA 状态挂在 Full-KV 节点上 | t/r-type 记在布局元数据 | Full 和滑动窗口共用一棵树，避免两套索引对不齐。 |
+| Mooncake TE / GDS / Mooncake store | Transfer Bus / L2–L3 介质 | 只借鉴怎么搬字节、远端怎么存对象。谁命中、KV 在哪，仍归控制面。 |
+
+### 关键差异
+
+- FlexKV **不索引 HBM**，GPU 命中仍看引擎 APC；lake L0 在控制面。
+- 驱逐不向下层写回；lake L2 是 F4 恢复点，冷热按移动。
+- Redis/事件不是单写者位置视图；worker 退出后本机树通常一起没。
 
 ## 代码级复用策略（按模块，互不替代）
 
@@ -283,7 +307,7 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 - vendor 的主要收益——现成的测试——在这两层拿不到：它们的正确性依赖真实环境（NIXL、RDMA 网卡、GPU、S3），拷过来单测跑不起来，只剩下钉工具链和 re-vendor 合并的成本。
 - 语言边界：engine 层管对接推理引擎，lake 的引擎对接在 Python 计算层，用不上它。
 - 推论：就算传输底座改选 NIXL，也只能救回 physical 的 transfer 半边，engine 层依然不可用。真正的决策点是"KV 归谁、谁发起传输"，传输底座的选择是它的下游。
-- 其余（SGLang HiCache 策略、LMCache 后端思路、vLLM `KVConnectorBase_V1`、Dynamo kv-router 选路公式）继续以**借鉴/对照**为主，默认不链进依赖树；计算层（P5）再评估 vLLM/SGLang 引擎经 connector 接入。
+- 其余（SGLang HiCache 策略、LMCache 后端思路、vLLM `KVConnectorBase_V1`、FlexKV/UCM connector、Dynamo kv-router 选路公式）继续以**借鉴/对照**为主，默认不链进依赖树；计算层（P5）再评估 vLLM/SGLang 引擎经 connector 接入。
 
 **现状（P4.2 合入 / P4.3）**：复用 **B** vendor + controlplane radix/驱逐。**P4.3**：`LocalTierEngine`（写回**只 L2**；L3 仅 demote/cap XOR；`pin`≈`lock_ref`；`TierSideEffects`）+ `TierPipeline` + `apply_location_events`；PutEnd=Mooncake COMPLETE。对齐 `storage-layer.md` 写回路径与 SGLang demotion-only L1。真 NVMe/跨机 defer P5；满块顺便写 L1 留 P7。
 
@@ -300,7 +324,7 @@ P4(KV Pool 原型,Rust)时按此顺序；**1 与「Dynamo KVBM」分属上表 A/
 2. **Dynamo kvbm-logical**（代码复用 B，fork 抽 crate）：radix + `BlockManager`/`presence_markers` → `kv-pool` / controlplane；补 L0 + promote。
 3. **Mooncake store + LMCache storage_backends**：KV store 分片/后端 → L3 + L2/NVMe（字节层；寻址仍归 B）。
 4. **Ascend MemCache**（对照，非默认复用）：Meta/Local、多层淘汰、OneCopy 路径分类 → 昇腾部署与对象池 API 形态对照；不替代 A/B。
-5. **UCM `UcmKVStoreBaseV1` + connector**（对照，偏 P5）：store 原语/工厂、PD-via-pool 叙事、layer-wise connector → worker↔池形态；不替代 A/B，不引入稀疏必选项。
+5. **UCM / FlexKV connector**（对照，偏 P5）：UCM 的 store 原语/工厂、PD-via-pool；FlexKV 的 delay-free D2H、GPU 只映射、每层本机 radix。均不替代 A/B，不把 HBM 排除在权威索引外，不引入稀疏必选项。
 6. **SGLang HiCache HiRadixTree + page_first_direct**：节点记位置 + 布局策略 → `locations` 元数据 + 分块流水线（对照 B，非第二套树）。
 7. **SGLang HiCache prefetch/write-back 策略**：迁移触发与写回频率 → 冷热迁移 + decode 写回 N。
 8. **LMCache rust/ + 跨实例复用**：Rust 存储层工程模式 + 复用场景验证。
@@ -346,7 +370,7 @@ Dynamo 跨 **P4(存储)** 与 **控制面(选路/通信)**,不进上面"抄源�
 - **双向 pipeline**:Dynamo offload demote-only(G1→G2→G3/G4),promote 走 leader session 拉取;lake 要自建 promote pipeline(L3→L2→L1→L0 预放置)。
 - **控制面一致性**:Dynamo KV 事件走 NATS(best-effort,`lib/runtime/src/distributed.rs:483` 丢了即跳过);lake 位置视图权威在存储控制面进程内存、etcd 降频 checkpoint,Router 本地镜像一跳命中。
 
-> 参考源码时注意:五个 submodule 各带自己的 `.claude/` 规则(如 sglang 的 modify-component-must-read、mooncake 的 skills),那些是**修改它们自身代码**的约束,与我们参考其设计无关,忽略。
+> 参考源码时注意:各 submodule 自带 `.claude/` 规则(如 sglang 的 modify-component-must-read、mooncake 的 skills),那些是**修改它们自身代码**的约束,与我们参考其设计无关,忽略。
 
 ## submodule 使用约定
 
@@ -360,6 +384,7 @@ Dynamo 跨 **P4(存储)** 与 **控制面(选路/通信)**,不进上面"抄源�
 跨多个 submodule 的机制专题(非单项目分目录):
 
 - **PD 分离的控制机制**:vLLM(KVConnector 插件 + 外部 proxy)vs SGLang(固定角色 + 内建队列状态机)对比——角色划分、配对握手、KV 传输推进、失败处理,及与 lake"KV 归池 + 逐请求选模式"的差异。见 [`pd-disaggregation.md`](pd-disaggregation.md)。
+- **HBM 归属与 KV 卸载**:谁发 GPU 槽、GPU 是否编进传输图、Dynamo G1 句柄 vs 池；覆盖 HiCache / vLLM offload / LMCache / KVBM / FlexKV / UCM / Mooncake store+TE / MemCache / TileRT / TensorCast / CMX。见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 
 ## 非 submodule 文献参考
 

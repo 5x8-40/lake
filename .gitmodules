@@ -28,3 +28,6 @@
 [submodule "3rdparty/tensorcast"]
 	path = 3rdparty/tensorcast
 	url = https://github.com/tensorcast-ai/tensorcast.git
+[submodule "3rdparty/flexkv"]
+	path = 3rdparty/flexkv
+	url = https://github.com/taco-project/FlexKV.git

@@ -137,17 +137,19 @@ lake/
 │       ├── lmcache/               #   LMCache 深度分析
 │       ├── mooncake/              #   Mooncake 深度分析
 │       ├── vllm/                  #   vLLM 深度分析（计算层参考）
-│       └── dynamo/                #   Dynamo 深度分析（编排层/控制面参考）
+│       ├── dynamo/                #   Dynamo 深度分析（编排层/控制面参考）
+│       └── flexkv/                #   FlexKV（引擎旁 CPU/SSD/远端卸载）
 ├── 3rdparty/                   # 参考源码（git submodule，只读）
 │   ├── sglang/                 #   SGLang（HiCache 分层 KV + spec decode 计算层）
 │   ├── lmcache/                #   LMCache（跨实例 KV 复用）
 │   ├── mooncake/               #   Mooncake（KVCache-centric 分离架构）
 │   ├── vllm/                   #   vLLM（计算层：PagedAttention/KV connector）
-│   └── dynamo/                 #   Dynamo（编排层：KV-aware router + KVBM 三层 offload）
+│   ├── dynamo/                 #   Dynamo（编排层：KV-aware router + KVBM 三层 offload）
+│   └── flexkv/                 #   FlexKV（引擎旁 CPU/SSD/远端 KV 卸载）
 └── src/                        # 早期单进程 Python 原型（验证假设用，将被 rust/go/python 子项目取代）
 ```
 
-> 首次 clone 后执行 `git submodule update --init --recursive` 拉取 `3rdparty/`。五个参考项目与本系统设计的逐层对应见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。
+> 首次 clone 后执行 `git submodule update --init --recursive` 拉取 `3rdparty/`。参考项目与本系统设计的逐层对应见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。
 >
 > submodule 体积较大（SGLang/Mooncake/vLLM 各数百 MB）。磁盘紧张或想快速浏览时用浅克隆：
 > ```bash

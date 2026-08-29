@@ -81,8 +81,9 @@ docs/
 | `3rdparty/memcache` | Ascend/memcache | **昇腾分布式 KVCache 对象池**(MetaService/LocalService、HBM/DRAM/SSD、MemFabric OneCopy)→ 见 [`docs/research/memcache/`](docs/research/memcache/) |
 | `3rdparty/ucm` | ModelEngine-Group/unified-cache-management | **统一缓存框架**(可插拔 KVStore、vLLM connector、稀疏插件、PD-via-pool)→ 见 [`docs/research/ucm/`](docs/research/ucm/) |
 | `3rdparty/tensorcast` | tensorcast-ai/tensorcast | **张量状态基础设施层**:权重/KV/checkpoint 抽离进程为分布式 artifact + Global Store/Store Daemon 控制面/数据面分离 + CUDA IPC 同机零拷贝 + RDMA/TCP P2P + policy 预设(cache/durable/ha/cold/warm/pinned)放置契约 + binding 版本热替换 → 见 [`docs/research/tensorcast/`](docs/research/tensorcast/)(overview / architecture / evaluation) |
+| `3rdparty/flexkv` | taco-project/FlexKV | **引擎旁多层 KV 卸载**:CPU/SSD/REMOTE radix + GPU IPC 映射(不拥有 HBM)+ vLLM/SGLang/Dynamo/TRT connector → 见 [`docs/research/flexkv/`](docs/research/flexkv/)(overview / architecture / pain-points) |
 
-逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm,tensorcast}/`；Transformers 仅作为模型定义源码参考。
+逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm,tensorcast,flexkv}/`；Transformers 仅作为模型定义源码参考。
 
 约定:
 - `3rdparty/` **只读**,不修改 submodule 内代码。要改造先 fork 换 URL。
@@ -118,6 +119,7 @@ docs/
    - **Agentic cache workload**：匿名 Cursor 用量、provider cache 留存、File Library 边界与 90%/95% 仿真输入 → `docs/research/agentic-cache-workload.md`
    - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）
    - **张量状态基础设施(TensorCast)**:权重/KV/checkpoint 抽离进程为分布式 artifact + Global Store/Store Daemon 控制面/数据面分离 + CUDA IPC 同机零拷贝 + RDMA/TCP P2P + policy 预设(cache/durable/ha/cold/warm/pinned)放置契约 + binding 版本热替换 + tensor view(TP shard) → `docs/research/tensorcast/{overview,architecture,evaluation}.md`（submodule `3rdparty/tensorcast`;与 lake 存储层/权重缓存同构对照）
+   - **引擎旁 KV 卸载(FlexKV)**:CPU/SSD/REMOTE 本机 radix、GPU 仅 IPC 映射、delay-free D2H、vLLM/SGLang/Dynamo connector → `docs/research/flexkv/{overview,architecture,pain-points}.md`；HBM/卸载全 3rdparty 对照（含 G1 句柄）见 `docs/research/hbm-tier-and-offload.md`
    - 跨项目逐层对应与借鉴顺序 → `docs/research/3rdparty-reference.md`
 3. **沿代码回溯**：每个参考文档末尾都有「代码索引」节，把概念/机制映射到 `文件:符号`。符号名是稳定锚点（行号会漂移，找不到时 `grep -n "符号名" 3rdparty/<repo>/<文件路径>`）。需要确认实现细节时，直接读对应符号的源码。
 

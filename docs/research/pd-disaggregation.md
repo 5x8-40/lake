@@ -22,7 +22,7 @@ vLLM 引擎本身**不内建 PD 编排**,而是把"KV 怎么在 P/D 间搬"抽�
 
 外部 proxy(`examples/disaggregated/disaggregated_serving/disagg_proxy_demo.py`)先把请求发 P 实例(配 `kv_producer`)触发 KV 产出,再发 D 实例(`kv_consumer`)续 decode;角色由 `kv_transfer_config` 配置。P/D 间握手用 `KVConnectorHandshakeMetadata`,传输元数据用 `KVConnectorMetadata`。
 
-传输后端多样,均实现为 connector:**NIXL / Mooncake / P2pNccl / LMCache / SharedStorage / FlexKV** 等(`vllm/distributed/kv_transfer/kv_connector/v1/` 下各子目录)。
+传输后端多样,均实现为 connector:**NIXL / Mooncake / P2pNccl / LMCache / SharedStorage / FlexKV** 等(`vllm/distributed/kv_transfer/kv_connector/v1/` 下各子目录)。FlexKV 本体见 [`flexkv/`](flexkv/)。
 
 ### 特点
 

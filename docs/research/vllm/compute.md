@@ -79,7 +79,7 @@ connector 分两侧(同文件):
 | `LMCacheConnectorV1` | `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py` (L72) | 跨实例复用 + 多后端 |
 | `MooncakeStoreConnector` | `…/mooncake/store/connector.py` (L87) | RDMA 零拷贝 KV 池 |
 | `NixlBaseConnector` | `…/nixl/connector.py` (L79) | NIXL 传输 |
-| `FlexKVConnectorV1` | `…/flexkv_connector.py` (L35) | rank-0 leader + eventfd layerwise |
+| `FlexKVConnectorV1` | `…/flexkv_connector.py` (L35) | 调度侧 launch + GPU IPC 映射；见 [`flexkv/`](../flexkv/) |
 | `MultiConnector` | `…/multi_connector.py` (L128) | 组合多 connector |
 | `OffloadingConnector` / `SimpleCPUOffloadConnector` | `…/offloading_connector.py`、`…/simple_cpu_offload_connector.py` | CPU offload |
 
@@ -300,7 +300,7 @@ FSM / bitmask fill 在 scheduler 侧 CPU(`StructuredOutputManager`);`execute_mod
 | LMCache connector | `vllm/distributed/kv_transfer/kv_connector/v1/lmcache_connector.py`::`LMCacheConnectorV1` (L72) |
 | Mooncake connector | `…/mooncake/store/connector.py`::`MooncakeStoreConnector` (L87) |
 | NIXL connector | `…/nixl/connector.py`::`NixlBaseConnector` (L79) |
-| FlexKV connector | `…/flexkv_connector.py`::`FlexKVConnectorV1` (L35) |
+| FlexKV connector | `…/flexkv_connector.py`::`FlexKVConnectorV1` (L35)；实现在 `3rdparty/flexkv`，见 [`flexkv/`](../flexkv/) |
 | 组合 connector | `…/multi_connector.py`::`MultiConnector` (L128) |
 | offload connector | `…/offloading_connector.py`::`OffloadingConnector` (L46) / `…/simple_cpu_offload_connector.py`::`SimpleCPUOffloadConnector` (L45) |
 | Mooncake connector(已扩目录) | `…/mooncake/`::`store/connector.py::MooncakeStoreConnector` (L87) / `mooncake_connector.py` / `rdma_utils.py` / `stats.py` |

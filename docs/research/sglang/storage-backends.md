@@ -37,7 +37,7 @@ L3 后端统一抽象,位于 `hicache_storage.py:141`。三套接口代际并存
 ## 非后端注册的替代方案
 
 - `lmcache`(`LMCRadixCache` 继承 `RadixCache`,非 `HiCacheStorage`)— radix-cache 层集成,`--enable-lmcache` + `--lmcache-config-file`。见 [../lmcache/overview.md](../lmcache/overview.md)。
-- `flexkv`(`FlexKVRadixCache` 继承 `RadixCache`)— `--enable-flexkv`,rank-0 leader 模式 + eventfd layerwise。
+- `flexkv`(`FlexKVRadixCache` 继承 `RadixCache`)— `--enable-flexkv`,rank-0 leader 模式 + eventfd layerwise。源码与 HBM 角色见 [`../flexkv/`](../flexkv/)。
 
 ## 异构 TP(`tp_lcm_size`)
 
