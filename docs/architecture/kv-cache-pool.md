@@ -73,7 +73,7 @@ message BlockMeta { KVBlockID id; BlockKind block_kind; repeated Location locati
 
 radix tree 归存储池,按 `(model_id, revision)` 分命名空间(每命名空间一个 `BlockRegistry` / 一棵 radix)。节点 = block hash,路径 = token 序列;给定 prompt 沿树匹配最长公共前缀,确定可复用 KV block 范围。下线级联删 = drop 整个命名空间(强句柄释放 → radix Weak 失效)。
 
-**权威、镜像与本地 overlay**：radix tree 的**全局提交态权威**在存储控制面进程内存（位置视图权威的一部分,见 [`control-plane.md`](control-plane.md)「位置视图权威的归属」）。Router 与各 agent 各持一份**只读 global view mirror**（控制面 gRPC stream 推送的副本,见 [`control-plane.md`](control-plane.md)「Router 持位置视图镜像」）。这不等于 agent 没有可写本地状态：每个 agent 还维护自己的 **local overlay**（本机 L0/L1/L2 状态、slot/free-list、local ref、writeback/in-flight 状态）,热路径先写本地 overlay,再把满块注册、位置变化、ref 汇总、barrier 等事件批量/异步提交给 CP。换言之:mirror 只读;local overlay 可写;CP 只接收全局可见的提交态事件。
+**权威、镜像与本地 overlay**：radix tree 的**全局提交态权威**在存储控制面进程内存（位置视图权威的一部分,见 [`control-plane.md`](control-plane.md)「位置视图权威的归属」）。Router 与各 agent 各持一份**只读 global view mirror**（控制面 gRPC stream 推送的副本,见 [`control-plane.md`](control-plane.md)「Router 持位置视图镜像」）。这不等于 agent 没有可写本地状态：每个 agent 还维护自己的 **local overlay**（本机 L0/L1/L2 状态、slot/free-list、local ref、writeback/in-flight 状态）,热路径先写本地 overlay,再把满块注册、位置变化、ref 汇总、barrier 等事件批量/异步提交给 CP。换言之:mirror 只读;local overlay 可写;CP 只接收全局可见的提交态事件。全量镜像的规模上限与演进方向见 [`control-plane.md`](control-plane.md)「镜像的规模上限与演进」。
 
 **两类查询走不同的树**（别混）：
 
