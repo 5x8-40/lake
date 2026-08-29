@@ -143,11 +143,9 @@ Dynamo router 维护**本地 radix 树副本**（每 router 实例一份），�
 | 1 PB | 20 KB（薄 KV / MLA 类） | 2.56 MB | ~390 M（3.9 亿） | ~50 GB |
 | 24 PB（800 台 × 30TB，单一超大模型多套部署） | 20 KB | 2.56 MB | ~9.4 G（94 亿） | ~1.2 TB（不可行） |
 
-两个敏感性：①同样字节数，KV 越薄的模型 block 越多、镜像越大（20KB/token 是不利情形；300KB/token 的胖 GQA 同样 1PB 只有 ~26M block、~3.4GB）；②radix 节点只存 hash 不存 token 序列（对齐 vLLM `ExternalBlockHash` 链式哈希查找）是上述数字成立的前提——若像 SGLang `TreeNode` 边上存 token id（+512B/block），1PB 薄 KV 场景涨到 ~250GB。
+两个敏感性：①同样字节数，KV 越薄的模型 block 越多、索引越大（20KB/token 是不利情形；300KB/token 的胖 GQA 同样 1PB 只有 ~26M block、~3.4GB）；②radix 节点只存 hash 不存 token 序列（对齐 vLLM `ExternalBlockHash` 链式哈希查找）是上述数字成立的前提——若像 SGLang `TreeNode` 边上存 token id（+512B/block），1PB 薄 KV 场景涨到 ~250GB。
 
-**触发条件**：单一超大模型 + 多实例部署（一套 8 台 64 卡、集群上百套）——每个节点都是同一 `(model_id, revision)`，"节点只订阅自己服务的命名空间"帮不上，这是全量镜像真正撞线的场景。多模型集群可靠命名空间订阅续命更久。
-
-注意先坏的并不是镜像内存：**CP 单写者吞吐/内存与推送扇出**（事件率 × 订阅者数）更早撞线；镜像内存是第三个约束。
+**问题出在谁的内存**：CP 与 Router 是控制节点，索引放不下可以加内存，不是架构问题；**计算节点的 DRAM 是池的 L1 载体**，索引每占 1GB，KV 卸载容量就少 1GB——真正不能占的是计算节点。触发场景：单一超大模型 + 多实例部署（一套 8 台 64 卡、集群上百套），每个节点都是同一 `(model_id, revision)`，按命名空间订阅帮不上。
 
 ### 对照：星型有中心索引为何不爆炸
 
@@ -161,19 +159,15 @@ reference 实现全是"有中心"的，但它们的索引不爆炸，机制分�
 
 **"星型不爆炸"是有条件的**：比"每节点一份"晚到，不是不到（LMCache 已撞）。
 
-**lake 与三派的差异**：①lake radix 覆盖 L0–L3 **含持久层**（L2 = F4 恢复点每块必注册、L3 SSOT），跟踪集合天然比"只跟踪缓存层"的系统大一个量级——这是 durable-first + 统一编址的设计代价；②选路热路径 µs 级（5ms 预算，见 [`cost-model.md`](cost-model.md)），付不起星型派的每操作 RPC；③D-direct 要答"哪个节点 HBM 有这段前缀"，实例私有派答不了。
+**lake 与三派的差异**：①lake radix 覆盖 L0–L3 **含持久层**（L2 = F4 恢复点每块必注册、L3 SSOT），跟踪集合天然比"只跟踪缓存层"的系统大一个量级——这是 durable-first + 统一编址的设计代价；②lake 要答"哪个节点的 HBM 有这段前缀"（本地命中判定），实例私有派答不了；③星型派的每操作 RPC 并非付不起（一跳 ~0.5ms，在 5ms 模式选择预算内，见 [`cost-model.md`](cost-model.md)），镜像的价值是省掉这跳、且 CP 故障时路由不中断。
 
 ### 演进方向（撞线时启用）
 
-本质是**混合**：热路径保持镜像优势（不付 RPC），冷尾退化到星型工作点（付 RPC）。
-
-1. **镜像瘦身**：只推 ①共享热前缀（产品化部署的 system prompt/工具定义/文件库，复用价值的九成在此，见 [`../research/agentic-cache-workload.md`](../research/agentic-cache-workload.md)，账单命中率 91.9%）+ ②L0 预放置块（方案 Z 本来就发布）+ ③路由到本机的会话链（会话到达一次性预取，之后新块本机自产自知）。冷长尾（各会话历史块）不推送。镜像大小与集群规模脱钩。
-2. **冷 miss 同步查权威**：复用现成的权威回退路径（P6.3 已有镜像 total-miss 回退权威的先例；`LookupPrefix`/`Locate`），一跳 ~0.5ms 在 5ms 预算内。一致性语义不变——权威查询本就线性一致（见 [`consistency.md`](consistency.md) §1），只是选路查询的分布从"全本地"变成"热本地 + 冷回源"。
-3. **CP 按 block 哈希范围分片**撑查询 QPS：比 Mooncake 进程内 1024 锁分片更进一步，做跨实例分片；shard ring（join/drain/remove）地基已有，与控制面多副本（下「控制面 HA」）同属规模化议程。
-4. **会话局部性是设计内假设**：亲和路由（session id + HRW 钉家节点，`go/router/affinity.go::pickNodeForRequest`）使会话历史大概率在家节点本机（local overlay 可知，无需全局镜像）；负载均衡/扩缩容导致的漂移是少数，漂移走冷查询 + 池内拉取（durable-first 保证数据不依赖原节点存活）。行业同向押注：vLLM #48501 `session_id`/`continuation_id`（[`../research/vllm/kv-session-roadmap.md`](../research/vllm/kv-session-roadmap.md)）、SGLang #21846 agent hints（[`../research/sglang/agentic-kv-roadmap.md`](../research/sglang/agentic-kv-roadmap.md)）。
-5. **附带收益**：推送事件率从"每块注册"降到"热集变更"，扇出问题顺带缓解。
-
-**兜底**：共享/局部性假设全失效（裸多租户 API + 会话随机漂移）时，退化为"每请求问一次 CP"——即 Mooncake/MemCache 的常规工作点，系统不死，只是热路径优势消失。镜像是优化层，不是正确性依赖。
+1. **全局索引收归控制面**：CP 持权威 + Router 持镜像；**计算 agent 去掉全局镜像，只持本机索引**（本机块表/地址/free-list）。agent 原来用镜像做的事都有去处：前缀匹配与模式决策本来就在 Router；read set 由 Router 路由时算出、随请求下发（`GenerateRequest` 已有 `exec_mode`/`hint` 字段，扩展即可）；组 batch 只需本机 HBM 状态，本机 agent 自管；拉块的确切地址走两跳（见下条）。计算节点在索引上零内存开销。
+2. **索引条目实例级**：CP 只记"块在哪些实例"（每条省掉地址/槽位，~130B → ~80B），确切位置由本实例 agent 管。实例内分层移动（同机 HBM↔DRAM↔NVMe）不再上报 CP，写频率下降；搬 KV 变两跳（先问 CP 在哪个实例，再问实例拿地址）——搬 KV 是 ms 级路径，多 ~0.5ms 无感。HDFS NameNode/DataNode 即此二级结构；Mooncake master 记精确位置，比这重。
+3. **请求路由不变**：Router 读本地镜像，零 RPC，CP 故障时路由不中断（镜像仍在，只是更陈旧）。即使去掉镜像，一跳 CP 查询也在 5ms 预算内——镜像是优化层，不是正确性依赖。
+4. **预热触发**：Router 的查询/上报可让 CP 提前启动 KV 搬运（`ReportHits` 已有先例，放置决策仍在池侧，不违反方案 Z 单向耦合），比"下发 → agent 发现 miss → 补拉"更早。
+5. **兜底**：CP/Router 也装不下时，Router 只留热集（共享热前缀 + L0 预放置块；复用价值九成在共享前缀，见 [`../research/agentic-cache-workload.md`](../research/agentic-cache-workload.md)，账单命中率 91.9%），冷前缀查 CP——退化为 Mooncake/MemCache 的集中查询工作点，系统不死。会话局部性（亲和路由 HRW 钉家节点，`go/router/affinity.go::pickNodeForRequest`）使会话历史大概率在本机，冷查询占比低。行业同向押注：vLLM #48501 `session_id`/`continuation_id`（[`../research/vllm/kv-session-roadmap.md`](../research/vllm/kv-session-roadmap.md)）、SGLang #21846 agent hints（[`../research/sglang/agentic-kv-roadmap.md`](../research/sglang/agentic-kv-roadmap.md)）。
 
 ## 控制面 HA（对应 #3 待讨论 #4，已定）
 

@@ -14,7 +14,7 @@
 - **控制面是权威**：位置视图、radix、引用汇总的唯一真相在**存储控制面进程内存**（单写者线性一致）。**etcd 不承载高频位置写**——满块注册（每次 prefill 新块都触发）是高频写，进 etcd 会被 Raft 复制 + watch 放大拖垮；etcd 只存**降频 checkpoint**（节点/模型/配额/revision + 位置快照），供控制面崩溃重建、Router 冷启动建镜像、stream 断时回退。强一致权威在内存而非 etcd 的依据见 §8。
 - **数据面读镜像**：agent / Router 各持本地镜像（零 RPC 决策），由控制面**推送**刷新（gRPC stream；同机可用共享内存直读），触发 = 位置视图权威变更（放置 / 驱逐覆写 / 迁移 / 满块注册）。详见 [`scheduling.md`](scheduling.md) §1 前缀解析、[`control-plane.md`](control-plane.md) Router 镜像节。
 - **陈旧只损性能不损正确性**：镜像滞后导致误判本地命中 → agent pull 向控制面确认 → miss 则从池（L1/L2，未命中退 L3）回填（多一跳）。热点前缀变动少、基本不陈旧；陈旧风险集中在冷门 block，miss 代价也小。
-- **规模演进预留**：全量镜像撞线后（见 [`control-plane.md`](control-plane.md)「镜像的规模上限与演进」），冷前缀选路查询回源控制面权威——一致性语义不变（权威查询本就线性一致），仅选路查询的分布从"全本地"变为"热本地 + 冷回源"。
+- **规模演进预留**：全量镜像撞线后（见 [`control-plane.md`](control-plane.md)「镜像的规模上限与演进」），全局索引收归 CP + Router、计算 agent 只持本机索引，跨节点位置查询回源 CP 权威——一致性语义不变（权威查询本就线性一致）。
 
 > **参考对照**：LMCache 一致性节明示"无全局强一致"，靠 controller ZMQ 消息 + 心跳 + 序列号 + `RWLockWithTimeout`、full-sync best-effort（`sharing-and-backends.md`）；Mooncake 元数据全在 leader 内存、etcd 仅存 OpLog（`mooncake/kv-store.md` MasterService）。lake 的位置视图权威在控制面进程内存强一致（单写者线性一致），etcd 降频做持久后盾——既不靠 best-effort 复制（强于 LMCache），又不在高频写上压 etcd（学 Mooncake 把热元数据留内存的思路，但 lake 有全局权威而非 per-instance）。
 
