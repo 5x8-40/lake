@@ -253,7 +253,7 @@ Dynamo 部署拓扑（`components/src/dynamo/router/CLAUDE.md` "Frontend/Router 
 
 > Bifrost（[maximhq/bifrost](https://github.com/maximhq/bifrost)，外部 AI gateway）担鉴权 / 限流 / 过载 shedding / 可观测——外部控制面职责（CLAUDE.md 第3条）。lake 不自研入口、不定义私有入口 gRPC。下列是 Bifrost **配置面**约束，非 lake 代码。
 
-1. **协议面（选 A）**：Router **只实现 OpenAI 兼容**。Anthropic 客户端 → Bifrost 转 OpenAI → Router；Router 不双协议。对外 OpenAI 兼容（边1 客户端↔Bifrost、边2 Bifrost↔Router，均 HTTP），对内 gRPC（边3 及以下）。Bifrost 可替换（任何 OpenAI 兼容 gateway 即可），非硬绑定。
+1. **协议面(OpenAI 单协议)**：Router **只实现 OpenAI 兼容**。Anthropic 客户端 → Bifrost 转 OpenAI → Router；Router 不双协议。对外 OpenAI 兼容（边1 客户端↔Bifrost、边2 Bifrost↔Router，均 HTTP），对内 gRPC（边3 及以下）。Bifrost 可替换（任何 OpenAI 兼容 gateway 即可），非硬绑定。
 2. **不二次选路**：Bifrost **单一 upstream = lake Router**；关跨 provider failover、关 semantic cache。过载只决定「进 / 不进」，**「去哪」仍归 Router**——Router 持位置视图镜像做模式 + 节点选路（见上文「Router 持位置视图镜像」）。
 3. **过载信号**：P2 先 Bifrost **本地限流**（按配置阈值进/不进）；lake 容量信号（队列长度 / in-flight / 剩余容量，见 [`../features/nonfunctional.md`](../features/nonfunctional.md)）对接 Bifrost 自适应留 **P7**——届时把 Worker/Router 上报的容量喂 Bifrost。请求级 shedding 始终归 Bifrost，lake 不自 shedding（CLAUDE.md 第3条）。
 4. **透传**：lake 私有字段（`agent_hints` / `kv_hints` 等自定义 header、streaming SSE）须端到端透传，**Bifrost 不剥**；SSE 增量原样回传客户端。
