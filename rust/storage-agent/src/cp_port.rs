@@ -13,7 +13,7 @@ use lake_tiered_store::{LocalTier, LocationEvent, PipelineAction, TierPipeline};
 pub trait ControlPlanePort {
     /// Quota preflight **before** durable flush.
     ///
-    /// Mirrors proto `ControlPlaneService.AdmitRegisterBlocks` (P4.6 方案 A).
+    /// Mirrors proto `ControlPlaneService.AdmitRegisterBlocks` (P4.6 写前准入).
     /// In-process [`AuthorityPort`] calls `Authority::preflight_register` directly;
     /// tonic clients should call the same RPC over the wire.
     fn admit_register_blocks(&mut self, req: &RegisterBlocksRequest) -> Result<(), String>;

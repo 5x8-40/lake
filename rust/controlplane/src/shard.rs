@@ -299,7 +299,7 @@ impl Authority {
             .unwrap_or(0)
     }
 
-    /// 扩容 warmup 选块(方案 Z:池侧自主决策,Router 不指挥放置):
+    /// 扩容 warmup 选块(池放置·调度读视图:池侧自主决策,Router 不指挥放置):
     /// 按 hit_count(跨节点总计)降序取 top-k,排除已在目标节点 L0 的块。
     /// 选中的 (block,node) 记滞回标记(P7.6),后续跟随流量不重复下发。
     /// 参考:SGLang HiCache 扩容时按 radix 热度预取;差异是我们由存储池

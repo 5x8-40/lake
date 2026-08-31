@@ -90,7 +90,7 @@ pub const DEFAULT_VIEW_BROADCAST_CAP: usize = 256;
 /// P7 收口:单次扩容 warmup 选块上限(对齐 Router 热集窗口量级)。
 pub const DEFAULT_WARMUP_K: usize = 256;
 
-/// 池侧 warmup 出口(方案 Z:扩容 warmup 由池自主发起,Router 只经
+/// 池侧 warmup 出口(池放置·调度读视图:扩容 warmup 由池自主发起,Router 只经
 /// `ReportHits` 报告命中、不指挥放置)。生产接目标节点 agent `PlaceBlocks`
 /// 客户端;原型默认日志实现(真实字节搬运归 P5),测试注入记录器。
 ///
@@ -968,7 +968,7 @@ impl ControlPlaneService for ControlPlane {
                         migration_count,
                         "join_shard_node"
                     );
-                    // P7 收口(方案 Z):新节点 warmup 由池侧按 hit_count 自主选块
+                    // P7 收口(池放置·调度读视图):新节点 warmup 由池侧按 hit_count 自主选块
                     // 发起;Router 只经 ReportHits 报告命中,不指挥放置。
                     let plan = auth.warmup_plan(&req.node_id, DEFAULT_WARMUP_K);
                     (
@@ -3381,7 +3381,7 @@ mod tests {
         assert!(migs.iter().all(|m| !m.push_l2_first));
     }
 
-    /// P7 收口(方案 Z):ReportHits 喂 hit_count → warmup_plan 按热度选块,
+    /// P7 收口(池放置·调度读视图):ReportHits 喂 hit_count → warmup_plan 按热度选块,
     /// 已在目标 L0 的块排除;未知块上报跳过(best-effort)。
     #[test]
     fn p7_report_hits_feeds_warmup_plan() {
@@ -3740,7 +3740,7 @@ mod tests {
         assert_eq!(calls[0].1, vec![b"a".to_vec(), b"b".to_vec()]);
     }
 
-    /// P7 收口(方案 Z):join 后 warmup 由池侧自主发起(WarmupSink),
+    /// P7 收口(池放置·调度读视图):join 后 warmup 由池侧自主发起(WarmupSink),
     /// 不经 Router PlaceBlocks。
     #[tokio::test]
     async fn p7_join_triggers_pool_side_warmup() {

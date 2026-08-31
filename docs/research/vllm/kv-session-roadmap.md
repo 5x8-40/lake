@@ -191,7 +191,7 @@ RFC 链到 llm-d 系列（Google Docs）：Agentic Northstar、KV-Cache Orchestr
 
 | 主题 | vLLM (#48168/#48501) | SGLang (#21846 / #27574) | lake |
 |------|----------------------|---------------------------|------|
-| 智能归属 | 控制面 indexer；引擎机制 | Router soft hint；引擎可拒 | Gateway 意图可选；**池权威放置**（方案 Z） |
+| 智能归属 | 控制面 indexer；引擎机制 | Router soft hint；引擎可拒 | Gateway 意图可选；**池权威放置** |
 | 会话坐标 | `session_id` + 内容链 `continuation_id` | session_id / agent_hints / KvHint | 链式 `block_hash` + 可选 session scope；续跑靠池位置 |
 | 可见性 | KV Events + 未来标签 | kv_events + 实验 router index | **强一致位置视图**（非最终一致旁路） |
 | 缓存分层 | `kv_offload` per-instance | HiCache L1/L2 私有 + L3 | **L0–L3 归池** |
@@ -199,7 +199,7 @@ RFC 链到 llm-d 系列（Google Docs）：Agentic Northstar、KV-Cache Orchestr
 | 硬 pin | 明确拒绝（#37003） | soft protect（#29173） | `ref>0` 冻结 ≠ 无界 pin |
 
 **最强同向信号**：#48501「引擎=无策略机制、控制面=集群内存图」几乎就是 lake 拆分叙事。  
-**仍分叉**：vLLM 事件流 + 外部 indexer（最终一致）vs lake 控制面内存权威；vLLM HBM 仍引擎自分配 vs 方案 Z。
+**仍分叉**：vLLM 事件流 + 外部 indexer（最终一致）vs lake 控制面内存权威；vLLM HBM 仍引擎自分配 vs 池放置·调度读视图。
 
 ---
 

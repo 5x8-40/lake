@@ -86,7 +86,7 @@ flowchart LR
 | L2 | NVMe(池化) | 大 | ~10μs | **F4 恢复点**(持久,断电不丢) | 存储池(block 放哪个节点 NVMe 由池决定) |
 | L3 | 对象存储 | 无限 | ~ms | SSOT 永久权威 | 唯一权威 |
 
-> **物理约束**:L0 的统一管理是元数据层面的——物理访问仍受 GPU 本地性约束,attention 读 KV 必须在本机 HBM,无法高效跨节点直读。因此同一 batch 各 sequence 的 KV 必须已在同一 GPU HBM(本地命中),否则先由存储池补拉。放置与 batch 的边界见下"方案 Z"。L1/L2 跨节点访问走 SNIC(见 [`topology.md`](topology.md))。
+> **物理约束**:L0 的统一管理是元数据层面的——物理访问仍受 GPU 本地性约束,attention 读 KV 必须在本机 HBM,无法高效跨节点直读。因此同一 batch 各 sequence 的 KV 必须已在同一 GPU HBM(本地命中),否则先由存储池补拉。放置与 batch 的边界见下"池放置·调度读视图"。L1/L2 跨节点访问走 SNIC(见 [`topology.md`](topology.md))。
 
 **读取路径**:L0 → L1 → L2 → L3,逐层回填。
 **写入路径**(两条独立职责,不要混):
@@ -136,7 +136,7 @@ flowchart LR
 
 迁移 / GC / 碎片整理共享一个后台任务带宽池,内部按优先级调度。总预算 < 10%,不额外放宽(见 [`../features/slo.md`](../features/slo.md))。
 
-### 放置与 batch 的职责边界(方案 Z)
+### 放置与 batch 的职责边界(池放置·调度读视图)
 
 存储池的 HBM 放置与计算层 batch 组成**单向耦合**:
 

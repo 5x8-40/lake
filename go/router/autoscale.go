@@ -263,7 +263,7 @@ func (r *nodeRegistry) lastReady() (string, bool) {
 	return r.ready[len(r.ready)-1], true
 }
 
-// hotSet 命中观测窗(按服务节点分桶,有界 FIFO,窗内去重)——P7 收口(方案 Z):
+// hotSet 命中观测窗(按服务节点分桶,有界 FIFO,窗内去重)——P7 收口(池放置·调度读视图):
 // Router 只作热度传感器,命中批量上报 CP(ReportHits → radix hit_count);
 // 扩容 warmup / 预放置的选块与发起归池侧,Router 不指挥放置。
 // P7.6(B2):命中按服务节点分桶——ReportHits.node_id = 命中流量的服务节点
@@ -356,7 +356,7 @@ func (s *Server) applyScale(ctx context.Context, d ScaleDecision) error {
 		s.lastReadyLatencyMu.Unlock()
 		slog.Info("scale-out: node ready",
 			"node", id, "migrations", resp.GetMigrationCount(), "ring_gen", resp.GetMap().GetGeneration())
-		// P7 收口(方案 Z):新节点 warmup 由池侧自主决策发起——CP 在
+		// P7 收口(池放置·调度读视图):新节点 warmup 由池侧自主决策发起——CP 在
 		// JoinShardNode 后按 hit_count(ReportHits 喂入)选热块并下发
 		// PlaceBlocks;Router 不指挥放置,只持续上报命中(autoscaleTick 尾部)。
 		// P7.4 注:原 Router 侧 prefetch 时延探针随归属迁移移除——warmup
@@ -417,7 +417,7 @@ func (s *Server) reapDraining(ctx context.Context) {
 // autoscaleTick 一个评估周期:先收割 draining,再按指标决策执行。
 func (s *Server) autoscaleTick(ctx context.Context) {
 	s.reapDraining(ctx)
-	// P7 收口(方案 Z):命中观测批量上报 CP(radix hit_count),供池侧
+	// P7 收口(池放置·调度读视图):命中观测批量上报 CP(radix hit_count),供池侧
 	// 扩容 warmup / 未来预放置选块;Router 只报告、不指挥放置。
 	// 先于 applyScale 上报:同 tick 的命中计数能喂进本次 Join 的 warmup_plan。
 	s.flushHotHits(ctx)

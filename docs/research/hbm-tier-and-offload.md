@@ -1,6 +1,6 @@
 # HBM 归属与 KV 卸载对照
 
-> 2026-08-29。范围：`3rdparty/` 中涉及 GPU HBM 或 KV 卸载的组件。不改方案 Z。  
+> 2026-08-29。范围：`3rdparty/` 中涉及 GPU HBM 或 KV 卸载的组件。不改池放置·调度读视图。  
 > 分项细节见各目录 overview；本文只做横切对照。lake：F3/F4、[`../architecture/storage-layer.md`](../architecture/storage-layer.md)。
 
 ## 1. 三个接口
@@ -120,7 +120,7 @@ L0 归池，是把 HBM 收成与 L1/L2 相同的一层缓存，不是为了独�
 
 | | 引擎持 HBM | L0 归池 |
 |--|----------|---------|
-| 往 GPU 装 KV | 请求到达后 `allocate_slots`，再 H2D / G2→G1 onboard | 后台按热度 promotion / 预取到 L0，请求路径只读视图（方案 Z） |
+| 往 GPU 装 KV | 请求到达后 `allocate_slots`，再 H2D / G2→G1 onboard | 后台按热度 promotion / 预取到 L0，请求路径只读视图（池放置·调度读视图） |
 | L0 坐标 | APC + KV event，随引擎进程 | 与 L1/L2 同在控制面 `locations` |
 | 计算进程退出（节点还在） | 引擎页与 APC 失效 | slot 仍由池 agent 管，视图不必作废 |
 | 整机退出 | 两边 L0 都没了，靠 L2/L3 | 同左；F4 从 L2，视图仍指向 KV Node |

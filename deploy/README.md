@@ -4,7 +4,7 @@
 
 ```
 curl → Go Router (:8080)
-         ├─ AgentService.Dispatch + TransferService (:50054)  # 边10 + 边7/8
+         ├─ AgentService.Dispatch + TransferService (:50054)  # Dispatch + 节点间传输
          └─ WorkerService.Generate (:50053)
                 ├─ ControlPlane Lookup/Register (:50051)
                 └─ TcpDataService Put/Get (:50052)           # TCP 退化数据面

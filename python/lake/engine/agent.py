@@ -1,4 +1,4 @@
-"""StorageAgent 协议 —— Python↔Rust agent FFI 的 Python 侧草签（D2，边6）。
+"""StorageAgent 协议 —— Python↔Rust agent FFI 的 Python 侧草签（D2）。
 
 不进 protobuf（FFI / PyO3）。生产实现：`lake-storage-agent` `.so`。
 参考:vLLM `KVConnectorBase_V1`（start_load_kv / wait_for_save / request_finished）；

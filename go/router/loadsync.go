@@ -9,7 +9,7 @@ import (
 	lakepb "github.com/chengda-wu/lake/go/pb"
 )
 
-// RunLoadSync P6.4:Router → agent 的 ReportLoad 常驻循环(边10 上报通道):
+// RunLoadSync P6.4:Router → agent 的 ReportLoad 常驻循环(Router→agent 上报通道):
 // 周期性把调度器 LoadSnapshot(队列/in-flight/剩余容量)流式上报 agent;
 // 读 ack 回收池写路径触硬配额的 BackpressureSignal,打进调度器(该 model
 // 新启动暂停 bpTTL,不丢请求)。断流/错误延迟重连;仅 ctx 取消时返回。

@@ -125,7 +125,7 @@ hybrid KV cache config(full + SWA + Mamba 多 group)是 bug 重灾区:
 2. 多层 offload 是**单实例内级联**(GPU↔CPU↔NVMe/Obj 同机),非跨节点池。
 3. **无 radix**——APC hash 顺序匹配 + `OffloadKey` 平铺键,断链即停。
 4. **无集群位置视图/本地命中**——KV Events `medium` 仅单实例介质标记;`session_id`/`continuation_id` 是 RFC(#48501)。
-5. HBM **引擎自分配**(offload/connector 只借传输)——方案 Z"池管 HBM 放置"无对应。
+5. HBM **引擎自分配**(offload/connector 只借传输)——池放置·调度读视图"池管 HBM 放置"无对应。
 6. MLA/混合 attention 的 per-layer 连续性要求与 connector cross-layer 传输冲突(#45997)。
 
 ---
@@ -189,7 +189,7 @@ flowchart TB
 | agent 生命周期不可见(#48501) | 划清边界:准入/过载归 gateway、执行系统只上报信号;预留 agent hint 透传位 | hint 字段、evict/prefetch 语义都没设计 |
 | 语义复用污染(#44223) | 维持前缀链式 hash(必含 parent),不承诺语义/PIC 复用 | 与上游同样受 RoPE 位置耦合限制 |
 | 启动固定 P/D 角色 | 设计上按请求在 PD 分离/混部/D-direct 间选路(见 [../../architecture/execution-modes.md](../../architecture/execution-modes.md)) | 模式选择 <5ms 预算、切换开销均未验证 |
-| HBM 引擎自分配 | 方案 Z"池管 HBM 放置",vLLM 无对应 | 池化 HBM 入图约束全待验证 |
+| HBM 引擎自分配 | 池放置·调度读视图"池管 HBM 放置",vLLM 无对应 | 池化 HBM 入图约束全待验证 |
 
 **可借鉴的实现(与优劣无关)**,细节见 [compute.md](compute.md) / [block-lifecycle.md](block-lifecycle.md):`OffloadingManager`/`LookupResult` 三态查询、KV Events schema(`BlockStored` 的 `medium`/`group_idx`)、`OffloadKey` 内容寻址编码、secondary tier cascade/promotion 异步作业模型、`#45997` layer-major 布局、`#48501` session 坐标方案。这些是可直接参考的现成做法,lake 是否照搬仍待定。
 

@@ -26,7 +26,7 @@ import (
 type Config struct {
 	HTTPAddr    string // 默认 :8080
 	WorkerAddr  string // WorkerService,默认 127.0.0.1:50053
-	AgentAddr   string // AgentService(边10 Dispatch),默认 127.0.0.1:50054
+	AgentAddr   string // AgentService(Router→agent Dispatch),默认 127.0.0.1:50054
 	CPAddr      string // ControlPlaneService(权威回退查询),默认 127.0.0.1:50051
 	NodeRole    string // 候选执行节点角色(hybrid/prefill/decode,LAKE_NODE_ROLE),P6.3 选路输入;单节点原型默认 hybrid
 	MaxInFlight int    // P6.4:单节点并发执行上限(P6.5 起总并发=×ready 节点数;非准入控制——队列无界不拒请求);单 worker mock 默认 1
@@ -42,7 +42,7 @@ type Config struct {
 }
 
 // Server OpenAI 兼容 HTTP → Dispatch(agent) → Generate(worker)。
-// P3 入口即本服务(边2);不经 Bifrost。
+// P3 入口即本服务(客户端直连 Router);不经 Bifrost。
 // P6.1:Router 已接 CP 客户端(LookupPrefix/Locate 权威回退档,冷启动/gap 用)。
 // P6.2:后台 RunViewSync 消费 CP SubscribeView 维护本地只读镜像(ViewMirror);
 // 选路读镜像零 RPC,gap/断线自动 resume,resume 过老 CP 回退快照。
@@ -327,7 +327,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			s.modeCounts[string(mode)]++
 			s.modeCountsMu.Unlock()
 		}
-		// 边10:先 Dispatch 到 agent(P3 仅 ack;执行仍在 Worker.Generate)。
+		// 先 Dispatch 到 agent(P3 仅 ack;执行仍在 Worker.Generate)。
 		ack, err := s.agent.Dispatch(execCtx, &lakepb.DispatchRequest{
 			Mode:         string(mode),
 			TargetNodeId: nodeID,

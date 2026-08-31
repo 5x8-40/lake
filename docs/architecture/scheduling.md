@@ -26,7 +26,7 @@
    - 负载：考虑队列长度、HBM 放置余量（HBM 由存储池统一管理，Router 读存储池的 L0 容量视图）。
    - 目标：最小化 (增量 prefill 计算 + KV 传输) 的加权和。
 3. **Decode 节点预分配**：在 Prefill 完成前就选定目标 Decode 节点，由存储池把 KV 放置到其 HBM（本地命中优先）。
-   - **消歧（请求路径内放置 ≠ 方案 Z 后台预放置）**：此处"由存储池把 KV 放置到 D 的 HBM"是**请求路径内**的新产出 KV 放置（prefill 刚产出的 KV 必须现放，与时序二正向"与 A 计算重叠"一致，见 [`execution-modes.md`](execution-modes.md)），**不是**方案 Z 的后台热度预放置（方案 Z 是请求到达前按热度通用预放置、发布位置视图，不感知具体 batch，见 [`storage-layer.md`](storage-layer.md) "放置与 batch 的职责边界"）。两者都是池主动放置、调度单向消费,但触发时机与对象不同:后台预放置=热度驱动为本地命中攒数据(供 D-direct);请求路径内放置=新 KV 必现放(供本次 PD 传递)。守方案 Z 单向耦合——调度只读视图、不指挥放置,请求路径内放置也由池在选路结果上自主执行。
+   - **消歧（请求路径内放置 ≠ 池放置·调度读视图的后台预放置）**：此处"由存储池把 KV 放置到 D 的 HBM"是**请求路径内**的新产出 KV 放置（prefill 刚产出的 KV 必须现放，与时序二正向"与 A 计算重叠"一致，见 [`execution-modes.md`](execution-modes.md)），**不是**池放置·调度读视图的后台热度预放置（它是请求到达前按热度通用预放置、发布位置视图，不感知具体 batch，见 [`storage-layer.md`](storage-layer.md) "放置与 batch 的职责边界"）。两者都是池主动放置、调度单向消费,但触发时机与对象不同:后台预放置=热度驱动为本地命中攒数据(供 D-direct);请求路径内放置=新 KV 必现放(供本次 PD 传递)。守池放置·调度读视图的单向耦合——调度只读视图、不指挥放置,请求路径内放置也由池在选路结果上自主执行。
 4. **SLO 感知与优先级调度（Router 职责）**：Router 在选路时纳入 SLO 预算（如 D-direct 模式选择开销须 < 5ms，否则吃掉本地命中省传输的收益）与请求优先级——**优先级队列**决定已准入请求的执行顺序与抢占（被抢占者 KV 在存储池保留，见第 3 节）。**不设降级链**：若选不到合适节点或执行失败（故障/超时），不写 mode-to-mode 的预设 fallback、不"拒绝"已准入请求，而是触发 F4 故障恢复 → Router 依最新集群状态重跑 `f(请求, 集群状态) → (模式, 节点)` 重选模选点。
    - **边界**：过载层面的**入口准入 / 限并发 / 按优先级丢弃**归 gateway/外部控制面（决定请求"进/不进"，过载拒绝不计推理系统失败率）；Router 只对**已准入**请求做 SLO 路由与优先级**排队顺序**（决定"去哪/何时/怎么跑"，不丢请求）。Worker 不自 shedding，只上报剩余容量、队列长度、in-flight 等信号。详见 [`../features/slo.md`](../features/slo.md) "过载控制"节。
 
@@ -72,7 +72,7 @@
 **为何倾向 External 式**：
 
 1. **KV/本地命中是一等输入**——只有持全局命中视图镜像的 Router 能正确做 D-direct / 前缀亲和；引擎内 waiting/running 打分**看不见**存储池放置，二次 LB 会稀释甚至抵消命中收益。SGLang 层 A 即此问题；层 B 生产仍是近似树，`cache_aware_zmq`/Indexer 仍弱于池权威。
-2. **职责边界**：过载归 Gateway，选模选点归 Router，执行归 Worker——引擎内再 LB 会把「去哪」拆成两段，难守 5ms 模式选择预算与单向耦合（方案 Z）。
+2. **职责边界**：过载归 Gateway，选模选点归 Router，执行归 Worker——引擎内再 LB 会把「去哪」拆成两段，难守 5ms 模式选择预算与单向耦合（池放置·调度读视图）。
 3. **对照**：vLLM External = 外部定 rank；SGLang 层 B = 外部定 worker(+软/演进中的事件 cache-aware)；lake Router ≈ 二者之上 + 真命中视图。队列打分只作**负载信号输入**（worker 上报 → Router 加权），不作为第二层权威分发。
 
 **开放细节（不阻塞本倾向）**：
@@ -96,7 +96,7 @@
 - **默认 overlap**:主循环对齐 SGLang `event_loop_overlap`(CPU 收尾 ∥ 下一 GPU forward;device 侧 token 接力)。请求结束 → `agent.on_request_finished`(见 compute-layer「请求结束与资源释放」)。
 - **Continuous batching**：Decode / 混部节点动态拼接 batch;执行形态由角色配置 + 本步 `SchedulerOutput` 选择(同一 `lake.engine`,非 prefill/decode 分树)。
 - **PagedAttention** 风格的块状 KV 管理，与存储池的 block 粒度对齐(表由池 agent 组装,调度器不持 KV 权威)。
-- **放置与 batch 单向耦合（方案 Z）**：同一 batch 各 sequence 的 KV 必须同时在本机 HBM（attention 一次读全部）。存储池按热度主动预放置 KV 到 HBM 并发布位置视图;调度器读视图组 batch（本地命中优先），缺失补拉，不反向指挥放置。见 [`storage-layer.md`](storage-layer.md) / [`execution-modes.md`](execution-modes.md)。
+- **放置与 batch 单向耦合（池放置·调度读视图）**：同一 batch 各 sequence 的 KV 必须同时在本机 HBM（attention 一次读全部）。存储池按热度主动预放置 KV 到 HBM 并发布位置视图;调度器读视图组 batch（本地命中优先），缺失补拉，不反向指挥放置。见 [`storage-layer.md`](storage-layer.md) / [`execution-modes.md`](execution-modes.md)。
 - **一步交互序（D5 已定）**：`schedule`（只读视图）→ `prepare_step`（**唯一**补拉/占槽/ready）→ `execute` → `done` → 结束则 `on_request_finished`。补拉预算 `pull_budget_ms`（0=同步等到齐）；默认 **不允许批内缺块请求仍进算**（`allow_partial_hit=false` = all-or-nothing；与单请求前缀部分命中无关）。`allow_partial_hit=true` 时 agent 回缩 `effective_*_set`，调度器须过滤后再 execute。详见 [`compute-layer.md`](compute-layer.md)「D5」。
 - **三模式 + vLLM 调度几何（C5）**：节点消费 `PrefixHint`；`mode_select` 为纯函数骨架（生产权威在 Go Router）。`local_hit`（含部分）→ `ExecMode.D_DIRECT`；**整段**本地命中只把 `num_computed=prompt_len`，下一步按生成几何 schedule（**无** SGLang `PREBUILT` 分相）。Runner / prepare 只吃 `num_scheduled_tokens` + read/write 几何。
 - **抢占**：高优先级请求可抢占低优先级，被抢占者的 KV 在存储池中保留（不丢失，本机 HBM 放置释放归还存储池）。
@@ -139,7 +139,7 @@
 
 **请求级亲和选路(P7.6 B1,已落地)**:Router 选点为**两段式**(`go/router/affinity.go::pickNodeForRequest`,纯内存 µs 级):①**热路径**——逐 ready 节点在镜像上算本地前缀得分(命中前缀中在请求方 L0 的连续块数),得分最高者胜出;其 per-node in-flight ≥ 护栏(默认 8,`Config.AffinityInFlightGuard`)则降级次优,全部过载落②。②**冷路径**——纯整数 rendezvous(HRW):`score = fnv1a64(routingKey‖node)` 取 max、平局按节点 id 升序,与池侧 B2-a 预放置(`placement.rs::preplace_on_register`)严格同构;负载经护栏过滤表达(in-flight ≥ 护栏的节点先剔除,全过载退无过滤纯 HRW),**不进 score**——float64 加权在 u64→f64 精度碰撞或负载不等时会与池侧家节点分叉(review #69)。路由键 = `X-Lake-Session-Id` 头优先,否则有界深度前缀锚点 `hashes[min(len,8)-1]`(深度 1 会被全局系统前缀打成热点)。in-flight 记账在 `nodeRegistry`(**选路即占 +1 / 请求完成 -1**,含排队与抢占重试在途——护栏看得见排队中的亲和负载;原先 dispatch 前才 +1 有 TOCTOU + queue-blind 缺陷,review #69)——是选路热路径的即时本地信号,区别于 loadsync 的出站遥测上报。参考 Dynamo `lib/kv-router/src/protocols.rs::WorkerSelectionResult`(overlap_blocks 命中量化为一等输入)与 SGLang `sgl-model-gateway/src/policies/cache_aware.rs::CacheAwarePolicy`(失衡退最短队列);**关键差异**:reference 是 routing-to-history 近似树(按请求文本历史猜亲和、旁路最终一致),lake 是**池权威视图镜像上的真本地命中**(得分即 D-direct 资格)+ **池侧放置闭环**(B2 跟随流量放置 + HRW 预放置把命中数据造到 Router 将要选的节点上,见 [`kv-cache-pool.md`](kv-cache-pool.md))。冷路径哈希与池侧 B2-a 预放置同字节布局(FNV-1a 64,`placement.rs::hrw_score`),负载未饱和时 Router 与池**逐点同家**。实测(RR 0.106–0.230 → 亲和 0.905–1.000,连续本地前缀口径)见 [`../features/slo.md`](../features/slo.md)「本地命中率」P7.6 校准。抢占重跑节点沿用「Submit 前选一次」(跨节点 retry 重选与 F4 重路由统一设计,未来工作),但 **hint/模式每次 attempt 重算**——镜像可能已变(预放置/驱逐/新注册),冻结三元组会在视图变化后错模(review #69)。
 
-**边界(重申,守方案 Z 单向耦合)**:
+**边界(重申,守池放置·调度读视图 单向耦合)**:
 - 调度**只读**命中视图,不反向指挥存储池放置。存储池按热度主动预放置并发布位置视图;调度读视图组 batch(本地命中优先→D-direct,缺失补拉)。信息流单向。
 - 命中视图由存储池权威维护,陈旧只影响命中率(miss→pull→控制面确认),不影响正确性(与 [`kv-cache-pool.md`](kv-cache-pool.md) "block table 池组装"的本地视图镜像语义一致)。
 - **投机解码的 draft 候选 token(未验证)不进 radix**;但 **drafter 自己的 KV 与 target KV 同款进池、跨请求前缀复用**(SGLang `PoolName.DRAFT`),seed hidden 是否跨请求缓存待定(先按重算式,见 [`compute-layer.md`](compute-layer.md) "投机解码")。命中感知对 target KV 与 drafter KV 均适用(t-type 与 r-type 均含,复用条件一致——都按全前缀命中,见 [`kv-cache-pool.md`](kv-cache-pool.md) "t-type / r-type")。

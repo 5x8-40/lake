@@ -121,7 +121,7 @@ Dynamo router 维护**本地 radix 树副本**（每 router 实例一份），�
 
 1. **粒度 = 增量事件 + 单流序号 + gap replay（非快照）**。控制面是**单权威、单发布者**，`publisher_id` 恒为控制面，退化为单流 sequence（比 dynamo 多发布者简单）。借鉴 `DeduplicatingStream`（`mod.rs:218`）的 `(publisher_id, sequence)` 去重。冷启动：snapshot-on-connect（带序号建镜像）→ 之后增量。断线：Router 报 "resume from seq N"，控制面重放。重放有界，两种回退全量快照：`N+1` 早于 replay buffer floor（缓冲逐出）；或 `N` 达到/超过控制面已发序号上界（CP 重启 `next_seq` 归 1、buffer 空，旧 resume 点无法用重放证明有效，issue #74 S2/D1）——接收方收快照（`seq=0`）时重置镜像与本地序号。
 2. **gap replay 通道 = 单 bidi stream（带 resume），非单独 RPC**。单权威 → 单连接 → 单序号上下文。dynamo 用单独 DEALER socket 是多发布者 pub/sub 拓扑的需要，lake 不必照搬。
-3. **agent 与 Router 同协议**。dynamo router 和 worker 引擎连同一事件流、不同订阅者。→ 边4（Router）与边5（agent）**同一套推送协议**，不同订阅者（对应 #3 待讨论 #6 = 是）。
+3. **agent 与 Router 同协议**。dynamo router 和 worker 引擎连同一事件流、不同订阅者。→ CP 对 Router 与对 agent **同一套推送协议**，不同订阅者（对应 #3 待讨论 #6 = 是）。
 4. **etcd checkpoint 三重角色**（非浪费）：控制面重启重建内存权威 / Router 冷启动 snapshot 源 / stream 断时 Router 回退（更陈旧但非空）直到重连。这让主方案"依赖控制面在线"有了兜底。
 5. **陈旧只损性能**。gap/replay 保证最终一致，期间 router 误判 → 回退确认 → miss 回填，多一跳。正合 [`consistency.md`](consistency.md) §1"陈旧只损性能不损正确性"。
 
@@ -166,7 +166,7 @@ reference 实现全是"有中心"的，但它们的索引不爆炸，机制分�
 1. **全局索引收归控制面**：CP 持权威 + Router 持镜像；**计算 agent 去掉全局镜像，只持本机索引**（本机块表/地址/free-list）。agent 原来用镜像做的事都有去处：前缀匹配与模式决策本来就在 Router；read set 由 Router 路由时算出、随请求下发（`GenerateRequest` 已有 `exec_mode`/`hint` 字段，扩展即可）；组 batch 只需本机 HBM 状态，本机 agent 自管；拉块的确切地址走两跳（见下条）。计算节点在索引上零内存开销。
 2. **索引条目实例级**：CP 只记"块在哪些实例"（每条省掉地址/槽位，~130B → ~80B），确切位置由本实例 agent 管。实例内分层移动（同机 HBM↔DRAM↔NVMe）不再上报 CP，写频率下降；搬 KV 变两跳（先问 CP 在哪个实例，再问实例拿地址）——搬 KV 是 ms 级路径，多 ~0.5ms 无感。HDFS NameNode/DataNode 即此二级结构；Mooncake master 记精确位置，比这重。
 3. **请求路由不变**：Router 读本地镜像，零 RPC，CP 故障时路由不中断（镜像仍在，只是更陈旧）。即使去掉镜像，一跳 CP 查询也在 5ms 预算内——镜像是优化层，不是正确性依赖。
-4. **预热触发**：Router 的查询/上报可让 CP 提前启动 KV 搬运（`ReportHits` 已有先例，放置决策仍在池侧，不违反方案 Z 单向耦合），比"下发 → agent 发现 miss → 补拉"更早。
+4. **预热触发**：Router 的查询/上报可让 CP 提前启动 KV 搬运（`ReportHits` 已有先例，放置决策仍在池侧，不违反池放置·调度读视图 单向耦合），比"下发 → agent 发现 miss → 补拉"更早。
 5. **兜底**：CP/Router 也装不下时，Router 只留热集（共享热前缀 + L0 预放置块；复用价值九成在共享前缀，见 [`../research/agentic-cache-workload.md`](../research/agentic-cache-workload.md)，账单命中率 91.9%），冷前缀查 CP——退化为 Mooncake/MemCache 的集中查询工作点，系统不死。会话局部性（亲和路由 HRW 钉家节点，`go/router/affinity.go::pickNodeForRequest`）使会话历史大概率在本机，冷查询占比低。行业同向押注：vLLM #48501 `session_id`/`continuation_id`（[`../research/vllm/kv-session-roadmap.md`](../research/vllm/kv-session-roadmap.md)）、SGLang #21846 agent hints（[`../research/sglang/agentic-kv-roadmap.md`](../research/sglang/agentic-kv-roadmap.md)）。
 
 ## 控制面 HA（对应 #3 待讨论 #4，已定）
@@ -215,12 +215,12 @@ Dynamo 把通信拆**三层正交**（`lib/runtime/src/`），正好印证 lake 
 
 | 通信需求 | Dynamo | lake 对应边 |
 |---|---|---|
-| 注册/发现（低频强一致） | etcd `Discovery` trait（`discovery/mod.rs:781`），`v1/<类别>/<ns>/<component>/...` 前缀 | 边4/5/6 控制面元数据；lake 一套 etcd + key space 隔离同此模式 |
-| 高频事件流（best-effort） | `EventTransportTx/Rx`（NATS/ZMQ，`transports/event_plane/transport.rs:28`） | 边4/5 位置视图推送；lake 改 gRPC stream（单权威直推，见上） |
-| 请求面 RPC | TCP（`transports/tcp.rs`） | 边2 HTTP(OpenAI 兼容,Bifrost↔Router)/ 边3/5/10 gRPC(内部) |
-| 大块数据 | NIXL RDMA（`kvbm-physical` TransferManager） | 边7/8 RDMA 旁路 |
-| 对象存储 | S3/Azure（`object/mod.rs` `ObjectBlockOps`） | 边9 S3 API |
-| 同进程 | in-process trait 调用 | 边6 FFI（PyO3） |
+| 注册/发现（低频强一致） | etcd `Discovery` trait（`discovery/mod.rs:781`），`v1/<类别>/<ns>/<component>/...` 前缀 | Router/agent↔CP 与 worker↔agent 的控制面元数据；lake 一套 etcd + key space 隔离同此模式 |
+| 高频事件流（best-effort） | `EventTransportTx/Rx`（NATS/ZMQ，`transports/event_plane/transport.rs:28`） | CP→Router/agent 位置视图推送；lake 改 gRPC stream（单权威直推，见上） |
+| 请求面 RPC | TCP（`transports/tcp.rs`） | 入口 HTTP(OpenAI 兼容,Bifrost↔Router)/ 内部 gRPC(Router↔CP、agent↔CP、Router→worker) |
+| 大块数据 | NIXL RDMA（`kvbm-physical` TransferManager） | 节点间 KV RDMA 旁路 |
+| 对象存储 | S3/Azure（`object/mod.rs` `ObjectBlockOps`） | CP↔对象存储 S3 API |
+| 同进程 | in-process trait 调用 | worker↔agent FFI（PyO3） |
 
 **关键印证**：
 
@@ -246,14 +246,14 @@ Dynamo 部署拓扑（`components/src/dynamo/router/CLAUDE.md` "Frontend/Router 
 **对 lake 的输入**：
 
 - **集群级调度逻辑归 Router，不拆独立进程**：Dynamo 的请求级选路（`LocalScheduler`）内嵌 router 进程，lake 可同——集群级调度（池间 / 弹性）作 Router 内逻辑，同进程同机直接调用，省 gRPC。拆独立进程只在调度变重 / 要独立扩缩时才有必要（先不拆）。注：这里"调度"= 集群级 = Router，**不含**节点级 scheduler（那个在计算节点上，per-engine，跟 Router 无关）。
-- **Gateway 不自研，用 Bifrost（外部 AI gateway）**：dynamo 默认 frontend + router 同进程省一跳，但 lake 把入口网关交给外部 Bifrost（鉴权/限流/过载 shedding/可观测归外部控制面，CLAUDE.md 第3条）。**Router 只实现 OpenAI 兼容**——Anthropic 客户端由 Bifrost 转 OpenAI 再进 Router，lake 不自研入口 adapter、不定义私有入口 gRPC。对外 OpenAI 兼容（边1/边2 HTTP），对内（Router↔worker↔pool）gRPC。对接约束见下「Gateway（Bifrost）对接约定」。
+- **Gateway 不自研，用 Bifrost（外部 AI gateway）**：dynamo 默认 frontend + router 同进程省一跳，但 lake 把入口网关交给外部 Bifrost（鉴权/限流/过载 shedding/可观测归外部控制面，CLAUDE.md 第3条）。**Router 只实现 OpenAI 兼容**——Anthropic 客户端由 Bifrost 转 OpenAI 再进 Router，lake 不自研入口 adapter、不定义私有入口 gRPC。对外 OpenAI 兼容（客户端↔Bifrost↔Router 均 HTTP），对内（Router↔worker↔pool）gRPC。对接约束见下「Gateway（Bifrost）对接约定」。
 - **存储控制面是独立进程**：dynamo 没有这个（lake 独有），因为 lake 把存储权威从 worker 剥离了。这是 lake 比 dynamo 多出来的一个进程。
 
 ## Gateway（Bifrost）对接约定（对应 #3 ③，PR #13）
 
 > Bifrost（[maximhq/bifrost](https://github.com/maximhq/bifrost)，外部 AI gateway）担鉴权 / 限流 / 过载 shedding / 可观测——外部控制面职责（CLAUDE.md 第3条）。lake 不自研入口、不定义私有入口 gRPC。下列是 Bifrost **配置面**约束，非 lake 代码。
 
-1. **协议面（选 A）**：Router **只实现 OpenAI 兼容**。Anthropic 客户端 → Bifrost 转 OpenAI → Router；Router 不双协议。对外 OpenAI 兼容（边1 客户端↔Bifrost、边2 Bifrost↔Router，均 HTTP），对内 gRPC（边3 及以下）。Bifrost 可替换（任何 OpenAI 兼容 gateway 即可），非硬绑定。
+1. **协议面(OpenAI 单协议)**：Router **只实现 OpenAI 兼容**。Anthropic 客户端 → Bifrost 转 OpenAI → Router；Router 不双协议。对外 OpenAI 兼容（客户端↔Bifrost、Bifrost↔Router，均 HTTP），对内 gRPC(Router 以下各跳)。Bifrost 可替换（任何 OpenAI 兼容 gateway 即可），非硬绑定。
 2. **不二次选路**：Bifrost **单一 upstream = lake Router**；关跨 provider failover、关 semantic cache。过载只决定「进 / 不进」，**「去哪」仍归 Router**——Router 持位置视图镜像做模式 + 节点选路（见上文「Router 持位置视图镜像」）。
 3. **过载信号**：P2 先 Bifrost **本地限流**（按配置阈值进/不进）；lake 容量信号（队列长度 / in-flight / 剩余容量，见 [`../features/nonfunctional.md`](../features/nonfunctional.md)）对接 Bifrost 自适应留 **P7**——届时把 Worker/Router 上报的容量喂 Bifrost。请求级 shedding 始终归 Bifrost，lake 不自 shedding（CLAUDE.md 第3条）。
 4. **透传**：lake 私有字段（`agent_hints` / `kv_hints` 等自定义 header、streaming SSE）须端到端透传，**Bifrost 不剥**；SSE 增量原样回传客户端。
@@ -267,7 +267,7 @@ Dynamo 部署拓扑（`components/src/dynamo/router/CLAUDE.md` "Frontend/Router 
 | 3 | KV Node 有 agent？ | dynamo 无 KV Node 概念（远端 = 对象存储 + NIXL）；`TransferManager` + `export/import_metadata` 是 RDMA 注册参考 | KV Node 跑 agent（复用计算节点 agent 代码），做 RDMA 注册 / 读写服务 |
 | 4 | 存储控制面单 leader / 多副本？ | per-instance `InstanceLeader` P2P，非单 leader / 非 Raft | **已定**：拒绝 P2P（不满足强一致）；单 leader + etcd lease 选主 + checkpoint 重建（仿 Mooncake），多副本留 P7。见上文「控制面 HA」 |
 | 5 | Gateway 自研 / 外部？ | dynamo frontend 自研（OpenAI HTTP）或 k8s Gateway API + EPP | **已定：不自研，用 Bifrost**（外部 AI gateway）；Router 只 OpenAI 兼容（Anthropic 由 Bifrost 转），无私有入口 gRPC（见下「Gateway 对接约定」） |
-| 6 | 边4 = 边5？ | router 与 worker 同事件流不同订阅者 | 同协议、不同订阅者（是） |
+| 6 | CP→Router 与 CP→agent 同一套推送？ | router 与 worker 同事件流不同订阅者 | 同协议、不同订阅者（是） |
 
 > #4 的结论（Router 镜像走 gRPC stream 主方案 + 同机共享内存优化、1/2 否决、粒度与协议）见上文 "Router 持位置视图镜像" 节；#4 剩余两项（控制面与 Router 是否同机、控制面 HA）归 #3 待讨论 #1 / #4。**控制面 HA 已定**（见上文「控制面 HA」），控制面与 Router 是否同机留 `topology.md` P7。
 

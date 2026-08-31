@@ -49,10 +49,10 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // =============================================================================
-// ControlPlaneService — 边3/4/5:Router + agent ↔ 存储控制面
+// ControlPlaneService — Router + agent ↔ 存储控制面
 // =============================================================================
 type ControlPlaneServiceClient interface {
-	// 边3/4:订阅位置视图 live 镜像(Router 与 agent 同协议、不同订阅者,#3 已定)。
+	// 订阅位置视图 live 镜像(Router 与 agent 同协议、不同订阅者,#3 已定)。
 	//
 	//	事件形态参考 vLLM BlockStored/BlockRemoved、Mooncake Conductor 订阅事件。
 	//	单权威 → 单流 sequence + gap replay(见 control-plane.md「粒度与协议」)。
@@ -67,7 +67,7 @@ type ControlPlaneServiceClient interface {
 	//
 	//	(见 kv-cache-pool.md「搬 KV 查权威分层」)。
 	Locate(ctx context.Context, in *LocateRequest, opts ...grpc.CallOption) (*LocateResponse, error)
-	// P4.6:配额写前准入(方案 A)。纯检查、不 reserve、不改位置视图。
+	// P4.6:配额写前准入。纯检查、不 reserve、不改位置视图。
 	//
 	//	对齐 Mooncake PutStart 的「写前问 Master」公开边界;无 reserved 占座(Reserve* → 多进程/P4.7)。
 	//	agent 须在 flush durable **之前**调用;触硬 → Ack.ok=false + backpressure。
@@ -128,7 +128,7 @@ type ControlPlaneServiceClient interface {
 	GetShardMap(ctx context.Context, in *GetShardMapRequest, opts ...grpc.CallOption) (*GetShardMapResponse, error)
 	// 加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
 	//
-	//	P7 收口(方案 Z):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
+	//	P7 收口(池放置·调度读视图):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
 	//	hit_count 选热块 → agent PlaceBlocks),Router 只报告命中(ReportHits)、
 	//	不指挥放置。
 	JoinShardNode(ctx context.Context, in *JoinShardNodeRequest, opts ...grpc.CallOption) (*JoinShardNodeResponse, error)
@@ -139,7 +139,7 @@ type ControlPlaneServiceClient interface {
 	// P7 收口:命中上报(best-effort 批量)。Router 在本地镜像上观测到前缀命中后
 	//
 	//	批量回传,CP 累计到 radix 节点 hit_count(SGLang TreeNode.hit_count 同款),
-	//	供 promote 准入 / 扩容 warmup 选块 / 未来方案 Z 预放置复用——一套热度信号。
+	//	供 promote 准入 / 扩容 warmup 选块 / 未来池侧预放置复用——一套热度信号。
 	//	丢失可容忍(计数偏弱),不进 ViewEvent。
 	ReportHits(ctx context.Context, in *ReportHitsRequest, opts ...grpc.CallOption) (*Ack, error)
 }
@@ -402,10 +402,10 @@ func (c *controlPlaneServiceClient) ReportHits(ctx context.Context, in *ReportHi
 // for forward compatibility.
 //
 // =============================================================================
-// ControlPlaneService — 边3/4/5:Router + agent ↔ 存储控制面
+// ControlPlaneService — Router + agent ↔ 存储控制面
 // =============================================================================
 type ControlPlaneServiceServer interface {
-	// 边3/4:订阅位置视图 live 镜像(Router 与 agent 同协议、不同订阅者,#3 已定)。
+	// 订阅位置视图 live 镜像(Router 与 agent 同协议、不同订阅者,#3 已定)。
 	//
 	//	事件形态参考 vLLM BlockStored/BlockRemoved、Mooncake Conductor 订阅事件。
 	//	单权威 → 单流 sequence + gap replay(见 control-plane.md「粒度与协议」)。
@@ -420,7 +420,7 @@ type ControlPlaneServiceServer interface {
 	//
 	//	(见 kv-cache-pool.md「搬 KV 查权威分层」)。
 	Locate(context.Context, *LocateRequest) (*LocateResponse, error)
-	// P4.6:配额写前准入(方案 A)。纯检查、不 reserve、不改位置视图。
+	// P4.6:配额写前准入。纯检查、不 reserve、不改位置视图。
 	//
 	//	对齐 Mooncake PutStart 的「写前问 Master」公开边界;无 reserved 占座(Reserve* → 多进程/P4.7)。
 	//	agent 须在 flush durable **之前**调用;触硬 → Ack.ok=false + backpressure。
@@ -481,7 +481,7 @@ type ControlPlaneServiceServer interface {
 	GetShardMap(context.Context, *GetShardMapRequest) (*GetShardMapResponse, error)
 	// 加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
 	//
-	//	P7 收口(方案 Z):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
+	//	P7 收口(池放置·调度读视图):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
 	//	hit_count 选热块 → agent PlaceBlocks),Router 只报告命中(ReportHits)、
 	//	不指挥放置。
 	JoinShardNode(context.Context, *JoinShardNodeRequest) (*JoinShardNodeResponse, error)
@@ -492,7 +492,7 @@ type ControlPlaneServiceServer interface {
 	// P7 收口:命中上报(best-effort 批量)。Router 在本地镜像上观测到前缀命中后
 	//
 	//	批量回传,CP 累计到 radix 节点 hit_count(SGLang TreeNode.hit_count 同款),
-	//	供 promote 准入 / 扩容 warmup 选块 / 未来方案 Z 预放置复用——一套热度信号。
+	//	供 promote 准入 / 扩容 warmup 选块 / 未来池侧预放置复用——一套热度信号。
 	//	丢失可容忍(计数偏弱),不进 ViewEvent。
 	ReportHits(context.Context, *ReportHitsRequest) (*Ack, error)
 	mustEmbedUnimplementedControlPlaneServiceServer()
@@ -1100,19 +1100,19 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // =============================================================================
-// AgentService — 边10:Router/控制面 → agent
+// AgentService — Router/控制面 → agent
 // =============================================================================
 type AgentServiceClient interface {
-	// 边10:Router 选好模式+节点后,下发调度指令给目标 agent(组 batch)。
+	// Router 选好模式+节点后,下发调度指令给目标 agent(组 batch)。
 	//
 	//	携带 hints(agent_hints/kv_hints),与 #13 Bifrost 透传对齐(仿 SGLang #21846 agent_hints)。
 	//	本稿只定调度骨架;request_id / 输入 token / 采样参数等请求体字段后续 PR 补。
 	Dispatch(ctx context.Context, in *DispatchRequest, opts ...grpc.CallOption) (*Ack, error)
-	// 边10:agent 上报负载(队列长度/in-flight/剩余容量),供过载信号 P7 对接 Bifrost。
+	// agent 上报负载(队列长度/in-flight/剩余容量),供过载信号 P7 对接 Bifrost。
 	//
 	//	流式上报、流式 ack(避免客户端关流才 ack 的运维别扭)。
 	ReportLoad(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LoadReport, Ack], error)
-	// 控制面 → agent:补拉放置(缺失 KV 放到指定节点 HBM,方案 Z 单向耦合)。
+	// 控制面 → agent:补拉放置(缺失 KV 放到指定节点 HBM,池放置·调度读视图 单向耦合)。
 	PlaceBlocks(ctx context.Context, in *PlaceBlocksRequest, opts ...grpc.CallOption) (*Ack, error)
 }
 
@@ -1162,19 +1162,19 @@ func (c *agentServiceClient) PlaceBlocks(ctx context.Context, in *PlaceBlocksReq
 // for forward compatibility.
 //
 // =============================================================================
-// AgentService — 边10:Router/控制面 → agent
+// AgentService — Router/控制面 → agent
 // =============================================================================
 type AgentServiceServer interface {
-	// 边10:Router 选好模式+节点后,下发调度指令给目标 agent(组 batch)。
+	// Router 选好模式+节点后,下发调度指令给目标 agent(组 batch)。
 	//
 	//	携带 hints(agent_hints/kv_hints),与 #13 Bifrost 透传对齐(仿 SGLang #21846 agent_hints)。
 	//	本稿只定调度骨架;request_id / 输入 token / 采样参数等请求体字段后续 PR 补。
 	Dispatch(context.Context, *DispatchRequest) (*Ack, error)
-	// 边10:agent 上报负载(队列长度/in-flight/剩余容量),供过载信号 P7 对接 Bifrost。
+	// agent 上报负载(队列长度/in-flight/剩余容量),供过载信号 P7 对接 Bifrost。
 	//
 	//	流式上报、流式 ack(避免客户端关流才 ack 的运维别扭)。
 	ReportLoad(grpc.BidiStreamingServer[LoadReport, Ack]) error
-	// 控制面 → agent:补拉放置(缺失 KV 放到指定节点 HBM,方案 Z 单向耦合)。
+	// 控制面 → agent:补拉放置(缺失 KV 放到指定节点 HBM,池放置·调度读视图 单向耦合)。
 	PlaceBlocks(context.Context, *PlaceBlocksRequest) (*Ack, error)
 	mustEmbedUnimplementedAgentServiceServer()
 }
@@ -1301,7 +1301,7 @@ const (
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
 // =============================================================================
-// TransferService — 边7/8:传输控制信令(字节走数据面旁路)
+// TransferService — 节点间传输控制信令(字节走数据面旁路)
 // =============================================================================
 // P4.4:接线 TcpTransport(单进程本地拷贝 / gRPC TcpDataService 字节搬运)。
 // P5:同 API 换 RdmaTransport(Mooncake FFI),业务零改。
@@ -1317,7 +1317,7 @@ type TransferServiceClient interface {
 	FreeBatch(ctx context.Context, in *FreeBatchRequest, opts ...grpc.CallOption) (*Ack, error)
 	// 引擎契约:pull(block_ids) 返回 handle,publish(逐层增量)上报产出。
 	//
-	//	跨实例控制信令;worker 本机调 agent 走 FFI(边6)不进 proto。
+	//	跨实例控制信令;worker 本机调 agent 走 FFI 不进 proto。
 	//	Pull 异步 + 可中断(仿 SGLang prefetch 三策略 + 预算);Publish layer-wise(仿 SGLang on_publish + page_first_direct)。
 	Pull(ctx context.Context, in *PullRequest, opts ...grpc.CallOption) (*PullResponse, error)
 	// 释放 Pull handle + 其目标段(TcpTransport arena);不调用则 handle/段按 Pull 次数泄漏。
@@ -1412,7 +1412,7 @@ func (c *transferServiceClient) FreePublish(ctx context.Context, in *FreePublish
 // for forward compatibility.
 //
 // =============================================================================
-// TransferService — 边7/8:传输控制信令(字节走数据面旁路)
+// TransferService — 节点间传输控制信令(字节走数据面旁路)
 // =============================================================================
 // P4.4:接线 TcpTransport(单进程本地拷贝 / gRPC TcpDataService 字节搬运)。
 // P5:同 API 换 RdmaTransport(Mooncake FFI),业务零改。
@@ -1428,7 +1428,7 @@ type TransferServiceServer interface {
 	FreeBatch(context.Context, *FreeBatchRequest) (*Ack, error)
 	// 引擎契约:pull(block_ids) 返回 handle,publish(逐层增量)上报产出。
 	//
-	//	跨实例控制信令;worker 本机调 agent 走 FFI(边6)不进 proto。
+	//	跨实例控制信令;worker 本机调 agent 走 FFI 不进 proto。
 	//	Pull 异步 + 可中断(仿 SGLang prefetch 三策略 + 预算);Publish layer-wise(仿 SGLang on_publish + page_first_direct)。
 	Pull(context.Context, *PullRequest) (*PullResponse, error)
 	// 释放 Pull handle + 其目标段(TcpTransport arena);不调用则 handle/段按 Pull 次数泄漏。
@@ -1826,7 +1826,7 @@ const (
 //
 // WorkerService — 计算层 Generate。
 //
-//	生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
+//	生产:Router Dispatch → agent → FFI 调引擎;token 流经 agent/SSE 回 Router。
 //	P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
 //	    执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;
 //	    P6.3 起 mode 由 Router 读镜像决策后经 GenerateRequest.exec_mode 下发。
@@ -1858,7 +1858,7 @@ func (c *workerServiceClient) Generate(ctx context.Context, in *GenerateRequest,
 //
 // WorkerService — 计算层 Generate。
 //
-//	生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
+//	生产:Router Dispatch → agent → FFI 调引擎;token 流经 agent/SSE 回 Router。
 //	P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
 //	    执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;
 //	    P6.3 起 mode 由 Router 读镜像决策后经 GenerateRequest.exec_mode 下发。

@@ -227,7 +227,7 @@ flowchart TB
 
 ### PD 分离下的传输流程(engine-to-engine 控制链切断)
 
-关键后果:Q2.1 定了"block 对引擎纯寻址、block table 池组装、引擎零地址"——于是 **engine-to-engine 控制链被彻底切断**。vLLM/SGLang 的 PD 分离是两个引擎的 connector 直接握手、用 device 网络 engine-to-engine 传(引擎既拥有 KV 又发起传输;两家控制机制对比见 [`../research/pd-disaggregation.md`](../research/pd-disaggregation.md));本系统引擎不知道地址、不组装 block table、不拥有 KV,**两个引擎从不知道对方存在**,池是唯一中介。但**数据线仍是直连 RDMA**(A 的 HBM → B 的 HBM),wire 效率不变——变的是控制权归属:发起者从引擎换成池的本地 agent。
+关键后果:Q2 定了"block 对引擎纯寻址、block table 池组装、引擎零地址"——于是 **engine-to-engine 控制链被彻底切断**。vLLM/SGLang 的 PD 分离是两个引擎的 connector 直接握手、用 device 网络 engine-to-engine 传(引擎既拥有 KV 又发起传输;两家控制机制对比见 [`../research/pd-disaggregation.md`](../research/pd-disaggregation.md));本系统引擎不知道地址、不组装 block table、不拥有 KV,**两个引擎从不知道对方存在**,池是唯一中介。但**数据线仍是直连 RDMA**(A 的 HBM → B 的 HBM),wire 效率不变——变的是控制权归属:发起者从引擎换成池的本地 agent。
 
 完整流程(以 A prefill 产出、B decode 消费前缀):
 
@@ -258,7 +258,7 @@ L0 是 layer-first(引擎逐层写),跨实例传输要转 page-first(整块连�
 
 - **L0 直传依赖 GPUDirect RDMA**:NIC 与 GPU 同 PCIe root 才直读 HBM;否则经 pinned host(L1)中转一次拷贝。部署拓扑(RDMA 可用性退化)留 [`topology.md`](topology.md),接口不变(传输引擎内部吸收)。
 - **直传 vs 经池中转是路由决策**:A、B 时序重叠 → 直传省一跳;A 先结束 B 后到 → 经池中转。归 Router/调度器按时序选,非传输层职责。
-- **in-process agent = 传输引擎的本地端点**:agent 在 worker 进程内注册本地内存、发起/接收传输;传输引擎本身是池的分布式数据面。L0 内存注册用 in-process(Q1 定的方案 a)最顺——Rust `.so` 直接拿 worker 的 CUDA 内存句柄去注册 RDMA MR,省一道 IPC。
+- **in-process agent = 传输引擎的本地端点**:agent 在 worker 进程内注册本地内存、发起/接收传输;传输引擎本身是池的分布式数据面。L0 内存注册用 in-process(Q1 定论)最顺——Rust `.so` 直接拿 worker 的 CUDA 内存句柄去注册 RDMA MR,省一道 IPC。
 
 ### 双网络路径(compute network / storage network)
 
@@ -332,7 +332,7 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 - **满块路**:block 填满 → 池算哈希 → 写回 L2 durable(NVMe)→ 注册 radix。这是自然边界,radix 注册本就要等满块(vLLM `ExternalBlockHash` 也只对完整 block 算哈希)。decode 跨 block 边界即产生满块,请求进行中就可能触发。**durable-first**:L2 写回完成后才注册 radix 发布视图(radix 发布时后盾已落实,对齐 Mooncake COMPLETE 前字节已落稳、Dynamo settled 后才 register presence;SGLang 反向 register-先靠 `host_value`+`BlockRemoved` 补偿)。register 后到请求结束屏障之间 block 持 **writeback ref 不可驱逐**(请求进行中冻结,非防悬空——durable-first 已消除"radix 有、durable 无"窗口;参考 SGLang `write_back` 驱逐即回写,见 [`consistency.md`](consistency.md) §3)。请求结束是**写回屏障**(flush+ack + writeback ref 归零,解冻晚于 barrier)。满块写回的频率(满一个就写 vs 攒几个一起写)即"写回频率 N"。**P7.3 已校准**:写回字节量与 N 无关(块数 × 块字节恒定),N 只影响 ops 频率(ops ∝ 1/N)——按 ops/RPC 预算选 N,原型建议 N=2–4 块一批(ops 降 2–4×,容错窗口多 1–3 个块,可接受);见「P7.3 校准结论」。**P7 收口:N 落地为 per-agent 配置**(`WritebackBatcher`,攒 N 块 flush + 请求屏障兜底 drain + 闲时提前)——per-agent 无需跨节点一致(durable-first 按块成立),不同节点不同 N 只影响各自产出块的 F4 窗口,SLO 记账按集群最大 N;N=1 即 eager 现状。N 激进调大时 radix 生长滞后(N 个块)的备选=双轨注册(易失位置即满即注册 + durable 位置 flush 后补注册),暂不做(见 `engine.rs::put_durable` 注释)。
 - **尾块路**:请求结束时仍未填满的 block(尾块)→ 请求结束点写回一次,写"当前尾 block 的全部已填 token",重放时整块覆盖。纯容错,不进 radix(哈希未定,或带 partial 标记)。因尾块只在请求结束写一次,无增量式。
 
-引擎不感知 block 满不满(Q2.1:block 对引擎纯寻址单位)——满块判断、哈希、radix 注册、写回全归池。容错点 = "KV 落 L2(NVMe)"的时刻;满块越频繁写回(N 小)→ 崩溃丢的越少、写放大越大,反之亦然。decode 增量写回同时服务容错 + 前缀生长(见 [`execution-modes.md`](execution-modes.md) 时序二反向)。
+引擎不感知 block 满不满(Q2:block 对引擎纯寻址单位)——满块判断、哈希、radix 注册、写回全归池。容错点 = "KV 落 L2(NVMe)"的时刻;满块越频繁写回(N 小)→ 崩溃丢的越少、写放大越大,反之亦然。decode 增量写回同时服务容错 + 前缀生长(见 [`execution-modes.md`](execution-modes.md) 时序二反向)。
 
 ## 多模型生命周期
 
@@ -350,7 +350,7 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 - 每 `(model_id, revision)` 设软配额(常态上限)与硬配额(绝对上限)(P4.6:`SetModelQuota`/`GetModelQuota`;亦可随 `RegisterModel` 登记)。
   - 软配额内自由写入;超软配额按该模型冷块(inactive/`LineageBackend`)淘汰腾位。
   - 闲时借用池全局空闲空间(best-effort,遇压力可从超软借用方回收)。
-  - **写前准入(方案 A)**：公开 RPC `AdmitRegisterBlocks`(纯检查、不 reserve)→ 再 flush durable → `RegisterBlocks`(PutEnd)。对齐 Mooncake `PutStart` 的公开边界形态,无 reserved 占座(`Reserve*` → 多进程/P4.7)。触硬 → `Ack.backpressure`(`HARD_QUOTA`);请求级 shedding 仍归 gateway,见 [`../features/slo.md`](../features/slo.md)。
+  - **写前准入**：公开 RPC `AdmitRegisterBlocks`(纯检查、不 reserve)→ 再 flush durable → `RegisterBlocks`(PutEnd)。对齐 Mooncake `PutStart` 的公开边界形态,无 reserved 占座(`Reserve*` → 多进程/P4.7)。触硬 → `Ack.backpressure`(`HARD_QUOTA`);请求级 shedding 仍归 gateway,见 [`../features/slo.md`](../features/slo.md)。
 - 配额权重按模型负载/命中率动态调整(调度器决策,控制面下发)。
 - **扩容**:加入 KV Node,按一致性哈希重分布,仅迁移落在新节点区间的 block。
 - **缩容**:Drain 目标 Node(block 迁出或下沉 L3)再下线。
@@ -387,7 +387,7 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 **P4.8 原型**(单进程 mock;真 NVMe/跨机 → P5):
 
 - Proto:`TriggerDefrag` / `PauseBackground`(挂 `ControlPlaneService`)。
-- **计划在 CP**:读 radix `prefix_chain` + Location → `DefragMove` 列表(`COMPACT` / `COLOCATE` / `BOTH`);**不**指挥调度器(方案 Z)。**COLOCATE 仅同 node**(跨节点需 Transfer + source/target → P5);打包目标须与 CP 占用视图对齐(空闲或已是目标块自身),避免生成 `place_at: slot occupied` 的死计划。
+- **计划在 CP**:读 radix `prefix_chain` + Location → `DefragMove` 列表(`COMPACT` / `COLOCATE` / `BOTH`);**不**指挥调度器(池放置·调度读视图)。**COLOCATE 仅同 node**(跨节点需 Transfer + source/target → P5);打包目标须与 CP 占用视图对齐(空闲或已是目标块自身),避免生成 `place_at: slot occupied` 的死计划。
 - **执行在 tiered-store**:`SegmentArena`(L2 段式布局)+ `TierPipeline` 动作 `CompactSegment` / `CoLocateMove`;与 promote/demote/GC 共享 [`BandwidthPool`](../../rust/tiered-store/src/bandwidth.rs)(`PauseBackground` → pause/resume)。
 - **PutEnd 同步**:`register_request` 从 `LocalTierEngine::l2_placement` 填 `segment_id`/`offset`,CP 初始视图与 arena 一致(禁止固定 `1,0` 占位叠块)。
 - 完成后发 `LocationEvent::Moved` → CP `relocate_in_view` 更新 `segment_id`/`offset`。
@@ -423,7 +423,7 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
    - **in-flight 去重 + 异步 promote 原语**(决策 6+5 存储半边):同块在途不重复发起(Dynamo offload 去重同款);`begin_promote`/`finish_promote` 两段式——dispatch 收到预取清单即 begin(与排队/batching 重叠,SGLang prefetch-at-schedule 形态),prepare 只 finish 等残余。时延收益待 P5 真字节路径校准。
    - **L3 截断阈值**(决策 A,成本模型派生):L3 命中段 <2 块(256 token)不预取直接重算,≥2 块批量异步预取、不进同步 promote;L1/L2 加载恒胜。派生值与 SGLang 硬编码 `prefetch_threshold=256` 互证,见 [`cost-model.md`](cost-model.md) §5。
    残留:并发去重收益与异步时延收益未测(原型单线程),归 P5。**接线状态**:三件套目前在 `LocalTierEngine` 引擎层 + p73 对照实验生效;agent 生产 fill 路径尚未改调 `promote_to_l0_admitted`/`begin_promote`,`flush_every_n`(`WritebackBatcher`)未接 agent 写回——生产接线归 P5 真字节路径,届时「已收口」才成立。
-6. **扩容 warmup 归属(方案 Z 灰区修复)**:P6.4 的扩容 prefetch 由 Router 选块并指挥 `PlaceBlocks`,越方案 Z 边界。已挪池侧:Router 只经 `ReportHits` 上报命中(best-effort 批量),CP `join_shard_node` 后按 hit_count 自主选块(top-k,排除已在目标 L0)经 `WarmupSink` 下发。热度信号**两套口径**(非一套三用):引擎本地 `hit_counts`(promote 准入,单节点即时视角,不出节点)与 CP `ReportHits` 计数(扩容 warmup / 未来方案 Z 预放置,集群视角,best-effort 弱一致)——双轨无害:准入要即时本地、warmup 容忍弱一致;统一(引擎计数经 agent 汇入 CP)归 P5 之后。
+6. **扩容 warmup 归属(池放置·调度读视图边界修复)**:P6.4 的扩容 prefetch 由 Router 选块并指挥 `PlaceBlocks`,越池放置·调度读视图边界。已挪池侧:Router 只经 `ReportHits` 上报命中(best-effort 批量),CP `join_shard_node` 后按 hit_count 自主选块(top-k,排除已在目标 L0)经 `WarmupSink` 下发。热度信号**两套口径**(非一套三用):引擎本地 `hit_counts`(promote 准入,单节点即时视角,不出节点)与 CP `ReportHits` 计数(扩容 warmup / 未来池侧预放置,集群视角,best-effort 弱一致)——双轨无害:准入要即时本地、warmup 容忍弱一致;统一(引擎计数经 agent 汇入 CP)归 P5 之后。
 
 ## 开放问题
 

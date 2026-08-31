@@ -17,7 +17,7 @@
 |------|------|------|
 | HBM/DRAM/SSD + LRU/水位 | `MultiLevelElimination`、ssd 文档 | 对齐「多层」；补 LFU-Aging、前缀亲和、`ref>0` 冻结 |
 | 无 L3 对象 SSOT / L2=F4 恢复点产品叙事 | README 重在池与 OneCopy | lake 持久语义分层写死（F4 / SSOT） |
-| HBM 由 LocalService 贡献 | `MmcBmProxy` MEDIA_HBM | 方向同「HBM 进池」；放置权威与 D-direct 仍按方案 Z |
+| HBM 由 LocalService 贡献 | `MmcBmProxy` MEDIA_HBM | 方向同「HBM 进池」；放置权威与 D-direct 仍按池放置·调度读视图 |
 
 ## 3. 一致性与 HA
 

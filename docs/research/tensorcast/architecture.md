@@ -254,7 +254,7 @@ lake 的池 agent/控制面还没有成形的可观测性规范,这一节基本�
 | 分片/变换 | view 元数据(narrow/transpose v1)+ piece/assembly/sealing | KV 不解释布局;(权重侧未来可参考) |
 | 高基数元数据 | 分片宿主 + HRW 租约(k=3,fencing token) | 统一进控制面 radix + 位置视图(不分片) |
 | KV 路径多样性 | 选源(local/disk/P2P)× 选传输(RDMA/mTCP/IPC)× 按读回退;**无 NIC 级选路**(拓扑未接路由)、**无引擎直达** | 双网络路径(compute/storage NIC 带宽归池)+ D→P 零存储读取特例(DualPath 原生) |
-| 放置智能 | TaaS 不内置放置策略(Signal 暴露状态,prefetch/pin 归 caller 编程);驱逐是 daemon 本地反应式 | 池按热度**主动**迁移(promotion/demotion/L0 预放置)+ 被动兜底;调度器单向读视图(方案 Z) |
+| 放置智能 | TaaS 不内置放置策略(Signal 暴露状态,prefetch/pin 归 caller 编程);驱逐是 daemon 本地反应式 | 池按热度**主动**迁移(promotion/demotion/L0 预放置)+ 被动兜底;调度器单向读视图 |
 | 前缀共置/碎片整理 | 无(不懂前缀,无法共置) | 逻辑共置 + 物理压实,后台带宽池 <10% |
 | 控制面位置 | GS 在物化/miss 路径,每请求不经过 | 位置视图在每请求关键路径(Router 读本地镜像,零 RPC,5ms 预算;拿不准回查 CP 权威) |
 | 故障恢复 | 租约过期重建(高基数)/ 持久副本(低基数);GS 单点 | F4 重路由 + L2 durable 恢复点;控制面 HA 待做 |

@@ -1,4 +1,4 @@
-//! lake-storage-agent:AgentService(边10) + TransferService(边7/8)。
+//! lake-storage-agent:AgentService(Router→agent 调度) + TransferService(节点间传输)。
 //!
 //! 默认 `0.0.0.0:50054`。环境变量 `LAKE_AGENT_ADDR` 可覆盖。
 //! Transfer 用进程内 `TcpTransport` + `InMemoryByteStore`(单测/冒烟站位;
