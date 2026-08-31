@@ -17,7 +17,7 @@
 - [sampling-params.md](sampling-params.md) — **Sampling 参数对照**(SGLang × vLLM):核心/独有字段、`n`≠beam、spec 禁 min_p/logit_bias；penalty 空泡与 V2；采样状态归属 / Spec 兼容矩阵 / `n` 与前缀 KV 共享
 - [scheduler-worker-interface.md](scheduler-worker-interface.md) — **Scheduler→Worker 字段全集**(SGLang × vLLM):`SchedulerOutput` vs `ScheduleBatch`/`ForwardBatch`、差异表、架构根因、对 lake D1 含义
 - [nvidia-cmx.md](nvidia-cmx.md) — **NVIDIA CMX**：目标栈、公开成熟度、VAST G3/G3.5 边界及 lake 映射；模型字节、容量和 Prefill KV 加载计算见 [`tools/cmx-sim/`](../../tools/cmx-sim/)
-- [agentic-cache-workload.md](agentic-cache-workload.md) — **Agentic cache workload**：匿名 Cursor 用量、provider 留存、File Library 边界及仿真输入
+- [agentic-cache-workload.md](agentic-cache-workload.md) — **Agentic cache workload**：匿名 Cursor 用量、公开 request 级 trace（Codex × SWE-bench Pro / AgentX）、provider 留存、File Library 边界及仿真输入
 - [distributed-models.md](distributed-models.md) — **分布式模型对比**：各项目拓扑/元数据权威/同步机制/一致性分级/HA/扩展性总表与四类归纳；各 overview 有「分布式模型」详节
 
 本文把它们的关键组件与本系统(`docs/architecture/`)逐层对应,并标注**借鉴点**与**关键差异**(我们的设计更彻底)。
