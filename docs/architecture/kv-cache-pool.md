@@ -227,7 +227,7 @@ flowchart TB
 
 ### PD 分离下的传输流程(engine-to-engine 控制链切断)
 
-关键后果:Q2.1 定了"block 对引擎纯寻址、block table 池组装、引擎零地址"——于是 **engine-to-engine 控制链被彻底切断**。vLLM/SGLang 的 PD 分离是两个引擎的 connector 直接握手、用 device 网络 engine-to-engine 传(引擎既拥有 KV 又发起传输;两家控制机制对比见 [`../research/pd-disaggregation.md`](../research/pd-disaggregation.md));本系统引擎不知道地址、不组装 block table、不拥有 KV,**两个引擎从不知道对方存在**,池是唯一中介。但**数据线仍是直连 RDMA**(A 的 HBM → B 的 HBM),wire 效率不变——变的是控制权归属:发起者从引擎换成池的本地 agent。
+关键后果:Q2 定了"block 对引擎纯寻址、block table 池组装、引擎零地址"——于是 **engine-to-engine 控制链被彻底切断**。vLLM/SGLang 的 PD 分离是两个引擎的 connector 直接握手、用 device 网络 engine-to-engine 传(引擎既拥有 KV 又发起传输;两家控制机制对比见 [`../research/pd-disaggregation.md`](../research/pd-disaggregation.md));本系统引擎不知道地址、不组装 block table、不拥有 KV,**两个引擎从不知道对方存在**,池是唯一中介。但**数据线仍是直连 RDMA**(A 的 HBM → B 的 HBM),wire 效率不变——变的是控制权归属:发起者从引擎换成池的本地 agent。
 
 完整流程(以 A prefill 产出、B decode 消费前缀):
 
@@ -332,7 +332,7 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 - **满块路**:block 填满 → 池算哈希 → 写回 L2 durable(NVMe)→ 注册 radix。这是自然边界,radix 注册本就要等满块(vLLM `ExternalBlockHash` 也只对完整 block 算哈希)。decode 跨 block 边界即产生满块,请求进行中就可能触发。**durable-first**:L2 写回完成后才注册 radix 发布视图(radix 发布时后盾已落实,对齐 Mooncake COMPLETE 前字节已落稳、Dynamo settled 后才 register presence;SGLang 反向 register-先靠 `host_value`+`BlockRemoved` 补偿)。register 后到请求结束屏障之间 block 持 **writeback ref 不可驱逐**(请求进行中冻结,非防悬空——durable-first 已消除"radix 有、durable 无"窗口;参考 SGLang `write_back` 驱逐即回写,见 [`consistency.md`](consistency.md) §3)。请求结束是**写回屏障**(flush+ack + writeback ref 归零,解冻晚于 barrier)。满块写回的频率(满一个就写 vs 攒几个一起写)即"写回频率 N"。**P7.3 已校准**:写回字节量与 N 无关(块数 × 块字节恒定),N 只影响 ops 频率(ops ∝ 1/N)——按 ops/RPC 预算选 N,原型建议 N=2–4 块一批(ops 降 2–4×,容错窗口多 1–3 个块,可接受);见「P7.3 校准结论」。**P7 收口:N 落地为 per-agent 配置**(`WritebackBatcher`,攒 N 块 flush + 请求屏障兜底 drain + 闲时提前)——per-agent 无需跨节点一致(durable-first 按块成立),不同节点不同 N 只影响各自产出块的 F4 窗口,SLO 记账按集群最大 N;N=1 即 eager 现状。N 激进调大时 radix 生长滞后(N 个块)的备选=双轨注册(易失位置即满即注册 + durable 位置 flush 后补注册),暂不做(见 `engine.rs::put_durable` 注释)。
 - **尾块路**:请求结束时仍未填满的 block(尾块)→ 请求结束点写回一次,写"当前尾 block 的全部已填 token",重放时整块覆盖。纯容错,不进 radix(哈希未定,或带 partial 标记)。因尾块只在请求结束写一次,无增量式。
 
-引擎不感知 block 满不满(Q2.1:block 对引擎纯寻址单位)——满块判断、哈希、radix 注册、写回全归池。容错点 = "KV 落 L2(NVMe)"的时刻;满块越频繁写回(N 小)→ 崩溃丢的越少、写放大越大,反之亦然。decode 增量写回同时服务容错 + 前缀生长(见 [`execution-modes.md`](execution-modes.md) 时序二反向)。
+引擎不感知 block 满不满(Q2:block 对引擎纯寻址单位)——满块判断、哈希、radix 注册、写回全归池。容错点 = "KV 落 L2(NVMe)"的时刻;满块越频繁写回(N 小)→ 崩溃丢的越少、写放大越大,反之亦然。decode 增量写回同时服务容错 + 前缀生长(见 [`execution-modes.md`](execution-modes.md) 时序二反向)。
 
 ## 多模型生命周期
 
