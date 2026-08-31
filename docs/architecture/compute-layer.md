@@ -650,7 +650,7 @@ Python 落点：`runtime/scheduler_output.py`（dataclass）← `node_scheduler`
 
 ## D2 — `pool_iface` / StorageAgent FFI 草签（已定 2026-07-22）
 
-> **不进 protobuf**（边6 = PyO3 / `.so`）。Python 落点：`lake/engine/agent.py::StorageAgent` + `lake/engine/pool_types.py`；P3 实现 `lake/engine/agents/grpc_skeleton.py`；单测 `lake/engine/agents/memory.py`。
+> **不进 protobuf**（worker↔agent 同进程 PyO3 / `.so`）。Python 落点：`lake/engine/agent.py::StorageAgent` + `lake/engine/pool_types.py`；P3 实现 `lake/engine/agents/grpc_skeleton.py`；单测 `lake/engine/agents/memory.py`。
 
 ### 函数表面
 

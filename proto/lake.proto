@@ -8,13 +8,13 @@ import "schema.proto";
 
 // RPC 边界草稿（#3 通信边 + 00-plan.md:167 三组接口）。
 //
-// 原则:KV 字节走 RDMA 旁路(边7/8),proto 只定义控制 msg(查询/命令/元数据/完成回执)。
-// worker ↔ in-process agent 同进程走 FFI(边6,PyO3),不进 proto。
+// 原则:KV 字节走 RDMA 旁路,proto 只定义控制 msg(查询/命令/元数据/完成回执)。
+// worker ↔ in-process agent 同进程走 FFI(PyO3),不进 proto。
 //
 // 3 个 service 按通信边划分:
-//   ControlPlaneService — 边3/4/5:Router+agent ↔ 存储控制面(控制面进程实现)
-//   AgentService        — 边10:Router/控制面 → agent(agent 进程实现)
-//   TransferService     — 边7/8:传输控制信令(字节旁路;**agent / KV Node agent 实现,非控制面**)
+//   ControlPlaneService — Router+agent ↔ 存储控制面(控制面进程实现)
+//   AgentService        — Router/控制面 → agent(agent 进程实现)
+//   TransferService     — 节点间传输控制信令(字节旁路;**agent / KV Node agent 实现,非控制面**)
 //                         P4:TcpTransport(gRPC 字节走 TcpDataService);P5:RdmaTransport
 //   TcpDataService      — TCP 退化数据面(Put/Get bytes;对齐 Mooncake MC_FORCE_TCP fallback)
 //
@@ -25,10 +25,10 @@ import "schema.proto";
 //   - SGLang match_prefix(LookupPrefix 蓝本)+ prefetch 三策略(Pull 预算/可中断)+ on_publish layer-wise + agent_hints(Dispatch)
 
 // =============================================================================
-// ControlPlaneService — 边3/4/5:Router + agent ↔ 存储控制面
+// ControlPlaneService — Router + agent ↔ 存储控制面
 // =============================================================================
 service ControlPlaneService {
-  // 边3/4:订阅位置视图 live 镜像(Router 与 agent 同协议、不同订阅者,#3 已定)。
+  // 订阅位置视图 live 镜像(Router 与 agent 同协议、不同订阅者,#3 已定)。
   //   事件形态参考 vLLM BlockStored/BlockRemoved、Mooncake Conductor 订阅事件。
   //   单权威 → 单流 sequence + gap replay(见 control-plane.md「粒度与协议」)。
   rpc SubscribeView(SubscribeRequest) returns (stream ViewUpdate);
@@ -122,15 +122,15 @@ service ControlPlaneService {
 }
 
 // =============================================================================
-// AgentService — 边10:Router/控制面 → agent
+// AgentService — Router/控制面 → agent
 // =============================================================================
 service AgentService {
-  // 边10:Router 选好模式+节点后,下发调度指令给目标 agent(组 batch)。
+  // Router 选好模式+节点后,下发调度指令给目标 agent(组 batch)。
   //   携带 hints(agent_hints/kv_hints),与 #13 Bifrost 透传对齐(仿 SGLang #21846 agent_hints)。
   //   本稿只定调度骨架;request_id / 输入 token / 采样参数等请求体字段后续 PR 补。
   rpc Dispatch(DispatchRequest) returns (Ack);
 
-  // 边10:agent 上报负载(队列长度/in-flight/剩余容量),供过载信号 P7 对接 Bifrost。
+  // agent 上报负载(队列长度/in-flight/剩余容量),供过载信号 P7 对接 Bifrost。
   //   流式上报、流式 ack(避免客户端关流才 ack 的运维别扭)。
   rpc ReportLoad(stream LoadReport) returns (stream Ack);
 
@@ -139,7 +139,7 @@ service AgentService {
 }
 
 // =============================================================================
-// TransferService — 边7/8:传输控制信令(字节走数据面旁路)
+// TransferService — 节点间传输控制信令(字节走数据面旁路)
 // =============================================================================
 // P4.4:接线 TcpTransport(单进程本地拷贝 / gRPC TcpDataService 字节搬运)。
 // P5:同 API 换 RdmaTransport(Mooncake FFI),业务零改。
@@ -153,7 +153,7 @@ service TransferService {
   rpc FreeBatch(FreeBatchRequest) returns (Ack);
 
   // 引擎契约:pull(block_ids) 返回 handle,publish(逐层增量)上报产出。
-  //   跨实例控制信令;worker 本机调 agent 走 FFI(边6)不进 proto。
+  //   跨实例控制信令;worker 本机调 agent 走 FFI 不进 proto。
   //   Pull 异步 + 可中断(仿 SGLang prefetch 三策略 + 预算);Publish layer-wise(仿 SGLang on_publish + page_first_direct)。
   rpc Pull(PullRequest) returns (PullResponse);
   // 释放 Pull handle + 其目标段(TcpTransport arena);不调用则 handle/段按 Pull 次数泄漏。
@@ -168,7 +168,7 @@ service TransferService {
 // Messages
 // ==================================================================
 
-// --- 订阅视图(边3/4) ---
+// --- 订阅视图(Router/agent↔CP) ---
 message SubscribeRequest {
   string subscriber_id  = 1;   // Router 实例 / agent 实例
   uint64 resume_from_seq = 2;  // 断线重连:"resume from seq N"(见 control-plane.md「粒度与协议」)
@@ -469,7 +469,7 @@ message LeaseAck {
   uint64 ttl_ms    = 2;
 }
 
-// --- Dispatch(边10 调度指令) ---
+// --- Dispatch(Router→agent 调度指令) ---
 message DispatchRequest {
   string mode                       = 1;   // PD_SEPARATED | COLOCATED | D_DIRECT
   string target_node_id             = 2;
@@ -489,7 +489,7 @@ message PlaceBlocksRequest {
   string target_node_id       = 2;   // 放到哪个节点 HBM
 }
 
-// --- 传输(边7/8 控制信令) ---
+// --- 传输(节点间控制信令) ---
 // 对齐 Mooncake Transport::TransferRequest{source,target_id,target_offset,length}
 // (opcode 默认 WRITE;READ 语义由 Pull 覆盖,不进本消息)。
 message TransferBatchRequest {
@@ -590,7 +590,7 @@ message GetBlocksResponse {
 }
 
 // WorkerService — 计算层 Generate。
-//   生产:Router Dispatch(边10)→ agent → FFI(边6)调引擎;token 流经 agent/SSE 回 Router。
+//   生产:Router Dispatch → agent → FFI 调引擎;token 流经 agent/SSE 回 Router。
 //   P3/P4:Router 先 AgentService.Dispatch(ack 占位)再调本 service;worker 内调 ControlPlane + TcpDataService。
 //       执行仍在本 service(非 agent 组 batch);prefill/decode 同进程 mock;
 //       P6.3 起 mode 由 Router 读镜像决策后经 GenerateRequest.exec_mode 下发。

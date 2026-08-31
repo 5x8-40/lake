@@ -1,6 +1,6 @@
 //! `TransferService` gRPC → `TcpTransport` + 内容寻址字节库。
 //!
-//! 挂在 storage-agent(边7/8,非控制面)。Pull 仿 SGLang prefetch 三策略;
+//! 挂在 storage-agent(节点间传输,非控制面)。Pull 仿 SGLang prefetch 三策略;
 //! Publish 仿 `on_publish` layer-wise + **按 request_id 分作用域**的 seq fence。
 
 use std::collections::{HashMap, HashSet};

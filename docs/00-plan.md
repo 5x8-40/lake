@@ -174,7 +174,7 @@ lake/
 
 ### 接口边界（P2 定稿）
 - [x] `proto/schema.proto`：KVBlockID / Location / BlockMeta schema（#2，见 [PR #16](https://github.com/chengda-wu/lake/pull/16)）
-- [x] `proto/lake.proto`：RPC 边界草稿——ControlPlaneService（边3/4/5）/ AgentService（边10）/ TransferService（边7/8），KV 字节走 RDMA 旁路、worker↔agent 走 FFI 不进 proto（边界草稿;三语言生成验证见 [PR #17](https://github.com/chengda-wu/lake/pull/17)）
+- [x] `proto/lake.proto`：RPC 边界草稿——ControlPlaneService(Router/agent↔CP)/ AgentService(Router→worker Dispatch)/ TransferService(节点间 KV 传输)，KV 字节走 RDMA 旁路、worker↔agent 走 FFI 不进 proto（边界草稿;三语言生成验证见 [PR #17](https://github.com/chengda-wu/lake/pull/17)）
 - [x] 三语言空壳目录 + stub 编译（[PR #17](https://github.com/chengda-wu/lake/pull/17)：Rust workspace / Go router+pb / Python lake_pb+worker 包；`scripts/gen_stubs.sh`；工程基建 [PR #18](https://github.com/chengda-wu/lake/pull/18)：Cargo.lock 入仓 + 工具链钉版本 + CI 三语言 build/stub-drift/fmt/lint + storage-agent feature 门控）
 - [ ] KV block 传输：gRPC 控制平面 + RDMA/共享内存数据平面，二进制布局规格（`TransferRequest` 控制信令已定，字节布局待传输引擎落地）
 
@@ -199,9 +199,9 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 
 | 点 | P3 | 生产（P4+） |
 |----|----|-------------|
-| Gateway | **不做 Bifrost**；客户端直打 Router OpenAI HTTP（边2） | Bifrost → Router（远期） |
-| KV 字节 | `SkeletonKvService` **gRPC 传 bytes**（入 Rust 内存池；P4.4 正名 `TcpDataService`） | RDMA 旁路（边7/8），proto 仅控制信令；TCP 退化保留 |
-| worker↔agent | Router → `AgentService.Dispatch`（边10 **ack 占位**）→ `WorkerService.Generate`；worker 内调 ControlPlane+SkeletonKv | Dispatch → agent 组 batch → FFI(边6) |
+| Gateway | **不做 Bifrost**；客户端直打 Router OpenAI HTTP | Bifrost → Router（远期） |
+| KV 字节 | `SkeletonKvService` **gRPC 传 bytes**（入 Rust 内存池；P4.4 正名 `TcpDataService`） | RDMA 旁路，proto 仅控制信令；TCP 退化保留 |
+| worker↔agent | Router → `AgentService.Dispatch`(**ack 占位**)→ `WorkerService.Generate`；worker 内调 ControlPlane+SkeletonKv | Dispatch → agent 组 batch → FFI(PyO3 同进程) |
 | 执行模式 | 固定 **混部**（同进程 mock prefill+decode） | Router 三模式选路 |
 | 前缀复用 | ControlPlane `LookupPrefix` + `RegisterBlocks`（进程内存） | 同协议；权威仍在 Rust 控制面内存 |
 

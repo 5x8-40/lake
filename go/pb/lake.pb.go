@@ -381,7 +381,7 @@ func (TransferStatusResponse_State) EnumDescriptor() ([]byte, []int) {
 	return file_lake_proto_rawDescGZIP(), []int{53, 0}
 }
 
-// --- 订阅视图(边3/4) ---
+// --- 订阅视图(Router/agent↔CP) ---
 type SubscribeRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	SubscriberId  string                 `protobuf:"bytes,1,opt,name=subscriber_id,json=subscriberId,proto3" json:"subscriber_id,omitempty"`       // Router 实例 / agent 实例
@@ -3221,7 +3221,7 @@ func (x *LeaseAck) GetTtlMs() uint64 {
 	return 0
 }
 
-// --- Dispatch(边10 调度指令) ---
+// --- Dispatch(Router→agent 调度指令) ---
 type DispatchRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Mode          string                 `protobuf:"bytes,1,opt,name=mode,proto3" json:"mode,omitempty"` // PD_SEPARATED | COLOCATED | D_DIRECT
@@ -3411,7 +3411,7 @@ func (x *PlaceBlocksRequest) GetTargetNodeId() string {
 	return ""
 }
 
-// --- 传输(边7/8 控制信令) ---
+// --- 传输(节点间控制信令) ---
 // 对齐 Mooncake Transport::TransferRequest{source,target_id,target_offset,length}
 // (opcode 默认 WRITE;READ 语义由 Pull 覆盖,不进本消息)。
 type TransferBatchRequest struct {
