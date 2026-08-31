@@ -54,7 +54,7 @@ h = Cache Read / (Cache Write + uncached input + Cache Read)
 |---|---|
 | 每 trial LLM 调用数 | 均值 33（P50 30 / P90 57 / P99 90） |
 | 全量 cache hit | **94.2%**（1,301.5M / 1,382.3M input token） |
-| input : output | **131 : 1**（prefill 绝对主导） |
+| input : output | 131 : 1 |
 | cache : 新增 input | 16.1 : 1 |
 | 单次调用 input | 均值 68,329（P50 63,917 / P90 114,888 / P99 166,322） |
 | 单次调用 uncached | 均值 3,991（P50 758 / P90 8,736 / P99 53,323） |
@@ -62,13 +62,13 @@ h = Cache Read / (Cache Write + uncached input + Cache Read)
 | 上下文增长 | 首轮 ~12.4K → 末轮均值 84.5K（P99 180.9K）；均值 2,242 token/turn（P50 880） |
 | trial 时长 | 均值 336.8 s（P50 273.7 s）；调用间隔均值 10.5 s（P50 5.2 s / P99 81.4 s） |
 
-三个对仿真直接有用的结构事实：
+对仿真有直接参考价值的三个结构事实：
 
 - **turn 级命中率单调上升**：turn 1 平均 87.4%，turn 7 起稳定 ≥94%，turn 40 达 98.1%。会话越深，新算占比越小。
 - **跨 trial 共享前缀**：93.8% 的 trial 首轮调用即命中（命中的是其他并发 trial 写下的 system prompt 前缀；主共享组 11,520 token、覆盖 568/610 个 trial），命中者首轮平均命中 93.2%。
-- **uncached 计算重尾**：top 1% 调用占 20.5% 的 uncached prefill 计算量，top 10% 占 64.2%。按均值 provision 会低估尾部长 prefill。
+- **uncached 计算重尾**：top 1% 调用占 20.5% 的 uncached prefill 计算量，top 10% 占 64.2%。按均值估计计算需求会低估尾部长 prefill。
 
-blog 同时给出本地 offload 的两个结构性限制（正是分布式池的动机）：单实例容量/驱逐（100K token 上下文即 GB 级，如 Kimi-2.5 FP8 约 3.8 GB）与跨实例 miss（负载均衡把会话后续 turn 调度到没见过前缀的实例）。其合成扩展负载（20K 公共 token + 10K 首轮输入 + 2,048 token/turn × 30 turn、900 output、output/input ≈ 1.3%）是可复用的仿真输入形状。
+blog 同时给出本地 offload 的两个结构性限制（即分布式 KV 池的动机）：单实例容量/驱逐（100K token 上下文约 GB 级，如 Kimi-2.5 FP8 约 3.8 GB）与跨实例 miss（负载均衡把会话后续 turn 调度到没有该前缀的实例）。其合成扩展负载（20K 公共 token + 10K 首轮输入 + 2,048 token/turn × 30 turn、900 output、output/input ≈ 1.3%）可作为仿真输入形状复用。
 
 限制：单一 agent 框架（Codex）与单一任务族（SWE-bench Pro）；`cached_tokens` 是 provider 账单口径，不证明物理 KV 的留存位置或 TTL。
 

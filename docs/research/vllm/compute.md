@@ -83,12 +83,12 @@ connector 分两侧(同文件):
 | `MultiConnector` | `…/multi_connector.py` (L128) | 组合多 connector |
 | `OffloadingConnector` / `SimpleCPUOffloadConnector` | `…/offloading_connector.py`、`…/simple_cpu_offload_connector.py` | CPU offload |
 
-### 生产验证：vLLM × Mooncake Store（2026-05）
+### 集成实测：vLLM × Mooncake Store（2026-05）
 
-[vLLM blog 2026-05-06](https://vllm.ai/blog/2026-05-06-mooncake-store) 报道了 `MooncakeStoreConnector` + `MultiConnector` 面向 agentic 负载的生产化集成（trace 数据见 [`../agentic-cache-workload.md`](../agentic-cache-workload.md) §2）：
+[vLLM blog 2026-05-06](https://vllm.ai/blog/2026-05-06-mooncake-store) 给出 `MooncakeStoreConnector` + `MultiConnector` 面向 agentic 负载的集成与实测（trace 数据见 [`../agentic-cache-workload.md`](../agentic-cache-workload.md) §2）：
 
-- scheduler 侧按 block hash 查 Mooncake master 指导调度；worker 侧把 GPU KV 注册为 RDMA buffer，GPUDirect RDMA 直传（不占 SM、不经 CPU staging），描述符准备放专用后台 I/O 线程，传输全异步；
-- `MultiConnector` 把 PD connector 与 store connector 串链：prefill 写池、decode 写池即可被 prefill 看见（decode 暂不读池）；
+- scheduler 侧按 block hash 查 Mooncake master 指导调度；worker 侧把 GPU KV 注册为 RDMA buffer，GPUDirect RDMA 直传（不占 SM、不经 CPU staging），描述符准备在专用后台 I/O 线程完成，传输全异步；
+- `MultiConnector` 把 PD connector 与 store connector 串链：prefill 与 decode 都写池，decode 写入对 prefill 立即可见（decode 自身暂不读池）；
 - Kimi-2.5 NVFP4 + GB200、1P1D 12 GPU 跑真实 Codex trace：吞吐 3.8×、P50 TTFT 46×、E2E 8.6×，命中率 1.7%（仅 system prompt）→ 92.2%；round-robin 路由下扩到 60 GPU 近线性、命中率 >95%；
 - 其 roadmap（分布式 NVMe offload、混合注意力模型 offload、cache-aware routing、DualPath 式双路加载）分别对应 lake 的 L2 分层、混合模型布局（如 GLM-5.3-Flash 的 MLA+KDA）、Router 选路与 [`../dualpath.md`](../dualpath.md)。
 
