@@ -170,7 +170,7 @@ pub(crate) struct PoolView {
     pub(crate) global_refs: HashMap<SequenceHash, RefAccounts>,
     /// P7 收口:命中计数(ReportHits 喂入)。生产挂 radix 节点
     /// (SGLang `TreeNode.hit_count` 同款),原型平铺按 flat hash;
-    /// 供扩容 warmup 选块 / 方案 Z 预放置复用。
+    /// 供扩容 warmup 选块 / 池侧预放置复用。
     /// P7.6(B2):扩成 per-(block,node)——识别「热在哪个节点」,
     /// 供跟随流量预放置(`placement.rs`)。
     pub(crate) hit_counts: HashMap<Vec<u8>, HashMap<String, u32>>,

@@ -1,4 +1,4 @@
-"""前缀命中提示——Router / probe 的输入，供节点组 batch（方案 Z 只读）。"""
+"""前缀命中提示——Router / probe 的输入，供节点组 batch（池放置·调度读视图，只读）。"""
 
 from __future__ import annotations
 

@@ -91,7 +91,7 @@ connector 分两侧(同文件):
 
 `SupportsHMA`(L85,ABC 标记):connector 声明支持 **hybrid memory allocator (HMA)**——即 connector 可与 HMA 协同使用。HMA 是 vLLM 针对**多 KV cache group 混合架构**(如 Mamba+attention)的显存管理器,把多个 group 的 KV 放进同一池统一分配。`SupportsHMA` 要求 connector 实现 `request_finished_all_groups`:在一个请求的**所有** KV cache group 都完成后再统一异步 free block(而非逐 group 释放),使 connector 的 save/send 与 HMA 的多 group 释放时序对齐。
 
-**对本系统**:`SupportsHMA` **不对应**方案 Z("外部管 HBM")——vLLM 的 HBM 始终由引擎自身分配,connector 只借(`register_kv_caches`)做传输,无论是否 HMA。方案 Z 的"存储池放置 KV 到 HBM、worker 消费"在 vLLM **无对应能力标记**,是我们相对 vLLM 的增量,需自行设计(见 [`../../architecture/compute-layer.md`](../../architecture/compute-layer.md) "待写:HBM 池化下的入图与 KV 管理")。本系统存储池 client ≈ 一个常驻的 `KVConnectorBase_V1`;区别:vLLM connector 是可选插件、per-instance,本系统是必经路径、集群级权威。
+**对本系统**:`SupportsHMA` **不对应**池放置·调度读视图("外部管 HBM")——vLLM 的 HBM 始终由引擎自身分配,connector 只借(`register_kv_caches`)做传输,无论是否 HMA。池放置·调度读视图 的"存储池放置 KV 到 HBM、worker 消费"在 vLLM **无对应能力标记**,是我们相对 vLLM 的增量,需自行设计(见 [`../../architecture/compute-layer.md`](../../architecture/compute-layer.md) "待写:HBM 池化下的入图与 KV 管理")。本系统存储池 client ≈ 一个常驻的 `KVConnectorBase_V1`;区别:vLLM connector 是可选插件、per-instance,本系统是必经路径、集群级权威。
 
 ## KV Events(引擎→外可见性通道 ★)
 
@@ -147,7 +147,7 @@ connector 分两侧(同文件):
   - vLLM `kv_offload` **per-instance**(引擎 Scheduler 进程内,tier 私有);我们归**存储池集群权威**,跨节点统一编址 L0–L3。
   - vLLM tier 间是**单实例内级联**(GPU↔CPU↔NVMe/Obj 同机);我们是**跨节点池**(DRAM/NVMe block 放本机还是远端 KV Node 由池放置决定)。
   - vLLM **无 radix**(`OffloadKey` 平铺);我们 radix + 位置视图 + D-direct。
-  - vLLM HBM 仍引擎自分配(offload 只借做传输);**方案 Z"池管 HBM 放置"无对应**。
+  - vLLM HBM 仍引擎自分配(offload 只借做传输);**池放置·调度读视图"池管 HBM 放置"无对应**。
   - vLLM 的"统一管全部分层"是**单实例内**的;我们的 F3"存储池统一管理 L0–L3"是**集群级**的——这是量级差异。
 
 ## Worker / Model Runner
@@ -398,7 +398,7 @@ FSM / bitmask fill 在 scheduler 侧 CPU(`StructuredOutputManager`);`execute_mod
 1. **PagedAttention block + block table**:存储池 KV block 与 vLLM block 对齐,worker 仍用 block table 做 paged attention,物理位置由存储池元数据定。
 2. **`KVConnectorBase_V1` 接口形态**:本系统存储池 client ≈ 常驻 connector;scheduler/worker 双侧 + metadata 协调 + layer-wise save/load 流水线 mixin 直接参考。
 3. **`ExternalBlockHash`**:worker 向存储池查前缀的自然键,与存储池 `(model_id,layer,block_hash)` 内容寻址对接。
-4. **`SupportsHMA` 能力标记**:声明 connector 支持 hybrid memory allocator(多 KV cache group 混合架构),要求 `request_finished_all_groups` 与多 group 释放时序对齐。**注意:它不对应方案 Z**——vLLM 的 HBM 始终引擎自分配,connector 只借做传输;方案 Z 的"池管 HBM 放置"是本系统增量,vLLM 无对应标记。
+4. **`SupportsHMA` 能力标记**:声明 connector 支持 hybrid memory allocator(多 KV cache group 混合架构),要求 `request_finished_all_groups` 与多 group 释放时序对齐。**注意:它不对应池放置·调度读视图**——vLLM 的 HBM 始终引擎自分配,connector 只借做传输;池放置·调度读视图 的"池管 HBM 放置"是本系统增量,vLLM 无对应标记。
 5. **KV Events 事件 schema**(★ 新):`BlockStored`/`BlockRemoved` 携 `ExternalBlockHash` + `medium` + `group_idx`,是控制面构建集群 KV 位置视图的现成事件源形态;`KVEventAggregator` 跨 worker 聚合去重可参考。
 6. **`OffloadingManager` / `LookupResult` / `OffloadPolicy`**(★ 新):三态查找(MISS/HIT/HIT_PENDING/RETRY)+ 策略枚举(BLOCK_LEVEL/REQUEST_LEVEL)直接映射我们"Pool 命中/待传/miss";`OffloadKey`(hash+group_idx)内容寻址编码可参考。
 7. **secondary tier cascade/promotion 异步作业模型**(★ 新):`SecondaryTierManager` 的 GPU→CPU→secondary 级联 store、secondary→CPU→GPU promotion load、`JobMetadata.is_promotion` 与我们"L2→L1 promotion / L1→L2 demotion"同构。
@@ -415,7 +415,7 @@ FSM / bitmask fill 在 scheduler 侧 CPU(`StructuredOutputManager`);`execute_mod
 - vLLM **无 radix**(APC hash 顺序匹配 + `OffloadKey` 平铺键)、**无集群位置视图/本地命中**(KV Events `medium` 仅单实例介质标记);我们 radix + 位置视图 + D-direct。
 - vLLM 跨 session/实例协调(`session_id`/`continuation_id`、P2P KV Events)仍是 **RFC**(#48501/#48203,未落地);我们设计即为集群级。
 - vLLM connector 是**可选 per-instance 插件**;我们是**必经集群级路径**。
-- vLLM HBM **引擎自分配**(offload/connector 只借传输);我们**池管 HBM 放置**(方案 Z,vLLM 无对应)。
+- vLLM HBM **引擎自分配**(offload/connector 只借传输);我们**池管 HBM 放置**(池放置·调度读视图,vLLM 无对应)。
 - vLLM attention 主路径 **C++/CUDA**;我们选 **Python + Triton**(自定义核门槛不同)。
 - vLLM worker **有状态**(加载模型+HBM KV);我们 **无状态**(状态全剥离,秒级伸缩)。
 

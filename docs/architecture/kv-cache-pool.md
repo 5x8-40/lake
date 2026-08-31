@@ -387,7 +387,7 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 **P4.8 原型**(单进程 mock;真 NVMe/跨机 → P5):
 
 - Proto:`TriggerDefrag` / `PauseBackground`(挂 `ControlPlaneService`)。
-- **计划在 CP**:读 radix `prefix_chain` + Location → `DefragMove` 列表(`COMPACT` / `COLOCATE` / `BOTH`);**不**指挥调度器(方案 Z)。**COLOCATE 仅同 node**(跨节点需 Transfer + source/target → P5);打包目标须与 CP 占用视图对齐(空闲或已是目标块自身),避免生成 `place_at: slot occupied` 的死计划。
+- **计划在 CP**:读 radix `prefix_chain` + Location → `DefragMove` 列表(`COMPACT` / `COLOCATE` / `BOTH`);**不**指挥调度器(池放置·调度读视图)。**COLOCATE 仅同 node**(跨节点需 Transfer + source/target → P5);打包目标须与 CP 占用视图对齐(空闲或已是目标块自身),避免生成 `place_at: slot occupied` 的死计划。
 - **执行在 tiered-store**:`SegmentArena`(L2 段式布局)+ `TierPipeline` 动作 `CompactSegment` / `CoLocateMove`;与 promote/demote/GC 共享 [`BandwidthPool`](../../rust/tiered-store/src/bandwidth.rs)(`PauseBackground` → pause/resume)。
 - **PutEnd 同步**:`register_request` 从 `LocalTierEngine::l2_placement` 填 `segment_id`/`offset`,CP 初始视图与 arena 一致(禁止固定 `1,0` 占位叠块)。
 - 完成后发 `LocationEvent::Moved` → CP `relocate_in_view` 更新 `segment_id`/`offset`。
@@ -423,7 +423,7 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
    - **in-flight 去重 + 异步 promote 原语**(决策 6+5 存储半边):同块在途不重复发起(Dynamo offload 去重同款);`begin_promote`/`finish_promote` 两段式——dispatch 收到预取清单即 begin(与排队/batching 重叠,SGLang prefetch-at-schedule 形态),prepare 只 finish 等残余。时延收益待 P5 真字节路径校准。
    - **L3 截断阈值**(决策 A,成本模型派生):L3 命中段 <2 块(256 token)不预取直接重算,≥2 块批量异步预取、不进同步 promote;L1/L2 加载恒胜。派生值与 SGLang 硬编码 `prefetch_threshold=256` 互证,见 [`cost-model.md`](cost-model.md) §5。
    残留:并发去重收益与异步时延收益未测(原型单线程),归 P5。**接线状态**:三件套目前在 `LocalTierEngine` 引擎层 + p73 对照实验生效;agent 生产 fill 路径尚未改调 `promote_to_l0_admitted`/`begin_promote`,`flush_every_n`(`WritebackBatcher`)未接 agent 写回——生产接线归 P5 真字节路径,届时「已收口」才成立。
-6. **扩容 warmup 归属(方案 Z 灰区修复)**:P6.4 的扩容 prefetch 由 Router 选块并指挥 `PlaceBlocks`,越方案 Z 边界。已挪池侧:Router 只经 `ReportHits` 上报命中(best-effort 批量),CP `join_shard_node` 后按 hit_count 自主选块(top-k,排除已在目标 L0)经 `WarmupSink` 下发。热度信号**两套口径**(非一套三用):引擎本地 `hit_counts`(promote 准入,单节点即时视角,不出节点)与 CP `ReportHits` 计数(扩容 warmup / 未来方案 Z 预放置,集群视角,best-effort 弱一致)——双轨无害:准入要即时本地、warmup 容忍弱一致;统一(引擎计数经 agent 汇入 CP)归 P5 之后。
+6. **扩容 warmup 归属(池放置·调度读视图边界修复)**:P6.4 的扩容 prefetch 由 Router 选块并指挥 `PlaceBlocks`,越池放置·调度读视图边界。已挪池侧:Router 只经 `ReportHits` 上报命中(best-effort 批量),CP `join_shard_node` 后按 hit_count 自主选块(top-k,排除已在目标 L0)经 `WarmupSink` 下发。热度信号**两套口径**(非一套三用):引擎本地 `hit_counts`(promote 准入,单节点即时视角,不出节点)与 CP `ReportHits` 计数(扩容 warmup / 未来池侧预放置,集群视角,best-effort 弱一致)——双轨无害:准入要即时本地、warmup 容忍弱一致;统一(引擎计数经 agent 汇入 CP)归 P5 之后。
 
 ## 开放问题
 

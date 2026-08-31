@@ -25,7 +25,7 @@
 
 ## 计算引擎结构
 
-本节落定 Python 计算层的**代码形态与职责切分**:大框架对齐 vLLM Model Runner V2 的模块化目录与 step 接口;职责按 Q1/Q2 / 方案 Z 重切——引擎不拥有 KV、不组装 block table。
+本节落定 Python 计算层的**代码形态与职责切分**:大框架对齐 vLLM Model Runner V2 的模块化目录与 step 接口;职责按 Q1/Q2 / 池放置·调度读视图 重切——引擎不拥有 KV、不组装 block table。
 
 ### 已定决策
 
@@ -63,7 +63,7 @@ storage-agent (.so / PyO3)        # 组装 block table、L0 slot、传输 fence�
 
 | vLLM V2 | lake | 原因 |
 |---------|------|------|
-| `gpu/kv_connector.py`(可选插件) | `engine/pool_iface.py`(必经) | 方案 Z:池权威;引擎不知地址、不组装表 |
+| `gpu/kv_connector.py`(可选插件) | `engine/pool_iface.py`(必经) | 池放置·调度读视图:池权威;引擎不知地址、不组装表 |
 | `gpu/block_table.py`(runner 内 apply) | **不在 engine**;agent 写固定地址 tensor | Q1 |
 | `BlockPool` / `KVCacheManager` | Rust 池 + agent | Q2 |
 | 内嵌 `speculator` | `engine/drafter/`(`post`/`pre_forward`) | 统一自回归与 diffusion;见"投机解码" |
@@ -684,7 +684,7 @@ Python 落点：`runtime/scheduler_output.py`（dataclass）← `node_scheduler`
 
 ## D5 — schedule ↔ agent 一步交互序（已定 2026-07-22）
 
-守方案 Z：**调度只读视图组 batch，不指挥放置**；补拉只在 `prepare_step` 内由 agent 发起。
+守池放置·调度读视图：**调度只读视图组 batch，不指挥放置**；补拉只在 `prepare_step` 内由 agent 发起。
 
 ```
 node_scheduler.schedule()          # 读命中视图镜像；产出 SchedulerOutput（含 read/write set）
@@ -725,7 +725,7 @@ agent 收单即 begin_promote(在途去重)     # 与排队 / batching 重叠
 prepare_step 只 finish_promote 等残余     #  由 prefill adder 发起,不等排队结束)
 ```
 
-- **不违方案 Z**：hint 从 read_set 派生（"这次要读什么"），不是放置命令（"把块放哪给未来用"）；拉取仍由 agent 发起，调度器接口里没有放置动词。
+- **不违池放置·调度读视图**：hint 从 read_set 派生（"这次要读什么"），不是放置命令（"把块放哪给未来用"）；拉取仍由 agent 发起，调度器接口里没有放置动词。
 - **不违 ready/done**：ready fence 前 read set 必须齐（all-or-nothing 不变）；异步只是把搬运与排队重叠，prepare 的等待从"全程"变"残余"。
 - **不违 durable-first**：promote 源只认已发布（durable）位置；在途块由 in-flight 去重保证单发起（`engine.rs::begin_promote/finish_promote`）。
 - hint 是**可忽略建议**：agent 忙/块已 L0/在途，直接弃；失败不阻塞 dispatch，退化回 prepare 同步补拉。

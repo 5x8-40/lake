@@ -346,7 +346,7 @@ func TestTickReportsHitsWhenAutoscaleOff(t *testing.T) {
 	}
 }
 
-// P7 收口判据(方案 Z):扩容后 Router **不再**指挥放置(无 PlaceBlocks);
+// P7 收口判据(池放置·调度读视图):扩容后 Router **不再**指挥放置(无 PlaceBlocks);
 // 命中观测经 autoscale tick 批量上报 CP(ReportHits),warmup 选块/发起归池侧。
 func TestScaleOutReportsHitsNotPlacement(t *testing.T) {
 	placeCalled := make(chan struct{}, 1)

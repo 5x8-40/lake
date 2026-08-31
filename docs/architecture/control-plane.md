@@ -166,7 +166,7 @@ reference 实现全是"有中心"的，但它们的索引不爆炸，机制分�
 1. **全局索引收归控制面**：CP 持权威 + Router 持镜像；**计算 agent 去掉全局镜像，只持本机索引**（本机块表/地址/free-list）。agent 原来用镜像做的事都有去处：前缀匹配与模式决策本来就在 Router；read set 由 Router 路由时算出、随请求下发（`GenerateRequest` 已有 `exec_mode`/`hint` 字段，扩展即可）；组 batch 只需本机 HBM 状态，本机 agent 自管；拉块的确切地址走两跳（见下条）。计算节点在索引上零内存开销。
 2. **索引条目实例级**：CP 只记"块在哪些实例"（每条省掉地址/槽位，~130B → ~80B），确切位置由本实例 agent 管。实例内分层移动（同机 HBM↔DRAM↔NVMe）不再上报 CP，写频率下降；搬 KV 变两跳（先问 CP 在哪个实例，再问实例拿地址）——搬 KV 是 ms 级路径，多 ~0.5ms 无感。HDFS NameNode/DataNode 即此二级结构；Mooncake master 记精确位置，比这重。
 3. **请求路由不变**：Router 读本地镜像，零 RPC，CP 故障时路由不中断（镜像仍在，只是更陈旧）。即使去掉镜像，一跳 CP 查询也在 5ms 预算内——镜像是优化层，不是正确性依赖。
-4. **预热触发**：Router 的查询/上报可让 CP 提前启动 KV 搬运（`ReportHits` 已有先例，放置决策仍在池侧，不违反方案 Z 单向耦合），比"下发 → agent 发现 miss → 补拉"更早。
+4. **预热触发**：Router 的查询/上报可让 CP 提前启动 KV 搬运（`ReportHits` 已有先例，放置决策仍在池侧，不违反池放置·调度读视图 单向耦合），比"下发 → agent 发现 miss → 补拉"更早。
 5. **兜底**：CP/Router 也装不下时，Router 只留热集（共享热前缀 + L0 预放置块；复用价值九成在共享前缀，见 [`../research/agentic-cache-workload.md`](../research/agentic-cache-workload.md)，账单命中率 91.9%），冷前缀查 CP——退化为 Mooncake/MemCache 的集中查询工作点，系统不死。会话局部性（亲和路由 HRW 钉家节点，`go/router/affinity.go::pickNodeForRequest`）使会话历史大概率在本机，冷查询占比低。行业同向押注：vLLM #48501 `session_id`/`continuation_id`（[`../research/vllm/kv-session-roadmap.md`](../research/vllm/kv-session-roadmap.md)）、SGLang #21846 agent hints（[`../research/sglang/agentic-kv-roadmap.md`](../research/sglang/agentic-kv-roadmap.md)）。
 
 ## 控制面 HA（对应 #3 待讨论 #4，已定）

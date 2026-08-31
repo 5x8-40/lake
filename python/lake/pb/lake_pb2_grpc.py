@@ -357,7 +357,7 @@ class ControlPlaneServiceServicer:
 
     def JoinShardNode(self, request, context):
         """加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
-        P7 收口(方案 Z):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
+        P7 收口(池放置·调度读视图):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
         hit_count 选热块 → agent PlaceBlocks),Router 只报告命中(ReportHits)、
         不指挥放置。
         """
@@ -382,7 +382,7 @@ class ControlPlaneServiceServicer:
     def ReportHits(self, request, context):
         """P7 收口:命中上报(best-effort 批量)。Router 在本地镜像上观测到前缀命中后
         批量回传,CP 累计到 radix 节点 hit_count(SGLang TreeNode.hit_count 同款),
-        供 promote 准入 / 扩容 warmup 选块 / 未来方案 Z 预放置复用——一套热度信号。
+        供 promote 准入 / 扩容 warmup 选块 / 未来池侧预放置复用——一套热度信号。
         丢失可容忍(计数偏弱),不进 ViewEvent。
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
@@ -1214,7 +1214,7 @@ class AgentServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def PlaceBlocks(self, request, context):
-        """控制面 → agent:补拉放置(缺失 KV 放到指定节点 HBM,方案 Z 单向耦合)。
+        """控制面 → agent:补拉放置(缺失 KV 放到指定节点 HBM,池放置·调度读视图 单向耦合)。
         """
         context.set_code(grpc.StatusCode.UNIMPLEMENTED)
         context.set_details('Method not implemented!')

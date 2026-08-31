@@ -26,7 +26,7 @@
 | 现象 | 证据 | lake |
 |------|------|------|
 | 层间尽力 inclusive，驱逐不 demote | 驱逐文档 | L0/L1 缓存副本；L2/L3 按移动；主动 promotion |
-| 无「把前缀放到从未算过它的 GPU」 | GPU 只注册本进程页 | 方案 Z 预放置 L0 |
+| 无「把前缀放到从未算过它的 GPU」 | GPU 只注册本进程页 | 池侧预放置 L0 |
 | GDS / Mooncake 是传输优化 | GDS、TE、store adapter | 可作 Transfer Bus 后端对照，不替代位置权威 |
 
 ## 4. 故障与弹性

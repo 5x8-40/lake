@@ -84,7 +84,7 @@ class PoolIface:
         return cls(_grpc_agent_type()(cp, kv), **kwargs)
 
     def probe_prefix(self, req: Req) -> PrefixHint:
-        """方案 Z：只读命中视图 / Lookup；不放置。"""
+        """池放置·调度读视图：只读命中视图 / Lookup；不放置。"""
         if isinstance(self._agent, InMemoryAgent):
             computed, full = self._agent.probe_local(req.req_id, len(req.prompt_token_ids))
             blocks = computed // 8

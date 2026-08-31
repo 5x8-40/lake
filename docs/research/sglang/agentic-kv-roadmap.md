@@ -94,7 +94,7 @@
 
 **状态**：roadmap ☐ · RFC open · submodule：**无** `KvHint` / `agent_hints` 字段。
 
-**对 lake**：原则同「gateway 可有意图、池/引擎执行」；lake 放置权威更硬（方案 Z），不靠 soft pin 撑全局共享。
+**对 lake**：原则同「gateway 可有意图、池/引擎执行」；lake 放置权威更硬（池放置·调度读视图），不靠 soft pin 撑全局共享。
 
 ### 2.3 Direct L3 cache mode / `buffer_only` (#20535)
 

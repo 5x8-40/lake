@@ -141,7 +141,7 @@ def rebalance():
 | **binding**(daemon 持稳定 CUDA layout,`swap` 换版本) | 权重热替换 / model revision 切换 | **直接借鉴**版本热替换模式 |
 | **tensor view / in-flight transform**(TP shard/slice/transpose 作元数据,realize 时应用) | (未来 TP)分片 | **未来 TP 参考**:shard 表达为元数据,source 选择 + 物化统一管线 |
 | **统一物化管线**(DISK→DRAM→VRAM 显式异步) | L3→L2→L1→L0 流水线 | **同构**;lake 已有 tiered-store pipeline |
-| **topology-aware P2P fanout**(replica 位置 + 介质层 + 负载 + 拓扑距离) | Transfer Engine / 方案 Z 放置后调度 | **同向**:fanout 规划基于元数据 = lake"池放置、调度读视图" |
+| **topology-aware P2P fanout**(replica 位置 + 介质层 + 负载 + 拓扑距离) | Transfer Engine / 池放置·调度读视图 | **同向**:fanout 规划基于元数据 = lake"池放置、调度读视图" |
 
 **核心结论**:TensorCast ≈ lake 的**存储层 + 权重缓存**(张量状态抽取 + daemon 拥有内存 + 分层物化 + 放置策略),**但不含** radix 前缀复用控制面、请求级 PD/D-direct 选路、计算层。它是 lake 存算分离论点的**工业级佐证**(独立状态层、worker 无状态化),但在 KV 前缀复用与一致性权威上**不如 lake 彻底**。
 
@@ -299,7 +299,7 @@ KV 在通用词里的表达是 **manifest(清单)**:一张"这个请求的 KV �
 | **LIP**(引擎显存原地租借给池) | (KV 侧无需借鉴) | KV 不需要:lake 的 KV 产出即落进池分配的 L0 slot,天生零拷贝入池,LIP 要解决的问题不存在。**权重侧可作兼容路径**:未改造引擎自加载权重后原地租给池共享,是"引擎零改造入池"的过渡方案。其约束集(同设备禁消费 / staged-only P2P / 心跳续租 / owner 死即撤销)是"池为何要拥有内存"的反面论证 |
 | **tensor view 作元数据**(TP shard/slice/transpose,realize 时应用) | (未来 TP)rank-local 分片 | 未来 TP 支持:shard 表达为 artifact 元数据,source 选择 + P2P 路由 + 校验 + 物化共用同一管线,不必每个使用方拉全量再 reshape |
 | **统一物化管线 DISK→DRAM→VRAM**(显式、有界、跨工作流复用) | tiered-store pipeline(L3→L2→L1→L0) | 同构;TensorCast "bounded, reusable across workflows" 的表述强化 lake 设计 |
-| **topology-aware P2P fanout**(replica 位置 + 介质 + 负载 + 拓扑距离) | 方案 Z(池放置、调度读视图) | fanout 规划基于 artifact 元数据 = lake"池主动放置、调度单向读视图" |
+| **topology-aware P2P fanout**(replica 位置 + 介质 + 负载 + 拓扑距离) | 池放置·调度读视图 | fanout 规划基于 artifact 元数据 = lake"池主动放置、调度单向读视图" |
 | **高低基数差异化元数据**(权重集中 vs KV 分片租约) | (lake 当前 L0–L3 统一编址,不分基数) | **lake 可借鉴**:高基数 KV 元数据若不走统一权威而分片,可缓解中心元数据压力。但 lake 选择单写者权威位置视图(见差异),分片租约是另一种扩展性取舍,需权衡 |
 | **分片租约 + HRW + 隔离令牌**(防脑裂、去中心元数据) | 控制面单写者 + etcd checkpoint | 对照而非照搬:lake 用单点权威换"随时能问到底"(守 5ms),TensorCast 用分片租约换元数据扩展性。lake 多节点扩展到极大规模时,分片租约是备选 HA/扩展路径 |
 | **Signal 反馈闭环**(TaaS 不内置策略,暴露状态给调用者) | 池上报容量/队列/in-flight 供 gateway/Router | **边界一致**:TensorCast 策略在调用者、机制在 TaaS;lake 过载归 gateway、执行归推理系统。同一"机制/策略分离"哲学 |
@@ -312,7 +312,7 @@ KV 在通用词里的表达是 **manifest(清单)**:一张"这个请求的 KV �
 - **与 Mooncake 打平怎么读(场景压平)**:TensorCast 与 HiCache 不在一层——它是 HiCache 的后端,正确对照是 Mooncake。§6.3 打平,是因为这个负载只调 exists/get/put:内容寻址、分片租约、view 全不触发,区别被场景压平——打平本身就是论文要的卖点(通用抽象不输专用系统)。区别在场景之外:一套栈同时管权重/checkpoint(Mooncake 不能);publish/hydrate 让调用者能主动搬 KV(Mooncake 只有写穿/命中两条被动路径);规模上去后分片元数据优于集中 master。对 lake 的参考价值因此在权重侧(view/binding/assembly)与工程侧(HA/mTCP/可观测性),不在 KV 控制面。
 - **KV 所有权哲学(租借 vs 收归)**:TensorCast 的 KV 是 **Caller-Leased**——引擎保留所有权,只把临时管理权租给系统,迁移时 publish/hydrate 由引擎侧适配器执行。lake 把 KV 所有权**收归池**(比 TensorCast 的 System-Owned 更彻底):引擎零地址、不持索引,KV 的生死/位置/谱系全归池权威。租借模式引擎改造小、接入快(manifest/publish/hydrate/evict 四个实例钩子);收归模式换来池的全局前缀复用/放置/故障恢复与 worker 可销毁。这是"TensorCast ≈ lake 存储层 minus radix 控制面"在所有权维度的另一种表述。
 - **一致性权威(单点一本账 vs 分片各记各的)**:先把 lake 自己说准。有人会问:agent 是异步提交 CP 的,那不就是最终一致吗?——**对,写入传播确实是最终一致的**:agent 热路径先写本地 overlay,满块注册、位置变化批量异步报给 CP,事件到达之前 CP 的账就是旧的。"强一致"说的不是传播,是**提交点之后**:① CP 进程内存是单写者,事件一旦提交,账永远只有一本、不分叉,同步读必拿到最新提交态(线性一致);② 搬 KV、确认位置时同步查 CP 权威,不走镜像。所以 lake 的全貌是"**最终一致的传播 + 一个能问到底的权威**":Router 平时读本地镜像(零 RPC),误判了回查 CP、miss 回填,只损性能不损正确性。这跟纯最终一致的差别在于:纯最终一致系统里你问到的永远是"可能是旧的",lake 里你总能花一次同步 RPC 问到确定答案。TensorCast 没有这个单点:GS 只存 N 条分片租约,KV 页的副本账分散在各分片宿主本地,worker 缓存租约、心跳对账——**没有任何一处能一跳回答"这页 KV 全局在哪"**。这会导致什么:lake 的 Router 任何时候都能从本地镜像(必要时回查 CP)拿到全局提交态,D-direct 决策守得住 5ms 预算;代价是 CP 是中心——单点写、内存装全量元数据、HA 靠 lease + checkpoint 重建,规模到极致是瓶颈。TensorCast 元数据压力天然分散,百万级 KV 页打不爆中心;代价是读者拿到的可能是旧账(租约缓存没刷新、心跳没收敛),选错副本就传输失败重试、回退 disk 读,故障分片在租约过期前事实不可用。两家都接受"陈旧只损性能不损正确性",差别在 lake 留了一个能问到底的权威,TensorCast 没有。
-- **放置智能归谁(池自治 vs 调用者编程)**:lake 的池**主动**按热度迁移(promotion/demotion/L0 预放置),调度器单向读视图(方案 Z);TensorCast **刻意不内置放置策略**——Signal 只暴露状态,prefetch/pin/迁移全由调用者编程,daemon 的驱逐只是本地反应式(GPU 满了先驱逐再重试)。这是"纯状态层"定位的代价与自觉:优化智商全在调用者侧,池本身不替任何人做决定。
+- **放置智能归谁(池自治 vs 调用者编程)**:lake 的池**主动**按热度迁移(promotion/demotion/L0 预放置),调度器单向读视图;TensorCast **刻意不内置放置策略**——Signal 只暴露状态,prefetch/pin/迁移全由调用者编程,daemon 的驱逐只是本地反应式(GPU 满了先驱逐再重试)。这是"纯状态层"定位的代价与自觉:优化智商全在调用者侧,池本身不替任何人做决定。
 - **张量感知 vs 不透明字节(最尖锐对立)**:论文明确主张 TaaS **"不能像对象存储那样把数据当不透明字节块"**,必须张量原生(理解身份/布局/设备/变换),才能做 in-flight transform、view、按并行度切片;lake **KV 刻意不透明字节**(模型无关池,接新模型只注册 `model_id` 命名空间,池不解释张量布局)。这是**有意的根本对立**——TensorCast 用结构换灵活性与联合优化,lake 用不透明换模型无关与池统一。权重侧 lake 可择机引入张量感知(view/分片),**KV 侧坚持不透明**(前缀复用靠 radix hash,不靠张量语义)。
   - 不透明 ≠ 不管布局。lake 的答案是**布局一致性靠命名空间约定,不靠池解释**:注册 `(model_id, revision)` 时 `ModelDescriptor` 就带上 `num_layers`、`BlockSpec`(block_tokens、bytes_per_block)、`hash_algo`,接入该命名空间的所有 worker 必须按同一布局生产/消费;同一模型换布局(FP8↔BF16 KV、改 block 大小、变头配置)→ 注册成新 revision,即新命名空间——schema 本就约定 KV 不跨 revision 复用,布局隔离正好落在这道现有边界上。池唯一能做的校验是块大小对不上就拒写;块内字节怎么排,池永远不看。代价:布局兼容性由接入方自律,池不替你发现"同 hash 不同字节"的误接——这是不透明字节省掉转换逻辑的同时让渡出去的检查。
   - 那 PD 分离时 P 和 D 两边 layout 不一致怎么办?分两种。**排布不同**(P 的 kernel 按 layer-first 写、池里流通的是 page-first):数学内容相同,只是内存摆法不同,在 worker↔池边界由 agent 一次 kernel launch 转掉(见 [`../../architecture/kv-cache-pool.md`](../../architecture/kv-cache-pool.md)「布局转换」)——P 和 D 各自内部用什么排布随意,出池/入池时对齐到池约定。**内容/规格不同**(dtype、头数、block 大小变了):转换无意义,本来也不该共享,必须各注册各的命名空间。

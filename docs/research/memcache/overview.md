@@ -13,7 +13,7 @@ MemCache 是面向 **LLM / GR 推理** 的**高性能分布式 KVCache 对象存
 | MemCache 概念 | 本系统对应 | 关系 |
 |---------------|-----------|------|
 | MetaService（池分配 + 对象元数据 + LRU） | 存储控制面位置视图 / 配额·GC | **形态相近**（独立元数据面）；语义是 **exact-key 对象**，非 radix 内容寻址 |
-| LocalService 贡献 HBM/DRAM | L0/L1 池化载体 | **值得对照**：节点贡献设备/主机内存进池；lake 更彻底（HBM 亦池权威、方案 Z） |
+| LocalService 贡献 HBM/DRAM | L0/L1 池化载体 | **值得对照**：节点贡献设备/主机内存进池；lake 更彻底（HBM 亦池权威、池放置·调度读视图） |
 | MemFabric OneCopy（device_rdma/sdma、host_rdma…） | Transfer Bus | **Ascend 路径参考**；NVIDIA 侧仍以 Mooncake TE / NIXL 为主 |
 | HBM→DRAM→SSD 多层 + 高低水位淘汰 | L0–L3 冷热 | **分层思想可借鉴**；lake 另有 L3 对象 SSOT、前缀亲和、引用冻结 |
 | 多副本 put（≤8） | 池副本策略 | 参考；lake 副本与冷热/配额统一编排 |

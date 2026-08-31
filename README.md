@@ -121,7 +121,7 @@ lake/
 │   │   └── nonfunctional.md    #   非功能需求
 │   ├── architecture/           # P1 架构设计 — 怎么搭
 │   │   ├── overview.md         #   总体架构
-│   │   ├── storage-layer.md    #   存储层（L0–L3 分层 / 冷热 / 方案 Z）
+│   │   ├── storage-layer.md    #   存储层（L0–L3 分层 / 冷热 / 池放置·调度读视图）
 │   │   ├── compute-layer.md    #   计算层（HBM 池化入图 / KV 管理 / 投机解码）
 │   │   ├── kv-cache-pool.md    #   KV cache 池（Block 寻址 / 跨实例传输 / ref / 双网络）
 │   │   ├── scheduling.md       #   路由与调度（命中感知 / 在途再均衡）

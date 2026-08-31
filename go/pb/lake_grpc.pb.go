@@ -128,7 +128,7 @@ type ControlPlaneServiceClient interface {
 	GetShardMap(ctx context.Context, in *GetShardMapRequest, opts ...grpc.CallOption) (*GetShardMapResponse, error)
 	// 加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
 	//
-	//	P7 收口(方案 Z):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
+	//	P7 收口(池放置·调度读视图):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
 	//	hit_count 选热块 → agent PlaceBlocks),Router 只报告命中(ReportHits)、
 	//	不指挥放置。
 	JoinShardNode(ctx context.Context, in *JoinShardNodeRequest, opts ...grpc.CallOption) (*JoinShardNodeResponse, error)
@@ -139,7 +139,7 @@ type ControlPlaneServiceClient interface {
 	// P7 收口:命中上报(best-effort 批量)。Router 在本地镜像上观测到前缀命中后
 	//
 	//	批量回传,CP 累计到 radix 节点 hit_count(SGLang TreeNode.hit_count 同款),
-	//	供 promote 准入 / 扩容 warmup 选块 / 未来方案 Z 预放置复用——一套热度信号。
+	//	供 promote 准入 / 扩容 warmup 选块 / 未来池侧预放置复用——一套热度信号。
 	//	丢失可容忍(计数偏弱),不进 ViewEvent。
 	ReportHits(ctx context.Context, in *ReportHitsRequest, opts ...grpc.CallOption) (*Ack, error)
 }
@@ -481,7 +481,7 @@ type ControlPlaneServiceServer interface {
 	GetShardMap(context.Context, *GetShardMapRequest) (*GetShardMapResponse, error)
 	// 加入 KV Node → 重算环,仅返回落在新节点区间的迁移计划(最小迁移)。
 	//
-	//	P7 收口(方案 Z):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
+	//	P7 收口(池放置·调度读视图):join 后**新节点 warmup 由池侧自主决策发起**(CP 按
 	//	hit_count 选热块 → agent PlaceBlocks),Router 只报告命中(ReportHits)、
 	//	不指挥放置。
 	JoinShardNode(context.Context, *JoinShardNodeRequest) (*JoinShardNodeResponse, error)
@@ -492,7 +492,7 @@ type ControlPlaneServiceServer interface {
 	// P7 收口:命中上报(best-effort 批量)。Router 在本地镜像上观测到前缀命中后
 	//
 	//	批量回传,CP 累计到 radix 节点 hit_count(SGLang TreeNode.hit_count 同款),
-	//	供 promote 准入 / 扩容 warmup 选块 / 未来方案 Z 预放置复用——一套热度信号。
+	//	供 promote 准入 / 扩容 warmup 选块 / 未来池侧预放置复用——一套热度信号。
 	//	丢失可容忍(计数偏弱),不进 ViewEvent。
 	ReportHits(context.Context, *ReportHitsRequest) (*Ack, error)
 	mustEmbedUnimplementedControlPlaneServiceServer()
@@ -1112,7 +1112,7 @@ type AgentServiceClient interface {
 	//
 	//	流式上报、流式 ack(避免客户端关流才 ack 的运维别扭)。
 	ReportLoad(ctx context.Context, opts ...grpc.CallOption) (grpc.BidiStreamingClient[LoadReport, Ack], error)
-	// 控制面 → agent:补拉放置(缺失 KV 放到指定节点 HBM,方案 Z 单向耦合)。
+	// 控制面 → agent:补拉放置(缺失 KV 放到指定节点 HBM,池放置·调度读视图 单向耦合)。
 	PlaceBlocks(ctx context.Context, in *PlaceBlocksRequest, opts ...grpc.CallOption) (*Ack, error)
 }
 
@@ -1174,7 +1174,7 @@ type AgentServiceServer interface {
 	//
 	//	流式上报、流式 ack(避免客户端关流才 ack 的运维别扭)。
 	ReportLoad(grpc.BidiStreamingServer[LoadReport, Ack]) error
-	// 控制面 → agent:补拉放置(缺失 KV 放到指定节点 HBM,方案 Z 单向耦合)。
+	// 控制面 → agent:补拉放置(缺失 KV 放到指定节点 HBM,池放置·调度读视图 单向耦合)。
 	PlaceBlocks(context.Context, *PlaceBlocksRequest) (*Ack, error)
 	mustEmbedUnimplementedAgentServiceServer()
 }

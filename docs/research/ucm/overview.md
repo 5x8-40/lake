@@ -16,7 +16,7 @@ UCM（华为 ModelEngine）是挂在 **vLLM / vLLM-Ascend / SGLang / MindIE** �
 | `UCMConnector` / `KVConnectorBase_V1` | worker↔存储池 client | **接入样板**（引擎侧插件）；lake 要将 connector 升为必经集群路径 |
 | NFS / Mooncake / POSIX / DS3FS… store | L2/L3 后端 | 多后端工厂模式对照 LMCache；生产默认仍可复用 Mooncake TE |
 | `UcmSparseBase`（scheduler/worker hooks） | （远期）长上下文稀疏 | **lake 当前非核心**；对照「算法与存储解耦」 |
-| PD via unified storage pool | 存算分离 + PD/混部/D-direct | **叙事最接近 lake**：实例无状态、池作中间态；湖仍更彻底（HBM 归池、方案 Z、三模式选路） |
+| PD via unified storage pool | 存算分离 + PD/混部/D-direct | **叙事最接近 lake**：实例无状态、池作中间态；湖仍更彻底（HBM 归池、池放置·调度读视图、三模式选路） |
 | Cache Blend / window extrapolate | — | 应用侧能力；非 lake P0–P4 主线 |
 
 **核心结论**：UCM 是 **「vLLM 生态上的 KV 中心化框架」**——前缀缓存 + 多 store + 稀疏插件 + 以池中转做 PD。与 LMCache 同属 **引擎插件层**；与 Mooncake/MemCache 的关系是 **消费其 store/传输**。lake 借鉴其 **store 抽象、connector 集成、PD-via-pool 叙事**；拒绝把 **引擎私有 HBM + 可选 connector** 当作权威模型。
@@ -85,7 +85,7 @@ vLLM / Ascend / SGLang / MindIE
 
 ## 局限（相对 lake）
 
-1. **仍是引擎插件**：HBM/调度权威在 vLLM；非集群位置视图 + 方案 Z。  
+1. **仍是引擎插件**：HBM/调度权威在 vLLM；非集群位置视图 + 池放置·调度读视图。  
 2. **无独立 radix 控制面**：前缀依赖引擎 APC/block hash + store `lookup_on_prefix`。  
 3. **无 D-direct / 三模式 Router**：PD 叙事主推池中转，不覆盖本地命中直跳选路。  
 4. **稀疏/Blend 等能力宽** — lake 近期不必照搬，避免范围膨胀。

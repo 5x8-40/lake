@@ -69,7 +69,7 @@ vLLM 是**高性能 LLM 推理引擎**:以 PagedAttention 块状管理 GPU KV ca
 - vLLM 的 `kv_offload` 仍 **per-instance**——跑在该引擎的 Scheduler 进程内,tier 是**引擎私有**,非集群级权威池;无跨实例强一致位置视图。我们归存储池集群权威。
 - 仍 **无 radix**——`OffloadKey` 是 `hash+group_idx` 平铺键,非前缀树;前缀匹配仍靠 hash。我们 radix + 位置视图。
 - 跨实例/跨 session 协调(`session_id`/`continuation_id`、P2P KV Events)仍是 RFC/计划;我们设计即为集群级。
-- HBM 仍引擎自分配(`kv_offload`/connector 只借做传输)——**方案 Z 的"池管 HBM 放置"vLLM 无对应**,是我们增量。
+- HBM 仍引擎自分配(`kv_offload`/connector 只借做传输)——**池放置·调度读视图 的"池管 HBM 放置"vLLM 无对应**,是我们增量。
 
 **可借鉴(已落地抽象)**:`OffloadingManager`/`LookupResult`/`OffloadPolicy` 三态查找 + 策略枚举、KV Events 事件 schema(`BlockStored` 的 `medium`/`group_idx`)、`OffloadKey` 内容寻址编码、secondary tier 的 cascade/promotion 异步作业模型(`JobMetadata` 带 `is_promotion`/`req_context`)。详见 [compute.md](compute.md) "KV Events" 与 "KV offload 子系统"节。
 
@@ -211,7 +211,7 @@ AsyncLLM(引擎入口)
 | 跨 session/实例协调 | **RFC** #48501(`session_id`/`continuation_id`,未落地) | 设计即为集群级 |
 | 调度器 | 引擎进程内,单实例 | 控制面独立(Go),集群视角 |
 | 外部 KV | `KVConnectorBase_V1` 插件(可选) | 存储池一等公民(必经) |
-| HBM 归属 | 引擎自分配(connector/offload 只借传输) | 池管 HBM 放置(方案 Z) |
+| HBM 归属 | 引擎自分配(connector/offload 只借传输) | 池管 HBM 放置(池放置·调度读视图) |
 | attention 核 | C++/CUDA(FlashAttention) | Python + Triton |
 | 弹性 | worker 有状态,扩缩慢 | 节点无状态,秒级 |
 | Spec decode | 完备(Eagle/Medusa/…) | 参考其 proposer/speculator 划分 |

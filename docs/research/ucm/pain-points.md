@@ -29,7 +29,7 @@
 
 | 现象 | 证据 | lake |
 |------|------|------|
-| 分层能力分散在各 store/稀疏卸载 | NFS/Mooncake/… + sparse offload | L0–L3 统一由池管；方案 Z 主动预放置 |
+| 分层能力分散在各 store/稀疏卸载 | NFS/Mooncake/… + sparse offload | L0–L3 统一由池管；池侧主动预放置 |
 | 无 F11 多模型配额/GC 叙事 | 配置偏 connector/store | 软硬配额、借用、背压上送 gateway |
 
 ## 5. 工程成本

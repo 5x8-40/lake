@@ -85,7 +85,7 @@
 
 ### 关键差异
 
-- Mooncake 的 KVCache 池服务于"实例间共享/迁移",实例仍拥有本地 HBM;我们连 HBM 放置都归存储池(方案 Z)。
+- Mooncake 的 KVCache 池服务于"实例间共享/迁移",实例仍拥有本地 HBM;我们连 HBM 放置都归存储池(池放置·调度读视图)。
 - Mooncake 无 radix 前缀树的内容寻址复用(按 segment ID 存取);我们用内容寻址 `(model_id, layer, block_hash)` + radix 实现前缀复用,SGLang RadixAttention 的思路补上这一块。
 - Mooncake 无"统一管理 L0-L3 + 冷热生命周期 + 多模型配额/GC/碎片整理"——这些是我们的存储池增量(F11)。
 
@@ -125,7 +125,7 @@ vLLM 是本系统**计算层(Python + Triton)**的直接参考。SGLang/LMCache/
 |-----------|----------|------|
 | **PagedAttention**(block 分页 + block table) | 存储池 KV block + worker block table | 见 compute-layer。block 粒度对齐,worker 仍用 block table 做 paged attention,物理位置由存储池元数据定 |
 | **`KVConnectorBase_V1`** 外部 KV 插件接口(scheduler/worker 双侧 + metadata + layer-wise mixin) | 计算层 worker ↔ 存储池 client | 见 vllm/compute.md。接口形态直接参考;LMCache/Mooncake/NIXL/FlexKV 均已实现为 connector,印证接入路径可行 |
-| **`SupportsHMA`**(hybrid memory allocator 能力标记) | (无对应——方案 Z 是本系统增量) | `SupportsHMA` 声明 connector 支持 HMA(多 KV cache group 混合架构,如 Mamba+attention),需 `request_finished_all_groups` 与多 group 释放对齐。**注意:它不是"外部管 HBM"**——vLLM 的 HBM 始终引擎自分配,connector 只借做传输。方案 Z 的"池管 HBM 放置"vLLM 无对应标记,需自设计(见 [`../architecture/compute-layer.md`](../architecture/compute-layer.md)) |
+| **`SupportsHMA`**(hybrid memory allocator 能力标记) | (无对应——池放置·调度读视图 是本系统增量) | `SupportsHMA` 声明 connector 支持 HMA(多 KV cache group 混合架构,如 Mamba+attention),需 `request_finished_all_groups` 与多 group 释放对齐。**注意:它不是"外部管 HBM"**——vLLM 的 HBM 始终引擎自分配,connector 只借做传输。池放置·调度读视图 的"池管 HBM 放置"vLLM 无对应标记,需自设计(见 [`../architecture/compute-layer.md`](../architecture/compute-layer.md)) |
 | **`ExternalBlockHash`**(跨实例外部哈希) | 存储池内容寻址 `(model_id,layer,block_hash)` | worker 向存储池查前缀的自然键,与存储池内容寻址直接对接 |
 | **`GPUModelRunner`**(load_model + execute_model + block table 维护) | 计算层 worker 生命周期与执行循环 | worker 生命周期(Warm→Serving→Drain)、execute_model、block table 维护直接借鉴 |
 | **权重 offloader**(UVA + `_prefetch_checkpoint`) | 权重归存储池 + 计算层流式加载 | vLLM 的权重流式喂 GPU 是"权重存算分离"的原型 |
@@ -139,7 +139,7 @@ vLLM 是本系统**计算层(Python + Triton)**的直接参考。SGLang/LMCache/
 - vLLM 多层 offload 是**单实例内级联**(GPU↔CPU↔NVMe/Obj 同机);我们是**跨节点池**统一管 L0–L3。
 - vLLM **无 radix tree**(APC hash 顺序匹配 + `OffloadKey` 平铺键)、**无集群位置视图/本地命中**(KV Events `medium` 仅单实例介质标记);我们 radix + 位置视图 + D-direct。
 - vLLM connector 是**可选 per-instance 插件**;我们是**必经集群级路径**(存储池 client 常驻)。
-- vLLM HBM **引擎自分配**(offload/connector 只借传输);我们**池管 HBM 放置**(方案 Z,vLLM 无对应)。
+- vLLM HBM **引擎自分配**(offload/connector 只借传输);我们**池管 HBM 放置**(池放置·调度读视图,vLLM 无对应)。
 - vLLM attention 主路径 **C++/CUDA**(FlashAttention);我们选 **Python + Triton**(自定义核门槛与生态不同)。
 - vLLM worker **有状态**(加载模型 + HBM KV,崩溃丢 KV);我们 **无状态**(状态全剥离,秒级伸缩,F4 续推)。
 
@@ -163,7 +163,7 @@ vLLM 是本系统**计算层(Python + Triton)**的直接参考。SGLang/LMCache/
 
 ### 关键差异(我们更彻底)
 
-- **存算分离彻底度**:Dynamo 的 KV 仍由 engine 持有,KVBM 是"offload 层"(把 engine 的 KV 卸到 CPU/SSD/远端);lake **HBM 归池、worker 不拥有任何内存**,KVBM 式 offload 在 lake 是池的统一放置(方案 Z),非引擎私有缓存的延伸。
+- **存算分离彻底度**:Dynamo 的 KV 仍由 engine 持有,KVBM 是"offload 层"(把 engine 的 KV 卸到 CPU/SSD/远端);lake **HBM 归池、worker 不拥有任何内存**,KVBM 式 offload 在 lake 是池的统一放置,非引擎私有缓存的延伸。
 - **控制面一致性**:Dynamo KV 事件走 NATS(best-effort 事件流)、discovery 多后端,无全局强一致位置视图;lake **位置视图权威在存储控制面进程内存**(单写者线性一致),etcd 降频 checkpoint,Router 本地镜像一跳命中(见 [`../architecture/control-plane.md`](../architecture/control-plane.md)、[`../architecture/consistency.md`](../architecture/consistency.md) §1)。Dynamo 偏"事件流编排",lake 偏"内存强一致权威 + 镜像"。
 - **radix 归属**:Dynamo KV-aware router 用 block 哈希 overlap,radix 前缀树/内容寻址仍依赖底层 engine;lake 把 radix 归存储池统一管。
 - **执行模式**:Dynamo 侧重 PD/E-P-D 物理隔离;lake 多 D-direct(本地命中零传输)与混部,Dynamo 无明确对应。
@@ -207,7 +207,7 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 | **`UcmKVStoreBaseV1`** lookup/prefetch/load/dump | kv-pool / Transfer Bus 客户端原语 | API 边界清晰；键语义仍换成内容寻址 |
 | **`UcmConnectorFactoryV1`** 多后端 | L2/L3 后端注册 | 工厂懒加载对照 |
 | **`UCMConnector` / LayerWise / PD** | worker↔池、P5 流水线 | vLLM connector 工业集成样板 |
-| **PD via unified storage pool** | 存算分离 + PD/混部 | 叙事同向；lake 另补 D-direct 与方案 Z |
+| **PD via unified storage pool** | 存算分离 + PD/混部 | 叙事同向；lake 另补 D-direct 与池放置·调度读视图 |
 | **`UcmSparseBase`** | （Could）长上下文 | 算法与存储解耦可记；非 P0–P4 必做 |
 
 ### 关键差异
@@ -223,12 +223,12 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 | 我们的设计层 | 主要参考 | 我们多做的(更彻底) |
 |--------------|----------|---------------------|
 | **计算层**(worker/attention/runner) | **vLLM**(PagedAttention/`GPUModelRunner`/spec decode) | worker 无状态化(模型/KV 从存储池读写);attention 核用 Triton |
-| **worker↔存储池接入** | **vLLM `KVConnectorBase_V1`** + **UCM / FlexKV connector** 集成样板 | connector 从可选插件升为存储池必经路径;集群级权威。注:`SupportsHMA`(HMA,多 KV group)≠ 方案 Z,方案 Z 为本系统增量 |
+| **worker↔存储池接入** | **vLLM `KVConnectorBase_V1`** + **UCM / FlexKV connector** 集成样板 | connector 从可选插件升为存储池必经路径;集群级权威。注:`SupportsHMA`(HMA,多 KV group)≠ 池放置·调度读视图,池放置·调度读视图 为本系统增量 |
 | L0-L3 分层 | SGLang HiCache | L1/L2 也归存储池(非实例私有);统一冷热/生命周期 |
 | KV Pool 数据面 | Mooncake transfer-engine + store；**Ascend MemCache**(异构对照) | 内容寻址 + radix + 多模型配额/GC/碎片整理；MemCache 作 Meta/Local·多层·OneCopy 对照(exact-key,非 radix) |
 | 前缀复用 | SGLang RadixAttention + LMCache | radix 归存储池 + 位置视图一跳 + 反向回传生长 |
 | 执行模式 | DistServe/Splitwise + HiCache PD + **UCM PD-via-pool** | 三模式逐请求选路 + D-direct(本地命中直跳) |
-| 放置/调度边界 | (我们的方案 Z,原创) | 存储池主动放置 + 调度器单向消费 |
+| 放置/调度边界 | 池放置·调度读视图(本项目原创) | 存储池主动放置 + 调度器单向消费 |
 | **编排层/控制面** | **Dynamo**(KVBM logical/physical/engine + KV-aware router) | 位置视图权威在存储控制面进程内存、etcd 降频 checkpoint(Dynamo 走 NATS 事件流);HBM 归池而非 engine offload;Rust 存储控制面 + Go 调度控制面分工(Dynamo 单一 Rust 编排) |
 | **超低延迟 decode / PD 胶水** | **TileRT**(`TileRTConnector` + NIXL/Mooncake;核闭源) | 借鉴 connector claim、MTP-aware 传 KV、双传输;拒绝单槽/bs=1/引擎私有 HBM。详见 [tilert/](tilert/) |
 
