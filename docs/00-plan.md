@@ -233,7 +233,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 - [x] gRPC 接口 + RDMA 数据平面（先 TCP 后 RDMA）（传输面复用 A；P4.4：`Transport`+`TcpTransport`+`TcpDataService` 正名自 SkeletonKv；`TransferService` 接线；真 RDMA → P5）
 - [x] 一致性哈希分片 + KV Node 扩缩时的 block 重分布（P4.9：`GetShardMap`/`JoinShardNode`/`DrainShardNode`；环+最小迁移+Drain 推 L2 计划；真跨机字节 → P5，见 #20）
 - [x] **多模型生命周期**：模型注册/下线级联删、revision 失效（F11；P4.5：`RegisterModel`/`DeregisterModel` + `(model_id,revision)` 命名空间，见 #20）
-- [x] **按模型配额与空间分配**（软/硬配额 + 借用 + 背压；P4.6：`AdmitRegisterBlocks` 写前准入(方案 A，不 reserve) + `SetModelQuota`/`GetModelQuota` + `BackpressureSignal`；`Reserve*` → 多进程/P4.7，见 #20）
+- [x] **按模型配额与空间分配**（软/硬配额 + 借用 + 背压；P4.6：`AdmitRegisterBlocks` 写前准入(不 reserve) + `SetModelQuota`/`GetModelQuota` + `BackpressureSignal`；`Reserve*` → 多进程/P4.7，见 #20）
 - [x] **GC**：冷块/孤儿块回收 + 崩溃 reconcile（P4.7：`ReconcileOrphans`/`DiscardBlocks`/`CheckpointStore` 内存 mock；节点级 reconcile 兜底 writeback 泄漏；见 #20。P4.3 review 半原子 `apply_location_events` 等仍可后续收紧）
 - [x] **碎片整理**：逻辑共置 + 物理压实，后台节流可暂停（P4.8：`TriggerDefrag`/`PauseBackground` + `SegmentArena` + pipeline Compact/CoLocate；共享 BandwidthPool；见 #20）
 

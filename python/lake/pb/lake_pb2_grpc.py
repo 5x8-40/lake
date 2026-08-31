@@ -224,7 +224,7 @@ class ControlPlaneServiceServicer:
         raise NotImplementedError('Method not implemented!')
 
     def AdmitRegisterBlocks(self, request, context):
-        """P4.6:配额写前准入(方案 A)。纯检查、不 reserve、不改位置视图。
+        """P4.6:配额写前准入。纯检查、不 reserve、不改位置视图。
         对齐 Mooncake PutStart 的「写前问 Master」公开边界;无 reserved 占座(Reserve* → 多进程/P4.7)。
         agent 须在 flush durable **之前**调用;触硬 → Ack.ok=false + backpressure。
         请求体复用 RegisterBlocksRequest(只读 model/revision/pool_kind/block hashes 计费;

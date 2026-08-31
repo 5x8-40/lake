@@ -350,7 +350,7 @@ ref 分两级,频率不同(解耦"每 step 高频"与"低频全局",避免 per-s
 - 每 `(model_id, revision)` 设软配额(常态上限)与硬配额(绝对上限)(P4.6:`SetModelQuota`/`GetModelQuota`;亦可随 `RegisterModel` 登记)。
   - 软配额内自由写入;超软配额按该模型冷块(inactive/`LineageBackend`)淘汰腾位。
   - 闲时借用池全局空闲空间(best-effort,遇压力可从超软借用方回收)。
-  - **写前准入(方案 A)**：公开 RPC `AdmitRegisterBlocks`(纯检查、不 reserve)→ 再 flush durable → `RegisterBlocks`(PutEnd)。对齐 Mooncake `PutStart` 的公开边界形态,无 reserved 占座(`Reserve*` → 多进程/P4.7)。触硬 → `Ack.backpressure`(`HARD_QUOTA`);请求级 shedding 仍归 gateway,见 [`../features/slo.md`](../features/slo.md)。
+  - **写前准入**：公开 RPC `AdmitRegisterBlocks`(纯检查、不 reserve)→ 再 flush durable → `RegisterBlocks`(PutEnd)。对齐 Mooncake `PutStart` 的公开边界形态,无 reserved 占座(`Reserve*` → 多进程/P4.7)。触硬 → `Ack.backpressure`(`HARD_QUOTA`);请求级 shedding 仍归 gateway,见 [`../features/slo.md`](../features/slo.md)。
 - 配额权重按模型负载/命中率动态调整(调度器决策,控制面下发)。
 - **扩容**:加入 KV Node,按一致性哈希重分布,仅迁移落在新节点区间的 block。
 - **缩容**:Drain 目标 Node(block 迁出或下沉 L3)再下线。
