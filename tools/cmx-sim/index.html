@@ -33,6 +33,7 @@
         <option value="v4pro">DeepSeek V4-Pro</option>
         <option value="v4flash">DeepSeek V4-Flash</option>
         <option value="glm52">GLM-5.2</option>
+        <option value="glm53flash">GLM-5.3-Flash</option>
         <option value="k3" selected>Kimi K3</option>
       </select>
 
@@ -201,11 +202,15 @@
         $("profile").value = previous;
       }
       const isV4 = modelId === "v4pro" || modelId === "v4flash";
-      $("mtpWrap").hidden = !(isV4 || modelId === "glm52");
+      const hasMtp = Boolean(S.MODELS[modelId].hasMtp);
+      $("mtpWrap").hidden = !hasMtp;
+      if (!hasMtp) $("includeMtp").checked = false;
       $("compressorPolicyWrap").hidden = !isV4;
       $("mtpLabel").textContent = isV4
         ? "计入 V4 的 1 层 MTP SWA 状态"
-        : "计入 GLM 的 1 层 MTP KV/index";
+        : modelId === "glm53flash"
+          ? "计入 GLM-5.3-Flash 的 1 层 MTP KV（indexer 共享）"
+          : "计入 GLM 的 1 层 MTP KV/index";
     }
 
     function syncConditionalInputs() {
@@ -533,6 +538,8 @@ Pool read budget = ${result.loadMode === "agentic"
            ${anchorRow("V4-Flash", "v4flash", "bf16-logical")}
            ${anchorRow("GLM-5.2 base", "glm52", "fp8-logical")}
            ${anchorRow("GLM-5.2 + MTP", "glm52", "fp8-logical", true)}
+           ${anchorRow("GLM-5.3-Flash", "glm53flash", "bf16-logical")}
+           ${anchorRow("GLM-5.3-Flash + MTP", "glm53flash", "bf16-logical", true)}
            ${anchorRow("Kimi K3", "k3", "fp8-vllm-state")}
          </tbody>`;
     }

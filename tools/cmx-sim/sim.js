@@ -64,6 +64,20 @@
       convKernel: 4,
       evidence: "moonshotai/Kimi-K3 config + vLLM KDA state implementation",
     },
+    glm53flash: {
+      id: "glm53flash",
+      name: "GLM-5.3-Flash",
+      kind: "dsa-kda",
+      nMla: 11,
+      nKda: 34,
+      kdaHeads: 64,
+      kdaDim: 128,
+      convKernel: 4,
+      indexCompress: 4,
+      hasMtp: true,
+      evidence:
+        "zai-org/GLM-5.3-Flash config.json；KDA state 按 vLLM K3 同构公式推导",
+    },
   };
 
   var PROFILES = {
@@ -142,6 +156,26 @@
         byteClass: "mixed-payload",
         confidence: "mixed",
         note: "MLA 按 FP8；KDA conv 默认仍按 BF16，recurrent 为 FP32。",
+      },
+    ],
+    glm53flash: [
+      {
+        id: "bf16-logical",
+        label: "BF16 逻辑布局（1024 B MLA / 256 B index÷4）",
+        mainEntryBytes: 1024,
+        indexEntryBytes: 256,
+        byteClass: "logical-payload",
+        confidence: "derived",
+        note: "config.json：kv_lora_rank=512、NoPE；indexer 128 维单向量、index_kpool=4 压缩；不含页对齐。",
+      },
+      {
+        id: "fp8-logical",
+        label: "FP8 逻辑 MLA + FP8 index（512 B / 128 B÷4）",
+        mainEntryBytes: 512,
+        indexEntryBytes: 128,
+        byteClass: "logical-payload",
+        confidence: "estimate",
+        note: "官方文档支持 FP8 KV；entry 按 1 B/元素推算，未审计引擎 entry 结构。",
       },
     ],
   };
@@ -355,6 +389,18 @@
       growingBytesPerToken =
         nLayers * profile.mainEntryBytes + nIndexer * profile.indexEntryBytes;
       growingBytes = tokens * growingBytesPerToken;
+    } else if (model.kind === "dsa-kda") {
+      // DSA indexer 是单向量 entry，只在 index_kpool 组闭合时物化；MTP 层
+      // 共享 indexer（index_share_for_mtp_iteration），只加一层 MLA KV。
+      var mlaLayers = model.nMla + (includeMtp ? 1 : 0);
+      var indexEntries = Math.floor(tokens / model.indexCompress);
+      growingBytes =
+        mlaLayers * tokens * profile.mainEntryBytes +
+        model.nMla * indexEntries * profile.indexEntryBytes;
+      growingBytesPerToken =
+        mlaLayers * profile.mainEntryBytes +
+        (model.nMla * profile.indexEntryBytes) / model.indexCompress;
+      stateBytes = tokens > 0 ? kdaStateBytes(model) : 0;
     } else {
       growingBytesPerToken = model.nMla * profile.mainEntryBytes;
       growingBytes = tokens * growingBytesPerToken;
