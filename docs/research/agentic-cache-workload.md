@@ -74,9 +74,11 @@ blog 同时给出本地 offload 的两个结构性限制（即分布式 KV 池�
 
 ## 3. AgentX v1.0（SemiAnalysis InferenceX）
 
-**[公开基准 + 方法论]** [AgentX](https://inferencex.semianalysis.com/zh/agentx) 是 SemiAnalysis 的 agentic 负载回放基准（Apache 2.0 开源，[完整测试方法](https://inferencex.semianalysis.com/agentx/methodology)）。与 §2 的原始 request 级 trace 不同，AgentX 是**可回放基准**：匿名化后的会话结构 + 确定性重建 + 统一测量协议，用于横向比较 serving 系统。v1.0 于 2026-06-21 构建，含 393 个自愿采集的 Claude Code 会话、135,282 个请求；匿名化方法与 Qwen-Bailian（最早的生产 trace 公开语料之一）类似。发布数月内，合作伙伴以其为衡量标准向 vLLM/SGLang/TRT-LLM 等上游提交了 50+ 优化 PR。
+**[公开基准 + 方法论]** [AgentX](https://inferencex.semianalysis.com/zh/agentx) 是 SemiAnalysis 的 agentic 负载回放基准（Apache 2.0）。与 §2 的原始 request 级 trace 不同，AgentX 是可回放基准：匿名化会话结构 + 确定性重建 + 统一测量协议，用于横向比较 serving 系统。v1.0 于 2026-06-21 构建，含 393 个自愿采集的 Claude Code 会话、135,282 个请求，匿名化方法与 Qwen-Bailian 类似；发布数月内合作伙伴以其为衡量标准向上游引擎提交了 50+ 优化 PR。资料入口：[测试方法](https://inferencex.semianalysis.com/agentx/methodology)、[InferenceXv3 发布文](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat)、Hugging Face 数据集（[full](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126) / [256k](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126-256k)，WEKA 格式，AIPerf 可读）。
 
-数据集概况（筛选规则：会话 ≥20 个请求、Claude Code ≥2.1.139、同时运行 subagent ≤10；剔除完全重复请求、安全监控/标题生成的短 classifier 调用、重建后 input 超 990K token 的请求）。两个变体均公开（Hugging Face：[full](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126)、[256k](https://huggingface.co/datasets/semianalysisai/cc-traces-weka-062126-256k)），AIPerf 可读的 WEKA trace 格式：
+### 3.1 数据集概况
+
+筛选规则：会话 ≥20 个请求、Claude Code ≥2.1.139、同时运行 subagent ≤10；剔除完全重复请求、安全监控/标题生成的短 classifier 调用、重建后 input 超 990K token 的请求。
 
 | 维度 | full 变体 | 256k 变体 |
 |---|---|---|
@@ -90,11 +92,13 @@ blog 同时给出本地 offload 的两个结构性限制（即分布式 KV 池�
 | 模型组合（按 turn） | claude-opus-4-8 62.1k、fable-5 16.2k、haiku-4-5 8.0k、opus-4-7 6.4k、opus-4-6 5.5k | 同左（opus-4-8 35.9k） |
 | subagent group | 1,697 个；时长中位 2.27 min（p95 18.5 min）；每会话 group 数中位 4 | 同左 |
 
-重建保真度：全部 135,282 个请求中，重建 token 数 / 服务商 token 数之比中位数 1.004（p25–p75 区间围绕 1.0，官方注明不代表逐请求固定误差上限），即长度维度重建基本无系统偏差。
+重建保真度：全部 135,282 个请求中，重建 token 数 / 服务商 token 数之比中位数 1.004（p25–p75 围绕 1.0，官方注明不代表逐请求固定误差上限），长度维度无系统偏差。
 
-口径说明：**会话** = 一次完整 Claude Code 任务；**请求** = 单次 LLM 调用，分 main agent（主链）、subagent（支链，带 join gate）、辅助（一次性侧支调用，不带 join edge，主链不等它；具体语义 trace 未标注，安全监控/标题生成类已在筛选中剔除）三类；分布表的 **turn** = main + subagent 请求，不含辅助请求。表内 cached/uncached 按 64-token block hash 在本会话内的前缀复用计算，是**逻辑复用率**（假设 cache 无限保留的上限），不是任何实际系统的物理命中；物理命中见下方实测表。各分位属同一分布的不同统计量，max 行之间不是同一请求。
+### 3.2 负载分布
 
-逐 turn/request 分布（数据集页统计；full 分布 n=98,827 turn，256k n=68,266；均为 p50 / p75 / p90 / p95 / max）：
+口径说明：**会话** = 一次完整 Claude Code 任务；**请求** = 单次 LLM 调用，分 main agent（主链）、subagent（支链，带 join gate）、辅助（一次性侧支调用，不带 join edge，主链不等它；语义 trace 未标注，安全监控/标题生成类已剔除）三类；分布表的 **turn** = main + subagent 请求，不含辅助请求。cached/uncached 按 64-token block hash 的会话内前缀复用计算，是**逻辑复用率**（cache 无限保留时的上限），不是物理命中；物理命中见 §3.3。各分位是同一分布的不同统计量，不同行的 max 不属同一请求。
+
+逐 turn 分布（full n=98,827，256k n=68,266；p50 / p75 / p90 / p95 / max）：
 
 | 维度 | full 变体 | 256k 变体 |
 |---|---|---|
@@ -105,25 +109,32 @@ blog 同时给出本地 offload 的两个结构性限制（即分布式 KV 池�
 | subagent 请求 ISL | 64.0k / 119.7k / 196.3k / 259.5k / 918.5k（n=42,029） | 60.6k / 105.1k / 161.7k / 196.5k / 255.8k（n=39,822） |
 | subagent 请求 OSL | 328 / 640 / 1.3k / 2.0k / 59.9k | 330 / 637 / 1.2k / 1.9k / 59.9k |
 
-时间维度（发布文）：轮间延迟（主要为 tool 执行时间）中位 3.84 s，仅 ~10% 超过 1 min（多为等待人工介入的间隔）；ISL/OSL 与轮间延迟均近似 log-normal。发布文另给出全部 DeepSeek V4 回放 run 的实际请求分布：ISL p50 88k / p90 272k / p95 404k / p99 675k，OSL p50 413 / p90 2.2k / p95 3.7k / p99 8.6k——closed-loop 回放从会话 25%–75% 处起播、按系统速度推进，run 级分布与语料全量分布口径不同。
+时间维度：轮间延迟（主要为 tool 执行时间）中位 3.84 s，约 10% 超过 1 min（多为等待人工介入）；ISL/OSL 与轮间延迟近似 log-normal。发布文另给出全部 DeepSeek V4 回放 run 的请求分布（ISL p50 88k / p90 272k / p95 404k / p99 675k，OSL p50 413 / p90 2.2k / p95 3.7k / p99 8.6k）；closed-loop 回放从会话 25%–75% 处起播、按系统速度推进，run 级分布与语料全量口径不同。
 
-实测命中率（InferenceXv3 各配置 run，理论命中率由负载决定、实测差距来自系统实现）：
+两点解读：
+
+- per-turn cached fraction 中位 99%（full），与 §2 Codex trace 的 turn 级命中率单调上升同向；uncached input 中位仅 1.7k token/请求，新算量集中在长尾（p95 14.7k、max 949.4k）。
+- 分布近似 log-normal，可用对数正态拟合做仿真采样；但分布受 harness 注入上下文量影响（Claude Code 偏多，Pi 等偏少），换 harness 需重新标定。
+
+### 3.3 实测命中率
+
+InferenceXv3 各配置 run 的实测值。理论命中率由负载决定（§3.2 逻辑复用率），实测与理论的差距来自系统实现：
 
 | 配置 | 并发客户端 | HBM hit | DRAM hit | 说明 |
 |---|---|---|---|---|
 | B300 vLLM DEP8 + 3TB DRAM offload | 384 | 91% | 1.36% | HBM KV 工作集 ≈43M token，负载刚好不超出 |
 | B200（其余配置相同） | 196 | 73% | ≈20% | HBM 工作集 ≈22M token，约为 B300 一半 |
-| GB200 TP4/EP4/DP-attention | 32 | 28.8%（理论 96%） | — | 每个 DP rank 持私有 1/4 池，会话落错 rank 即全量重算 |
-| ATOM 稀疏 checkpoint 保留修复前 → 后 | 48 | 5.6% → 96.45% | — | sliding-window gate 丢弃率 91.35% → 0.16% |
+| GB200 TP4/EP4/DP-attention | 32 | 28.8%（理论 96%） | — | 机制见下 |
+| ATOM 稀疏 checkpoint 保留修复前 → 后 | 48 | 5.6% → 96.45% | — | 机制见下 |
 
-四个对仿真直接有用的结构事实：
+两处大差距的机制，发布文有明确归因：
 
-- **per-turn cached fraction 中位 99%（full）**：与 §2 Codex trace 的 turn 级命中率单调上升同向；uncached input 中位仅 1.7k token/请求，新算量集中在少数长 prefill（p95 14.7k、max 949.4k）。
-- **理论 vs 实测命中率的差距来自放置/路由/驱逐实现，不是负载本身**：同一负载下 DP 私有池 28.8% vs 理论 96%，window-gate 误丢 5.6% vs 96.45%。这两类损耗正是统一存储池 + 全局位置视图要消除的。
-- **HBM 工作集是可测的容量输入**：B300 DEP8 ≈43M token、B200 ≈22M token；DRAM offload 为 write-through，官方经验法则是 DRAM 容量需为 HBM 的 1.5–3× 才有效。
-- **分布形态近似 log-normal**：ISL/OSL/轮间延迟/subagent 时长均可用对数正态拟合做仿真采样；但分布受 harness 注水影响（Claude Code 注入上下文偏多，Pi 等偏少），换 harness 需重标定。
+- **GB200 DPA：放置分片 + 路由无亲和**。DP-attention 下每个 DP rank 只持有池的 1/4 私有分片，路由不按 cache 位置选 rank；会话后续请求落到不含前缀的 rank 即全量重算（原文："Each DP rank owns a private quarter of the pool; a 300k-token session re-landing on the wrong rank recomputes everything"）。KV 在集群内存在，但对本次请求不可达。对应修复是 SGLang 的 DP cache affinity（会话粘到持有其 cache 的 rank）。
+- **ATOM：保留/驱逐策略**。prefix 匹配实际找到了，但混合注意力模型恢复前缀需要 sliding-window 尾部 checkpoint，保留策略不留它，匹配被丢弃（原文："the cache was not missing but being overruled"；window-gate 丢弃率 91.35% → 0.16%）。修复是选择性保留 window 尾部 checkpoint。
 
-回放管线的四个方法要点：
+容量规划的实测输入：HBM KV 工作集 B300 DEP8 ≈43M token、B200 ≈22M token；DRAM offload 为 write-through，官方经验法则 DRAM 容量需为 HBM 的 1.5–3×。
+
+### 3.4 回放方法
 
 - **匿名化保 prefix 结构、不保内容**：input 按 64-token block 转为会话内串联 hash（重复 block ID = 共享 prefix），AIPerf 回放前用确定性合成 coding/tool-use token 填充。客户端不可观测的字段（服务端 chat template、专有 tokenizer、加密 reasoning、图片/文档展开后的 token 数）用确定性 placeholder + 按模型 padding 处理。
 - **subagent 归属依赖 Claude Code 两个新 header**：`x-claude-code-agent-id` / `x-claude-code-parent-agent-id`（[anthropics/claude-code#49207](https://github.com/anthropics/claude-code/issues/49207)，Workflow 工具 fan-out 由 [#66761](https://github.com/anthropics/claude-code/issues/66761) 扩展）。没有这两个 header，N 个并发 subagent 在代理侧与 N 个无关会话不可区分，spawn/join 结构无法恢复。
@@ -132,7 +143,11 @@ blog 同时给出本地 offload 的两个结构性限制（即分布式 KV 池�
 
 测量协议（P7 校准可逐项对照）：固定 seed 在每段会话记录时长的 25%–75% 区间均匀选起点 → `max_tokens=1` primer 物化主 agent 与 subagent 的活跃前缀 → 每条回放 lane 再完成 10 个 warmup 请求 → 测量 barrier 开启；对外指标只统计随后 1 小时 profiling 窗口；每次循环使用唯一 cache-bust 标记，避免无关回放轮次间形成共享 prefix。报告指标为 output throughput/chip、p90 interactivity、TTFT、ITL、cache 行为与 serving 成本，要求吞吐与延迟同时给出。两个配套规则：合成 token 的 draft 接受率与自然输出不同，acceptance length 按（模型 × speculator × draft length × thinking mode）取 SPEED-Bench coding 类实测值，记录在带版本 golden 文件，引擎侧强制 acceptance 控制已合入 SGLang/TRT-LLM/vLLM/ATOM；DRAM offload 对非标准配置服务器上限 3 TB，标准系统按实际装机，且每种配置只能按 GPU 占比使用对应 host DRAM。
 
-对仿真的价值：会话拓扑（subagent DAG + join gate）与轮间延迟的公开重建方法；WEKA trace 在 Hugging Face 公开可下载，上文分布表之外还可自行统计任意维度；64-token block 串联 hash 与 LMCache `ChunkedTokenDatabase`、本系统 radix block 哈希同构；primer + warmup + cache-bust + closed-loop 是 P7 性能校准可直接借鉴的协议；256k 变体适合受限 context 下的对照仿真。subagent fan-out 的 KV 压力形态也值得注意：单个 turn 可同时拉起多个短生命周期 subagent，各自分配 KV、快速结束，cache 压力呈尖峰而非稳态——按均匀请求流调优的调度与驱逐策略在该模式下的行为需要单独验证（1,697 个 group、时长中位 2.27 min 是该尖峰的定量尺度）。限制：合成 payload 不能评估模型质量；block ID 仅会话内有效，跨会话 prefix identity 不可得（与 §2 Codex trace 的跨 trial 共享前缀互补）；trace 不含服务端内部转换，重建长度有按模型 padding 的近似成分。
+### 3.5 对仿真的价值与限制
+
+价值：会话拓扑（subagent DAG + join gate）与轮间延迟的公开重建方法；WEKA trace 公开可下载，上表之外可自行统计任意维度；64-token block 串联 hash 与 LMCache `ChunkedTokenDatabase`、本系统 radix block 哈希同构；primer + warmup + cache-bust + closed-loop 是 P7 性能校准可直接借鉴的协议；256k 变体适合受限 context 对照。subagent fan-out 的 KV 压力形态需单独验证：单个 turn 可同时拉起多个短生命周期 subagent，各自分配 KV、快速结束，cache 压力呈尖峰而非稳态（1,697 个 group、时长中位 2.27 min 是定量尺度），按均匀请求流调优的调度与驱逐策略在该模式下行为不同。
+
+限制：合成 payload 不能评估模型质量；block ID 仅会话内有效，跨会话 prefix identity 不可得（与 §2 Codex trace 的跨 trial 共享前缀互补）；trace 不含服务端内部转换，重建长度有按模型 padding 的近似成分。
 
 ## 4. Provider cache 留存：合同与实测
 
