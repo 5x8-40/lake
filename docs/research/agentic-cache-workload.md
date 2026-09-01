@@ -74,18 +74,32 @@ blog 同时给出本地 offload 的两个结构性限制（即分布式 KV 池�
 
 ## 3. AgentX v1.0（SemiAnalysis InferenceX）
 
-**[公开基准 + 方法论]** [AgentX](https://inferencex.semianalysis.com/zh/agentx) 是 SemiAnalysis 的 agentic 负载回放基准。v1.0 数据集含 393 个自愿采集的 Claude Code 会话（≥20 个请求、Claude Code ≥2.1.139、同时运行 subagent ≤10；剔除重复请求、客户端安全监控/标题生成请求，以及重建后 input 超 990K token 的请求）。
+**[公开基准 + 方法论]** [AgentX](https://inferencex.semianalysis.com/zh/agentx) 是 SemiAnalysis 的 agentic 负载回放基准（Apache 2.0 开源，[完整测试方法](https://inferencex.semianalysis.com/agentx/methodology)）。与 §2 的原始 request 级 trace 不同，AgentX 是**可回放基准**：匿名化后的会话结构 + 确定性重建 + 统一测量协议，用于横向比较 serving 系统。v1.0 于 2026-06-21 构建，含 393 个自愿采集的 Claude Code 会话、135,282 个请求；匿名化方法与 Qwen-Bailian（最早的生产 trace 公开语料之一）类似。发布数月内，合作伙伴以其为衡量标准向 vLLM/SGLang/TRT-LLM 等上游提交了 50+ 优化 PR。
 
-| 维度 | 数值 |
-|---|---|
-| 会话数 | 393（44% 含 subagent） |
-| 单请求 input 中位 | 142K token |
-| 单请求 output 中位 | 444 token |
-| 变体 | full（至 1M context）/ 256k |
+数据集概况（筛选规则：会话 ≥20 个请求、Claude Code ≥2.1.139、同时运行 subagent ≤10；剔除完全重复请求、安全监控/标题生成的短 classifier 调用、重建后 input 超 990K token 的请求）：
 
-回放方法：HTTP 代理自愿采集时间、token 数、会话与 subagent ID → 原始 prompt/代码/tool 内容移除，input 按 **64-token block 转会话内串联 hash**（保留 prefix 结构、不暴露内容）→ AIPerf 以确定性合成 token 重建会话 DAG（main agent 轮次 + 并行 subagent + 辅助请求 + 轮间 tool 执行时间）→ 固定 seed warmup 建立 cache 状态后，closed-loop 多并发 profiling 1 小时；每会话加独立 cache-bust 标记，避免无关会话共享 prefix。投机解码 acceptance length 按 SPEED-Bench 实测固定；无标准 DRAM 配置的服务器 DRAM offload 上限 3 TB。
+| 维度 | full 变体 | 256k 变体 |
+|---|---|---|
+| 会话数 | 393（175 个含 subagent，44%） | 同左 |
+| 请求数 | 135,282 | 68,266（移除超限请求，保留相对时间与 subagent 重叠） |
+| 单请求 input 中位 | 142,016 token | 88,768 token |
+| 单请求 output 中位 | 444 token | 376 token |
+| 上下文上限 | 1M token | 256K token |
+| subagent group | 1,697 个；时长中位 2.27 min（p95 18.5 min）；每会话 group 数中位 4 | 同左 |
+| 格式 | AIPerf 可读的 WEKA trace，公开可下载 | 同左 |
 
-对仿真的价值：会话拓扑（subagent DAG）与 KV 复用模式的公开重建方法；64-token block 串联 hash 与 LMCache `ChunkedTokenDatabase`、本系统 radix block 哈希同构；closed-loop 并发 + cache-bust 隔离是 P7 性能校准可直接借鉴的协议。限制：合成 payload 不能评估模型质量；trace 不含原始内容，跨会话 prefix identity 不可得。
+重建保真度：全部 135,282 个请求中，重建 token 数 / 服务商 token 数之比中位数 1.004（p25–p75 区间围绕 1.0，官方注明不代表逐请求固定误差上限），即长度维度重建基本无系统偏差。
+
+对仿真有直接参考价值的四个方法要点：
+
+- **匿名化保 prefix 结构、不保内容**：input 按 64-token block 转为会话内串联 hash（重复 block ID = 共享 prefix），AIPerf 回放前用确定性合成 coding/tool-use token 填充。客户端不可观测的字段（服务端 chat template、专有 tokenizer、加密 reasoning、图片/文档展开后的 token 数）用确定性 placeholder + 按模型 padding 处理。
+- **subagent 归属依赖 Claude Code 两个新 header**：`x-claude-code-agent-id` / `x-claude-code-parent-agent-id`（[anthropics/claude-code#49207](https://github.com/anthropics/claude-code/issues/49207)，Workflow 工具 fan-out 由 [#66761](https://github.com/anthropics/claude-code/issues/66761) 扩展）。没有这两个 header，N 个并发 subagent 在代理侧与 N 个无关会话不可区分，spawn/join 结构无法恢复。
+- **DAG 重建语义**：主 agent 请求成线性链；subagent 链在符合条件的父请求完成后 spawn，在下一个依赖它的主请求前经 join gate 汇合；一次性辅助请求无 join edge 独立运行。trace 只记请求时间戳与分支 ID，不记触发分支的 tool 级事件——回放保留请求顺序、分支重叠与轮间延迟，不推断服务端内部因果。
+- **closed-loop 并发语义**：concurrency 指并发 agent 客户端数，不是固定 request batch；subagent fan-out 使服务端瞬时请求数可高于客户端数。更快的系统在同一小时内推进到会话更后位置，实际请求组合随系统速度略变（低并发时最明显）——跨系统比较的是同一场景定义下的曲线，不是同一批请求。
+
+测量协议（P7 校准可逐项对照）：固定 seed 在每段会话记录时长的 25%–75% 区间均匀选起点 → `max_tokens=1` primer 物化主 agent 与 subagent 的活跃前缀 → 每条回放 lane 再完成 10 个 warmup 请求 → 测量 barrier 开启；对外指标只统计随后 1 小时 profiling 窗口；每次循环使用唯一 cache-bust 标记，避免无关回放轮次间形成共享 prefix。报告指标为 output throughput/chip、p90 interactivity、TTFT、ITL、cache 行为与 serving 成本，要求吞吐与延迟同时给出。两个配套规则：合成 token 的 draft 接受率与自然输出不同，acceptance length 按（模型 × speculator × draft length × thinking mode）取 SPEED-Bench coding 类实测值，记录在带版本 golden 文件，引擎侧强制 acceptance 控制已合入 SGLang/TRT-LLM/vLLM/ATOM；DRAM offload 对非标准配置服务器上限 3 TB，标准系统按实际装机，且每种配置只能按 GPU 占比使用对应 host DRAM。
+
+对仿真的价值：会话拓扑（subagent DAG + join gate）与轮间延迟的公开重建方法，且 WEKA trace 公开可下载、可自行统计分布（页面只给中位数）；64-token block 串联 hash 与 LMCache `ChunkedTokenDatabase`、本系统 radix block 哈希同构；primer + warmup + cache-bust + closed-loop 是 P7 性能校准可直接借鉴的协议；256k 变体适合受限 context 下的对照仿真。subagent fan-out 的 KV 压力形态也值得注意：单个 turn 可同时拉起多个短生命周期 subagent，各自分配 KV、快速结束，cache 压力呈尖峰而非稳态——按均匀请求流调优的调度与驱逐策略在该模式下的行为需要单独验证（1,697 个 group、时长中位 2.27 min 是该尖峰的定量尺度）。限制：合成 payload 不能评估模型质量；block ID 仅会话内有效，跨会话 prefix identity 不可得（与 §2 Codex trace 的跨 trial 共享前缀互补）；trace 不含服务端内部转换，重建长度有按模型 padding 的近似成分。
 
 ## 4. Provider cache 留存：合同与实测
 
@@ -131,7 +145,7 @@ LMCache `QuotaManager` 提供 `cache_salt → byte limit` 的动态配额接口�
 
 request 级公开 trace（§2/§3）补齐的输入与仍缺的项：
 
-- **已可得**：单请求 input/cached/uncached/output 分布、turn 级命中率曲线、inter-call delay 分布（≈ KV 需存活的空闲间隔）、跨会话共享前缀比例（Codex trace）；会话拓扑与 subagent 结构（AgentX）。
+- **已可得**：单请求 input/cached/uncached/output 分布、turn 级命中率曲线、inter-call delay 分布（≈ KV 需存活的空闲间隔）、跨会话共享前缀比例（Codex trace）；会话拓扑（subagent DAG + join gate）、轮间/tool 执行延迟与 closed-loop 回放协议（AgentX，WEKA trace 公开可下载）。
 - **仍缺**：request arrival 过程（Codex trial 内调用是串行的，trace 不含多会话并发到达）；prefix identity 与 reuse distance（AgentX block hash 仅会话内串联，跨会话被 cache-bust 隔离）；KV bytes 仍需模型 layout 换算（见 cmx-sim）；provider 物理 TTL 仍无观测。
 
 KV 加载页可以直接用峰值 prompt token/s 和平均 hit 计算 token-proportional growing-KV load：
@@ -174,6 +188,9 @@ raw_storage = copies × (hot_prefix + retained_writes) / usable_fraction
 - [Inferact/codex_swebenchpro_traces（Hugging Face 数据集）](https://huggingface.co/datasets/Inferact/codex_swebenchpro_traces)
 - [vLLM blog：Serving Agentic Workloads at Scale with vLLM × Mooncake（2026-05-06）](https://vllm.ai/blog/2026-05-06-mooncake-store)
 - [AgentX 测试方法与数据集（SemiAnalysis InferenceX）](https://inferencex.semianalysis.com/zh/agentx)
+- [AgentX 完整测试方法（methodology）](https://inferencex.semianalysis.com/agentx/methodology)
+- [A Brief Overview of Agentic Workloads（InferenceX blog）](https://inferencex.semianalysis.com/blog/brief-overview-of-agentic-workloads)
+- [AgentX – InferenceXv3 发布文（SemiAnalysis Newsletter）](https://newsletter.semianalysis.com/p/agentx-inferencexv3-does-cuda-moat)
 - [Mempko：Your Agentic Workflow's Cache Keepalive Costs 8x Too Much（v2）](https://blog.mempko.com/your-agentic-workflows-cache-keepalive-costs-8x-too-much-v2-the-interval-frontier/)
 - [Keeping the Cache Warm Pays（arXiv:2607.19214）](https://arxiv.org/abs/2607.19214)
 - [Anthropic Prompt Caching](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
