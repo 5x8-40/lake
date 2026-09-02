@@ -131,6 +131,28 @@ blog 的 V3.2-style 对照为 `83.875 GiB`，所以缩减比例约 `8.71×`。�
 
 V4-Flash 的绝对 GiB 是根据 21 个 c4a、20 个 c128a 和 2 个 SWA-only layer 推导，blog 没有发布该绝对值。
 
+### GLM-5.3-Flash 布局对齐
+
+GLM-5.3-Flash（320B/A18B MoE）是混合注意力：45 层 = 11 层 `deepseek_sparse_attention`（Sparse MLA）+ 34 层 `linear_attention`（KDA）。`config.json` 关键字段：`kv_lora_rank=512`、`qk_rope_head_dim=0`（`mla_use_nope=true`）、`index_head_dim=128`、`index_kpool=4`（`index_kpool_compress=true`）、`linear_attn_config{num_heads=64, head_dim=128, short_conv_kernel_size=4}`、`num_nextn_predict_layers=1`。
+
+1 Mi-token BF16 逻辑布局：
+
+```text
+deepseek_sparse_attention/layer（11 层）
+  = 1,048,576 × 1024 + floor(1,048,576 / 4) × 256
+  = 1024 MiB shared-KV + 64 MiB indexer = 1088 MiB
+linear_attention/layer（34 层）
+  = 0 growing；固定 KDA state（vLLM 口径：recurrent FP32 + conv BF16）
+  = 64×128×128×4 + 64×128×3×3×2 = 4.1406 MiB
+合计 = 11 × 1088 MiB + 34 × 4.1406 MiB
+     = 11,968 + 140.78125 MiB ≈ 11.8250 GiB
+```
+
+- indexer 与 DeepSeek DSA 同形：每 token 单向量 128 维（MQA 风格）；`index_n_heads=32` 是查询侧头数，不进缓存条目。`index_kpool=4` 表示每 4 个 token 一条索引，组闭合才物化（同 V4 C4/C128 语义）。
+- MTP 层只加 1 层 sparse-MLA KV（+1 GiB @ 1 Mi-token），indexer 共享（`index_share_for_mtp_iteration=true`）。
+- z.ai blog 的 vendor claim：attention compute 3.01×、KV cache 4.44× 小于 GLM-5.3；按 "average KV cache size per layer (BF16)" 口径仍略大于 Kimi-K3 与 DeepSeek-V4-Flash。该口径是总状态 ÷ 总层数，与本表绝对 GiB 不能直接互换。
+- KDA state 按 vLLM K3 同构公式（recurrent FP32 + conv BF16）推导；vLLM 上游尚未合入 `glm5_next`，engine entry/page 合同未知，engine-pages 口径返回 `N/A`。
+
 ### 其他 1 Mi-token 校验点
 
 | 模型/profile | growing payload | fixed/window state | transferable payload |
@@ -139,6 +161,9 @@ V4-Flash 的绝对 GiB 是根据 21 个 c4a、20 个 c128a 和 2 个 SWA-only la
 | V4-Pro FP8 main + FP4 index payload | 4.9135 GiB | 4.3486 MiB SWA + 17.8438 MiB compressor | 4.9352 GiB |
 | GLM-5.2 FP8 logical | 46.5820 GiB | 0 | 46.5820 GiB |
 | GLM-5.2 FP8 logical + MTP | 47.2734 GiB | 0 | 47.2734 GiB |
+| GLM-5.3-Flash BF16 logical | 11.6875 GiB | 140.7813 MiB KDA | 11.8250 GiB |
+| GLM-5.3-Flash BF16 logical + MTP | 12.6875 GiB | 140.7813 MiB KDA | 12.8250 GiB |
+| GLM-5.3-Flash FP8 logical | 5.8438 GiB | 140.7813 MiB KDA | 5.9812 GiB |
 | Kimi K3 FP8 MLA + vLLM KDA | 13.5000 GiB | 428.5547 MiB | 13.9185 GiB |
 
 V4 base/speculative/online-C128 compressor 是不同 representation；V4/GLM MTP 是可选 component。K3 KDA recurrent state 是 FP32，不能只算 growing MLA。
@@ -312,6 +337,8 @@ TTFT       = c + (1-h) × (aN + bN²)
 - [vLLM：DeepSeek V4](https://vllm.ai/blog/2026-04-24-deepseek-v4)
 - [DeepSeek-V4 paper](https://arxiv.org/abs/2606.19348)
 - [GLM-5.2 official model article](https://huggingface.co/blog/zai-org/glm-52-blog)
+- [GLM-5.3-Flash official blog](https://z.ai/blog/glm-5.3-flash)
+- [GLM-5.3-Flash config.json](https://huggingface.co/zai-org/GLM-5.3-Flash/blob/main/config.json)
 - [Kimi K3 official model card](https://huggingface.co/moonshotai/Kimi-K3)
 
 后续合同见 [#22](https://gitlab.com/BeeBreeze/lake/-/issues/22) 和 [#23](https://gitlab.com/BeeBreeze/lake/-/issues/23)。

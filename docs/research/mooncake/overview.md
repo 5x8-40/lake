@@ -62,7 +62,7 @@ Mooncake 是 **KVCache-centric 的存算分离架构**:将 prefill/decode 集群
 
 | 系统 | 集成方式 |
 |------|---------|
-| **vLLM** | KV Connector(PD disaggregation + cross-instance KV),`mooncake_connector_v1.py::MooncakeConnector` |
+| **vLLM** | KV Connector(PD disaggregation + cross-instance KV),`mooncake_connector_v1.py::MooncakeConnector`;Store 经 `MooncakeStoreConnector`+`MultiConnector` 做集群级 KV 池([vLLM blog 2026-05-06](https://vllm.ai/blog/2026-05-06-mooncake-store):60×GB200 近线性、命中率 >95%) |
 | **SGLang** | HiCache L3 后端 + PD disaggregation 传输 + EP + P2P weight |
 | **LMCache** | Remote connector |
 | **TensorRT-LLM** | KVCache 传输 |

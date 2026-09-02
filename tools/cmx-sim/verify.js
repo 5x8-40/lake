@@ -105,6 +105,30 @@ close(
   1e-12,
   "Kimi K3 FP8 MLA + vLLM KDA state"
 );
+close(
+  layout("glm53flash", "bf16-logical").growingBytes / S.GiB,
+  11.6875,
+  1e-12,
+  "GLM-5.3-Flash BF16 growing KV + indexer"
+);
+close(
+  layout("glm53flash", "bf16-logical").stateBytes / S.MiB,
+  140.78125,
+  1e-9,
+  "GLM-5.3-Flash vLLM KDA state"
+);
+close(
+  layout("glm53flash", "bf16-logical").totalBytes / S.GiB,
+  11.824981689453125,
+  1e-12,
+  "GLM-5.3-Flash transferable session state"
+);
+close(
+  layout("glm53flash", "fp8-logical").growingBytes / S.GiB,
+  5.84375,
+  1e-12,
+  "GLM-5.3-Flash FP8 growing KV + indexer"
+);
 
 // Independent golden formula: this does not call sessionLayout for any
 // intermediate term.
@@ -125,6 +149,17 @@ assert.equal(
   layout("v4pro", "bf16-logical", 4).growingBytes,
   30 * (1024 + 256)
 );
+// GLM-5.3-Flash indexer entries likewise materialize per closed kpool=4
+// group, while sparse-MLA KV grows per token.
+assert.equal(
+  layout("glm53flash", "bf16-logical", 3).growingBytes,
+  3 * 11 * 1024
+);
+assert.equal(
+  layout("glm53flash", "bf16-logical", 4).growingBytes,
+  4 * 11 * 1024 + 11 * 256
+);
+assert.equal(layout("glm53flash", "bf16-logical", 0).totalBytes, 0);
 assert.equal(
   layout("v4pro", "bf16-logical", 128).growingBytes,
   30 * 32 * (1024 + 256) + 31 * 1024
@@ -155,6 +190,14 @@ const glmMtp = layout("glm52", "fp8-logical", ONE_MI_TOKEN, true);
 assert.equal(
   glmMtp.totalBytes - glmBase.totalBytes,
   ONE_MI_TOKEN * (576 + 132)
+);
+// GLM-5.3-Flash MTP adds one sparse-MLA KV layer and shares the indexer
+// (index_share_for_mtp_iteration), so the delta carries no index entry.
+const glm53fBase = layout("glm53flash", "bf16-logical");
+const glm53fMtp = layout("glm53flash", "bf16-logical", ONE_MI_TOKEN, true);
+assert.equal(
+  glm53fMtp.growingBytes - glm53fBase.growingBytes,
+  ONE_MI_TOKEN * 1024
 );
 
 // Compressor ring policies are separate representations, not a generic
@@ -790,4 +833,5 @@ console.log("  V4-Pro growing KV     =", S.fmtGiB(layout("v4pro", "bf16-logical"
 console.log("  V4-Pro blog paged KV  =", S.fmtGiB(layout("v4pro", "bf16-logical").pagedKvBytes));
 console.log("  V4-Pro + comp. state  =", S.fmtGiB(layout("v4pro", "bf16-logical").totalBytes));
 console.log("  GLM-5.2 base FP8      =", S.fmtGiB(layout("glm52", "fp8-logical").totalBytes));
+console.log("  GLM-5.3-Flash BF16    =", S.fmtGiB(layout("glm53flash", "bf16-logical").totalBytes));
 console.log("  Kimi K3 FP8 + state   =", S.fmtGiB(layout("k3", "fp8-vllm-state").totalBytes));
