@@ -141,13 +141,28 @@ InferenceXv3 各配置 run 的实测值。理论命中率由负载决定（§3.2
 - **DAG 重建语义**：主 agent 请求成线性链；subagent 链在符合条件的父请求完成后 spawn，在下一个依赖它的主请求前经 join gate 汇合；一次性辅助请求无 join edge 独立运行。trace 只记请求时间戳与分支 ID，不记触发分支的 tool 级事件——回放保留请求顺序、分支重叠与轮间延迟，不推断服务端内部因果。
 - **closed-loop 并发语义**：concurrency 指并发 agent 客户端数，不是固定 request batch；subagent fan-out 使服务端瞬时请求数可高于客户端数。更快的系统在同一小时内推进到会话更后位置，实际请求组合随系统速度略变（低并发时最明显）——跨系统比较的是同一场景定义下的曲线，不是同一批请求。
 
-测量协议（P7 校准可逐项对照）：固定 seed 在每段会话记录时长的 25%–75% 区间均匀选起点 → `max_tokens=1` primer 物化主 agent 与 subagent 的活跃前缀 → 每条回放 lane 再完成 10 个 warmup 请求 → 测量 barrier 开启；对外指标只统计随后 1 小时 profiling 窗口；每次循环使用唯一 cache-bust 标记，避免无关回放轮次间形成共享 prefix。报告指标为 output throughput/chip、p90 interactivity、TTFT、ITL、cache 行为与 serving 成本，要求吞吐与延迟同时给出。两个配套规则：合成 token 的 draft 接受率与自然输出不同，acceptance length 按（模型 × speculator × draft length × thinking mode）取 SPEED-Bench coding 类实测值，记录在带版本 golden 文件，引擎侧强制 acceptance 控制已合入 SGLang/TRT-LLM/vLLM/ATOM；DRAM offload 对非标准配置服务器上限 3 TB，标准系统按实际装机，且每种配置只能按 GPU 占比使用对应 host DRAM。
+测量协议（P7 校准可逐项对照）：
+
+- **起播**：固定 seed 在每段会话记录时长的 25%–75% 区间均匀选起点；`max_tokens=1` primer 先物化主 agent 与 subagent 的活跃前缀，每条回放 lane 再完成 10 个 warmup 请求，然后测量 barrier 开启。
+- **窗口与隔离**：对外指标只统计 barrier 之后 1 小时 profiling 窗口；每次循环使用唯一 cache-bust 标记，避免无关回放轮次间形成共享 prefix。
+- **报告指标**：output throughput/chip、p90 interactivity、TTFT、ITL、cache 行为、serving 成本；吞吐与延迟须同时给出，单一 latency 不能描述一次 run。
+- **spec decode 配套**：合成 token 的 draft 接受率与自然输出不同，acceptance length 按（模型 × speculator × draft length × thinking mode）取 SPEED-Bench coding 类实测值，记录在带版本 golden 文件；引擎侧强制 acceptance 控制已合入 SGLang/TRT-LLM/vLLM/ATOM。
+- **DRAM offload 配套**：非标准配置服务器上限 3 TB；GB200/GB300 NVL72、TPUv7 等标准系统按实际装机；每种配置只能按 GPU 占比使用对应 host DRAM。
 
 ### 3.5 对仿真的价值与限制
 
-价值：会话拓扑（subagent DAG + join gate）与轮间延迟的公开重建方法；WEKA trace 公开可下载，上表之外可自行统计任意维度；64-token block 串联 hash 与 LMCache `ChunkedTokenDatabase`、本系统 radix block 哈希同构；primer + warmup + cache-bust + closed-loop 是 P7 性能校准可直接借鉴的协议；256k 变体适合受限 context 对照。subagent fan-out 的 KV 压力形态需单独验证：单个 turn 可同时拉起多个短生命周期 subagent，各自分配 KV、快速结束，cache 压力呈尖峰而非稳态（1,697 个 group、时长中位 2.27 min 是定量尺度），按均匀请求流调优的调度与驱逐策略在该模式下行为不同。
+价值：
 
-限制：合成 payload 不能评估模型质量；block ID 仅会话内有效，跨会话 prefix identity 不可得（与 §2 Codex trace 的跨 trial 共享前缀互补）；trace 不含服务端内部转换，重建长度有按模型 padding 的近似成分。
+- 会话拓扑（subagent DAG + join gate）与轮间延迟的公开重建方法；WEKA trace 公开可下载，上表之外可自行统计任意维度。
+- 64-token block 串联 hash 与 LMCache `ChunkedTokenDatabase`、本系统 radix block 哈希同构。
+- primer + warmup + cache-bust + closed-loop 是 P7 性能校准可直接借鉴的协议；256k 变体适合受限 context 对照。
+- subagent fan-out 的 KV 压力形态：单个 turn 可拉起多个短生命周期 subagent，各自分配 KV、快速结束，cache 压力呈尖峰而非稳态（1,697 个 group、时长中位 2.27 min）；按均匀请求流调优的调度与驱逐策略在该模式下需单独验证。
+
+限制：
+
+- 合成 payload 不能评估模型质量。
+- block ID 仅会话内有效，跨会话 prefix identity 不可得（与 §2 Codex trace 的跨 trial 共享前缀互补）。
+- trace 不含服务端内部转换，重建长度有按模型 padding 的近似成分。
 
 ## 4. Provider cache 留存：合同与实测
 
