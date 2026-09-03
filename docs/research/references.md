@@ -16,7 +16,9 @@
   - **计算层参考**:PagedAttention、worker/model runner、`KVConnectorBase_V1` 接口、spec decode。
   - **KV 大规模管理演进**(Q3 2026 roadmap #48168):原生多层 KV offload + KV Events 已落地;session 坐标编排见 #48501 / [kv-session-roadmap.md](vllm/kv-session-roadmap.md)。
 - **Dynamo** → [`dynamo/`](dynamo/):[总览](dynamo/overview.md)
-  - **编排层/控制面参考**(NVIDIA,Rust):推理引擎之上的编排层,KV-aware router + KVBM(GPU→CPU→SSD→远端 三层 offload)+ 多后端通信(etcd/nats/tcp/zmq)。Rust 写控制面/编排,是 lake Rust 存储控制面的直接参照系。
+  - **编排层/控制面参考**(NVIDIA,Rust):推理引擎之上的编排层,KV-aware router + 多后端通信(etcd/nats/tcp/zmq)。Rust 写控制面/编排,是 lake Rust 存储控制面的直接参照系。KVBM(GPU→CPU→SSD→远端 offload)已 sunset,见总览「KVBM 变局」。
+- **KVCR** → [`kvcr/`](kvcr/):[总览](kvcr/overview.md)
+  - **KVBM 继任者**(NVIDIA,Python):引擎进程内 KV 二级存储 + router hint 驱动跨节点 P2P(NIXL);不管 GPU、复用 router 全局视图、Guard sidecar 容错、策略可插拔。
 - **TileRT** → [`tilert/`](tilert/):[总览](tilert/overview.md) · [vLLM PD 插件](tilert/pd-vllm.md) · [痛点与 lake 对照](tilert/pain-points.md)
   - **超低延迟 decode**(tile runtime,核在闭源 `.so`)+ **vLLM prefill→TileRT decode**(`TileRTConnector`、NIXL/Mooncake、MTP-aware 传 KV)。不作存储池/radix 参考。
 - **Ascend MemCache** → [`memcache/`](memcache/):[总览](memcache/overview.md) · [架构](memcache/architecture.md) · [痛点与 lake 对照](memcache/pain-points.md)

@@ -224,7 +224,7 @@ P1 关键篇（execution-modes + overview）已齐，够支撑 proto 起草。�
 > 实现参考:`3rdparty/` submodule 逐层对应见 [`research/3rdparty-reference.md`](research/3rdparty-reference.md)。  
 > **代码级复用（两模块正交）**：  
 > - **A** Mooncake transfer-engine → `rust/transfer`（字节搬迁；P4 抄设计 + TCP，真 RDMA 推后）  
-> - **B** Dynamo kvbm-logical → **P4.1** vendor（[PR #21](https://github.com/chengda-wu/lake/pull/21)）；**P4.2** 起 `lake-controlplane` 链依赖 + `BlockRegistry`/`InactiveIndex` 薄驱动（见 #20）  
+> - **B** Dynamo kvbm-logical → **P4.1** vendor（[PR #21](https://github.com/chengda-wu/lake/pull/21)）；**P4.2** 起 `lake-controlplane` 链依赖 + `BlockRegistry`/`InactiveIndex` 薄驱动（见 #20）。**2026-09 注**：上游 KVBM 已 sunset（转向 [KVCR](research/kvcr/overview.md)），vendor 拷贝为冻结快照，见 `rust/vendor/UPSTREAM.md`  
 > 切片命名用 **P4.1–P4.9**（勿与 GitHub PR 号混淆）；详见 #20 与「代码级复用策略」。
 
 - [x] 内容寻址 block 存储 + 引用计数 + LFU-Aging / 前缀亲和驱逐（复用 B 起步；P4.2：`ReportRef` **合账骨架**——只累加 `global_refs`、忽略 `RefKind`，agent 本地一级/分 kind 后续；驱逐主路径 `LineageBackend::with_frequency`＝叶子约束≈前缀亲和 + TinyLFU 冷叶≈LFU-Aging；`MultiLruBackend` 仍 pub 对照；不 pub 纯 Lru/Fifo，见 `rust/vendor/UPSTREAM.md`。**驱逐正确性 = Authority 单测**（含 inactive 上界：满容 skip insert；压力 `allocate` 仅 `evict_n`）；生产 `ReportRef` 喂数与压力 `allocate` → 后续切片）

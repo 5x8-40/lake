@@ -1,6 +1,8 @@
 # Dynamo — 数据中心级分布式推理编排框架
 
-> 源码:`3rdparty/dynamo/`(NVIDIA ai-dynamo/dynamo,Apache-2.0)。Rust(~52%)+ Python(~34%)+ Go(~12%,K8s 相关)。本文为**核实后的分析**(读 README + `lib/` 源码结构与关键符号)。
+> 源码:`3rdparty/dynamo/`(NVIDIA ai-dynamo/dynamo,Apache-2.0,检出 `705796fccf`,2026-09-03)。Rust(~52%)+ Python(~34%)+ Go(~12%,K8s 相关)。本文为**核实后的分析**(读 README + `lib/` 源码结构与关键符号)。
+>
+> ⚠️ **2026-09 重大变局**:KVBM v1 已被官方宣布 **sunset**,继任者是独立仓 **[KVCR](../kvcr/overview.md)**(KV Cache Runner,2026-08 公开)。本文 KVBM 各节描述的机制仍成立(代码仍在 main),但**不再代表 Dynamo 的未来方向**——详见下文「KVBM 变局(2026-09 核实)」。
 
 ## 定位
 
@@ -26,7 +28,7 @@ client → Frontend(OpenAI 兼容 HTTP) → Router(KV-aware) → workers(vLLM/SG
 |------|------|----------|
 | **Frontend** | OpenAI 兼容 HTTP 入口 | Gateway |
 | **Router**(KV-aware) | 按 worker 负载 + KV cache overlap 选 worker,省重算 prefill | Router |
-| **KVBM**(KV Block Manager) | GPU→CPU→SSD→远端 多层 KV offload | Tiered Store(L0-L3) |
+| **KVBM**(KV Block Manager) | GPU→CPU→SSD→远端 多层 KV offload(**已 sunset**,继任者 [KVCR](../kvcr/overview.md)) | Tiered Store(L0-L3) |
 | **Planner** | SLA 驱动 autoscaler,profiling 后 right-size GPU 池 | (弹性,远期) |
 | **ModelExpress** | NIXL/NVLink GPU 间流式传权重,7x 冷启动 | 权重加载(远期) |
 | **Grove** | K8s operator,拓扑感知 gang 调度(机架/主机/NUMA) | (部署,远期) |
@@ -57,6 +59,18 @@ KV-aware 路由:Router 维护各 worker 的 KV block 哈希集合,新请求按 p
 | **kvbm-engine** | 运行时(runtime)、offload、leader、collectives、object(S3/Azure) | 池运行时 + L3 SSOT + 副本/leader |
 
 KVBM offload 路径:`GPU → CPU → SSD → 远端存储(S3/Azure blob)`,1.0 新增"global KV events for cluster-wide cache visibility"(集群级缓存可见性)——对应 lake 控制面强一致位置视图。
+
+### KVBM 变局(2026-09 核实)
+
+**KVBM 已被官方放弃,继任者是独立仓 [KVCR](../kvcr/overview.md)。** 时间线(全部经 issue/PR 与 git 历史核实):
+
+- **v1 = `lib/llm/src/block_manager/` + `lib/bindings/kvbm/`**(生产 vLLM/TRT-LLM 绑定至今依赖它):跨实例共享两次尝试 [#4887](https://github.com/ai-dynamo/dynamo/pull/4887)(G4 对象存储 + ZMQ registry hub)/ [#5243](https://github.com/ai-dynamo/dynamo/pull/5243)(+23k 行分布式 KVBM)**均未合并**;v1 生产匹配**仅本机** G2/G3(`lib/bindings/kvbm/src/block_manager/vllm/connector/leader/slot.rs`::`acquire_local_matches`)。
+- **v2 = `lib/kvbm-{engine,logical,physical,common,config}/`**:2026-04-08 经 [#6773](https://github.com/ai-dynamo/dynamo/pull/6773) 合入 main,含 session 化跨实例 remote search/pull 协议(`lib/kvbm-engine/docs/session.md`)——但**只合了库,生产绑定仍走 v1**,仅 mocker 使用;接线工作在未合并分支(`ryan/kvbm-bindings`/`ryan/kvbm-engine-service`,契约先行 `lib/kvbm-connector/CONTRACT.md`)。
+- **2026-07-16** [DEP #11673](https://github.com/ai-dynamo/dynamo/issues/11673) 官方原话:"**KVBM v1 is being sunset**";新方向 = "引擎原生 offload(如 vLLM OffloadingConnector)+ P2P 连接各节点 CPU 层"。
+- **2026-08-24** 新实现公开为 **[KVCR](https://github.com/ai-dynamo/kvcr)**(KV Cache Runner):框架无关 Python 库,不管 GPU,复用 router 全局视图 + 请求级 hint,NIXL P2P。分析见 [`../kvcr/overview.md`](../kvcr/overview.md)。
+- **2026-08-27** [#12993](https://github.com/ai-dynamo/dynamo/pull/12993) 文档把 KVBM 从 offload 推荐后端撤下(改推 LMCache/FlexKV/HiCache);KVBM 代码仍保留在 main("keep it alive until the new solution is ready")。
+
+**对 lake 的影响**:`rust/vendor/` vendor 的 kvbm-logical 上游已冻结(见 [`../../architecture/kv-virtual-memory.md`](../../architecture/kv-virtual-memory.md));v2/KVCR 的演进方向(引擎原生布局 + router hint + P2P)与 vendor 拷贝无关,不影响其正确性,但后续不会再有上游修复可同步。
 
 ## 运行时与通信(transports / discovery)
 
