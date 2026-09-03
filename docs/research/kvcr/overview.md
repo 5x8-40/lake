@@ -10,7 +10,7 @@ KVCR 是**引擎进程内的 KV 缓存二级存储库 + 跨节点 P2P 数据面*
 
 ## 出处(PROVENANCE)
 
-据 [`PROVENANCE.md`](../../../3rdparty/kvcr/PROVENANCE.md):
+据 `3rdparty/kvcr/PROVENANCE.md`([GitHub 链接](https://github.com/ai-dynamo/kvcr/blob/main/PROVENANCE.md);CI 不检出 submodule,文档一律不相对链接进 `3rdparty/`):
 
 - 核心代码抽自 NVIDIA **私有 vLLM fork** 的 `vllm/v1/kv_offload/tiering/kvcc/`(6 个生产模块),2026-08-21 从内部仓 `NVIDIA-dev/kvcc` 初始化公开仓,全新历史。
 - 即:它生来就是 **vLLM 原生 `kv_offload` 框架的一个 tiering 后端**,不是 Dynamo 的组件。Dynamo KV Router 只是它对接的 router 之一(还支持 sgl-router、llmd-router)。
