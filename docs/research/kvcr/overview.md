@@ -24,13 +24,9 @@ KVCR 是一个运行在推理引擎进程里的库,职责有两块:一是把 KV 
 
 ## 在推理栈中的位置
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="figures/kv-architecture-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="figures/kv-architecture-light.png">
-  <img src="figures/kv-architecture-light.png" alt="KVCR 架构">
-</picture>
+![KVCR 架构](figures/kv-architecture-light.svg)
 
-(图源:[`3rdparty/kvcr/docs/figures/kv-architecture-light.svg`](https://github.com/ai-dynamo/kvcr/blob/main/docs/figures/kv-architecture-light.svg),深色模式自动切换 dark 版)
+(图源:`3rdparty/kvcr/docs/figures/kv-architecture-light.svg`)
 
 以 vLLM 为例,KVCR 接在 `vllm/v1/kv_offload/tiering/` 的多层卸载框架下。该框架的模型(见 `tiering/manager.py` 头注释)是:
 
@@ -101,13 +97,9 @@ DEP #11673 指出现有方案(含 KVBM)的两种失败模式:一是 GPU 紧耦�
 
 ## 架构
 
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="figures/kv-architecture-detailed-dark.png">
-  <source media="(prefers-color-scheme: light)" srcset="figures/kv-architecture-detailed-light.png">
-  <img src="figures/kv-architecture-detailed-light.png" alt="KVCR 组件边界">
-</picture>
+![KVCR 组件边界](figures/kv-architecture-detailed-light.svg)
 
-(图源:[`3rdparty/kvcr/docs/figures/kv-architecture-detailed-light.svg`](https://github.com/ai-dynamo/kvcr/blob/main/docs/figures/kv-architecture-detailed-light.svg),深色模式自动切换 dark 版)
+(图源:`3rdparty/kvcr/docs/figures/kv-architecture-detailed-light.svg`)
 
 ### 组件角色
 
@@ -148,7 +140,7 @@ DEP #11673 指出现有方案(含 KVBM)的两种失败模式:一是 GPU 紧耦�
 
 ![KVCR 数据面](figures/kvcr-masthead.jpg)
 
-(图源:[`3rdparty/kvcr/docs/figures/kvcr-masthead.jpg`](https://github.com/ai-dynamo/kvcr/blob/main/docs/figures/kvcr-masthead.jpg);引擎经控制面 API 调用进程内 KVCR,KVCR 数据面经 NIXL/RDMA 与对端 KVCR 直传)
+(图源:`3rdparty/kvcr/docs/figures/kvcr-masthead.jpg`;引擎经控制面 API 调用进程内 KVCR,KVCR 数据面经 NIXL/RDMA 与对端 KVCR 直传)
 
 - hint 协议的格式与标准化状态见下节「hint 协议」。
 - KVCR 之间的传输由目的地发起;router 不在数据路径上。两端之间的控制通道(用 ZMQ 消息库)只传连接信息、确认和传输控制信令,KV 字节本身经 NIXL 直接传输。
