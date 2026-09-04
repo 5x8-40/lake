@@ -59,9 +59,102 @@ Dynamo 把系统分成三个平面,各用各的通信栈(官方架构页 `archit
 
 NVIDIA 官方宣传文(2025-03 GTC 发布博客)把 Dynamo 归纳为四个创新:**Planner、Smart Router、Distributed KV Cache Manager(即 KVBM)、NIXL**——KV 数据面组件(KVBM)被 KVCR 取代后,剩下三个恰好都是控制面/传输层,印证了"Dynamo 的本体是编排层"的判断(见「KVBM 变局」节)。
 
-## KV 路由(kv-router)
+## 模块详解(modular-components + concepts)
 
-源码入口:`lib/kv-router/src/`。核心数据结构在 `protocols.rs`:
+> 来源:main 上 `docs/fern/pages/developer-guide/knowledge-base/` 下的 `modular-components/`(frontend / router / planner / profiler / ai-simulate / backends)与 `concepts/`(fault-tolerance / observability / simulation / system-architecture)两组文档。以下按模块核实整理,官方页名在括号内标注。
+
+### Frontend
+
+API 网关,OpenAI 兼容 HTTP + KServe gRPC 双入口(Anthropic Messages API 为实验性)。负责预处理(chat 模板、tokenize)与后处理(detokenize)——因此它**只需要模型的配置文件与 tokenizer 文件,不需要权重**;推荐配 ModelExpress + 共享 PVC 让全集群只下载一次。内嵌 router,`--router-mode` 七种:`round-robin` / `random` / `power-of-two` / `kv` / `direct` / `least-loaded` / `device-aware-weighted`。支持 `nvext`(NVIDIA 请求扩展字段,可带路由 hint 与缓存控制)和 Python 自定义路由扩展。
+
+### Router(KV-aware)
+
+文档量最大的模块(20 页),核心内容:
+
+**成本模型**(`router-design.md`):对每个候选 worker 算代价,取最低者:
+
+```text
+adjusted_prefill = max(0, prefill_blocks
+                     - device_overlap_credit      # GPU 上命中
+                     - host_hit_weight * host_overlap      # 主机内存命中
+                     - disk_hit_weight * disk_overlap      # SSD 命中
+                     - shared_multiplier * shared_beyond)  # 共享层命中
+cost = prefill_load_scale * adjusted_prefill
+     + potential_decode_blocks          # 该请求 decode 将占的块数
+     + active_request_weight * active_requests
+```
+
+三个输入信号:设备/主机/磁盘/共享层的前缀命中(来自全局索引)、预计 decode 占用、在途请求数。命中权重越高越偏 TTFT,越低越偏负载均衡(ITL);`router_temperature` 非零时对代价做 softmax 采样引入随机性。
+
+![Router 成本函数示意](figures/router-kv-routing-overview.jpg)
+
+(图源:`3rdparty/dynamo/docs/fern/assets/img/router-kv-routing-overview.jpg`;三个 worker 的 Cached/Prefill/Decode 块数与代价计算,选代价最低的 Worker 2)
+
+**状态来源**:两条互补链路——
+- **缓存块**:worker 上的 `KVPublisher` 在块创建/删除时发事件,Router 的 `KvIndexer` 用前缀树(节点上带 worker id)维护全局视图,`find_matches_for_request` 返回每个 worker 命中多少块。两种实现:单线程 RadixTree 或默认的 ConcurrentRadixTree(N 线程池 + sticky 分区,读写并发)。
+- **在途块**:Router 本地"slot manager"即时预测(路由时 +、首 token 时改、结束时 -),不等事件。
+
+**可靠性设计**(对 lake 位置视图很有对照价值):
+- **gap 检测与恢复**:每个 worker 给自己的事件编单调递增序号,Router 发现序号跳变就向该 worker 的**本地索引**要全量快照重建;worker 新加入时全量灌入,移除时整棵子树删掉。事件面是 fire-and-forget,权威在 worker 本地索引。
+- **多 Router 副本同步**(`--router-replica-sync`):副本间经事件面互发三类生命周期事件(`AddRequest` / `MarkPrefillCompleted` / `Free`),只为让各副本的**在途负载估计**更全;明确"不同步前缀缓存状态、不保证选路一致",队列满了丢最新消息,CLOCK 回收器清闲置租约(默认 300 秒)。
+
+**其余专题页**(未逐一深读,留作指针):worker 过滤(`worker-filtering.md`)、按优先级类别做差额轮询调度(`deficit-round-robin.md`)、PD 分离路由、多数据中心 KV 路由(`multi-dc-kv-routing.md`)、拓扑感知 KV 传输(`topology-aware-kv-transfer.md`)、router 三件套独立部署(standalone indexer/selection/slot tracker)、offload 后端支持矩阵(`offloading-support-matrix.md`)。
+
+### Planner
+
+自动扩缩容控制器,`planner-design.md` 描述的内部结构:
+
+![Planner 组成](figures/planner-architecture.svg)
+
+(图源:`3rdparty/dynamo/docs/fern/assets/img/planner-architecture.svg`)
+
+- **双环控制**:慢环(throughput-based)用流量预测 + 性能模型算容量下限;快环(load-based)用引擎实时指标做 ±1 步进的 SLA 纠偏,只能在下限之上调。慢环防短噪声误扩缩,快环补预测误差。
+- **插件流水线**:OBSERVE(采指标)→ PREDICT(预测下一时段请求数/ISL/OSL)→ PROPOSE(各插件提扩缩建议)→ RECONCILE/CONSTRAIN(合并、卡 GPU 预算)→ EXECUTE(经 connector 下发)。内置算法就是走这条流水线的插件,外部可用 gRPC 插件扩展。
+
+![Planner 插件流水线](figures/planner-plugin-pipeline.png)
+
+(图源:`3rdparty/dynamo/docs/fern/assets/img/planner-plugin-pipeline.png`)
+
+- **负载预测器**四种:Constant(稳定负载)/ ARIMA(趋势季节)/ Kalman(突发)/ Prophet(复杂季节),都支持用 trace 文件预热;KV 命中率与投机解码接受率不预测,用最近一次观测值。
+- **容量估计**来源按优先级:worker 自基准 > AIConfigurator 插值 > profiling 产出的 NPZ 文件 > 在线回归冷启动。快环用三个回归模型(输入"本迭代 prefill token 总数/decode KV token 总数",输出单次前向耗时,再模拟调度估 TTFT/ITL)。
+- **下发(connector)**:`KubernetesConnector` 直接 PATCH DGD 资源由 operator 调和;`VirtualConnector` 把决策写进运行时,供非 K8s 的外部编排器轮询执行。一个本地 Planner 只管一个 DGD;跨 DGD 共享 GPU 预算用 GlobalPlanner。
+
+### Profiler
+
+给 Planner 供数据的 profiling 工具:输入模型 + 负载(ISL/OSL)+ SLA(TTFT/ITL 目标),输出 prefill/decode 各自的最优 TP 度、性能插值数据、以及一份可直接部署的 DGD 清单。两种途径:**AI Configurator 离线估计**(约 30 秒,不起 GPU,默认)与 **AIPerf 在线实测**(2-4 小时,要 GPU,更准)。推荐经 `DynamoGraphDeploymentRequest`(DGDR)声明式发起,`autoApply: true` 可自动应用结果。
+
+### AISimulate / DynoSim(仿真,实验性)
+
+不起 GPU 集群就能预测服务行为的离线仿真器:**mocker 引擎核**(模拟调度、KV 分配、前缀缓存、抢占、前向耗时)+ 可选的 router 仿真与 planner-in-the-loop 仿真。trace 摄入兼容 Mooncake JSONL 与 Dynamo 自己的 request trace;`Sweeper` 做配置空间搜索(如 GLM-5 FP8 的 PD 配置帕累托扫描)。lake 的 `tools/cmx-sim/` 计算器是同类思路的极简化版本。
+
+### Backends(引擎接入)
+
+两种接入方式:
+- **集成式(integrated)**:Dynamo worker 与引擎同进程,功能最全,生产路径。
+- **Sidecar(实验性)**:引擎不动,旁边跑一个纯 CPU 的 Dynamo sidecar 进程——目标设计是**请求面由 Frontend 直连引擎原生 gRPC,sidecar 只管服务发现与事件转发**(当前版本请求仍过 sidecar)。意义:不 import 引擎私有 API、依赖隔离、故障可归因。vLLM/SGLang 支持聚合与分离两种拓扑,TRT-LLM 仅聚合。
+
+KV offload 走后端各自的 connector(vLLM 的 `kv-cache-offloading.md` 推 LMCache/FlexKV/HiCache;SGLang 有 HiCache 页)——KVBM 撤下后的官方推荐路径。
+
+### 容错(concepts/fault-tolerance,四机制)
+
+| 机制 | 做法 | 关键点 |
+|------|------|--------|
+| **优雅退出** | SIGTERM → 先从发现面注销端点(秒级停止收新流量)→ 宽限期(默认 5s)→ drain 在途请求(总上限默认 15 分钟)→ 清资源 | "先注销再 drain"的顺序保证不再接新请求 |
+| **请求迁移** | pipeline 里的 Migrator 算子拦截所有请求/响应,逐 token 累积已生成内容;worker 中途挂了就把"原 prompt + 已生成 token"作为新请求发给健康 worker 续算 | 客户端无感;迁移次数上限在 Frontend 级配置 |
+| **请求取消** | 客户端断开时沿 pipeline 传播取消,释放 KV 块 | (未深读,见 `request-cancellation-architecture.md`) |
+| **请求拒绝(过载)** | 两层:Frontend 的 Router 按 worker 上报的负载事件维护"忙碌集合"并排除(全忙则回 HTTP 529,可配);worker 侧另有硬上限 `--engine-request-limit N` + 溢出队列 Q(默认 16),满则拒 | 529(过载)与 503(无可用路径)区分;worker 是否忙碌按 DP rank 判定,**所有 rank 都忙才算忙** |
+
+另有 **canary 主动健康检查**(observability 概念页):空闲超时的端点会被发一个真实的最小请求验证推理通路;正常流量天然抑制 canary。默认关闭。
+
+### 可观测性(concepts/observability)
+
+- **指标拉、轨迹推**:Prometheus 拉 `/metrics`;trace 与日志经 OTLP 推到 collector(可接 Tempo/Loki)。
+- **三键关联**:调用方可传 `x-request-id`,加上 OTLP 的 `trace_id` / `span_id`,结构化日志(JSONL)里三键并列,可互查。
+- **前向指标(FPM)持久化**:从发布路径旁路一份进**有界队列**落盘(gzip JSONL),队列满就丢记录——明确"不为观测性拖慢推理"。
+
+## KV 路由协议源码(lib/kv-router)
+
+> 路由器的成本模型、事件流与可靠性设计见上文「模块详解 → Router」;本节是 `lib/kv-router/src/` 的源码级协议细节。核心数据结构在 `protocols.rs`:
 
 - **`LocalBlockHash(pub u64)` / `ExternalSequenceBlockHash(pub u64)`**:block 哈希。`ExternalSequenceBlockHash` 注释明示"engine 从 token IDs + 可选 metadata + **parent block hash** 计算"——即**前缀链式哈希**,与 lake `block_hash = hash(parent || 本块 tokens)` 同构。这是 lake 链式哈希防误复用的直接工业印证。
 - **`Placement { owner: PlacementOwner, tier: StorageTier }`**:block 的位置 = owner + tier。
@@ -70,8 +163,6 @@ NVIDIA 官方宣传文(2025-03 GTC 发布博客)把 Dynamo 归纳为四个创新
 - **`PlacementEvent { placement, event: KvCacheEvent }`**:位置变更事件,推送用。对应 lake"位置视图权威变更触发推送(放置/驱逐/迁移/满块注册)"。
 - **`RouterRequest`/`RouterResponse`**:Router 的 RPC 协议,`RouterResponse` 含 `overlap_blocks`(命中重叠块数)、`effective_overlap_blocks`——KV-aware 路由的命中量化。
 - **`KvTransferEnforcement`**:强制 KV 传输的策略枚举(对应 lake PD 分离/D-direct 的模式选择边界)。
-
-KV-aware 路由:Router 维护各 worker 的 KV block 哈希集合,新请求按 prompt 前缀哈希找 overlap 最多的 worker,省重算。无 KV 事件时降级为"预测式路由"(按负载)。
 
 ## KVBM(KV Block Manager)三层架构
 
@@ -174,6 +265,12 @@ PD 分离为"独立可伸缩的 GPU 池",三后端(vLLM/SGLang/TRT-LLM)都支持
 | KVBM 块状态机 + RAII 注册事件 | KV block 生命周期管理 | `Reset→Partial→Complete→Registered`,注册/析构自动发事件,免显式反注册;lake 块生命周期可参考(见 [`../sglang/block-lifecycle.md`](../sglang/block-lifecycle.md)) |
 | KVBM G4 "storage advisor" 模式 | (lake 不采用,作对照) | 存储厂商订阅事件面自建索引、自行冷热分层——与 lake"位置视图归存储控制面权威"相反,是有价值的反面对照 |
 | 三平面分离(请求/控制/事件) | lake 通信分层 | 请求面 TCP、事件面 ZMQ/NATS、发现面 etcd/K8s 各自独立选型,印证"按流量特征选栈" |
+| Router 成本函数(分层命中加权) | Router 命中感知选路 | device/host/disk/shared 四层命中各有权重,可直接对照 lake"Pool 命中 vs 本地命中"的差异化计价 |
+| 事件 gap 检测 + worker 本地索引快照恢复 | 位置视图推送的可靠性兜底 | 事件面 fire-and-forget + 序号 gap 触发全量快照,与 lake"镜像推送 + 回查兜底"同构 |
+| 多 Router 副本只同步在途负载、不同步缓存状态 | (lake Router 扩展时参考) | 明确区分"易失负载估计"(副本间 best-effort)与"缓存状态"(worker 本地索引为权威),边界划得干净 |
+| Planner 双环(慢预测环给下限 + 快反应环 ±1) | (lake 弹性,远期) | 慢环防噪声、快环纠偏的分工,以及"扩缩间隔必须长于扩缩完成时间"的工程约束 |
+| 请求迁移的 token 累积重发 | F4 故障恢复 | Migrator 在 pipeline 里累积已生成 token,worker 挂了带全量上下文换 worker 续算——lake F4 重路由时的状态携带可参考 |
+| 过载拒绝两层(router 忙碌集合 + worker 硬上限 N+Q) | (lake 归 gateway,不采用) | Dynamo 在推理系统内做了 shedding;lake 明确把过载控制划给 gateway,这是两家职责边界的差异点 |
 | KV-aware router(overlap 量化) | Router 命中感知选路 | `overlap_blocks` 命中量化,见 [`../../architecture/scheduling.md`](../../architecture/scheduling.md) "缓存命中感知调度" |
 | transports 多后端可插拔 | 通信选型(见 #3) | etcd/nats/tcp/zmq 按部署形态选,印证"控制面存储 vs 事件面"可分离 |
 | KV events 走 NATS 而非 etcd | (lake 待定) | 高频事件流用 NATS、权威元数据用 etcd 的分工,值得 lake 评估 |
@@ -207,6 +304,12 @@ G1 是传输句柄（无 `BlockManager<G1>`）、与 KV event / 本机 G2/G3 的
 | KVBM 逻辑层 | `lib/kvbm-logical/src/`(`blocks`/`pools`/`manager`/`events`/`pubsub`) |
 | KVBM 物理层(布局/传输) | `lib/kvbm-physical/src/`(`layout`/`transfer`/`manager`) |
 | KVBM 引擎层(运行时/offload/leader/object) | `lib/kvbm-engine/src/`(`runtime`/`offload`/`leader`/`collectives`/`object`) |
+| Router 索引器(前缀树 + gap 恢复) | `lib/kv-router/src/indexer/`;副本同步与租约见 `lib/kv-router/src/{active_set,recovery}/` |
+| Router 成本模型 | `lib/kv-router/src/protocols.rs` + `scheduling/`;文档 `modular-components/router/router-design.md` |
+| Planner 双环与插件流水线 | `components/src/dynamo/planner/core/{load_scaling,throughput_scaling,state_machine}.py` + `plugins/`;文档 `modular-components/planner/planner-design.md` |
+| Profiler / DGDR | `components/src/dynamo/profiler/`;文档 `modular-components/profiler/` |
+| 仿真(mocker / replay) | `components/src/dynamo/{mocker,replay}/`;文档 `concepts/simulation/dynosim-architecture.md` |
+| Frontend / 全局路由 | `components/src/dynamo/{frontend,global_router,global_planner}/` |
 | 通信后端(多后端) | `lib/runtime/src/transports.rs`::`etcd`/`nats`/`tcp`/`zmq`/`event_plane` |
 | 服务发现 | `lib/runtime/src/discovery/`(`kube`/`kv_store`/`mock`) |
 | 组件抽象 | `lib/runtime/src/component.rs` / `pipeline/` |
