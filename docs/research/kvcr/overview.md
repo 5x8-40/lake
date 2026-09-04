@@ -111,7 +111,7 @@ DEP #11673 指出现有方案(含 KVBM)的两种失败模式:一是 GPU 紧耦�
 
 (图源:`3rdparty/kvcr/docs/figures/kvcr-masthead.jpg`;Framework 经控制面 API 调用进程内 KVCR,KVCR 数据面经 NIXL/RDMA 与 peer KVCR 直传)
 
-- hint 协议(JSON,`src/kvcr/hint_parser.py`):`source_control_endpoint`、`block_hashes`(u64 列表)、`mode`(`copy` 保留源 / `move` 成功后源可驱逐)、`no_retain`(建议目的地不留副本)。超时或取消保留源副本。
+- hint 协议的格式与标准化状态见下节「hint 协议」。
 - KVCR 间传输由目的地发起;router 不在数据路径上;peer 控制通道(ZMQ)只传连接元数据、确认与传输控制,字节经 NIXL 直传。
 - NIXL 后端可按路径配置([kvcr#16](https://github.com/ai-dynamo/kvcr/pull/16)):`local_dram_backend`(本地 DRAM 传输)与 `remote_fw_dram_backend`(peer DRAM 传输)分开指定。
 - `query` 返回 `HIT(tier)` / `FETCHING(tier)` / `FETCHABLE(source_tier)` / `MISS`,只读本地状态,不查 router;远端源信息仅经 `submit_hint` 到达。`FETCHABLE`(peer DRAM) 的实际可读性在传输与 pin 成功后才确认。
@@ -151,6 +151,37 @@ sequenceDiagram
     EB->>EB: 跳过前缀重算,直接 decode
 ```
 
+### hint 协议
+
+hint 是 router 把全局 KV 知识按请求捎给数据面的元数据约定。存在理由:KVCR 实例不维护 peer 库存,全局视图只在 router;而数据搬运由 KVCR 间 P2P 完成,router 不在数据路径上——hint 补上了这两者之间的接缝。
+
+当前快照(pin `9cd4e08`)的 wire 格式(`src/kvcr/hint_parser.py`):挂在请求元数据的 `router_hint` 键下,JSON 对象,4 个字段。
+
+| 字段 | 含义 |
+|------|------|
+| `source_control_endpoint` | 源 KVCR 的 peer 控制通道地址;为空表示用本地存储或查对象存储 |
+| `block_hashes` | 前缀块的 u64 哈希列表(即 `BlockKey` 集合),必填非空 |
+| `mode` | `copy`(默认,保留源副本)/ `move`(传输成功后源可驱逐) |
+| `no_retain` | 建议目的地用完不留副本(一次性共享场景) |
+
+语义要点:
+
+- **是提示不是命令**:目的地引擎自行决定用不用(`query` → `FETCHABLE` → 按自身负载决定 `fetch` 还是重算);router 也可按自己的成本模型选择不发。
+- **请求级生命周期**:`submit_hint(hints, request_id)` 注册,`discard_hint` 丢弃;源端点信息只活在请求作用域内,不进入任何全局状态——KVCR 侧因此永远不需要 peer 库存。
+- **可扩展**:解析器注释说明"其他字段待 KVCR 消费时再加",信封先行、字段渐进。
+
+**标准化状态(2026-09-04 核实):未达成一致,是 NVIDIA 单方推动的早期提案。** Dynamo 团队在同一周(08-12 ~ 08-24)向四个社区同时发出 RFC,目前无一被接受:
+
+| RFC | 状态 |
+|-----|------|
+| [dynamo#13134](https://github.com/ai-dynamo/dynamo/pull/13134) typed KV hint contract | open;review 中格式大改——从扁平 JSON 改为带 `protocol_version` + `action_type`/`action_version` 的 versioned envelope |
+| [vllm#53421](https://github.com/vllm-project/vllm/issues/53421) KV Hint Envelope | open,零评论 |
+| [sglang#36224](https://github.com/sgl-project/sglang/issues/36224) KV Hint Envelope | open,零评论 |
+| [TRT-LLM#18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151) router hint P2P | open,零评论 |
+| [kvcr#18](https://github.com/ai-dynamo/kvcr/pull/18) 解析器适配 versioned envelope(取第一个 `kv.fetch` action) | open,与 dynamo#13134 需同步合并;版本不匹配只做告警( advisory) |
+
+即:外部社区尚无响应,格式本身还在演化(扁平 → versioned envelope),短期内以 Dynamo/KVCR 自家实现为准,对接其他引擎前需重新核对当时格式。
+
 ### 状态模型
 
 中心结构为 `block_index: BlockKey → BlockRecord`(`src/kvcr/core.py`)。`BlockRecord` 记录该块的全部已知位置(`fw_mem` / `local_dram` / `g3`)、`in_flight_ops` 与访问统计;只含本地状态,不随集群规模增长。驻留状态与操作状态分离;claim 挂在具体驻留上防止使用中被驱逐;就绪且无 claim 的驻留进入 policy 打分的驱逐队列。
@@ -177,7 +208,7 @@ event loop 负责全部元数据变更,不执行阻塞调用;独立的 progress 
 | 2026-08-21 / 08-24 | KVCR 仓初始化 / 在 DEP #11673 公开 |
 | 2026-08-27 | [dynamo#12993](https://github.com/ai-dynamo/dynamo/pull/12993) 文档将 KVBM 从 offload 推荐后端撤下 |
 | 2026-09-03 | [kvcr#16](https://github.com/ai-dynamo/kvcr/pull/16) NIXL 后端按路径可配;[kvcr#17](https://github.com/ai-dynamo/kvcr/pull/17) Guard 多池改造(claim 协议改为按 Guard 索引,不兼容变更) |
-| 并行 | 生态对接:TRT-LLM [#18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151)(router hint P2P)、vLLM [#53421](https://github.com/vllm-project/vllm/issues/53421)(hint envelope)与 [#53624](https://github.com/vllm-project/vllm/pull/53624)(KVCR adapter)、SGLang [#36224](https://github.com/sgl-project/sglang/issues/36224)(hint)与 [#32903](https://github.com/sgl-project/sglang/issues/32903)(KVCR 作 HiCache 后端)、Dynamo router [#13134](https://github.com/ai-dynamo/dynamo/pull/13134)(typed KV hint contract) |
+| 并行 | 生态对接(以下 RFC 截至 2026-09-04 均 open,外部社区尚无响应,详见「hint 协议」节):TRT-LLM [#18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151)(router hint P2P)、vLLM [#53421](https://github.com/vllm-project/vllm/issues/53421)(hint envelope)与 [#53624](https://github.com/vllm-project/vllm/pull/53624)(KVCR adapter)、SGLang [#36224](https://github.com/sgl-project/sglang/issues/36224)(hint)与 [#32903](https://github.com/sgl-project/sglang/issues/32903)(KVCR 作 HiCache 后端)、Dynamo router [#13134](https://github.com/ai-dynamo/dynamo/pull/13134)(typed KV hint contract) |
 
 外部贡献者曾给 KVBM 提交 P2P 实现([#7879](https://github.com/ai-dynamo/dynamo/pull/7879),g2pb global peer offloading,draft),因官方转向 KVCR 而搁置。
 
