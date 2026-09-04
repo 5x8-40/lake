@@ -36,6 +36,52 @@ Dynamo 把系统分成三个平面,各用各的通信栈(官方架构页 `archit
 
 要点:KV 传输是 **worker 间直连**,无共享存储瓶颈,且传输不阻塞 GPU 前向计算;传输协调方式因后端而异(vLLM 用 block ID、SGLang 用 bootstrap 连接、TRT-LLM 用不透明状态)。路由失败时本地运行时会把该 worker 临时拉黑(默认 5 秒,`DYN_RUNTIME_INHIBITED_DURATION_SECS`),等服务发现收敛。
 
+官方架构页(旧 URL slug 为 `architecture-flow`)的彩色分流图,按阶段着色(蓝=主请求流,绿=prefill,橙=decode 路由,紫=完成回包,灰虚线=基础设施):
+
+```mermaid
+graph TD
+    Client["HTTP Client"] --> S1[["1 REQUEST"]]
+    S1 -->|HTTP API| Frontend["Frontend<br/>(OpenAI 兼容, :8000)"]
+    Frontend --> S2[["2 PREPROCESS"]]
+    S2 -->|tokenize + 校验| PrefillRouter["PrefillRouter"]
+    PrefillRouter --> S3[["3 ROUTE TO PREFILL"]]
+    S3 -->|选 prefill worker| PrefillWorker["Prefill Worker"]
+    PrefillWorker --> S4[["4 PREFILL"]]
+    S4 -->|算 KV| PrefillKVCache[("Prefill KV Cache<br/>(GPU VRAM)")]
+    PrefillWorker --> S5[["5 RETURN METADATA"]]
+    S5 -->|disaggregated_params| PrefillRouter
+    PrefillRouter --> S6[["6 ROUTE TO DECODE"]]
+    S6 -->|注入传输元数据| DecodeWorker["Decode Worker"]
+    DecodeWorker --> S7[["7 KV TRANSFER"]]
+    S7 -->|NIXL GPU-to-GPU| PrefillKVCache
+    PrefillKVCache -.->|直传| DecodeKVCache[("Decode KV Cache<br/>(GPU VRAM)")]
+    DecodeWorker --> S8[["8 DECODE"]]
+    S8 -->|生成 token| DecodeKVCache
+    DecodeWorker --> S9[["9 RESPONSE"]]
+    S9 -->|流式 token| Frontend
+    Frontend -->|HTTP 响应| Client
+
+    subgraph INF["基础设施"]
+        Discovery[("Discovery<br/>etcd 或 K8s")]
+        EventPlane[("事件面<br/>KV 事件(ZMQ/NATS)")]
+        Planner["Planner<br/>(自动扩缩)"]
+    end
+    Frontend -.-> Discovery
+    PrefillRouter -.-> Discovery
+    PrefillWorker -.->|注册| Discovery
+    DecodeWorker -.->|注册| Discovery
+    PrefillWorker -.->|KV 事件| EventPlane
+    DecodeWorker -.->|KV 事件| EventPlane
+    Frontend -.->|指标| Planner
+    Planner -.->|扩缩| PrefillWorker
+    Planner -.->|扩缩| DecodeWorker
+
+    linkStyle 0,1,2,3,4,5 stroke:#1565C0,stroke-width:3px
+    linkStyle 6,7,8,9 stroke:#2E7D32,stroke-width:3px
+    linkStyle 10,11,12,13,14 stroke:#E65100,stroke-width:3px
+    linkStyle 15,16,17,18,19 stroke:#6A1B9A,stroke-width:3px
+```
+
 两种路由拓扑:
 - **Dynamo-native Frontend 路由**:`client → Frontend → Router → workers`,Frontend 内置 router,无外部 gateway。
 - **Gateway API + GAIE**:K8s Gateway API Inference Extension → Endpoint Picker Plugin(EPP)→ Frontend sidecar(direct router 模式)。
