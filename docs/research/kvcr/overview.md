@@ -54,7 +54,7 @@ SGLang 侧则作为 HiCacheStorage 后端接入([sglang#32903](https://github.co
 
 ## 与 KVBM 的区别
 
-DEP #11673 指出现有方案(含 KVBM)的两种失败模式:一是 GPU 紧耦合——外部组件管理 GPU 侧 KV block,占用 kernel launch 带宽且需与引擎持续同步;二是过于简单——内存压力下被动驱逐,无准入过滤与跨节点协调。KVBM 两条都符合:v1 管理 G1 布局与搬运并带自定义 CUDA kernel;跨实例方案(#4887/#5243,自建 ZMQ registry hub)均未合并。KVCR 按相反的边界重做:
+DEP #11673 指出现有方案(含 KVBM)的两种失败模式:一是 GPU 紧耦合——外部组件直接管理 GPU 侧的 KV block,既要和引擎的 kernel 调度抢资源,又要持续和引擎同步状态;二是过于简单——内存压力下被动驱逐,无准入过滤与跨节点协调。KVBM 两条都符合:v1 管理 G1 布局与搬运并带自定义 CUDA kernel;跨实例方案(#4887/#5243,自建 ZMQ registry hub)均未合并。KVCR 按相反的边界重做:
 
 | 维度 | KVBM(v1) | KVCR |
 |------|----------|------|
@@ -63,7 +63,7 @@ DEP #11673 指出现有方案(含 KVBM)的两种失败模式:一是 GPU 紧耦�
 | 全局视图 | 曾自建 registry hub(未合并)/ NATS 事件流 | 不自建,复用 router 的最终一致 inventory;KVCR 只知本地 |
 | 跨机共享 | v1 无(仅本机 G2/G3);v2 有协议未接生产 | 主要能力:hint 驱动、目的地发起、NIXL P2P(远端 DRAM→本地 DRAM 或直灌 GPU) |
 | 接入方式 | 自定义 connector + kernel | 引擎原生 kv_offload / HiCache 后端;框架负责 canonical 布局 |
-| 弹性 | 引擎退出则缓存失效 | KVCR-Guard sidecar 持有内存池,引擎故障后缓存仍可供远端读取,重启后 fenced handoff 恢复 |
+| 弹性 | 引擎退出则缓存失效 | KVCR-Guard sidecar 持有内存池,引擎故障后缓存仍可供远端读取,重启后交接恢复(见「组件角色」) |
 | 策略 | 固定 | 可插拔 policy(准入/驱逐/放置/恢复),默认 LRU |
 | 状态 | sunset(2026-07-16 官方宣布;2026-08-27 [dynamo#12993](https://github.com/ai-dynamo/dynamo/pull/12993) 将其从 offload 推荐后端撤下) | 早期开发,MVP 目标 2026-09 月中 |
 
@@ -71,7 +71,7 @@ DEP #11673 指出现有方案(含 KVBM)的两种失败模式:一是 GPU 紧耦�
 
 1. GPU 管理归引擎:引擎已持有全部调度上下文(调度状态、活跃请求、decode 步数),外部实体要获得同等上下文只能持续同步,协调必然落到热路径。KVCR 遵守的不变量是 GPU 内存所有权与调度归引擎,谁物理发起 DMA 不重要。
 2. 框架原生 offload 已成熟:vLLM kv_offload 输出 canonical 布局,SGLang 类似;KVBM 自定义 reshape kernel 的必要性消失。因此框架负责布局,KVCR 只做数据搬运。
-3. 全局视图不重复建设:router 为路由本就追踪 KV 位置;registry hub 与之重复。router 持全局 inventory(按 `BlockKey`,尽量小),KVCR 实例不维护 peer 库存。同节点与跨节点复用使用同一 source 模型,共置只改变传输方式,不改变所有权与协调模型。
+3. 全局视图不重复建设:router 为路由本就追踪 KV 位置;registry hub 与之重复。router 持全局 inventory(按 `BlockKey`,尽量小),KVCR 实例不维护 peer 库存。同节点与跨节点复用走同一套"router 指明来源"的模型:同节点时 NIXL 自动选本机传输方式,所有权与协调流程不变。
 4. 拉取与重算的取舍下放给 worker:router 只发 hint,是否拉取由目的地按自身负载决定;集中式成本决策难以做好。
 
 ## KVBM v2 为什么也被放弃
@@ -99,11 +99,38 @@ DEP #11673 指出现有方案(含 KVBM)的两种失败模式:一是 GPU 紧耦�
 
 ### 组件角色
 
-- **Framework/Engine**:GPU 内存唯一所有者;决定哪些 block 进出自有内存;经描述符与可选 pin 接口把自有 GPU/host 内存暴露给 KVCR;向 router 上报自有内存。
-- **KV Router**:维护各 engine/KVCR 实例上报的最终一致全局 `BlockKey` inventory(带 tier 标签);按 overlap 与负载做缓存感知路由;向目的地 KVCR 发 hint(跨机检索时含源节点与 peer control endpoint)。
-- **KVCR**:引擎进程内库;管理 KVCR 自有 DRAM/SSD 驻留与配置的对象存储;上报 KVCR 层 inventory;经 NIXL 执行数据移动;执行内建或用户策略;响应引擎的可用性查询;不阻塞引擎热路径。
-- **KVCR-Guard(可选 sidecar)**:弹性开启时持有 KVCR 的 DRAM 池;提供一个 socket 端点供 active KVCR attach 并恢复已提交状态;attach 后经共享内存直访池,正常操作无 IPC 往返;宿主 backup KVCR(自带 NIXL agent),fencing 失效 owner 后可服务已提交的 KV;引擎重启后热启动并交还所有权。不覆盖引擎自有内存。
-- **kvcr_service(内存服务 daemon)**:Guard 的内存供应方,预分配 `--guard-count` 份连续内存,每份可含多个池(`--pool-sizes-gb 48,16`,另加固定 100 MiB 恢复 journal);worker 按 Guard 索引 claim([kvcr#17](https://github.com/ai-dynamo/kvcr/pull/17) 起 claim 协议按 Guard 而非单池,为多池做准备;当前仍把多池区域作为一个合并数据区暴露)。
+**Framework/Engine(推理引擎,如 vLLM)**
+
+- GPU 显存的唯一所有者,GPU 侧的分配、驱逐、调度都归它。
+- 决定哪些 KV block 进入或离开自己的内存,以及何时进出。
+- 通过内存描述符(和可选的 pin 接口)把自己的 GPU/host 内存暴露给 KVCR,KVCR 据此代为搬运这些数据。
+- 把自己内存中有哪些 block 上报给 router。
+
+**KV Router**
+
+- 汇总所有 engine 和 KVCR 实例的上报,维护一份全局的 `BlockKey → 位置` 表(最终一致,每条带层级标签)。
+- 路由请求时综合考虑前缀命中情况和节点负载。
+- 命中的 KV 在其他节点时,向目的地 KVCR 发 hint(内含源节点地址)。
+
+**KVCR(引擎进程内的库)**
+
+- 管理自己名下的 DRAM/SSD 和可选的对象存储:哪些 block 驻留、驱逐哪些、放在哪层。
+- 向 router 上报自己这一层的库存。
+- 所有数据搬运经 NIXL 执行;准入、驱逐、放置策略可替换(内建 LRU)。
+- 响应引擎的"这些 block 是否在"查询;所有操作异步,不阻塞引擎的推理热路径。
+
+**KVCR-Guard(可选 sidecar 进程)**
+
+- 作用:让 KVCR 的 DRAM 池在引擎进程崩溃后仍然存活。引擎自有内存不在保障范围内。
+- 开启弹性后,DRAM 池由 Guard 进程持有,而不是由引擎进程内的 KVCR 持有。KVCR 通过 unix socket 向 Guard 注册(attach),之后直接映射同一块共享内存读写,正常读写没有 IPC 开销。
+- Guard 内还运行一个 backup KVCR(带自己的 NIXL agent)。引擎崩溃时,Guard 先对旧 KVCR 做 fencing——即隔离失效者、确保它不会再写这块池——然后由 backup KVCR 接管池,其他节点仍可读取其中已提交的 KV。
+- 引擎重启后,新的 KVCR 重新 attach,恢复全部已提交状态,再通过一次同样的 fencing 交接把池的所有权拿回来。
+
+**kvcr_service(内存服务 daemon)**
+
+- Guard 的内存供应方,负责池的生命周期。
+- 启动时预分配 `--guard-count` 份连续内存,每份对应一个 Guard;每份内部可含多个池(如 `--pool-sizes-gb 48,16` 表示 48 GiB + 16 GiB 两个池),外加固定 100 MiB 的恢复 journal。
+- worker 按 Guard 索引认领。[kvcr#17](https://github.com/ai-dynamo/kvcr/pull/17) 起认领协议从按池改为按 Guard,为一个 Guard 管多个池做准备;当前实现仍把一份内的多个池合并成一个数据区暴露。
 
 ### 数据面:hint 驱动的 P2P
 
@@ -178,17 +205,21 @@ hint 是 router 把全局 KV 知识按请求捎给数据面的元数据约定。
 | [vllm#53421](https://github.com/vllm-project/vllm/issues/53421) KV Hint Envelope | open,零评论 |
 | [sglang#36224](https://github.com/sgl-project/sglang/issues/36224) KV Hint Envelope | open,零评论 |
 | [TRT-LLM#18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151) router hint P2P | open,零评论 |
-| [kvcr#18](https://github.com/ai-dynamo/kvcr/pull/18) 解析器适配 versioned envelope(取第一个 `kv.fetch` action) | open,与 dynamo#13134 需同步合并;版本不匹配只做告警( advisory) |
+| [kvcr#18](https://github.com/ai-dynamo/kvcr/pull/18) 解析器适配 versioned envelope(取第一个 `kv.fetch` action) | open,与 dynamo#13134 需同步合并;版本不匹配只告警不拒绝 |
 
 即:外部社区尚无响应,格式本身还在演化(扁平 → versioned envelope),短期内以 Dynamo/KVCR 自家实现为准,对接其他引擎前需重新核对当时格式。
 
 ### 状态模型
 
-中心结构为 `block_index: BlockKey → BlockRecord`(`src/kvcr/core.py`)。`BlockRecord` 记录该块的全部已知位置(`fw_mem` / `local_dram` / `g3`)、`in_flight_ops` 与访问统计;只含本地状态,不随集群规模增长。驻留状态与操作状态分离;claim 挂在具体驻留上防止使用中被驱逐;就绪且无 claim 的驻留进入 policy 打分的驱逐队列。
+中心数据结构是 `block_index`:一张 `BlockKey → BlockRecord` 的表(`src/kvcr/core.py`)。每条 `BlockRecord` 记录一个块当前已知的全部位置(`fw_mem` / `local_dram` / `g3`)、正在进行的操作(`in_flight_ops`)和访问统计。表中只有本地状态,因此不随集群规模增长。
+
+两类状态分开记录:**驻留(residency)**表示"块在哪里、是否就绪";**操作(operation)**表示"正在对它做什么"。防驱逐通过 claim 实现:claim 挂在具体驻留上,只要 claim 存在(例如传输进行中),该驻留就不参与驱逐。就绪且无 claim 的驻留进入驱逐队列,由 policy 打分决定驱逐顺序。
 
 ### 异步执行
 
-event loop 负责全部元数据变更,不执行阻塞调用;独立的 progress 线程持有 NIXL agent,提交并轮询传输,完成后回投 event loop。每个操作有 deadline;超时或取消立即上报并开始安全释放;framework pin 在依赖工作完成后尽快释放;若 NIXL 仍可能访问相关描述符,物理释放等待传输静止。
+两条线程分工:event loop 线程负责全部元数据变更,本身不执行任何阻塞调用;progress 线程持有 NIXL agent,负责提交传输、轮询进度,完成后把结果投回 event loop。
+
+每个操作都有 deadline。超时或被取消时,先立即向调用方上报结果,再在后台做安全释放——上报不等清理完成。引擎 pin 住的内存在依赖它的工作结束后尽快释放;唯一的例外是,若 NIXL 仍可能访问相关内存描述符,物理释放要推迟到传输完全静止之后,避免释放仍在被 DMA 读写的内存。
 
 ### API 表面
 
