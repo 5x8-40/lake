@@ -2,6 +2,8 @@
 
 > 2026-08-29。范围：`3rdparty/` 中涉及 GPU HBM 或 KV 卸载的组件。不改池放置·调度读视图。  
 > 分项细节见各目录 overview；本文只做横切对照。lake：F3/F4、[`../architecture/storage-layer.md`](../architecture/storage-layer.md)。
+>
+> ⚠️ **2026-09-03 更新**：Dynamo KVBM 已被官方宣布 sunset（[DEP #11673](https://github.com/ai-dynamo/dynamo/issues/11673)），继任者 [KVCR](kvcr/overview.md) 把"引擎拥有 GPU、缓存层不碰 GPU 管理"这一原则推得更彻底（KVBM 还注册 G1 layout 做 DMA，KVCR 连这也改成引擎给指针、NIXL 代办）。本文 §2 的 KVBM G1 分析描述的是 kvbm-engine(v2) 架构，机制结论仍成立，但该代码线已不会继续演进。
 
 ## 1. 三个接口
 

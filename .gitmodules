@@ -31,3 +31,6 @@
 [submodule "3rdparty/flexkv"]
 	path = 3rdparty/flexkv
 	url = https://github.com/taco-project/FlexKV.git
+[submodule "3rdparty/kvcr"]
+	path = 3rdparty/kvcr
+	url = https://github.com/ai-dynamo/kvcr

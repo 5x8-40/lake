@@ -7,7 +7,8 @@
 - [`mooncake/`](mooncake/) — Mooncake:[总览](mooncake/overview.md) · [传输引擎](mooncake/transfer-engine.md) · [KV 存储与池化](mooncake/kv-store.md)
 - [`vllm/`](vllm/) — vLLM:[总览](vllm/overview.md) · [计算层抽象与存算分离接入点](vllm/compute.md) · [block 生命周期](vllm/block-lifecycle.md) · [上游痛点与 lake 对照](vllm/pain-points.md) · [Q3 KV/Session 调度 #48168/#48501](vllm/kv-session-roadmap.md)
 - [`transformers/`](transformers/) — Hugging Face Transformers:[总览](transformers/overview.md) · Qwen3 `nn.Module` 模型定义、HF config 字段、decoder/model/causal-lm 分层源码参考
-- [`dynamo/`](dynamo/) — Dynamo(NVIDIA):[总览](dynamo/overview.md) · 数据中心级推理编排(KV-aware router + KVBM 三层 + Rust 控制面)
+- [`dynamo/`](dynamo/) — Dynamo(NVIDIA):[总览](dynamo/overview.md) · 数据中心级推理编排(KV-aware router + Rust 控制面;KVBM 已 sunset → KVCR)
+- [`kvcr/`](kvcr/) — KVCR(NVIDIA):[总览](kvcr/overview.md) · KVBM 继任者:引擎进程内 KV 二级存储 + router hint 驱动的跨节点 P2P(不管 GPU、复用 router 全局视图、NIXL 数据面、Guard 容错)
 - [`tilert/`](tilert/) — TileRT:[总览](tilert/overview.md) · [vLLM PD 插件](tilert/pd-vllm.md) · [痛点与 lake 对照](tilert/pain-points.md)
 - [`memcache/`](memcache/) — Ascend MemCache:[总览](memcache/overview.md) · [架构](memcache/architecture.md) · [痛点与 lake 对照](memcache/pain-points.md)
 - [`ucm/`](ucm/) — UCM(ModelEngine):[总览](ucm/overview.md) · [架构](ucm/architecture.md) · [痛点与 lake 对照](ucm/pain-points.md)
@@ -31,14 +32,15 @@
 | `3rdparty/mooncake` | [kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake) | main HEAD | 传输引擎 + 对象级 KV 池 |
 | `3rdparty/vllm` | [vllm-project/vllm](https://github.com/vllm-project/vllm) | main HEAD (ab132ee98) | **计算层**(PagedAttention/worker/connector/spec decode) |
 | `3rdparty/transformers` | [huggingface/transformers](https://github.com/huggingface/transformers) | main HEAD | **模型定义**:Qwen3 `nn.Module`/HF config/decoder 分层,作为 vLLM/SGLang 模型实现的上游对照 |
-| `3rdparty/dynamo` | [ai-dynamo/dynamo](https://github.com/ai-dynamo/dynamo) | main HEAD | **编排层/控制面**:KV-aware router + KVBM 三层 offload + Rust 编排 + 多后端通信 |
+| `3rdparty/dynamo` | [ai-dynamo/dynamo](https://github.com/ai-dynamo/dynamo) | main HEAD (`705796fccf`, 2026-09-03) | **编排层/控制面**:KV-aware router + Rust 编排 + 多后端通信;KVBM 已 sunset(见 [dynamo/overview.md](dynamo/overview.md)「KVBM 变局」) |
+| `3rdparty/kvcr` | [ai-dynamo/kvcr](https://github.com/ai-dynamo/kvcr) | main HEAD (`361a2a1`, 2026-09-02) | **KVBM 继任者**:引擎进程内 KV 二级存储 + router hint 驱动 P2P + NIXL + Guard 容错;见 [kvcr/](kvcr/) |
 | `3rdparty/tilert` | [tile-ai/TileRT](https://github.com/tile-ai/TileRT) | main HEAD (`a8368a6`, v0.1.5) | **超低延迟 decode** + **vLLM PD 插件**(`TileRTConnector`);见 [tilert/](tilert/) |
 | `3rdparty/memcache` | [Ascend/memcache](https://github.com/Ascend/memcache) | master HEAD (`14b4e35`) | **昇腾 KV 对象池** Meta/Local + MemFabric;见 [memcache/](memcache/) |
 | `3rdparty/ucm` | [ModelEngine-Group/unified-cache-management](https://github.com/modelengine-group/unified-cache-management) | main HEAD (`37af15e`) | **统一缓存框架** store+connector+PD-via-pool;见 [ucm/](ucm/) |
 | `3rdparty/tensorcast` | [tensorcast-ai/tensorcast](https://github.com/tensorcast-ai/tensorcast) | main HEAD (`19f54d60`, v0.1.0+6) | **张量状态基础设施层** artifact + Global Store/Store Daemon + CUDA IPC + RDMA/TCP P2P + policy 放置契约 + binding 热替换;见 [tensorcast/](tensorcast/) |
 | `3rdparty/flexkv` | [taco-project/FlexKV](https://github.com/taco-project/FlexKV) | main HEAD (`a5c8f12`, 2026-08-27) | **引擎旁多层 KV 卸载** CPU/SSD/REMOTE radix + GPU IPC 映射 + vLLM/SGLang/Dynamo/TRT connector;见 [flexkv/](flexkv/) |
 
-> 生态相连:vLLM `KVConnectorBase_V1` 被 LMCache/Mooncake/NIXL/**FlexKV**/**TileRT**/**UCM** 等实现;vLLM-Ascend 另将 **MemCache** 列为 KV Pool backend;SGLang HiCache 把 Mooncake 作 L3,另有 `--enable-flexkv`;Dynamo 编排 vLLM/SGLang,可把 FlexKV 当 connector;UCM 主推经统一池做 PD;TileRT 做低延迟 decode。我们站在其上做更彻底的存算分离。
+> 生态相连:vLLM `KVConnectorBase_V1` 被 LMCache/Mooncake/NIXL/**FlexKV**/**TileRT**/**UCM** 等实现;vLLM-Ascend 另将 **MemCache** 列为 KV Pool backend;SGLang HiCache 把 Mooncake 作 L3,另有 `--enable-flexkv`;Dynamo 编排 vLLM/SGLang,可把 FlexKV 当 connector;UCM 主推经统一池做 PD;TileRT 做低延迟 decode;**KVCR** 走另一条路——vLLM 原生 `kv_offload` tiering 后端 + SGLang HiCacheStorage 后端 + router hint 协议(TRT-LLM/vLLM/SGLang/Dynamo router 四方对齐中)。我们站在其上做更彻底的存算分离。
 
 ---
 

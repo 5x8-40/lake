@@ -76,7 +76,8 @@ docs/
 | `3rdparty/lmcache` | LMCache/LMCache | 跨请求/跨实例 KV 复用、多存储后端、`rust/` 工程模式 |
 | `3rdparty/vllm` | vllm-project/vllm | **计算层**:PagedAttention、worker/`GPUModelRunner`、`KVConnectorBase_V1` 接口(存算分离接入点)、spec decode |
 | `3rdparty/transformers` | huggingface/transformers | **模型定义参考**:Qwen3/PyTorch `nn.Module` 结构、HF config 字段、decoder/model/causal-lm 分层；只作模型骨架与配置对照,不作服务端执行参考 |
-| `3rdparty/dynamo` | ai-dynamo/dynamo | **编排层/控制面**:KV-aware router、KVBM(GPU→CPU→SSD→远端 三层 offload)逻辑/物理/引擎三层、Rust 编排、多后端通信(etcd/nats/tcp/zmq) |
+| `3rdparty/dynamo` | ai-dynamo/dynamo | **编排层/控制面**:KV-aware router、Rust 编排、多后端通信(etcd/nats/tcp/zmq);KVBM(GPU→CPU→SSD→远端 offload)已被官方 sunset(2026-07 DEP #11673),代码仍在 main 但不再演进 → 见 [`docs/research/dynamo/overview.md`](docs/research/dynamo/overview.md)「KVBM 变局」 |
+| `3rdparty/kvcr` | ai-dynamo/kvcr | **KVBM 继任者**:引擎进程内 KV 二级存储(DRAM/SSD/对象存储)+ router hint 驱动跨节点 P2P(NIXL)+ Guard sidecar 容错 + 可插拔策略;不管 GPU、复用 router 全局视图 → 见 [`docs/research/kvcr/`](docs/research/kvcr/)(overview) |
 | `3rdparty/tilert` | tile-ai/TileRT | **超低延迟 decode**(tile runtime,核闭源) + **vLLM PD 插件**(`TileRTConnector`/`pd_vllm`,NIXL/Mooncake)→ 见 [`docs/research/tilert/`](docs/research/tilert/) |
 | `3rdparty/memcache` | Ascend/memcache | **昇腾分布式 KVCache 对象池**(MetaService/LocalService、HBM/DRAM/SSD、MemFabric OneCopy)→ 见 [`docs/research/memcache/`](docs/research/memcache/) |
 | `3rdparty/ucm` | ModelEngine-Group/unified-cache-management | **统一缓存框架**(可插拔 KVStore、vLLM connector、稀疏插件、PD-via-pool)→ 见 [`docs/research/ucm/`](docs/research/ucm/) |
@@ -114,7 +115,8 @@ docs/
    - **计算层(vLLM)**:PagedAttention/worker/model runner + KV connector 接口(worker↔存储池接入点) + spec decode + 权重加载 → `docs/research/vllm/{overview,compute}.md`
  - **模型定义(Transformers)**:Qwen3 `nn.Module`/HF config/decoder/model/causal-lm 分层 → `docs/research/transformers/overview.md`
    - **vLLM Q3 KV/Session 调度**(#48168 agent prefix · #48501 `session_id`/`continuation_id` · retention) → `docs/research/vllm/kv-session-roadmap.md`
-   - **编排层/控制面**:KV-aware router(overlap 量化) + KVBM logical/physical/engine 三层 offload + Placement/StorageTier(介质非位置) + 链式 block 哈希 + 多后端通信(etcd/nats/tcp/zmq) → `docs/research/dynamo/overview.md`
+   - **编排层/控制面**:KV-aware router(overlap 量化) + Placement/StorageTier(介质非位置) + 链式 block 哈希 + 多后端通信(etcd/nats/tcp/zmq) → `docs/research/dynamo/overview.md`(注意:KVBM 已 sunset,见该文「KVBM 变局」)
+ - **跨节点 KV 共享 / KVBM 继任者(KVCR)**:引擎进程内二级存储 + router hint P2P + NIXL + Guard 容错 + 策略可插拔;与 KVBM 的区别与重做原因 → `docs/research/kvcr/overview.md`
    - **NVIDIA CMX**：目标栈、公开成熟度、VAST G3/G3.5 边界与 lake 映射 → `docs/research/nvidia-cmx.md`；模型字节、容量与 Prefill KV 加载计算器 → `tools/cmx-sim/`
    - **Agentic cache workload**：匿名 Cursor 用量、公开 request 级 trace（Codex × SWE-bench Pro / AgentX）、provider cache 留存、File Library 边界与 90%/95% 仿真输入 → `docs/research/agentic-cache-workload.md`
    - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）

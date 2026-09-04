@@ -13,8 +13,10 @@
 |------|-----|
 | Upstream | https://github.com/ai-dynamo/dynamo |
 | Commit | `f5b1c1cceaee8374e3e6134f43f8aa1a0a225f9c` |
-| 对应本地 submodule | `3rdparty/dynamo` @ 同上 SHA（vendor 时一致） |
+| 对应本地 submodule | `3rdparty/dynamo` @ 同上 SHA（vendor 时一致；2026-09-03 submodule 已推进至 `705796fccf`，vendor pin 不变） |
 | Vendor 日期 | 2026-07-21 |
+
+> ⚠️ **上游状态（2026-09）**：Dynamo 官方已宣布 KVBM v1 sunset（[DEP #11673](https://github.com/ai-dynamo/dynamo/issues/11673)），KV 缓存方向转向独立仓 [KVCR](https://github.com/ai-dynamo/kvcr)（Python，引擎原生 offload + router hint P2P，与 kvbm-logical 的 Rust 设计不同源）。本 vendor 拷贝因此视为**冻结快照**：正确性不受影响（约 500 单测门禁照旧），但不要再期待上游修复可同步；如需演进，按 fork 自行维护。详见 `docs/research/dynamo/overview.md`「KVBM 变局」与 `docs/research/kvcr/overview.md`。
 
 ## 工具链 / MSRV
 

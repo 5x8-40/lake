@@ -59,6 +59,12 @@ jobs:
           python-version: "3.12"
       - name: Python runtime deps
         run: pip install "grpcio>=1.82.1" "protobuf>=7.35.0" "transformers"
+      # 栈端口 50051-50054 落在 Linux 默认 ephemeral 范围(32768-60999)内:
+      # runner 上任何外连(含 runner agent 长连接)可能恰好占用源端口 50052 等,
+      # run-local.sh 的 127.0.0.1 预检看不到绑在外网卡的 socket,随后 0.0.0.0 通配 bind 即 AddrInUse。
+      # 把 ephemeral 范围压到栈端口以下,根除这类偶发冲突(2026-09-03 实测命中)。
+      - name: keep ephemeral ports clear of stack ports
+        run: sudo sysctl -w net.ipv4.ip_local_port_range="32768 50050"
       - name: start stack
         env:
           # P3 smoke 只验证三语言骨架联通性；不安装 Torch，避免触发 Qwen3 backend。
