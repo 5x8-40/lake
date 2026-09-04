@@ -242,6 +242,26 @@ KVCR 为本节点的所有 block 维护一张索引表(`block_index`,`src/kvcr/c
 - Router↔KVCR:`InventoryEvent{keys, tier, removed}` 上报(只报受影响的 key);`submit_hint` / `discard_hint` 下发。
 - Policy:`decide_ingest` / `eviction_score` / `decide_eviction` / `on_ingest` / `on_remove` / `decide_recovery`;`PlacementAction` = KEEP/DROP/COPY_TO/MOVE_TO;默认 LRU。`no_evict` claim 为硬约束,`no_retain` 为建议,冲突时 `no_evict` 优先。
 
+### 可插拔 policy
+
+KVCR 把"收不收、放哪层、驱逐谁、驱逐时怎么处置"全部抽象成策略接口(`src/kvcr/policy.py::KVCachePolicy`),部署方可整体替换;机制(怎么搬数据)不变,策略(收放谁)可换。六个钩子的调用时机:
+
+| 钩子 | 何时被调 | 能决定什么 |
+|------|----------|-----------|
+| `decide_ingest(meta, source, required_local, router_hints, framework_hints)` | 一个块要写入 KVCR 池之前 | 收不收(KEEP/DROP)、放哪层;**入参带 router hint 和引擎 hint**,可按来源做准入过滤 |
+| `eviction_score(meta, source) → float` | 块进入驱逐候选队列时 | 冷热打分,分数低的先被驱逐——LRU/LFU/自定义热度都插在这里 |
+| `decide_eviction(meta, source)` | 某个块被选中驱逐之后 | 怎么处置:DROP(直接丢)或 MOVE_TO(降到下层,如 DRAM→SSD) |
+| `on_ingest` / `on_remove` | 块首次入池 / 最后一份被移除后 | 观察事件,供有状态的策略维护自己的统计(如频率计数) |
+| `decide_recovery(meta, failure)` | 策略要求的放置失败时 | 补救动作(当前只支持 DROP) |
+
+内建四个策略(`policy.py`):`FIFOPolicy`(收了就不丢,按先进先出驱逐)、`LRUPolicy`(按最近使用打分)、`G3FIFOPolicy` / `G3LRUPolicy`(驱逐时不直接丢,改为 MOVE_TO 到 SSD 层)。
+
+**对照"按冷热 tier up / tier down"的完整形态,KVCR 目前实现到哪一步(2026-09-04 快照):**
+
+- **冷热判定**:已有,即 `eviction_score` 钩子;
+- **tier down(降层)**:已有。驱逐时经 `decide_eviction → MOVE_TO G3` 把块从 DRAM 移到 SSD 而不是丢弃,内建 G3 策略就是这个行为;
+- **tier up(从下往上提升/预取)**:只有被动路径——引擎 `fetch` 读 miss 时,KVCR 把块从 SSD 或远端拉进 DRAM(读 miss 回填)。**主动预取(按热度或 hint 提前把块从下层/远端搬到上层)尚未实现**,证据有三:ingest 时的 COPY_TO/MOVE_TO 放置还没接线(`policy_runtime.py` 中 `TODO(kvcr-g3): Wire ingest-time COPY_TO and MOVE_TO placement`);`submit_hint` 只建立 peer 连接、不启动数据搬运,设计文档注明"proactive fetching, staging, or pinning may be added later";router hint 的主动 copy/move(用于缓存再平衡)也标注为后续扩展。
+
 ## 时间线
 
 | 时间 | 事件 |
@@ -263,6 +283,7 @@ KVCR 为本节点的所有 block 维护一张索引表(`block_index`,`src/kvcr/c
 - **GPU 所有权方向相反**:KVCR 是引擎拥有一切(含 HBM)、KVCR 服务引擎;lake 是池拥有一切(HBM 为 L0)、引擎无状态可随时销毁。KVCR-Guard 是在"引擎长期存活"假设上的容错补丁;lake 的假设本身是引擎随时销毁。两者服务的前提不同:KVCR 面向"引擎自有缓存"的部署形态,lake 面向存算分离。
 - **hint(拉模式,决策在 worker)与位置视图推送(放置归池、调度读视图)**:KVCR 的 `submit_hint` + `query` + worker 侧成本决策,对应 lake「池放置·调度读视图」的单向耦合;差别在于 lake 的放置主动权在池(按热度预放置),KVCR 的搬运主动权在目的地 worker(router 只发 hint)。
 - **分层**:KVCR 的 `CacheTier`(framework mem / KVCR DRAM / SSD / object / peer)同为介质分层,与 lake L0–L3 同构;但 KVCR 按所有权再细分(framework-owned / KVCR-owned),lake 不区分所有权(全归池)。
+- **层间迁移的主动性**:lake 设计是主动为主(按热度 promotion/demotion + L0 预放置)加被动兜底(读 miss 回填);KVCR 目前只有被动回填(`fetch` 读 miss)和驱逐降层(`MOVE_TO G3`),主动提升/预取是设计意图但尚未实现(见「可插拔 policy」节)。lake 的"池主动预放置"在 KVCR 体系里没有对应物——它的"主动"最多到 router hint 驱动的目的地拉取。
 - **可借鉴的机制**:pin/claim(传输中防驱逐与共享获取的取消安全)、操作 deadline(安全释放可超 deadline、调度不可)、policy 接口形态(`decide_ingest` / `eviction_score` / COPY_TO / MOVE_TO)、`no_retain` 建议性 hint、Guard 的 fenced handoff 与共享内存直访(对应 lake F4 恢复与 L2 恢复点)。
 
 ## 代码索引
@@ -279,6 +300,6 @@ KVCR 为本节点的所有 block 维护一张索引表(`block_index`,`src/kvcr/c
 | NIXL progress 线程 | `src/kvcr/progress.py`::`_KVCRProgress` / `_Op` |
 | peer 控制通道(ZMQ) | `src/kvcr/control_channels.py` |
 | router hint 协议解析 | `src/kvcr/hint_parser.py`::`ROUTER_HINT_KEY` / `_parse_kv_hint` |
-| 策略接口与运行时 | `src/kvcr/policy.py`::`KVCachePolicy`;`src/kvcr/policy_runtime.py` |
+| 策略接口与运行时 | `src/kvcr/policy.py`::`KVCachePolicy`(内建 `FIFOPolicy`/`LRUPolicy`/`G3FIFOPolicy`/`G3LRUPolicy`);`src/kvcr/policy_runtime.py`::`_PolicyInvoker`(决策校验与白名单) |
 | Guard(sidecar/接管/热恢复) | `src/kvcr/guard.py` / `guard_protocol.py` / `recovery_journal.py` / `memory.py`(共享内存池)/ `kvcr_service.py`(独立 daemon) |
 | 设计文档 | `docs/design_overview.md`(Goals/Architecture/四个 API 面) |
