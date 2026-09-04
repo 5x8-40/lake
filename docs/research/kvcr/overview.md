@@ -25,9 +25,9 @@ KVCR 是一个运行在推理引擎进程里的库,职责有两块:一是把 KV 
 ## 在推理栈中的位置
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="figures/kv-architecture-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="figures/kv-architecture-light.svg">
-  <img src="figures/kv-architecture-light.svg" alt="KVCR 架构">
+  <source media="(prefers-color-scheme: dark)" srcset="figures/kv-architecture-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="figures/kv-architecture-light.png">
+  <img src="figures/kv-architecture-light.png" alt="KVCR 架构">
 </picture>
 
 (图源:[`3rdparty/kvcr/docs/figures/kv-architecture-light.svg`](https://github.com/ai-dynamo/kvcr/blob/main/docs/figures/kv-architecture-light.svg),深色模式自动切换 dark 版)
@@ -102,9 +102,9 @@ DEP #11673 指出现有方案(含 KVBM)的两种失败模式:一是 GPU 紧耦�
 ## 架构
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="figures/kv-architecture-detailed-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="figures/kv-architecture-detailed-light.svg">
-  <img src="figures/kv-architecture-detailed-light.svg" alt="KVCR 组件边界">
+  <source media="(prefers-color-scheme: dark)" srcset="figures/kv-architecture-detailed-dark.png">
+  <source media="(prefers-color-scheme: light)" srcset="figures/kv-architecture-detailed-light.png">
+  <img src="figures/kv-architecture-detailed-light.png" alt="KVCR 组件边界">
 </picture>
 
 (图源:[`3rdparty/kvcr/docs/figures/kv-architecture-detailed-light.svg`](https://github.com/ai-dynamo/kvcr/blob/main/docs/figures/kv-architecture-detailed-light.svg),深色模式自动切换 dark 版)
