@@ -162,6 +162,16 @@ Router 侧的缓存视图是 `KvIndexer` 前缀树(节点带 worker id,`find_mat
 
 前提是 `--router-mode kv` + KV 事件 + 分离部署 + decode worker 发布 KV 事件(`--router-conditional-disagg` 开启)。**与 lake 对照**:这正是 lake 的 D-direct(本地命中零传输直跳)——Dynamo 把它做成实验性的阈值绕过开关,lake 把它作为一等执行模式。
 
+**offload 层的命中:D 侧 KV 落到 DRAM/NVMe 后,谁能读?**(源自 `router/offloading-support-matrix.md`)
+
+router 能看见分层命中:KV 事件带介质标注,router 按层给命中计价——**device 1.0 / host(DRAM)0.75 / disk(NVMe)0.25 / 共享池 0.5**(均可配,0 = 忽略该层命中)。但"router 看见"和"别的 worker 能读"是两回事,分三种情况:
+
+1. **本机命中(生产可用)**:D 把 KV offload 到**自己的** DRAM/SSD,新请求被路由到**同一个 worker**,由它本机 onboard 读回 HBM。三后端都支持(vLLM `OffloadingConnector`、SGLang HiCache、TRT-LLM 原生 host cache)。注意这要求请求恰好路由回本 worker——router 的分层计价正是在提高这个概率。
+2. **跨 worker 读本机的 DRAM/NVMe(不可用)**:D 的 DRAM 在另一个 worker 上,P 想拉——vLLM 路径里带 `REMOTE` locality 的事件**直接被 router 丢弃**,共享池索引标注"仍在规划"(still planned);KVBM v1 生产匹配仅本机。即:**worker 私有的 DRAM/NVMe 只服务本 worker**。
+3. **经共享池(SGLang + Mooncake,生产可用)**:D 写入 Mooncake 共享池(DRAM/NVMe 是**池的**介质,不属任何 worker),P 从池里读;router 用 `--shared-cache-type hicache` + `shared_cache_multiplier` 计价。这是目前唯一打通的跨 worker offload 复用路径。vLLM 侧对应能力(共享池索引)尚未做。
+
+KVCR 的 P2P(router hint 指明位置 + NIXL 直拉,见 [KVCR 分析](../kvcr/overview.md))正是为情况 2 做的继任方案:不经过共享池,目的地 worker 直接从源 worker 的 DRAM 拉。
+
 **其余专题页**(未逐一深读,留作指针):worker 过滤(`worker-filtering.md`)、按优先级类别做差额轮询调度(`deficit-round-robin.md`)、PD 分离路由、多数据中心 KV 路由(`multi-dc-kv-routing.md`)、拓扑感知 KV 传输(`topology-aware-kv-transfer.md`)、router 三件套独立部署(standalone indexer/selection/slot tracker)、offload 后端支持矩阵(`offloading-support-matrix.md`)。
 
 ### Planner
