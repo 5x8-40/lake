@@ -166,7 +166,9 @@ Router 侧的缓存视图是 `KvIndexer` 前缀树(节点带 worker id,`find_mat
 
 router 能看见分层命中:KV 事件带介质标注,router 按层给命中计价——**device 1.0 / host(DRAM)0.75 / disk(NVMe)0.25 / 共享池 0.5**(均可配,0 = 忽略该层命中)。但"router 看见"和"别的 worker 能读"是两回事,分三种情况:
 
-1. **本机命中(生产可用)**:D 把 KV offload 到**自己的** DRAM/SSD,新请求被路由到**同一个 worker**,由它本机 onboard 读回 HBM。三后端都支持(vLLM `OffloadingConnector`、SGLang HiCache、TRT-LLM 原生 host cache)。注意这要求请求恰好路由回本 worker——router 的分层计价正是在提高这个概率。
+1. **本机命中(生产可用)**:worker 把 KV offload 到**自己的** DRAM/SSD,之后由**它自己** onboard 读回 HBM。三后端都支持(vLLM `OffloadingConnector`、SGLang HiCache、TRT-LLM 原生 host cache)。注意"本机"在两种部署下含义不同:
+   - **聚合部署**:一个 worker 实例既做 P 又做 D,本机 DRAM/SSD 里的 KV(含 decode 阶段生成的)对后续请求直接可用,无歧义;
+   - **PD 分离部署**:P 和 D 是不同实例(通常不同机器)。**P 侧**本机命中是常规路径——P worker offload 自己算过的 prefill KV,新请求路由回它时本机读回、省重算;**D 侧**生成的 KV 留在 D 实例手里,新请求若正常走 P 则读不到 D 的本机 DRAM,要利用它只能让请求**直落同一个 D**(即上面的 conditional disagg)。router 的分层计价(host 0.75 / disk 0.25)正是在提高"请求路由回持有数据的那个实例"的概率。
 2. **跨 worker 读本机的 DRAM/NVMe(不可用)**:D 的 DRAM 在另一个 worker 上,P 想拉——vLLM 路径里带 `REMOTE` locality 的事件**直接被 router 丢弃**,共享池索引标注"仍在规划"(still planned);KVBM v1 生产匹配仅本机。即:**worker 私有的 DRAM/NVMe 只服务本 worker**。
 3. **经共享池(SGLang + Mooncake,生产可用)**:D 写入 Mooncake 共享池(DRAM/NVMe 是**池的**介质,不属任何 worker),P 从池里读;router 用 `--shared-cache-type hicache` + `shared_cache_multiplier` 计价。这是目前唯一打通的跨 worker offload 复用路径。vLLM 侧对应能力(共享池索引)尚未做。
 
