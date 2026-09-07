@@ -182,6 +182,8 @@ KVCR 的 P2P(router hint 指明位置 + NIXL 直拉,见 [KVCR 分析](../kvcr/ov
 
 **其余专题页**(未逐一深读,留作指针):worker 过滤(`worker-filtering.md`)、按优先级类别做差额轮询调度(`deficit-round-robin.md`)、PD 分离路由、多数据中心 KV 路由(`multi-dc-kv-routing.md`)、拓扑感知 KV 传输(`topology-aware-kv-transfer.md`)、router 三件套独立部署(standalone indexer/selection/slot tracker)、offload 后端支持矩阵(`offloading-support-matrix.md`)。
 
+**模型级路由**(选哪个模型/哪家 API,与本节的实例级选 worker 是两个层次)的厂商与学术调研、以及对本 Router 的借鉴方向见 [`../model-routing.md`](../model-routing.md)。
+
 ### Planner
 
 自动扩缩容控制器,`planner-design.md` 描述的内部结构:
