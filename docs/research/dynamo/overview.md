@@ -190,8 +190,27 @@ KVCR 的 P2P(router hint 指明位置 + NIXL 直拉,见 [KVCR 分析](../kvcr/ov
 
 (图源:`3rdparty/dynamo/docs/fern/assets/img/planner-architecture.svg`)
 
-- **双环控制**:慢环(throughput-based)用流量预测 + 性能模型算容量下限;快环(load-based)用引擎实时指标做 ±1 步进的 SLA 纠偏,只能在下限之上调。慢环防短噪声误扩缩,快环补预测误差。
-- **插件流水线**:OBSERVE(采指标)→ PREDICT(预测下一时段请求数/ISL/OSL)→ PROPOSE(各插件提扩缩建议)→ RECONCILE/CONSTRAIN(合并、卡 GPU 预算)→ EXECUTE(经 connector 下发)。内置算法就是走这条流水线的插件,外部可用 gRPC 插件扩展。
+- **双环控制**:Planner 里有两个扩缩容回路,各管一种时间尺度——
+
+  | | 慢环(throughput-based) | 快环(load-based) |
+  |---|---|---|
+  | **解决什么** | 未来一段时间的容量需求(看趋势) | 当下的 SLA 偏差(救突发) |
+  | **输入** | Prometheus 流量指标(请求数/ISL/OSL),经预测器外推下一时段 | 引擎每次前向的实时指标(FPM:本迭代 prefill/decode token 数、队列深度) |
+  | **怎么算** | 预测负载 ÷ 单副本容量(来自 profiling/性能模型)= 需要多少副本 | 在线回归估出当前 TTFT/ITL,所有引擎都超 SLA 就 +1,都低于 SLA×系数就 -1 |
+  | **节奏** | 长间隔(可配) | 短间隔(可配,比慢环频繁) |
+  | **产出** | 副本数**下限** | 在下限**之上**微调 |
+
+  为什么要两个:只有慢环,预测错了或突发流量会顶破 SLA;只有快环,短时噪声会引发频繁扩缩,而扩缩本身很慢(起 pod、加载模型、注册),抖动期间决策互相踩踏。所以慢环定下限——"预测到的需求不因短期空闲被误删";快环在下限之上快速纠偏。
+
+- **插件流水线**:Planner 每个 tick(决策周期)跑一条六阶段流水线,上面两个环就是挂在流水线上的内置插件——
+
+  1. **OBSERVE**:采集(worker 数、流量指标、前向指标);
+  2. **PREDICT**:慢环的预测器外推下一时段流量;
+  3. **PROPOSE**:慢环插件按预测提"副本数下限",快环插件按实时指标提"±1"建议;
+  4. **RECONCILE / CONSTRAIN**:合并各插件建议,卡 GPU 预算与各组件最小副本数;
+  5. **EXECUTE**:经 connector 下发(K8s PATCH DGD / VirtualConnector)。
+
+  外部可以写 gRPC 插件挂进同一条流水线,与内置插件并列提建议。
 
 ![Planner 插件流水线](figures/planner-plugin-pipeline.png)
 
