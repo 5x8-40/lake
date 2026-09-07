@@ -92,14 +92,14 @@ graph TD
 |------|------|----------|
 | **Frontend** | OpenAI 兼容 HTTP 入口;预处理/后处理 | Gateway |
 | **Router**(KV-aware,含 PrefillRouter) | 按 worker 负载 + KV cache overlap 选 worker,省重算 prefill;编排 PD 分离的 prefill→decode 交接 | Router |
-| **KVBM**(KV Block Manager) | GPU→CPU→SSD→远端 多层 KV offload(**已 sunset**,继任者 [KVCR](../kvcr/overview.md)) | Tiered Store(L0-L3) |
+| **KVBM**(KV Block Manager) | GPU→CPU→SSD→远端 多层 KV offload(**已 sunset**,继任者 [KVCR](../kvcr/overview.md),**独立成仓** ai-dynamo/kvcr) | Tiered Store(L0-L3) |
 | **Planner** | SLA 驱动 autoscaler,持续读 GPU 容量指标,决定 PD 分离还是聚合、各相加减 GPU | (弹性,远期) |
 | **DistributedRuntime**(`lib/runtime`) | 所有组件的地基:服务发现、端点注册、请求传输、生命周期;Rust 实现,Python 经绑定复用 | (lake 三语言各自的运行时) |
-| **NIXL** | 独立传输库:同一套 API 搬 HBM/DRAM/SSD/对象存储("memory sections"),屏蔽 NVLink/InfiniBand/RoCE/以太网差异 | 传输引擎(规划 RDMA 旁路) |
-| **ModelExpress** | NIXL/NVLink GPU 间流式传权重,7x 冷启动(已独立成仓 ai-dynamo/modelexpress) | 权重加载(远期) |
-| **Grove** | K8s operator,拓扑感知 gang 调度(机架/主机/NUMA,NVL72)(独立仓 ai-dynamo/grove) | (部署,远期) |
+| **NIXL** | 传输库(**独立成仓** ai-dynamo/nixl):同一套 API 搬 HBM/DRAM/SSD/对象存储("memory sections"),屏蔽 NVLink/InfiniBand/RoCE/以太网差异 | 传输引擎(规划 RDMA 旁路) |
+| **ModelExpress** | NIXL/NVLink GPU 间流式传权重,7x 冷启动(**已独立成仓** ai-dynamo/modelexpress) | 权重加载(远期) |
+| **Grove** | K8s operator,拓扑感知 gang 调度(机架/主机/NUMA,NVL72)(**独立成仓** ai-dynamo/grove) | (部署,远期) |
 | **Dynamo Operator** | K8s 部署调和:按 Planner 给的期望 worker 数 reconcile | (部署,远期) |
-| **AISimulate** | 离线仿真:不起 GPU 集群就预测服务行为、搜索部署配置 | (无) |
+| **AISimulate** | 离线仿真:不起 GPU 集群就预测服务行为、搜索部署配置(**独立分发**:wheel + crate 发布,源码树不入 dynamo 仓) | (无) |
 | **Fault Tolerance** | canary 健康检查 + 在途请求迁移;路由失败临时拉黑 worker | F4(部分对应) |
 | **mocker** | 模拟引擎,压测/验证路由与 KVBM 行为用 | (无) |
 
@@ -115,7 +115,7 @@ API 网关,OpenAI 兼容 HTTP + KServe gRPC 双入口(Anthropic Messages API 为
 
 ### Router(KV-aware)
 
-文档量最大的模块(20 页),核心内容:
+文档量最大的模块(20 页)。先回答一个常见疑问:**`--router-mode kv` 是感知负载的**——KV 模式不是纯缓存亲和,而是"缓存命中 + 负载"的联合成本函数(下面的公式里 decode 占用、在途请求数都是负载项);纯负载选路是另外两种模式(`least-loaded` / `power-of-two`)。KV 事件不可用时(`--no-router-kv-events`),缓存项改为按路由决策预测,负载项不受影响。
 
 **成本模型**(`router-design.md`):对每个候选 worker 算代价,取最低者:
 
@@ -136,13 +136,31 @@ cost = prefill_load_scale * adjusted_prefill
 
 (图源:`3rdparty/dynamo/docs/fern/assets/img/router-kv-routing-overview.jpg`;三个 worker 的 Cached/Prefill/Decode 块数与代价计算,选代价最低的 Worker 2)
 
-**状态来源**:两条互补链路——
-- **缓存块**:worker 上的 `KVPublisher` 在块创建/删除时发事件,Router 的 `KvIndexer` 用前缀树(节点上带 worker id)维护全局视图,`find_matches_for_request` 返回每个 worker 命中多少块。两种实现:单线程 RadixTree 或默认的 ConcurrentRadixTree(N 线程池 + sticky 分区,读写并发)。
-- **在途块**:Router 本地"slot manager"即时预测(路由时 +、首 token 时改、结束时 -),不等事件。
+**状态来源:两类状态,权威各在一处**
 
-**可靠性设计**(对 lake 位置视图很有对照价值):
-- **gap 检测与恢复**:每个 worker 给自己的事件编单调递增序号,Router 发现序号跳变就向该 worker 的**本地索引**要全量快照重建;worker 新加入时全量灌入,移除时整棵子树删掉。事件面是 fire-and-forget,权威在 worker 本地索引。
-- **多 Router 副本同步**(`--router-replica-sync`):副本间经事件面互发三类生命周期事件(`AddRequest` / `MarkPrefillCompleted` / `Free`),只为让各副本的**在途负载估计**更全;明确"不同步前缀缓存状态、不保证选路一致",队列满了丢最新消息,CLOCK 回收器清闲置租约(默认 300 秒)。
+| 状态 | 谁产生 | 权威在哪 | Router 怎么拿到 |
+|------|--------|----------|----------------|
+| **缓存块**(哪些 worker 存了哪些前缀) | worker 的 `KVPublisher`,块创建/删除时发事件 | **worker 本地索引**(每个 worker 默认带 LocalKvIndexer) | 订阅事件面做增量更新;发现落后就向 worker 拉全量快照 |
+| **在途负载**(各 worker 正在跑多少请求/块) | Router 自己记账 | **无权威**,各 Router 副本各自预测 | 本地 slot manager 即时记账:路由时 +、首 token 时改、请求结束时 - |
+
+Router 侧的缓存视图是 `KvIndexer` 前缀树(节点带 worker id,`find_matches_for_request` 返回每个 worker 命中多少块),两种实现:单线程 RadixTree,或默认的 ConcurrentRadixTree(N 线程池 + sticky 分区,读写并发)。
+
+**可靠性:按故障场景看**
+
+1. **事件丢失**:worker 给自己的事件编单调递增序号;Router 发现序号跳变(gap),就重置该 worker 的分区、向其本地索引拉全量快照重建。事件面本身是 fire-and-forget(发了不等确认),丢事件是预期内行为。
+2. **worker 上线/下线**:上线时全量灌入它的本地索引;下线时从全局前缀树里整棵删掉它的块。
+3. **Router 重启**:索引全丢,经发现面找到所有 worker 后逐个拉快照重建。
+4. **多 Router 副本**(`--router-replica-sync`):副本间互发三类生命周期事件(`AddRequest` / `MarkPrefillCompleted` / `Free`),**只同步在途负载估计,不同步缓存状态**——缓存状态以 worker 本地索引为权威,各副本自行订阅维护;负载同步是 best-effort(队列满丢最新事件,闲置租约默认 300 秒由 CLOCK 回收器清理),不保证各副本选路一致。
+
+**D 侧 KV 的复用:conditional disagg(实验性)**
+
+多轮对话场景:上一轮的完整 KV(prompt + 已生成 token)留在 decode worker 上,新请求前缀与它高度重叠。Dynamo 的复用方式**不是把 D 的 KV 搬回 P**(跨实例拉取没有生产路径),而是让这个请求**跳过远端 prefill,直接在该 decode worker 上本地补算差额前缀、继续 decode**——即这一请求退化成聚合执行。源码 `lib/kv-router/src/conditional_disagg.rs`,三种触发策略:
+
+- `IslBounding`(默认):净新增 prefill(prompt 减去 D 侧命中)< 2048 token **且**占 prompt 比例 < 70% 才绕过——两个条件防"大请求挤占 decode 池";
+- `PrefillLoad`:router 选中的 prefill worker 已忙就绕过;
+- `IslOrLoad`:以上任一满足即绕过。
+
+前提是 `--router-mode kv` + KV 事件 + 分离部署 + decode worker 发布 KV 事件(`--router-conditional-disagg` 开启)。**与 lake 对照**:这正是 lake 的 D-direct(本地命中零传输直跳)——Dynamo 把它做成实验性的阈值绕过开关,lake 把它作为一等执行模式。
 
 **其余专题页**(未逐一深读,留作指针):worker 过滤(`worker-filtering.md`)、按优先级类别做差额轮询调度(`deficit-round-robin.md`)、PD 分离路由、多数据中心 KV 路由(`multi-dc-kv-routing.md`)、拓扑感知 KV 传输(`topology-aware-kv-transfer.md`)、router 三件套独立部署(standalone indexer/selection/slot tracker)、offload 后端支持矩阵(`offloading-support-matrix.md`)。
 
@@ -297,7 +315,7 @@ KVBM offload 路径:`GPU → CPU → SSD → 远端存储(S3/Azure blob)`,1.0 �
 
 ## PD 分离 / E/P/D
 
-PD 分离为"独立可伸缩的 GPU 池",三后端(vLLM/SGLang/TRT-LLM)都支持。多模态扩展为 **E/P/D**(encode/prefill/decode)三路 + embedding cache。对应 lake PD 分离 + 混部 + D-direct 三模式(但 lake 多一档 D-direct 本地命中,Dynamo 侧重 PD 物理隔离)。
+PD 分离为"独立可伸缩的 GPU 池",三后端(vLLM/SGLang/TRT-LLM)都支持。多模态扩展为 **E/P/D**(encode/prefill/decode)三路 + embedding cache。对应 lake PD 分离 + 混部 + D-direct 三模式;D 侧 KV 复用在 Dynamo 里是实验性 conditional disagg(见「模块详解 → Router」),lake 的 D-direct 是一等模式。
 
 ## 借鉴点(对应 lake 设计)
 
@@ -328,7 +346,7 @@ G1 是传输句柄（无 `BlockManager<G1>`）、与 KV event / 本机 G2/G3 的
 - **存算分离彻底度**:Dynamo 的 KV 仍由 engine(vLLM/SGLang)持有,KVBM 是"offload 层"(把 engine 的 KV 卸到 CPU/SSD/远端);G1 无 `BlockManager`。lake **HBM 归池、worker 不拥有任何内存**,KVBM 式 offload 在 lake 是池的统一放置,非引擎私有缓存的延伸。
 - **控制面一致性**:Dynamo KV 事件走 NATS(best-effort 事件流)、discovery 多后端,无全局强一致位置视图;lake 位置视图权威在存储控制面进程内存(单写者线性一致)、etcd 降频 checkpoint,Router 本地镜像一跳命中(见 [`../architecture/consistency.md`](../../architecture/consistency.md) §1)。Dynamo 更偏"事件流编排",lake 更偏"强一致权威 + 镜像"。
 - **radix 前缀复用**:Dynamo KV-aware router 用 block 哈希 overlap,但 radix 前缀树/内容寻址复用仍依赖底层 engine(SGLang RadixAttention);lake 把 radix 归存储池统一管。
-- **执行模式**:Dynamo 侧重 PD/E-P-D 物理隔离 + KV-aware 路由;lake 多 D-direct(本地命中零传输直跳)与混部,Dynamo 无明确对应。
+- **执行模式**:Dynamo 侧重 PD/E-P-D 物理隔离 + KV-aware 路由;D 侧 KV 复用靠实验性的 conditional disagg(阈值绕过 prefill 直落 D,见「模块详解 → Router」),近似 lake 的 D-direct 但非一等模式;lake 另有混部,Dynamo 的聚合部署相当于固定混部、无逐请求选模。
 - **多模型/池生命周期**:Dynamo 以单集群服务为主;lake 存储池是长期存续、模型无关的独立基础设施(F11),配额/GC/碎片整理/多模型命名空间。
 
 ## 代码索引
@@ -352,6 +370,7 @@ G1 是传输句柄（无 `BlockManager<G1>`）、与 KV event / 本机 G2/G3 的
 | KVBM 引擎层(运行时/offload/leader/object) | `lib/kvbm-engine/src/`(`runtime`/`offload`/`leader`/`collectives`/`object`) |
 | Router 索引器(前缀树 + gap 恢复) | `lib/kv-router/src/indexer/`;副本同步与租约见 `lib/kv-router/src/{active_set,recovery}/` |
 | Router 成本模型 | `lib/kv-router/src/protocols.rs` + `scheduling/`;文档 `modular-components/router/router-design.md` |
+| conditional disagg(D 侧 KV 复用) | `lib/kv-router/src/conditional_disagg.rs`::`IslBoundingPolicy` / `PrefillLoadPolicy` / `IslOrLoadPolicy` |
 | Planner 双环与插件流水线 | `components/src/dynamo/planner/core/{load_scaling,throughput_scaling,state_machine}.py` + `plugins/`;文档 `modular-components/planner/planner-design.md` |
 | Profiler / DGDR | `components/src/dynamo/profiler/`;文档 `modular-components/profiler/` |
 | 仿真(mocker / replay) | `components/src/dynamo/{mocker,replay}/`;文档 `concepts/simulation/dynosim-architecture.md` |
