@@ -242,9 +242,31 @@ KVCR 的 P2P(router hint 指明位置 + NIXL 直拉,见 [KVCR 分析](../kvcr/ov
 
 ### Backends(引擎接入)
 
-两种接入方式:
-- **集成式(integrated)**:Dynamo worker 与引擎同进程,功能最全,生产路径。
-- **Sidecar(实验性)**:引擎不动,旁边跑一个纯 CPU 的 Dynamo sidecar 进程——目标设计是**请求面由 Frontend 直连引擎原生 gRPC,sidecar 只管服务发现与事件转发**(当前版本请求仍过 sidecar)。意义:不 import 引擎私有 API、依赖隔离、故障可归因。vLLM/SGLang 支持聚合与分离两种拓扑,TRT-LLM 仅聚合。
+Dynamo 不自己实现推理引擎,而是把现成引擎(vLLM/SGLang/TRT-LLM)接进来当 worker——这里说的 **worker 就是前面请求流里的 prefill/decode worker**,即集群里一个干推理活的进程。引擎不会天生就是 Dynamo worker:它不会向发现面注册自己、不会发 KV 事件、也不暴露 Dynamo 的 RPC 端点,这些"Dynamo 侧的事"得有人替它做。按"谁来做",有两种接入方式:
+
+```mermaid
+flowchart LR
+    F[Frontend / Router]
+    subgraph INT["集成式:一个进程"]
+        direction TB
+        G1["Dynamo 胶水层<br/>注册 / KV 事件 / generate 端点"]
+        E1["引擎本体<br/>(vLLM/SGLang/TRT-LLM)"]
+        G1 ---|同进程函数调用| E1
+    end
+    subgraph SC["Sidecar:同机两个进程"]
+        direction TB
+        S["Dynamo sidecar<br/>纯 CPU,只做注册 + 事件转发"]
+        E2["原版引擎进程<br/>(未修改, 如 vllm serve)"]
+        S <-->|本机 gRPC| E2
+    end
+    F -->|请求| INT
+    F -->|请求| SC
+```
+
+- **集成式(integrated,生产路径)**:用 Dynamo 提供的启动器起引擎(如 `python3 -m dynamo.vllm`)。**一个进程里同时装着两部分**:引擎本体(算 KV、生成 token)+ Dynamo 胶水层(注册、发事件、暴露端点),两者函数调用直连。功能最全;代价是 Dynamo 要 import 引擎的私有 API,两边依赖版本绑死。
+- **Sidecar(实验性)**:引擎用官方原版方式自己起(如 `vllm serve`),完全不知道 Dynamo 的存在;同一台机器(同一个 pod)里再跑一个**纯 CPU 的 sidecar 进程**,替引擎做 Dynamo 侧的事:把它注册进发现面、把它的 KV 事件转发到事件面。目标形态是 Frontend 的请求**直接发给引擎的原生 gRPC 接口**,sidecar 完全退出请求路径;当前版本请求还要经过 sidecar 中转。
+
+Sidecar 的意义:不改引擎代码、不绑依赖版本、引擎和 Dynamo 的故障能分开定位;代价是功能覆盖还不如集成式。三个引擎的 sidecar 现状:vLLM/SGLang 支持聚合与分离两种拓扑,TRT-LLM 仅聚合。
 
 KV offload 走后端各自的 connector(vLLM 的 `kv-cache-offloading.md` 推 LMCache/FlexKV/HiCache;SGLang 有 HiCache 页)——KVBM 撤下后的官方推荐路径。
 
