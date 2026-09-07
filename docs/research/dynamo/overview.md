@@ -169,10 +169,16 @@ router 能看见分层命中:KV 事件带介质标注,router 按层给命中计�
 1. **本机命中(生产可用)**:worker 把 KV offload 到**自己的** DRAM/SSD,之后由**它自己** onboard 读回 HBM。三后端都支持(vLLM `OffloadingConnector`、SGLang HiCache、TRT-LLM 原生 host cache)。注意"本机"在两种部署下含义不同:
    - **聚合部署**:一个 worker 实例既做 P 又做 D,本机 DRAM/SSD 里的 KV(含 decode 阶段生成的)对后续请求直接可用,无歧义;
    - **PD 分离部署**:P 和 D 是不同实例(通常不同机器)。**P 侧**本机命中是常规路径——P worker offload 自己算过的 prefill KV,新请求路由回它时本机读回、省重算;**D 侧**生成的 KV 留在 D 实例手里,新请求若正常走 P 则读不到 D 的本机 DRAM,要利用它只能让请求**直落同一个 D**(即上面的 conditional disagg)。router 的分层计价(host 0.75 / disk 0.25)正是在提高"请求路由回持有数据的那个实例"的概率。
-2. **跨 worker 读本机的 DRAM/NVMe(不可用)**:D 的 DRAM 在另一个 worker 上,P 想拉——vLLM 路径里带 `REMOTE` locality 的事件**直接被 router 丢弃**,共享池索引标注"仍在规划"(still planned);KVBM v1 生产匹配仅本机。即:**worker 私有的 DRAM/NVMe 只服务本 worker**。
-3. **经共享池(SGLang + Mooncake,生产可用)**:D 写入 Mooncake 共享池(DRAM/NVMe 是**池的**介质,不属任何 worker),P 从池里读;router 用 `--shared-cache-type hicache` + `shared_cache_multiplier` 计价。这是目前唯一打通的跨 worker offload 复用路径。vLLM 侧对应能力(共享池索引)尚未做。
+2. **跨 worker 读另一台机器的 DRAM/NVMe(不可用)**:D 进程跑在机器 A 上,KV offload 在机器 A 的 DRAM 里;P 进程在机器 B 上。机器 B 的进程要读机器 A 的 DRAM,必须有跨机传输机制(RDMA 之类)加上"谁知道数据在哪"的全局索引——Dynamo 生产路径两者都没有:vLLM 路径里带 `REMOTE` locality 的事件**直接被 router 丢弃**(共享池索引标注"仍在规划"),KVBM v1 生产匹配仅本机。即:**worker 私有的 DRAM/NVMe 只服务本 worker**。
+3. **经共享池(SGLang HiCache + Mooncake,生产可用)**:注意这条路径里的两个组件都来自引擎生态,**KVBM 不在其中**——
+   - **HiCache** 是 SGLang 自己的分层缓存:L1 = GPU HBM,L2 = 本机 DRAM,L3 = 可插拔存储后端(见 [`../sglang/hicache.md`](../sglang/hicache.md));
+   - **Mooncake**([kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake),分析见 [`../mooncake/overview.md`](../mooncake/overview.md))是独立的分布式 KV 存储服务:把多台机器的 DRAM/NVMe 汇成一个**池**,由 Mooncake 的 store 管理,不属任何 worker。
 
-KVCR 的 P2P(router hint 指明位置 + NIXL 直拉,见 [KVCR 分析](../kvcr/overview.md))正是为情况 2 做的继任方案:不经过共享池,目的地 worker 直接从源 worker 的 DRAM 拉。
+   链路:D 所在 worker 把 HiCache 的 L3 后端配成 Mooncake(`--hicache-storage-backend mooncake`),KV 写进池;P 所在 worker 的 HiCache 查 L3、命中同一个池、从池里读。router 用 `--shared-cache-type hicache` + `shared_cache_multiplier`(默认 0.5)给这种命中计价。这是目前唯一打通的跨 worker offload 复用路径;vLLM 侧对应能力(共享池索引)尚未做。
+
+**KVBM 在这张图里的位置:不在图里。** KVBM 是 Dynamo 自建的 offload 层(G1-G4,已 sunset);上面三条路径里,offload 由**引擎自己的缓存系统**做(vLLM OffloadingConnector / SGLang HiCache),共享层由**外部存储服务**做(Mooncake)。KVBM 撤下后,Dynamo 官方对"KV 落 DRAM/NVMe"的答案就是:引擎原生分层 + 外部共享后端;跨机直拉等 KVCR。
+
+KVCR 的 P2P(router hint 指明位置 + NIXL 直拉,见 [KVCR 分析](../kvcr/overview.md))正是为情况 2 做的继任方案:不经过共享池,目的地 worker 直接从源 worker 所在机器的 DRAM 拉。
 
 **其余专题页**(未逐一深读,留作指针):worker 过滤(`worker-filtering.md`)、按优先级类别做差额轮询调度(`deficit-round-robin.md`)、PD 分离路由、多数据中心 KV 路由(`multi-dc-kv-routing.md`)、拓扑感知 KV 传输(`topology-aware-kv-transfer.md`)、router 三件套独立部署(standalone indexer/selection/slot tracker)、offload 后端支持矩阵(`offloading-support-matrix.md`)。
 
