@@ -202,7 +202,15 @@ KVCR 的 P2P(router hint 指明位置 + NIXL 直拉,见 [KVCR 分析](../kvcr/ov
 
   为什么要两个:只有慢环,预测错了或突发流量会顶破 SLA;只有快环,短时噪声会引发频繁扩缩,而扩缩本身很慢(起 pod、加载模型、注册),抖动期间决策互相踩踏。所以慢环定下限——"预测到的需求不因短期空闲被误删";快环在下限之上快速纠偏。
 
-  **上限谁来给**:副本数上限不是算出来的,是预算配置卡住的,分三层——① 本地 Planner 的 `max_gpu_budget`(单个 DGD 的 GPU 总数上限,默认 8),CONSTRAIN 阶段把快慢环的所有建议都卡进预算;配套的 `min_gpu_budget`(默认 -1 = 关闭)是 GPU 下限,`min == max` 时总量钉死,Planner 只在 prefill/decode 之间重新分配;② 跨多个 DGD 共享 GPU 时,由 GlobalPlanner 的 `--max-total-gpus` 把守总盘(默认不设),超预算的扩缩请求被拒绝;③ 最外层是物理约束——K8s 集群实际可用的 GPU,预算只是 Planner 的自约束,超出物理资源的决策会以 pod pending 的形式暴露。
+  **上限谁来给**:上限不是算出来的,是三层预算由近及远卡住的(DGD = DynamoGraphDeployment,Dynamo 的 K8s CRD;一份 CR 描述一次完整部署:哪些组件、各几个副本):
+
+  | 层 | 配置 | 默认 | 作用 |
+  |---|---|---|---|
+  | 单部署 | 本地 Planner 的 `max_gpu_budget` | 8 块 GPU | 一个 DGD 的 GPU 总量上限;CONSTRAIN 阶段把快慢环的建议都卡进预算 |
+  | 多部署 | GlobalPlanner 的 `--max-total-gpus` | 不设 | 多个 DGD 共享 GPU 池时的总盘;超预算的扩缩请求被拒绝 |
+  | 物理层 | K8s 集群实际可用 GPU | — | 预算只是 Planner 的自约束;超出物理资源的决策以 pod pending(调度不出来)暴露 |
+
+  配套还有 `min_gpu_budget`(GPU 下限,默认 -1 = 关闭);`min == max` 时总量钉死,Planner 只在 prefill/decode 之间重新分配。
 
 - **插件流水线**:Planner 每个 tick(决策周期)跑一条六阶段流水线,上面两个环就是挂在流水线上的内置插件——
 
