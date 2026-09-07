@@ -272,14 +272,16 @@ KV offload 走后端各自的 connector(vLLM 的 `kv-cache-offloading.md` 推 LM
 
 ### 容错(concepts/fault-tolerance,四机制)
 
+先统一一个背景词:Dynamo 运行时里,一个请求从进来到出去要过一串处理环节(预处理 → 路由 → 调 worker → 后处理),这串环节叫 **pipeline(请求处理流水线)**,每个环节叫一个 **operator(算子)**——这是 Dynamo 运行时的概念(`lib/runtime/src/pipeline/`),**跟模型并行里的 PP(流水线并行)无关**。下面的容错机制,大多以"在 pipeline 里插一个算子"的方式实现。
+
 | 机制 | 做法 | 关键点 |
 |------|------|--------|
-| **优雅退出** | SIGTERM → 先从发现面注销端点(秒级停止收新流量)→ 宽限期(默认 5s)→ drain 在途请求(总上限默认 15 分钟)→ 清资源 | "先注销再 drain"的顺序保证不再接新请求 |
-| **请求迁移** | pipeline 里的 Migrator 算子拦截所有请求/响应,逐 token 累积已生成内容;worker 中途挂了就把"原 prompt + 已生成 token"作为新请求发给健康 worker 续算 | 客户端无感;迁移次数上限在 Frontend 级配置 |
-| **请求取消** | 客户端断开时沿 pipeline 传播取消,释放 KV 块 | (未深读,见 `request-cancellation-architecture.md`) |
-| **请求拒绝(过载)** | 两层:Frontend 的 Router 按 worker 上报的负载事件维护"忙碌集合"并排除(全忙则回 HTTP 529,可配);worker 侧另有硬上限 `--engine-request-limit N` + 溢出队列 Q(默认 16),满则拒 | 529(过载)与 503(无可用路径)区分;worker 是否忙碌按 DP rank 判定,**所有 rank 都忙才算忙** |
+| **优雅退出** | 收到 SIGTERM(K8s 停 pod 的信号)→ 先从发现面注销自己(秒级停止收新流量)→ 宽限期(默认 5 秒)→ 排空在途请求(总上限默认 15 分钟)→ 清资源退出 | "先注销再排空"的顺序保证不再接新请求 |
+| **请求迁移** | 在 pipeline 里包一个**迁移层**(Migrator):它套在"调 worker"这一步外面,拦截所有请求和响应,逐 token 记下已生成内容;worker 中途挂了,就把"原 prompt + 已生成 token"拼成新请求发给健康 worker 续算 | 客户端无感;迁移次数上限在 Frontend 级配置 |
+| **请求取消** | 客户端断开时,取消信号沿 pipeline 传到 worker,释放 KV 块 | (未深读,见 `request-cancellation-architecture.md`) |
+| **请求拒绝(过载)** | 两层:① Frontend 的 Router 按 worker 上报的负载事件维护一份"忙碌集合",选路时排除;所有可用 worker 都忙则回 HTTP 529(可配)。② worker 自己有硬上限 `--engine-request-limit N` 加溢出队列 Q(默认 16),都满则拒 | 529(过载)与 503(无可用路径)区分;一个 worker 内部可能有多个 DP 分片(数据并行),**所有分片都忙才算这个 worker 忙**,不浪费还能接活的分片 |
 
-另有 **canary 主动健康检查**(observability 概念页):空闲超时的端点会被发一个真实的最小请求验证推理通路;正常流量天然抑制 canary。默认关闭。
+另有 **canary 主动健康检查**(observability 概念页):端点空闲超过阈值时,Dynamo 主动给它发一个真实的最小请求,验证推理通路还活着;有正常流量时不发(流量本身就是通路正常的证据)。默认关闭。
 
 ### 可观测性(concepts/observability)
 
