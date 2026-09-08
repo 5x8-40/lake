@@ -34,3 +34,12 @@
 [submodule "3rdparty/kvcr"]
 	path = 3rdparty/kvcr
 	url = https://github.com/ai-dynamo/kvcr
+[submodule "3rdparty/production-stack"]
+	path = 3rdparty/production-stack
+	url = https://github.com/vllm-project/production-stack.git
+[submodule "3rdparty/aibrix"]
+	path = 3rdparty/aibrix
+	url = https://github.com/vllm-project/aibrix.git
+[submodule "3rdparty/llm-d-router"]
+	path = 3rdparty/llm-d-router
+	url = https://github.com/llm-d/llm-d-router.git

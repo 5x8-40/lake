@@ -39,6 +39,9 @@
 | `3rdparty/ucm` | [ModelEngine-Group/unified-cache-management](https://github.com/modelengine-group/unified-cache-management) | main HEAD (`37af15e`) | **统一缓存框架** store+connector+PD-via-pool;见 [ucm/](ucm/) |
 | `3rdparty/tensorcast` | [tensorcast-ai/tensorcast](https://github.com/tensorcast-ai/tensorcast) | main HEAD (`19f54d60`, v0.1.0+6) | **张量状态基础设施层** artifact + Global Store/Store Daemon + CUDA IPC + RDMA/TCP P2P + policy 放置契约 + binding 热替换;见 [tensorcast/](tensorcast/) |
 | `3rdparty/flexkv` | [taco-project/FlexKV](https://github.com/taco-project/FlexKV) | main HEAD (`a5c8f12`, 2026-08-27) | **引擎旁多层 KV 卸载** CPU/SSD/REMOTE radix + GPU IPC 映射 + vLLM/SGLang/Dynamo/TRT connector;见 [flexkv/](flexkv/) |
+| `3rdparty/production-stack` | [vllm-project/production-stack](https://github.com/vllm-project/production-stack) | main HEAD (`fc00f98b`, 2026-09-08) | **实例级路由器**:`vllm_router` 的 session/prefixaware/kvaware 策略与 issue 教训;见 [model-routing.md](model-routing.md) §5 |
+| `3rdparty/aibrix` | [vllm-project/aibrix](https://github.com/vllm-project/aibrix) | main HEAD (`fe7db93e`, 2026-09-08) | **网关路由策略集**:prefix-cache/Preble/VTC + 可组合打分 + Redis 状态同步;见 [model-routing.md](model-routing.md) §5 |
+| `3rdparty/llm-d-router` | [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) | main HEAD (`abb404ef`, 2026-09-08) | **EPP 精确缓存感知**:KV 事件 → 全局块索引 + 推测索引(`pkg/kvcache/`);见 [model-routing.md](model-routing.md) §5 |
 
 > 生态相连:vLLM `KVConnectorBase_V1` 被 LMCache/Mooncake/NIXL/**FlexKV**/**TileRT**/**UCM** 等实现;vLLM-Ascend 另将 **MemCache** 列为 KV Pool backend;SGLang HiCache 把 Mooncake 作 L3,另有 `--enable-flexkv`;Dynamo 编排 vLLM/SGLang,可把 FlexKV 当 connector;UCM 主推经统一池做 PD;TileRT 做低延迟 decode;**KVCR** 走另一条路——vLLM 原生 `kv_offload` tiering 后端 + SGLang HiCacheStorage 后端 + router hint 协议(TRT-LLM/vLLM/SGLang/Dynamo router 四方对齐中)。我们站在其上做更彻底的存算分离。
 

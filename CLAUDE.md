@@ -83,6 +83,9 @@ docs/
 | `3rdparty/ucm` | ModelEngine-Group/unified-cache-management | **统一缓存框架**(可插拔 KVStore、vLLM connector、稀疏插件、PD-via-pool)→ 见 [`docs/research/ucm/`](docs/research/ucm/) |
 | `3rdparty/tensorcast` | tensorcast-ai/tensorcast | **张量状态基础设施层**:权重/KV/checkpoint 抽离进程为分布式 artifact + Global Store/Store Daemon 控制面/数据面分离 + CUDA IPC 同机零拷贝 + RDMA/TCP P2P + policy 预设(cache/durable/ha/cold/warm/pinned)放置契约 + binding 版本热替换 → 见 [`docs/research/tensorcast/`](docs/research/tensorcast/)(overview / architecture / evaluation) |
 | `3rdparty/flexkv` | taco-project/FlexKV | **引擎旁多层 KV 卸载**:CPU/SSD/REMOTE radix + GPU IPC 映射(不拥有 HBM)+ vLLM/SGLang/Dynamo/TRT connector → 见 [`docs/research/flexkv/`](docs/research/flexkv/)(overview / architecture / pain-points) |
+| `3rdparty/production-stack` | vllm-project/production-stack | **实例级路由器参考**:`vllm_router` 的 session/prefixaware/kvaware 策略(`src/vllm_router/routers/routing_logic.py`)→ 见 [`docs/research/model-routing.md`](docs/research/model-routing.md) §5 |
+| `3rdparty/aibrix` | vllm-project/aibrix | **网关路由策略集**:prefix-cache/Preble/VTC/SLO + 可组合加权打分 + Redis 多副本状态同步(`pkg/plugins/gateway/`)→ 见 [`docs/research/model-routing.md`](docs/research/model-routing.md) §5 |
+| `3rdparty/llm-d-router` | llm-d/llm-d-router | **EPP 精确缓存感知**:KV 事件→全局块索引+推测索引(`pkg/kvcache/`)、prefix/load scorer 组合 → 见 [`docs/research/model-routing.md`](docs/research/model-routing.md) §5 |
 
 逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm,tensorcast,flexkv}/`；Transformers 仅作为模型定义源码参考。
 
