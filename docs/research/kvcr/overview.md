@@ -78,6 +78,8 @@ DEP #11673 指出现有方案(含 KVBM)的两种失败模式:一是 GPU 紧耦�
 3. 全局视图不重复建设:router 为路由本就追踪 KV 位置,自建注册中心与之重复。router 持全局位置表(按 `BlockKey` 组织,尽量小),KVCR 实例不维护其他节点的库存。同节点与跨节点复用走同一套"router 指明来源"的模型:同节点时 NIXL 自动选本机传输方式,所有权与协调流程不变。
 4. 拉取与重算的取舍下放给 worker:router 只发 hint,是否拉取由目的地按自身负载决定;集中式成本决策难以做好。
 
+> 旁证:[kvcached](../kvcached/overview.md)(GPU VMM 弹性 KV)与 KVCR 的边界正好互补——KVCR 不碰 GPU、引擎给指针;kvcached 只碰 GPU 页映射、不管 KV 语义。两者组合(弹性 G1 + KVCR L2+)有一个待解问题:VMM 页 unmap/remap 与 NIXL 显存注册的共存(kvcached 的 PD 目前只验证了 NixlConnector)。
+
 ## KVBM v2 为什么也被放弃
 
 没有单独的官方废弃声明;公开记录显示的过程是:

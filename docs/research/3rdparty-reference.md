@@ -254,6 +254,7 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 - TileRT **核闭源**、钉 8×B200、公开树无 radix/分层池/`bs>1`——**不是**存储面或通用计算层蓝图。
 - PD 是 **vLLM block_id → 单槽 inject**；lake 是池权威 + 混合执行（含 D-direct）。
 - 过载 429 在小路由器内；lake 过载归 gateway。
+- 生态补位:[kvcached](kvcached/overview.md)(GPU VMM 页弹性)与 Dynamo/KVCR 正交——KVCR 不碰 GPU,kvcached 只管 GPU 页映射;组合形态与 VMM×RDMA 待解问题见该文 §4。
 
 ## 9. FlexKV → 引擎旁 CPU/SSD/远端卸载
 
@@ -276,6 +277,29 @@ FlexKV 与 **LMCache / UCM 同层**（引擎 connector），本机索引接近 *
 - FlexKV **不索引 HBM**，GPU 命中仍看引擎 APC；lake L0 在控制面。
 - 驱逐不向下层写回；lake L2 是 F4 恢复点，冷热按移动。
 - Redis/事件不是单写者位置视图；worker 退出后本机树通常一起没。
+
+## 10. kvcached → GPU VMM 页弹性（L0 机制参考）
+
+源码入口:`3rdparty/kvcached/`(`csrc/` + `kvcached/`)。深度分析见 [`kvcached/`](kvcached/)。HBM 归属对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
+
+kvcached 与其他参考项目不在同一层:不分层、不索引前缀、不做跨节点,只做一件事——把 GPU KV 张量的虚拟地址与物理页解耦(cuMem VMM),让同卡多引擎实例弹性共享显存。对 lake 的意义在 L0:池 agent 管理 HBM 物理页时,这是唯一在真实引擎(vLLM/SGLang)上验证过的工程闭环。
+
+### 借鉴点
+
+| kvcached 设计 | 我们对应 | 说明 |
+|---------------|----------|------|
+| VA 预留 + 页级 map/unmap + zero page COW | L0 物理页按需分配 | 引擎无感(张量地址稳定,CUDA graph 安全);冷启动物理零占用 |
+| 热页缓存(min5/max10)+ 映射失败回滚 | L0 agent 分配快速路径 | 微秒级 alloc;无全局互斥时的兜底 |
+| kvctl→shm→100ms 轮询 resize(revision 状态机) | 池配额下发通道 | 带外、不占请求路径;applied/deferred/stale/conflict 语义可直接用 |
+| `get_page_occupancy` 页级存活块统计 | L0「引用数>0 冻结」 | 页可否 unmap 的判定依据 |
+| autopatch(.pth + import 钩子) | 计算层引擎接入方式 | 引擎零改动;代价是补丁面跟随引擎版本 |
+
+### 关键差异
+
+- kvcached 无全局视图(shm 只记账、驱动仲裁物理页、TOCTOU 靠 headroom);lake L0 位置归存储控制面权威。
+- kvcached 不知页内 KV 身份(索引在引擎 APC);lake L0 slot 有块级身份,支撑 D-direct 与 F4。
+- VMM 页重映射与 RDMA 注册共存未解(PD 仅验证 NixlConnector);lake Transfer Bus 需前置解决。
+- 弹性止步单机单卡;lake L0–L3 统一编址。
 
 ## 代码级复用策略（按模块，互不替代）
 
@@ -335,6 +359,7 @@ P4(KV Pool 原型,Rust)时按此顺序；**1 与「Dynamo KVBM」分属上表 A/
 8. **LMCache rust/ + 跨实例复用**：Rust 存储层工程模式 + 复用场景验证。
 9. **vLLM `KVConnectorBase_V1` + `GPUModelRunner`**（偏 P5）：worker ↔ 存储池 client 形态 + layer-wise 流水线。
 10. **TileRT `pd_vllm`**（偏 P5 PD 胶水对照）：`TileRTConnector` claim / MTP-aware 传 KV / NIXL·Mooncake；**不**复用闭源 `.so`。
+11. **kvcached**（偏 P6/P7，L0 弹性机制参考）：VMM 页级 map/unmap + zero page COW + kvctl 配额协议 → 池 agent 管理 HBM 物理页；**不**复用其去中心化协调（lake 用控制面权威）。
 
 ### Dynamo 参考补充(编排层/控制面,跨阶段)
 
@@ -389,7 +414,7 @@ Dynamo 跨 **P4(存储)** 与 **控制面(选路/通信)**,不进上面"抄源�
 跨多个 submodule 的机制专题(非单项目分目录):
 
 - **PD 分离的控制机制**:vLLM(KVConnector 插件 + 外部 proxy)vs SGLang(固定角色 + 内建队列状态机)对比——角色划分、配对握手、KV 传输推进、失败处理,及与 lake"KV 归池 + 逐请求选模式"的差异。见 [`pd-disaggregation.md`](pd-disaggregation.md)。
-- **HBM 归属与 KV 卸载**:谁发 GPU 槽、GPU 是否编进传输图、Dynamo G1 句柄 vs 池；覆盖 HiCache / vLLM offload / LMCache / KVBM / FlexKV / UCM / Mooncake store+TE / MemCache / TileRT / TensorCast / CMX。见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
+- **HBM 归属与 KV 卸载**:谁发 GPU 槽、GPU 是否编进传输图、Dynamo G1 句柄 vs 池；覆盖 HiCache / vLLM offload / LMCache / KVBM / FlexKV / UCM / Mooncake store+TE / MemCache / TileRT / TensorCast / CMX / kvcached。见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 - **分布式模型**:全部参考项目的拓扑/元数据权威/同步机制/一致性分级/HA/扩展性对比,四类归纳(中心权威星型/分片租约/事件流最终一致/弱协调)与对 lake 的印证警示。见 [`distributed-models.md`](distributed-models.md)。
 
 ## 非 submodule 文献参考
