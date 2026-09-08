@@ -40,19 +40,18 @@ Anthropic 没有模型路由产品,Claude Code 里是用户手动 `/model` 选�
 
 ### Databricks:Smart Routing + Omnigent(任务级,选模型也选 harness)
 
-2026 年发布,Beta 状态,文档见 [Smart Routing for coding agents](https://docs.databricks.com/aws/en/ai-gateway/smart-routing),设计细节见官方博客 [Smart Routing in Unity AI Gateway](https://www.databricks.com/blog/smart-routing-unity-ai-gateway-match-frontier-quality-30-lower-cost-task)。面向编程 agent。
-
-![模型 × harness 的成本-质量分布](model-routing/figures/databricks-smart-routing-1.png)
-
-(图源:[Databricks 博客](https://www.databricks.com/blog/smart-routing-unity-ai-gateway-match-frontier-quality-30-lower-cost-task)。编程任务的成本-质量前沿上,模型与 harness 的组合高度分散,大量日常工作不需要最贵组合——这是路由存在的理由。)
-
-要点:
+2026 年发布,Beta 状态,文档见 [Smart Routing for coding agents](https://docs.databricks.com/aws/en/ai-gateway/smart-routing),设计细节见官方博客 [Smart Routing in Unity AI Gateway](https://www.databricks.com/blog/smart-routing-unity-ai-gateway-match-frontier-quality-30-lower-cost-task)。面向编程 agent,要点:
 
 1. **任务级而非请求级**。任务开始时定一次模型和 harness,整个会话不再换。原因:大规模下成本由 prompt cache 命中率主导,逐请求换模型会显著拉低命中率,省的钱不如丢的多。
 2. **分类器要便宜**。用一个低延迟小模型读任务描述和元数据,打几个语义标签:改系统的哪部分、提示词带什么代码证据(片段/报错栈/无)、失败形态、改动是否局部、项目类型。由此得出任务族和语言族。
 3. **默认中等,双向调整**。路由器默认选中档模型,按标签向上升档(需要前沿能力)或降档(任务简单)。一个策略覆盖整个模型谱系。
 4. **模型和 harness 联合选择**。harness(决定每轮发多少上下文、何时调工具、何时压缩上下文)对成本的影响可以超过 2 倍,只换模型不换 harness 拿不到这部分。联合选择由 Omnigent(元 harness,编排多个编程会话)执行;子 agent 启动时独立再过一次路由——初始 prompt 往往欠定义,子任务边界更清晰,路由更准。
-5. **效果**:内部 workload 省 35%,公开 benchmark 省 56%,质量追平单用 Opus 5。
+5. **效果**(博客给出的实测数字):
+
+| 评测集 | 成本 | 质量 |
+|--------|------|------|
+| 内部 coding workload | Opus 5 单模型的 65%(省 35%) | 超过任一单模型 |
+| 公开 coding benchmark | 省 56% | 追平 Opus 5 |
 
 ![Smart Routing 的任务级路由流程](model-routing/figures/databricks-smart-routing-2.png)
 
@@ -86,7 +85,12 @@ flowchart LR
     end
 ```
 
-1. **粒度更细:轮次级**。Databricks 是任务级(任务开始定一次,保缓存);OpenSquilla 每一轮都重新选模型。轮次级能省更多(报告数据:保留固定旗舰模型 99.96% 的任务质量,成本降 88.9%;PinchBench 25 任务上与 OpenClaw+Opus 4.7 同分 0.925,成本 $0.688 vs $6.233),代价是频繁换模型会丢 prompt cache——它的解法是 **prompt 缓存隔离**(按档位隔离缓存命名空间)加自适应提示词(简单轮次连系统提示都换轻量版,缓存代价同步缩小)。两种粒度谁更优,取决于 provider 侧缓存价格与命中形态,没有通用答案。
+1. **粒度更细:轮次级**。Databricks 是任务级(任务开始定一次,保缓存);OpenSquilla 每一轮都重新选模型。代价是频繁换模型会丢 prompt cache——它的解法是 **prompt 缓存隔离**(按档位隔离缓存命名空间)加自适应提示词(简单轮次连系统提示都换轻量版,缓存代价同步缩小)。两种粒度谁更优,取决于 provider 侧缓存价格与命中形态,没有通用答案。技术报告的实测数字:
+
+| 评测 | 对比对象 | 质量 | 成本 |
+|------|----------|------|------|
+| 全量任务 | 固定旗舰模型 | 保留 99.96% | 降 88.9% |
+| PinchBench 25 任务 | OpenClaw + Opus 4.7 | 同分 0.925 | $0.688 vs $6.233 |
 2. **路由之外还有集成**。难题不只路由给一个模型,而是分发给多个候选模型再聚合作答(mixture-of-agents 思路),报告声称在深度研究任务上以 Fable 5 的 31% 成本拿到更高分;带成本感知回退——单模型够用时自动跳过集成。
 3. **思维深度分级**:简单轮次直接关闭推理(reasoning)输出,不为"你好"付推理 token 的钱。
 
@@ -94,9 +98,9 @@ flowchart LR
 
 API 聚合商,`openrouter/auto` 自动选模型。2026 年 8 月换掉原 NotDiamond 引擎,新机制自称 "wisdom of the market"([公告](https://openrouter.ai/blog/announcements/introducing-the-new-auto-router/)):把 prompt 分到约 30 类任务,按**全平台最近 7 天开发者真实消费份额**(周 55T+ token)给该类任务选模型。用户用 `cost_tier`(low/medium/high/xhigh/max 五档)控制价格带;多轮对话传 `session_id` 保持模型粘连。不收路由费,按选中模型原价计费。
 
-![OpenRouter auto 的工作方式](model-routing/figures/openrouter-auto-beta.png)
+![Auto Router 各任务类别上的模型胜率热力图](model-routing/figures/openrouter-category-heatmap.png)
 
-(图源:[OpenRouter 公告](https://openrouter.ai/blog/announcements/introducing-the-new-auto-router/)。一个 prompt 进来,Auto 分类、按市场信号加权、选模型。)
+(图源:[OpenRouter 公告](https://openrouter.ai/blog/announcements/introducing-the-new-auto-router/)。每个任务类别下各模型的近期平台消费份额——"市场信号"的具体形态:不同类别胜出的模型不同,路由就是把请求分到该类别的胜出者。)
 
 反例:[Martian](https://www.linkedin.com/pulse/martian-vs-openrouter-optimization-trap-vidhi-vashishth-ney8c) 是最早做模型路由的创业公司,已从路由器转型。教训:模型选择是开发者最在乎、也最难验证对错的决策(看不到"另一个模型会怎么答"),纯黑盒自动路由难以建立信任;OpenRouter 先把接入、计费、failover 做好,自动路由只作为可选项。
 
@@ -246,11 +250,14 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 
 (图源:[KubeAI 博客](https://www.kubeai.org/blog/2025/02/26/llm-load-balancing-at-scale-chwbl/)。左:随机路由下同一会话的各轮被打散,缓存难以命中;右:一致性哈希让同前缀请求稳定落同一副本。)
 
-实测(8×L4、Llama 3.1 8B、ShareGPT 会话、1200 并发线程):TTFT 比 K8s 默认随机降 95%,吞吐升 127%。代价:哈希只保证"同前缀同副本",不知道缓存是否已被驱逐,也不感知实时负载(只在超界时让位)。
+实测(8×L4、Llama 3.1 8B、ShareGPT 会话):
 
-![KubeAI PrefixHash 的 TTFT 对比](model-routing/figures/kubeai-ttft-benchmark.png)
+| 指标(1200 并发线程) | K8s 默认(随机) | KubeAI PrefixHash | 变化 |
+|---|---|---|---|
+| TTFT | 基线 | — | **降 95%** |
+| 吞吐 | 基线 | — | **升 127%** |
 
-(图源:KubeAI 博客,同上。并发越高,PrefixHash 与随机路由的 TTFT 差距越大。)
+且并发越高,与随机路由的差距越大(低并发时三者接近)。代价:哈希只保证"同前缀同副本",不知道缓存是否已被驱逐,也不感知实时负载(只在超界时让位)。
 
 ### 对照表
 
