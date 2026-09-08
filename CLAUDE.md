@@ -119,7 +119,7 @@ docs/
  - **跨节点 KV 共享 / KVBM 继任者(KVCR)**:引擎进程内二级存储 + router hint P2P + NIXL + Guard 容错 + 策略可插拔;与 KVBM 的区别与重做原因 → `docs/research/kvcr/overview.md`
    - **NVIDIA CMX**：目标栈、公开成熟度、VAST G3/G3.5 边界与 lake 映射 → `docs/research/nvidia-cmx.md`；模型字节、容量与 Prefill KV 加载计算器 → `tools/cmx-sim/`
    - **Agentic cache workload**：匿名 Cursor 用量、公开 request 级 trace（Codex × SWE-bench Pro / AgentX）、provider cache 留存、File Library 边界与 90%/95% 仿真输入 → `docs/research/agentic-cache-workload.md`
-   - **模型级路由(model router)**:OpenAI/Databricks/OpenRouter 等厂商路由产品、RouteLLM 等开源与论文、对实例级 Router(Dynamo/lake)的借鉴 → `docs/research/model-routing.md`
+   - **模型级路由与 APC 亲和调度**:OpenAI/Databricks/OpenRouter/OpenSquilla 等模型路由产品、RouteLLM 等论文、Anthropic prompt caching 经验、vLLM production-stack 与 SGLang 的缓存亲和/会话粘连调度、对实例级 Router(Dynamo/lake)的借鉴 → `docs/research/model-routing.md`
    - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）
    - **张量状态基础设施(TensorCast)**:权重/KV/checkpoint 抽离进程为分布式 artifact + Global Store/Store Daemon 控制面/数据面分离 + CUDA IPC 同机零拷贝 + RDMA/TCP P2P + policy 预设(cache/durable/ha/cold/warm/pinned)放置契约 + binding 版本热替换 + tensor view(TP shard) → `docs/research/tensorcast/{overview,architecture,evaluation}.md`（submodule `3rdparty/tensorcast`;与 lake 存储层/权重缓存同构对照）
    - **引擎旁 KV 卸载(FlexKV)**:CPU/SSD/REMOTE 本机 radix、GPU 仅 IPC 映射、delay-free D2H、vLLM/SGLang/Dynamo connector → `docs/research/flexkv/{overview,architecture,pain-points}.md`；HBM/卸载全 3rdparty 对照（含 G1 句柄）见 `docs/research/hbm-tier-and-offload.md`
