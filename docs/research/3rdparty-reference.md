@@ -14,6 +14,7 @@
 - [`ucm/`](ucm/) — UCM(ModelEngine):[总览](ucm/overview.md) · [架构](ucm/architecture.md) · [痛点与 lake 对照](ucm/pain-points.md)
 - [`tensorcast/`](tensorcast/) — TensorCast:[总览](tensorcast/overview.md) · [运行时架构](tensorcast/architecture.md) · [论文实验详录](tensorcast/evaluation.md) · 张量状态基础设施层(权重/KV/checkpoint 抽离进程 + Global Store/Store Daemon + CUDA IPC + RDMA/TCP P2P + policy 放置契约 + binding 热替换)
 - [`flexkv/`](flexkv/) — FlexKV(TACO):[总览](flexkv/overview.md) · [架构与 HBM](flexkv/architecture.md) · [痛点与 lake 对照](flexkv/pain-points.md) · 引擎旁 CPU/SSD/远端卸载(GPU 由引擎持有,IPC 映射)
+- [`kvcached/`](kvcached/) — kvcached(OVG):[总览](kvcached/overview.md) · GPU 虚拟内存化弹性 KV(VA/物理页解耦、跨进程显存超卖、kvctl 配额、zero page 冷启动;无 daemon、不分层、不管前缀索引)
 - [guided-decoding.md](guided-decoding.md) — **Guided / structured decoding**(SGLang × vLLM):xgrammar/llguidance 库边界、overlap/async 下能否消同步、spec+grammar 硬缺口
 - [sampling-params.md](sampling-params.md) — **Sampling 参数对照**(SGLang × vLLM):核心/独有字段、`n`≠beam、spec 禁 min_p/logit_bias；penalty 空泡与 V2；采样状态归属 / Spec 兼容矩阵 / `n` 与前缀 KV 共享
 - [scheduler-worker-interface.md](scheduler-worker-interface.md) — **Scheduler→Worker 字段全集**(SGLang × vLLM):`SchedulerOutput` vs `ScheduleBatch`/`ForwardBatch`、差异表、架构根因、对 lake D1 含义
@@ -39,6 +40,7 @@
 | `3rdparty/ucm` | [ModelEngine-Group/unified-cache-management](https://github.com/modelengine-group/unified-cache-management) | main HEAD (`37af15e`) | **统一缓存框架** store+connector+PD-via-pool;见 [ucm/](ucm/) |
 | `3rdparty/tensorcast` | [tensorcast-ai/tensorcast](https://github.com/tensorcast-ai/tensorcast) | main HEAD (`19f54d60`, v0.1.0+6) | **张量状态基础设施层** artifact + Global Store/Store Daemon + CUDA IPC + RDMA/TCP P2P + policy 放置契约 + binding 热替换;见 [tensorcast/](tensorcast/) |
 | `3rdparty/flexkv` | [taco-project/FlexKV](https://github.com/taco-project/FlexKV) | main HEAD (`a5c8f12`, 2026-08-27) | **引擎旁多层 KV 卸载** CPU/SSD/REMOTE radix + GPU IPC 映射 + vLLM/SGLang/Dynamo/TRT connector;见 [flexkv/](flexkv/) |
+| `3rdparty/kvcached` | [ovg-project/kvcached](https://github.com/ovg-project/kvcached) | main HEAD (`60cad94`, 2026-08-22, v0.1.5) | **GPU VMM 弹性 KV**:VA/物理页解耦 + 跨进程超卖(driver 仲裁,无 daemon)+ kvctl 配额;见 [kvcached/](kvcached/) |
 
 > 生态相连:vLLM `KVConnectorBase_V1` 被 LMCache/Mooncake/NIXL/**FlexKV**/**TileRT**/**UCM** 等实现;vLLM-Ascend 另将 **MemCache** 列为 KV Pool backend;SGLang HiCache 把 Mooncake 作 L3,另有 `--enable-flexkv`;Dynamo 编排 vLLM/SGLang,可把 FlexKV 当 connector;UCM 主推经统一池做 PD;TileRT 做低延迟 decode;**KVCR** 走另一条路——vLLM 原生 `kv_offload` tiering 后端 + SGLang HiCacheStorage 后端 + router hint 协议(TRT-LLM/vLLM/SGLang/Dynamo router 四方对齐中)。我们站在其上做更彻底的存算分离。
 
