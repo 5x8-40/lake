@@ -25,6 +25,19 @@ flowchart LR
 
 ## 2. 模型级路由:厂商产品
 
+先把原理路线归个类,后面的产品和论文都可以对号入座:
+
+| 原理路线 | 机制 | 代表 |
+|----------|------|------|
+| **规则分流** | 按场景/阈值写死规则,无学习成分 | claude-code-router、LiteLLM 等 AI 网关 |
+| **轻量分类器** | 小模型/BERT/LightGBM 给请求打难度或类型标签,标签映射到模型档位 | Databricks(小模型打语义标签)、OpenSquilla(LightGBM+ONNX)、vLLM Semantic Router(ModernBERT)、HybridLLM(BERT) |
+| **偏好数据学习** | 用人类偏好/对战数据训练打分器,再用阈值标定控制强模型调用比例 | RouteLLM(矩阵分解/Elo/BERT)、OpenAI(用用户切换行为、偏好率、正确率持续训练) |
+| **级联试错** | 先调便宜模型,给回答打分,不够再升级更贵的——串行试错而非一次决策 | FrugalGPT |
+| **结构信息** | 利用任务间的相似性:查询聚类或任务-模型建图 | Avengers(聚类)、GraphRouter(异构图) |
+| **市场信号** | 不训练模型,按平台真实消费份额选每个任务类别的胜出者 | OpenRouter auto-beta |
+
+两条共同约束贯穿所有路线:**做判断的组件必须比省下的钱便宜**(所以没有一家用前沿模型当路由器);**换模型的时机受缓存约束**(换模型=重建前缀缓存,见 §4)。
+
 ### OpenAI:GPT-5 的 real-time router
 
 GPT-5 不是单个模型,而是一个系统:快速模型 `gpt-5-main` 答大多数问题,深度推理模型 `gpt-5-thinking` 处理难题,前面放一个实时路由器决定用哪个([GPT-5 System Card](https://openai.com/index/gpt-5-system-card/))。
