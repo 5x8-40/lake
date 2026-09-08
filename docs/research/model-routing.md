@@ -40,7 +40,13 @@ Anthropic 没有模型路由产品,Claude Code 里是用户手动 `/model` 选�
 
 ### Databricks:Smart Routing + Omnigent(任务级,选模型也选 harness)
 
-2026 年发布,Beta 状态,文档见 [Smart Routing for coding agents](https://docs.databricks.com/aws/en/ai-gateway/smart-routing),设计细节见官方博客 [Smart Routing in Unity AI Gateway](https://www.databricks.com/blog/smart-routing-unity-ai-gateway-match-frontier-quality-30-lower-cost-task)。面向编程 agent,要点:
+2026 年发布,Beta 状态,文档见 [Smart Routing for coding agents](https://docs.databricks.com/aws/en/ai-gateway/smart-routing),设计细节见官方博客 [Smart Routing in Unity AI Gateway](https://www.databricks.com/blog/smart-routing-unity-ai-gateway-match-frontier-quality-30-lower-cost-task)。面向编程 agent。
+
+![模型 × harness 的成本-质量分布](model-routing/figures/databricks-smart-routing-1.png)
+
+(图源:[Databricks 博客](https://www.databricks.com/blog/smart-routing-unity-ai-gateway-match-frontier-quality-30-lower-cost-task)。编程任务的成本-质量前沿上,模型与 harness 的组合高度分散,大量日常工作不需要最贵组合——这是路由存在的理由。)
+
+要点:
 
 1. **任务级而非请求级**。任务开始时定一次模型和 harness,整个会话不再换。原因:大规模下成本由 prompt cache 命中率主导,逐请求换模型会显著拉低命中率,省的钱不如丢的多。
 2. **分类器要便宜**。用一个低延迟小模型读任务描述和元数据,打几个语义标签:改系统的哪部分、提示词带什么代码证据(片段/报错栈/无)、失败形态、改动是否局部、项目类型。由此得出任务族和语言族。
@@ -52,6 +58,10 @@ Anthropic 没有模型路由产品,Claude Code 里是用户手动 `/model` 选�
 |--------|------|------|
 | 内部 coding workload | Opus 5 单模型的 65%(省 35%) | 超过任一单模型 |
 | 公开 coding benchmark | 省 56% | 追平 Opus 5 |
+
+![路由后的成本-质量前沿 vs 单模型](model-routing/figures/databricks-smart-routing-3.png)
+
+(图源:Databricks 博客,同上。路由把成本-质量权衡曲线推向左上:同等质量下成本更低。)
 
 ![Smart Routing 的任务级路由流程](model-routing/figures/databricks-smart-routing-2.png)
 
@@ -257,7 +267,13 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 | TTFT | 基线 | — | **降 95%** |
 | 吞吐 | 基线 | — | **升 127%** |
 
-且并发越高,与随机路由的差距越大(低并发时三者接近)。代价:哈希只保证"同前缀同副本",不知道缓存是否已被驱逐,也不感知实时负载(只在超界时让位)。
+且并发越高,与随机路由的差距越大(低并发时三者接近):
+
+![KubeAI PrefixHash 的 TTFT 对比](model-routing/figures/kubeai-ttft-benchmark.png)
+
+(图源:KubeAI 博客,同上。横轴为并发线程数,纵轴为 TTFT(对数坐标);并发越高,PrefixHash 与随机路由的差距越大。)
+
+代价:哈希只保证"同前缀同副本",不知道缓存是否已被驱逐,也不感知实时负载(只在超界时让位)。
 
 ### 对照表
 
