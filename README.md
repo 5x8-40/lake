@@ -138,14 +138,16 @@ lake/
 │       ├── mooncake/              #   Mooncake 深度分析
 │       ├── vllm/                  #   vLLM 深度分析（计算层参考）
 │       ├── dynamo/                #   Dynamo 深度分析（编排层/控制面参考）
-│       └── flexkv/                #   FlexKV（引擎旁 CPU/SSD/远端卸载）
+│       ├── flexkv/                #   FlexKV（引擎旁 CPU/SSD/远端卸载）
+│       └── kvcached/              #   kvcached（GPU 虚拟内存弹性 KV）
 ├── 3rdparty/                   # 参考源码（git submodule，只读）
 │   ├── sglang/                 #   SGLang（HiCache 分层 KV + spec decode 计算层）
 │   ├── lmcache/                #   LMCache（跨实例 KV 复用）
 │   ├── mooncake/               #   Mooncake（KVCache-centric 分离架构）
 │   ├── vllm/                   #   vLLM（计算层：PagedAttention/KV connector）
 │   ├── dynamo/                 #   Dynamo（编排层：KV-aware router + KVBM 三层 offload）
-│   └── flexkv/                 #   FlexKV（引擎旁 CPU/SSD/远端 KV 卸载）
+│   ├── flexkv/                 #   FlexKV（引擎旁 CPU/SSD/远端 KV 卸载）
+│   └── kvcached/               #   kvcached（GPU 虚拟内存弹性 KV：VA/物理页解耦 + 跨进程超卖）
 └── src/                        # 早期单进程 Python 原型（验证假设用，将被 rust/go/python 子项目取代）
 ```
 

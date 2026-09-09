@@ -413,7 +413,7 @@ PD 分离为"独立可伸缩的 GPU 池",三后端(vLLM/SGLang/TRT-LLM)都支持
 | KV-aware router(overlap 量化) | Router 命中感知选路 | `overlap_blocks` 命中量化,见 [`../../architecture/scheduling.md`](../../architecture/scheduling.md) "缓存命中感知调度" |
 | transports 多后端可插拔 | 通信选型(见 #3) | etcd/nats/tcp/zmq 按部署形态选,印证"控制面存储 vs 事件面"可分离 |
 | KV events 走 NATS 而非 etcd | (lake 待定) | 高频事件流用 NATS、权威元数据用 etcd 的分工,值得 lake 评估 |
-| (生态)kvcached GPU VMM 页弹性 | (lake L0 弹性机制参考) | KVBM 因 GPU 紧耦合被 sunset;kvcached 只管页映射、不碰 KV 语义,可与 Dynamo 组合(单机超卖 + 集群编排);组合形态与待解问题见 [`../kvcached/overview.md`](../kvcached/overview.md) §4 |
+| (生态)kvcached GPU VMM 页弹性 | (lake L0 弹性机制参考) | KVBM 因 GPU 紧耦合被 sunset;kvcached 只管页映射、不碰 KV 语义,可与 Dynamo 组合(单机超卖 + 集群编排);组合形态与待解问题见 [`../kvcached/overview.md`](../kvcached/overview.md)「想象空间」节 |
 
 ## 关键差异(lake 更彻底)
 
