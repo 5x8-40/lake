@@ -206,11 +206,7 @@ kvcached 和 lake 是同一思想在两个尺度：kvcached 把 OS 虚拟内存�
 ### 对 lake 的设计空间（要自己设计/验证）
 
 5. **lake L0 的落地形态：VA 归引擎、物理页归池**。lake 断言「L0 HBM 归池」，但一直没回答：引擎张量要稳定地址（CUDA graph），池要按需供给物理页，怎么兼得？kvcached 给了工程答案——虚拟地址段归引擎（地址固定），物理页归分配者（按需 map/unmap）。lake 可把 PageAllocator 的角色换成池 agent（Rust）：worker 启动预留 VA 段，池 agent 按放置决策供页，位置视图记录块→（节点，页）映射。这把存算分离推进到最内层：HBM 不再是 worker 私有资源，而是池按页供给的。
-6. **F4 恢复：值钱的粒度是请求级，不是层流水**。分四层说：
-   - **纠正一个直觉**：恢复方向（池 → 恢复节点）做按层流水收益约等于零。decode 是访存 bound，每层计算（从 HBM 读该层 KV+权重，TB/s 级）远快于每层传输（网络/NVMe，几十 GB/s 级），流水线被传输占满、消费者挨饿，重叠只省下约一个 decode step（几十 ms），相对秒级传输可忽略。
-   - **layer-wise 传输的正确归宿是 P→D**：生产者是 compute-bound 的 prefill，每层 KV 算完即发，传输藏进计算阴影，D 在 P 结束后几乎立即开 decode——vLLM/Mooncake 的标准做法（`start_load_kv` / `wait_for_layer_load` / `save_kv_layer`，见 [`../vllm_vs_sglang/pd-disaggregation.md`](../vllm_vs_sglang/pd-disaggregation.md)），lake 的 PD 分离模式已覆盖。
-   - **F4 恢复真正值钱的两点**：① 请求级粒度——整节点故障要恢复几十上百个请求，KV 齐的请求先 decode，不等未齐的，首请求恢复时间从「全部传完」降到「该请求传完」。**这与 kvcached 无关**，纯 Transfer Bus 传输序 + 调度设计。② 弹性映射——恢复实例的 VA 段立即可用，物理页随传输到达逐页映射，无需先整段预留/就位。这是本条与 kvcached 唯一的接口，且价值有限：只在恢复节点 HBM 紧张、无法整段预留时才有意义。
-   - **前提**：Transfer Bus 按请求优先级与消费序排传输序。
+6. **F4 恢复：只有弹性映射与本主题相关，且价值有限**。恢复实例的 VA 段立即可用、物理页随传输到达逐页映射，无需先整段预留/就位——只在恢复节点 HBM 紧张、无法整段预留时才有意义。此前设想过的「按层流水恢复」已否决：decode 是访存 bound，每层计算（TB/s 级）远快于每层传输（几十 GB/s 级），流水线被传输占满，重叠收益约等于零；layer-wise 传输的正确归宿是 P→D（vLLM/Mooncake 标准做法，lake PD 分离已覆盖）。请求级恢复粒度、传输序编排属 lake 自身设计，与 kvcached 无关，不展开。
 7. **权重 VMM 化 / MoE 专家懒加载**。kvcached 只虚拟化 KV；同一机制可用于权重：MoE 专家 VA 预留，热专家常驻物理页，冷专家释放（字节在 DRAM/SSD，用时换入），单卡逻辑容量超物理容量。与 TensorCast 权重 artifact 化、lake Weight Cache 同方向。风险也最大：专家切换在 decode 路径上，换入延迟直接进 ITL，必须按路由分布做预测性预取。
 
 ### 小机制借鉴（拿来就用）
