@@ -85,13 +85,26 @@ docs/
 | `3rdparty/flexkv` | taco-project/FlexKV | **引擎旁多层 KV 卸载**:CPU/SSD/REMOTE radix + GPU IPC 映射(不拥有 HBM)+ vLLM/SGLang/Dynamo/TRT connector → 见 [`docs/research/flexkv/`](docs/research/flexkv/)(overview / architecture / pain-points) |
 | `3rdparty/kvcached` | ovg-project/kvcached | **GPU 虚拟内存弹性 KV**:VA/物理页解耦(cuMem 页级映射/解映射)、跨进程显存超卖(无 daemon、驱动仲裁)、kvctl 硬配额、zero page 冷启动 → 见 [`docs/research/kvcached/`](docs/research/kvcached/)(overview) |
 
-逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm,tensorcast,flexkv,kvcached}/`；Transformers 仅作为模型定义源码参考。
+逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析(设计/架构/技术栈/优劣)见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm,tensorcast,flexkv,kvcached}/`；Transformers 仅作为模型定义源码参考。
 
 约定:
 - `3rdparty/` **只读**,不修改 submodule 内代码。要改造先 fork 换 URL。
 - submodule 自带 `.claude/` 规则——改它们自身代码的约束,与本项目无关,**忽略**。
 - clone 本仓库需 `git submodule update --init --recursive`。体积较大时可用浅克隆:`git clone --recurse-submodules --depth 1 --shallow-submodules <repo>`(浅克隆后无法在 submodule 内随意 `checkout` 切 ref)。Ascend MemCache 的传输底座 `memfabric_hybrid` 为**嵌套** submodule——文档推荐的 recursive clone/update **会**一并拉下;仅非 recursive 初始化时才不拉。审计 OneCopy 时需确认该路径已 init。TileRT 公开树相对较小。
 - 设计/实现遇到分层、传输、复用、放置等问题,先查对应 submodule 源码再动手。
+
+### 新增参考项目的登记清单
+
+新增一个参考项目时,按此清单登记,缺一项即未完成:
+
+1. **调研文档** `docs/research/<name>/overview.md`(项目大时分目录多文档)。必含:头部元信息(源码/许可/语言构成/论文或官网)、一句话定位、与本系统的关系(逐组件映射)、设计哲学、架构、分布式模型、技术栈、优势与局限、借鉴点与关键差异,末尾「代码索引」节把概念/机制映射到 `文件:符号`(符号锚点,不写行号)。
+2. **本文件**:3rdparty 表加一行 + 下方「reference 强制查阅规则」按主题定位加一条。
+3. **[`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)**:submodule 清单加行 + 新增专节(借鉴点/关键差异)。
+4. **[`docs/research/references.md`](docs/research/references.md)**:submodule 清单与主题分类各加一条。
+5. **[`docs/research/distributed-models.md`](docs/research/distributed-models.md)**:总表加行 + 四类归纳归类。
+6. **[`README.md`](README.md)**:目录结构中 `research/` 与 `3rdparty/` 两清单同步。
+7. 相关专题文档按需补充(HBM/卸载 → `hbm-tier-and-offload.md`;PD → `pd-disaggregation.md`),相关项目文档加反向链接。
+8. 文档相对链接**不得**深入 `3rdparty/` 内部(链接检查脚本会拒);用语简洁,术语与既有文档一致。
 
 ## reference 强制查阅规则（硬性，每次都做）
 

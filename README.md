@@ -130,22 +130,42 @@ lake/
 │   │   ├── consistency.md      #   一致性与故障模型（持久语义 / ref 两级 / 风险窗口）
 │   │   └── topology.md         #   部署拓扑（双网络 / RDMA 退化 / 故障域）
 │   └── research/               # 相关工作
-│       ├── references.md
-│       ├── 3rdparty-reference.md  # 3rdparty 源码与本设计的逐层对应(汇总)
-│       ├── dualpath.md            #   DualPath 双路径 KV 加载分析
-│       ├── sglang/                #   SGLang HiCache 深度分析(+ 上游痛点)
-│       ├── lmcache/               #   LMCache 深度分析
-│       ├── mooncake/              #   Mooncake 深度分析
-│       ├── vllm/                  #   vLLM 深度分析（计算层参考）
-│       ├── dynamo/                #   Dynamo 深度分析（编排层/控制面参考）
-│       ├── flexkv/                #   FlexKV（引擎旁 CPU/SSD/远端卸载）
-│       └── kvcached/              #   kvcached（GPU 虚拟内存弹性 KV）
+│       ├── references.md            #   文献与参考总清单
+│       ├── 3rdparty-reference.md    #   3rdparty 源码与本设计的逐层对应(汇总)
+│       ├── pd-disaggregation.md     #   PD 分离控制机制对比(vLLM vs SGLang)
+│       ├── hbm-tier-and-offload.md  #   HBM 归属与 KV 卸载路径对照
+│       ├── distributed-models.md    #   各项目分布式模型对比
+│       ├── guided-decoding.md       #   Guided/structured decoding(xgrammar 边界)
+│       ├── sampling-params.md       #   Sampling 参数对照(SGLang × vLLM)
+│       ├── scheduler-worker-interface.md # Scheduler→Worker 字段对照
+│       ├── dualpath.md              #   DualPath 双路径 KV 加载分析
+│       ├── nvidia-cmx.md            #   NVIDIA CMX 目标栈与边界
+│       ├── agentic-cache-workload.md #  Agentic cache 负载与仿真输入
+│       ├── sglang/                  #   SGLang HiCache 深度分析(+ 上游痛点)
+│       ├── lmcache/                 #   LMCache 深度分析
+│       ├── mooncake/                #   Mooncake 深度分析
+│       ├── vllm/                    #   vLLM 深度分析（计算层参考）
+│       ├── transformers/            #   Transformers（模型定义参考）
+│       ├── dynamo/                  #   Dynamo 深度分析（编排层/控制面参考）
+│       ├── kvcr/                    #   KVCR（KVBM 继任者）
+│       ├── tilert/                  #   TileRT（超低延迟 decode + PD 插件）
+│       ├── memcache/                #   Ascend MemCache（昇腾 KV 对象池）
+│       ├── ucm/                     #   UCM（统一缓存框架）
+│       ├── tensorcast/              #   TensorCast（张量状态基础设施）
+│       ├── flexkv/                  #   FlexKV（引擎旁 CPU/SSD/远端卸载）
+│       └── kvcached/                #   kvcached（GPU 虚拟内存弹性 KV）
 ├── 3rdparty/                   # 参考源码（git submodule，只读）
 │   ├── sglang/                 #   SGLang（HiCache 分层 KV + spec decode 计算层）
 │   ├── lmcache/                #   LMCache（跨实例 KV 复用）
 │   ├── mooncake/               #   Mooncake（KVCache-centric 分离架构）
 │   ├── vllm/                   #   vLLM（计算层：PagedAttention/KV connector）
+│   ├── transformers/           #   Transformers（模型定义参考）
 │   ├── dynamo/                 #   Dynamo（编排层：KV-aware router + KVBM 三层 offload）
+│   ├── kvcr/                   #   KVCR（KVBM 继任者：引擎内二级存储 + P2P）
+│   ├── tilert/                 #   TileRT（超低延迟 decode + vLLM PD 插件）
+│   ├── memcache/               #   Ascend MemCache（昇腾分布式 KVCache 对象池）
+│   ├── ucm/                    #   UCM（统一缓存框架：可插拔 KVStore）
+│   ├── tensorcast/             #   TensorCast（张量状态基础设施层）
 │   ├── flexkv/                 #   FlexKV（引擎旁 CPU/SSD/远端 KV 卸载）
 │   └── kvcached/               #   kvcached（GPU 虚拟内存弹性 KV：VA/物理页解耦 + 跨进程超卖）
 └── src/                        # 早期单进程 Python 原型（验证假设用，将被 rust/go/python 子项目取代）
