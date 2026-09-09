@@ -33,21 +33,21 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 
 ## 设计哲学
 
-- 把 OS 虚拟内存思想搬上 GPU：VA 稳定（引擎无感、CUDA graph 安全），物理页按需供给。
+- 把 OS 虚拟内存思想搬上 GPU：张量的虚拟地址固定不变（引擎无感、CUDA graph 安全），背后的物理页按需供给。
 - 不碰 KV 语义：不知道页里装的是哪个块，索引留给引擎 APC——这是它与 KVBM 命运分野的根因（KVBM 管 block 布局被 sunset，见 [`../kvcr/overview.md`](../kvcr/overview.md)）。
 - 无中心协调：物理页由 CUDA 驱动仲裁（先 `cuMemCreate` 先得），记账走 `/dev/shm`，不设 daemon。
 - 引擎零改动：autopatch 运行时注入，而非 fork 引擎。
 
 ## 核心机制
 
-官方宣传四个特性，逐条对源码核实如下（细节见对应小节）：
+以下四个方向是本次调研要验证的设想（不是 kvcached 官方宣称）。对每条回答两个问题：kvcached 今天是否真具备（对源码核实，细节见对应小节）；这套能力能否在 Dynamo 里做。
 
-| # | 宣称 | 结论 | 实际机制 |
-|---|------|------|----------|
-| 1 | 跨进程显存超卖 | 成立 | VA 私有 + 物理页按需映射，闲置页经驱动流转 |
-| 2 | 独立 daemon 全局统筹 | 与宣传不符 | 无 daemon；进程内库 + /dev/shm 记账 + 驱动仲裁 |
-| 3 | 零物理分配冷启动 | 成立（仅 KV） | VA 预留 + 全段先指向同一 zero page，启动物理占用约一页 |
-| 4 | 多租户硬配额 | 成立（有边界） | 硬在分配拒绝；在用页不能强收 |
+| # | 设想 | kvcached 是否具备 | 实际机制 | Dynamo 里能不能做 |
+|---|------|------|----------|----------|
+| 1 | 跨进程显存超卖 | 具备 | VA 私有 + 物理页按需映射，闲置页经驱动流转 | 能。kvcached 是引擎侧插件，Dynamo worker 用 vLLM/SGLang 后端时可直接带入；与 NIXL 的 GPU 直传共存是待解问题（见「想象空间」第 11 条） |
+| 2 | 独立 daemon 全局统筹 | 不具备（实现与设想相反） | 无 daemon；进程内库 + /dev/shm 记账 + 驱动仲裁 | 能，且更顺。Dynamo 本就有控制面（etcd + planner），把各 worker 的用量记账上报 planner 即成全局统筹，不必走 kvcached 的无锁路线 |
+| 3 | 零物理分配冷启动 | 具备（仅 KV） | VA 预留 + 全段先指向同一 zero page，启动物理占用约一页 | 能。省掉 worker 拉起时的 KV 预分配与 profiling 定容；权重加载是另一段，需另解（TensorCast 方向） |
+| 4 | 多租户硬配额 | 具备（有边界） | 硬在分配拒绝；在用页不能强收 | 能。kvctl 是带外 CLI，Dynamo 里应改成控制面下发配额；「在用页不可强收」的边界相同 |
 
 ### 按需页映射与跨进程流转（超卖）
 
@@ -83,7 +83,7 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 
 - 启动时整段 VA 先全部指向同一个物理页（zero page，2MB），物理占用约一页（`csrc/ftensor.cpp::FTensor::init_with_zero_`）。首次使用某页时才把它改指到真实物理页（`FTensor::map`）。
 - 省掉的是 KV 物理预分配，以及「按空闲显存反推 KV 容量」的 profiling 依赖；权重加载、CUDA graph 不省。
-- VA 稳定、张量地址不变，物理页重映射对 kernel 和 CUDA graph 透明。这是这条路线成立的关键性质。
+- 张量地址从头到尾不变，物理页换进换出对 kernel 和 CUDA graph 透明。这是这条路线成立的关键性质。
 - 完整的 serverless 拉起 = kvcached（KV 零占用）+ 引擎 sleep/wake（权重）+ controller 按流量唤醒（`examples/06_serverless_serving`）。
 
 ### 硬配额
@@ -181,7 +181,7 @@ kvcached 和 lake 是同一思想在两个尺度：kvcached 把 OS 虚拟内存�
 
 ### 进一步可做（要自己设计/验证）
 
-8. **lake L0 的落地形态：VA 归引擎、物理页归池**。lake 断言「L0 HBM 归池」，但一直没回答：引擎张量要稳定地址（CUDA graph），池要按需供给物理页，怎么兼得？kvcached 给了工程答案——VA 段归引擎（地址稳定），物理页归分配者（按需 map/unmap）。lake 可把 PageAllocator 的角色换成池 agent（Rust）：worker 启动预留 VA 段，池 agent 按放置决策供页，位置视图记录块→（节点，页）映射。这把存算分离推进到最内层：HBM 不再是 worker 私有资源，而是池按页供给的。
+8. **lake L0 的落地形态：VA 归引擎、物理页归池**。lake 断言「L0 HBM 归池」，但一直没回答：引擎张量要稳定地址（CUDA graph），池要按需供给物理页，怎么兼得？kvcached 给了工程答案——虚拟地址段归引擎（地址固定），物理页归分配者（按需 map/unmap）。lake 可把 PageAllocator 的角色换成池 agent（Rust）：worker 启动预留 VA 段，池 agent 按放置决策供页，位置视图记录块→（节点，页）映射。这把存算分离推进到最内层：HBM 不再是 worker 私有资源，而是池按页供给的。
 9. **F4 边拉边映射**。执行节点故障后，恢复实例的 VA 段立即可用，物理页随传输到达逐页映射，decode 不必等整段 KV 就位——恢复时间从「传完」降到「第一页到达」。需要 Transfer Bus 按 decode 消费顺序排传输序。
 10. **权重 VMM 化 / MoE 专家懒加载**。kvcached 只虚拟化 KV；同一机制可用于权重：MoE 专家 VA 预留，热专家常驻物理页，冷专家释放（字节在 DRAM/SSD，用时换入），单卡逻辑容量超物理容量。与 TensorCast 权重 artifact 化、lake Weight Cache 同方向。风险也最大：专家切换在 decode 路径上，换入延迟直接进 ITL，必须按路由分布做预测性预取。
 11. **RDMA 冲突的精确化与 ODP 路线**。先把冲突范围说准：只有 RDMA 端点是 GPU 显存时才冲突（NixlConnector 式 G1→G1 直传、Mooncake TE 注册 GPU 内存）；KVCR 的主层中转模式（GPU→DRAM 走 cudaMemcpy，DRAM→对端走 NIXL，注册的是 DRAM）天然规避。所以「kvcached + KVCR」组合的冲突面比直觉小。正解调研方向是 RDMA ODP（On-Demand Paging）：注册 VA 区域、物理页由驱动按需换入换出，正是为「注册区域物理页可变」设计的机制；GPU 显存的 ODP 依赖 HMM/ATS 与 NIC 驱动支持，需实测。次选：传输期间临时钉住、整段 VA 预注册 + 物理页池化。
