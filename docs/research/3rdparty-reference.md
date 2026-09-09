@@ -298,7 +298,7 @@ kvcached 与其他参考项目不在同一层:不分层、不索引前缀、不�
 
 - kvcached 无全局视图(shm 只记账、物理页先到先得、并发超分靠 5% 余量兜底);lake L0 位置归存储控制面权威。
 - kvcached 不知页内 KV 身份(索引在引擎 APC);lake L0 slot 有块级身份,支撑 D-direct 与 F4。
-- 物理页重映射与 RDMA 注册的共存未解(PD 仅验证 NixlConnector);lake Transfer Bus 需前置解决。
+- 物理页重映射与 RDMA 注册的冲突仅限「RDMA 端点是 GPU 显存」的场景(G1→G1 直传);经 DRAM 中转天然规避,正解候选是 RDMA ODP(见 [kvcached/overview.md](kvcached/overview.md) §4.3);lake Transfer Bus 需前置定路线。
 - 弹性止步单机单卡;lake L0–L3 统一编址。
 
 ## 代码级复用策略（按模块，互不替代）
