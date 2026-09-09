@@ -15,9 +15,7 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 - 不是 daemon：名字来自 "KV cache daemon"，实现是嵌在引擎进程里的库（见「核心机制 → 无 daemon 的协调」）；
 - 不碰权重：只虚拟化 KV 张量，权重的 sleep/wake 靠引擎自身能力。
 
-生态：Red Hat 的 [Sardeenz](https://github.com/rh-aiservices-bu/sardeenz) 基于 kvcached 做 k8s/OpenShift 多模型动态 serving（[2026-04 官方博客](https://www.redhat.com/en/blog/running-llms-dynamically-production-limited-resources-hard-we-think-theres-room-another-approach)）。支持 vLLM ≥0.8.4、SGLang ≥0.4.9，MHA/GQA/MLA/滑窗/hybrid 注意力，TP/PP。
-
-Sardeenz 的好处值得说清：kvcached 只解决「显存怎么共享」，Sardeenz 补上面的运营层——哪个模型加载到哪张卡、何时加载/卸载、统一 OpenAI 兼容入口按模型名路由、按模型的显存可见性与「装不装得下」预检、蓝绿迁移（目标卡加载→切流→排空→卸载，失败则原实例继续服务）、sleep 管理与配置预设；单容器单端口，定位小规模（几个模型 × 几张卡）。它回答的正是「多模型部署扩缩容调度」谁来落地的问题：这类弹性机制要产品化必须配一个控制面——Sardeenz 是单机/小规模版，Dynamo planner + gateway 是集群版。
+生态：Red Hat 的 [Sardeenz](https://github.com/rh-aiservices-bu/sardeenz) 基于 kvcached 做 k8s/OpenShift 多模型动态 serving（[2026-04 官方博客](https://www.redhat.com/en/blog/running-llms-dynamically-production-limited-resources-hard-we-think-theres-room-another-approach)，详见「仓库与架构 → 生态」）。支持 vLLM ≥0.8.4、SGLang ≥0.4.9，MHA/GQA/MLA/滑窗/hybrid 注意力，TP/PP。
 
 ## 与本系统的关系
 
@@ -149,6 +147,10 @@ Sardeenz 的好处值得说清：kvcached 只解决「显存怎么共享」，Sa
 - 布局：默认每层一对 K/V 张量；`KVCACHED_CONTIGUOUS_LAYOUT` 为全层单张量 + compound page；MLA 单 buffer。
 - TP/PP：TP 各 worker 经 IPC 广播 map/unmap。
 - GIL 死锁教训（issue [#371](https://github.com/ovg-project/kvcached/issues/371)）：Python 线程经绑定调进 C++ 阻塞接口（如 `alloc_page`）时若一直攥着 GIL，而 C++ 后台线程（预分配 worker）又要回调 Python、必须拿 GIL——两边互等，死锁。修法：阻塞绑定进 C++ 前先放 GIL，回调前再拿；且持 C++ 锁期间不销毁 Python 回调对象（销毁也要 GIL，会造成锁序倒置）（`csrc/inc/page_allocator.hpp` 类注释、`csrc/page_allocator.cpp:541`；回归测试 `tests/test_prealloc_gil_deadlock.py`）。
+
+### 生态
+
+Sardeenz 的好处值得说清：kvcached 只解决「显存怎么共享」，Sardeenz 补上面的运营层——哪个模型加载到哪张卡、何时加载/卸载、统一 OpenAI 兼容入口按模型名路由、按模型的显存可见性与「装不装得下」预检、蓝绿迁移（目标卡加载→切流→排空→卸载，失败则原实例继续服务）、sleep 管理与配置预设；单容器单端口，定位小规模（几个模型 × 几张卡）。它回答的正是「多模型部署扩缩容调度」谁来落地的问题：这类弹性机制要产品化必须配一个控制面——Sardeenz 是单机/小规模版，Dynamo planner + gateway 是集群版。
 
 ## 分布式模型
 
