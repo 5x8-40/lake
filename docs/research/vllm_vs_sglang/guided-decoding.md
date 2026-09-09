@@ -2,7 +2,7 @@
 
 > 源码:`3rdparty/sglang`、`3rdparty/vllm`。本文对照两边对 **grammar-guided / structured output** 的支持，重点回答：在 overlap / async scheduling 下能否避免 host↔device 同步、让 GPU 执行路径**完全无空闲**；以及 xgrammar / llguidance / outlines 等库是否把 FSM 放到了 GPU。
 >
-> 不涉及 HiCache / KV connector（见各 overview）；计算层总览见 [sglang/model-runner.md](sglang/model-runner.md)、[vllm/compute.md](vllm/compute.md)。thinking 开关/长度预算见 [sglang/thinking-control.md](sglang/thinking-control.md)（与 grammar 正交，可叠加）。采样参数字段对照见 [sampling-params.md](sampling-params.md)。
+> 不涉及 HiCache / KV connector（见各 overview）；计算层总览见 [sglang/model-runner.md](../sglang/model-runner.md)、[vllm/compute.md](../vllm/compute.md)。thinking 开关/长度预算见 [sglang/thinking-control.md](../sglang/thinking-control.md)（与 grammar 正交，可叠加）。采样参数字段对照见 [sampling-params.md](sampling-params.md)。
 
 ## 一句话结论
 
@@ -38,7 +38,7 @@ CPU:           accept(N-1) + fill_bitmask(N) ─┘
 
 ## SGLang：overlap schedule × grammar
 
-> Overlap 主循环、FutureMap、关 overlap 条件的**完整机制**见 [`sglang/model-runner.md`](sglang/model-runner.md)「Overlap schedule」；本节只谈与 grammar 的交叉。
+> Overlap 主循环、FutureMap、关 overlap 条件的**完整机制**见 [`sglang/model-runner.md`](../sglang/model-runner.md)「Overlap schedule」；本节只谈与 grammar 的交叉。
 
 后端选择：`--grammar-backend` ∈ `{xgrammar, outlines, llguidance, none}`（默认 xgrammar）。
 
@@ -128,7 +128,7 @@ TensorRT-LLM 更进一步：把 grammar advance / mask gen 挂 **CUDA callback**
 
 | 关注点 | 参考实现 | lake |
 |--------|----------|------|
-| 结构化约束正确性 | xgrammar / llguidance FSM + bitmask | 可直接复用同库或等价接口；FSM 游标属请求控制态（抢占重算时须随迁或重放 token 复原，见 [`../architecture/scheduling.md`](../architecture/scheduling.md)） |
+| 结构化约束正确性 | xgrammar / llguidance FSM + bitmask | 可直接复用同库或等价接口；FSM 游标属请求控制态（抢占重算时须随迁或重放 token 复原，见 [`../architecture/scheduling.md`](../../architecture/scheduling.md)） |
 | 隐藏 CPU 开销 | forward ∥ fill_bitmask，sample 前汇合 | **应照搬**此重叠契约；worker 上报信号、gateway 管过载，不在引擎内为 grammar 降 batch |
 | device 绝对无空闲 | 未做到（async/spec 破洞） | 若要绝对零气泡：自研 GPU FSM 或 CUDA-callback-in-graph（TRT-LLM 方向），代价远高于接 xgrammar——**默认接受「mask ≪ forward」近零，不把绝对无空闲当硬 SLO** |
 | grammar 归属 | host `Req` / scheduler 侧 manager | 与 lake「语义状态在 host、device 只镜像执行必要张量」一致（见 model-runner「请求数据结构」） |

@@ -1,7 +1,7 @@
 # SGLang — 上游痛点与 lake 对照
 
 > 源码:`3rdparty/sglang`(submodule)。本文整理 **上游 GitHub issue / roadmap** 暴露的尚未解决痛点,并区分「可修工程债 / 架构债 / 物理或职责边界上难消掉的点」,供 lake 设计取舍。  
-> HiCache 机制本身见 [overview.md](overview.md) / [hicache.md](hicache.md);block 何时释放/彻底放弃见 [block-lifecycle.md](block-lifecycle.md);PD 控制机制见 [../pd-disaggregation.md](../pd-disaggregation.md);thinking 能力缺口见 [thinking-control.md](thinking-control.md)。  
+> HiCache 机制本身见 [overview.md](overview.md) / [hicache.md](hicache.md);block 何时释放/彻底放弃见 [block-lifecycle.md](block-lifecycle.md);PD 控制机制见 [../pd-disaggregation.md](../vllm_vs_sglang/pd-disaggregation.md);thinking 能力缺口见 [thinking-control.md](thinking-control.md)。  
 > **#21846 端到端设计专文**（Q2/Q3 地图、增量 PD、Host 直传、agent hint、与 lake 对照）见 [agentic-kv-roadmap.md](agentic-kv-roadmap.md)。
 >
 > **调研快照**:2026-07-17 · submodule `37f94cb7a0`(`origin/main`) · 议题以当时 open 状态为准,编号可漂移,以 GitHub 为准。#21846 专文另有 2026-07-24 核对。
@@ -218,7 +218,7 @@ PD 总路线 [#21703](https://github.com/sgl-project/sglang/issues/21703) 另缺
 | 引擎内「看懂」agent 图 | 工具时隙、subagent 在编排层(#27574 原则) | 只能做 soft hint;**智能放 router** |
 | PD×HiCache×PP×MTP×Sparse×Hybrid 全绿 | 组合正确性近似指数 | 矩阵测试 + 砍组合;不能承诺任意叠 |
 | Thinking 硬预算且不伤质量 | 结束思考是生成行为 | logits 软引导或产品接受硬切——无完美解 |
-| 启动固定 P/D 角色 | `--disaggregation-mode` 启动定角色(见 [pd-disaggregation.md](../pd-disaggregation.md)) | runtime role 在 roadmap;逐请求 PD/混部/D-direct **不是** SGLang 目标形态 |
+| 启动固定 P/D 角色 | `--disaggregation-mode` 启动定角色(见 [pd-disaggregation.md](../vllm_vs_sglang/pd-disaggregation.md)) | runtime role 在 roadmap;逐请求 PD/混部/D-direct **不是** SGLang 目标形态 |
 
 ---
 

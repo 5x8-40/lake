@@ -24,7 +24,7 @@ vLLM 是**高性能 LLM 推理引擎**:以 PagedAttention 块状管理 GPU KV ca
 
 **核心结论**:vLLM 的**计算面抽象**(paged attention、worker、model runner、connector 接口、spec decode)可直接借鉴;其**状态管理**(KV/调度/元数据进程私有、单实例)本是我们剥离的对象——但 vLLM 自 2026 起正**主动向存算分离方向演进**(见下节"KV 大规模管理演进"),原生多层 offload + KV Events 已落地,差距正在收窄而非静止。vLLM 自身已通过 `KVConnectorBase_V1` 把"外部 KV"留作插件口——Mooncake/LMCache/NIXL/FlexKV 都是它的 connector——本系统等于把这个口"扶正":KV 不再是插件可选优化,而是存储池一等公民。
 
-详见 [compute.md](compute.md)(计算层抽象与 connector 接口)、[block-lifecycle.md](block-lifecycle.md)(block 释放/驱逐/offload 生命周期)、[pain-points.md](pain-points.md)(上游痛点与 lake 对照)、[../guided-decoding.md](../guided-decoding.md)(structured output × async scheduling 同步气泡)、[../sampling-params.md](../sampling-params.md)(采样参数与 spec×min_p/logit_bias)、[../scheduler-worker-interface.md](../scheduler-worker-interface.md)(`SchedulerOutput` 字段全集 × SGLang 对照)。
+详见 [compute.md](compute.md)(计算层抽象与 connector 接口)、[block-lifecycle.md](block-lifecycle.md)(block 释放/驱逐/offload 生命周期)、[pain-points.md](pain-points.md)(上游痛点与 lake 对照)、[../guided-decoding.md](../vllm_vs_sglang/guided-decoding.md)(structured output × async scheduling 同步气泡)、[../sampling-params.md](../vllm_vs_sglang/sampling-params.md)(采样参数与 spec×min_p/logit_bias)、[../scheduler-worker-interface.md](../vllm_vs_sglang/scheduler-worker-interface.md)(`SchedulerOutput` 字段全集 × SGLang 对照)。
 
 ## KV 大规模管理演进(Q3 2026 roadmap + 已落地代码)
 

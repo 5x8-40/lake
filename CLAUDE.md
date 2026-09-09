@@ -103,7 +103,7 @@ docs/
 4. **[`docs/research/references.md`](docs/research/references.md)**:submodule 清单与主题分类各加一条。
 5. **[`docs/research/distributed-models.md`](docs/research/distributed-models.md)**:总表加行 + 四类归纳归类。
 6. **[`README.md`](README.md)**:目录结构中 `research/` 与 `3rdparty/` 两清单同步。
-7. 相关专题文档按需补充(HBM/卸载 → `hbm-tier-and-offload.md`;PD → `pd-disaggregation.md`),相关项目文档加反向链接。
+7. 相关专题文档按需补充(HBM/卸载 → `hbm-tier-and-offload.md`;PD → `vllm_vs_sglang/pd-disaggregation.md`),相关项目文档加反向链接。
 8. 文档相对链接**不得**深入 `3rdparty/` 内部(链接检查脚本会拒);用语简洁,术语与既有文档一致。
 
 ## reference 强制查阅规则（硬性，每次都做）
@@ -119,9 +119,9 @@ docs/
    - block 生命周期(何时释放/降层/彻底放弃,现状 vs 未来) → `docs/research/sglang/block-lifecycle.md`
    - 上游 issue/roadmap 痛点与 lake 对照 → `docs/research/sglang/pain-points.md`
    - **Agentic 分布式 KV 总设计**(SGLang #21846：增量 PD、Host 直传、UnifiedRadix、agent hint) → `docs/research/sglang/agentic-kv-roadmap.md`
-   - **Guided / structured decoding**(xgrammar 库边界、overlap/async 同步、spec+grammar) → `docs/research/guided-decoding.md`
-   - **Sampling 参数对照**(SGLang × vLLM;`n`≠beam;spec 兼容;penalty 空泡;状态归属与前缀共享) → `docs/research/sampling-params.md`
-   - **Scheduler→Worker 字段**(vLLM `SchedulerOutput` × SGLang `ScheduleBatch`/`ForwardBatch`、架构根因) → `docs/research/scheduler-worker-interface.md`
+   - **Guided / structured decoding**(xgrammar 库边界、overlap/async 同步、spec+grammar) → `docs/research/vllm_vs_sglang/guided-decoding.md`
+   - **Sampling 参数对照**(SGLang × vLLM;`n`≠beam;spec 兼容;penalty 空泡;状态归属与前缀共享) → `docs/research/vllm_vs_sglang/sampling-params.md`
+   - **Scheduler→Worker 字段**(vLLM `SchedulerOutput` × SGLang `ScheduleBatch`/`ForwardBatch`、架构根因) → `docs/research/vllm_vs_sglang/scheduler-worker-interface.md`
    - 跨实例复用 + 多存储后端 + 内容寻址 + 控制器元数据 + Rust 裸设备 I/O → `docs/research/lmcache/{overview,sharing-and-backends}.md`
    - RDMA 零拷贝传输 + 多 NIC 聚合 + 对象级 KV store + 分配策略 + HA → `docs/research/mooncake/{overview,transfer-engine,kv-store}.md`
    - **昇腾 KV 对象池**(MemCache):Meta/Local、HBM/DRAM/SSD、MemFabric OneCopy → `docs/research/memcache/{overview,architecture,pain-points}.md`（与 Mooncake store 同层对照；非 radix 控制面）

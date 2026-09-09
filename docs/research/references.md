@@ -29,11 +29,11 @@
   - TACO 多层 KV 卸载:引擎持有 GPU 槽,FlexKV 索引 CPU/SSD/REMOTE,IPC 映射 HBM 做 D2H/H2D;vLLM/SGLang/Dynamo/TRT 均有 connector。
 - **kvcached** → [`kvcached/`](kvcached/):[总览](kvcached/overview.md)
   - OVG(Prism/OSDI 2026)GPU 虚拟内存弹性 KV:VA/物理页解耦、同卡多实例超卖显存(无 daemon、驱动仲裁)、kvctl 硬配额、zero page 冷启动。
-- **Guided / structured decoding** → [`guided-decoding.md`](guided-decoding.md)
+- **Guided / structured decoding** → [`guided-decoding.md`](vllm_vs_sglang/guided-decoding.md)
   - SGLang × vLLM:xgrammar/llguidance 仅 GPU apply、FSM 仍在 CPU;overlap/async 近零 vs spec+grammar / pending token 的同步气泡;与 lake 重叠契约及抢占时 FSM 游标交接。
-- **Sampling 参数** → [`sampling-params.md`](sampling-params.md)
+- **Sampling 参数** → [`sampling-params.md`](vllm_vs_sglang/sampling-params.md)
   - SGLang × vLLM 字段对照;`n`≠beam;spec 兼容矩阵;penalty 空泡与 V2;采样状态归属(不进 KV 池)与 `n` 前缀共享。
-- **Scheduler→Worker 接口** → [`scheduler-worker-interface.md`](scheduler-worker-interface.md)
+- **Scheduler→Worker 接口** → [`scheduler-worker-interface.md`](vllm_vs_sglang/scheduler-worker-interface.md)
   - vLLM `SchedulerOutput` 与 SGLang `ScheduleBatch`/`ForwardBatch` 字段全集、差异与架构根因;供 lake `SchedulerOutput` D1 对照。
 
 与本系统逐层对应、借鉴点、关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。

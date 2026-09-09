@@ -15,9 +15,9 @@
 - [`tensorcast/`](tensorcast/) — TensorCast:[总览](tensorcast/overview.md) · [运行时架构](tensorcast/architecture.md) · [论文实验详录](tensorcast/evaluation.md) · 张量状态基础设施层(权重/KV/checkpoint 抽离进程 + Global Store/Store Daemon + CUDA IPC + RDMA/TCP P2P + policy 放置契约 + binding 热替换)
 - [`flexkv/`](flexkv/) — FlexKV(TACO):[总览](flexkv/overview.md) · [架构与 HBM](flexkv/architecture.md) · [痛点与 lake 对照](flexkv/pain-points.md) · 引擎旁 CPU/SSD/远端卸载(GPU 由引擎持有,IPC 映射)
 - [`kvcached/`](kvcached/) — kvcached(OVG):[总览](kvcached/overview.md) · GPU 虚拟内存化弹性 KV(VA/物理页解耦、跨进程显存超卖、kvctl 配额、zero page 冷启动;无 daemon、不分层、不管前缀索引)
-- [guided-decoding.md](guided-decoding.md) — **Guided / structured decoding**(SGLang × vLLM):xgrammar/llguidance 库边界、overlap/async 下能否消同步、spec+grammar 硬缺口
-- [sampling-params.md](sampling-params.md) — **Sampling 参数对照**(SGLang × vLLM):核心/独有字段、`n`≠beam、spec 禁 min_p/logit_bias；penalty 空泡与 V2；采样状态归属 / Spec 兼容矩阵 / `n` 与前缀 KV 共享
-- [scheduler-worker-interface.md](scheduler-worker-interface.md) — **Scheduler→Worker 字段全集**(SGLang × vLLM):`SchedulerOutput` vs `ScheduleBatch`/`ForwardBatch`、差异表、架构根因、对 lake D1 含义
+- [guided-decoding.md](vllm_vs_sglang/guided-decoding.md) — **Guided / structured decoding**(SGLang × vLLM):xgrammar/llguidance 库边界、overlap/async 下能否消同步、spec+grammar 硬缺口
+- [sampling-params.md](vllm_vs_sglang/sampling-params.md) — **Sampling 参数对照**(SGLang × vLLM):核心/独有字段、`n`≠beam、spec 禁 min_p/logit_bias；penalty 空泡与 V2；采样状态归属 / Spec 兼容矩阵 / `n` 与前缀 KV 共享
+- [scheduler-worker-interface.md](vllm_vs_sglang/scheduler-worker-interface.md) — **Scheduler→Worker 字段全集**(SGLang × vLLM):`SchedulerOutput` vs `ScheduleBatch`/`ForwardBatch`、差异表、架构根因、对 lake D1 含义
 - [nvidia-cmx.md](nvidia-cmx.md) — **NVIDIA CMX**：目标栈、公开成熟度、VAST G3/G3.5 边界及 lake 映射；模型字节、容量和 Prefill KV 加载计算见 [`tools/cmx-sim/`](../../tools/cmx-sim/)
 - [agentic-cache-workload.md](agentic-cache-workload.md) — **Agentic cache workload**：匿名 Cursor 用量、公开 request 级 trace（Codex × SWE-bench Pro / AgentX）、provider 留存、File Library 边界及仿真输入
 - [distributed-models.md](distributed-models.md) — **分布式模型对比**：各项目拓扑/元数据权威/同步机制/一致性分级/HA/扩展性总表与四类归纳；各 overview 有「分布式模型」详节
@@ -413,7 +413,7 @@ Dynamo 跨 **P4(存储)** 与 **控制面(选路/通信)**,不进上面"抄源�
 
 跨多个 submodule 的机制专题(非单项目分目录):
 
-- **PD 分离的控制机制**:vLLM(KVConnector 插件 + 外部 proxy)vs SGLang(固定角色 + 内建队列状态机)对比——角色划分、配对握手、KV 传输推进、失败处理,及与 lake"KV 归池 + 逐请求选模式"的差异。见 [`pd-disaggregation.md`](pd-disaggregation.md)。
+- **PD 分离的控制机制**:vLLM(KVConnector 插件 + 外部 proxy)vs SGLang(固定角色 + 内建队列状态机)对比——角色划分、配对握手、KV 传输推进、失败处理,及与 lake"KV 归池 + 逐请求选模式"的差异。见 [`pd-disaggregation.md`](vllm_vs_sglang/pd-disaggregation.md)。
 - **HBM 归属与 KV 卸载**:谁发 GPU 槽、GPU 是否编进传输图、Dynamo G1 句柄 vs 池；覆盖 HiCache / vLLM offload / LMCache / KVBM / FlexKV / UCM / Mooncake store+TE / MemCache / TileRT / TensorCast / CMX / kvcached。见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 - **分布式模型**:全部参考项目的拓扑/元数据权威/同步机制/一致性分级/HA/扩展性对比,四类归纳(中心权威星型/分片租约/事件流最终一致/弱协调)与对 lake 的印证警示。见 [`distributed-models.md`](distributed-models.md)。
 
