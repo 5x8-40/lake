@@ -66,6 +66,8 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 
 **超卖的适用边界**：单模型、同构流量下，单卡多实例通常不划算——权重在 HBM 里要存 N 份（KV 弹性帮不了权重），流量被拆成更小的 batch 反而拉低 decode 效率；单实例 continuous batching + chunked prefill 本就能吃下并发，调配置（batch 上限、max_len、图捕获）即可。官方 3×8B demo 是机制演示，不是推荐形态。单模型多实例真正成立的例外：① 配置形态异构（不同 max_model_len / spec 开关 / 量化 / 图预算，一个实例无法同时是两种形态）；② SLO 隔离（长 prefill 防队头阻塞）；③ 灰度/滚动升级同卡并存；④ 故障隔离；⑤ 同模型多租户要硬配额（特性 4）。超卖的主战场是**多模型混部**（权重不同，本来就必须多实例，静态切分浪费的是彼此的闲置）与**弹性伸缩**（占用随负载走，见「想象空间」第 2 条）。
 
+多模型混部的收益拆开看（回应「权重也要占 HBM」）：**权重是常驻成本，KV 是变动成本**。N 个活跃模型的权重就是 N 份，弹性帮不了；收益来自三处——① KV 削峰错谷：各模型按自身峰值静态预留 KV，共享后按同时刻总需求供给，峰值不同时到来就有差值可赚；② **挂载集 ≫ 活跃集**：闲置模型权重 sleep 到 DRAM 或卸载，权重只占活跃模型的 HBM，一张卡可挂几十冷模型、同时只醒几个（serverless 多模型的核心）；③ 长尾聚合：各自 QPS 低、单独占卡浪费的模型混部摊薄。反过来，若所有模型常驻且全热，收益只剩 KV 弹性部分，权重 N 份无法省。LoRA 变体是收益最大化的特例：base 权重共享，每个模型只多一个 adapter。
+
 ### 无 daemon 的协调
 
 ![协调机制](figures/coordination.svg)
@@ -189,7 +191,7 @@ kvcached 和 lake 是同一思想在两个尺度：kvcached 把 OS 虚拟内存�
 ### 对 lake 的设计空间（要自己设计/验证）
 
 5. **lake L0 的落地形态：VA 归引擎、物理页归池**。lake 断言「L0 HBM 归池」，但一直没回答：引擎张量要稳定地址（CUDA graph），池要按需供给物理页，怎么兼得？kvcached 给了工程答案——虚拟地址段归引擎（地址固定），物理页归分配者（按需 map/unmap）。lake 可把 PageAllocator 的角色换成池 agent（Rust）：worker 启动预留 VA 段，池 agent 按放置决策供页，位置视图记录块→（节点，页）映射。这把存算分离推进到最内层：HBM 不再是 worker 私有资源，而是池按页供给的。
-6. **F4 按层流水恢复**。执行节点故障后，恢复实例的 VA 段立即可用，物理页随传输到达逐页映射。但 decode 的启动单位不是「页」而是「层」：一步 attention 要读该请求每一层的全部 KV（softmax 覆盖完整前缀），一层内的 KV 又跨多个 2MB 页——「第一页到达」连一层都不够。正确机制是**按层流水**：forward 按层顺序执行，第 1 层的全部页就位即可开始算，算第 i 层时第 i+1 层的页在传——恢复启动等待从「整段传完」降到「第一层就位」，总恢复时间从 传输+计算 串行变为 max（传输， 计算） 重叠。这正是 vLLM layer-wise save/load 的标准做法（`start_load_kv` / `wait_for_layer_load` / `save_kv_layer`，见 [`../vllm_vs_sglang/pd-disaggregation.md`](../vllm_vs_sglang/pd-disaggregation.md)）。前提：Transfer Bus 必须按 decode 消费顺序（层序）排传输序。多请求恢复还有另一层粒度：KV 已齐的请求先 decode，不等未齐的。
+6. **F4 恢复：值钱的粒度是请求级，不是层流水**。先纠正一个直觉：恢复方向（池 → 恢复节点）做按层流水收益约等于零——decode 是访存 bound，每层计算（从 HBM 读该层 KV+权重，TB/s 级）远快于每层传输（网络/NVMe，几十 GB/s 级），流水线被传输占满、消费者挨饿，重叠只省下约一个 decode step（几十 ms），相对秒级传输可忽略。layer-wise 传输的正确归宿是 **P→D**：生产者是 compute-bound 的 prefill，每层 KV 算完即发，传输藏进计算阴影，D 在 P 结束后几乎立即开 decode——vLLM/Mooncake 的标准做法（`start_load_kv` / `wait_for_layer_load` / `save_kv_layer`，见 [`../vllm_vs_sglang/pd-disaggregation.md`](../vllm_vs_sglang/pd-disaggregation.md)），lake 的 PD 分离模式已覆盖。F4 恢复真正值钱的是另外两点：① **请求级粒度**——整节点故障要恢复几十上百个请求，KV 齐的请求先 decode，不等未齐的，首请求恢复时间从「全部传完」降到「该请求传完」；② **与 kvcached 组合的弹性映射**——恢复实例的 VA 段立即可用，物理页随传输到达逐页映射，无需先整段预留/就位，对 HBM 紧张的恢复节点有用。前提：Transfer Bus 按请求优先级与消费序排传输序。
 7. **权重 VMM 化 / MoE 专家懒加载**。kvcached 只虚拟化 KV；同一机制可用于权重：MoE 专家 VA 预留，热专家常驻物理页，冷专家释放（字节在 DRAM/SSD，用时换入），单卡逻辑容量超物理容量。与 TensorCast 权重 artifact 化、lake Weight Cache 同方向。风险也最大：专家切换在 decode 路径上，换入延迟直接进 ITL，必须按路由分布做预测性预取。
 
 ### 小机制借鉴（拿来就用）
@@ -254,7 +256,7 @@ kvcached 和 lake 是同一思想在两个尺度：kvcached 把 OS 虚拟内存�
 
 - 上游：[github.com/ovg-project/kvcached](https://github.com/ovg-project/kvcached)；官网 [kvcached.org](https://kvcached.org/)
 - 论文：
-  - Prism（OSDI 2026，[arXiv 2505.04021](https://arxiv.org/abs/2505.04021)）：多 LLM 服务系统论文——在 kvcached 弹性 KV 之上做两级调度（集群级模型编排 + 节点级显存共享），官方报 >2× 成本节省、3.3× SLO 达成率提升。kvcached 是其开源底座。
-  - GPU OS 愿景（[arXiv 2508.08448](https://arxiv.org/abs/2508.08448)）：立场文——GPU 单任务模式在 LLM 时代不可持续，主张像 CPU OS 一样做 GPU 资源管理与共享层；kvcached 是这一愿景在显存/KV 维度的落地。
+  - Prism（OSDI 2026，[arXiv 2505.04021](https://arxiv.org/abs/2505.04021)）：多 LLM 服务系统论文——多个**不同**模型（非单模型多实例）共享 GPU，在 kvcached 弹性 KV 之上做两级调度（集群级模型编排 + 节点级显存共享），官方报 >2× 成本节省、3.3× SLO 达成率提升。kvcached 是其开源底座。
+  - GPU OS 愿景（[arXiv 2508.08448](https://arxiv.org/abs/2508.08448)）：立场文——论证 GPU 单任务模式在 LLM 时代不可持续：显存成为瓶颈（模型变大 + KV 等中间状态膨胀）、显存用量动态不可预测（自回归生成，同样输入输出长度都不同，静态预留只能按峰值）、负载多样化（推理/训练/微调/复合 AI 流水线要共存）；主张像 CPU OS 一样做 GPU 资源管理与共享层。kvcached 是这一愿景在显存/KV 维度的落地。
 - 本仓：`3rdparty/kvcached` @ `60cad94`
 - 对照：[`../hbm-tier-and-offload.md`](../hbm-tier-and-offload.md)、[`../dynamo/overview.md`](../dynamo/overview.md)、[`../kvcr/overview.md`](../kvcr/overview.md)、[`../sglang/elastic-memory-pool.md`](../sglang/elastic-memory-pool.md)
