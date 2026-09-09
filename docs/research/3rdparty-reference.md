@@ -254,7 +254,7 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 - TileRT **核闭源**、钉 8×B200、公开树无 radix/分层池/`bs>1`——**不是**存储面或通用计算层蓝图。
 - PD 是 **vLLM block_id → 单槽 inject**；lake 是池权威 + 混合执行（含 D-direct）。
 - 过载 429 在小路由器内；lake 过载归 gateway。
-- 生态补位:[kvcached](kvcached/overview.md)(GPU VMM 页弹性)与 Dynamo/KVCR 正交——KVCR 不碰 GPU,kvcached 只管 GPU 页映射;组合形态与 VMM×RDMA 待解问题见该文 §4。
+- 生态补位:[kvcached](kvcached/overview.md)(GPU 虚拟内存页弹性)与 Dynamo/KVCR 正交——KVCR 不碰 GPU,kvcached 只管 GPU 页映射;组合形态与「物理页重映射 vs RDMA 注册」待解问题见该文 §4。
 
 ## 9. FlexKV → 引擎旁 CPU/SSD/远端卸载
 
@@ -282,13 +282,13 @@ FlexKV 与 **LMCache / UCM 同层**（引擎 connector），本机索引接近 *
 
 源码入口:`3rdparty/kvcached/`(`csrc/` + `kvcached/`)。深度分析见 [`kvcached/`](kvcached/)。HBM 归属对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 
-kvcached 与其他参考项目不在同一层:不分层、不索引前缀、不做跨节点,只做一件事——把 GPU KV 张量的虚拟地址与物理页解耦(cuMem VMM),让同卡多引擎实例弹性共享显存。对 lake 的意义在 L0:池 agent 管理 HBM 物理页时,这是唯一在真实引擎(vLLM/SGLang)上验证过的工程闭环。
+kvcached 与其他参考项目不在同一层:不分层、不索引前缀、不做跨节点,只做一件事——把 GPU KV 张量的虚拟地址与物理页解耦(CUDA 虚拟内存管理),让同卡多引擎实例弹性共享显存。对 lake 的意义在 L0:池 agent 管理 HBM 物理页时,这是唯一在真实引擎(vLLM/SGLang)上验证过的工程闭环。
 
 ### 借鉴点
 
 | kvcached 设计 | 我们对应 | 说明 |
 |---------------|----------|------|
-| VA 预留 + 页级 map/unmap + zero page COW | L0 物理页按需分配 | 引擎无感(张量地址稳定,CUDA graph 安全);冷启动物理零占用 |
+| VA 预留 + 页级映射/解映射 + zero page 懒分配 | L0 物理页按需分配 | 引擎无感(张量地址稳定,CUDA graph 安全);冷启动物理零占用 |
 | 热页缓存(min5/max10)+ 映射失败回滚 | L0 agent 分配快速路径 | 微秒级 alloc;无全局互斥时的兜底 |
 | kvctl→shm→100ms 轮询 resize(revision 状态机) | 池配额下发通道 | 带外、不占请求路径;applied/deferred/stale/conflict 语义可直接用 |
 | `get_page_occupancy` 页级存活块统计 | L0「引用数>0 冻结」 | 页可否 unmap 的判定依据 |
@@ -296,9 +296,9 @@ kvcached 与其他参考项目不在同一层:不分层、不索引前缀、不�
 
 ### 关键差异
 
-- kvcached 无全局视图(shm 只记账、驱动仲裁物理页、TOCTOU 靠 headroom);lake L0 位置归存储控制面权威。
+- kvcached 无全局视图(shm 只记账、物理页先到先得、并发超分靠 5% 余量兜底);lake L0 位置归存储控制面权威。
 - kvcached 不知页内 KV 身份(索引在引擎 APC);lake L0 slot 有块级身份,支撑 D-direct 与 F4。
-- VMM 页重映射与 RDMA 注册共存未解(PD 仅验证 NixlConnector);lake Transfer Bus 需前置解决。
+- 物理页重映射与 RDMA 注册的共存未解(PD 仅验证 NixlConnector);lake Transfer Bus 需前置解决。
 - 弹性止步单机单卡;lake L0–L3 统一编址。
 
 ## 代码级复用策略（按模块，互不替代）

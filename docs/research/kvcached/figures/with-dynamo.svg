@@ -22,7 +22,7 @@
   <text x="272" y="292" font-size="9" fill="#059669">DRAM / SSD / 对象存储</text>
   <path d="M244,280 L256,226" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="4 3"/><circle cx="250" cy="252" r="7" fill="#dc2626"/><text x="247" y="256" font-size="9" fill="#ffffff">!</text>
   <text x="80" y="326" font-size="9" fill="#6b7280">引擎管 KV 语义 · kvcached 管页映射 · KVCR 管 L2+ 卸载</text>
-  <text x="80" y="348" font-size="10" fill="#dc2626">待解：VMM 页重映射 与 RDMA 注册共存</text>
+  <text x="80" y="348" font-size="10" fill="#dc2626">待解：物理页可重映射 × RDMA 注册需固定</text>
   <text x="80" y="368" font-size="10" fill="#6b7280">kvcached 不产生位置元数据，跨节点查找靠 Router</text>
 
   <rect x="520" y="168" width="380" height="216" rx="6" fill="#f9fafb" stroke="#e5e7eb"/>

@@ -23,8 +23,8 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 |---|------|------|----------|
 | 1 | 跨进程显存超卖 | 成立 | VA 私有 + 物理页按需映射，闲置页经驱动流转 |
 | 2 | 独立 daemon 全局统筹 | 与宣传不符 | 无 daemon；进程内库 + /dev/shm 记账 + 驱动仲裁 |
-| 3 | 零物理分配冷启动 | 成立（仅 KV） | VA 预留 + zero page（COW），启动物理占用约一页 |
-| 4 | 多租户硬配额 | 成立（有边界） | 硬在分配拒绝；in-use 页不能强收 |
+| 3 | 零物理分配冷启动 | 成立（仅 KV） | VA 预留 + 全段先指向同一 zero page，启动物理占用约一页 |
+| 4 | 多租户硬配额 | 成立（有边界） | 硬在分配拒绝；在用页不能强收 |
 
 ### 2.1 跨进程显存超卖：成立
 
@@ -32,7 +32,7 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 
 - 每个实例启动时 `cuMemAddressReserve` 一段私有 VA（`csrc/ftensor.cpp::alloc_virtual_mem`）。KV block 落到 2MB 页；页被使用时才 `cuMemCreate`+`cuMemMap` 物理页（`csrc/page.cpp::GPUPage`），页全空时 unmap+release 还给驱动（`csrc/page_allocator.cpp::PageAllocator::free_page`）。
 - 虚拟容量不因他实例占用而折减：vLLM 侧调度器可见容量固定为 `总显存 × gpu_memory_utilization`（`integration/vllm/patches.py::_get_virtual_kv_capacity_bytes`）。同卡每个实例都可按 90% 规划自己的虚拟 KV 空间。
-- 实例 A 空闲时物理页回到驱动空闲池；实例 B 映射前查 `cudaMemGetInfo`（默认留 5% headroom）后即可使用。
+- 实例 A 空闲时物理页回到驱动空闲池；实例 B 映射前先查全卡剩余物理显存，且默认最多只用总量的 95%（留 5% 安全余量）。
 - 分配性能：后台线程维持 5–10 页已映射缓存（`KVCACHED_MIN/MAX_RESERVED_PAGES`），分配快速路径为微秒级。
 - 前缀缓存与弹性共存：被 APC 引用的页保持映射，按页统计存活块（`KVCacheManager::get_page_occupancy`）；APC 占用上界由 `KVCACHED_MAX_CACHED_TOKENS` 控制。
 
@@ -49,17 +49,17 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 名字是 daemon，实现不是。全局协调由四件套完成，没有中心进程：
 
 1. 引擎进程内的 C++ 库（PageAllocator/FTensorAllocator）自决映射；
-2. 每进程一段 `/dev/shm` 记账（flock+mmap，三字段 total/used/prealloc，`csrc/inc/mem_info_tracker.hpp::MemInfoTracker`）；
+2. 每进程一段 `/dev/shm` 共享内存做记账（文件锁保护，就三个数：上限、已用、预分配，`csrc/inc/mem_info_tracker.hpp::MemInfoTracker`）；
 3. kvctl CLI 带外读写这些段（`kvcached/cli/kvctl.py`）；
 4. CUDA 驱动仲裁物理页：先 `cuMemCreate` 先得。
 
-防 OOM 也是分布式的：各进程映射前各自查全卡空闲，加 headroom，失败回滚。两个进程同时看到空闲、同时映射的竞态（TOCTOU）存在，没有全局互斥。
+防 OOM 也是各进程自理：映射前自己查一次全卡空闲显存，并且默认最多用物理总量的 95%。但「查」和「用」之间没有全局锁——两个进程可能同时查到空闲、同时映射，合计超出物理容量。真发生时靠这 5% 余量兜底；还放不下，这次映射就失败回滚（页退回空闲列表，分配报错）。
 
 `controller/` 是示例级前端：OpenAI 兼容路由 + 流量监控 + sleep 管理（tmux 编排），管「请求发给谁、闲了睡」，不管显存分配。
 
 ### 2.3 零物理分配冷启动：成立（仅 KV）
 
-- 启动时整段 VA 先全部映射到同一个 zero page（2MB），物理占用约一页（`csrc/ftensor.cpp::FTensor::init_with_zero_`）。首次使用某页时才换成真实物理页（`FTensor::map`），即 COW。
+- 启动时整段 VA 先全部指向同一个物理页（zero page，2MB），物理占用约一页（`csrc/ftensor.cpp::FTensor::init_with_zero_`）。首次使用某页时才把它改指到真实物理页（`FTensor::map`）。
 - 省掉的是 KV 物理预分配，以及「按空闲显存反推 KV 容量」的 profiling 依赖；权重加载、CUDA graph 不省。
 - VA 稳定、张量地址不变，物理页重映射对 kernel 和 CUDA graph 透明。这是这条路线成立的关键性质。
 - 完整的 serverless 拉起 = kvcached（KV 零占用）+ 引擎 sleep/wake（权重）+ controller 按流量唤醒（`examples/06_serverless_serving`）。
@@ -68,7 +68,7 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 
 链路：`kvctl limit <实例> <大小>` → 写该实例 shm 段的 total 字段 → 引擎内线程 100ms 轮询发现变化（`PageAllocator::resize_watcher`）→ `resize()` 收缩或扩张可用页。
 
-- 收缩只能回收空闲页；in-use 高于新限额时记为 deferred，等引擎自己释放。不能强收在用的页。
+- 收缩只能回收空闲页；在用页高于新限额时记为 deferred（延迟生效），等引擎自己释放。不能强收在用的页。
 - 「硬」体现在分配拒绝：可用页收缩后，超限分配直接失败，引擎表现为 KV 满。单个长请求吃不光整卡。
 - 配额上限是启动时定的虚拟容量；粒度是单个引擎进程组；并发写用 revision 防冲突（`kvcached/control.py::set_instance_memory_limit`，状态：applied/deferred/stale/conflict）。
 
@@ -100,7 +100,7 @@ controller/（示例前端：路由 + sleep 管理）
 
 ### 4.2 机制级借鉴
 
-3. **碰 GPU 的正确层次**。KVBM 被 sunset 的原因之一是直接管理 GPU 侧 block 布局、和引擎抢资源（见 [`../kvcr/overview.md`](../kvcr/overview.md)）。kvcached 示范了更安全的层次：只管页映射，不碰 KV 语义。Dynamo 若重做 GPU 侧弹性，应在 VMM 页层做，不在 block 层做。
+3. **碰 GPU 的正确层次**。KVBM 被官方放弃的原因之一是直接管理 GPU 侧 block 布局、和引擎抢资源（见 [`../kvcr/overview.md`](../kvcr/overview.md)）。kvcached 示范了更安全的层次：只管页映射，不碰 KV 语义。Dynamo 若重做 GPU 侧弹性，应在虚拟内存页层做，不在 block 层做。
 4. **页分配器工程细节**。2MB 页、5–10 页热缓存、微秒级分配路径、映射失败回滚。任何页粒度 GPU 分配器都用得上。
 5. **活进程改配额的协议**。带外写 shm + 100ms 轮询 + revision 状态机（applied/deferred/stale/conflict）。不占请求路径，Dynamo/KVCR 做动态限额可照搬。
 6. **页级占用统计**。`get_page_occupancy` 按页统计存活块，决定页能否释放。KVCR 做 GPU→DRAM 卸载的驱逐粒度判断时需要同类信息。
@@ -108,8 +108,8 @@ controller/（示例前端：路由 + sleep 管理）
 
 ### 4.3 要先解的问题
 
-8. **VMM × RDMA 注册**。NIXL/KVCR 直传要注册显存；页 unmap/remap 会让注册失效，pin 住又失去弹性。kvcached 自己的 PD 只验证了 NixlConnector 一个（`docs/PD_DISAGGREGATION.md`）。可选路线：按页注册/注销、传输期 pin、整段 VA 预注册 + 物理页池化。
-9. **多进程映射无互斥**。TOCTOU 靠 headroom 缓解。集群级部署时，这个责任更适合交给控制面（lake 的做法），而不是各进程自查。
+8. **显存重映射与 RDMA 注册冲突**。NIXL/KVCR 直传前要先注册显存，注册期间物理页不能动；kvcached 的弹性恰恰来自物理页随时解映射、重映射——钉住就失去弹性，不钉注册就失效。kvcached 自己的 PD 只验证了 NixlConnector 一个（`docs/PD_DISAGGREGATION.md`）。可选路线：按页注册/注销、传输期间临时钉住、整段 VA 预注册 + 物理页池化。
+9. **多进程映射无互斥**。「查空闲」和「映射」是两步，中间没有全局锁，并发时可能合计超分；kvcached 靠 5% 安全余量和失败回滚兜底。集群级部署时，这个责任更适合交给控制面统一记账（lake 的做法），而不是各进程自查。
 
 ## 5. 对照
 
@@ -131,18 +131,18 @@ controller/（示例前端：路由 + sleep 管理）
 
 值得参考：VMM 页弹性在真实引擎上的工程闭环（TP 广播、布局约束、async 调度下 unmap 前先同步）；zero page COW；带外配额通道；页级占用统计（对应 lake「引用数>0 冻结」）。
 
-不照搬：kvcached 无全局视图、不知页内 KV 身份、RDMA 是后补、弹性止步单机单卡。lake 的 L0 归池要求控制面权威位置、块级身份，且 Transfer Bus 要在设计时前置解决 VMM×RDMA 共存（见 [`../hbm-tier-and-offload.md`](../hbm-tier-and-offload.md) §5）。
+不照搬：kvcached 无全局视图、不知页内 KV 身份、RDMA 是后补、弹性止步单机单卡。lake 的 L0 归池要求控制面权威位置、块级身份，且 Transfer Bus 要在设计时前置解决「物理页重映射 vs RDMA 注册」的共存（见 [`../hbm-tier-and-offload.md`](../hbm-tier-and-offload.md) §5）。
 
 ## 6. 代码索引
 
 | 机制 | 文件:符号 |
 |------|-----------|
 | VA 预留（2MB 对齐） | `csrc/ftensor.cpp::alloc_virtual_mem` |
-| zero page COW 初始化 | `csrc/ftensor.cpp::FTensor::init_with_zero_` |
+| zero page 初始化（全段先指向同一页） | `csrc/ftensor.cpp::FTensor::init_with_zero_` |
 | 页级 map（unmap zero → cuMemCreate → cuMemMap） | `csrc/ftensor.cpp::FTensor::map`、`csrc/page.cpp::GPUPage` |
 | CUDA/HIP VMM 原语封装 | `csrc/inc/gpu_vmm.hpp::gpu_vmm::{address_reserve,mem_create,mem_map,mem_unmap,mem_release}` |
 | 页生命周期 + 热页缓存（min5/max10） | `csrc/page_allocator.cpp::PageAllocator::{alloc_page,free_page,prealloc_worker}` |
-| 物理余量自查（0.95 headroom） | `csrc/page_allocator.cpp::PageAllocator::get_avail_physical_pages` |
+| 物理余量自查（默认最多用 95% 显存） | `csrc/page_allocator.cpp::PageAllocator::get_avail_physical_pages` |
 | 配额 resize + 100ms 轮询 | `csrc/page_allocator.cpp::PageAllocator::{resize,resize_watcher}` |
 | shm 记账（flock+mmap） | `csrc/inc/mem_info_tracker.hpp::MemInfoTracker/RwLockedShm` |
 | block→page、APC 页占用 | `kvcached/kv_cache_manager.py::KVCacheManager.{alloc,free,get_page_occupancy}` |

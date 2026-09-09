@@ -362,7 +362,7 @@ KVBM offload 路径:`GPU → CPU → SSD → 远端存储(S3/Azure blob)`,1.0 �
 
 **对 lake 的影响**:`rust/vendor/` vendor 的 kvbm-logical 上游已冻结(见 [`../../architecture/kv-virtual-memory.md`](../../architecture/kv-virtual-memory.md));v2/KVCR 的演进方向(引擎原生布局 + router hint + P2P)与 vendor 拷贝无关,不影响其正确性,但后续不会再有上游修复可同步。
 
-> 外部对照:[kvcached](../kvcached/overview.md)(GPU VMM 弹性 KV)走了另一条"碰 GPU"的路线——不管 block 布局,只在 VMM 页层做 map/unmap,引擎无感。对比可见 KVBM 的教训不在"碰 GPU"本身,而在碰的层次(block 布局 vs 页映射)。
+> 外部对照:[kvcached](../kvcached/overview.md)(GPU 虚拟内存弹性 KV)走了另一条"碰 GPU"的路线——不管 block 布局,只在虚拟内存页层做映射/解映射,引擎无感。对比可见 KVBM 的教训不在"碰 GPU"本身,而在碰的层次(block 布局 vs 页映射)。
 
 ## 运行时与通信(transports / discovery)
 
