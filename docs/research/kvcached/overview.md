@@ -64,9 +64,7 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 
 （图源：`3rdparty/kvcached/assets/ttft_results/ttft_mean.svg`）
 
-**超卖的适用边界**：单模型、同构流量下，单卡多实例通常不划算——权重在 HBM 里要存 N 份（KV 弹性帮不了权重），流量被拆成更小的 batch 反而拉低 decode 效率；单实例 continuous batching + chunked prefill 本就能吃下并发，调配置（batch 上限、max_len、图捕获）即可。官方 3×8B demo 是机制演示，不是推荐形态。
-
-注意「需要多实例」不等于「需要同卡超卖」。形态异构（典型如投机采样分流：spec 是引擎级配置、不能按请求开关，低 batch 白捡 2–3 倍 ITL、高 batch 纯浪费，两种最优形态互斥）、SLO 隔离、灰度、故障隔离都是多实例的理由，但实例可以放不同卡、各自扩缩容，与同卡超卖无关——故障隔离甚至必须不同卡。单模型真正需要同卡超卖的只有**零头场景**：某形态流量不足一卡（如只占 5% 流量的延迟形态），独占一卡浪费，与同卡其他形态/模型共享；配合同模型权重共享（见下）时成本最低。
+### 收益与适用边界
 
 **收益（以 Prism 论文的生产 trace 与实验为准）**：目标负载是**模型动物园**——平台挂载大量模型（含低频但必需的长尾），热度倾斜且快速漂移。生产 trace 的两个实测特征决定收益来源：
 
@@ -75,7 +73,9 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 
 kvcached 的定位是把两种共享统一到一个机制：从闲置模型回收显存，既可换入权重（时间共享），也可缩 KV 预留（空间共享），页粒度、毫秒级、无需重启，甚至可以只对同卡模型的一个子集做时间共享。论文明确与扩缩容**正交**：扩缩容调副本数，Prism 管副本/模型之间的显存共享，两者组合使用。实测：**>2× 成本节省、3.3× SLO 达成率提升**（vs SOTA），已在 1 万+ GPU 生产环境部署；最坏情况（恒定速率、无空闲可协调）相比静态分区仅 3–5% TTFT/TPOT 开销。
 
-两个补充机制：
+**适用边界**：单模型、同构流量下，单卡多实例通常不划算——权重在 HBM 里要存 N 份（KV 弹性帮不了权重），流量被拆成更小的 batch 反而拉低 decode 效率；单实例 continuous batching + chunked prefill 本就能吃下并发，调配置（batch 上限、max_len、图捕获）即可。官方 3×8B demo 是机制演示，不是推荐形态。还要注意「需要多实例」不等于「需要同卡超卖」：形态异构（典型如投机采样分流——spec 是引擎级配置、不能按请求开关，低 batch 白捡 2–3 倍 ITL、高 batch 纯浪费，两种最优形态互斥）、SLO 隔离、灰度、故障隔离都是多实例的理由，但实例可以放不同卡、各自扩缩容，与同卡超卖无关（故障隔离甚至必须不同卡）。单模型真正需要同卡超卖的只有**零头场景**：某形态流量不足一卡（如只占 5% 流量的延迟形态），独占一卡浪费，与同卡其他形态/模型共享；配合同模型权重共享（见下）时成本最低。
+
+**两个补充机制**：
 
 - **同模型权重共享**：多实例可经 CUDA IPC 读同一份物理权重（`cuMemCreate` 导出句柄、他进程 import 映射；TensorCast daemon 模式、ServerlessLLM 已验证，见 [`../tensorcast/architecture.md`](../tensorcast/architecture.md)），即「1 份权重 + N 个弹性 KV 池」；代价是物理页生命周期跨进程耦合（需租约或所有权归池）、sleep 粒度变粗。
 - **LoRA 特例**：base 权重共享，每模型只多一个 adapter；multi-LoRA 在单实例内按请求选 adapter（vLLM/SGLang 原生支持），连多实例都不需要。
@@ -192,8 +192,8 @@ kvcached 和 lake 是同一思想在两个尺度：kvcached 把 OS 虚拟内存�
 
 ### 功能落地：四个设想在 Dynamo 里怎么做（重点）
 
-1. **单机多模型超卖 + Dynamo 集群编排**。Dynamo 管跨节点调度，kvcached 管单机显存弹性：worker 用 vLLM/SGLang 后端时 kvcached 以 autopatch 直接带入，同卡多模型/多实例的物理页按需流转。Prism（OSDI 2026）已验证这个两级结构，Red Hat Sardeenz 在 k8s/OpenShift 上产品化。不依赖 PD/RDMA，风险最低。
-2. **serverless：多模型扩缩容，实例数量与显存解耦**。kvcached（KV→约零）+ vLLM sleep mode（权重离卡）组合后，闲置实例的 HBM 占用接近零：sleep level 1 权重 offload 到 DRAM（唤醒 = DRAM→GPU 回拷，PCIe 下 8B 模型约零点几秒）；level 2 权重直接丢弃（唤醒 = 从模型源重载，更慢）（`vllm/device_allocator/sleep_mode_backend.py::CuMemBackend`）。睡后 HBM 残留主要是每进程固定开销：CUDA context（数百 MB）与 NCCL buffer（sleep 不动它，TP>1 时不可忽略）——单卡能挂多少冷实例，真实上限是这些固定开销而非权重/KV。于是一张卡可挂载大量冷实例，配合外部调度做**多模型部署的扩缩容**：Dynamo Planner 决定唤醒/休眠谁，拉起时同时省掉 KV 预分配和容量定容，唤醒延迟 = 权重回拷（level 1）或重载（level 2）。这正是 Prism 两级调度已验证的形态（`examples/06_serverless_serving`）。
+1. **单机多模型超卖 + Dynamo 集群编排**。目标负载是模型动物园（生产 trace：任意时刻 23%–50% 模型活跃，活跃集每小时变 54–766 次，见「收益与适用边界」）。Dynamo 管跨节点调度，kvcached 管单机显存弹性：worker 用 vLLM/SGLang 后端时 kvcached 以 autopatch 直接带入，同卡多模型/多实例的物理页按需流转。Prism（OSDI 2026）已验证这个两级结构（>2× 成本、3.3× SLO、1 万+ GPU 生产部署），Red Hat Sardeenz 在 k8s/OpenShift 上产品化。不依赖 PD/RDMA，风险最低。
+2. **serverless：多模型扩缩容，实例数量与显存解耦**。kvcached（KV→约零）+ vLLM sleep mode（权重离卡）组合后，闲置实例的 HBM 占用接近零：sleep level 1 权重 offload 到 DRAM（唤醒 = DRAM→GPU 回拷，PCIe 下 8B 模型约零点几秒）；level 2 权重直接丢弃（唤醒 = 从模型源重载，更慢）（`vllm/device_allocator/sleep_mode_backend.py::CuMemBackend`）。睡后 HBM 残留主要是每进程固定开销：CUDA context（数百 MB）与 NCCL buffer（sleep 不动它，TP>1 时不可忽略）——单卡能挂多少冷实例，真实上限是这些固定开销而非权重/KV。于是一张卡可挂载大量冷实例，配合外部调度做**多模型部署的扩缩容**：Dynamo Planner 决定唤醒/休眠谁，拉起时同时省掉 KV 预分配和容量定容，唤醒延迟 = 权重回拷（level 1）或重载（level 2）。注意纯 sleep 是**二态开关**（醒 = 权重 + 静态 KV 全占 / 睡 = 约零），活跃集快变时换权重会 thrashing（Prism trace 实测）；弹性 KV 补上 0~100% 的连续中间态——模型可以浅驻留接轻流量，不必整机醒睡。这正是 Prism 两级调度已验证的形态（`examples/06_serverless_serving`）。
 3. **全局统筹与配额归控制面**。kvcached 的协调是单机带外方案（shm 记账 + kvctl 手敲 + 各进程自查）；搬进 Dynamo 时这两件事都归控制面：worker 用量记账上报 planner 即成全局统筹（设想 2——kvcached 刻意不做 daemon，Dynamo 的 etcd + planner 恰是现成的 daemon）；配额由控制面下发替代 kvctl（设想 4，revision 状态机语义可保留）。控制面统一记账后，「查」和「用」之间的无锁超分窗口也随之消失——分配许可来自权威，而非各进程自查。
 
 ### RDMA 共存（重点）
@@ -207,9 +207,9 @@ kvcached 和 lake 是同一思想在两个尺度：kvcached 把 OS 虚拟内存�
 
 ### 小机制借鉴（拿来就用）
 
-8. **碰 GPU 的正确层次**。KVBM 被官方放弃的原因之一是直接管理 GPU 侧 block 布局、和引擎抢资源（见 [`../kvcr/overview.md`](../kvcr/overview.md)）。kvcached 示范了更安全的层次：只管页映射，不碰 KV 语义。Dynamo 若重做 GPU 侧弹性，应在虚拟内存页层做，不在 block 层做。
-9. **页分配器与配额协议细节**。2MB 同尺寸页 → 物理页完全互换、长期运行无碎片（变长分配器做不到）；5–10 页热缓存，分配快速路径微秒级；映射失败回滚。活进程改配额 = 带外写 shm + 100ms 轮询 + revision 状态机（applied/deferred/stale/conflict），不占请求路径。`get_page_occupancy` 按页统计存活块、决定页能否释放——KVCR 做 GPU→DRAM 卸载的驱逐粒度判断时需要同类信息。
-10. **路由信号：驱动级物理余量**。shm 段暴露每实例 used/limit/prealloc。Dynamo Router 目前按 KV 命中和负载路由，可加「可映射物理余量」信号，避免把请求打到映射会失败的实例。对 lake 更进一步：D-direct 要求本地 HBM 放得下前缀 KV，物理余量是选路的必要输入，且驱动级真实值比引擎自报更可靠。
+7. **碰 GPU 的正确层次**。KVBM 被官方放弃的原因之一是直接管理 GPU 侧 block 布局、和引擎抢资源（见 [`../kvcr/overview.md`](../kvcr/overview.md)）。kvcached 示范了更安全的层次：只管页映射，不碰 KV 语义。Dynamo 若重做 GPU 侧弹性，应在虚拟内存页层做，不在 block 层做。
+8. **页分配器与配额协议细节**。2MB 同尺寸页 → 物理页完全互换、长期运行无碎片（变长分配器做不到）；5–10 页热缓存，分配快速路径微秒级；映射失败回滚。活进程改配额 = 带外写 shm + 100ms 轮询 + revision 状态机（applied/deferred/stale/conflict），不占请求路径。`get_page_occupancy` 按页统计存活块、决定页能否释放——KVCR 做 GPU→DRAM 卸载的驱逐粒度判断时需要同类信息。
+9. **路由信号：驱动级物理余量**。shm 段暴露每实例 used/limit/prealloc。Dynamo Router 目前按 KV 命中和负载路由，可加「可映射物理余量」信号，避免把请求打到映射会失败的实例。对 lake 更进一步：D-direct 要求本地 HBM 放得下前缀 KV，物理余量是选路的必要输入，且驱动级真实值比引擎自报更可靠。
 
 ### 风险与边界
 
