@@ -93,6 +93,7 @@ GPU 页仍由引擎分配。组件维护 DRAM/SSD/远端索引；访问 GPU 靠�
 | TileRT | vLLM `block_id` 抽 KV，NIXL/Mooncake 写入 decode 单请求 GPU arena（`inject_cache`）。无分层卸载 |
 | TensorCast | `publish` 将 KV 从引擎页拷到 Store Daemon 侧 artifact。引擎内页仍由引擎分配。LIP 原地租借 v1 不用于 KV |
 | NVIDIA CMX | 目标栈含 GPU、KVBM、共享 flash。公开代码无端到端实现，不作对照依据 |
+| kvcached | 引擎进程内 VMM 库接管 KV 张量：VA 预留 + 2MB 页按需 map/unmap（zero page COW）；跨进程超卖由 CUDA driver 仲裁，无 daemon；不卸载、不索引前缀。见 [kvcached/overview.md](kvcached/overview.md) |
 
 ## 4. 对照表
 
@@ -112,6 +113,7 @@ GPU 页仍由引擎分配。组件维护 DRAM/SSD/远端索引；访问 GPU 靠�
 | TileRT | vLLM 抽；decode 单槽 | 不卸载 | 无 | 随 decode 请求 |
 | TensorCast | 引擎 | 不索引引擎页；管 publish 后副本 | GS / daemon | 引擎页失效；已 publish artifact 可保留 |
 | CMX | — | 未落地 | — | — |
+| kvcached | 引擎进程内 VMM 库（页级 map/unmap，物理按需） | 本身是 GPU VA 层（cuMem\*），KV 张量即 VA 视图 | 进程内页表 + `/dev/shm` 记账段 | VA/物理页随进程释放回驱动；shm 段 unlink |
 | lake（目标） | 池分配 L0 | L0 ∈ `locations` | 控制面 radix + `locations` | 该卡 HBM 失效；L2 为 F4；视图仍指向 KV Node |
 
 ## 5. lake
@@ -159,3 +161,4 @@ L0→L0 RDMA 仍要注册 GPU 内存（对照 KVBM `g1_handle`）。归池后注
 | MemCache 介质 | `mmc_bm_proxy.cpp`::`MmcBmProxy`（`MEDIA_HBM` / `MEDIA_DRAM`） |
 | TileRT | `prefill_connector.py`::`TileRTConnector`；`inject_cache` |
 | TensorCast | `publish` / `hydrate`（[`tensorcast/overview.md`](tensorcast/overview.md)） |
+| kvcached 页级 map/unmap | `3rdparty/kvcached/csrc/ftensor.cpp`::`FTensor::{map,unmap}`；`csrc/page_allocator.cpp`::`PageAllocator::{alloc_page,free_page}` |

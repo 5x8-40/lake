@@ -362,6 +362,8 @@ KVBM offload 路径:`GPU → CPU → SSD → 远端存储(S3/Azure blob)`,1.0 �
 
 **对 lake 的影响**:`rust/vendor/` vendor 的 kvbm-logical 上游已冻结(见 [`../../architecture/kv-virtual-memory.md`](../../architecture/kv-virtual-memory.md));v2/KVCR 的演进方向(引擎原生布局 + router hint + P2P)与 vendor 拷贝无关,不影响其正确性,但后续不会再有上游修复可同步。
 
+> 外部对照:[kvcached](../kvcached/overview.md)(GPU 虚拟内存弹性 KV)走了另一条"碰 GPU"的路线——不管 block 布局,只在虚拟内存页层做映射/解映射,引擎无感。对比可见 KVBM 的教训不在"碰 GPU"本身,而在碰的层次(block 布局 vs 页映射)。
+
 ## 运行时与通信(transports / discovery)
 
 源码:`lib/runtime/src/transports.rs` + `discovery/`。Dynamo 的通信后端是**多后端可插拔**,三个平面各自独立选型(2026-09 以 main 上 `architecture.md` 为准,比本文早期版本更细):
@@ -411,6 +413,7 @@ PD 分离为"独立可伸缩的 GPU 池",三后端(vLLM/SGLang/TRT-LLM)都支持
 | KV-aware router(overlap 量化) | Router 命中感知选路 | `overlap_blocks` 命中量化,见 [`../../architecture/scheduling.md`](../../architecture/scheduling.md) "缓存命中感知调度" |
 | transports 多后端可插拔 | 通信选型(见 #3) | etcd/nats/tcp/zmq 按部署形态选,印证"控制面存储 vs 事件面"可分离 |
 | KV events 走 NATS 而非 etcd | (lake 待定) | 高频事件流用 NATS、权威元数据用 etcd 的分工,值得 lake 评估 |
+| (生态)kvcached GPU VMM 页弹性 | (lake L0 弹性机制参考) | KVBM 因 GPU 紧耦合被 sunset;kvcached 只管页映射、不碰 KV 语义,可与 Dynamo 组合(单机超卖 + 集群编排);组合形态与待解问题见 [`../kvcached/overview.md`](../kvcached/overview.md)「想象空间」节 |
 
 ## 关键差异(lake 更彻底)
 

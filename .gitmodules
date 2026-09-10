@@ -34,3 +34,6 @@
 [submodule "3rdparty/kvcr"]
 	path = 3rdparty/kvcr
 	url = https://github.com/ai-dynamo/kvcr
+[submodule "3rdparty/kvcached"]
+	path = 3rdparty/kvcached
+	url = https://github.com/ovg-project/kvcached

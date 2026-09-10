@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="400" viewBox="0 0 960 400" font-family="sans-serif">
+  <rect width="960" height="400" fill="#ffffff"/>
+  <text x="36" y="34" font-size="17" font-weight="bold" fill="#111827">协调机制：四件套，无中心 daemon</text>
+
+  <rect x="36" y="76" width="250" height="120" rx="6" fill="#f9fafb" stroke="#e5e7eb"/>
+  <text x="52" y="98" font-size="13" font-weight="bold" fill="#374151">引擎进程 A</text>
+  <rect x="52" y="108" width="218" height="56" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="64" y="130" font-size="12" font-weight="bold" fill="#1e40af">kvcached 库</text>
+  <text x="64" y="150" font-size="10" fill="#3b82f6">PageAllocator / FTensor</text>
+
+  <rect x="36" y="232" width="250" height="120" rx="6" fill="#f9fafb" stroke="#e5e7eb"/>
+  <text x="52" y="254" font-size="13" font-weight="bold" fill="#374151">引擎进程 B</text>
+  <rect x="52" y="264" width="218" height="56" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="64" y="286" font-size="12" font-weight="bold" fill="#1e40af">kvcached 库</text>
+  <text x="64" y="306" font-size="10" fill="#3b82f6">PageAllocator / FTensor</text>
+
+  <rect x="346" y="76" width="260" height="196" rx="6" fill="none" stroke="#6b7280" stroke-dasharray="6 4"/>
+  <text x="362" y="98" font-size="12" font-weight="bold" fill="#374151">/dev/shm</text>
+  <rect x="362" y="110" width="228" height="60" fill="#f9fafb" stroke="#9ca3af"/>
+  <text x="374" y="132" font-size="11" fill="#374151">kvcached_engine_A</text>
+  <text x="374" y="152" font-size="10" fill="#6b7280">{total, used, prealloc}</text>
+  <rect x="362" y="186" width="228" height="60" fill="#f9fafb" stroke="#9ca3af"/>
+  <text x="374" y="208" font-size="11" fill="#374151">kvcached_engine_B</text>
+  <text x="374" y="228" font-size="10" fill="#6b7280">{total, used, prealloc}</text>
+
+  <rect x="666" y="110" width="250" height="96" rx="6" fill="#f9fafb" stroke="#374151"/>
+  <text x="682" y="134" font-size="13" font-weight="bold" fill="#374151">kvctl / kvtop</text>
+  <text x="682" y="154" font-size="10" fill="#6b7280">带外 CLI，直接读写 shm 段</text>
+  <text x="682" y="172" font-size="10" fill="#6b7280">list · limit · watch · delete</text>
+
+  <rect x="346" y="300" width="260" height="52" rx="6" fill="#ecfdf5" stroke="#059669"/>
+  <text x="362" y="322" font-size="12" font-weight="bold" fill="#047857">CUDA 驱动</text>
+  <text x="362" y="340" font-size="10" fill="#059669">物理页最终仲裁者</text>
+
+  <path d="M286,136 L358,140" fill="none" stroke="#374151" marker-end="url(#arrD)" marker-start="url(#arrDL)"/>
+  <path d="M286,292 L358,218" fill="none" stroke="#374151" marker-end="url(#arrD)" marker-start="url(#arrDL)"/>
+  <path d="M666,150 L610,152" fill="none" stroke="#374151" marker-end="url(#arrD)" marker-start="url(#arrDL)"/>
+  <path d="M160,164 C160,300 250,326 342,326" fill="none" stroke="#059669" marker-end="url(#arrG2)"/>
+  <path d="M160,320 C200,344 280,340 342,334" fill="none" stroke="#059669" marker-end="url(#arrG2)"/>
+
+  <text x="640" y="290" font-size="11" fill="#b91c1c">注意：「查空闲」和「映射」之间没有全局锁，</text>
+  <text x="640" y="308" font-size="11" fill="#b91c1c">两进程可能同时映射、合计超分，靠 5% 余量与回滚兜底</text>
+
+  <text x="36" y="382" font-size="11" fill="#374151">灰箭头：写用量 / 读限额（引擎侧 100ms 轮询）；kvctl 随时读写    绿箭头：映射前查全卡空闲显存（默认最多用 95%）</text>
+
+  <defs>
+    <marker id="arrD" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#374151"/></marker>
+    <marker id="arrDL" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto"><path d="M8,0 L0,4 L8,8 Z" fill="#374151"/></marker>
+    <marker id="arrG2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#059669"/></marker>
+  </defs>
+</svg>

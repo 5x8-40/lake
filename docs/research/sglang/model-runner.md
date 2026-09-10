@@ -129,7 +129,7 @@ Req  →  ScheduleBatch  →  ForwardBatch
 ### 留在 host 的 `Req` 字段(`managers/schedule_batch.py::Req`)
 
 - 身份/文本:`rid`、`origin_input_text`、`origin_input_ids`、`output_ids`
-- 控制:`sampling_params`、finish reason、stream/logprob/LoRA/grammar(guided decoding 与 overlap/spec 同步见 [../guided-decoding.md](../guided-decoding.md))
+- 控制:`sampling_params`、finish reason、stream/logprob/LoRA/grammar(guided decoding 与 overlap/spec 同步见 [../guided-decoding.md](../vllm_vs_sglang/guided-decoding.md))
 - 调度:`kv_committed_len`、`ReqKvInfo`、`extend_range`、chunked 计数
 - 缓存策略:`last_node`、host hit 长度、`cache_protected_len`
 - `req_pool_idx`:host `int`,指向 device 表的一行
@@ -399,7 +399,7 @@ SGLang 维护独立 `PrefillCudaGraphRunner` 与 `DecodeCudaGraphRunner`。前�
 ## Overlap schedule（异步调度 / 消 device 空泡）
 
 > 默认开启（`--disable-overlap-schedule` 关掉）。目标：让 **CPU 收尾藏进 GPU forward 阴影**，并用 **FutureMap 在 device 侧接力 token**，避免「等上步 token 回 CPU 再开下步」的空泡。  
-> Grammar 专项（何时仍被迫同步）见 [`../guided-decoding.md`](../guided-decoding.md)；vLLM 对等物是 async scheduling + `pending_structured_output_tokens`。
+> Grammar 专项（何时仍被迫同步）见 [`../guided-decoding.md`](../vllm_vs_sglang/guided-decoding.md)；vLLM 对等物是 async scheduling + `pending_structured_output_tokens`。
 
 ### 要消的空泡是什么
 
@@ -473,7 +473,7 @@ CPU:  … | process(N-1) + sample(N)| process(N) + sample(N+1)| …
 | Structured | 非 spec 可藏进阴影；**spec+grammar 强制关 overlap** | `pending_structured_output_tokens` → defer sample |
 | 默认 | overlap **开** | async 可配 |
 
-细节与「能否绝对无空闲」结论见 [`../guided-decoding.md`](../guided-decoding.md)。
+细节与「能否绝对无空闲」结论见 [`../guided-decoding.md`](../vllm_vs_sglang/guided-decoding.md)。
 
 ### 对 lake（已定）
 
@@ -493,7 +493,7 @@ CPU:  … | process(N-1) + sample(N)| process(N) + sample(N+1)| …
 
 ## 与 vLLM ModelRunner V2 对照
 
-> Scheduler→Worker **字段全集**、差异表与架构根因见专文 [`../scheduler-worker-interface.md`](../scheduler-worker-interface.md)（定 lake D1 时优先读）。
+> Scheduler→Worker **字段全集**、差异表与架构根因见专文 [`../scheduler-worker-interface.md`](../vllm_vs_sglang/scheduler-worker-interface.md)（定 lake D1 时优先读）。
 
 vLLM 现有两套 runner,开关 `VLLM_USE_V2_MODEL_RUNNER`(`vllm_config.use_v2_model_runner`),在 `gpu_worker.py` 分支构造:
 

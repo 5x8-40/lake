@@ -39,6 +39,7 @@
 | FlexKV | 本机自治 + Redis 快照 | 本机 radix；Redis GMS 快照非权威 | 周期 upload/rebuild + lease | 最终一致（快照可陈旧） | 后端决定 | 无；worker 退出索引失效 | 快照时效；无回查权威 |
 | UCM | 无自有（继承 store 后端） | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 |
 | TileRT | 点对点（单槽 PD） | 无（进程内忙闲表） | 一次性握手 | 不适用 | 不适用 | 无（429） | 不适用（专用 bs=1） |
+| kvcached | 单机多进程（无中心） | 无（驱动仲裁物理页，shm 只记账） | shm 记账 + 100ms 轮询 | 无索引（不知 KV 身份） | 不适用（页即字节） | 进程退出页还驱动 | 单机单卡边界 |
 | mooncake-p2p-store | P2P 无中心 | etcd | BitTorrent 式 register/拉取 | etcd 强一致（元数据） | 分片拉取 | etcd | 适合 checkpoint 分发，非热路径 |
 
 ## 3. 四类归纳
@@ -67,6 +68,7 @@ lake 的处理：同样不将高频写压入 etcd，但权威保留在 CP 内存
 - LMCache：有中心 controller，但设计为 best-effort（心跳 + full sync 0.8 阈值），lookup O(n²) 为已知瓶颈，属协调器而非权威。
 - UCM：框架自身不含分布式语义，全部继承后端；语义强弱取决于所挂 store。
 - TileRT：bs=1 专用引擎，无共享状态，不涉及一致性问题。
+- kvcached：单机 GPU 页弹性，无中心到连事件流都没有——物理页分配是驱动内原子操作，不产生位置索引需求；跨节点/分层/全局视图均不在 scope。
 
 ## 4. 对 lake 的参考结论
 
@@ -95,3 +97,4 @@ lake 的处理：同样不将高频写压入 etcd，但权威保留在 CP 内存
 - [tensorcast/overview.md](tensorcast/overview.md)：GS+Daemon 星型 + 高低基数分片租约（含与 lake 一致性权威的详细对照）
 - [flexkv/overview.md](flexkv/overview.md)「分布式模型」：本机 radix + Redis 周期快照
 - [tilert/overview.md](tilert/overview.md)「分布式模型」：无（单槽点对点）
+- [kvcached/overview.md](kvcached/overview.md)「分布式模型」：单机多进程无中心（驱动仲裁 + shm 记账）

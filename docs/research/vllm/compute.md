@@ -247,11 +247,11 @@ EngineCore.scheduler.schedule() → SchedulerOutput
 
 ## Structured Output / Guided Decoding
 
-FSM / bitmask fill 在 scheduler 侧 CPU(`StructuredOutputManager`);`execute_model` 与 `get_grammar_bitmask` 可重叠,`sample_tokens` 前 apply GPU kernel。async scheduling 遇 `pending_structured_output_tokens` 会 defer sample——**非绝对无空闲**。专文与 SGLang 对照见 [`../guided-decoding.md`](../guided-decoding.md)。
+FSM / bitmask fill 在 scheduler 侧 CPU(`StructuredOutputManager`);`execute_model` 与 `get_grammar_bitmask` 可重叠,`sample_tokens` 前 apply GPU kernel。async scheduling 遇 `pending_structured_output_tokens` 会 defer sample——**非绝对无空闲**。专文与 SGLang 对照见 [`../guided-decoding.md`](../vllm_vs_sglang/guided-decoding.md)。
 
 ## Sampling Parameters
 
-引擎 `SamplingParams` 字段、与 SGLang 对照、以及 **spec decode 硬禁 `min_p`/`logit_bias`**（spec 路径不装对应 logits processor）见 [`../sampling-params.md`](../sampling-params.md)。
+引擎 `SamplingParams` 字段、与 SGLang 对照、以及 **spec decode 硬禁 `min_p`/`logit_bias`**（spec 路径不装对应 logits processor）见 [`../sampling-params.md`](../vllm_vs_sglang/sampling-params.md)。
 
 ## 代码索引
 
@@ -362,7 +362,7 @@ FSM / bitmask fill 在 scheduler 侧 CPU(`StructuredOutputManager`);`execute_mod
 | PP 批队列 | `vllm/v1/engine/core.py::step_with_batch_queue` |
 | PP 激活 / token | `worker/gpu_worker.py::execute_model`;`worker/gpu/pp_utils.py::PPHandler` |
 | 官方 DP / 并行文档 | `docs/serving/data_parallel_deployment.md` / `docs/serving/parallelism_scaling.md` |
-| structured output × async | [`../guided-decoding.md`](../guided-decoding.md);`structured_output/__init__.py::StructuredOutputManager`;`async_scheduler.py` |
+| structured output × async | [`../guided-decoding.md`](../vllm_vs_sglang/guided-decoding.md);`structured_output/__init__.py::StructuredOutputManager`;`async_scheduler.py` |
 
 ### 权重加载 / offload
 

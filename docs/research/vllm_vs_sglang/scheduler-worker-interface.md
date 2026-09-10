@@ -3,7 +3,7 @@
 > 源码锚点（行号会漂移，以符号为准）:  
 > - vLLM:`vllm/v1/core/sched/output.py::{SchedulerOutput,NewRequestData,CachedRequestData,GrammarOutput}`；消费方 `vllm/v1/worker/gpu/model_runner.py::GPUModelRunner.execute_model`  
 > - SGLang:`managers/schedule_batch.py::ScheduleBatch` → `model_executor/forward_batch_info.py::ForwardBatch`；消费方 `managers/tp_worker.py::TpModelWorker.forward_batch_generation`  
-> 相关:[`sglang/model-runner.md`](sglang/model-runner.md)、[`vllm/compute.md`](vllm/compute.md)、lake [`../architecture/compute-layer.md`](../architecture/compute-layer.md)「计算引擎结构」/ D1、[`../architecture/scheduling.md`](../architecture/scheduling.md) §3.1。
+> 相关:[`sglang/model-runner.md`](../sglang/model-runner.md)、[`vllm/compute.md`](../vllm/compute.md)、lake [`../architecture/compute-layer.md`](../../architecture/compute-layer.md)「计算引擎结构」/ D1、[`../architecture/scheduling.md`](../../architecture/scheduling.md) §3.1。
 
 本文梳理**调度侧提供给 worker / model runner 的全部字段**，对比差异，并解释背后的架构分叉——供 lake 定 `SchedulerOutput` / `NodeScheduleOutput` 时对照（D1）。
 
@@ -217,7 +217,7 @@ DP token 数 **all_gather 发生在 Scheduler**（`dp_attn.py::prepare_mlp_sync_
 | KV 定位 | `block_ids` / `new_block_ids` | `out_cache_loc` + `req_to_token` 行 | **低**：表行 vs 写槽 |
 | 投机草稿 | `scheduled_spec_decode_tokens` | `spec_info` + `ForwardMode.TARGET_VERIFY` 等 | **低**：token 列表 vs 富结构 |
 | 多模态 | `scheduled_encoder_inputs` + NewRequest.`mm_features` | `multimodal_inputs` / `encoder_*` | 中 |
-| 结束/释放 | `finished_req_ids` / `free_encoder_mm_hashes`（Worker **只清 runner 态**；KV 已在 Scheduler `update_from_output` 放下） | Scheduler `process_batch_result` 内 `release_kv_cache`，**不进** FB 信封 | 低（位置不同；阶段对照见 [`sglang/block-lifecycle.md`](sglang/block-lifecycle.md) / [`vllm/block-lifecycle.md`](vllm/block-lifecycle.md)「请求结束的调度阶段」） |
+| 结束/释放 | `finished_req_ids` / `free_encoder_mm_hashes`（Worker **只清 runner 态**；KV 已在 Scheduler `update_from_output` 放下） | Scheduler `process_batch_result` 内 `release_kv_cache`，**不进** FB 信封 | 低（位置不同；阶段对照见 [`sglang/block-lifecycle.md`](../sglang/block-lifecycle.md) / [`vllm/block-lifecycle.md`](../vllm/block-lifecycle.md)「请求结束的调度阶段」） |
 | 抢占 | `preempted_req_ids` / `resumed_req_ids` | 调度内 retract；无同构 Output 字段 | 低 |
 | Structured output | `GrammarOutput` + pending 标志 | `has_grammar` + `Req.grammar` | 中（时序模型不同） |
 | 外部 KV | `kv_connector_metadata` | HiCache / disagg 另路径，无同名 metadata | 低 |
@@ -307,7 +307,7 @@ DP token 数 **all_gather 发生在 Scheduler**（`dp_attn.py::prepare_mlp_sync_
 - **SGLang**：`prepare_mlp_sync_batch_raw` 在 **Scheduler** `all_gather` token 数 / graph 标志 → 写 `global_num_tokens*` → 必要时 `IDLE`。
 - **vLLM**：DP 协调偏 `DPCoordinator` + wave；pad/graph 共识多在 **runner**（`dispatch_cg_and_sync_dp`），**不进** `SchedulerOutput`。
 
-→ 同是「跨 DP 对齐」，字段出现的层不同——lake 已定跟 SGLang：**sync 落 node_scheduler**（[`scheduling.md`](../architecture/scheduling.md) §3.1）。
+→ 同是「跨 DP 对齐」，字段出现的层不同——lake 已定跟 SGLang：**sync 落 node_scheduler**（[`scheduling.md`](../../architecture/scheduling.md) §3.1）。
 
 ### 6.6 投机与 structured output 的挂载
 
@@ -353,4 +353,4 @@ DP token 数 **all_gather 发生在 Scheduler**（`dp_attn.py::prepare_mlp_sync_
 | SGLang 前向批 | `model_executor/forward_batch_info.py::{ForwardBatch,ForwardMode}` |
 | SGLang worker 入口 | `managers/tp_worker.py::TpModelWorker.forward_batch_generation` |
 | SGLang DP sync | `managers/scheduler_components/dp_attn.py::prepare_mlp_sync_batch_raw` |
-| 对照叙事 | [`sglang/model-runner.md`](sglang/model-runner.md)「与 vLLM ModelRunner V2 对照」「Data Parallel」 |
+| 对照叙事 | [`sglang/model-runner.md`](../sglang/model-runner.md)「与 vLLM ModelRunner V2 对照」「Data Parallel」 |
