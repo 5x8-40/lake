@@ -66,10 +66,10 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 
 ### 收益与适用边界
 
-**收益（以 Prism 论文的生产 trace 与实验为准）**：目标负载是**模型动物园**——平台挂载大量模型（含低频但必需的长尾），热度倾斜且快速漂移。生产 trace 的两个实测特征决定收益来源：
+**收益（以 Prism 论文的生产 trace 与实验为准）**：目标负载是**模型动物园**——平台同时挂载成百上千个不同模型（base / 各客户 fine-tune / LoRA / 版本），绝大多数低频但必需保持可用，热度倾斜且快速漂移。生产 trace 的两个实测特征决定收益来源：
 
 - **模型级：bursty group**——任意时刻只有 23%–50% 的模型活跃，活跃集合每小时变化 54–766 次（最慢的 trace 也约每分钟变一次）。纯空间共享（静态混部）锁死闲置模型的显存：Novita trace 中模型 70% 以上时间空闲，50% 显存被占而不用。
-- **请求级：极端波动**——多模型请求交错到达，纯时间共享（sleep/换入换出）换权重要秒级，活跃集合几分钟一变就 thrashing，SLO 直接违约（对照组里 ServerlessLLM 的 TTFT 达成率最差）。
+- **请求级：极端波动**——多模型请求交错到达，纯时间共享（sleep/换入换出）换权重要秒级，活跃集合几分钟一变就 thrashing（反复换入换出，算力全耗在加载权重上而非服务请求），SLO 直接违约（对照组里 ServerlessLLM 的 TTFT 达成率最差）。
 
 kvcached 的定位是把两种共享统一到一个机制：从闲置模型回收显存，既可换入权重（时间共享），也可缩 KV 预留（空间共享），页粒度、毫秒级、无需重启，甚至可以只对同卡模型的一个子集做时间共享。论文明确与扩缩容**正交**：扩缩容调副本数，Prism 管副本/模型之间的显存共享，两者组合使用。实测：**>2× 成本节省、3.3× SLO 达成率提升**（vs SOTA），已在 1 万+ GPU 生产环境部署；最坏情况（恒定速率、无空闲可协调）相比静态分区仅 3–5% TTFT/TPOT 开销。
 
@@ -193,7 +193,7 @@ kvcached 和 lake 是同一思想在两个尺度：kvcached 把 OS 虚拟内存�
 ### 功能落地：四个设想在 Dynamo 里怎么做（重点）
 
 1. **单机多模型超卖 + Dynamo 集群编排**。目标负载是模型动物园（生产 trace：任意时刻 23%–50% 模型活跃，活跃集每小时变 54–766 次，见「收益与适用边界」）。Dynamo 管跨节点调度，kvcached 管单机显存弹性：worker 用 vLLM/SGLang 后端时 kvcached 以 autopatch 直接带入，同卡多模型/多实例的物理页按需流转。Prism（OSDI 2026）已验证这个两级结构（>2× 成本、3.3× SLO、1 万+ GPU 生产部署），Red Hat Sardeenz 在 k8s/OpenShift 上产品化。不依赖 PD/RDMA，风险最低。
-2. **serverless：多模型扩缩容，实例数量与显存解耦**。kvcached（KV→约零）+ vLLM sleep mode（权重离卡）组合后，闲置实例的 HBM 占用接近零：sleep level 1 权重 offload 到 DRAM（唤醒 = DRAM→GPU 回拷，PCIe 下 8B 模型约零点几秒）；level 2 权重直接丢弃（唤醒 = 从模型源重载，更慢）（`vllm/device_allocator/sleep_mode_backend.py::CuMemBackend`）。睡后 HBM 残留主要是每进程固定开销：CUDA context（数百 MB）与 NCCL buffer（sleep 不动它，TP>1 时不可忽略）——单卡能挂多少冷实例，真实上限是这些固定开销而非权重/KV。于是一张卡可挂载大量冷实例，配合外部调度做**多模型部署的扩缩容**：Dynamo Planner 决定唤醒/休眠谁，拉起时同时省掉 KV 预分配和容量定容，唤醒延迟 = 权重回拷（level 1）或重载（level 2）。注意纯 sleep 是**二态开关**（醒 = 权重 + 静态 KV 全占 / 睡 = 约零），活跃集快变时换权重会 thrashing（Prism trace 实测）；弹性 KV 补上 0~100% 的连续中间态——模型可以浅驻留接轻流量，不必整机醒睡。这正是 Prism 两级调度已验证的形态（`examples/06_serverless_serving`）。
+2. **serverless：多模型扩缩容，实例数量与显存解耦**。kvcached（KV→约零）+ vLLM sleep mode（权重离卡）组合后，闲置实例的 HBM 占用接近零：sleep level 1 权重 offload 到 DRAM（唤醒 = DRAM→GPU 回拷，PCIe 下 8B 模型约零点几秒）；level 2 权重直接丢弃（唤醒 = 从模型源重载，更慢）（`vllm/device_allocator/sleep_mode_backend.py::CuMemBackend`）。睡后 HBM 残留主要是每进程固定开销：CUDA context（数百 MB）与 NCCL buffer（sleep 不动它，TP>1 时不可忽略）——单卡能挂多少冷实例，真实上限是这些固定开销而非权重/KV。于是一张卡可挂载大量冷实例，配合外部调度做**多模型部署的扩缩容**：Dynamo Planner 决定唤醒/休眠谁，拉起时同时省掉 KV 预分配和容量定容，唤醒延迟 = 权重回拷（level 1）或重载（level 2）。注意纯 sleep 是**二态开关**（醒 = 权重 + 静态 KV 全占 / 睡 = 约零），活跃集快变时换权重会 thrashing（Prism trace 实测）；弹性 KV 补上 0~100% 的连续中间态——模型可以浅驻留接轻流量，不必整机醒睡。扩缩容替代不了这一点：它调的是实例数，调不动单实例的驻留比例（stock 引擎的 footprint 启动时定死，没有「0.2 个实例」）。这正是 Prism 两级调度已验证的形态（`examples/06_serverless_serving`）。
 3. **全局统筹与配额归控制面**。kvcached 的协调是单机带外方案（shm 记账 + kvctl 手敲 + 各进程自查）；搬进 Dynamo 时这两件事都归控制面：worker 用量记账上报 planner 即成全局统筹（设想 2——kvcached 刻意不做 daemon，Dynamo 的 etcd + planner 恰是现成的 daemon）；配额由控制面下发替代 kvctl（设想 4，revision 状态机语义可保留）。控制面统一记账后，「查」和「用」之间的无锁超分窗口也随之消失——分配许可来自权威，而非各进程自查。
 
 ### RDMA 共存（重点）
