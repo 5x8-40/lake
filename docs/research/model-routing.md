@@ -35,7 +35,7 @@ flowchart LR
 | 判断依据 | 怎么工作 | 训练/数据来源 | 代表(决策形式) |
 |----------|----------|----------------|----------------|
 | **人工规则** | 按场景/阈值写死规则 | 不学习 | claude-code-router、LiteLLM(路由) |
-| **请求内容分类** | 分类器给请求打难度/类型标签,标签映射到模型档位 | 分类器本身怎么来,各家不同:推理时 prompt 小模型现打、是否专门训练未公开(Databricks);本地训练的 LightGBM,数据来自自家 harness 日志回流(OpenSquilla);公开/合成数据集微调的 ModernBERT(vLLM-SR) | Databricks、OpenSquilla、vLLM-SR、HybridLLM(路由) |
+| **请求内容分类** | 分类器给请求打难度/类型标签,标签映射到模型档位 | 分类器本身怎么来,各家不同:推理时 prompt 小模型现打、是否专门训练未公开(Databricks);本地训练的 LightGBM,数据来自自家 harness 日志回流(OpenSquilla,飞轮机制公开);公开数据集微调的 ModernBERT,训练流程与数据集全部公开(vLLM-SR,见下文) | Databricks、OpenSquilla、vLLM-SR、HybridLLM(路由) |
 | **效果数据学习** | 直接学习"这个请求哪个模型能答好" | 人类对战偏好(RouteLLM 用 Chatbot Arena);线上隐式反馈(OpenAI 用**用户手动切换模型的行为**当"选错了"的监督信号,再加偏好率与实测正确率);事后回放打分(FrugalGPT 的打分器) | RouteLLM、OpenAI(路由) |
 | **先试再升** | 不预测,先跑便宜模型,给实际回答打分,不够再升级更贵的 | 打分器用回放数据训练(标签="便宜模型的回答对不对",来自标准答案或 judge 模型的事后判定) | FrugalGPT(级联) |
 | **结构相似性** | 查询聚类或任务-模型建图,按同类查询上各模型的历史表现选 | 各模型的历史表现回放 | Avengers、GraphRouter(路由) |
@@ -45,15 +45,24 @@ flowchart LR
 
 两条共同约束贯穿所有路线:**做判断的组件必须比省下的钱便宜**(所以没有一家用前沿模型当路由器);**换模型的时机受缓存约束**(换模型=重建前缀缓存,见 §4)。
 
-### OpenAI:GPT-5 的 real-time router
+### OpenAI:GPT-5 系列的 real-time router
 
-GPT-5 不是单个模型,而是一个系统:快速模型 `gpt-5-main` 答大多数问题,深度推理模型 `gpt-5-thinking` 处理难题,前面放一个实时路由器决定用哪个([GPT-5 System Card](https://openai.com/index/gpt-5-system-card/))。
+GPT-5 不是单个模型,而是一个系统:快速模型答大多数问题,深度推理模型处理难题,前面放一个实时路由器决定用哪个([GPT-5 System Card](https://openai.com/index/gpt-5-system-card/))。GPT-5.2 延续了这个结构,ChatGPT 里的 "Auto" 档就是路由器:在 Instant / Thinking / Pro 三档之间选([GPT-5.2 发布文](https://openai.com/index/introducing-gpt-5-2/))。
 
 - **路由依据**:对话类型、复杂度、工具需求、显式意图(用户写 "think hard about this" 就强制走推理模型)。
-- **训练方式**:路由器持续用真实线上信号训练——用户手动切换模型的行为、回答偏好率、实测正确率。
+- **训练方式**:持续用真实线上信号训练——用户手动切换模型的行为、回答偏好率、实测正确率。除此之外(分类器形态、特征、阈值)未公开。
 - **兜底**:用量超限后由 mini 版接管剩余请求。
 - **不对外暴露**:API 里仍是显式指定模型,路由器只在 ChatGPT 产品内工作。
-- **实例级调度未公开**:System Card 只讲到模型级路由;OpenAI 是否围绕缓存命中率做实例级调度、harness 侧有没有类似 Anthropic(§4)的前缀纪律,均未公开。
+- **用户接受度是真实问题**:路由器上线后引发强烈反弹——用户想知道自己用的是哪个模型;OpenAI 一周内恢复了模型选择器,2025 年 12 月进一步对 Free/Go 免费档**回滚**了自动路由(默认 Instant,推理模型改手动选),付费档保留 Auto([WIRED 报道](https://www.wired.com/story/openai-router-relaunch-gpt-5-sam-altman/))。
+
+**实例级路由反而有公开文档**,写在 prompt caching 指南里([API 文档](https://developers.openai.com/api/docs/guides/prompt-caching)、[Prompt Caching 201](https://developers.openai.com/cookbook/examples/prompt_caching_201)):
+
+- 请求按**前缀哈希**路由到机器:对隐藏系统内容之后的前缀头部(约 256 token,因模型而异,含工具定义)做哈希,同前缀倾向落同一台机器;可传 `prompt_cache_key` 与前缀哈希组合,增强粘连(某编程客户命中率从 60% 提到 87%)。
+- 负载优先于亲和:同一前缀+key 超过约 15 RPM 就溢出到其他机器(每台新机器付一次 cache miss)——与 KubeAI 的"有界负载"是同一个取舍(§5)。
+- 缓存规则:≥1024 token 才缓存,按 128 token 增量匹配;命中可省最多 80% TTFT、90% 输入费用。
+- harness 侧约束与 Anthropic(§4)一致:官方建议稳定内容放最前、不要在系统提示里放易变元数据。
+
+也就是说,OpenAI 的实例级方案与 KubeAI 同属"无状态前缀哈希 + 负载溢出"一路,只是作为托管服务提供;模型级路由器本身如何与这层缓存路由交互,未公开。
 
 ### Anthropic:无官方路由
 
@@ -106,7 +115,13 @@ Anthropic 没有模型路由产品,Claude Code 里是用户手动 `/model` 选�
 
 **分类器是什么**。SquillaRouter 是本机运行的传统机器学习分类器:LightGBM(梯度提升树,传统 ML 而非神经网络,训练快、推理是微秒级)加 ONNX Runtime(跨平台推理引擎,模型文件随仓库用 Git LFS 分发)。给**每一轮**请求提取特征——长度、语言、是否含代码片段、关键词、语义嵌入——输出 C0–C3 四档的概率向量,按阈值映射到"能胜任的最便宜档"。整个推理在本机完成,零 token 消耗,提示词不出本机;原生库缺失或 `--router disabled` 时降级为直连单模型。
 
-**分类器怎么训练**。数据来自 harness 数据飞轮(arXiv 2607.11399):每一轮路由把"选了哪个模型"与"任务最终成败"**分开记录**——成败由环境自动打标签(测试是否通过等),不需要人工标注;积累下来的错误决策就是下一版分类器的训练数据。新模型离线评估通过才上线,发现回归自动回滚。同一个飞轮还用于向模型池蒸馏 harness 原生模型,报告的终局设想是三层模型池:通用基座兜底 + harness 原生模型 + 超廉价快速通道。
+**分类器怎么训练**。数据来自 harness 数据飞轮(arXiv 2607.11399):每一轮路由把"选了哪个模型"与"任务最终成败"**分开记录**——成败由环境自动打标签(测试是否通过等),不需要人工标注;积累下来的错误决策就是下一版分类器的训练数据。新模型离线评估通过才上线,发现回归自动回滚。论文把这条路叫 "staged router-model path":冷启动用开源的 LightGBM ranker,随着日志积累逐步换成更强的路由模型。
+
+**三层模型池的终局设想**(同篇论文,需要展开):飞轮的数据有**两个**消费者——既训练路由器(选得更准),也蒸馏/微调一个"harness 原生模型"(在这个 harness 的任务分布上比同价位通用模型更强)。两者互相加强:路由越准,原生模型拿到的训练数据越对口;原生模型越强,需要昂贵模型的轮次越少。收敛后的模型池分三层:
+
+1. **超廉价快速通道**:最小模型吃掉占大头的机械轮次(代码探索、格式化、简单编辑),单轮成本趋近于零;
+2. **harness 原生模型**:飞轮蒸馏出的专用模型,接管中间档;
+3. **通用基座兜底**:前沿模型只处理前两层都搞不定的难题。
 
 **每轮重选模型,缓存命中怎么保持**。换模型确实会丢 prompt cache,它的解法有两层:一是 **prompt 缓存隔离**——按档位划分缓存命名空间,同一档位的各轮共享该档位的前缀缓存;换档不是全部作废,而是回到该档位上次使用时的前缀位置继续。二是**自适应提示词**——简单轮次连系统提示都换成轻量版,前缀短,重建代价同步缩小。也就是说,轮次级路由把"换档丢缓存"从全损改成了按档位分段的部分损失。报告披露到这一层,更细的实现(历史消息如何裁剪进各档位命名空间)未公开。
 
@@ -164,9 +179,19 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
 
 ### vLLM Semantic Router(开源)
 
-[vllm-project/semantic-router](https://github.com/vllm-project/semantic-router):挂在 Envoy 网关上的外挂处理器(ext_proc),用 Rust(Candle/ONNX)在本地跑分类器,Go 负责与 Envoy 对接。工作方式很直接:请求进来后先过一组本地小分类器——基于 ModernBERT(BERT 架构的现代化版本)——分别回答"这条请求的意图/领域是什么""含不含个人敏感信息""像不像越狱攻击"等问题;分类结果按人工写的布尔规则组合,决定发给模型池里的哪个模型。分类器用公开或合成数据集微调。
+[vllm-project/semantic-router](https://github.com/vllm-project/semantic-router):挂在 Envoy 网关上的外挂处理器(ext_proc),用 Rust(Candle/ONNX)在本地跑分类器,Go 负责与 Envoy 对接。工作方式很直接:请求进来后先过一组本地小分类器,分类结果按人工写的布尔规则组合,决定发给模型池里的哪个模型。
 
-论文 [When to Reason(arXiv 2510.08731)](https://arxiv.org/html/2510.08731v1) 验证了其中一个场景的收益:先判断"这题需不需要推理",不需要就走非推理模型——MMLU-Pro 上延迟与 token 消耗减半且精度不降。分类器本身必须够快才划算:后续工作把这条分类链路优化了 98 倍([arXiv 2603.12646](https://arxiv.org/html/2603.12646v1))。
+**训练完全公开**([训练文档](https://llm-semantic-router.readthedocs.io/en/latest/training/datasets/)):共享一个 ModernBERT-base 骨干(BERT 架构的现代化版本),上面挂四个分类头,各用一个公开数据集微调——领域分类(MMLU-Pro,10 类)、PII 检测(Microsoft Presidio 数据集,6 类实体)、越狱检测(越狱分类数据集,二分类)、意图分类(Glaive Function Calling,8 类)。模型和代码都在 HuggingFace / GitHub 上。这是"分类器路线"里训练过程最透明的一家,可以直接复现。
+
+论文 [When to Reason(arXiv 2510.08731)](https://arxiv.org/html/2510.08731v1) 验证了其中一个场景的收益:先判断"这题需不需要推理",不需要就走非推理模型——MMLU-Pro 上延迟与 token 消耗减半且精度不降。
+
+**分类链路本身的开销**也值得记([arXiv 2603.12646](https://arxiv.org/html/2603.12646v1)):原始实现处理 8K token 输入要 **4,918ms**(标准 attention 是 O(n²) 内存,3 个并发分类器光 attention mask 就要约 4.5GB,与 vLLM 共享 GPU 时直接 OOM)。三段优化后到 **50ms**(累计 98 倍):
+
+1. 自研 Flash Attention 算子(ONNX Runtime / ROCm),attention 内存降到 O(n):4,918 → 127ms(38.7 倍);
+2. 经典 NLP 压缩(TextRank、TF-IDF、位置加权、新颖度打分)把任意长度输入先压到约 512 token 再进分类器,延迟与显存都与原长度脱钩:127 → 62ms(2 倍);
+3. 近流式请求体处理(自适应分块 + 零拷贝 JSON):62 → 50ms(1.2 倍)。
+
+最终 16K token 的路由 108ms 完成,路由器显存占用 <800MB——可以与 LLM 服务共享一张卡,不需要独占加速器。
 
 ### LiteLLM / Portkey 等 AI 网关
 
@@ -183,6 +208,7 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
 | RouteLLM([arXiv 2406.18665](https://arxiv.org/abs/2406.18665),[lm-sys/RouteLLM](https://github.com/lm-sys/RouteLLM)) | 2024,LMSYS | 用 Chatbot Arena 真人对战数据训练四种路由器:**相似度加权排名**(把查询嵌入,找 Arena 里最相似的对战记录,按相似度加权算出"强模型在这类查询上的胜率")、矩阵分解、BERT 分类器、causal LLM 分类器;再用一个阈值控制"胜率差多大才值得调强模型",阈值越高越省钱 | MT-Bench 上省 85% 成本、保持 95% GPT-4 质量;开源、模型数据在 HuggingFace |
 | GraphRouter([ICLR 2025](https://arxiv.org/abs/2410.03834)) | 2025 | 把任务、查询、模型建成异构图的节点,"某模型能答好某查询"是边;路由变成预测边——相似任务之间可以互相提供证据 | 利用任务间结构信息 |
 | Avengers([arXiv 2408.12683](https://arxiv.org/abs/2408.12683)) | 2024 | 最简单的一支:把历史查询按嵌入**聚类**(嵌入后按向量距离分组),统计每个簇里哪个小模型历史平均分最高;新查询落入哪个簇,就用那个簇的冠军 | 不训练任何神经网络也有竞争力 |
+| Avengers-Pro([arXiv 2508.12631](https://arxiv.org/abs/2508.12631)) | 2025 | Avengers 的成本版,三步轻量操作:嵌入(Qwen3-embedding-8B)→ k-means 聚成 60 簇 → 每个簇给每个模型算"性能-效率分"(参数 α 加权该簇上的准确率与成本);推理时把查询嵌入选最近的 4 个簇,按簇分数加总选模型。调 α 就在"更准"与"更省"之间滑动 | 6 个 benchmark、8 个旗舰模型上:同等成本比 GPT-5-medium 高 +7% 准确率,同等质量省 27% 成本;LLMRouterBench 里表现最好的方法(见下) |
 | 综述([arXiv 2603.04445](https://arxiv.org/html/2603.04445v2)) | 2026 | 路由/级联统一分类 | 入门地图 |
 
 ![RouteLLM 在 MT-Bench 上的成本-质量权衡](model-routing/figures/routellm-mt-bench.png)
@@ -192,12 +218,16 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
 ### 评测:方法多,有效的少
 
 - [RouterBench](https://arxiv.org/abs/2403.12031)(2024,Martian 开源):11 个模型 × 7 个任务,40 万条预计算输出。做法是把"每个模型在每个请求上答得怎么样、花多少钱"事先算好公开,新路由器不用重跑模型就能离线评测——路由策略离线评测的事实标准。
-- [LLMRouterBench](https://aclanthology.org/2026.findings-acl.1881.pdf)(ACL 2026 Findings):更大规模的统一重测——40 万实例、21 个数据集、33 个模型(13 个旗舰 + 20 个约 7B 的轻量模型),构建花约 1.8B token、1K GPU 时加 $2.7K API 费。被测的 10 个方法覆盖各路线:RouterDC、EmbedLLM、MODEL-SAT、Avengers、HybridLLM、FrugalGPT、RouteLLM、GraphRouter、Avengers-Pro,以及**商业产品 OpenRouter**。结论值得注意:
-  1. 领先方法彼此接近,且都接近"每个数据集固定选最优单模型"这个上限(Dataset Oracle)——说明现有路由器的收益主要来自抓住粗粒度的领域结构,而不是逐请求的精细判断;
-  2. 与理论上限(逐题 Oracle)的差距主要来自"模型召回失败":只有少数模型能答对的题,路由器选不中它们;
-  3. **商业路由器 OpenRouter 跑不过"永远选最好单模型"的基线**;独立解读([Sean Geng](https://seangeng.com/writing/the-honest-guide-to-llm-routing))给出的数字是相对基线 −24.7%;
-  4. 表现最好的 Avengers-Pro 最多省 31.7% 成本且质量持平;embedding 骨干的选择影响有限,模型池越大收益越递减。
-- [RouterArena](https://arxiv.org/abs/2510.00202)(2025):实时排行榜形态的评测,也测商业路由器——NotDiamond 因频繁选贵模型排名靠后(第 12)。
+- [LLMRouterBench](https://aclanthology.org/2026.findings-acl.1881.pdf)(ACL 2026 Findings,上海 AI Lab):更大规模的统一重测——40 万实例、21 个数据集、33 个模型,构建花约 1.8B token、1K GPU 时加 $2.7K API 费。被测的 10 个方法覆盖各路线:RouterDC、EmbedLLM、MODEL-SAT、Avengers、HybridLLM、FrugalGPT、RouteLLM、GraphRouter、Avengers-Pro,以及**商业产品 OpenRouter**。它分两个设定,参照系不同,读结果时不能混:
+
+  **设定一:性能设定**(20 个约 7B 的轻量模型池,只看准确率)。参照系:Random(随机选,下限)、Best Single(事后知道的全局最强单模型)、**Dataset Oracle**(每个数据集固定选该数据集的最强单模型)、Oracle(逐题选对且最便宜,理论上限)。结果:
+
+  1. 领先方法彼此接近(EmbedLLM / GraphRouter / MODEL-SAT / Avengers 的 AvgAcc 在 70.3–71.9 之间),且都接近 Dataset Oracle 的 73.10。**为什么这说明收益来自粗粒度领域结构**:Dataset Oracle 只做一件粗粒度的事——"认出这是数学题,就派数学最强的模型",不做任何逐请求的精细判断;最好的路由器几乎追平它,说明现有方法的收益绝大部分来自这一层。反过来说,论文里各种精巧的逐请求判断,相对"按域选模型"几乎没带来额外收益。
+  2. 与理论上限的差距(Gap@O 约 21%)主要来自**模型召回失败**:只有不超过 3 个模型能答对的题(占测试集 11.9%),路由器准确率只有约 24%;即使放宽到"正确答案在路由器的前 3 个候选里"(Recall@3)也只有约 50%。精细判断不是没收益,是现有方法做不到。
+  3. 对部署友好的结论:Avengers 不训练神经网络(纯聚类)也在第一梯队;embedding 骨干换成弱模型几乎不影响结果;模型池越大收益越递减,精心挑选的小池子更划算。
+
+  **设定二:性能-成本设定**(13 个旗舰模型池,参照系 Best Single = GPT-5)。指标:PerfGain(质量相对 GPT-5 的增减)与 CostSave(质量不低于 GPT-5 前提下的最大省钱幅度)。结果:**OpenRouter 的 PerfGain 是 −24.7%**——质量比"所有请求都发给 GPT-5"还差 24.7%,质量不达标所以 CostSave 记 N/A(论文脚注:OpenRouter 用自己平台的模型池,不可配置)。这与设定一不矛盾:Dataset Oracle 是轻量池里的上界参照,−24.7% 是旗舰池里相对 GPT-5 基线的差距,两个设定两批模型。表现最好的 **Avengers-Pro**:PerfGain +4.0%、CostSave +31.7%,几乎独占 Pareto 前沿(机制见上表);RouteLLM +2.6% / +11.4%;HybridLLM、FrugalGPT 两个二分类级联/路由器都是负收益。
+- [RouterArena](https://arxiv.org/abs/2510.00202)(ICLR 2026):实时排行榜形态,把路由器当黑盒测(各家用各自的模型池),主指标 Arena Score 是准确率与 log₂ 成本的加权调和平均。榜单前几名(Sqwish、AgentForge、Weave、Nadir)都是商业或个人闭源提交,**原理未公开**;开源排名最高的是 vLLM-SR(第 5)。知名商业路由器反而靠后:GPT-5 第 7(模型池受限),NotDiamond 第 12(频繁选贵模型)。论文总结的共同短板:现有路由器都不擅长识别"这题便宜模型就够了"的查询。
 - 独立实测的冷静数字:Sean Geng 的 [The honest guide to LLM model routing](https://seangeng.com/writing/the-honest-guide-to-llm-routing) 综合各家数据后认为,生产混合流量上诚实的省钱幅度约 **20–25%**(Factory Router 在 Terminal-Bench 2 上:99% 的 Opus 4.7 通过率、省 20% 成本),远低于论文里的 85–98%——论文数字来自"旗舰 vs 极小模型"的两极池,生产池的档差没那么大。
 
 ## 4. 实例级路由的约束来源:缓存命中率
@@ -287,7 +317,15 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 
 (图源:[AIBrix README](https://github.com/vllm-project/aibrix)。路由策略在 Gateway Plugins 层,与元数据服务、自动扩缩容并列。)
 
-策略分四类。**负载类**:least-request / least-busy-time / least-latency / least-kv-cache / throughput / power-of-two(随机抽两个 pod 取较闲者)。**缓存类**:`prefix-cache`(把 prompt 按 token 块哈希,找持有相同前缀块的 pod,同时做负载均衡防热点;官方数据 TTFT 比随机路由改善约 45%)和 `prefix-cache-preble`(实现 ICLR'25 的 Preble 论文:全局前缀树 + 负载感知,成本模型是 prefill/decode 的线性回归)。**公平类**:`vtc-basic`(实现 OSDI'24 的 VTC:按每个用户的历史 token 用量做公平调度,用量少的优先)。**SLO 类**:`slo` / `slo-pack-load` / `slo-least-load`(按各 pod 的 SLO 达成率选)。Preble / VTC / D²LPM 三篇论文本身的机制见 §6 调度算法表。
+策略分四类:
+
+| 类 | 策略 | 机制 |
+|----|------|------|
+| 负载 | least-request / least-busy-time / least-latency / least-kv-cache / throughput / power-of-two | 按 pod 的实时指标选较闲者;power-of-two 是随机抽两个取较闲 |
+| 缓存 | `prefix-cache` | 路由器本地维护**固定大小哈希表**(默认 20 万槽位,4 token/块做 xxhash,LRU 淘汰),记录"块→pod";请求按块哈希找持有相同前缀的 pod,再叠加负载项防热点。官方数据:TTFT 比随机路由改善约 45% |
+| 缓存 | `prefix-cache-preble` | 实现 ICLR'25 的 Preble 论文(§6):索引换成**全局前缀树**(不是哈希表),负载项换成 Preble 的成本模型(prefill/decode 线性回归)。与 `prefix-cache` 的差别在索引结构和成本模型,不是同一策略的两个名字 |
+| 公平 | `vtc-basic` | 实现 OSDI'24 的 VTC(§6):按每个用户的历史 token 用量做公平调度,用量少的优先 |
+| SLO | `slo` / `slo-pack-load` / `slo-least-load` | 按各 pod 的 SLO 达成率选 |
 
 两个工程点:**可组合策略**——每个策略输出归一化分数,按配置里的权重加权求和(如 `"least-request:2,throughput:1"` 表示 least-request 占 2/3、throughput 占 1/3),不是单一写死的代价函数,每种策略可独立灰度;**多副本状态同步**——网关插件多副本时前缀缓存状态经 Redis 增量同步,且必须显式开 `AIBRIX_STATESYNC_ENABLED`,否则各副本各算各的、路由结果不一致(官方文档点名这是最常见的踩坑点)。
 
@@ -306,7 +344,12 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 
 (图源:[llm-d README](https://github.com/llm-d/llm-d)。EPP 在网关路径上,消费各 pod 的 KV 事件流。)
 
-工作方式:vLLM/SGLang/TRT-LLM 通过 ZMQ 发布 KV 事件(BlockStored / BlockRemoved / AllBlocksCleared),EPP 的 KV-Cache Indexer 维护全局"块→pod"索引,scorer 按最长连续前缀给候选 pod 打分、按介质层加权。独有的机制是**推测索引**(speculative indexing),解决一个具体的时序问题:路由决策做完到 worker 的 KV 事件传播回索引之间有个窗口期(毫秒级);如果两个同前缀的请求接连到达,第二个请求查索引时,第一个请求刚写入的 KV 还没登记,亲和就断了。做法是决策完成后立刻往索引里写一条"预计这些块会在这个 pod 上"的短期条目(TTL 默认 2 秒),等真实事件到达确认、或过期自动删除——本质是用预测填补事件传播的延迟。多副本:每个 EPP 副本独立订阅所有 pod 的事件流,天然收敛到同一索引,active-active。KV 事件流正在成为生态标准接口(vLLM/SGLang/TRT-LLM 都发)。
+工作方式分四块:
+
+1. **状态来源**:vLLM/SGLang/TRT-LLM 通过 ZMQ 发布 KV 事件(BlockStored / BlockRemoved / AllBlocksCleared)——KV 事件流正在成为生态标准接口,三家引擎都发。
+2. **索引与打分**:EPP 的 KV-Cache Indexer 用事件流维护全局"块→pod"索引;scorer 按最长连续前缀给候选 pod 打分,按介质层(HBM/DRAM/SSD)加权。
+3. **推测索引**(speculative indexing,独有):解决一个具体的时序问题——路由决策做完到 worker 的 KV 事件传播回索引之间有毫秒级窗口;两个同前缀请求接连到达时,第二个查索引会发现第一个刚写的 KV 还没登记,亲和就断了。做法是决策完成后立刻往索引里写一条"预计这些块会在这个 pod 上"的短期条目(TTL 默认 2 秒),等真实事件到达确认、或过期自动删除。本质是用预测填补事件传播的延迟,思路干净,可直接借用(lake 的对应窗口见 §8 第 7 条)。
+4. **多副本**:每个 EPP 副本独立订阅所有 pod 的事件流,天然收敛到同一索引,active-active,不需要共享存储。
 
 ### Kthena
 
@@ -316,7 +359,9 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 
 (图源:[Kthena README](https://github.com/volcano-sh/kthena)。kthena-router 是数据面,缓存感知以插件形式挂入。)
 
-`kvcache-aware` 插件([文档](https://kthena.volcano.sh/docs/user-guide/kvcache-aware)):Runtime sidecar 订阅 vLLM 的 ZMQ KV 事件,把 token 块哈希写进 **Redis**;router 请求时查 Redis 给 pod 打分。块大小默认 16 token,最多匹配 128 块——即最多比对 2048 token 的前缀。设这个上限是因为每块匹配都是一次 Redis 查询,块数越多热路径越慢;2k token 的前缀通常已足够区分该发哪个 pod,再长对决策的改善有限,所以不是精度损失,而是热路径开销与区分度的权衡。PD 分离的调度顺序与别家相反:**先给 decode pod 打分排序,再为选中的 D 配同组 prefill pod**(保证 KV 局部性)。官方自述 router 是参考实现,因为 Gateway Inference Extension 不原生支持 PD 分离。
+`kvcache-aware` 插件([文档](https://kthena.volcano.sh/docs/user-guide/kvcache-aware)):Runtime sidecar 订阅 vLLM 的 ZMQ KV 事件,把 token 块哈希写进 **Redis**;router 请求时查 Redis 给 pod 打分。块大小默认 16 token,最多匹配 128 块(`maxBlocksToMatch`,配置项)——即默认最多比对 2048 token 的前缀。
+
+这个 2k 上限在 agent 场景确实可能不够:如果所有请求共享同一段 2k 的系统提示,匹配只能覆盖"大家一样的部分",区分不出会话级亲和。要澄清两点:(a) 它是可配的默认值,调大的代价是每请求的 Redis 查询次数线性增长——上限的本质是热路径开销与匹配深度的权衡;(b) 默认配置的定位是"系统提示词级亲和",会话级长前缀亲和需要调大上限或换索引结构,这是该实现的已知边界。PD 分离的调度顺序与别家相反:**先给 decode pod 打分排序,再为选中的 D 配同组 prefill pod**(保证 KV 局部性)。官方自述 router 是参考实现,因为 Gateway Inference Extension 不原生支持 PD 分离。
 
 ### KubeAI:无状态路线
 
@@ -355,12 +400,26 @@ CHWBL 的出处与验证:Google Research 2016 年提出([论文 arXiv 1608.01350
 | Kthena | sidecar 订 KV 事件写 Redis,router 请求时查 | filter-score 插件链;PD 先选 D 再配同组 P | 状态外置 Redis |
 | KubeAI(CHWBL) | **无状态**:前缀+LoRA 名哈希即路由 | 有界负载防热点,超界才让位 | 无状态,天然一致 |
 
-把这张表按设计模式归纳,真正不同的选择只有几处:
+把本节各家的设计按问题归纳(这张表是 §5 的浓缩,细节回查上文各节):
 
-1. **缓存状态从哪来,三档取舍**:推测(SGLang,零成本但驱逐后失真)→ 事件订阅(Dynamo/llm-d/Kthena,准但有传播延迟,llm-d 用推测索引补窗口)→ 集中记账/权威视图(production-stack 的 LMCache controller、lake 的存储池,最准但要维护一个中心组件)。KubeAI 的无状态哈希是退出这个权衡的另一条路:不记状态,用哈希天然获得亲和。
-2. **命中与负载怎么结合,两种范式**:加权求和(Dynamo/AIBrix/llm-d,平滑但权重难调)vs 阈值切换(SGLang 失衡时整体切最短队列、production-stack 低于命中阈值回退 QPS,简单可预测但有跳变)。
-3. **热路径纪律一致**:都不在请求路径上做重活——tokenize 移到旁路或干脆字符串匹配(production-stack #59/#1016),状态查询走本地内存或异步。
-4. **多副本一致两条路**:事件流各自收敛(llm-d/Dynamo)或外置共享存储(AIBrix/Kthena 的 Redis)。
+| 设计问题 | 可选方案 | 谁这么选 |
+|----------|----------|----------|
+| 缓存状态从哪来 | 路由器本地推测(零成本,驱逐后失真) | SGLang `cache_aware`、production-stack `prefixaware` |
+| | 引擎发事件、路由器订阅(准,有毫秒级传播延迟) | Dynamo、llm-d、Kthena |
+| | 集中记账/权威视图(最准,要维护中心组件) | production-stack `kvaware`(LMCache controller)、lake(存储池) |
+| | 不记状态,前缀哈希即路由(零状态,不知驱逐与负载) | KubeAI、OpenAI API(前缀哈希 + `prompt_cache_key`) |
+| 事件传播的窗口期怎么补 | 决策后先写短期预测条目(TTL 2s),等事件确认 | llm-d 推测索引(独有) |
+| 命中与负载怎么结合 | 加权求和(平滑,权重难调) | Dynamo、AIBrix(可组合打分)、llm-d |
+| | 阈值切换(简单可预测,有跳变) | SGLang(失衡切最短队列)、production-stack(低于命中阈值回退 QPS) |
+| | 超界才让位(亲和优先,负载封顶) | KubeAI(`meanLoadFactor`)、OpenAI(同前缀 15 RPM 溢出) |
+| 会话怎么粘连 | 显式 key | SGLang `X-SMG-Routing-Key`、OpenRouter `session_id`、OpenAI `prompt_cache_key`、production-stack `session` |
+| | 前缀哈希天然粘连 | KubeAI、各缓存感知策略 |
+| 热路径纪律 | 不 tokenize(字符串/块哈希代替)、状态查询走本地内存或旁路 | 全员;反面教材 production-stack #1016 |
+| 多副本一致 | 事件流各自收敛 | llm-d、Dynamo |
+| | 外置共享存储 | AIBrix(Redis,需显式开 `AIBRIX_STATESYNC_ENABLED`)、Kthena(Redis) |
+| | 无状态天然一致 | KubeAI |
+| PD 分离的调度顺序 | 先选 D 再配同组 P(保 KV 局部性) | Kthena |
+| 匹配深度的上限 | 块数上限防热路径过慢,默认只够系统提示词级亲和 | Kthena(128 块 × 16 token,可配) |
 
 lake 在这张表里的位置:缓存状态由存储池权威维护(强于推测、记账、事件收敛三种),会话亲和靠前缀命中自然获得。
 
@@ -375,9 +434,18 @@ lake 在这张表里的位置:缓存状态由存储池权威维护(强于推测�
 | SSJF([arXiv 2404.08509](https://arxiv.org/abs/2404.08509),LMSYS) | 微调一个 BERT-base,输入 prompt 直接回归输出 token 数;按预测长度做"投机式最短作业优先" | 平均完成时间降 30-40%,吞吐 2.2-3.6× |
 | ELIS([arXiv 2505.09142](https://arxiv.org/abs/2505.09142)) | BGE 文本嵌入 + 分类,最短剩余时间优先 | 平均完成时间降 19.6% |
 | PARS([arXiv 2510.03243](https://arxiv.org/abs/2510.03243)) | 不预测绝对长度,学成对排序("这两个请求哪个更长")——相对顺序比绝对值更鲁棒;有 vLLM 实现 | 优于 FCFS 与既有 SJF 变体 |
-| TIE([arXiv 2604.00499](https://arxiv.org/abs/2604.00499)) | 不预测点估计:先用实测数据拟合输出长度的**分布**(实测呈重尾,用 log-t 分布拟合),再用"尾部膨胀期望"(把分布期望按长尾概率上调)代替长度进 SJF——惩罚"有可能变长"的请求 | 每 token 延迟比 SSJF 再降 2.9× |
+| TIE([arXiv 2604.00499](https://arxiv.org/abs/2604.00499)) | 不预测点估计:先用实测数据拟合输出长度的**分布**(实测呈重尾,用 log-t 分布拟合,见下图),再用"尾部膨胀期望"(把分布期望按长尾概率上调)代替长度进 SJF——惩罚"有可能变长"的请求 | 每 token 延迟比 SSJF 再降 2.9× |
 
-**产品化现状(提出两年后的检验)**:这一支 2024 年就有了,但主流引擎至今默认 FCFS。vLLM 主线的 SJF 类 PR([#29366](https://github.com/vllm-project/vllm/pull/29366),2025 年底)是 opt-in,且用 prompt 长度做代理而非输出长度预测,实测收益只有 6–7%;SLO-aware 调度([#53571](https://github.com/vllm-project/vllm/pull/53571))同样用 prompt 长度阈值而非预测。预测式调度没进主线的原因,综合各方讨论:(1) 预测器本身的训练与推理开销不小,且精度受限(SageSched 论文的批评:微调模型既重又测不准);(2) 连续批处理已经缓解了大部分队头阻塞,预测能再榨出的空间有限;(3) 论文里 2–4 倍的收益按单请求延迟算,生产看的是 SLO 内吞吐,账算过来只有个位数百分比;(4) 纯 SJF 会饿死长请求,还要额外配防饿死机制。不是方向不对,是在当前引擎形态下收益覆盖不了复杂度——做进 lake 前应先离线 replay 验证。
+![输出长度的重尾分布与 log-t 拟合](model-routing/figures/tie-logt-distribution.svg)
+
+(图源:[TIE 论文](https://arxiv.org/abs/2604.00499) Figure 1。同一个 prompt 采样 256 次的输出长度直方图,红线是拟合的 log-t 分布——同一个问题的回答长度本身是个重尾随机变量,这是"预测分布而非点估计"的依据。)
+
+**产品化现状(提出两年后的检验)**:这一支 2024 年就有了,进产品的情况要分两层说。
+
+- **预测输出长度做调度:仍未进主线**。vLLM 主线的 SJF 类 PR([#29366](https://github.com/vllm-project/vllm/pull/29366),2025 年底)是 opt-in,且用 prompt 长度做代理而非输出长度预测,实测收益只有 6–7%;SLO-aware 调度([#53571](https://github.com/vllm-project/vllm/pull/53571))同样用 prompt 长度阈值而非预测。
+- **长度感知调度:已进产品,但用的是观测值不是预测值**。vllm-ascend(华为昇腾的 vLLM 产品化分支)2026 年 8 月合入 DyntraLB([#12292](https://github.com/vllm-project/vllm-ascend/pull/12292)):PD 分离的 decode 节点内,各 DP rank 因请求长度不均会产生通信空泡(快的等慢的);DyntraLB 按**各请求已实现的 KV 块数**(decode 进行中的真实长度)估计负载,对请求做暂停/恢复/准入控制来抹平。思路与 PARS 同属"按长度调度",但它用的是 decode 中的观测值——不需要预测器,也就没有预测误差。
+
+预测式调度没进主线的原因,综合各方讨论:(1) 预测器本身的训练与推理开销不小,且精度受限(SageSched 论文的批评:微调模型既重又测不准);(2) 连续批处理已经缓解了大部分队头阻塞,预测能再榨出的空间有限;(3) 论文里 2–4 倍的收益按单请求延迟算,生产看的是 SLO 内吞吐,账算过来只有个位数百分比;(4) 纯 SJF 会饿死长请求,还要额外配防饿死机制。DyntraLB 的选择(用观测值绕开预测)侧面印证了第 (1)(4) 条。对 lake 的结论:做进 Router 前应先离线 replay 验证;decode 中的观测长度(存储池能看到)比预测器更便宜可靠。
 
 ### 调度算法
 
@@ -385,7 +453,7 @@ lake 在这张表里的位置:缓存状态由存储池权威维护(强于推测�
 |------|------|------|--------------|
 | Preble([2407.00023](https://arxiv.org/abs/2407.00023)) | ICLR 2025 | 全局前缀树 + 负载感知放置 | 缓存亲和调度的学术原型;AIBrix `prefix-cache-preble` 与 SGLang `cache_aware` 都源自它 |
 | VTC([2401.00588](https://arxiv.org/abs/2401.00588)) | OSDI 2024 | 虚拟 token 计数的多租户公平 | AIBrix `vtc-basic`;lake 里公平性归 gateway |
-| DLPM / D²LPM([2501.14312](https://arxiv.org/abs/2501.14312)) | 2025 | **公平 + 局部性统一**:给每个客户端记一本"亏欠账"(应得服务额度减去已得,亏欠多者优先——即 deficit counter),但选 worker 时只在前缀命中的里挑;分布式版 D²LPM 用"每客户端 × 每 worker"双级配额 + 全局 radix 树,异步同步驱逐信息 | 首个同时保公平与前缀局部性的调度;吞吐最高 2.87× VTC;AIBrix #677 点名参考 |
+| DLPM / D²LPM([2501.14312](https://arxiv.org/abs/2501.14312)) | 2025 | **公平 + 局部性统一**,两个机制拼起来:(1) 公平——给每个客户端记一本"亏欠账":应得服务额度减去已得额度,差值越大越优先(类似排队时等得最久的人先办);(2) 局部性——尽量把请求发给存着它前缀的 worker(最长前缀匹配)。两者天然冲突(严格公平会把请求发到没缓存的 worker 上),DLPM 的做法是先按账本找出最亏欠的客户端,再在持有其前缀的 worker 里选;分布式版 D²LPM 加"每客户端 × 每 worker"双级配额防热点,前缀树全局共享、驱逐信息异步同步 | 首个同时保公平与前缀局部性的调度;吞吐最高 2.87× VTC;AIBrix #677 点名参考 |
 | Llumnix([2406.03243](https://arxiv.org/abs/2406.03243),[开源](https://github.com/AlibabaPAI/llumnix)) | OSDI 2024 | **运行时重调度**:请求连 KV 一起在实例间热迁移,像 OS 的进程调度 | 路由是"决策时最优",迁移是"运行时纠偏"——第三条路;尾延迟改善一个数量级 |
 | FastServe([2305.05920](https://arxiv.org/abs/2305.05920)) | NSDI 2026 | skip-join MLFQ,按输出 token 粒度抢占 | 解决实例内队头阻塞;与输出长度预测一支互补 |
 | Autellix([2502.13965](https://arxiv.org/abs/2502.13965)) | 2025 | **程序级调度**:把 agent 程序当一等公民,按程序累计服务时间(PLAS)与关键路径(ATLAS)排优先级 | agent 多调用场景的调度;同延迟下吞吐 4-15× |
@@ -398,7 +466,19 @@ lake 在这张表里的位置:缓存状态由存储池权威维护(强于推测�
 
 (图源:[Llumnix 论文](https://arxiv.org/abs/2406.03243) Figure 5。请求分发、KV 热迁移、自动扩缩容由同一个运行时调度器统一决策——路由是决策时最优,迁移是运行时纠偏。)
 
-这一支工作的共同模式:都在补"决策时信息不足"——Preble/D²LPM 补全局前缀视图,FastServe 补抢占能力,Llumnix 补运行时纠偏,Autellix/Parrot 补程序级上下文,Mélange 补成本模型,Mooncake 补全局 KV 中心视图,Marconi 补准入控制。与生产栈的差距也很一致:学术原型大多假设全局状态完美可得、决策开销为零;§5 的生产实现,主要工作就是把这两件事做实(事件订阅、推测索引、热路径纪律)。
+这一支工作的共同模式:都在补"决策时信息不足"。逐个说清补的是什么:
+
+| 工作 | 补的是什么 | 具体含义 |
+|------|-----------|----------|
+| Preble / D²LPM | 全局前缀视图 | 调度器知道每个 worker 缓存了哪些前缀,而不是按历史瞎猜 |
+| FastServe | 抢占能力 | 长请求 decode 到一半可以被暂停,让短请求先跑完(传统 FCFS 一旦开跑就不能打断) |
+| Llumnix | 运行时纠偏 | 请求连 KV 一起在实例间热迁移——开局没分对,中途还能搬 |
+| Autellix / Parrot | 程序级上下文 | 调度器知道多个请求属于同一个 agent 程序,按程序的总进度排优先级,而不是孤立地看每个请求 |
+| Mélange | 成本模型 | 按请求尺寸分布选配 GPU 型号组合,而不是全场同一种卡 |
+| Mooncake | 全局 KV 视图 + 早拒 | 以 KV 为中心选 P/D 对;过载时预测性地拒绝请求,而不是让它们排队超时 |
+| Marconi | 准入控制 | 不是所有前缀都值得缓存——按复用概率决定收不收,省得缓存被一次性前缀污染 |
+
+与生产栈的差距也很一致:学术原型大多假设"全局状态免费可得、决策零开销"。§5 的生产实现,主要工作就是把这两个假设做实——用事件订阅代替完美视图(llm-d/Kthena),用推测索引补传播窗口(llm-d),用热路径纪律控制决策开销(production-stack 的教训)。
 
 PD 分离一系(DistServe / Splitwise / PD-Serve 等)与本文主题相邻但已在 [`vllm_vs_sglang/pd-disaggregation.md`](vllm_vs_sglang/pd-disaggregation.md) 覆盖,不重复。
 
@@ -432,7 +512,7 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
 6. **命中阈值与失衡切换**。短请求设命中阈值,不做亲和查询直接负载均衡(production-stack 默认 2000 token);负载严重失衡时缓存亲和整体让位(SGLang 的双阈值切换)。lake 的亲和信息更可靠(存储池权威视图,非推测),这些阈值与切换逻辑可以直接移植。
 7. **推测索引**(llm-d)。路由决策到 KV 位置视图更新之间存在窗口期,连续同前缀请求会在窗口期内失去亲和。llm-d 的做法是决策后立即写入短期预测条目(TTL 2 秒),等确认或过期。lake Router 读存储池位置视图,同样有"决策-放置"窗口,这个机制可直接借用。
 8. **无状态保底**(KubeAI CHWBL)。位置视图不可用或存储池控制面故障时,Router 可以退到"前缀+模型/LoRA 一致性哈希"——零状态、天然多副本一致、仍保前缀亲和,优于随机,也比"按负载预测"的降级路径更便宜。
-9. **公平与局部性兼得**(D²LPM)。给每个客户端记"亏欠账"(应得服务额度减去已得,亏欠多者优先),选 worker 时只在前缀命中的里挑;分布式下用"客户端 × worker"双级配额。lake 里公平性决策归 gateway,但这套配额机制是 gateway 侧现成可参考的算法。
+9. **公平与局部性兼得**(D²LPM)。公平调度(按各客户端历史用量排队,用量少的优先)与前缀亲和(尽量发给存着该前缀的 worker)天然冲突:严格公平会把请求发到没有它缓存的 worker 上。D²LPM 的解法(机制展开见 §6 表):先按"亏欠账"找出最亏欠的客户端,再在持有其前缀的 worker 里选,并用"(客户端 × worker)"配额防止某个热门前缀把单个 worker 打爆。lake 里公平性决策归 gateway,这套算法是 gateway 侧现成的参考。
 
 **上线与运维的注意事项**
 
@@ -451,23 +531,31 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
 
 ## 9. 相邻主题存档(链接备查,不在本文展开)
 
-以下来自个人技术笔记的整理,与路由相邻但属于别的层次。按"属于哪一层"归档:
+以下来自个人技术笔记的整理,与路由相邻但属于别的层次。按"属于哪一层"分三组,每组先说清是什么、与路由什么关系,再列链接。
 
-| 主题 | 内容 | 与路由的关系 | lake 对应层 |
-|------|------|--------------|--------------|
-| **KV 显存管理**(分配器层) | vLLM 的 [cache policy framework(#11928)](https://github.com/vllm-project/vllm/pull/11928)、[unify allocating slots(#12608)](https://github.com/vllm-project/vllm/pull/12608)、[Hybrid Memory Allocator RFC(#11382)](https://github.com/vllm-project/vllm/issues/11382)、[Hybrid KV Cache Manager 设计文档](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager.html);蚂蚁 [glake](https://github.com/antgroup/glake) 仓里的 GMLake([arXiv 2401.08156](https://arxiv.org/abs/2401.08156),ASPLOS'24,训练侧显存碎片)、vTensor(VMM 虚拟张量管理)、LayerKV([arXiv 2410.00428](https://arxiv.org/abs/2410.00428),按层粒度的 KV 管理降 TTFT) | 实例选定之后,实例内部的 KV 怎么摆 | 存储池的块管理与碎片整理,见 [`architecture/kv-cache-pool.md`](../architecture/kv-cache-pool.md) |
-| **实例内调度** | vLLM [prefix sorting(#13762)](https://github.com/vllm-project/vllm/pull/13762):batch 内按前缀排序,提高 APC 命中 | batch 内优化,与实例间路由正交 | — |
-| **PD 间 KV 传输工程** | MLA 冗余拉取的随机映射、GQA 切分不对齐的先传后转、HCCL 的 2M 地址对齐、小块聚合成大传输 + 双流拷贝——见 [vllm-ascend#1568](https://github.com/vllm-project/vllm-ascend/pull/1568)、[Mooncake#502](https://github.com/kvcache-ai/Mooncake/pull/502)、[Mooncake#619](https://github.com/kvcache-ai/Mooncake/pull/619)、[知乎分析](https://zhuanlan.zhihu.com/p/1946608360259577576) | 路由选定 P/D 之后,传输层怎么搬 KV | Transfer Bus,见 [`mooncake/overview.md`](mooncake/overview.md) 与 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md) |
+**KV 显存管理(分配器层)** —— 实例选定之后,实例内部的 KV 怎么摆。lake 对应层:存储池的块管理与碎片整理([`architecture/kv-cache-pool.md`](../architecture/kv-cache-pool.md))。
+
+- vLLM 侧:[cache policy framework(#11928)](https://github.com/vllm-project/vllm/pull/11928)(驱逐策略可插拔)、[unify allocating slots(#12608)](https://github.com/vllm-project/vllm/pull/12608)(统一 slot 分配)、[Hybrid Memory Allocator RFC(#11382)](https://github.com/vllm-project/vllm/issues/11382) 与 [Hybrid KV Cache Manager 设计文档](https://docs.vllm.ai/en/latest/design/hybrid_kv_cache_manager.html)(混合 KV 的分配器设计)
+- 蚂蚁 [glake](https://github.com/antgroup/glake) 仓:GMLake([arXiv 2401.08156](https://arxiv.org/abs/2401.08156),ASPLOS'24,训练侧显存碎片)、vTensor(VMM 虚拟张量管理)、LayerKV([arXiv 2410.00428](https://arxiv.org/abs/2410.00428),按层粒度的 KV 管理降 TTFT)
+
+**实例内调度** —— batch 内优化,与实例间路由正交。
+
+- vLLM [prefix sorting(#13762)](https://github.com/vllm-project/vllm/pull/13762):batch 内按前缀排序,提高 APC 命中
+
+**PD 间 KV 传输工程** —— 路由选定 P/D 之后,传输层怎么搬 KV。lake 对应层:Transfer Bus([`mooncake/overview.md`](mooncake/overview.md)、[`hbm-tier-and-offload.md`](hbm-tier-and-offload.md))。
+
+- 要解决的问题:MLA 冗余拉取、GQA 切分不对齐、HCCL 的 2M 地址对齐、小块传输的聚合与双流拷贝
+- 参考实现:[vllm-ascend#1568](https://github.com/vllm-project/vllm-ascend/pull/1568)、[Mooncake#502](https://github.com/kvcache-ai/Mooncake/pull/502)、[Mooncake#619](https://github.com/kvcache-ai/Mooncake/pull/619)、[知乎分析](https://zhuanlan.zhihu.com/p/1946608360259577576)
 
 ## 参考链接
 
-- OpenAI:[GPT-5 System Card](https://openai.com/index/gpt-5-system-card/)、[Introducing GPT-5](https://openai.com/index/introducing-gpt-5/)
+- OpenAI:[GPT-5 System Card](https://openai.com/index/gpt-5-system-card/)、[Introducing GPT-5.2](https://openai.com/index/introducing-gpt-5-2/)、[Prompt caching 文档](https://developers.openai.com/api/docs/guides/prompt-caching)与 [Prompt Caching 201](https://developers.openai.com/cookbook/examples/prompt_caching_201)(实例级前缀哈希路由)、[WIRED:路由器回滚报道](https://www.wired.com/story/openai-router-relaunch-gpt-5-sam-altman/)
 - Databricks:[Smart Routing 博客](https://www.databricks.com/blog/smart-routing-unity-ai-gateway-match-frontier-quality-30-lower-cost-task)、[产品文档](https://docs.databricks.com/aws/en/ai-gateway/smart-routing);Cognition:[Devin Fusion 博客](https://cognition.com/blog/devin-fusion)
 - OpenRouter:[Auto Router 公告](https://openrouter.ai/blog/announcements/introducing-the-new-auto-router/)、[文档](https://openrouter.ai/docs/guides/routing/routers/auto-router);Martian 分析:[The LLM router was three products wearing one name](https://www.thedeepfeed.ai/posts/2026-06-09-llm-router-three-products-one-name/);独立实测:[The honest guide to LLM model routing](https://seangeng.com/writing/the-honest-guide-to-llm-routing)、[Factory Router](https://factory.ai/news/factory-router)
 - OpenSquilla:[GitHub](https://github.com/TokenRhythm/opensquilla)、[技术报告](https://aixiv.science/abs/aixiv.260822.000001)([中文](https://chinaxiv.org/abs/202608.00176))、[数据飞轮论文 arXiv 2607.11399](https://arxiv.org/abs/2607.11399)、[官网](https://opensquilla.ai/zh/)
 - 小米 MiMo:[桌面客户端开放邀测(Smart 调度)](https://mp.weixin.qq.com/s/Ey0GaGl3erC6sm_ubOOEEQ)
 - Anthropic:[Prompt caching is everything](https://claude.com/blog/lessons-from-building-claude-code-prompt-caching-is-everything)
-- 开源:[lm-sys/RouteLLM](https://github.com/lm-sys/RouteLLM)、[vllm-project/semantic-router](https://github.com/vllm-project/semantic-router)、[vllm-project/production-stack](https://github.com/vllm-project/production-stack)([KV-aware routing 文档](https://docs.vllm.ai/projects/production-stack/en/vllm-stack-0.1.11/use_cases/kv-cache-aware-routing.html);相关 issue:[#855 2026 roadmap](https://github.com/vllm-project/production-stack/issues/855)、[#1016 热路径阻塞](https://github.com/vllm-project/production-stack/issues/1016)、[#1073 回退信号过期](https://github.com/vllm-project/production-stack/issues/1073)、[#1074 全零负载假健康](https://github.com/vllm-project/production-stack/issues/1074))、[musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)、[LiteLLM](https://github.com/BerriAI/litellm)
+- 开源:[lm-sys/RouteLLM](https://github.com/lm-sys/RouteLLM)、[vllm-project/semantic-router](https://github.com/vllm-project/semantic-router)([训练与数据集文档](https://llm-semantic-router.readthedocs.io/en/latest/training/datasets/))、[vllm-project/production-stack](https://github.com/vllm-project/production-stack)([KV-aware routing 文档](https://docs.vllm.ai/projects/production-stack/en/vllm-stack-0.1.11/use_cases/kv-cache-aware-routing.html);相关 issue:[#855 2026 roadmap](https://github.com/vllm-project/production-stack/issues/855)、[#1016 热路径阻塞](https://github.com/vllm-project/production-stack/issues/1016)、[#1073 回退信号过期](https://github.com/vllm-project/production-stack/issues/1073)、[#1074 全零负载假健康](https://github.com/vllm-project/production-stack/issues/1074))、[musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)、[LiteLLM](https://github.com/BerriAI/litellm)
 - 调度栈:[vllm-project/production-stack](https://github.com/vllm-project/production-stack)、[vllm-project/aibrix](https://github.com/vllm-project/aibrix)、[llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) 三个已引入 `3rdparty/` 同名 submodule;[AIBrix 路由策略文档](https://aibrix.readthedocs.io/latest/features/gateway-plugins.html)(issue:[#672 LSH 路由](https://github.com/vllm-project/aibrix/issues/672)、[#677 树版 Preble](https://github.com/vllm-project/aibrix/issues/677))、[llm-d KV-Cache Indexer](https://llm-d.ai/docs/architecture/advanced/kv-management/kv-indexer)、[volcano-sh/kthena](https://github.com/volcano-sh/kthena)([kvcache-aware 插件](https://kthena.volcano.sh/docs/user-guide/kvcache-aware))、[substratusai/kubeai](https://github.com/substratusai/kubeai)([CHWBL 博客](https://www.kubeai.org/blog/2025/02/26/llm-load-balancing-at-scale-chwbl/))
 - SGLang 调度源码(本地 `3rdparty/sglang/sgl-model-gateway/src/policies/`,[GitHub](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway/src/policies)):`cache_aware.rs`(近似前缀树+失衡切换)、`consistent_hashing.rs`(`X-SMG-Routing-Key` 会话粘连)、`tree.rs`
-- 论文:FrugalGPT [2305.05176](https://arxiv.org/abs/2305.05176) · HybridLLM [2404.14618](https://arxiv.org/abs/2404.14618) · RouteLLM [2406.18665](https://arxiv.org/abs/2406.18665) · GraphRouter [2410.03834](https://arxiv.org/abs/2410.03834) · RouterBench [2403.12031](https://arxiv.org/abs/2403.12031) · LLMRouterBench [ACL 2026](https://aclanthology.org/2026.findings-acl.1881.pdf) · RouterArena [2510.00202](https://arxiv.org/abs/2510.00202) · 路由综述 [2603.04445](https://arxiv.org/html/2603.04445v2) · When to Reason [2510.08731](https://arxiv.org/abs/2510.08731) · SSJF [2404.08509](https://arxiv.org/abs/2404.08509) · ELIS [2505.09142](https://arxiv.org/abs/2505.09142) · PARS [2510.03243](https://arxiv.org/abs/2510.03243) · TIE [2604.00499](https://arxiv.org/abs/2604.00499) · Preble [2407.00023](https://arxiv.org/abs/2407.00023) · VTC [2401.00588](https://arxiv.org/abs/2401.00588) · Llumnix [2406.03243](https://arxiv.org/abs/2406.03243) · FastServe [2305.05920](https://arxiv.org/abs/2305.05920) · Autellix [2502.13965](https://arxiv.org/abs/2502.13965) · Mélange [2404.14527](https://arxiv.org/abs/2404.14527) · Mooncake [2407.00079](https://arxiv.org/abs/2407.00079) · Marconi [2411.19379](https://arxiv.org/abs/2411.19379) · D²LPM [2501.14312](https://arxiv.org/abs/2501.14312) · GMLake [2401.08156](https://arxiv.org/abs/2401.08156) · LayerKV [2410.00428](https://arxiv.org/abs/2410.00428) · CHWBL [1608.01350](https://arxiv.org/abs/1608.01350)([Google Research 博客](https://research.google/blog/consistent-hashing-with-bounded-loads/));vLLM 调度 PR:[SJF #29366](https://github.com/vllm-project/vllm/pull/29366)、[SLO-aware #53571](https://github.com/vllm-project/vllm/pull/53571)
+- 论文:FrugalGPT [2305.05176](https://arxiv.org/abs/2305.05176) · HybridLLM [2404.14618](https://arxiv.org/abs/2404.14618) · RouteLLM [2406.18665](https://arxiv.org/abs/2406.18665) · GraphRouter [2410.03834](https://arxiv.org/abs/2410.03834) · Avengers [2408.12683](https://arxiv.org/abs/2408.12683) · Avengers-Pro [2508.12631](https://arxiv.org/abs/2508.12631) · RouterBench [2403.12031](https://arxiv.org/abs/2403.12031) · LLMRouterBench [ACL 2026](https://aclanthology.org/2026.findings-acl.1881.pdf) · RouterArena [2510.00202](https://arxiv.org/abs/2510.00202) · 路由综述 [2603.04445](https://arxiv.org/html/2603.04445v2) · When to Reason [2510.08731](https://arxiv.org/abs/2510.08731) · SSJF [2404.08509](https://arxiv.org/abs/2404.08509) · ELIS [2505.09142](https://arxiv.org/abs/2505.09142) · PARS [2510.03243](https://arxiv.org/abs/2510.03243) · TIE [2604.00499](https://arxiv.org/abs/2604.00499) · Preble [2407.00023](https://arxiv.org/abs/2407.00023) · VTC [2401.00588](https://arxiv.org/abs/2401.00588) · Llumnix [2406.03243](https://arxiv.org/abs/2406.03243) · FastServe [2305.05920](https://arxiv.org/abs/2305.05920) · Autellix [2502.13965](https://arxiv.org/abs/2502.13965) · Mélange [2404.14527](https://arxiv.org/abs/2404.14527) · Mooncake [2407.00079](https://arxiv.org/abs/2407.00079) · Marconi [2411.19379](https://arxiv.org/abs/2411.19379) · D²LPM [2501.14312](https://arxiv.org/abs/2501.14312) · GMLake [2401.08156](https://arxiv.org/abs/2401.08156) · LayerKV [2410.00428](https://arxiv.org/abs/2410.00428) · CHWBL [1608.01350](https://arxiv.org/abs/1608.01350)([Google Research 博客](https://research.google/blog/consistent-hashing-with-bounded-loads/));vLLM 调度 PR:[SJF #29366](https://github.com/vllm-project/vllm/pull/29366)、[SLO-aware #53571](https://github.com/vllm-project/vllm/pull/53571)、[vllm-ascend DyntraLB #12292](https://github.com/vllm-project/vllm-ascend/pull/12292)
