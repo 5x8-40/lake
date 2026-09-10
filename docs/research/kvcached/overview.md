@@ -21,7 +21,7 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 
 | kvcached 概念 | 本系统对应 | 关系 |
 |---------------|-----------|------|
-| `FTensor`（VA 预留 + 页级映射） | L0 物理页按需分配 | **机制样板**；lake 把分配者从进程内库换成池 agent（见「想象空间」第 5 条） |
+| `FTensor`（VA 预留 + 页级映射） | L0 物理页按需分配 | **机制样板**；lake 把分配者从进程内库换成池 agent（见「想象空间」第 1 条） |
 | `PageAllocator`（热页缓存/resize） | 池 agent 的 HBM 页管理 | 工程细节可照搬：2MB 同尺寸页无碎片、5–10 页热缓存、失败回滚 |
 | `MemInfoTracker`（`/dev/shm` 记账） | 配额/用量上报 | 带外、不占请求路径；lake 归控制面权威 |
 | kvctl（revision 状态机） | 池配额下发通道 | applied/deferred/stale/conflict 语义可直接用 |
@@ -44,7 +44,7 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 
 | # | 设想 | kvcached 是否具备 | 实际机制 | Dynamo 里能不能做 |
 |---|------|------|----------|----------|
-| 1 | 跨进程显存超卖 | 具备 | VA 私有 + 物理页按需映射，闲置页经驱动流转 | 能。kvcached 是引擎侧插件，Dynamo worker 用 vLLM/SGLang 后端时可直接带入；与 NIXL 的 GPU 直传共存是待解问题（见「想象空间」第 4 条） |
+| 1 | 跨进程显存超卖 | 具备 | VA 私有 + 物理页按需映射，闲置页经驱动流转 | 能。kvcached 是引擎侧插件，Dynamo worker 用 vLLM/SGLang 后端时可直接带入；与 NIXL 的 GPU 直传共存是待解问题（见「想象空间」第 2 条） |
 | 2 | 独立 daemon 全局统筹 | 不具备（实现与设想相反） | 无 daemon；进程内库 + /dev/shm 记账 + 驱动仲裁 | 能，且更顺。Dynamo 本就有控制面（etcd + planner），把各 worker 的用量记账上报 planner 即成全局统筹，不必走 kvcached 的无锁路线 |
 | 3 | 零物理分配冷启动 | 具备（仅 KV） | VA 预留 + 全段先指向同一 zero page，启动物理占用约一页 | 能。省掉 worker 拉起时的 KV 预分配与 profiling 定容；权重加载是另一段，需另解（TensorCast 方向） |
 | 4 | 多租户硬配额 | 具备（有边界） | 硬在分配拒绝；在用页不能强收 | 能。kvctl 是带外 CLI，Dynamo 里应改成控制面下发配额；「在用页不可强收」的边界相同 |
@@ -176,7 +176,7 @@ Sardeenz 的好处值得说清：kvcached 只解决「显存怎么共享」，Sa
 - **一致性**：无全局锁。「查空闲」与「映射」两步之间可并发超分，靠 5% 安全余量与失败回滚兜底。
 - **HA 与故障**：进程退出，其 VA 与物理页由驱动回收，shm 段 unlink；无跨进程状态需要恢复。
 - **扩展性**：无协调成本，但边界是单机单卡；跨节点、分层、全局视图均不在 scope。
-- **与 lake 对照**：kvcached 是「无中心」的极端——连事件流/快照都没有，因为不需要：物理页分配是驱动内的原子操作，不产生位置索引需求。lake 需要块级位置权威（D-direct/F4），故必须有 CP；但 L0 物理页的按需供给机制可直接借 kvcached（见「想象空间」第 5 条）。
+- **与 lake 对照**：kvcached 是「无中心」的极端——连事件流/快照都没有，因为不需要：物理页分配是驱动内的原子操作，不产生位置索引需求。lake 需要块级位置权威（D-direct/F4），故必须有 CP；但 L0 物理页的按需供给机制可直接借 kvcached（见「想象空间」第 1 条）。
 
 ## 技术栈
 
@@ -188,30 +188,30 @@ Sardeenz 的好处值得说清：kvcached 只解决「显存怎么共享」，Sa
 
 kvcached 和 lake 是同一思想在两个尺度：kvcached 把 OS 虚拟内存搬进单张 GPU（VA 与物理页解耦）；lake 把 KV 编址统一到集群的 L0–L3。两者缺的东西正好互为对方有的——kvcached 缺全局视图、内容身份、跨节点（lake 控制面已有）；lake 缺引擎无感的页级弹性机制（kvcached 已在真实引擎验证）。
 
-先立场景分野：kvcached/Prism 的收益主体是**平台托管大量不同模型**（模型动物园，卖给多客户超分）；Dynamo 的主场景是**同模型大规模部署对外提供 API**——后者里超卖无收益（见「收益与适用边界」），kvcached 对后者的价值在机制层：L0 落地形态（第 5 条）、RDMA 共存（第 4 条）、扩缩容提速（第 2 条）。以下按优先级排：功能落地与 RDMA 共存两个重点在前，对 lake 的设计空间居中，可照搬的小机制在后从简。
+先立场景分野：kvcached/Prism 的收益主体是**平台托管大量不同模型**（模型动物园，卖给多客户超分）；Dynamo 的主场景是**同模型大规模部署对外提供 API**——后者里超卖无收益（见「收益与适用边界」），kvcached 对后者的价值在机制层。以下重点在前，设计空间与小机制居中，模型动物园场景备查殿后。
 
 ![与 Dynamo 组合](figures/with-dynamo.svg)
 
-### 功能落地：四个设想在 Dynamo 里怎么做（重点）
+### 重点（Dynamo 主场景可落地）
 
-1. **单机多模型超卖 + Dynamo 集群编排**。目标负载是模型动物园（生产 trace：任意时刻 23%–50% 模型活跃，活跃集每小时变 54–766 次，见「收益与适用边界」）。Dynamo 管跨节点调度，kvcached 管单机显存弹性：worker 用 vLLM/SGLang 后端时 kvcached 以 autopatch 直接带入，同卡多模型/多实例的物理页按需流转。Prism（OSDI 2026）已验证这个两级结构（>2× 成本、3.3× SLO、1 万+ GPU 生产部署），Red Hat Sardeenz 在 k8s/OpenShift 上产品化。不依赖 PD/RDMA，风险最低。**适用前提**：平台托管大量不同模型；同模型大规模 API 部署不适用（每形态流量 ≥ 整卡时，一实例一卡 + 扩缩容即可）。
-2. **serverless 与扩缩容提速：实例数量与显存解耦**。对**同模型大规模部署**，这条的价值不是多模型挂载，而是把扩缩容的时间常数压到秒级——常备 headroom ≈ 突发幅度 × 扩容时间常数，时间常数越小，为吸收扩容延迟预留的余量越小。对**模型动物园**，则是下述多模型挂载形态。kvcached（KV→约零）+ vLLM sleep mode（权重离卡）组合后，闲置实例的 HBM 占用接近零：sleep level 1 权重 offload 到 DRAM（唤醒 = DRAM→GPU 回拷，PCIe 下 8B 模型约零点几秒）；level 2 权重直接丢弃（唤醒 = 从模型源重载，更慢）（`vllm/device_allocator/sleep_mode_backend.py::CuMemBackend`）。睡后 HBM 残留主要是每进程固定开销：CUDA context（数百 MB）与 NCCL buffer（sleep 不动它，TP>1 时不可忽略）——单卡能挂多少冷实例，真实上限是这些固定开销而非权重/KV。于是一张卡可挂载大量冷实例，配合外部调度做**多模型部署的扩缩容**：Dynamo Planner 决定唤醒/休眠谁，拉起时同时省掉 KV 预分配和容量定容，唤醒延迟 = 权重回拷（level 1）或重载（level 2）。注意纯 sleep 是**二态开关**（醒 = 权重 + 静态 KV 全占 / 睡 = 约零），活跃集快变时换权重会 thrashing（Prism trace 实测）；弹性 KV 补上 0~100% 的连续中间态——模型可以浅驻留接轻流量，不必整机醒睡。扩缩容替代不了这一点：它调的是实例数，调不动单实例的驻留比例（stock 引擎的 footprint 启动时定死，没有「0.2 个实例」）。这正是 Prism 两级调度已验证的形态（`examples/06_serverless_serving`）。
-3. **全局统筹与配额归控制面**。kvcached 的协调是单机带外方案（shm 记账 + kvctl 手敲 + 各进程自查）；搬进 Dynamo 时这两件事都归控制面：worker 用量记账上报 planner 即成全局统筹（设想 2——kvcached 刻意不做 daemon，Dynamo 的 etcd + planner 恰是现成的 daemon）；配额由控制面下发替代 kvctl（设想 4，revision 状态机语义可保留）。控制面统一记账后，「查」和「用」之间的无锁超分窗口也随之消失——分配许可来自权威，而非各进程自查。注意配额主要面向多租户场景；同模型部署只需要前半（用量记账上报），硬配额用不上。
-
-### RDMA 共存（重点）
-
-4. **RDMA 冲突的精确化与 ODP 路线**。先把冲突范围说准：只有 RDMA 端点是 GPU 显存时才冲突（NixlConnector 式 G1→G1 直传、Mooncake TE 注册 GPU 内存）；KVCR 的主层中转模式（GPU→DRAM 走 cudaMemcpy，DRAM→对端走 NIXL，注册的是 DRAM）天然规避。所以「kvcached + KVCR」组合的冲突面比直觉小。正解调研方向是 RDMA ODP（On-Demand Paging）：注册 VA 区域、物理页由驱动按需换入换出，正是为「注册区域物理页可变」设计的机制；GPU 显存的 ODP 依赖 HMM/ATS 与 NIC 驱动支持，需实测。次选：传输期间临时钉住、整段 VA 预注册 + 物理页池化。
+1. **lake L0 的落地形态：VA 归引擎、物理页归池**。lake 断言「L0 HBM 归池」，但一直没回答：引擎张量要稳定地址（CUDA graph），池要按需供给物理页，怎么兼得？kvcached 给了工程答案——虚拟地址段归引擎（地址固定），物理页归分配者（按需 map/unmap）。lake 可把 PageAllocator 的角色换成池 agent（Rust）：worker 启动预留 VA 段，池 agent 按放置决策供页，位置视图记录块→（节点，页）映射。这把存算分离推进到最内层：HBM 不再是 worker 私有资源，而是池按页供给的。
+2. **RDMA 共存：冲突精确化与 ODP 路线**。先把冲突范围说准：只有 RDMA 端点是 GPU 显存时才冲突（NixlConnector 式 G1→G1 直传、Mooncake TE 注册 GPU 内存）；KVCR 的主层中转模式（GPU→DRAM 走 cudaMemcpy，DRAM→对端走 NIXL，注册的是 DRAM）天然规避。所以「kvcached + KVCR」组合的冲突面比直觉小。正解调研方向是 RDMA ODP（On-Demand Paging）：注册 VA 区域、物理页由驱动按需换入换出，正是为「注册区域物理页可变」设计的机制；GPU 显存的 ODP 依赖 HMM/ATS 与 NIC 驱动支持，需实测。次选：传输期间临时钉住、整段 VA 预注册 + 物理页池化。
+3. **扩缩容提速：实例数量与显存解耦**。同模型大规模部署里，kvcached 的价值是把扩缩容时间常数从分钟级压到秒级：拉起时 KV 零物理分配（特性 3）、省掉容量定容；闲置时 sleep 把权重离卡（level 1 offload 到 DRAM，唤醒 = 回拷，PCIe 下 8B 模型约零点几秒；level 2 丢弃重载更慢），睡后 HBM 残留只剩 CUDA context（数百 MB）与 NCCL buffer（`vllm/device_allocator/sleep_mode_backend.py::CuMemBackend`）。常备 headroom ≈ 突发幅度 × 扩容时间常数——时间常数压下来，为吸收扩容延迟预留的余量直接小一个量级。
 
 ### 对 lake 的设计空间（要自己设计/验证）
 
-5. **lake L0 的落地形态：VA 归引擎、物理页归池**。lake 断言「L0 HBM 归池」，但一直没回答：引擎张量要稳定地址（CUDA graph），池要按需供给物理页，怎么兼得？kvcached 给了工程答案——虚拟地址段归引擎（地址固定），物理页归分配者（按需 map/unmap）。lake 可把 PageAllocator 的角色换成池 agent（Rust）：worker 启动预留 VA 段，池 agent 按放置决策供页，位置视图记录块→（节点，页）映射。这把存算分离推进到最内层：HBM 不再是 worker 私有资源，而是池按页供给的。
-6. **权重 VMM 化 / MoE 专家懒加载**。kvcached 只虚拟化 KV；同一机制可用于权重：MoE 专家 VA 预留，热专家常驻物理页，冷专家释放（字节在 DRAM/SSD，用时换入），单卡逻辑容量超物理容量。与 TensorCast 权重 artifact 化、lake Weight Cache 同方向。风险也最大：专家切换在 decode 路径上，换入延迟直接进 ITL，必须按路由分布做预测性预取。
+4. **权重 VMM 化 / MoE 专家懒加载**。kvcached 只虚拟化 KV；同一机制可用于权重：MoE 专家 VA 预留，热专家常驻物理页，冷专家释放（字节在 DRAM/SSD，用时换入），单卡逻辑容量超物理容量。与 TensorCast 权重 artifact 化、lake Weight Cache 同方向。风险也最大：专家切换在 decode 路径上，换入延迟直接进 ITL，必须按路由分布做预测性预取。
 
 ### 小机制借鉴（拿来就用）
 
-7. **碰 GPU 的正确层次**。KVBM 被官方放弃的原因之一是直接管理 GPU 侧 block 布局、和引擎抢资源（见 [`../kvcr/overview.md`](../kvcr/overview.md)）。kvcached 示范了更安全的层次：只管页映射，不碰 KV 语义。Dynamo 若重做 GPU 侧弹性，应在虚拟内存页层做，不在 block 层做。
-8. **页分配器与配额协议细节**。2MB 同尺寸页 → 物理页完全互换、长期运行无碎片（变长分配器做不到）；5–10 页热缓存，分配快速路径微秒级；映射失败回滚。活进程改配额 = 带外写 shm + 100ms 轮询 + revision 状态机（applied/deferred/stale/conflict），不占请求路径。`get_page_occupancy` 按页统计存活块、决定页能否释放——KVCR 做 GPU→DRAM 卸载的驱逐粒度判断时需要同类信息。
-9. **路由信号：驱动级物理余量**。shm 段暴露每实例 used/limit/prealloc。Dynamo Router 目前按 KV 命中和负载路由，可加「可映射物理余量」信号，避免把请求打到映射会失败的实例。对 lake 更进一步：D-direct 要求本地 HBM 放得下前缀 KV，物理余量是选路的必要输入，且驱动级真实值比引擎自报更可靠。
+5. **碰 GPU 的正确层次**。KVBM 被官方放弃的原因之一是直接管理 GPU 侧 block 布局、和引擎抢资源（见 [`../kvcr/overview.md`](../kvcr/overview.md)）。kvcached 示范了更安全的层次：只管页映射，不碰 KV 语义。Dynamo 若重做 GPU 侧弹性，应在虚拟内存页层做，不在 block 层做。
+6. **页分配器与配额协议细节**。2MB 同尺寸页 → 物理页完全互换、长期运行无碎片（变长分配器做不到）；5–10 页热缓存，分配快速路径微秒级；映射失败回滚。活进程改配额 = 带外写 shm + 100ms 轮询 + revision 状态机（applied/deferred/stale/conflict），不占请求路径。`get_page_occupancy` 按页统计存活块、决定页能否释放——KVCR 做 GPU→DRAM 卸载的驱逐粒度判断时需要同类信息。
+7. **路由信号：驱动级物理余量**。shm 段暴露每实例 used/limit/prealloc。Dynamo Router 目前按 KV 命中和负载路由，可加「可映射物理余量」信号，避免把请求打到映射会失败的实例。对 lake 更进一步：D-direct 要求本地 HBM 放得下前缀 KV，物理余量是选路的必要输入，且驱动级真实值比引擎自报更可靠。
+
+### 模型动物园场景（非 Dynamo 主场景，备查）
+
+- **单机多模型超卖 + 集群编排**：worker 用 vLLM/SGLang 后端时 kvcached 以 autopatch 直接带入，Dynamo 管跨节点调度、kvcached 管单机显存弹性。Prism（OSDI 2026）已验证这个两级结构（>2× 成本、3.3× SLO、1 万+ GPU 生产部署），Sardeenz 在 k8s/OpenShift 产品化。不依赖 PD/RDMA，风险最低。
+- **serverless 多模型挂载**：kvcached（KV→约零）+ sleep（权重离卡）后一张卡可挂几十冷模型、同时只醒几个；纯 sleep 是二态开关，活跃集快变会 thrashing，弹性 KV 补 0~100% 连续中间态（`examples/06_serverless_serving`）。
 
 ### 风险与边界
 
@@ -239,9 +239,9 @@ kvcached 和 lake 是同一思想在两个尺度：kvcached 把 OS 虚拟内存�
 
 ### lake
 
-值得参考：VMM 页弹性在真实引擎上的工程闭环（TP 广播、布局约束、async 调度下 unmap 前先同步）；zero page 懒分配；带外配额通道；页级占用统计（对应 lake「引用数>0 冻结」）。对 lake 最重要的一条是 L0 落地形态——VA 归引擎、物理页归池 agent，见「想象空间」第 5 条。
+值得参考：VMM 页弹性在真实引擎上的工程闭环（TP 广播、布局约束、async 调度下 unmap 前先同步）；zero page 懒分配；带外配额通道；页级占用统计（对应 lake「引用数>0 冻结」）。对 lake 最重要的一条是 L0 落地形态——VA 归引擎、物理页归池 agent，见「想象空间」第 1 条。
 
-不照搬：kvcached 无全局视图、不知页内 KV 身份、RDMA 是后补、弹性止步单机单卡。lake 的 L0 归池要求控制面权威位置、块级身份；Transfer Bus 按传输端点定路线——经 DRAM 中转天然规避重映射冲突，G1→G1 直传才需正面解（候选 ODP，见「想象空间」第 4 条；另见 [`../hbm-tier-and-offload.md`](../hbm-tier-and-offload.md) §5）。
+不照搬：kvcached 无全局视图、不知页内 KV 身份、RDMA 是后补、弹性止步单机单卡。lake 的 L0 归池要求控制面权威位置、块级身份；Transfer Bus 按传输端点定路线——经 DRAM 中转天然规避重映射冲突，G1→G1 直传才需正面解（候选 ODP，见「想象空间」第 2 条；另见 [`../hbm-tier-and-offload.md`](../hbm-tier-and-offload.md) §5）。
 
 ## 代码索引
 
