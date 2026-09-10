@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="470" viewBox="0 0 960 470" font-family="sans-serif">
+  <rect width="960" height="470" fill="#ffffff"/>
+  <text x="36" y="34" font-size="17" font-weight="bold" fill="#111827">与 Dynamo 组合：各管一层</text>
+
+  <rect x="280" y="58" width="400" height="56" rx="6" fill="#eef2ff" stroke="#4f46e5"/>
+  <text x="296" y="80" font-size="13" font-weight="bold" fill="#3730a3">Dynamo Router</text>
+  <text x="296" y="100" font-size="10" fill="#4f46e5">路由信号：KV 命中 · 负载 ·（可新增）物理余量</text>
+
+  <rect x="60" y="168" width="380" height="216" rx="6" fill="#f9fafb" stroke="#e5e7eb"/>
+  <text x="76" y="190" font-size="13" font-weight="bold" fill="#374151">节点 1</text>
+  <rect x="80" y="204" width="160" height="44" fill="#ffffff" stroke="#6b7280"/>
+  <text x="92" y="222" font-size="11" font-weight="bold" fill="#374151">引擎</text>
+  <text x="92" y="238" font-size="9" fill="#6b7280">vLLM / SGLang</text>
+  <rect x="260" y="204" width="160" height="44" fill="#fff7ed" stroke="#ea580c"/>
+  <text x="272" y="222" font-size="11" font-weight="bold" fill="#c2410c">NIXL</text>
+  <text x="272" y="238" font-size="9" fill="#ea580c">KV 传输</text>
+  <rect x="80" y="258" width="160" height="44" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="92" y="276" font-size="11" font-weight="bold" fill="#1e40af">kvcached</text>
+  <text x="92" y="292" font-size="9" fill="#3b82f6">HBM 页弹性</text>
+  <rect x="260" y="258" width="160" height="44" fill="#f0fdf4" stroke="#059669"/>
+  <text x="272" y="276" font-size="11" font-weight="bold" fill="#047857">KVCR</text>
+  <text x="272" y="292" font-size="9" fill="#059669">DRAM / SSD / 对象存储</text>
+  <path d="M244,280 L256,226" fill="none" stroke="#dc2626" stroke-width="2" stroke-dasharray="4 3"/><circle cx="250" cy="252" r="7" fill="#dc2626"/><text x="247" y="256" font-size="9" fill="#ffffff">!</text>
+  <text x="80" y="326" font-size="9" fill="#6b7280">引擎管 KV 语义 · kvcached 管页映射 · KVCR 管 L2+ 卸载</text>
+  <text x="80" y="348" font-size="10" fill="#dc2626">待解：物理页可重映射 × RDMA 注册需固定</text>
+  <text x="80" y="368" font-size="10" fill="#6b7280">kvcached 不产生位置元数据，跨节点查找靠 Router</text>
+
+  <rect x="520" y="168" width="380" height="216" rx="6" fill="#f9fafb" stroke="#e5e7eb"/>
+  <text x="536" y="190" font-size="13" font-weight="bold" fill="#374151">节点 2（同构）</text>
+  <rect x="540" y="204" width="340" height="98" fill="#ffffff" stroke="#e5e7eb"/>
+  <text x="556" y="232" font-size="11" fill="#374151">引擎 + kvcached + KVCR + NIXL</text>
+  <text x="556" y="254" font-size="9" fill="#6b7280">结构同节点 1</text>
+
+  <path d="M400,114 L250,164" fill="none" stroke="#4f46e5" marker-end="url(#arrI)"/>
+  <path d="M560,114 L710,164" fill="none" stroke="#4f46e5" marker-end="url(#arrI)"/>
+  <text x="290" y="142" font-size="10" fill="#4f46e5">路由 + hint</text>
+  <path d="M440,250 L516,250" fill="none" stroke="#ea580c" marker-end="url(#arrO)" marker-start="url(#arrOL)"/>
+  <text x="433" y="238" font-size="10" fill="#c2410c">NIXL P2P</text>
+
+  <text x="60" y="420" font-size="11" fill="#374151">已验证形态：Prism（OSDI 2026）= 上层路由 + 单机弹性显存的两级调度</text>
+  <text x="60" y="442" font-size="11" fill="#374151">kvcached 与 KVCR 正交：一个管 GPU 页弹性、不管 KV 语义；一个管 L2+ 卸载、不管 GPU</text>
+
+  <defs>
+    <marker id="arrI" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#4f46e5"/></marker>
+    <marker id="arrO" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#ea580c"/></marker>
+    <marker id="arrOL" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto"><path d="M8,0 L0,4 L8,8 Z" fill="#ea580c"/></marker>
+  </defs>
+</svg>

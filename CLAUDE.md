@@ -83,17 +83,31 @@ docs/
 | `3rdparty/ucm` | ModelEngine-Group/unified-cache-management | **统一缓存框架**(可插拔 KVStore、vLLM connector、稀疏插件、PD-via-pool)→ 见 [`docs/research/ucm/`](docs/research/ucm/) |
 | `3rdparty/tensorcast` | tensorcast-ai/tensorcast | **张量状态基础设施层**:权重/KV/checkpoint 抽离进程为分布式 artifact + Global Store/Store Daemon 控制面/数据面分离 + CUDA IPC 同机零拷贝 + RDMA/TCP P2P + policy 预设(cache/durable/ha/cold/warm/pinned)放置契约 + binding 版本热替换 → 见 [`docs/research/tensorcast/`](docs/research/tensorcast/)(overview / architecture / evaluation) |
 | `3rdparty/flexkv` | taco-project/FlexKV | **引擎旁多层 KV 卸载**:CPU/SSD/REMOTE radix + GPU IPC 映射(不拥有 HBM)+ vLLM/SGLang/Dynamo/TRT connector → 见 [`docs/research/flexkv/`](docs/research/flexkv/)(overview / architecture / pain-points) |
+| `3rdparty/kvcached` | ovg-project/kvcached | **GPU 虚拟内存弹性 KV**:VA/物理页解耦(cuMem 页级映射/解映射)、跨进程显存超卖(无 daemon、驱动仲裁)、kvctl 硬配额、zero page 冷启动 → 见 [`docs/research/kvcached/`](docs/research/kvcached/)(overview) |
 | `3rdparty/production-stack` | vllm-project/production-stack | **实例级路由器参考**:`vllm_router` 的 session/prefixaware/kvaware 策略(`src/vllm_router/routers/routing_logic.py`)→ 见 [`docs/research/model-routing.md`](docs/research/model-routing.md) §5 |
 | `3rdparty/aibrix` | vllm-project/aibrix | **网关路由策略集**:prefix-cache/Preble/VTC/SLO + 可组合加权打分 + Redis 多副本状态同步(`pkg/plugins/gateway/`)→ 见 [`docs/research/model-routing.md`](docs/research/model-routing.md) §5 |
 | `3rdparty/llm-d-router` | llm-d/llm-d-router | **EPP 精确缓存感知**:KV 事件→全局块索引+推测索引(`pkg/kvcache/`)、prefix/load scorer 组合 → 见 [`docs/research/model-routing.md`](docs/research/model-routing.md) §5 |
 
-逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm,tensorcast,flexkv}/`；Transformers 仅作为模型定义源码参考。
+逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析(设计/架构/技术栈/优劣)见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm,tensorcast,flexkv,kvcached}/`；Transformers 仅作为模型定义源码参考。
 
 约定:
 - `3rdparty/` **只读**,不修改 submodule 内代码。要改造先 fork 换 URL。
 - submodule 自带 `.claude/` 规则——改它们自身代码的约束,与本项目无关,**忽略**。
 - clone 本仓库需 `git submodule update --init --recursive`。体积较大时可用浅克隆:`git clone --recurse-submodules --depth 1 --shallow-submodules <repo>`(浅克隆后无法在 submodule 内随意 `checkout` 切 ref)。Ascend MemCache 的传输底座 `memfabric_hybrid` 为**嵌套** submodule——文档推荐的 recursive clone/update **会**一并拉下;仅非 recursive 初始化时才不拉。审计 OneCopy 时需确认该路径已 init。TileRT 公开树相对较小。
 - 设计/实现遇到分层、传输、复用、放置等问题,先查对应 submodule 源码再动手。
+
+### 新增参考项目的登记清单
+
+新增一个参考项目时,按此清单登记,缺一项即未完成:
+
+1. **调研文档** `docs/research/<name>/overview.md`(项目大时分目录多文档)。必含:头部元信息(源码/许可/语言构成/论文或官网)、一句话定位、与本系统的关系(逐组件映射)、设计哲学、架构、分布式模型、技术栈、优势与局限、借鉴点与关键差异,末尾「代码索引」节把概念/机制映射到 `文件:符号`(符号锚点,不写行号)。
+2. **本文件**:3rdparty 表加一行 + 下方「reference 强制查阅规则」按主题定位加一条。
+3. **[`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)**:submodule 清单加行 + 新增专节(借鉴点/关键差异)。
+4. **[`docs/research/references.md`](docs/research/references.md)**:submodule 清单与主题分类各加一条。
+5. **[`docs/research/distributed-models.md`](docs/research/distributed-models.md)**:总表加行 + 四类归纳归类。
+6. **[`README.md`](README.md)**:目录结构中 `research/` 与 `3rdparty/` 两清单同步。
+7. 相关专题文档按需补充(HBM/卸载 → `hbm-tier-and-offload.md`;PD → `vllm_vs_sglang/pd-disaggregation.md`),相关项目文档加反向链接。
+8. 文档相对链接**不得**深入 `3rdparty/` 内部(链接检查脚本会拒);用语简洁,术语与既有文档一致。
 
 ## reference 强制查阅规则（硬性，每次都做）
 
@@ -108,9 +122,9 @@ docs/
    - block 生命周期(何时释放/降层/彻底放弃,现状 vs 未来) → `docs/research/sglang/block-lifecycle.md`
    - 上游 issue/roadmap 痛点与 lake 对照 → `docs/research/sglang/pain-points.md`
    - **Agentic 分布式 KV 总设计**(SGLang #21846：增量 PD、Host 直传、UnifiedRadix、agent hint) → `docs/research/sglang/agentic-kv-roadmap.md`
-   - **Guided / structured decoding**(xgrammar 库边界、overlap/async 同步、spec+grammar) → `docs/research/guided-decoding.md`
-   - **Sampling 参数对照**(SGLang × vLLM;`n`≠beam;spec 兼容;penalty 空泡;状态归属与前缀共享) → `docs/research/sampling-params.md`
-   - **Scheduler→Worker 字段**(vLLM `SchedulerOutput` × SGLang `ScheduleBatch`/`ForwardBatch`、架构根因) → `docs/research/scheduler-worker-interface.md`
+   - **Guided / structured decoding**(xgrammar 库边界、overlap/async 同步、spec+grammar) → `docs/research/vllm_vs_sglang/guided-decoding.md`
+   - **Sampling 参数对照**(SGLang × vLLM;`n`≠beam;spec 兼容;penalty 空泡;状态归属与前缀共享) → `docs/research/vllm_vs_sglang/sampling-params.md`
+   - **Scheduler→Worker 字段**(vLLM `SchedulerOutput` × SGLang `ScheduleBatch`/`ForwardBatch`、架构根因) → `docs/research/vllm_vs_sglang/scheduler-worker-interface.md`
    - 跨实例复用 + 多存储后端 + 内容寻址 + 控制器元数据 + Rust 裸设备 I/O → `docs/research/lmcache/{overview,sharing-and-backends}.md`
    - RDMA 零拷贝传输 + 多 NIC 聚合 + 对象级 KV store + 分配策略 + HA → `docs/research/mooncake/{overview,transfer-engine,kv-store}.md`
    - **昇腾 KV 对象池**(MemCache):Meta/Local、HBM/DRAM/SSD、MemFabric OneCopy → `docs/research/memcache/{overview,architecture,pain-points}.md`（与 Mooncake store 同层对照；非 radix 控制面）
@@ -126,6 +140,7 @@ docs/
    - **超低延迟 decode / vLLM PD 插件**(TileRT):connector claim、MTP-aware 传 KV、NIXL/Mooncake → `docs/research/tilert/{overview,pd-vllm,pain-points}.md`（核闭源,不作存储面参考）
    - **张量状态基础设施(TensorCast)**:权重/KV/checkpoint 抽离进程为分布式 artifact + Global Store/Store Daemon 控制面/数据面分离 + CUDA IPC 同机零拷贝 + RDMA/TCP P2P + policy 预设(cache/durable/ha/cold/warm/pinned)放置契约 + binding 版本热替换 + tensor view(TP shard) → `docs/research/tensorcast/{overview,architecture,evaluation}.md`（submodule `3rdparty/tensorcast`;与 lake 存储层/权重缓存同构对照）
    - **引擎旁 KV 卸载(FlexKV)**:CPU/SSD/REMOTE 本机 radix、GPU 仅 IPC 映射、delay-free D2H、vLLM/SGLang/Dynamo connector → `docs/research/flexkv/{overview,architecture,pain-points}.md`；HBM/卸载全 3rdparty 对照（含 G1 句柄）见 `docs/research/hbm-tier-and-offload.md`
+   - **GPU 虚拟内存弹性/多实例共享单卡(kvcached)**:VA/物理页解耦、跨进程超卖、kvctl 配额、zero page 冷启动、物理页重映射与 RDMA 注册冲突 → `docs/research/kvcached/overview.md`
    - **分布式模型对比**(拓扑/元数据权威/同步机制/索引与数据一致性分级/HA/扩展性；各 overview 有「分布式模型」节) → `docs/research/distributed-models.md`
    - 跨项目逐层对应与借鉴顺序 → `docs/research/3rdparty-reference.md`
 3. **沿代码回溯**：每个参考文档末尾都有「代码索引」节，把概念/机制映射到 `文件:符号`。符号名是稳定锚点（行号会漂移，找不到时 `grep -n "符号名" 3rdparty/<repo>/<文件路径>`）。需要确认实现细节时，直接读对应符号的源码。

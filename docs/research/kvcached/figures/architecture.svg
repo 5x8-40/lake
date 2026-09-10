@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="470" viewBox="0 0 960 470" font-family="sans-serif">
+  <rect width="960" height="470" fill="#ffffff"/>
+  <text x="36" y="34" font-size="17" font-weight="bold" fill="#111827">架构：引擎进程内注入 + 带外记账 + 驱动仲裁</text>
+
+  <rect x="36" y="64" width="340" height="310" rx="6" fill="#f9fafb" stroke="#e5e7eb"/>
+  <text x="52" y="88" font-size="13" font-weight="bold" fill="#374151">引擎进程（vLLM / SGLang）</text>
+  <text x="52" y="106" font-size="10" fill="#6b7280">autopatch 运行时注入，引擎文件零改动</text>
+
+  <rect x="52" y="118" width="308" height="38" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="64" y="134" font-size="12" font-weight="bold" fill="#1e40af">KVCacheManager（Py）</text>
+  <text x="64" y="150" font-size="10" fill="#3b82f6">block→page、alloc/free、APC 共存、占用统计</text>
+
+  <rect x="52" y="166" width="308" height="38" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="64" y="182" font-size="12" font-weight="bold" fill="#1e40af">PageAllocator（C++）</text>
+  <text x="64" y="198" font-size="10" fill="#3b82f6">物理页生命周期、热页缓存、配额 resize</text>
+
+  <rect x="52" y="214" width="308" height="38" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="64" y="230" font-size="12" font-weight="bold" fill="#1e40af">FTensor（C++）</text>
+  <text x="64" y="246" font-size="10" fill="#3b82f6">VA 预留、zero page、页级 map/unmap</text>
+
+  <rect x="52" y="262" width="308" height="38" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="64" y="278" font-size="12" font-weight="bold" fill="#1e40af">gpu_vmm（C++）</text>
+  <text x="64" y="294" font-size="10" fill="#3b82f6">VMM 原语封装（cuMem* / hipMem*）</text>
+
+  <rect x="52" y="310" width="308" height="38" fill="#eff6ff" stroke="#2563eb"/>
+  <text x="64" y="326" font-size="12" font-weight="bold" fill="#1e40af">MemInfoTracker（C++/Py）</text>
+  <text x="64" y="342" font-size="10" fill="#3b82f6">/dev/shm 记账（flock + mmap）</text>
+
+  <rect x="36" y="404" width="340" height="48" rx="6" fill="#ecfdf5" stroke="#059669"/>
+  <text x="52" y="424" font-size="12" font-weight="bold" fill="#047857">CUDA 驱动</text>
+  <text x="52" y="442" font-size="10" fill="#059669">物理页最终仲裁：先映射先得</text>
+
+  <rect x="440" y="64" width="230" height="60" rx="6" fill="#f9fafb" stroke="#374151"/>
+  <text x="456" y="86" font-size="13" font-weight="bold" fill="#374151">kvctl / kvtop</text>
+  <text x="456" y="104" font-size="10" fill="#6b7280">带外 CLI：limit / list / watch / delete</text>
+
+  <rect x="440" y="146" width="230" height="60" rx="6" fill="#f9fafb" stroke="#e5e7eb"/>
+  <text x="456" y="168" font-size="13" font-weight="bold" fill="#374151">controller（示例前端）</text>
+  <text x="456" y="186" font-size="10" fill="#6b7280">请求路由 + 流量监控 + sleep 管理</text>
+
+  <rect x="440" y="228" width="230" height="84" rx="6" fill="#f9fafb" stroke="#9ca3af"/>
+  <text x="456" y="250" font-size="12" font-weight="bold" fill="#374151">/dev/shm 记账段</text>
+  <text x="456" y="268" font-size="10" fill="#6b7280">kvcached_engine_&lt;pgid&gt;</text>
+  <text x="456" y="286" font-size="10" fill="#6b7280">{上限 total, 已用 used, 预分配 prealloc}</text>
+
+  <path d="M200,374 L200,398" fill="none" stroke="#059669" marker-end="url(#arrG2)"/>
+  <text x="214" y="392" font-size="10" fill="#059669">cuMem* 调用</text>
+
+  <path d="M555,124 L555,222" fill="none" stroke="#374151" marker-end="url(#arrD)" marker-start="url(#arrDL)"/>
+  <text x="565" y="180" font-size="10" fill="#374151">读写</text>
+
+  <path d="M376,329 L434,292" fill="none" stroke="#374151" marker-end="url(#arrD)" marker-start="url(#arrDL)"/>
+  <text x="368" y="220" font-size="10" fill="#374151">写用量 / 读限额（100ms 轮询）</text>
+
+  <path d="M440,158 L382,158" fill="none" stroke="#6b7280" stroke-dasharray="5 4" marker-end="url(#arrD)"/>
+  <text x="378" y="140" font-size="10" fill="#6b7280">路由 / sleep（示例级）</text>
+
+  <text x="440" y="360" font-size="11" fill="#374151">同卡每个引擎进程都内嵌同一套栈；</text>
+  <text x="440" y="378" font-size="11" fill="#374151">物理页经驱动在进程间流转（见「核心机制」）</text>
+  <text x="440" y="424" font-size="11" fill="#6b7280">灰箭头：记账读写　绿箭头：VMM 调用　虚线：示例级前端</text>
+
+  <defs>
+    <marker id="arrD" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#374151"/></marker>
+    <marker id="arrDL" markerWidth="8" markerHeight="8" refX="1" refY="4" orient="auto"><path d="M8,0 L0,4 L8,8 Z" fill="#374151"/></marker>
+    <marker id="arrG2" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 Z" fill="#059669"/></marker>
+  </defs>
+</svg>

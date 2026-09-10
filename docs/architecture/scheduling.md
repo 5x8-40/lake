@@ -161,7 +161,7 @@
 5. "驱逐到 CPU 暂等"在 lake 里就是池把 L0→L1 降级,不需专门 swap 通道。
 
 **控制态交接**(重算式下绝大多数随 request 重派或可由 token 历史重建,**硬核只两项**):
-- **必须显式随迁**:① 采样 RNG generator state(seeded 时不迁则续写偏离);② 结构化解码 FSM 游标(guided/regex/ebnf/json,或在目标端重放已生成 token 复原)。参考实现里 FSM 在 host、仅 bitmask apply 上 GPU,见 [`../research/guided-decoding.md`](../research/guided-decoding.md)。
+- **必须显式随迁**:① 采样 RNG generator state(seeded 时不迁则续写偏离);② 结构化解码 FSM 游标(guided/regex/ebnf/json,或在目标端重放已生成 token 复原)。参考实现里 FSM 在 host、仅 bitmask apply 上 GPU,见 [`../research/guided-decoding.md`](../research/vllm_vs_sglang/guided-decoding.md)。
 - **随 request 天然携带**:已生成 token 序列(= re-prefill 输入)、采样参数、max/min_tokens、优先级/SLO deadline。
 - **可由 token 历史重算**:rep/freq/presence penalty、logprobs 游标、stop-string 部分匹配。
 - **丢弃 + 目标端重建**:in-flight draft token(vLLM 抢占即清 `spec_token_ids`)→ 目标端 drafter `post_forward` 重新 seed。

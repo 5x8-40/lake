@@ -1,7 +1,7 @@
 # Sampling Parameters — SGLang × vLLM
 
 > 源码:`3rdparty/sglang/python/sglang/srt/sampling/sampling_params.py`、`managers/io_struct.py::GenerateReqInput`；`3rdparty/vllm/vllm/sampling_params.py`。  
-> 结构化约束细节见 [guided-decoding.md](guided-decoding.md)；thinking 预算见 [sglang/thinking-control.md](sglang/thinking-control.md)。
+> 结构化约束细节见 [guided-decoding.md](guided-decoding.md)；thinking 预算见 [sglang/thinking-control.md](../sglang/thinking-control.md)。
 
 ## 一句话结论
 

@@ -27,11 +27,13 @@
   - ModelEngine 统一缓存框架:可插拔 KVStore、vLLM connector、稀疏插件、**PD-via-pool**；与 LMCache 同属引擎插件层。
 - **FlexKV** → [`flexkv/`](flexkv/):[总览](flexkv/overview.md) · [架构与 HBM](flexkv/architecture.md) · [痛点与 lake 对照](flexkv/pain-points.md)
   - TACO 多层 KV 卸载:引擎持有 GPU 槽,FlexKV 索引 CPU/SSD/REMOTE,IPC 映射 HBM 做 D2H/H2D;vLLM/SGLang/Dynamo/TRT 均有 connector。
-- **Guided / structured decoding** → [`guided-decoding.md`](guided-decoding.md)
+- **kvcached** → [`kvcached/`](kvcached/):[总览](kvcached/overview.md)
+  - OVG(Prism/OSDI 2026)GPU 虚拟内存弹性 KV:VA/物理页解耦、同卡多实例超卖显存(无 daemon、驱动仲裁)、kvctl 硬配额、zero page 冷启动。
+- **Guided / structured decoding** → [`guided-decoding.md`](vllm_vs_sglang/guided-decoding.md)
   - SGLang × vLLM:xgrammar/llguidance 仅 GPU apply、FSM 仍在 CPU;overlap/async 近零 vs spec+grammar / pending token 的同步气泡;与 lake 重叠契约及抢占时 FSM 游标交接。
-- **Sampling 参数** → [`sampling-params.md`](sampling-params.md)
+- **Sampling 参数** → [`sampling-params.md`](vllm_vs_sglang/sampling-params.md)
   - SGLang × vLLM 字段对照;`n`≠beam;spec 兼容矩阵;penalty 空泡与 V2;采样状态归属(不进 KV 池)与 `n` 前缀共享。
-- **Scheduler→Worker 接口** → [`scheduler-worker-interface.md`](scheduler-worker-interface.md)
+- **Scheduler→Worker 接口** → [`scheduler-worker-interface.md`](vllm_vs_sglang/scheduler-worker-interface.md)
   - vLLM `SchedulerOutput` 与 SGLang `ScheduleBatch`/`ForwardBatch` 字段全集、差异与架构根因;供 lake `SchedulerOutput` D1 对照。
 
 与本系统逐层对应、借鉴点、关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
@@ -63,6 +65,7 @@
 
 ## 弹性与冷启动
 
+- **kvcached** (OVG, Prism/OSDI 2026): GPU 显存虚拟化——VA 与物理页解耦,同卡多实例超卖显存,零物理分配冷启动,kvctl 硬配额。**源码已引入** `3rdparty/kvcached`,见 [`kvcached/`](kvcached/)。
 - **ServerlessLLM** (OSDI'24): serverless 场景下 LLM 的快速加载与冷启动优化。
 - **dLoRA / PetS**: serverless 推理的弹性调度。
 
@@ -74,4 +77,4 @@
 
 - **DeepSpeed-Inference**, **TensorRT-LLM**, **Orca** (continuous batching): 推理引擎基线，本系统在其上做存算分离的解耦。
 
-> 注：以上为方向性参考。SGLang/Mooncake/LMCache/vLLM/Dynamo/TileRT/MemCache/UCM/FlexKV 等源码已引入 `3rdparty/`(submodule),与本项目设计的逐层对应、借鉴点与关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
+> 注：以上为方向性参考。SGLang/Mooncake/LMCache/vLLM/Dynamo/TileRT/MemCache/UCM/FlexKV/kvcached 等源码已引入 `3rdparty/`(submodule),与本项目设计的逐层对应、借鉴点与关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
