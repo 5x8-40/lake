@@ -74,21 +74,17 @@ kvcached 把 OS 虚拟内存的做法搬到 GPU KV cache：虚拟地址（VA）�
 4. **故障隔离**：单实例崩溃只影响部分流量。
 5. **同模型多租户硬配额**（特性 4）。
 
-注意：②–⑤ 是运维需求，与利用率无关；与利用率相关的只有 ①，且仅当单形态流量不足一卡时（GPU 最小分配单位是一张卡，买不到零点几张）——各形态流量都能喂满整卡时，独立扩缩容即可，不需要同卡多实例。
+**收益（以 Prism 论文的生产 trace 与实验为准）**：目标负载是**模型动物园**——平台挂载大量模型（含低频但必需的长尾），热度倾斜且快速漂移。生产 trace 的两个实测特征决定收益来源：
 
-超卖的主战场是**多模型混部**（权重不同，本来就必须多实例，静态切分浪费的是彼此的闲置）与**弹性伸缩**（占用随负载走，见「想象空间」第 2 条）。
+- **模型级：bursty group**——任意时刻只有 23%–50% 的模型活跃，活跃集合每小时变化 54–766 次（最慢的 trace 也约每分钟变一次）。纯空间共享（静态混部）锁死闲置模型的显存：Novita trace 中模型 70% 以上时间空闲，50% 显存被占而不用。
+- **请求级：极端波动**——多模型请求交错到达，纯时间共享（sleep/换入换出）换权重要秒级，活跃集合几分钟一变就 thrashing，SLO 直接违约（对照组里 ServerlessLLM 的 TTFT 达成率最差）。
 
-收益的账本：**权重是常驻成本，KV 是变动成本**——弹性机制只省 KV，权重省不了（除非共享）。
+kvcached 的定位是把两种共享统一到一个机制：从闲置模型回收显存，既可换入权重（时间共享），也可缩 KV 预留（空间共享），页粒度、毫秒级、无需重启，甚至可以只对同卡模型的一个子集做时间共享。论文明确与扩缩容**正交**：扩缩容调副本数，Prism 管副本/模型之间的显存共享，两者组合使用。实测：**>2× 成本节省、3.3× SLO 达成率提升**（vs SOTA），已在 1 万+ GPU 生产环境部署；最坏情况（恒定速率、无空闲可协调）相比静态分区仅 3–5% TTFT/TPOT 开销。
 
-**先承认：多数场景下扩缩容就是答案。** 形态的流量 ≥ 一卡、且变化慢于实例启动（分钟级）时，一实例一卡 + 扩缩容 + 空闲卡池就是最优：权重不重复、HBM 跑满、方案简单，不必引入 VMM。kvcached 的收益恰好集中在扩缩容失效的三个角落：
+两个补充机制：
 
-1. **形态零头（粒度）**：扩缩容的单位是「实例 × 卡」，每个形态不足一卡的零头就是浪费。形态少而大，零头可忽略；形态多而小（长尾模型、多租户 fine-tune、投机分流里的小流量形态），零头就是主成本。混部把多个零头装上一卡，且按同时刻总需求供给、峰值不同时到来就有差值可赚（削峰错谷）。
-2. **突发 × 扩容延迟（时间常数）**：必须常备的 headroom ≈ 突发幅度 × 扩容时间常数。kvcached 把冷启动压到秒级（特性 3）、权重 sleep/wake 压到秒级，直接缩小 headroom——这是对纯扩缩容路线的主要贡献，无需混部。
-3. **每形态至少一实例的地板（最小占用）**：形态不能缩到 0（否则冷启动分钟级），M 个形态 = M 份权重 + M 份静态 KV 预留。sleep 把权重挪进 DRAM 后 HBM 虽空，卡仍被该实例独占；别的进程要用这张卡就是混部，混部要不打架就需要弹性 KV。serverless 多模型（一卡挂几十冷模型、同时只醒几个）是这条的极端形态。
-
-同模型多实例确有必要时（上段五个例外），权重可经 CUDA IPC 共享（`cuMemCreate` 导出句柄、他进程 import 映射；TensorCast daemon 模式、ServerlessLLM 已验证，见 [`../tensorcast/architecture.md`](../tensorcast/architecture.md)），即「1 份权重 + N 个弹性 KV 池」，边际成本只剩 CUDA context + 图 + workspace；代价是物理页生命周期跨进程耦合（需租约或所有权归池）、sleep 粒度变粗。
-
-**LoRA 特例（收益最大化）**：base 权重共享，每模型只多一个 adapter；multi-LoRA 在单实例内按请求选 adapter（vLLM/SGLang 原生支持），连多实例都不需要。
+- **同模型权重共享**：多实例可经 CUDA IPC 读同一份物理权重（`cuMemCreate` 导出句柄、他进程 import 映射；TensorCast daemon 模式、ServerlessLLM 已验证，见 [`../tensorcast/architecture.md`](../tensorcast/architecture.md)），即「1 份权重 + N 个弹性 KV 池」；代价是物理页生命周期跨进程耦合（需租约或所有权归池）、sleep 粒度变粗。
+- **LoRA 特例**：base 权重共享，每模型只多一个 adapter；multi-LoRA 在单实例内按请求选 adapter（vLLM/SGLang 原生支持），连多实例都不需要。
 
 ### 无 daemon 的协调
 
@@ -277,7 +273,7 @@ kvcached 和 lake 是同一思想在两个尺度：kvcached 把 OS 虚拟内存�
 
 - 上游：[github.com/ovg-project/kvcached](https://github.com/ovg-project/kvcached)；官网 [kvcached.org](https://kvcached.org/)
 - 论文：
-  - Prism（OSDI 2026，[arXiv 2505.04021](https://arxiv.org/abs/2505.04021)）：多 LLM 服务系统论文——多个**不同**模型（非单模型多实例）共享 GPU，在 kvcached 弹性 KV 之上做两级调度（集群级模型编排 + 节点级显存共享），官方报 >2× 成本节省、3.3× SLO 达成率提升。kvcached 是其开源底座。
+  - Prism（OSDI 2026，[arXiv 2505.04021](https://arxiv.org/abs/2505.04021)）：多 LLM 服务系统论文——多个**不同**模型（非单模型多实例）共享 GPU，在 kvcached 弹性显存之上做两级调度（全局按 KVPR 做模型放置 + 节点内按 TTFT 余量做请求仲裁）。核心洞察：生产 trace 呈 bursty-group 模式（活跃模型集每分钟级变化），弹性显存把空间共享与时间共享统一到一个机制；论文明确与扩缩容正交。官方报 >2× 成本节省、3.3× SLO 达成率提升，已部署 1 万+ GPU。kvcached 是其开源底座。
   - GPU OS 愿景（[arXiv 2508.08448](https://arxiv.org/abs/2508.08448)）：立场文，论证 GPU 单任务模式在 LLM 时代不可持续，三个理由：① 显存成为瓶颈——模型变大 + KV 等中间状态膨胀；② 显存用量动态不可预测——自回归生成，同样输入输出长度都不同，静态预留只能按峰值；③ 负载多样化——推理/训练/微调/复合 AI 流水线要共存。主张像 CPU OS 一样做 GPU 资源管理与共享层；kvcached 是这一愿景在显存/KV 维度的落地。
 - 本仓：`3rdparty/kvcached` @ `60cad94`
 - 对照：[`../hbm-tier-and-offload.md`](../hbm-tier-and-offload.md)、[`../dynamo/overview.md`](../dynamo/overview.md)、[`../kvcr/overview.md`](../kvcr/overview.md)、[`../sglang/elastic-memory-pool.md`](../sglang/elastic-memory-pool.md)
