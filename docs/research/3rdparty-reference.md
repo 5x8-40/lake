@@ -42,8 +42,8 @@
 | `3rdparty/flexkv` | [taco-project/FlexKV](https://github.com/taco-project/FlexKV) | main HEAD (`a5c8f12`, 2026-08-27) | **引擎旁多层 KV 卸载** CPU/SSD/REMOTE radix + GPU IPC 映射 + vLLM/SGLang/Dynamo/TRT connector;见 [flexkv/](flexkv/) |
 | `3rdparty/kvcached` | [ovg-project/kvcached](https://github.com/ovg-project/kvcached) | main HEAD (`60cad94`, 2026-08-22, v0.1.5) | **GPU VMM 弹性 KV**:VA/物理页解耦 + 跨进程超卖(driver 仲裁,无 daemon)+ kvctl 配额;见 [kvcached/](kvcached/) |
 | `3rdparty/production-stack` | [vllm-project/production-stack](https://github.com/vllm-project/production-stack) | main HEAD (`fc00f98b`, 2026-09-08) | **实例级路由器**:`vllm_router` 的 session/prefixaware/kvaware 策略与 issue 教训;见 [model-routing.md](model-routing.md) §5 |
-| `3rdparty/aibrix` | [vllm-project/aibrix](https://github.com/vllm-project/aibrix) | main HEAD (`fe7db93e`, 2026-09-08) | **网关路由策略集**:prefix-cache/Preble/VTC + 可组合打分 + Redis 状态同步;见 [model-routing.md](model-routing.md) §5 |
-| `3rdparty/llm-d-router` | [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) | main HEAD (`abb404ef`, 2026-09-08) | **EPP 精确缓存感知**:KV 事件 → 全局块索引 + 推测索引(`pkg/kvcache/`);见 [model-routing.md](model-routing.md) §5 |
+| `3rdparty/aibrix` | [vllm-project/aibrix](https://github.com/vllm-project/aibrix) | main HEAD (`fe7db93e`, 2026-09-08) | **K8s 推理平台积木**:网关路由策略集 + KV 事件同步 + KV 感知扩缩 + aibrix_kvcache 卸载框架;深度分析见 [aibrix/](aibrix/) |
+| `3rdparty/llm-d-router` | [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) | main HEAD (`abb404ef`, 2026-09-08) | **EPP 精确缓存感知 + PD 编排**:KV 事件 → 全局块索引 + 推测索引(`pkg/kvcache/`)、插件化 scorer、pd-sidecar/coordinator;深度分析见 [llm-d/](llm-d/) |
 
 > 生态相连:vLLM `KVConnectorBase_V1` 被 LMCache/Mooncake/NIXL/**FlexKV**/**TileRT**/**UCM** 等实现;vLLM-Ascend 另将 **MemCache** 列为 KV Pool backend;SGLang HiCache 把 Mooncake 作 L3,另有 `--enable-flexkv`;Dynamo 编排 vLLM/SGLang,可把 FlexKV 当 connector;UCM 主推经统一池做 PD;TileRT 做低延迟 decode;**KVCR** 走另一条路——vLLM 原生 `kv_offload` tiering 后端 + SGLang HiCacheStorage 后端 + router hint 协议(TRT-LLM/vLLM/SGLang/Dynamo router 四方对齐中)。我们站在其上做更彻底的存算分离。
 
@@ -303,6 +303,52 @@ kvcached 与其他参考项目不在同一层:不分层、不索引前缀、不�
 - kvcached 不知页内 KV 身份(索引在引擎 APC);lake L0 slot 有块级身份,支撑 D-direct 与 F4。
 - 物理页重映射与 RDMA 注册的冲突仅限「RDMA 端点是 GPU 显存」的场景(G1→G1 直传);经 DRAM 中转天然规避,正解候选是 RDMA ODP(见 [kvcached/overview.md](kvcached/overview.md)「想象空间」节);lake Transfer Bus 需前置定路线。
 - 弹性止步单机单卡;lake L0–L3 统一编址。
+
+## 11. AIBrix → K8s 推理平台积木(网关路由 / 扩缩 / KV 卸载)
+
+源码入口:`3rdparty/aibrix/`(Go 控制面/网关 + Python runtime/`aibrix_kvcache`)。深度分析见 [`aibrix/`](aibrix/)(overview / architecture / pain-points);路由策略横评见 [model-routing.md](model-routing.md) §5;四栈对比见 [serving-stack-comparison.md](serving-stack-comparison.md)。
+
+AIBrix 是平台层项目:Envoy 网关插件选路 + CRD 全家桶编排 + PodAutoscaler + 引擎旁 KV 卸载框架。对 lake 的价值不在某一层的最深实现,而在**完整平台的职责切分样本**(限流/鉴权/扩缩全在推理系统之外,与 lake 职责边界原则同向)和 **KV 事件同步的工程实现**。
+
+### 借鉴点
+
+| AIBrix 设计 | 我们对应 | 说明 |
+|-------------|----------|------|
+| 策略注册表 + 加权组合打分(`RouterManager`/`ParseMultiRouterConfig`) | Router 代价函数演化 | scorer 组合形态的最直接参照,每策略独立灰度 |
+| KV 事件管线(`pkg/cache/kvcache/zmq_client.go` + `pkg/kvevent/manager.go`) | 存储控制面消费引擎事件 | ZMQ 订阅 + msgpack 编解码 + 事件→索引转换的分层可对照 |
+| TP 感知 KV 对齐(`GroupAwareKVCacheManager`) | P5 引擎对接 | TP>1 各 rank 命中长度不齐,prefill 前必须对齐——真实工程坑的明确解法 |
+| KV 感知扩缩指标(`gpu_cache_usage_perc`/`num_requests_waiting`) | 上报信号清单 | 扩缩归外部,但这些指标就是 lake 该暴露的信号 |
+| prefix-cache 双路线并存(本地哈希表 vs ZMQ 事件同步) | 近似派 vs 精确派对照 | 同一仓里的天然 A/B,佐证精确路线需要引擎配合 |
+
+### 关键差异(我们更彻底)
+
+- 路由亲和状态在网关进程内,默认不同步、可选 Redis 最终一致;lake 位置视图是存储控制面权威,Router 读镜像。
+- L1 在引擎进程内、L2 是外部集群 + Redis 成员表;lake L0–L3 统一归池。
+- PD 是 StormService 静态角色拓扑;lake PD 是逐请求运行时模式。
+- 卸载由引擎侧逐出策略局部决定;lake 由池按全局热度 + 引用计数统一决定。
+
+## 12. llm-d Router → EPP 精确缓存感知 + PD 编排
+
+源码入口:`3rdparty/llm-d-router/`(纯 Go 单仓:EPP + pd-sidecar + coordinator)。深度分析见 [`llm-d/`](llm-d/)(overview / architecture / pain-points);路由横评见 [model-routing.md](model-routing.md) §5;四栈对比见 [serving-stack-comparison.md](serving-stack-comparison.md)。
+
+llm-d Router 是 K8s Gateway API Inference Extension 标准下的 EPP 参考实现,代表"网关侧精确派"缓存感知的最高完成度:逐块索引、介质分权重、推测索引补传播窗口、14+ 种插件化 scorer。K8s 推理路由生态(production-stack、kgateway)正在向它收敛。
+
+### 借鉴点
+
+| llm-d 设计 | 我们对应 | 说明 |
+|------------|----------|------|
+| 推测索引(`prerequest.go::buildSpeculativeCache`,TTL 2s) | 决策-确认窗口处理 | 决策后先写短 TTL 条目、真实事件确认、二者共存——异步确认回路的通用补窗手法 |
+| 事件管线三件套(gap 重放/去重/订阅管理) | 存储控制面事件消费 | `zmq_subscriber.go` + `event_dedup_filter.go` + `subscriber_manager.go` 分层模板 |
+| `EndpointPickerConfig` YAML 声明插件组合 | Router 配置形态 | 加策略不动框架;profile 机制对应模式选择配置化 |
+| PD 决策顺序(先选 decode 再倒推 prefill) | 调度器组 batch | 状态最重的角色先定,与池放置读视图同向 |
+| 介质分权重打分(gpu=1.0/cpu=0.8) | 调度代价模型初值 | "命中不等于命中"的最简表达 |
+
+### 关键差异(我们更彻底)
+
+- EPP 索引是**派生缓存**(引擎事件才是真相,丢事件留幽灵条目,无权威可回查);lake 位置视图是权威状态本身。
+- 多副本各自订阅各自收敛,近似前缀状态副本间不共享(Active-Active 应避免);lake 权威推送镜像,副本间无收敛问题。
+- PD 是静态角色 + sidecar 串阶段;lake PD 是逐请求模式,混部/分离/D-direct 并存。
+- 架构假设每 pool 单 base 模型;lake 存储池模型无关,多 `(model_id, revision)` 共存。
 
 ## 代码级复用策略（按模块，互不替代）
 

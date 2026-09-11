@@ -85,8 +85,8 @@ docs/
 | `3rdparty/flexkv` | taco-project/FlexKV | **引擎旁多层 KV 卸载**:CPU/SSD/REMOTE radix + GPU IPC 映射(不拥有 HBM)+ vLLM/SGLang/Dynamo/TRT connector → 见 [`docs/research/flexkv/`](docs/research/flexkv/)(overview / architecture / pain-points) |
 | `3rdparty/kvcached` | ovg-project/kvcached | **GPU 虚拟内存弹性 KV**:VA/物理页解耦(cuMem 页级映射/解映射)、跨进程显存超卖(无 daemon、驱动仲裁)、kvctl 硬配额、zero page 冷启动 → 见 [`docs/research/kvcached/`](docs/research/kvcached/)(overview) |
 | `3rdparty/production-stack` | vllm-project/production-stack | **实例级路由器参考**:`vllm_router` 的 session/prefixaware/kvaware 策略(`src/vllm_router/routers/routing_logic.py`)→ 见 [`docs/research/model-routing.md`](docs/research/model-routing.md) §5 |
-| `3rdparty/aibrix` | vllm-project/aibrix | **网关路由策略集**:prefix-cache/Preble/VTC/SLO + 可组合加权打分 + Redis 多副本状态同步(`pkg/plugins/gateway/`)→ 见 [`docs/research/model-routing.md`](docs/research/model-routing.md) §5 |
-| `3rdparty/llm-d-router` | llm-d/llm-d-router | **EPP 精确缓存感知**:KV 事件→全局块索引+推测索引(`pkg/kvcache/`)、prefix/load scorer 组合 → 见 [`docs/research/model-routing.md`](docs/research/model-routing.md) §5 |
+| `3rdparty/aibrix` | vllm-project/aibrix | **K8s 推理平台积木**:网关路由策略集(prefix-cache 双路线/Preble/VTC)+ KV 事件同步(ZMQ)+ PodAutoscaler + aibrix_kvcache 卸载框架(L1/L2)→ 见 [`docs/research/aibrix/`](docs/research/aibrix/)(overview / architecture / pain-points) |
+| `3rdparty/llm-d-router` | llm-d/llm-d-router | **EPP 精确缓存感知 + PD 编排**:KV 事件→全局块索引+推测索引(`pkg/kvcache/`)、插件化 scorer、pd-sidecar/coordinator → 见 [`docs/research/llm-d/`](docs/research/llm-d/)(overview / architecture / pain-points) |
 
 逐层对应、借鉴点与**关键差异**(我们更彻底:L1/L2 也归存储池而非实例私有)见 [`docs/research/3rdparty-reference.md`](docs/research/3rdparty-reference.md)。各项目的深度分析(设计/架构/技术栈/优劣)见分目录:`docs/research/{sglang,lmcache,mooncake,vllm,dynamo,tilert,memcache,ucm,tensorcast,flexkv,kvcached}/`；Transformers 仅作为模型定义源码参考。
 
@@ -141,6 +141,9 @@ docs/
    - **张量状态基础设施(TensorCast)**:权重/KV/checkpoint 抽离进程为分布式 artifact + Global Store/Store Daemon 控制面/数据面分离 + CUDA IPC 同机零拷贝 + RDMA/TCP P2P + policy 预设(cache/durable/ha/cold/warm/pinned)放置契约 + binding 版本热替换 + tensor view(TP shard) → `docs/research/tensorcast/{overview,architecture,evaluation}.md`（submodule `3rdparty/tensorcast`;与 lake 存储层/权重缓存同构对照）
    - **引擎旁 KV 卸载(FlexKV)**:CPU/SSD/REMOTE 本机 radix、GPU 仅 IPC 映射、delay-free D2H、vLLM/SGLang/Dynamo connector → `docs/research/flexkv/{overview,architecture,pain-points}.md`；HBM/卸载全 3rdparty 对照（含 G1 句柄）见 `docs/research/hbm-tier-and-offload.md`
    - **GPU 虚拟内存弹性/多实例共享单卡(kvcached)**:VA/物理页解耦、跨进程超卖、kvctl 配额、zero page 冷启动、物理页重映射与 RDMA 注册冲突 → `docs/research/kvcached/overview.md`
+   - **K8s 推理平台(AIBrix)**:网关路由策略集 + prefix-cache 双路线(本地哈希表 vs ZMQ 事件同步)+ KV 事件管线 + TP 感知 KV 卸载(L1/L2)+ KV 感知扩缩 → `docs/research/aibrix/{overview,architecture,pain-points}.md`(与 llm-d 同层对照:网关侧索引)
+   - **EPP 精确缓存感知路由(llm-d Router)**:ext-proc 选路 + 逐块索引 + 推测索引(TTL 2s)+ 事件管线三件套(gap 重放/去重/订阅管理)+ PD sidecar/coordinator → `docs/research/llm-d/{overview,architecture,pain-points}.md`(K8s 路由收敛方向)
+   - **四栈对比(Dynamo/FlexKV/llm-d/AIBrix)**:覆盖层、KV 状态归属、定位象限、逐维度对比 → `docs/research/serving-stack-comparison.md`
    - **分布式模型对比**(拓扑/元数据权威/同步机制/索引与数据一致性分级/HA/扩展性；各 overview 有「分布式模型」节) → `docs/research/distributed-models.md`
    - 跨项目逐层对应与借鉴顺序 → `docs/research/3rdparty-reference.md`
 3. **沿代码回溯**：每个参考文档末尾都有「代码索引」节，把概念/机制映射到 `文件:符号`。符号名是稳定锚点（行号会漂移，找不到时 `grep -n "符号名" 3rdparty/<repo>/<文件路径>`）。需要确认实现细节时，直接读对应符号的源码。

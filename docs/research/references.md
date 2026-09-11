@@ -29,6 +29,12 @@
   - TACO 多层 KV 卸载:引擎持有 GPU 槽,FlexKV 索引 CPU/SSD/REMOTE,IPC 映射 HBM 做 D2H/H2D;vLLM/SGLang/Dynamo/TRT 均有 connector。
 - **kvcached** → [`kvcached/`](kvcached/):[总览](kvcached/overview.md)
   - OVG(Prism/OSDI 2026)GPU 虚拟内存弹性 KV:VA/物理页解耦、同卡多实例超卖显存(无 daemon、驱动仲裁)、kvctl 硬配额、zero page 冷启动。
+- **AIBrix** → [`aibrix/`](aibrix/):[总览](aibrix/overview.md) · [架构](aibrix/architecture.md) · [痛点与 lake 对照](aibrix/pain-points.md)
+  - 字节跳动捐赠 vllm-project 的 K8s 推理平台积木:Envoy 网关路由策略集(prefix-cache 本地哈希表与 ZMQ 事件同步双路线)、KV 感知 PodAutoscaler、aibrix_kvcache 引擎旁 L1/L2 卸载框架。
+- **llm-d Router** → [`llm-d/`](llm-d/):[总览](llm-d/overview.md) · [架构](llm-d/architecture.md) · [痛点与 lake 对照](llm-d/pain-points.md)
+  - K8s Gateway API Inference Extension 的 EPP 参考实现:逐块 KV 索引 + 推测索引(TTL 2s)+ 插件化 scorer + PD sidecar/coordinator 编排。
+- **四栈对比** → [`serving-stack-comparison.md`](serving-stack-comparison.md)
+  - Dynamo / FlexKV / llm-d / AIBrix:覆盖层、KV 状态归属、定位象限、路由/PD/扩缩/卸载逐维度对比。
 - **Guided / structured decoding** → [`guided-decoding.md`](vllm_vs_sglang/guided-decoding.md)
   - SGLang × vLLM:xgrammar/llguidance 仅 GPU apply、FSM 仍在 CPU;overlap/async 近零 vs spec+grammar / pending token 的同步气泡;与 lake 重叠契约及抢占时 FSM 游标交接。
 - **Sampling 参数** → [`sampling-params.md`](vllm_vs_sglang/sampling-params.md)
@@ -47,6 +53,9 @@
 - **DistServe** (OSDI'24): Disaggregating prefill and decoding，物理隔离 Prefill/Decode 以分别优化吞吐与延迟。
 - **Splitwise** (ISCA'24): Efficient generative LLM inference with phase-based disaggregation，按 phase 分离并建模资源。
 - **TensorCast** (tensorcast-ai): 张量状态基础设施层——把权重/KV/checkpoint/RL 参数从应用进程抽取为分布式 artifact,Global Store(控制面)规划放置与 fanout,Store Daemon(数据面)持本地张量内存 + CUDA IPC 同机零拷贝 + RDMA/TCP P2P 跨机;policy 预设(cache/durable/ha/cold/warm/pinned)定放置与持久化,retrieval source(local/disk/p2p)定取数路径。**源码已引入** `3rdparty/tensorcast`,与 lake 存储层 + 权重缓存同构,见 [`tensorcast/overview.md`](tensorcast/overview.md)。
+- **llm-d Router** (Red Hat/Google/IBM 等): K8s 原生分布式推理栈的路由仓——EPP(Envoy ext-proc)精确缓存感知选路 + pd-sidecar/coordinator 的 PD(/EPD)编排;扩缩在独立仓 WVA(KV 利用率/队列深度驱动,指标交 HPA/KEDA 执行)。**源码已引入** `3rdparty/llm-d-router`,见 [`llm-d/`](llm-d/)。
+- **AIBrix** (字节跳动 → vllm-project): K8s 推理平台积木——网关路由策略集、KV 事件同步、KV 感知扩缩、StormService 角色编排(PD 为静态拓扑)、aibrix_kvcache 卸载框架。**源码已引入** `3rdparty/aibrix`,见 [`aibrix/`](aibrix/)。
+- **Dynamo / FlexKV / llm-d / AIBrix 四栈对比**: 四者词汇表相似(KV 复用/路由/PD),区别在覆盖层与 KV 状态归属。见 [`serving-stack-comparison.md`](serving-stack-comparison.md);路由维度细评见 [`model-routing.md`](model-routing.md) §5。
 
 ## KV Cache 复用与传输
 
