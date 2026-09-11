@@ -40,6 +40,8 @@
 | UCM | 无自有（继承 store 后端） | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 |
 | TileRT | 点对点（单槽 PD） | 无（进程内忙闲表） | 一次性握手 | 不适用 | 不适用 | 无（429） | 不适用（专用 bs=1） |
 | kvcached | 单机多进程（无中心） | 无（驱动仲裁物理页，shm 只记账） | shm 记账 + 100ms 轮询 | 无索引（不知 KV 身份） | 不适用（页即字节） | 进程退出页还驱动 | 单机单卡边界 |
+| AIBrix | K8s 平台星型 + 网关多副本 | 编排:K8s etcd;用户/限流:Redis;路由亲和:网关进程内(无权威) | 默认不同步;可选 Redis 周期 pull/push;KV 事件 ZMQ 各副本各自订阅 | 最终一致(本地估计/事件收敛) | 引擎与 L2 后端各自负责 | 网关无状态;Redis 单点风险;L1 随 pod 消亡 | 副本 × 事件吞吐的固定放大 |
+| llm-d(EPP) | Envoy 后 EPP 多副本 + 引擎事件扇出 | 引擎 KV 事件为真相;EPP 索引是派生缓存 | 各副本独立订阅 ZMQ 事件流 + gap 重放 + 推测条目(TTL 2s) | 最终一致(幽灵条目可能) | 引擎负责 | Active-Passive 选主 / fail-open 直打;近似前缀下 Active-Active 应避免 | 每副本全量订阅全量索引;单 pool 单 EPP |
 | mooncake-p2p-store | P2P 无中心 | etcd | BitTorrent 式 register/拉取 | etcd 强一致（元数据） | 分片拉取 | etcd | 适合 checkpoint 分发，非热路径 |
 
 ## 3. 四类归纳
@@ -56,12 +58,12 @@
 优点是元数据扩展性；代价是读者可能读到过期租约缓存，故障分片在租约过期前不可用。
 对 lake：CP 元数据规模接近单机上限时的备选路径；当前 lake 选择单点权威，保证任何时刻可同步查询（D-direct 5ms 预算）。
 
-### C. 事件流 / 快照最终一致（Dynamo / vLLM / SGLang / FlexKV）
+### C. 事件流 / 快照最终一致（Dynamo / vLLM / SGLang / FlexKV / AIBrix / llm-d）
 
 共同特征：没有可同步查询的权威；通过事件推送（NATS / zmq）或周期快照（Redis GMS）维护最终一致索引，误判以重算、重试或回填兜底。
 采用该方案的原因：高频位置写不适合进入强一致存储（Dynamo 将 KV 事件从 etcd 移至 NATS 为一例）。
-代价：索引陈旧为常态。SGLang PP×L3 多树发散（#22607）是弱一致多副本协调成本的实例；FlexKV 在 worker 退出后索引失效，存在恢复缺口。
-lake 的处理：同样不将高频写压入 etcd，但权威保留在 CP 内存；事件流仅用于镜像传播，不作为权威本身。
+代价：索引陈旧为常态。SGLang PP×L3 多树发散（#22607）是弱一致多副本协调成本的实例；FlexKV 在 worker 退出后索引失效，存在恢复缺口;llm-d 丢 remove 事件留幽灵条目、多副本不共享近似前缀状态（官方建议近似前缀路由下避免 Active-Active）;AIBrix 默认连副本同步都没有，可选的 Redis 同步也是最终一致。
+lake 的处理：同样不将高频写压入 etcd，但权威保留在 CP 内存；事件流仅用于镜像传播，不作为权威本身。llm-d 的推测索引（决策后先写 TTL 2s 条目）是这类系统补"决策-确认窗口"的代表手法——lake 权威放置直接出视图，无此窗口。
 
 ### D. 弱协调 / 无（LMCache / UCM / TileRT）
 
@@ -98,3 +100,5 @@ lake 的处理：同样不将高频写压入 etcd，但权威保留在 CP 内存
 - [flexkv/overview.md](flexkv/overview.md)「分布式模型」：本机 radix + Redis 周期快照
 - [tilert/overview.md](tilert/overview.md)「分布式模型」：无（单槽点对点）
 - [kvcached/overview.md](kvcached/overview.md)「分布式模型」：单机多进程无中心（驱动仲裁 + shm 记账）
+- [aibrix/overview.md](aibrix/overview.md)「分布式模型」：K8s etcd + Redis + 网关进程内索引（可选最终一致同步 / KV 事件各自订阅）
+- [llm-d/overview.md](llm-d/overview.md)「分布式模型」：引擎事件为真相 + EPP 各副本派生索引各自收敛 + 推测条目补窗口
