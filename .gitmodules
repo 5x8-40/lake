@@ -37,3 +37,12 @@
 [submodule "3rdparty/kvcached"]
 	path = 3rdparty/kvcached
 	url = https://github.com/ovg-project/kvcached
+[submodule "3rdparty/production-stack"]
+	path = 3rdparty/production-stack
+	url = https://github.com/vllm-project/production-stack.git
+[submodule "3rdparty/aibrix"]
+	path = 3rdparty/aibrix
+	url = https://github.com/vllm-project/aibrix.git
+[submodule "3rdparty/llm-d-router"]
+	path = 3rdparty/llm-d-router
+	url = https://github.com/llm-d/llm-d-router.git
