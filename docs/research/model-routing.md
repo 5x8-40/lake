@@ -228,15 +228,18 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
   3. 对部署友好的结论:Avengers 不训练神经网络(纯聚类)也在第一梯队;embedding 骨干换成弱模型几乎不影响结果;**模型池越大收益越递减,精心挑选的小池子更划算**——原因是路由的收益来自模型间的互补(各有所长):Oracle 曲线显示从 2 个模型加到 4-6 个时上限提升最大,之后新模型擅长的领域大多已被覆盖,边际互补趋零;同时候选越多,路由器选错的概率越高。按"覆盖更多领域"挑 4-6 个互补的模型,比堆 20 个更划算。
 
   **设定二:性能-成本设定**(13 个旗舰模型池,参照系 Best Single = GPT-5)。指标:PerfGain(质量相对 GPT-5 的增减)与 CostSave(质量不低于 GPT-5 前提下的最大省钱幅度)。结果:**OpenRouter 的 PerfGain 是 −24.7%**——质量比"所有请求都发给 GPT-5"还差 24.7%,质量不达标所以 CostSave 记 N/A(论文脚注:OpenRouter 用自己平台的模型池,不可配置)。这与设定一不矛盾:Dataset Oracle 是轻量池里的上界参照,−24.7% 是旗舰池里相对 GPT-5 基线的差距,两个设定两批模型。表现最好的 **Avengers-Pro**:PerfGain +4.0%、CostSave +31.7%,几乎独占 Pareto 前沿(机制见上表);RouteLLM +2.6% / +11.4%;HybridLLM、FrugalGPT 两个二分类级联/路由器都是负收益。
-- [RouterArena](https://arxiv.org/abs/2510.00202)(ICLR 2026,[排行榜](https://routeworks.github.io/)):实时排行榜形态,把路由器当黑盒测(各家用各自的模型池),主指标 Arena Score 是准确率与 log₂ 成本的加权调和平均。前几名及其原理:
+- [RouterArena](https://arxiv.org/abs/2510.00202)(ICLR 2026,[排行榜](https://routeworks.github.io/)):实时排行榜形态,把路由器当黑盒测(各家用各自的模型池),主指标 Arena Score 是准确率与 log₂ 成本的加权调和平均。榜单滚动更新、榜首更迭很快,以下以 **2026-09 的榜单**为准:
 
-  1. **Sqwish Router**(第 1):商业产品,原理未公开。
-  2. **AgentForge Router**(第 2):个人提交,原理未公开。
-  3. **Weave Router**(第 3,[源码可得](https://github.com/workweave/router),Elastic License):**Avengers-Pro 的产品化**——进程内 ONNX 小模型做嵌入,对冻结的意图簇中心打分(簇打分器从 Avengers-Pro 改来,用生产流量重训),选该簇上历史表现追平旗舰的最便宜模型;按 action(单次 API 请求)路由,带会话粘连保缓存;决策 <50ms。
-  4. **NadirRouter**(第 4,[开源](https://github.com/NadirRouter/NadirClaw)):嵌入质心二分类——all-MiniLM-L6-v2 嵌入后与"简单/复杂"两个质心比余弦相似度,再叠加规则覆盖(检测到工具调用强制走强模型、检测到推理标记走推理模型、超长换长上下文模型、会话内保持同模型)。
-  5. **vLLM-SR**(第 5):ModernBERT 多分类器(见 §2)。
+  1. **前五名**(Paix2 77.63 / KT-ModelRouter 76.28 / Sqwish 76.21 / Divyam 75.85 / Cross-Router 75.75):全部是个人或商业提交,**原理均未公开**(KT-ModelRouter 挂了 GitHub 仓但内容为空)。
+  2. **公开原理的最高名次**:
+     - **vLLM-SR**(第 6,74.86):ModernBERT 多分类器(见 §2)。
+     - **nadir-caliper**(第 7,74.55):Nadir 作者的校准变体,细节未公开。
+     - **Weave Router**(第 10,72.82,[源码可得](https://github.com/workweave/router),Elastic License):**Avengers-Pro 的产品化**——进程内 ONNX 小模型做嵌入,对冻结的意图簇中心打分(簇打分器从 Avengers-Pro 改来,用生产流量重训),选该簇上历史表现追平旗舰的最便宜模型;按 action(单次 API 请求)路由,带会话粘连保缓存;决策 <50ms。
+     - **Nadir Router**(第 11,72.29,[开源](https://github.com/NadirRouter/NadirClaw)):嵌入质心二分类——all-MiniLM-L6-v2 嵌入后与"简单/复杂"两个质心比余弦相似度,再叠加规则覆盖(检测到工具调用强制走强模型、检测到推理标记走推理模型、超长换长上下文模型、会话内保持同模型)。
+     - **OrcaRouter-Adaptive**(第 12,72.08,[开源](https://github.com/Continuum-AI-Corp/OrcaRouter-Lite)+[论文](https://arxiv.org/abs/2605.30736)):**LinUCB 上下文 bandit**——用词法 + 句嵌入特征,离线阶段在精选 prompt 集上全信息评估每个候选模型、每臂拟合一个岭回归,上线后按 bandit 反馈只更新被选中那一臂。
+  3. **知名商业/旗舰反而靠后**:GPT-5 第 24(64.32,贵),NotDiamond 第 28(57.29,频繁选贵模型)。
 
-  也就是说,公开原理的前几名全是"嵌入 + 聚类/质心"一族——与 LLMRouterBench 里 Avengers 系表现最好互相印证。知名商业路由器反而靠后:GPT-5 第 7(模型池受限),NotDiamond 第 12(频繁选贵模型)。论文总结的共同短板:现有路由器都不擅长识别"这题便宜模型就够了"的查询。
+  结论:公开原理的上榜者仍是"**嵌入特征 + 轻量分类/回归/bandit**"一族——与 LLMRouterBench 里 Avengers 系表现最好互相印证;榜首被未公开的个人提交占据,无法分析。论文总结的共同短板:现有路由器都不擅长识别"这题便宜模型就够了"的查询。
 - **数字打架,怎么理解**(梳理而非堆砌):关于路由能省多少钱,四类来源的数字差出一个数量级——
 
   | 来源 | 数字 | 口径 |
@@ -325,7 +328,11 @@ flowchart LR
 - **agent 负载的路由需求**([#244](https://github.com/vllm-project/production-stack/issues/244)):feature request 要三样东西——跨 agent 的 KV 复用(同一 workflow 的 agent 共享上下文)、按 `session_id`/workflow 元数据的 agent 感知路由、workflow 级指标(跨 agent 命中率、workflow TTFT)。说明"agent 感知路由"已是社区显性需求。
 - **K8s 网关生态收敛**([#1032](https://github.com/vllm-project/production-stack/issues/1032)):kgateway 在 2.1 弃用、2.2 移除了 inference extension 支持,production-stack 迁移到 agentgateway + llm-d Router。信号:K8s 原生的推理路由正在向 **Gateway API Inference Extension + llm-d EPP** 这一组合收敛,各家自研 router 的定位都在向"参考实现"退(Kthena 官方也这么自述)。
 
-**要点**:1) `kvaware`(查 LMCache controller 集中记账)与 `prefixaware`(查路由器本地历史)的本质差别是"知不知道缓存已被驱逐";2) 最大教训是热路径纪律——路由器不 tokenize、不做同步远程调用(#1016 一小时重启 25 次);3) 生态信号:K8s 推理路由正向 Gateway API Inference Extension + llm-d EPP 收敛。
+**要点**:
+
+- `kvaware` 与 `prefixaware` 的本质差别是"知不知道缓存已被驱逐":前者查 LMCache controller 集中记账,后者查路由器本地历史。
+- 最大教训是热路径纪律:路由器不 tokenize、不做同步远程调用(#1016 一小时重启 25 次)。
+- 生态信号:K8s 推理路由正向 Gateway API Inference Extension + llm-d EPP 收敛。
 
 ### SGLang
 
@@ -334,7 +341,10 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 - **`cache_aware`**(`cache_aware.rs` + `tree.rs`):路由器为每个 worker 维护一棵**近似前缀树**(存原始文本而非 token id,省 tokenize 开销),按请求历史推断各 worker 的缓存内容,不查引擎真实状态。匹配率超阈值就发最匹配的 worker,否则发树最小(缓存容量最空)的;后台 LRU 驱逐叶子防内存膨胀。**负载不均衡时**(max-min 超绝对阈值且 max/min 超相对阈值)自动切到最短队列优先,均衡时切回缓存感知——缓存亲和与负载均衡按系统状态二选一,不是加权求和。
 - **`consistent_hashing`**(`consistent_hashing.rs`):会话粘连。优先级:显式 `X-SMG-Routing-Key` 请求头 > 隐式稳定头(`authorization` / `x-forwarded-for` / `cookie`)> 匿名请求随机。一致性哈希环保证 worker 上下线时只有少量会话换节点。
 
-**要点**:`cache_aware` 用路由器本地近似前缀树(存文本不存 token,零 tokenize 开销)按历史推测缓存,不查引擎;负载失衡时整体切最短队列——缓存亲和与负载均衡是**二选一切换**而非加权求和。
+**要点**:
+
+- `cache_aware` 用路由器本地近似前缀树(存文本不存 token,零 tokenize 开销)按历史推测缓存,不查引擎。
+- 负载失衡时整体切最短队列:缓存亲和与负载均衡是**二选一切换**,不是加权求和。
 
 ### AIBrix
 
@@ -363,7 +373,12 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 - [#677](https://github.com/vllm-project/aibrix/issues/677):树版 Preble 实现已完成(`prefixcacheindexer` + `algorithms`),并指出 Preble 的一个实际痛点:**prefill/decode 的成本模型是线性回归,系数按"模型 × GPU"硬编码**——换个硬件就要重新标定。后续参考方向点名了 Preble、SGLang 和 D²LPM。
 - CHWBL(见 KubeAI 节)曾被列入计划,因人力原因推迟。
 
-**要点**:1) 策略数量最多且**可组合**(归一化分数按权重加权求和,可独立灰度);2) `prefix-cache` 索引是固定大小哈希表(20 万槽 × 4 token/块),正考虑转向一致性哈希+LSH;3) 多副本状态走 Redis 增量同步,必须显式开 `AIBRIX_STATESYNC_ENABLED`——不开则各副本路由结果不一致,是官方点名的最常见踩坑点。
+**要点**:
+
+- 策略数量最多且**可组合**:归一化分数按权重加权求和,每种策略可独立灰度。
+- `prefix-cache` 索引是固定大小哈希表(20 万槽 × 4 token/块),正考虑转向一致性哈希+LSH。
+- 多副本状态走 Redis 增量同步,必须显式开 `AIBRIX_STATESYNC_ENABLED`:
+  - 不开则各副本各算各的、路由结果不一致,是官方点名的最常见踩坑点。
 
 ### llm-d
 
@@ -380,7 +395,12 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 3. **推测索引**(speculative indexing,独有):解决一个具体的时序问题——路由决策做完到 worker 的 KV 事件传播回索引之间有毫秒级窗口;两个同前缀请求接连到达时,第二个查索引会发现第一个刚写的 KV 还没登记,亲和就断了。做法是决策完成后立刻往索引里写一条"预计这些块会在这个 pod 上"的短期条目(TTL 默认 2 秒),等真实事件到达确认、或过期自动删除。本质是用预测填补事件传播的延迟,思路干净,可直接借用(lake 的对应窗口见 §8 第 7 条)。
 4. **多副本**:每个 EPP 副本独立订阅所有 pod 的事件流,天然收敛到同一索引,active-active,不需要共享存储。
 
-**要点**:1) "精确派"代表——引擎发 KV 事件(BlockStored/BlockRemoved),EPP 维护全局"块→pod"索引,KV 事件流正成为三家引擎(vLLM/SGLang/TRT-LLM)都发的生态标准接口;2) 独有**推测索引**:决策后先写 TTL 2 秒的预测条目,填补事件传播的毫秒级窗口,防同前缀请求接连到达时亲和断链;3) 多副本各自订阅、天然收敛,无需共享存储。
+**要点**:
+
+- "精确派"代表:引擎发 KV 事件(BlockStored/BlockRemoved),EPP 维护全局"块→pod"索引。
+  - KV 事件流正成为生态标准接口:vLLM / SGLang / TRT-LLM 三家都发。
+- 独有**推测索引**:决策后先写 TTL 2 秒的预测条目,填补事件传播的毫秒级窗口,防同前缀请求接连到达时亲和断链。
+- 多副本各自订阅全部 pod、天然收敛到同一索引,无需共享存储。
 
 ### Kthena
 
@@ -399,7 +419,12 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 3. **打分**:filter-score 插件链,可组合。
 4. **PD 分离的调度顺序**(与别家相反,值得注意):**先给 decode pod 打分排序,再为选中的 D 配同组 prefill pod**——保证 KV 局部性。官方自述 router 是参考实现,因为 Gateway Inference Extension 不原生支持 PD 分离。
 
-**要点**:1) 状态外置——sidecar 订 KV 事件把块哈希写 Redis,router 查 Redis;2) 默认匹配深度只有 2048 token(128 块 × 16 token,可配),定位是"系统提示词级亲和",会话级长前缀需调大;3) PD 调度顺序独有:**先选 D 再配同组 P**。
+**要点**:
+
+- 状态外置:sidecar 订 KV 事件把块哈希写 Redis,router 查 Redis。
+- 默认匹配深度只有 2048 token(128 块 × 16 token,可配):
+  - 定位是"系统提示词级亲和";会话级长前缀亲和需调大上限或换索引结构。
+- PD 调度顺序独有:**先给 decode pod 打分,再配同组 prefill**(保 KV 局部性)。
 
 ### KubeAI:无状态路线
 
@@ -430,7 +455,11 @@ CHWBL 的出处与验证:
 
 代价:哈希只保证"同前缀同副本",不知道缓存是否已被驱逐,也不感知实时负载(只在超界时让位)。
 
-**要点**:无状态前缀哈希(CHWBL)路线——零状态、天然一致、实测 TTFT 降 95%;代价是不知驱逐、不感知负载。适合"不想维护缓存状态"的场景。
+**要点**:
+
+- 无状态前缀哈希(CHWBL)路线:零状态、天然多副本一致、实测 TTFT 降 95%。
+- 代价:不知缓存是否已被驱逐,也不感知实时负载(只在超界时让位)。
+- 适合"不想维护缓存状态"的场景。
 
 ### OpenAI API(托管服务)
 
@@ -442,7 +471,11 @@ OpenAI 的 prompt caching 在服务端做实例级路由([官方文档](https://
 4. **生效条件**:前缀 ≥1024 token,按 128 token 递增匹配。
 5. **收益**:官方称最高省 80% TTFT、90% 输入成本。
 
-**要点**:托管服务里"前缀哈希 + 显式 key"的最简形态——不记驱逐、不感知负载,与 KubeAI 同族,但多了 `prompt_cache_key` 显式粘连。
+**要点**:
+
+- 托管服务里"前缀哈希 + 显式 key"的最简形态,与 KubeAI 同族。
+- 同样不记驱逐、不感知负载。
+- 比 KubeAI 多一个 `prompt_cache_key` 显式粘连(客户实测命中率 60%→87%)。
 
 ### 对照表
 
@@ -495,11 +528,38 @@ lake 在这张表里的位置:缓存状态由存储池权威维护(强于推测�
 | SSJF([arXiv 2404.08509](https://arxiv.org/abs/2404.08509),LMSYS) | 微调一个 BERT-base,输入 prompt 直接回归输出 token 数;按预测长度做"投机式最短作业优先" | 平均完成时间降 30-40%,吞吐 2.2-3.6× |
 | ELIS([arXiv 2505.09142](https://arxiv.org/abs/2505.09142)) | BGE 文本嵌入 + 分类,最短剩余时间优先 | 平均完成时间降 19.6% |
 | PARS([arXiv 2510.03243](https://arxiv.org/abs/2510.03243)) | 不预测绝对长度,学成对排序("这两个请求哪个更长")——相对顺序比绝对值更鲁棒;有 vLLM 实现 | 优于 FCFS 与既有 SJF 变体 |
-| TIE([arXiv 2604.00499](https://arxiv.org/abs/2604.00499)) | **按请求预测分布,不是预测一个数**:微调 DeBERTa-v3-base 编码 prompt,两个 MLP 头分别输出该请求输出长度 log-t 分布的 μ̂(位置)和 σ̂(展布),自由度 ν 固定 3.5——即每个请求都有自己专属的分布参数(回答"每个请求分布是否不同":是,这正是与"全场共用一条分布"的区别);调度分 = 分布期望 + 尾部期望上调(惩罚"有可能变长"的请求),代替长度进 SJF。实测依据:1K prompt × 各采样 100 次,输出长度平均偏度 3.10、P99/P50=10.77(重尾),log-t(ν=3.5) 拟合的 KS 检验通过率 90.6% | 每 token 延迟比 SSJF 再降 2.9× |
+| TIE([arXiv 2604.00499](https://arxiv.org/abs/2604.00499)) | **按请求预测分布,不是预测一个数**:DeBERTa 编码 prompt,两个 MLP 头输出该请求专属的 log-t 分布参数(公式与变量见下);调度分 = 分布期望 + 尾部惩罚,代替长度进 SJF | 在线每 token 延迟比最强基线降 2.31×,离线吞吐升 1.42× |
 
 ![输出长度的重尾分布与 log-t 拟合](model-routing/figures/tie-logt-distribution.svg)
 
 (图源:[TIE 论文](https://arxiv.org/abs/2604.00499) Figure 1。同一个 prompt 采样 256 次的输出长度直方图,红线是拟合的 log-t 分布——同一个问题的回答长度本身是个重尾随机变量,这是"预测分布而非点估计"的依据。)
+
+**TIE 的分布公式与变量**。输出长度 \(L\) 建模为:
+
+\[
+\log L = \mu + \sigma \cdot Y,\qquad Y \sim t(\nu),\quad \nu = 3.5\ (\text{固定})
+\]
+
+即 \(L \sim \text{Log-t}(\mu, \sigma, 3.5)\)。逐变量说清:
+
+1. **\(\mu\)(位置)**:该请求"典型输出长度"的对数——\(\mu\) 大 = 回答偏长。
+2. **\(\sigma\)(展布)**:不确定性——\(\sigma\) 大 = 长度波动大。
+3. **\(\nu = 3.5\)(自由度)**:尾部厚度,全场固定(论文消融选出的最优值,KS 检验通过率 90.6%)。
+4. **预测器**:\((\hat\mu, \hat\sigma) = f_\theta(\text{prompt})\),\(f_\theta\) 是微调的 DeBERTa-v3-base(CLS + mean + max 多池化)接两个 MLP 头;拟合优度 \(R^2\) 分别为 0.82 / 0.76。实测依据:1K prompt × 各采样 100 次,输出长度平均偏度 3.10、P99/P50 = 10.77(重尾)。
+5. **调度分**:\(\text{Score} = \mathbb{E}[\tilde X] + \beta \cdot \text{CVaR}_\alpha[\tilde X]\),其中 \(\tilde X = \min(L, \texttt{max\_tokens})\)(按 max_tokens 截断),\(\text{CVaR}_\alpha\) 是"超过 \(\alpha\) 分位数的平均长度"(\(\alpha = 0.9\)),\(\beta\) 是尾部惩罚权重。SJF 里的"长度"换成这个分数——惩罚"有可能变长"的请求。
+
+**换模型怎么办**(关键问题):上面的公式里其实还藏着两个变量——
+
+1. **服务模型 \(m\)**:训练数据是 LMSYS-Chat-1M 的 prompt 配上 **Llama-3-8B 各采样 20 次**的输出,所以预测器学到的其实是 \(\mu(x, m_0=\text{Llama-3-8B})\)。换模型后分布确实会漂:论文自己的图(Figure 6)就显示各模型输出长度分布不同,推理模型尤其夸张(DeepSeek-R1-Distill 平均约 1057 token,Mistral-7B 约 128 token,差近 10 倍)。
+2. **解码配置**:温度也改变分布(论文在温度 0.7 训练,≥1.6 时所有方法都退化)。
+
+论文的应对是**不重训直接泛化**(同一预测器直接在 70B 和 7 个其他家族的模型上测,声称效果好),理由是分布建模不过拟合、尾部惩罚能吸收预测误差。但这个声称有边界:同族同风格(聊天)模型间泛化可信;换成推理模型这种长度量级都变的,靠泛化不现实。工程上的正经解法三条:
+
+1. **按模型条件化**:预测器输入加 model_id(或每模型一个头),\(\mu(x)\) 变成 \(\mu(x, m)\)。
+2. **在线校准**:用观测到的实现长度对 \(\hat\mu\) 做滑动修正(如按模型维护一个加法偏置)——lake 的存储池能看到 decode 中的真实 KV 块数,校准信号免费。
+3. **只重训头**:论文的两阶段训练(先全量、后冻结 encoder 只训头)就是为此设计,换模型只需重训两个 MLP 头,成本低。
+
+另外论文自述的训练数据门槛也值得记住:点估计方法可以直接用生产日志训练,TIE 需要每个 prompt 多次采样来拟合分布,冷启动成本更高。
 
 **产品化现状(提出两年后的检验)**:这一支 2024 年就有了,进产品的情况分两层:
 
