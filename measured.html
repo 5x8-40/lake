@@ -1,0 +1,402 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>APC 实测数据与拟合</title>
+  <link rel="stylesheet" href="app.css?v=4" />
+</head>
+<body>
+  <nav class="topnav" aria-label="CMX 分析页面">
+    <a href="index.html">KV 加载</a>
+    <a href="capacity.html">容量换算</a>
+    <a href="economics.html">命中率对比</a>
+    <a href="measured.html" class="on" aria-current="page">实测数据</a>
+    <span class="navdoc">方法见 <a href="README.md">README</a></span>
+  </nav>
+
+  <header>
+    <h1>APC 实测数据与拟合</h1>
+    <p>
+      展示 MR !7 中两组设备数据，并按设备、模型分别拟合 TTFT、KV 量和带宽。
+    </p>
+    <div class="warn" role="note">
+      设备沿用 A/B 标识；每个设备、模型独立拟合，具体异常和误差见 README。
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside>
+      <h2>拟合对象</h2>
+      <label for="device">设备</label>
+      <select id="device"></select>
+
+      <label for="model">模型</label>
+      <select id="model"></select>
+      <p id="sourceNote" class="hint"></p>
+
+      <label for="metric">图表指标</label>
+      <select id="metric"></select>
+
+      <h2>预测点</h2>
+      <label for="hit">APC 命中率 %</label>
+      <input id="hit" type="number" min="0" max="100" step="0.1" value="90" />
+
+      <label for="sequence">序列长度 N（K token）</label>
+      <input id="sequence" type="number" min="1" step="1" value="64" />
+      <p class="hint">原始范围：hit 56%–99%，N=4K–1024K；范围外属于外推。</p>
+    </aside>
+
+    <main>
+      <div class="stats" id="stats" aria-live="polite"></div>
+
+      <section class="panel" aria-labelledby="chartHeading">
+        <h2 id="chartHeading">实测点与拟合曲线</h2>
+        <div class="tabs" id="legend" aria-label="图例"></div>
+        <div class="chart-wrap">
+          <svg
+            class="chart"
+            id="chart"
+            viewBox="0 0 900 340"
+            role="img"
+            aria-labelledby="measuredChartTitle measuredChartDesc"
+          ></svg>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="formulaHeading">
+        <h2 id="formulaHeading">当前拟合</h2>
+        <pre class="formula" id="formula"></pre>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="deviceAHeading">
+        <h2 id="deviceAHeading">设备 A 原始数据</h2>
+        <div id="deviceATable"></div>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="deviceBHeading">
+        <h2 id="deviceBHeading">设备 B 原始数据</h2>
+        <div id="deviceBTable"></div>
+      </section>
+
+      <section class="panel" aria-labelledby="limitsHeading">
+        <h2 id="limitsHeading">口径与边界</h2>
+        <ul class="notes">
+          <li><code>N</code> 使用原表的 K-token 单位，不是 token 原值。</li>
+          <li>TTFT 使用相对误差加权拟合，避免 1M 序列完全支配短序列。</li>
+          <li>V4 实测读写系数不对称；原因未公开，读、写带宽分别拟合。</li>
+          <li>表中 TB 沿用原 comment 的 <code>GB/s × 3600 / 1024</code> 换算。</li>
+          <li>Qwen3-235B 无 Cache TTFT/TPS 只展示原值，不进入任何拟合。</li>
+          <li>拟合只覆盖表中的 hit 与序列长度范围；具体残差见 README。</li>
+        </ul>
+      </section>
+
+      <footer>
+        APC 语义参考 vLLM <code>KVCacheManager.get_computed_blocks</code> 与
+        SGLang <code>RadixCache.match_prefix</code>；回归系数仅来自本页两条 MR comment。
+      </footer>
+    </main>
+  </div>
+
+  <script src="measured.js?v=1"></script>
+  <script>
+    "use strict";
+
+    const M = window.CmxMeasured;
+    const $ = (id) => document.getElementById(id);
+    const chartHits = [
+      { value: 0.56, color: "#4aa3d9" },
+      { value: 0.90, color: "#e08a3c" },
+      { value: 0.99, color: "#7cb87a" },
+    ];
+
+    function finiteNumber(id, fallback) {
+      const value = Number($(id).value);
+      return Number.isFinite(value) ? value : fallback;
+    }
+
+    function formatValue(value, digits = 4) {
+      if (value == null || Number.isNaN(value)) return "N/A";
+      if (typeof value === "string") return value;
+      if (!Number.isFinite(value)) return "∞";
+      if (Math.abs(value) >= 1000) return value.toFixed(2);
+      if (Math.abs(value) >= 100) return value.toFixed(3);
+      if (Math.abs(value) >= 1) return value.toFixed(digits);
+      return value.toPrecision(digits);
+    }
+
+    function formatRaw(value) {
+      if (value == null) return "—";
+      return String(value);
+    }
+
+    function formatPercent(value) {
+      if (value == null || !Number.isFinite(value)) return "N/A";
+      return `${(value * 100).toFixed(2)}%`;
+    }
+
+    function formatCoefficient(value) {
+      if (value == null || !Number.isFinite(value)) return "N/A";
+      const magnitude = Math.abs(value);
+      return magnitude !== 0 && (magnitude < 0.001 || magnitude >= 1000)
+        ? value.toExponential(6)
+        : value.toFixed(7);
+    }
+
+    function stat(key, value, detail, className = "") {
+      return `<div class="stat ${className}">
+        <div class="k">${key}</div>
+        <div class="v">${value}</div>
+        <div class="s">${detail}</div>
+      </div>`;
+    }
+
+    function syncDevices() {
+      $("device").innerHTML = M.DEVICES.map((device) =>
+        `<option value="${device.id}">${device.label} · comment ${device.noteId}</option>`
+      ).join("");
+    }
+
+    function syncModels() {
+      const device = M.deviceFor($("device").value);
+      const previous = $("model").value;
+      $("model").innerHTML = device.models.map((model) =>
+        `<option value="${model.id}">${model.label}</option>`
+      ).join("");
+      if (device.models.some((model) => model.id === previous)) {
+        $("model").value = previous;
+      }
+    }
+
+    function syncMetrics() {
+      $("metric").innerHTML = Object.values(M.METRICS).map((metric) =>
+        `<option value="${metric.id}">${metric.label} (${metric.unit})</option>`
+      ).join("");
+    }
+
+    function currentFit() {
+      return M.buildFit($("device").value, $("model").value);
+    }
+
+    function rawNoCacheText(fit, nK) {
+      if (!fit.model.noCacheTTFT) return "当前模型没有无 Cache 列";
+      const lengths = M.GRID.slice(0, 5).map((row) => row[1]);
+      const index = lengths.indexOf(nK);
+      if (index < 0) return "无 Cache 仅展示 4/16/64/256/1024K 原值，不插值";
+      const ttft = fit.model.noCacheTTFT[index];
+      const tps = fit.model.noCacheTPS[index];
+      return `无 Cache 原值：TTFT=${formatRaw(ttft)} s，TPS=${formatRaw(tps)}；不拟合`;
+    }
+
+    function renderStats(fit, prediction, metricId) {
+      const metric = M.METRICS[metricId];
+      const quality = fit.quality[metricId];
+      $("stats").innerHTML = [
+        stat("TTFT", `${formatValue(prediction.ttft)} s`, "相对误差加权拟合", "hot"),
+        stat("单层读 KV", `${formatValue(prediction.readMB)} MB`, "k · hit · N"),
+        stat("读带宽", `${formatValue(prediction.readGBs)} GB/s`, "d_read · hit · N / TTFT"),
+        stat("写带宽", `${formatValue(prediction.writeGBs)} GB/s`, "d_write · (1-hit) · N / TTFT"),
+        stat("1H 新增 KV", `${formatValue(prediction.newKv1hTB)} TB`, "写带宽 × 3600 / 1024"),
+        stat("1H 处理总量", `${formatValue(prediction.processed1hTB)} TB`, "新增量 ÷ (1-hit)"),
+        stat(`${metric.label} R²`, formatValue(quality.r2, 5), `${fit.device.label} · ${fit.model.label}`, quality.r2 >= 0.9 ? "ok" : "bad"),
+        stat(`${metric.label} 相对 RMSE`, formatPercent(quality.relativeRmse), rawNoCacheText(fit, prediction.nK)),
+      ].join("");
+    }
+
+    function renderFormula(fit, prediction, metricId) {
+      const c = fit.coefficients;
+      const q = fit.quality[metricId];
+      $("formula").textContent =
+`N 的单位：K token
+
+TTFT = c + (1-h) × (aN + bN²)
+单层读KV = k × h × N
+读带宽 = d_read × h × N / TTFT
+写带宽 = d_write × (1-h) × N / TTFT
+1H新增KV = 写带宽 × 3600 / 1024
+1H处理总量 = 1H新增KV / (1-h)
+
+c       = ${formatCoefficient(c.c)}
+a       = ${formatCoefficient(c.a)}
+b       = ${formatCoefficient(c.b)}
+k       = ${formatCoefficient(c.k)}
+d_read  = ${formatCoefficient(c.dRead)}
+d_write = ${formatCoefficient(c.dWrite)}
+
+预测点：h=${(prediction.hit * 100).toFixed(2)}%，N=${prediction.nK}K
+所选指标：${M.METRICS[metricId].label}
+R²=${formatValue(q.r2, 6)}，relative RMSE=${formatPercent(q.relativeRmse)}
+
+TTFT 的 c/a/b 使用 relative-error weighted least squares。
+k 使用过原点最小二乘；d_read/d_write 分别最小化相对带宽误差。`;
+    }
+
+    function metricValue(point, metricId) {
+      return point[metricId];
+    }
+
+    function drawChart(fit, metricId) {
+      const svg = $("chart");
+      const metric = M.METRICS[metricId];
+      const observed = fit.points.map((point) => ({
+        hit: point.hit,
+        nK: point.nK,
+        value: metricValue(point, metricId),
+      }));
+      const curves = chartHits.map((hit) => {
+        const points = [];
+        for (let step = 0; step <= 80; step += 1) {
+          const nK = 4 * (2 ** (8 * step / 80));
+          const prediction = M.predict(fit, hit.value, nK);
+          points.push({
+            nK,
+            value: metricValue(prediction, metricId),
+          });
+        }
+        return { ...hit, points };
+      });
+      const allValues = [
+        ...observed.map((point) => point.value),
+        ...curves.flatMap((curve) => curve.points.map((point) => point.value)),
+      ].filter((value) => Number.isFinite(value) && value > 0);
+      if (!allValues.length) {
+        svg.innerHTML =
+          `<title id="measuredChartTitle">实测点与拟合曲线</title>
+           <desc id="measuredChartDesc">当前输入没有可绘制的数据。</desc>`;
+        return;
+      }
+
+      const width = 900, height = 340, left = 78, right = 24, top = 28, bottom = 48;
+      const innerWidth = width - left - right;
+      const innerHeight = height - top - bottom;
+      const minLogY = Math.floor(Math.log10(Math.min(...allValues)));
+      const maxLogY = Math.ceil(Math.log10(Math.max(...allValues)));
+      const logSpan = Math.max(1, maxLogY - minLogY);
+      const x = (nK) => left + (Math.log2(nK / 4) / 8) * innerWidth;
+      const y = (value) =>
+        top + innerHeight -
+        ((Math.log10(value) - minLogY) / logSpan) * innerHeight;
+      const xTicks = [4, 16, 64, 256, 1024].map((nK) =>
+        `<text x="${x(nK)}" y="${height-16}" fill="#9a917f" font-size="11" text-anchor="middle">${nK}K</text>`
+      ).join("");
+      const yTicks = [];
+      for (let exponent = minLogY; exponent <= maxLogY; exponent += 1) {
+        const value = 10 ** exponent;
+        const yy = y(value);
+        yTicks.push(
+          `<line x1="${left}" y1="${yy}" x2="${width-right}" y2="${yy}" stroke="#2e2a24" />
+           <text x="${left-8}" y="${yy+4}" fill="#9a917f" font-size="11" text-anchor="end">1e${exponent}</text>`
+        );
+      }
+      const paths = curves.map((curve) => {
+        const path = curve.points.map((point, index) =>
+          `${index ? "L" : "M"}${x(point.nK)},${y(point.value)}`
+        ).join(" ");
+        return `<path d="${path}" fill="none" stroke="${curve.color}" stroke-width="2.2" />`;
+      }).join("");
+      const dots = observed.map((point) => {
+        const color = chartHits.find((item) => item.value === point.hit).color;
+        return `<circle cx="${x(point.nK)}" cy="${y(point.value)}" r="4" fill="${color}" stroke="#12110f" stroke-width="1.2" />`;
+      }).join("");
+      svg.innerHTML =
+        `<title id="measuredChartTitle">${metric.label}实测点与拟合曲线</title>
+         <desc id="measuredChartDesc">横轴为 K token 序列长度，纵轴为对数刻度 ${metric.unit}；圆点为实测，线为拟合。</desc>
+         ${yTicks.join("")}${xTicks}
+         <text x="${left + innerWidth / 2}" y="${height-2}" fill="#9a917f" font-size="11" text-anchor="middle">序列长度 N（K token，对数刻度）</text>
+         <line x1="${left}" y1="${top+innerHeight}" x2="${width-right}" y2="${top+innerHeight}" stroke="#5a5246" />
+         ${paths}${dots}`;
+      $("legend").innerHTML = chartHits.map((hit) =>
+        `<span class="legend-item"><i style="background:${hit.color}"></i>${(hit.value * 100).toFixed(0)}%：圆点实测 / 线拟合</span>`
+      ).join("");
+    }
+
+    function metricHeaders(model) {
+      const noCache = model.noCacheTTFT
+        ? `<th scope="col">无 Cache TTFT (s)</th><th scope="col">无 Cache TPS</th>`
+        : "";
+      return `${noCache}
+        <th scope="col">TTFT (s)</th>
+        <th scope="col">单层读 KV (MB)</th>
+        <th scope="col">读 GB/s</th>
+        <th scope="col">写 GB/s</th>
+        <th scope="col">1H 新增 (TB)</th>
+        <th scope="col">1H 处理 (TB)</th>`;
+    }
+
+    function rawCells(model, point) {
+      const noCache = model.noCacheTTFT
+        ? `<td>${formatRaw(point.noCacheTTFT)}</td><td>${formatRaw(point.noCacheTPS)}</td>`
+        : "";
+      return `${noCache}
+        <td>${formatRaw(point.ttft)}</td>
+        <td>${formatRaw(point.readMB)}</td>
+        <td>${formatRaw(point.readGBs)}</td>
+        <td>${formatRaw(point.writeGBs)}</td>
+        <td>${formatRaw(point.newKv1hTB)}</td>
+        <td>${formatRaw(point.processed1hTB)}</td>`;
+    }
+
+    function renderRawTable(device) {
+      const modelPoints = device.models.map((model) => ({
+        model,
+        points: M.pointsFor(model),
+      }));
+      const groupHeaders = device.models.map((model) => {
+        const columns = model.noCacheTTFT ? 8 : 6;
+        return `<th scope="colgroup" colspan="${columns}">${model.label}<br>${model.topology}</th>`;
+      }).join("");
+      const headers = device.models.map(metricHeaders).join("");
+      const rows = M.GRID.map((coordinate, index) => {
+        const hitCell = index % 5 === 0
+          ? `<th scope="rowgroup" rowspan="5">${(coordinate[0] * 100).toFixed(0)}%</th>`
+          : "";
+        const cells = modelPoints.map(({ model, points }) =>
+          rawCells(model, points[index])
+        ).join("");
+        return `<tr>${hitCell}<th scope="row">${coordinate[1]}</th>${cells}</tr>`;
+      }).join("");
+      return `<table>
+        <caption>${device.label} · <a href="${device.sourceUrl}">MR comment ${device.noteId}</a></caption>
+        <thead>
+          <tr>
+            <th scope="col" rowspan="2">APC hit</th>
+            <th scope="col" rowspan="2">N (K)</th>
+            ${groupHeaders}
+          </tr>
+          <tr>${headers}</tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>`;
+    }
+
+    function render() {
+      const fit = currentFit();
+      const hit = finiteNumber("hit", 90) / 100;
+      const nK = finiteNumber("sequence", 64);
+      const metricId = $("metric").value;
+      const prediction = M.predict(fit, hit, nK);
+      $("sourceNote").innerHTML =
+        `${fit.model.topology} · <a href="${fit.device.sourceUrl}">comment ${fit.device.noteId}</a>`;
+      renderStats(fit, prediction, metricId);
+      renderFormula(fit, prediction, metricId);
+      drawChart(fit, metricId);
+    }
+
+    syncDevices();
+    syncModels();
+    syncMetrics();
+    $("deviceATable").innerHTML = renderRawTable(M.deviceFor("device-a"));
+    $("deviceBTable").innerHTML = renderRawTable(M.deviceFor("device-b"));
+
+    $("device").addEventListener("change", () => {
+      syncModels();
+      render();
+    });
+    ["model", "metric", "hit", "sequence"].forEach((id) => {
+      $(id).addEventListener("input", render);
+      $(id).addEventListener("change", render);
+    });
+    render();
+  </script>
+</body>
+</html>

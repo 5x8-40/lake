@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Agentic APC：Prefill KV 加载</title>
+  <link rel="stylesheet" href="app.css?v=4" />
+</head>
+<body>
+  <nav class="topnav" aria-label="CMX 分析页面">
+    <a href="index.html" class="on" aria-current="page">KV 加载</a>
+    <a href="capacity.html">容量换算</a>
+    <a href="economics.html">命中率对比</a>
+    <a href="measured.html">实测数据</a>
+    <span class="navdoc">方法见 <a href="README.md">README</a></span>
+  </nav>
+
+  <header>
+    <h1>Agentic APC：请求吞吐与 KV 加载</h1>
+    <p>
+      计算 Prefill 侧的访问请求吞吐和外部 KV 加载带宽。
+    </p>
+    <div class="warn" role="note">
+      默认使用 Kimi K3 单用户峰值小时和长期平均命中率。Cursor usage event 不是 API request，因此默认 req/s 为 N/A。
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside>
+      <h2>模型与布局</h2>
+      <label for="model">模型</label>
+      <select id="model">
+        <option value="v4pro">DeepSeek V4-Pro</option>
+        <option value="v4flash">DeepSeek V4-Flash</option>
+        <option value="glm52">GLM-5.2</option>
+        <option value="glm53flash">GLM-5.3-Flash</option>
+        <option value="k3" selected>Kimi K3</option>
+      </select>
+
+      <label for="profile">KV / 状态布局</label>
+      <select id="profile"></select>
+      <p id="profileNote" class="hint"></p>
+
+      <label for="byteMode">KV 加载字节口径</label>
+      <select id="byteMode">
+        <option value="payload">当前 profile 载荷</option>
+        <option value="engine-pages">vLLM engine pages</option>
+        <option value="custom-wire">自定义 wire（payload × factor）</option>
+      </select>
+      <div id="wireFactorWrap" hidden>
+        <label for="customWireFactor">Wire / payload 倍数</label>
+        <input id="customWireFactor" type="number" min="0" step="0.01" value="1" />
+      </div>
+
+      <div id="compressorPolicyWrap" hidden>
+        <label for="compressorPolicy">V4 compressor state</label>
+        <select id="compressorPolicy">
+          <option value="base">Base ring（C4=8 / C128=128）</option>
+          <option value="speculative">SGLang spec ring（16 / 256）</option>
+          <option value="online-c128">SGLang online C128（1×3D）</option>
+        </select>
+      </div>
+
+      <div id="mtpWrap" class="checkrow" hidden>
+        <input id="includeMtp" type="checkbox" />
+        <label id="mtpLabel" for="includeMtp">把可选 MTP 状态计入会话</label>
+      </div>
+
+      <h2>请求</h2>
+      <label for="context">既有上下文 token <span id="contextValue"></span></label>
+      <input id="context" type="range" min="8192" max="1048576" step="8192" value="1048576" />
+      <label class="sr-only" for="contextNumber">既有上下文 token 数值</label>
+      <input id="contextNumber" type="number" min="8192" max="1048576" step="1" value="1048576" />
+
+      <label for="hit">可复用前缀比例 <span id="hitValue"></span></label>
+      <input id="hit" type="range" min="0" max="100" step="any" value="91.90280535566157" />
+
+      <div class="row2">
+        <div>
+          <label for="blockTokens">匹配块 token</label>
+          <input id="blockTokens" type="number" min="1" step="1" value="256" />
+        </div>
+        <div>
+          <label for="extraTokens">本轮新增 token</label>
+          <input id="extraTokens" type="number" min="0" step="1" value="0" />
+        </div>
+      </div>
+
+      <label for="remoteFraction">CMX 远程读比例 q</label>
+      <input id="remoteFraction" type="number" min="0" max="1" step="0.05" value="1" />
+
+      <h2>Workload</h2>
+      <label for="loadMode">负载来源</label>
+      <select id="loadMode">
+        <option value="agentic" selected>Kimi K3 单用户峰值 token/h</option>
+        <option value="compute">GPU-saturated（unique token/s ÷ U）</option>
+        <option value="arrival">外部访问请求率（req/s）</option>
+      </select>
+
+      <div id="agenticLoadWrap">
+        <label for="agenticPromptTokensHour">峰值 prompt token/h</label>
+        <input id="agenticPromptTokensHour" type="number" min="0" step="1" value="21215355" />
+        <p class="hint">2026-08-05 15:00 UTC+8；5 个 usage events，不是 5 个 requests。</p>
+      </div>
+
+      <div id="computeLoadWrap" hidden>
+        <label for="gpus">Prefill GPU 数</label>
+        <input id="gpus" type="number" min="1" step="1" value="72" />
+
+        <label for="uniqueTps">有效 unique token/s/GPU（假设或实测）</label>
+        <input id="uniqueTps" type="number" min="0" step="100" value="10000" />
+      </div>
+
+      <div id="arrivalLoadWrap" hidden>
+        <label for="arrivalReqs">外部访问请求率（req/s）</label>
+        <input id="arrivalReqs" type="number" min="0" step="0.1" value="10" />
+      </div>
+
+      <label for="readBudgetGBs">Pool KV 读取预算 GB/s（0 = 未知）</label>
+      <input id="readBudgetGBs" type="number" min="0" step="1" value="0" />
+
+      <h2>图</h2>
+      <label for="chartKind">横轴与指标</label>
+      <select id="chartKind">
+        <option value="hitIo">命中率 → P 侧 KV 加载带宽</option>
+        <option value="hitReq">命中率 → compute req/s</option>
+        <option value="ctxBytes">上下文 → 会话字节</option>
+      </select>
+    </aside>
+
+    <main>
+      <div class="stats" id="stats" aria-live="polite"></div>
+
+      <section class="panel" aria-labelledby="formulaHeading">
+        <h2 id="formulaHeading">当前工作点</h2>
+        <pre class="formula" id="formula"></pre>
+      </section>
+
+      <section class="panel" aria-labelledby="chartHeading">
+        <h2 id="chartHeading">图</h2>
+        <div class="tabs" id="legend" aria-label="图例"></div>
+        <div class="chart-wrap">
+          <svg
+            class="chart"
+            id="chart"
+            viewBox="0 0 900 340"
+            role="img"
+            aria-labelledby="chartSvgTitle chartSvgDesc"
+          ></svg>
+        </div>
+      </section>
+
+      <section class="panel table-panel" aria-labelledby="anchorsHeading">
+        <h2 id="anchorsHeading">1 Mi-token 校验锚点</h2>
+        <table id="anchors">
+          <caption>固定模型布局在 1,048,576 token 下的会话状态体积</caption>
+        </table>
+      </section>
+
+      <section class="panel" aria-labelledby="scopeHeading">
+        <h2 id="scopeHeading">口径</h2>
+        <ul class="notes">
+          <li><code>C</code> 是请求到来前的既有上下文；<code>E</code> 是本轮新增 token；最终长度为 <code>C+E</code>。</li>
+          <li>命中 token 按块向下取整。<code>q</code> 把“前缀命中”和“确实从 CMX 远程读取”分开。</li>
+          <li><code>GPU-saturated</code> 用 unique-token 吞吐反推 req/s；<code>U=0</code> 时必须使用外部请求率。</li>
+          <li>Agentic preset 只有 token/h，没有底层 request 数，因此不能推导 req/s。</li>
+          <li>K3 KDA 与 V4 compressor 是每次续算所需的固定状态；没有 request/resume rate 时，其加载带宽显示 N/A。</li>
+          <li>logical payload、engine entry payload、engine pages 和 custom wire 是不同口径。</li>
+          <li>Engine page 目前只对审计过的 V4 vLLM base-ring profile 给结果；N/A 表示合同未知，不回退成 payload。</li>
+        </ul>
+      </section>
+
+      <footer>
+        参考实现：
+        vLLM <code>KVCacheManager.get_computed_blocks</code>、
+        <code>MambaStateShapeCalculator.kda_state_shape</code>；
+        SGLang <code>prefetch_from_storage</code>、<code>_page_get_zero_copy</code>。
+      </footer>
+    </main>
+  </div>
+
+  <script src="sim.js?v=9"></script>
+  <script>
+    "use strict";
+
+    const S = window.CmxSim;
+    const $ = (id) => document.getElementById(id);
+
+    function finiteNumber(id, fallback) {
+      const value = Number($(id).value);
+      return Number.isFinite(value) ? value : fallback;
+    }
+
+    function syncProfiles() {
+      const modelId = $("model").value;
+      const previous = $("profile").value;
+      const profiles = S.profileOptions(modelId);
+      $("profile").innerHTML = profiles
+        .map((profile) => `<option value="${profile.id}">${profile.label}</option>`)
+        .join("");
+      if (profiles.some((profile) => profile.id === previous)) {
+        $("profile").value = previous;
+      }
+      const isV4 = modelId === "v4pro" || modelId === "v4flash";
+      const hasMtp = Boolean(S.MODELS[modelId].hasMtp);
+      $("mtpWrap").hidden = !hasMtp;
+      if (!hasMtp) $("includeMtp").checked = false;
+      $("compressorPolicyWrap").hidden = !isV4;
+      $("mtpLabel").textContent = isV4
+        ? "计入 V4 的 1 层 MTP SWA 状态"
+        : modelId === "glm53flash"
+          ? "计入 GLM-5.3-Flash 的 1 层 MTP KV（indexer 共享）"
+          : "计入 GLM 的 1 层 MTP KV/index";
+    }
+
+    function syncConditionalInputs() {
+      const customWire = $("byteMode").value === "custom-wire";
+      const agentic = $("loadMode").value === "agentic";
+      const externalArrival = $("loadMode").value === "arrival";
+      $("wireFactorWrap").hidden = !customWire;
+      $("agenticLoadWrap").hidden = !agentic;
+      $("computeLoadWrap").hidden = agentic || externalArrival;
+      $("arrivalLoadWrap").hidden = !externalArrival;
+    }
+
+    function params() {
+      return {
+        modelId: $("model").value,
+        profileId: $("profile").value,
+        includeMtp: $("includeMtp").checked,
+        compressorPolicy: $("compressorPolicy").value,
+        byteMode: $("byteMode").value,
+        customWireFactor: finiteNumber("customWireFactor", 1),
+        contextTokens: finiteNumber("contextNumber", 0),
+        extraTokens: finiteNumber("extraTokens", 0),
+        hitRate: finiteNumber("hit", 0) / 100,
+        blockTokens: finiteNumber("blockTokens", 1),
+        remoteFraction: finiteNumber("remoteFraction", 0),
+        admissionFraction: 0,
+        writeState: false,
+        gpus: finiteNumber("gpus", 1),
+        uniqueTpsGpu: finiteNumber("uniqueTps", 0),
+        loadMode: $("loadMode").value,
+        arrivalReqsPool: finiteNumber("arrivalReqs", 0),
+        agenticPromptTokensPerSecond:
+          finiteNumber("agenticPromptTokensHour", 0) / 3600,
+        readBudgetGBsPool: finiteNumber("readBudgetGBs", 0),
+      };
+    }
+
+    function stat(key, value, detail, className = "") {
+      return `<div class="stat ${className}">
+        <div class="k">${key}</div>
+        <div class="v">${value}</div>
+        <div class="s">${detail}</div>
+      </div>`;
+    }
+
+    function basisLabel(layout) {
+      if (layout.byteMode === "engine-pages") {
+        return "engine page allocation";
+      }
+      if (layout.byteMode === "custom-wire") {
+        return `custom wire ×${layout.customWireFactor}`;
+      }
+      return layout.profile.byteClass;
+    }
+
+    function renderStats(result) {
+      const agenticBudget = result.loadMode === "agentic";
+      const hasReadBudget = agenticBudget
+        ? result.agenticReadBudgetRatio != null
+        : result.readReqCeiling != null;
+      const ceilingText = hasReadBudget
+        ? agenticBudget
+          ? `${result.agenticReadBudgetRatio.toFixed(2)}×`
+          : `${S.fmtRate(result.readReqCeiling)} req/s`
+        : "未设置";
+      const ceilingDetail = hasReadBudget
+        ? agenticBudget
+          ? "读取预算 / growing-KV load"
+          : `KV 读取预算限幅后 ${
+            result.cappedReqsPool == null
+              ? "N/A"
+              : `${S.fmtRate(result.cappedReqsPool)} req/s`
+          }`
+        : "没有公开或实测的 Pool 读取预算";
+      const offeredDetail = result.loadMode === "agentic"
+        ? "usage event 不提供底层 request 数"
+        : result.loadMode === "arrival"
+        ? "用户提供的外部访问请求率"
+        : result.offeredReqsPool == null
+          ? "U=0；必须切换到外部请求率"
+          : `${result.gpus} Prefill GPU 满载计算约束`;
+      const workloadStat = result.loadMode === "agentic"
+        ? stat(
+            "Agentic 峰值 prompt",
+            `${S.fmtRate(result.agenticPromptTokensPerSecond)} token/s`,
+            "Kimi K3 单用户峰值小时"
+          )
+        : stat(
+            "负载来源",
+            result.loadMode === "arrival" ? "外部 req/s" : "GPU-saturated",
+            "非 Cursor usage-event 推导"
+          );
+      $("stats").innerHTML = [
+        stat("Payload 会话", S.fmtGiB(result.finalLayout.totalBytes), result.profile.label),
+        stat("所选口径会话", S.fmtGiB(result.finalLayout.selectedTotalBytes), basisLabel(result.finalLayout), "hot"),
+        stat("命中 / unique", `${result.matchedTokens.toLocaleString()} / ${result.uniqueTokens.toLocaleString()}`, `block=${result.blockTokens}`),
+        workloadStat,
+        stat("访问请求吞吐", result.offeredReqsPool == null ? "N/A" : `${S.fmtRate(result.offeredReqsPool)} req/s`, offeredDetail),
+        stat("Growing KV 加载", S.fmtGBs(result.requiredGrowingRead), "P 侧 Pool read", "hot"),
+        stat("Fixed state 加载", S.fmtGBs(result.requiredStateRead), result.requiredStateRead == null ? "缺少 request/resume rate" : "P 侧 Pool read"),
+        stat("完整 KV 加载", S.fmtGBs(result.requiredRead), result.requiredRead == null ? "至少一项加载率未知" : "P 侧 Pool read"),
+        stat("KV 读取 ceiling", ceilingText, ceilingDetail, hasReadBudget ? "ok" : ""),
+      ].join("");
+    }
+
+    function renderFormula(result) {
+      const reqFormula = result.loadMode === "agentic"
+        ? `observed req/s = N/A
+Cursor usage event 是聚合账单行，不能当模型 API request。`
+        : result.loadMode === "arrival"
+        ? `external req/s = ${S.fmtRate(result.arrivalReqsPool)}`
+        : `GPU-saturated λ = unique_tok/s/GPU × GPU / U
+                = ${result.uniqueTpsGpu.toLocaleString()} × ${result.gpus} / ${result.uniqueTokens.toLocaleString()}
+                = ${S.fmtRate(result.offeredReqsPool)} req/s${result.offeredReqsPool == null
+          ? "（U=0：此公式无定义，切换到外部请求率）"
+          : ""}`;
+      const loadFormula = result.loadMode === "agentic"
+        ? `peak prompt token/s = ${S.fmtRate(result.agenticPromptTokensPerSecond)} token/s
+cache-read token/s = peak_prompt × hit
+                   = ${S.fmtRate(result.agenticCacheReadTokensPerSecond)} token/s
+growing bytes/token = ${result.selectedGrowingBytesPerToken == null
+          ? "N/A"
+          : result.selectedGrowingBytesPerToken.toFixed(2)}
+growing KV load = cache-read token/s × growing bytes/token × q
+                = ${S.fmtGBs(result.requiredGrowingRead)}
+fixed-state load = N/A（缺少真实 request/resume rate）
+complete KV load = ${S.fmtGBs(result.requiredRead)}`
+        : `growing KV load/request = ${S.fmtGiB(result.growingReadPerRequest)}
+fixed-state load/request = ${S.fmtGiB(result.stateReadPerRequest)}
+complete KV load/request = ${S.fmtGiB(result.readPerRequest)}
+
+growing KV load bandwidth = req/s × growing load/request
+                          = ${S.fmtGBs(result.requiredGrowingRead)}
+fixed-state load bandwidth = ${S.fmtGBs(result.requiredStateRead)}
+complete KV load bandwidth = ${S.fmtGBs(result.requiredRead)}`;
+      $("formula").textContent =
+`M = floor(C × hit / block) × block
+  = floor(${result.contextTokens} × ${result.hitRate.toFixed(4)} / ${result.blockTokens}) × ${result.blockTokens}
+  = ${result.matchedTokens.toLocaleString()} matched tokens
+
+U = C − M + E
+  = ${result.contextTokens} − ${result.matchedTokens} + ${result.extraTokens}
+  = ${result.uniqueTokens.toLocaleString()} unique tokens/request
+
+byte basis = ${basisLabel(result.finalLayout)}
+payload/session = ${S.fmtGiB(result.finalLayout.totalBytes)}
+selected/session = ${S.fmtGiB(result.finalLayout.selectedTotalBytes)}
+
+${reqFormula}
+
+${loadFormula}
+
+Pool read budget = ${result.loadMode === "agentic"
+  ? result.agenticReadBudgetRatio == null
+    ? "未计算（读取预算为 0/未知）"
+    : `${result.agenticReadBudgetRatio.toFixed(2)}× growing-KV load`
+  : result.readReqCeiling == null
+    ? "未计算（读取预算为 0/未知）"
+    : `${S.fmtRate(result.readReqCeiling)} req/s ceiling（用户输入预算）`}`;
+    }
+
+    function ticks(min, max, count) {
+      const span = max - min || 1;
+      const raw = span / count;
+      const power = 10 ** Math.floor(Math.log10(raw));
+      const ratio = raw / power;
+      const step = (ratio <= 1 ? 1 : ratio <= 2 ? 2 : ratio <= 5 ? 5 : 10) * power;
+      const values = [];
+      for (let value = Math.ceil(min / step) * step; value <= max + step * 0.01; value += step) {
+        values.push(value);
+      }
+      return values;
+    }
+
+    function drawChart(spec) {
+      const svg = $("chart");
+      const width = 900, height = 340, left = 72, right = 18, top = 28, bottom = 44;
+      const innerWidth = width - left - right;
+      const innerHeight = height - top - bottom;
+      const xs = spec.series.flatMap((series) => series.points.map((point) => point.x));
+      const ys = spec.series.flatMap((series) => series.points.map((point) => point.y)).filter(Number.isFinite);
+      const minX = Math.min(...xs), maxX = Math.max(...xs);
+      const maxY = Math.max(...ys, 1);
+      const x = (value) => left + ((value - minX) / (maxX - minX || 1)) * innerWidth;
+      const y = (value) => top + innerHeight - (value / maxY) * innerHeight;
+      const grid = ticks(0, maxY, 5).map((value) => {
+        const yy = y(value);
+        return `<line x1="${left}" y1="${yy}" x2="${width-right}" y2="${yy}" stroke="#2e2a24" />
+          <text x="${left-8}" y="${yy+4}" fill="#9a917f" font-size="11" text-anchor="end">${spec.yFormat(value)}</text>`;
+      }).join("");
+      const xLabels = ticks(minX, maxX, 6).map((value) =>
+        `<text x="${x(value)}" y="${height-14}" fill="#9a917f" font-size="11" text-anchor="middle">${spec.xFormat(value)}</text>`
+      ).join("");
+      const paths = spec.series.map((series) => {
+        const path = series.points
+          .filter((point) => Number.isFinite(point.y))
+          .map((point, index) => `${index ? "L" : "M"}${x(point.x)},${y(point.y)}`)
+          .join(" ");
+        const dash = series.dash
+          ? ` stroke-dasharray="${series.dash}"`
+          : "";
+        return `<path d="${path}" fill="none" stroke="${series.color}" stroke-width="2.2"${dash} />`;
+      }).join("");
+      svg.innerHTML =
+        `<title id="chartSvgTitle">${spec.title}</title>
+         <desc id="chartSvgDesc">${spec.description}</desc>
+         ${grid}${xLabels}
+         <line x1="${left}" y1="${top+innerHeight}" x2="${width-right}" y2="${top+innerHeight}" stroke="#5a5246" />
+         ${paths}`;
+      $("legend").innerHTML = spec.series.map((series) =>
+        `<span class="legend-item"><i style="background:transparent;border-top:3px ${
+          series.dash ? "dashed" : "solid"
+        } ${series.color}"></i>${series.name}</span>`
+      ).join("");
+      $("chartHeading").textContent = spec.title;
+    }
+
+    function renderChart(p) {
+      const kind = $("chartKind").value;
+      if (kind === "ctxBytes") {
+        const contexts = [8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576];
+        const points = contexts.map((tokens) => ({
+          x: tokens,
+          y: S.sessionLayout({
+            modelId: p.modelId,
+            profileId: p.profileId,
+            tokens,
+            includeMtp: p.includeMtp,
+            compressorPolicy: p.compressorPolicy,
+            byteMode: p.byteMode,
+            customWireFactor: p.customWireFactor,
+          }).selectedTotalBytes,
+        }));
+        drawChart({
+          title: "上下文长度 → 会话状态字节",
+          description: "当前模型和布局下，最终会话状态体积随上下文长度变化。",
+          xFormat: (value) => value >= 1048576 ? "1Mi" : `${Math.round(value / 1024)}Ki`,
+          yFormat: (value) => `${(value / S.GiB).toFixed(value >= 10 * S.GiB ? 0 : 1)} GiB`,
+          series: [{ name: "所选字节口径", color: "#e08a3c", points }],
+        });
+        return;
+      }
+
+      const hits = [];
+      for (let percent = 0; percent <= 100; percent += 0.5) hits.push(percent / 100);
+      const rows = hits.map((hitRate) => S.prefillScenario({ ...p, hitRate }));
+      if (kind === "hitReq") {
+        const series = [{
+          name: p.loadMode === "arrival"
+            ? "外部 req/s"
+            : p.loadMode === "agentic"
+              ? "req/s（trace 未提供）"
+              : "GPU-saturated req/s",
+          color: "#7cb87a",
+          points: rows.map((row) => ({ x: row.hitRate, y: row.offeredReqsPool })),
+        }];
+        if (p.readBudgetGBsPool > 0) {
+          series.push({
+            name: "Pool 读取预算下限幅",
+            color: "#d46a5c",
+            dash: "8 5",
+            points: rows.map((row) => ({ x: row.hitRate, y: row.cappedReqsPool })),
+          });
+        }
+        drawChart({
+          title: "命中率 → 访问请求吞吐",
+          description: "外部 req/s 与 hit 无关；GPU-saturated req/s 由 unique token 分母推导；usage trace 不提供 req/s。",
+          xFormat: (value) => `${(value * 100).toFixed(0)}%`,
+          yFormat: (value) => `${S.fmtRate(value)} req/s`,
+          series,
+        });
+      } else {
+        drawChart({
+          title: "命中率 → P 侧 KV 加载带宽",
+          description: "Agentic 模式按峰值 prompt token/s；其他模式按 req/s 计算。只含 Prefill 侧 Pool read。",
+          xFormat: (value) => `${(value * 100).toFixed(0)}%`,
+          yFormat: (value) => S.fmtGBs(value),
+          series: [
+            {
+              name: "Growing KV load",
+              color: "#4aa3d9",
+              points: rows.map((row) => ({ x: row.hitRate, y: row.requiredGrowingRead })),
+            },
+            {
+              name: "Complete KV load",
+              color: "#e08a3c",
+              dash: "8 5",
+              points: rows.map((row) => ({ x: row.hitRate, y: row.requiredRead })),
+            },
+          ],
+        });
+      }
+    }
+
+    function anchorRow(label, modelId, profileId, includeMtp = false) {
+      const layout = S.sessionLayout({
+        modelId,
+        profileId,
+        tokens: 1048576,
+        includeMtp,
+      });
+      return `<tr>
+        <th scope="row">${label}</th>
+        <td>${layout.profile.byteClass}</td>
+        <td>${S.fmtGiB(layout.pagedKvBytes)}</td>
+        <td>${S.fmtGiB(layout.totalBytes - layout.pagedKvBytes)}</td>
+        <td>${S.fmtGiB(layout.totalBytes)}</td>
+        <td>${layout.engineAllocation ? S.fmtGiB(layout.engineAllocation.totalBytes) : "N/A"}</td>
+        <td>${layout.profile.confidence}</td>
+      </tr>`;
+    }
+
+    function renderAnchors() {
+      $("anchors").innerHTML =
+        `<caption>固定模型布局在 1,048,576 token 下的会话状态体积</caption>
+         <thead><tr>
+           <th scope="col">模型</th><th scope="col">Profile class</th>
+           <th scope="col">Payload paged KV</th><th scope="col">Payload 额外状态</th>
+           <th scope="col">Payload 合计</th><th scope="col">vLLM engine pages</th>
+           <th scope="col">证据等级</th>
+         </tr></thead>
+         <tbody>
+           ${anchorRow("V4-Pro", "v4pro", "bf16-logical")}
+           ${anchorRow("V4-Pro + MTP", "v4pro", "bf16-logical", true)}
+           ${anchorRow("V4-Flash", "v4flash", "bf16-logical")}
+           ${anchorRow("GLM-5.2 base", "glm52", "fp8-logical")}
+           ${anchorRow("GLM-5.2 + MTP", "glm52", "fp8-logical", true)}
+           ${anchorRow("GLM-5.3-Flash", "glm53flash", "bf16-logical")}
+           ${anchorRow("GLM-5.3-Flash + MTP", "glm53flash", "bf16-logical", true)}
+           ${anchorRow("Kimi K3", "k3", "fp8-vllm-state")}
+         </tbody>`;
+    }
+
+    function render() {
+      syncConditionalInputs();
+      const p = params();
+      $("contextValue").textContent = Number(p.contextTokens).toLocaleString();
+      $("hitValue").textContent = `${(p.hitRate * 100).toFixed(4)}%`;
+      const profile = S.profileFor(p.modelId, p.profileId);
+      const result = S.prefillScenario(p);
+      const unsupportedEngine =
+        p.byteMode === "engine-pages" &&
+        result.finalLayout.engineAllocation == null;
+      $("profileNote").textContent =
+        `${profile.note} · ${profile.byteClass} · ${profile.confidence} · ${S.MODELS[p.modelId].evidence}` +
+        (unsupportedEngine
+          ? " 当前 profile 没有可审计的 engine-page 合同，结果显示 N/A。"
+          : "");
+      renderStats(result);
+      renderFormula(result);
+      renderChart(p);
+    }
+
+    $("model").addEventListener("change", () => {
+      syncProfiles();
+      render();
+    });
+    $("context").addEventListener("input", () => {
+      $("contextNumber").value = $("context").value;
+      render();
+    });
+    $("contextNumber").addEventListener("input", () => {
+      const value = Math.max(8192, Math.min(1048576, finiteNumber("contextNumber", 8192)));
+      $("contextNumber").value = value;
+      $("context").value = value;
+      render();
+    });
+    [
+      "profile", "byteMode", "customWireFactor", "compressorPolicy",
+      "includeMtp", "hit", "blockTokens", "extraTokens",
+      "remoteFraction", "gpus", "uniqueTps", "loadMode", "arrivalReqs",
+      "agenticPromptTokensHour", "readBudgetGBs", "chartKind",
+    ].forEach((id) => {
+      $(id).addEventListener("input", render);
+      $(id).addEventListener("change", render);
+    });
+
+    syncProfiles();
+    $("profile").value = S.AGENTIC_PRESETS.kimiK3SingleUserPeak.profileId;
+    syncConditionalInputs();
+    renderAnchors();
+    render();
+  </script>
+</body>
+</html>
