@@ -100,7 +100,12 @@ Anthropic 没有模型路由产品,Claude Code 里是用户手动 `/model` 选�
 - **先做任务边界免费的场景**:PR 评审、子 agent、批量迁移、定时任务——任务描述由机器生成、一开始就完整,不用猜。
 - **晚几轮再路由**:首轮 prompt 是信息最差的决策点;让便宜模型先聊几轮澄清需求,任务成形后再路由。
 - **会话做小**:一个会话一件事,主题变了就开会话,路由更准也更便宜。
-- **换模型要在缓存失效点**:会话中途换模型意味着 cache miss;压缩(compaction)事件天然在丢缓存,是换模型的低成本时机。长期目标是路由层把 cache miss 显式计价。博客里提到的 **Cognition Devin Fusion** 就是按这个思路做的产品([官方博客](https://cognition.com/blog/devin-fusion),2026-06):Cognition(Devin 的公司)的多模型 harness,让一个前沿"主 agent"与一个便宜"sidekick"模型并行——主 agent 管规划、疑难和终审,sidekick 管代码探索、批量修改、跑测试等机械活;两者各自维护独立的缓存上下文,避免互相调用时重复付上下文的钱。执行过程中用轻量分类器判断当前任务是否超出了 sidekick 的能力,需要换模型时**卡在上下文压缩的时点换**——反正压缩要丢缓存,换模型就不再额外花钱。官方称在自己的编程评测(FrontierCode)上保持前沿质量、省约 35% 成本。
+- **换模型要在缓存失效点**:会话中途换模型意味着 cache miss;压缩(compaction)事件天然在丢缓存,是换模型的低成本时机。长期目标是路由层把 cache miss 显式计价。
+  - 按这个思路做的产品:**Cognition Devin Fusion**([官方博客](https://cognition.com/blog/devin-fusion),2026-06):
+    - 结构:一个前沿"主 agent"与一个便宜"sidekick"模型并行——主 agent 管规划、疑难和终审,sidekick 管代码探索、批量修改、跑测试等机械活。
+    - 缓存:两者各自维护独立的缓存上下文,避免互相调用时重复付上下文的钱。
+    - 换档时机:轻量分类器判断当前任务超出 sidekick 能力时,**卡在上下文压缩的时点换模型**——反正压缩要丢缓存,换模型不再额外花钱。
+    - 效果(官方口径):自家编程评测 FrontierCode 上保持前沿质量、省约 35% 成本。
 
 ### OpenSquilla:开源 agent 的轮次级路由
 
@@ -245,7 +250,7 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
 
   从这份榜单能读出三个结论:
 
-  1. **头部全是"小而便宜的精选池"**(4-7 个模型,以 flash/小杯为主)——正是本节开头"精心挑选的小池子更划算"的实战版。
+  1. **头部全是"小而便宜的精选池"**(4-7 个模型,以 flash/小杯为主)——正是上文 LLMRouterBench"精心挑选的小池子更划算"结论的实战版。
   2. **公开原理的上榜者仍是"嵌入特征 + 轻量分类/回归/bandit"一族**,与 LLMRouterBench 里 Avengers 系表现最好互相印证。
   3. **黑盒榜单防不住"看了答案再路由"**:Paix2 争议是"评测比方法难"(§7)的极端案例——只交预测文件不交代码的赛制,区分不了"真会路由"和"拟合了评测集"。
 
@@ -255,11 +260,11 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
   | 来源 | 数字 | 口径 |
   |------|------|------|
   | 学术论文(FrugalGPT / RouteLLM) | 省 85–98% | 两极模型池(旗舰 vs 极小)、单题 benchmark、质量阈值宽松 |
-  | 厂商自报(Databricks / OpenSquilla / Factory) | 省 20–56% | 各自 workload、各自基线,口径互不可比 |
+  | 厂商自报(Factory / Databricks / OpenSquilla) | 省 20% / 35–56% / **88.9%** | 各自 workload、各自基线,口径互不可比 |
   | 独立重测(LLMRouterBench) | 最好省 31.7%(Avengers-Pro);OpenRouter 为负 | 统一数据、统一基线(GPT-5) |
   | 第三方综合([Sean Geng](https://seangeng.com/writing/the-honest-guide-to-llm-routing)) | 生产混合流量约 **20–25%** | 综合多家实测后的估计 |
 
-  梳理后的结论:省钱幅度 ≈ **池子档差 × 简单流量占比**。论文数字大是因为池子两极化(旗舰和 7B 差百倍价格)且题目里简单题占大头;生产池档差小、难题占比高,所以 20–25% 才是可信区间。凡是声称 90% 的,先问它池子和流量分布。
+  梳理后的结论:省钱幅度 ≈ **池子档差 × 简单流量占比**。论文数字大是因为池子两极化(旗舰和 7B 差百倍价格)且题目里简单题占大头;生产池档差小、难题占比高,所以 20–25% 才是可信区间。OpenSquilla 自报的 88.9% 看着夸张,但按这个公式反而说得通:它的池子有"单轮成本趋近于零"的超廉价档(档差极大),且 agent 流量里机械轮次占大头(简单流量占比极高)——两个因子都拉满。所以凡是声称 90% 的,先问它池子和流量分布。
 
 ## 4. 实例级路由的约束来源:缓存命中率
 
@@ -463,8 +468,6 @@ CHWBL 的出处与验证:
 
 (图源:KubeAI 博客,同上。横轴为并发线程数,纵轴为 TTFT(对数坐标);并发越高,PrefixHash 与随机路由的差距越大。)
 
-代价:哈希只保证"同前缀同副本",不知道缓存是否已被驱逐,也不感知实时负载(只在超界时让位)。
-
 **要点**:
 
 - 无状态前缀哈希(CHWBL)路线:零状态、天然多副本一致、实测 TTFT 降 95%。
@@ -500,6 +503,8 @@ OpenAI 的 prompt caching 在服务端做实例级路由([官方文档](https://
 | KubeAI(CHWBL) | **无状态**:前缀+LoRA 名哈希即路由 | 有界负载防热点,超界才让位 | 无状态,天然一致 |
 | OpenAI API | **无状态**:隐藏系统内容之后约 256 token 的前缀哈希 | 同前缀 15 RPM 溢出到其他机器 | 无状态(托管服务内部) |
 
+(Dynamo Router 没有单列小节——它是本文的对照目标而非调研对象,机制见 [`dynamo/overview.md`](dynamo/overview.md) "Router" 节与 §8 开头。)
+
 ### 归纳:按设计问题对照
 
 上面这张表按系统看,下面这张**按问题看**——每个设计问题有哪几种解法、谁用了哪种(细节回查上文各小节):
@@ -525,7 +530,7 @@ OpenAI 的 prompt caching 在服务端做实例级路由([官方文档](https://
 7. **PD 分离先选谁**:先给 decode pod 打分、再配同组 prefill(保 KV 局部性)——Kthena 独有。
 8. **匹配深度的上限**:限制最多比对多少块,防热路径过慢;默认值只够"系统提示词级"亲和——Kthena(128 块 × 16 token,可配)。
 
-lake 在这张表里的位置:缓存状态由存储池权威维护(强于推测、记账、事件收敛三种),会话亲和靠前缀命中自然获得。
+lake 在这组问题里的位置:缓存状态由存储池权威维护(强于推测、记账、事件收敛三种),会话亲和靠前缀命中自然获得。
 
 ## 6. 实例级调度:学术原型
 
@@ -602,7 +607,7 @@ DyntraLB 的选择(用观测值绕开预测)侧面印证了第 1、4 条。对 l
 |------|------|------|--------------|
 | Preble([2407.00023](https://arxiv.org/abs/2407.00023)) | ICLR 2025 | 全局前缀树 + 负载感知放置 | 缓存亲和调度的学术原型;AIBrix `prefix-cache-preble` 与 SGLang `cache_aware` 都源自它 |
 | VTC([2401.00588](https://arxiv.org/abs/2401.00588)) | OSDI 2024 | 虚拟 token 计数的多租户公平 | AIBrix `vtc-basic`;lake 里公平性归 gateway |
-| DLPM / D²LPM([2501.14312](https://arxiv.org/abs/2501.14312)) | 2025 | **公平 + 局部性统一**。先澄清对象:这里的"公平"是**租户之间**的公平(共享集群的不同用户/应用),不是 worker 之间的公平——worker 是被分配的资源,租户是排队等服务的人。机制分两层:(1) 公平层——给每个**租户**记一本账:它应得的服务额度减去已得额度,差值越大越优先。举例:租户 A 今天已用了 1000 万 token,租户 B 只用了 100 万,B 的"亏欠"更大,下一个请求优先调度 B 的。(2) 局部性层——尽量把请求发给存着它前缀的 worker。两者天然冲突:严格公平可能要求调度 B 的请求,但存着 B 前缀的 worker 已经很忙。DLPM 的解法:先按账本选出最亏欠的租户,再只在持有其前缀的 worker 里挑;分布式版 D²LPM 再加"(租户 × worker)"双级配额——某个热门租户的请求不能全砸到同一个 worker 上,防热点。前缀树全局共享、驱逐信息异步同步 | 首个同时保租户公平与前缀局部性的调度;吞吐最高 2.87× VTC;AIBrix #677 点名参考 |
+| DLPM / D²LPM([2501.14312](https://arxiv.org/abs/2501.14312)) | 2025 | **公平 + 局部性统一**:租户公平(按历史用量的"亏欠账")与前缀局部性(发给存着前缀的 worker)天然冲突,DLPM 把两者拼起来(机制展开见表后) | 首个同时保租户公平与前缀局部性的调度;吞吐最高 2.87× VTC;AIBrix #677 点名参考 |
 | Llumnix([2406.03243](https://arxiv.org/abs/2406.03243),[开源](https://github.com/AlibabaPAI/llumnix)) | OSDI 2024 | **运行时重调度**:请求连 KV 一起在实例间热迁移,像 OS 的进程调度 | 路由是"决策时最优",迁移是"运行时纠偏"——第三条路;尾延迟改善一个数量级 |
 | FastServe([2305.05920](https://arxiv.org/abs/2305.05920)) | NSDI 2026 | skip-join MLFQ,按输出 token 粒度抢占 | 解决实例内队头阻塞;与输出长度预测一支互补 |
 | Autellix([2502.13965](https://arxiv.org/abs/2502.13965)) | 2025 | **程序级调度**:把 agent 程序当一等公民,按程序累计服务时间(PLAS)与关键路径(ATLAS)排优先级 | agent 多调用场景的调度;同延迟下吞吐 4-15× |
@@ -614,6 +619,14 @@ DyntraLB 的选择(用观测值绕开预测)侧面印证了第 1、4 条。对 l
 ![Llumnix 架构](model-routing/figures/llumnix-arch.png)
 
 (图源:[Llumnix 论文](https://arxiv.org/abs/2406.03243) Figure 5。请求分发、KV 热迁移、自动扩缩容由同一个运行时调度器统一决策——路由是决策时最优,迁移是运行时纠偏。)
+
+**D²LPM 机制展开**(表里放不下的部分):
+
+1. **先澄清"公平"的对象**:是**租户之间**的公平(共享集群的不同用户/应用),不是 worker 之间的公平——worker 是被分配的资源,租户是排队等服务的人。
+2. **公平层:亏欠账**。给每个租户记一本账:应得服务额度 − 已得额度,差值越大越优先。举例:租户 A 今天已用 1000 万 token,租户 B 只用了 100 万,B 的"亏欠"更大,下一个请求优先调度 B 的。
+3. **局部性层:前缀亲和**。尽量把请求发给存着它前缀的 worker(最长前缀匹配)。
+4. **两者的冲突与解法**:严格公平可能要求调度 B 的请求,但存着 B 前缀的 worker 已经很忙。DLPM 的做法是先按账本选出最亏欠的租户,再**只在持有其前缀的 worker 里挑**。
+5. **分布式版 D²LPM 的加法**:"(租户 × worker)"双级配额——某个热门租户的请求不能全砸到同一个 worker 上,防热点;前缀树全局共享、驱逐信息异步同步。
 
 这一支工作的共同模式:都在补"决策时信息不足"。逐个说清补的是什么:
 
@@ -634,7 +647,7 @@ PD 分离一系(DistServe / Splitwise / PD-Serve 等)与本文主题相邻但已
 ## 7. 跨层结论
 
 1. **路由粒度受缓存约束**。逐请求换模型/换实例都会破坏缓存命中:Databricks 因此选任务级,OpenRouter 提供 `session_id` 粘连,Anthropic 从 provider 侧给出原因(换模型=重建整个前缀缓存),SGLang/production-stack 用一致性哈希和 session 策略做粘连。"换档要在缓存失效点做"是共同的纪律。OpenSquilla 的轮次级路由是反例,但它用缓存隔离+自适应提示词把换档代价本身改小了——粒度之争的实质是缓存代价之争。
-2. **评测比方法难**。benchmark 任务太规整,真实会话首轮 prompt 欠定义(Databricks 原话);LLMRouterBench 显示大量发表方法无效。任何路由策略上线前都要用真实 trace 回放评测。
+2. **评测比方法难**。benchmark 任务太规整,真实会话首轮 prompt 欠定义(Databricks 原话);LLMRouterBench 显示大量发表方法无效;RouterArena 榜首的 Paix2 争议(§3)进一步说明:黑盒榜单连"真会路由"和"拟合了评测集"都区分不了。任何路由策略上线前都要用真实 trace 回放评测。
 3. **缓存命中率是一等运维指标**。Anthropic 把命中率下跌当事故(SEV)处理;harness 的提示词排布、工具集恒定、压缩 fork 都是围绕命中率的设计纪律;小米 MiMo 把同会话 99%、跨会话 95% 的命中率当产品卖点公布。推理系统侧同理:命中率应进 SLO 与告警,而不只是性能计数器。
 
 ## 8. 对 Dynamo / lake Router 的借鉴
@@ -647,7 +660,7 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
 
 **给代价函数加信号**
 
-1. **decode 长度预测**。cost 里的 `potential_decode_blocks` 目前是粗估;SSJF/ELIS/PARS 证明轻量预测器(BERT 级)可行且收益明确。预测输出长度还能辅助执行模式选择:预计 decode 很短的请求倾向混部,长的倾向 PD 分离。lake 可做:Router 挂一个可选预测器,先用历史请求离线 replay 验证,不进关键路径。
+1. **decode 长度预测**。cost 里的 `potential_decode_blocks` 目前是粗估;SSJF/ELIS/PARS 证明轻量预测器(BERT 级)可行,TIE 进一步给出分布形式(按请求预测 log-t 参数 + 尾部惩罚,比点估计稳)。两个注意点:预测器条件于训练时用的模型,**换模型要重校准**(§6);lake 的存储池能看到 decode 中的真实 KV 块数,在线校准信号免费。预测输出长度还能辅助执行模式选择:预计 decode 很短的请求倾向混部,长的倾向 PD 分离。lake 可做:Router 挂一个可选预测器,先用历史请求离线 replay 验证,不进关键路径。
 2. **难度信号跨层传递**。模型级路由按 lake 的职责划分归 gateway,不在推理系统内实现;但 gateway 判出的难度/任务类型可以作为请求元数据传下来,推理系统用它做调度分级和预放置决策。这与 KVCR hint 协议同构:hint 传 KV 位置,这类元数据传请求属性,都是"上层知道得多、下层执行"的单向传递。
 3. **agent / workflow 级上下文**。production-stack #244、Autellix、Parrot 说明社区已在要 workflow 级路由与指标。lake 的对应面:KVCR hint 协议传会话/工作流元数据,Router 按程序级上下文(而非单请求)做亲和;可复用 agentic workload 的 trace 分析([agentic-cache-workload.md](agentic-cache-workload.md))。
 
@@ -661,7 +674,7 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
 6. **命中阈值与失衡切换**。短请求设命中阈值,不做亲和查询直接负载均衡(production-stack 默认 2000 token);负载严重失衡时缓存亲和整体让位(SGLang 的双阈值切换)。lake 的亲和信息更可靠(存储池权威视图,非推测),这些阈值与切换逻辑可以直接移植。
 7. **推测索引**(llm-d)。路由决策到 KV 位置视图更新之间存在窗口期,连续同前缀请求会在窗口期内失去亲和。llm-d 的做法是决策后立即写入短期预测条目(TTL 2 秒),等确认或过期。lake Router 读存储池位置视图,同样有"决策-放置"窗口,这个机制可直接借用。
 8. **无状态保底**(KubeAI CHWBL)。位置视图不可用或存储池控制面故障时,Router 可以退到"前缀+模型/LoRA 一致性哈希"——零状态、天然多副本一致、仍保前缀亲和,优于随机,也比"按负载预测"的降级路径更便宜。
-9. **公平与局部性兼得**(D²LPM)。先澄清:这里的公平是**租户之间**的公平(共享集群的不同用户/应用按历史用量排队,用量少的优先),不是 worker 之间的公平——worker 是被分配的资源。它与前缀亲和(尽量发给存着该前缀的 worker)天然冲突:严格公平会把请求发到没有它缓存的 worker 上。D²LPM 的解法(机制展开见 §6 表):先按"亏欠账"找出最亏欠的租户,再只在持有其前缀的 worker 里选,并用"(租户 × worker)"配额防止某个热门租户把单个 worker 打爆。lake 里公平性决策归 gateway,这套算法是 gateway 侧现成的参考。
+9. **公平与局部性兼得**(D²LPM)。租户公平(按历史用量排队,用量少的优先)与前缀亲和(尽量发给存着该前缀的 worker)天然冲突:严格公平会把请求发到没有它缓存的 worker 上。D²LPM 的解法(机制展开见 §6):先按"亏欠账"找出最亏欠的租户,再只在持有其前缀的 worker 里选,并用"(租户 × worker)"配额防止某个热门租户把单个 worker 打爆。lake 里公平性决策归 gateway,这套算法是 gateway 侧现成的参考。
 
 **上线与运维的注意事项**
 
@@ -743,7 +756,7 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
 - [vllm-project/semantic-router](https://github.com/vllm-project/semantic-router)([训练与数据集文档](https://llm-semantic-router.readthedocs.io/en/latest/training/datasets/))
 - [musistudio/claude-code-router](https://github.com/musistudio/claude-code-router)
 - [LiteLLM](https://github.com/BerriAI/litellm)
-- RouterArena 系:[workweave/router(Weave)](https://github.com/workweave/router)、[NadirRouter/NadirClaw](https://github.com/NadirRouter/NadirClaw)
+- RouterArena 系:[workweave/router(Weave)](https://github.com/workweave/router)、[NadirRouter/NadirClaw](https://github.com/NadirRouter/NadirClaw)、[Continuum-AI-Corp/OrcaRouter-Lite](https://github.com/Continuum-AI-Corp/OrcaRouter-Lite)
 
 **实例级调度栈**(前三个已引入 `3rdparty/` 同名 submodule)
 
@@ -772,7 +785,7 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
 
 - RouterBench [2403.12031](https://arxiv.org/abs/2403.12031)
 - LLMRouterBench [ACL 2026](https://aclanthology.org/2026.findings-acl.1881.pdf)
-- RouterArena [2510.00202](https://arxiv.org/abs/2510.00202)([排行榜](https://routeworks.github.io/))
+- RouterArena [2510.00202](https://arxiv.org/abs/2510.00202)([排行榜](https://routeworks.github.io/);[提交仓 RouteWorks/RouterArena](https://github.com/RouteWorks/RouterArena)——各路由器的模型池配置在 `router_inference/config/`;Paix2 争议:[issue #190](https://github.com/RouteWorks/RouterArena/issues/190)、[#203](https://github.com/RouteWorks/RouterArena/issues/203))
 - 路由综述 [2603.04445](https://arxiv.org/html/2603.04445v2)
 
 **论文:输出长度预测**
