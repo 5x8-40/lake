@@ -230,7 +230,11 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
   **设定二:性能-成本设定**(13 个旗舰模型池,参照系 Best Single = GPT-5)。指标:PerfGain(质量相对 GPT-5 的增减)与 CostSave(质量不低于 GPT-5 前提下的最大省钱幅度)。结果:**OpenRouter 的 PerfGain 是 −24.7%**——质量比"所有请求都发给 GPT-5"还差 24.7%,质量不达标所以 CostSave 记 N/A(论文脚注:OpenRouter 用自己平台的模型池,不可配置)。这与设定一不矛盾:Dataset Oracle 是轻量池里的上界参照,−24.7% 是旗舰池里相对 GPT-5 基线的差距,两个设定两批模型。表现最好的 **Avengers-Pro**:PerfGain +4.0%、CostSave +31.7%,几乎独占 Pareto 前沿(机制见上表);RouteLLM +2.6% / +11.4%;HybridLLM、FrugalGPT 两个二分类级联/路由器都是负收益。
 - [RouterArena](https://arxiv.org/abs/2510.00202)(ICLR 2026,[排行榜](https://routeworks.github.io/)):实时排行榜形态,把路由器当黑盒测(各家用各自的模型池),主指标 Arena Score 是准确率与 log₂ 成本的加权调和平均。榜单滚动更新、榜首更迭很快,以下以 **2026-09 的榜单**为准:
 
-  1. **前五名**(Paix2 77.63 / KT-ModelRouter 76.28 / Sqwish 76.21 / Divyam 75.85 / Cross-Router 75.75):全部是个人或商业提交,**原理均未公开**(KT-ModelRouter 挂了 GitHub 仓但内容为空)。
+  1. **前五名**(Paix2 77.63 / KT-ModelRouter 76.28 / Sqwish 76.21 / Divyam 75.85 / Cross-Router 75.75):全部是个人或商业提交,路由原理均未公开。但提交以 PR 形式进 [RouteWorks/RouterArena](https://github.com/RouteWorks/RouterArena) 仓,`router_inference/config/` 下的配置文件公开了各家的**模型池**——这本身就很有信息量:
+     - **Paix2**(第 1):池子只有 4 个——MiniMax-M3 / agnes-2.0-flash / DeepSeek-R1-Qwen3-8B / GLM-4-9B,全是小模型便宜模型($0.27/1K 查询)。**成绩有诚信争议**(两个 issue 截至 2026-09 仍 open):[#190](https://github.com/RouteWorks/RouterArena/issues/190) 指其提交在已记录全部候选答案与分数之后修改了 294 题的路由选择,"最优选择率"从 66.35% 跳到 89.68%、最优准确率变成 100%——疑似看了评测结果再定路由(榜单规则明确禁止在评测数据上调路由器);[#203](https://github.com/RouteWorks/RouterArena/issues/203) 指其 MiniMax-M3 结果经 OpenRouter 复现不出(84.12% vs 65–69%,输入 token 数也对不上)。
+     - **KT-ModelRouter**(第 2):池子 5 个(deepseek-v4-flash/pro、gemma-4-31b、gemini-3-flash、qwen3-235b),描述只有一句"内部训练的路由策略"。
+     - **Sqwish**(第 3):商业,池子 5 个(qwen3-235b、qwen3-next-80b、Qwen3-Coder-Next、gemini-3.1-flash-lite、deepseek-v4-flash)。
+     - **Divyam**(第 4)/ **Cross-Router**(第 5):个人提交,池子 4 / 7 个,原理未公开。
   2. **公开原理的最高名次**:
      - **vLLM-SR**(第 6,74.86):ModernBERT 多分类器(见 §2)。
      - **nadir-caliper**(第 7,74.55):Nadir 作者的校准变体,细节未公开。
@@ -239,7 +243,13 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
      - **OrcaRouter-Adaptive**(第 12,72.08,[开源](https://github.com/Continuum-AI-Corp/OrcaRouter-Lite)+[论文](https://arxiv.org/abs/2605.30736)):**LinUCB 上下文 bandit**——用词法 + 句嵌入特征,离线阶段在精选 prompt 集上全信息评估每个候选模型、每臂拟合一个岭回归,上线后按 bandit 反馈只更新被选中那一臂。
   3. **知名商业/旗舰反而靠后**:GPT-5 第 24(64.32,贵),NotDiamond 第 28(57.29,频繁选贵模型)。
 
-  结论:公开原理的上榜者仍是"**嵌入特征 + 轻量分类/回归/bandit**"一族——与 LLMRouterBench 里 Avengers 系表现最好互相印证;榜首被未公开的个人提交占据,无法分析。论文总结的共同短板:现有路由器都不擅长识别"这题便宜模型就够了"的查询。
+  从这份榜单能读出三个结论:
+
+  1. **头部全是"小而便宜的精选池"**(4-7 个模型,以 flash/小杯为主)——正是本节开头"精心挑选的小池子更划算"的实战版。
+  2. **公开原理的上榜者仍是"嵌入特征 + 轻量分类/回归/bandit"一族**,与 LLMRouterBench 里 Avengers 系表现最好互相印证。
+  3. **黑盒榜单防不住"看了答案再路由"**:Paix2 争议是"评测比方法难"(§7)的极端案例——只交预测文件不交代码的赛制,区分不了"真会路由"和"拟合了评测集"。
+
+  论文总结的共同短板:现有路由器都不擅长识别"这题便宜模型就够了"的查询。
 - **数字打架,怎么理解**(梳理而非堆砌):关于路由能省多少钱,四类来源的数字差出一个数量级——
 
   | 来源 | 数字 | 口径 |
@@ -534,29 +544,36 @@ lake 在这张表里的位置:缓存状态由存储池权威维护(强于推测�
 
 (图源:[TIE 论文](https://arxiv.org/abs/2604.00499) Figure 1。同一个 prompt 采样 256 次的输出长度直方图,红线是拟合的 log-t 分布——同一个问题的回答长度本身是个重尾随机变量,这是"预测分布而非点估计"的依据。)
 
-**TIE 的分布公式与变量**。输出长度 \(L\) 建模为:
+**TIE 的分布公式与变量**。输出长度 L 建模为:
 
-\[
-\log L = \mu + \sigma \cdot Y,\qquad Y \sim t(\nu),\quad \nu = 3.5\ (\text{固定})
-\]
+```
+log L = μ + σ · Y,   Y ~ t(ν),   ν = 3.5(固定)
+即 L ~ Log-t(μ, σ, 3.5)——对数之后是 t 分布,原始尺度上就是重尾的
+```
 
-即 \(L \sim \text{Log-t}(\mu, \sigma, 3.5)\)。逐变量说清:
+逐变量说清:
 
-1. **\(\mu\)(位置)**:该请求"典型输出长度"的对数——\(\mu\) 大 = 回答偏长。
-2. **\(\sigma\)(展布)**:不确定性——\(\sigma\) 大 = 长度波动大。
-3. **\(\nu = 3.5\)(自由度)**:尾部厚度,全场固定(论文消融选出的最优值,KS 检验通过率 90.6%)。
-4. **预测器**:\((\hat\mu, \hat\sigma) = f_\theta(\text{prompt})\),\(f_\theta\) 是微调的 DeBERTa-v3-base(CLS + mean + max 多池化)接两个 MLP 头;拟合优度 \(R^2\) 分别为 0.82 / 0.76。实测依据:1K prompt × 各采样 100 次,输出长度平均偏度 3.10、P99/P50 = 10.77(重尾)。
-5. **调度分**:\(\text{Score} = \mathbb{E}[\tilde X] + \beta \cdot \text{CVaR}_\alpha[\tilde X]\),其中 \(\tilde X = \min(L, \texttt{max\_tokens})\)(按 max_tokens 截断),\(\text{CVaR}_\alpha\) 是"超过 \(\alpha\) 分位数的平均长度"(\(\alpha = 0.9\)),\(\beta\) 是尾部惩罚权重。SJF 里的"长度"换成这个分数——惩罚"有可能变长"的请求。
+1. **μ(位置)**:该请求"典型输出长度"的对数——μ 大 = 回答偏长。
+2. **σ(展布)**:不确定性——σ 大 = 长度波动大。
+3. **ν = 3.5(自由度)**:尾部厚度,全场固定(论文消融选出的最优值,KS 检验通过率 90.6%)。
+4. **预测器**:`(μ̂, σ̂) = f_θ(prompt)`,f_θ 是微调的 DeBERTa-v3-base(CLS + mean + max 多池化)接两个 MLP 头;拟合优度 R² 分别为 0.82 / 0.76。实测依据:1K prompt × 各采样 100 次,输出长度平均偏度 3.10、P99/P50 = 10.77(重尾)。
+5. **调度分**:
+
+   ```
+   Score = E[X̃] + β · CVaR_α[X̃],   其中 X̃ = min(L, max_tokens)
+   ```
+
+   即:按 max_tokens 把分布截断,取"期望长度 + β × 尾部条件期望"(CVaR_α = 超过 α 分位数时的平均长度,α = 0.9;β = 尾部惩罚权重)。SJF 里的"长度"换成这个分数——惩罚"有可能变长"的请求。
 
 **换模型怎么办**(关键问题):上面的公式里其实还藏着两个变量——
 
-1. **服务模型 \(m\)**:训练数据是 LMSYS-Chat-1M 的 prompt 配上 **Llama-3-8B 各采样 20 次**的输出,所以预测器学到的其实是 \(\mu(x, m_0=\text{Llama-3-8B})\)。换模型后分布确实会漂:论文自己的图(Figure 6)就显示各模型输出长度分布不同,推理模型尤其夸张(DeepSeek-R1-Distill 平均约 1057 token,Mistral-7B 约 128 token,差近 10 倍)。
+1. **服务模型 m**:训练数据是 LMSYS-Chat-1M 的 prompt 配上 **Llama-3-8B 各采样 20 次**的输出,所以预测器学到的其实是 `μ(x, m₀=Llama-3-8B)`。换模型后分布确实会漂:论文自己的图(Figure 6)就显示各模型输出长度分布不同,推理模型尤其夸张(DeepSeek-R1-Distill 平均约 1057 token,Mistral-7B 约 128 token,差近 10 倍)。
 2. **解码配置**:温度也改变分布(论文在温度 0.7 训练,≥1.6 时所有方法都退化)。
 
 论文的应对是**不重训直接泛化**(同一预测器直接在 70B 和 7 个其他家族的模型上测,声称效果好),理由是分布建模不过拟合、尾部惩罚能吸收预测误差。但这个声称有边界:同族同风格(聊天)模型间泛化可信;换成推理模型这种长度量级都变的,靠泛化不现实。工程上的正经解法三条:
 
-1. **按模型条件化**:预测器输入加 model_id(或每模型一个头),\(\mu(x)\) 变成 \(\mu(x, m)\)。
-2. **在线校准**:用观测到的实现长度对 \(\hat\mu\) 做滑动修正(如按模型维护一个加法偏置)——lake 的存储池能看到 decode 中的真实 KV 块数,校准信号免费。
+1. **按模型条件化**:预测器输入加 model_id(或每模型一个头),`μ(x)` 变成 `μ(x, m)`。
+2. **在线校准**:用观测到的实现长度对 μ̂ 做滑动修正(如按模型维护一个加法偏置)——lake 的存储池能看到 decode 中的真实 KV 块数,校准信号免费。
 3. **只重训头**:论文的两阶段训练(先全量、后冻结 encoder 只训头)就是为此设计,换模型只需重训两个 MLP 头,成本低。
 
 另外论文自述的训练数据门槛也值得记住:点估计方法可以直接用生产日志训练,TIE 需要每个 prompt 多次采样来拟合分布,冷启动成本更高。
