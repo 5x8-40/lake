@@ -10,7 +10,7 @@ AIBrix 是一套 **K8s 原生的 GenAI 推理基础设施积木**:控制面(CRD 
 
 ![AIBrix 架构](figures/aibrix-architecture-v1.jpeg)
 
-(图源:AIBrix 官方文档。左侧控制面:metadata service、autoscaler、CRD controllers;右侧数据面:Envoy 网关 + gateway plugins + 推理 pod(runtime sidecar)。)
+(图源:AIBrix 官方文档。左侧大框是 AIBrix 本体:上半控制面(metadata service、autoscaler、CRD controller manager),下半数据面(Envoy 网关 + gateway plugins + 带 runtime sidecar 的推理 pod);右侧是配套的基准/评测工具与 AI 应用编排(LoRA、批处理、多 agent 等,多为路线图方向)。)
 
 ## 与本系统的关系
 
@@ -101,7 +101,7 @@ flowchart TB
 **优势**(对 lake 有参考价值的):
 
 1. 功能面最完整的 K8s 推理平台样本:路由/扩缩/编排/卸载/元数据一套打齐,且都是生产部署形态。
-2. 路由策略数量最多且可组合:prefix-cache(哈希表与 RadixTree 两版)、least-request/least-latency/least-kv-cache、VTC、Preble,加权混合。
+2. 路由策略多且可组合:约 19 种独立策略(prefix-cache 哈希表与 RadixTree 两版、least-request/least-latency/least-kv-cache、VTC、Preble、SLO 等),支持加权混合(`"least-request:2,throughput:1"`)。
 3. 双索引路线并存(本地估计 vs KV 事件精确同步),是"近似派 vs 精确派"在同一项目里的天然对照实验。
 4. `aibrix_kvcache` 的 TP 感知对齐(各 TP rank 对齐已取回 KV 长度再 prefill)是跨引擎 KV 复用的真实工程问题,AIBrix 给出了明确解法。
 

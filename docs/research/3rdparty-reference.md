@@ -331,7 +331,7 @@ AIBrix 是平台层项目:Envoy 网关插件选路 + CRD 全家桶编排 + PodAu
 
 源码入口:`3rdparty/llm-d-router/`(纯 Go 单仓:EPP + pd-sidecar + coordinator)。深度分析见 [`llm-d/`](llm-d/)(overview / architecture / pain-points);路由横评见 [model-routing.md](model-routing.md) §5;四栈对比见 [serving-stack-comparison.md](serving-stack-comparison.md)。
 
-llm-d Router 是 K8s Gateway API Inference Extension 标准下的 EPP 参考实现,代表"网关侧精确派"缓存感知的最高完成度:逐块索引、介质分权重、推测索引补传播窗口、14+ 种插件化 scorer。K8s 推理路由生态(production-stack、kgateway)正在向它收敛。
+llm-d Router 是 K8s Gateway API Inference Extension 标准下的 EPP 参考实现,代表"网关侧精确派"缓存感知的最高完成度:逐块索引、介质分权重、推测索引补传播窗口、20 种插件化 scorer。K8s 推理路由生态(production-stack、kgateway)正在向它收敛。
 
 注意本仓只是 llm-d 项目的路由组件;项目级还有 WVA 扩缩优化器(独立仓,出目标副本数交 HPA/KEDA)、KV 索引库(已迁入本仓,#1886)、FS 卸载后端(已上游进 vLLM 多层级卸载连接器)、模拟器/基准工具链——完整地图见 [llm-d/overview.md](llm-d/overview.md)「项目地图」。
 

@@ -7,8 +7,8 @@
 
 1. **Dynamo**(NVIDIA):完整的**分布式推理运行时**——路由、PD 分离、KV 块管理、RDMA 传输、SLA 扩缩全在一个框架里,Rust 核心。
 2. **FlexKV**(腾讯云 TACO):一个**引擎旁 KV 卸载库**——只管"GPU 放不下时把 KV 卸到 CPU/SSD/远端",以插件(connector)形态注入现有引擎,不做路由、不做扩缩。
-3. **llm-d**(Red Hat/Google/IBM 等):K8s 原生推理栈,**组织下 18 个仓**:核心是 EPP 路由器(Endpoint Picker,挂在 Envoy 扩展点上做精确缓存感知选路;我们的 submodule `llm-d-router` 就是这个仓)+ PD 边车编排,外加 WVA 扩缩优化器、KV 索引库、文件系统卸载后端(已上游进 vLLM)、延迟预测器、基准/仿真工具链。
-4. **AIBrix**(字节跳动 → vllm-project):K8s **平台积木全家桶**——网关路由、自动扩缩、编排 CRD(K8s 自定义资源)、元数据服务、KV 卸载框架,九大件可拼装。
+3. **llm-d**(Red Hat/Google/IBM 等):K8s 原生推理栈,**组织下十余个仓**:核心是 EPP 路由器(Endpoint Picker,挂在 Envoy 扩展点上做精确缓存感知选路;我们的 submodule `llm-d-router` 就是这个仓)+ PD 边车编排,外加 WVA 扩缩优化器、KV 索引库、文件系统卸载后端(已上游进 vLLM)、延迟预测器、基准/仿真工具链。
+4. **AIBrix**(字节跳动 → vllm-project):K8s **平台积木全家桶**——网关路由、自动扩缩、编排 CRD(K8s 自定义资源)、元数据服务、KV 卸载框架,可按需拼装。
 
 ## 2. 为什么看起来相似
 
@@ -62,7 +62,7 @@
 |---|---|---|---|---|
 | 形态 | 独立 router 进程 | 无 | EPP(挂在 Envoy ext-proc 上) | Envoy ext-proc 网关插件 |
 | 索引 | 链式块哈希 + 事件流 | — | 逐块索引 + 推测条目(TTL 2s) | 本地哈希表 / 事件同步索引 |
-| 策略 | KV-aware + overlap 量化 | — | 插件 scorer 加权组合(14+ 种) | 策略集加权组合(数量最多) |
+| 策略 | KV-aware + overlap 量化 | — | 插件 scorer 加权组合(20 种) | 独立策略约 19 种,可加权组合 |
 | 多副本 | 各自维护视图 | — | 各自订阅收敛 | 默认各自为政,可选 Redis 同步 |
 
 (ext-proc = Envoy 的外部处理协议:转发请求前先调外部服务要决策。两家都挂在这同一个扩展点上。)

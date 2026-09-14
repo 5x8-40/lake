@@ -19,7 +19,7 @@
 | 现象 | 证据 | lake |
 |------|------|------|
 | 需要推测索引补"决策→确认"空窗 | `prerequest.go::defaultSpeculativeTTL`(2s) | 放置由池决定、视图由池发,无决策-确认窗口 |
-| 推测与确认条目共存,TTL 只清推测 | `TestSpeculativeAndConfirmedCoexist` | 不涉及 |
+| 推测条目只带请求块键(引擎键为 nil),TTL 到期自动清,确认条目由事件管线另写 | `prerequest.go::PreRequest`(`index.Add(ctx, nil, ...)`) | 不涉及 |
 | Director 对目标 pod 失效的 fallback 未完善 | `director.go` TODO | 失败即重跑选路函数(F4),无降级链 |
 
 ## 3. PD 分离
@@ -37,9 +37,9 @@
 |------|------|------|
 | 单 InferencePool 单 EPP(Envoy 限制) | `docs/architecture.md` 假设 | Router 无状态,水平扩 |
 | 每 pool 单一 base 模型 | 同上 | 存储池模型无关,多 `(model_id, revision)` 共存 |
-| DP rank 不进索引与去重 | `event_dedup_filter.go` TODO #370 | DP/TP 拓扑是放置输入,不是事后补的维度 |
+| DP(数据并行)rank 不进索引与去重 | `event_dedup_filter.go` TODO #370 | DP/TP 拓扑是放置输入,不是事后补的维度 |
 | 内存索引按 key 数计容,非按字节 | `in_memory.go` TODO | 池按字节与配额管理 |
-| 输出长度靠静态估计 | `inflightload/token_estimator.go` TODO | 调度输入含长度分布(参考 TIE,见 model-routing.md §6) |
+| 输出长度靠静态估计 | `.../dataproducer/inflightload/token_estimator.go` TODO(outlen) | 调度输入含长度分布(参考 TIE,见 model-routing.md §6) |
 | KV 卸载走引擎原生连接器(FS 后端由 llm-d-kv-cache 仓贡献,已上游进 vLLM 多层级卸载连接器),路由器不参与 | llm-d-kv-cache 仓 README | 池是必经路径,不靠引擎可选连接器;卸载决策归池不归引擎 |
 
 ## 可直接借鉴

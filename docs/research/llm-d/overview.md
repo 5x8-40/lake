@@ -15,14 +15,14 @@ llm-d Router 是 K8s 上推理流量的**智能入口**:核心是 EPP(Endpoint P
 
 ## 项目地图:llm-d 不止路由
 
-llm-d 是一个**完整的 K8s 分布式推理项目**(GitHub org 下 18 个仓),路由只是其中一块。主要组件:
+llm-d 是一个**完整的 K8s 分布式推理项目**(GitHub org 下十余个仓),路由只是其中一块。主要组件:
 
 | 仓 | 干什么 | 状态 |
 |----|--------|------|
 | `llm-d/llm-d` | 主仓:文档、部署指南(well-lit paths)、CI | 活跃 |
 | `llm-d/llm-d-router` | **EPP 路由 + PD sidecar + coordinator(本 submodule)** | 活跃;原名 inference-scheduler |
 | `llm-d/llm-d-kv-cache` | KV 块位置索引库 + 文件系统卸载后端 | 索引库**已迁入 router 仓**(#1886);FS 卸载后端**已上游进 vLLM**(成为多层级卸载连接器的 FS 层) |
-| `llm-d/llm-d-workload-variant-autoscaler` | WVA:SLO 感知的扩缩优化器(按 KV 利用率/队列深度/饱和度出目标副本数,交 HPA/KEDA 执行;论文 arXiv 2603.09730) | 活跃 |
+| `llm-d/llm-d-autoscaling` | WVA(Workload Variant Autoscaler):SLO 感知的扩缩优化器(按 KV 利用率/队列深度/饱和度出目标副本数,交标准 HPA/KEDA 执行——HPA 是 K8s 原生水平扩缩控制器,KEDA 是事件驱动扩缩器;论文 arXiv 2603.09730;仓原名 workload-variant-autoscaler) | 活跃 |
 | `llm-d/llm-d-latency-predictor` | 延迟预测服务(XGBoost 训练 + 预测) | 活跃 |
 | `llm-d/llm-d-async` / `llm-d-batch-gateway` | 异步请求处理 / OpenAI 兼容批量推理 API | 活跃 |
 | `llm-d/llm-d-benchmark` / `llm-d-inference-sim` | 基准框架 / 无 GPU 的 vLLM 模拟器 | 活跃 |
@@ -48,7 +48,7 @@ llm-d 是一个**完整的 K8s 分布式推理项目**(GitHub org 下 18 个仓)
 | WVA 扩缩优化器(项目级,独立仓) | Router Autoscaler(P6.5)+ KV Node join/drain(P4.9) | **同责对照**:WVA 出目标副本数、交标准 HPA/KEDA 执行;lake 决策在 Router、真实开机器归外部。WVA 的"变体间成本感知"(便宜的配置先扩)lake 没有对应 |
 | llmd-fs-backend(项目级,FS 卸载后端) | lake L2/L3 | 它选择**上游进 vLLM**(多层级卸载连接器的 FS 层)而不是自维护存储栈;lake 的 L2/L3 归存储池,引擎连接器只是接入点 |
 
-**核心结论**:llm-d Router 代表了"**网关侧精确派**"的最高完成度——事件驱动、逐块精确、推测索引补传播窗口、十余种 scorer 插件化组合。但它的索引始终是**路由器为自己决策维护的派生缓存**:引擎才是 KV 真相,EPP 只是尽可能快地逼近它。lake 把这个关系倒过来:存储池就是真相,Router 读的视图不需要"逼近"谁。
+**核心结论**:llm-d Router 代表了"**网关侧精确派**"的最高完成度——事件驱动、逐块精确、推测索引补传播窗口、20 种 scorer 插件化组合。但它的索引始终是**路由器为自己决策维护的派生缓存**:引擎才是 KV 真相,EPP 只是尽可能快地逼近它。lake 把这个关系倒过来:存储池就是真相,Router 读的视图不需要"逼近"谁。
 
 ## 设计哲学
 
@@ -163,12 +163,12 @@ flowchart TB
 | 事件批处理 | `pkg/kvevents/pool.go`::`processEventBatch` |
 | 事件去重 | `pkg/kvevents/event_dedup_filter.go`::`eventDedupFilter` |
 | 引擎适配 | `pkg/kvevents/engineadapter/vllm_adapter.go` / `sglang_adapter.go` |
-| 精确前缀 producer | `pkg/epp/scheduling/plugins/producer/preciseprefixcache/producer.go`::`Producer.Produce` / `Extract` |
-| 推测索引 | `.../preciseprefixcache/prerequest.go`::`defaultSpeculativeTTL` / `buildSpeculativeCache` / `PreRequest` |
-| 精确前缀 scorer | `.../scorer/preciseprefixcache/precise_prefix_cache.go`::`PrecisePrefixCachePluginType` |
-| 负载 scorer | `.../scorer/loadaware/load_aware.go`::`LoadAwareType` |
-| PD profile | `.../profilehandler/disagg/disagg_profile_handler.go`::`DisaggProfileHandlerType` |
-| PD 决策器 | `.../decider/prefix_based_pd_decider.go` / `always_disagg_pd_decider.go` |
+| 精确前缀 producer | `pkg/epp/framework/plugins/requestcontrol/dataproducer/preciseprefixcache/producer.go`::`Producer.Produce`;同目录 `extractor.go`::`Producer.Extract` |
+| 推测索引 | `.../dataproducer/preciseprefixcache/prerequest.go`::`defaultSpeculativeTTL` / `buildSpeculativeCache` / `PreRequest` |
+| 精确前缀 scorer | `pkg/epp/framework/plugins/scheduling/scorer/preciseprefixcache/precise_prefix_cache.go`::`PrecisePrefixCachePluginType` |
+| 负载 scorer | `.../scheduling/scorer/loadaware/load_aware.go`::`LoadAwareType` |
+| PD profile | `.../scheduling/profilehandler/disagg/disagg_profile_handler.go`::`DisaggProfileHandlerType` |
+| PD 决策器 | `.../scheduling/profilehandler/disagg/prefix_based_pd_decider.go` / `always_disagg_pd_decider.go` |
 | sidecar | `cmd/pd-sidecar/main.go`;`pkg/sidecar/proxy/proxy.go`::`NewProxy` |
 | coordinator | `cmd/coordinator/main.go`;`pkg/coordinator/pipeline/pipeline.go`::`Pipeline.Execute` |
 

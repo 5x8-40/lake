@@ -69,8 +69,8 @@ EPP 是 Envoy 的 External Processing 后端,只实现 `FULL_DUPLEX_STREAMED` �
 
 1. 调度完成后 `Producer.PreRequest` 立刻写入 `PodEntry{Speculative: true}`(只带请求块键,不带引擎键)。
 2. 条目放 `ttlcache`,默认 TTL **2 秒**(`defaultSpeculativeTTL`);到期 `OnEviction` 回调里 `Index.Evict` 清掉。
-3. 引擎真实 `BlockStored` 事件到达后写入非推测条目——**两者可共存**(`TestSpeculativeAndConfirmedCoexist`),确认不依赖推测条目过期。
-4. 打分时推测命中计入单独的 `"speculative"` 层,scorer 可区别对待。
+3. 推测条目只带请求块键(引擎键为 nil,`PreRequest` 里 `index.Add(ctx, nil, promptKeys, ...)`);引擎真实 `BlockStored` 事件到达后由事件管线写入确认条目,确认不依赖推测条目过期。
+4. 打分时推测命中计入单独的 `"speculative"` 层(`prefix_match.go::SpeculativeTier`),scorer 可区别对待。
 
 **小结**:推测索引是"最终一致 + 决策先行"系统的标准补窗手法,2 秒 TTL 是经验值。它解决的严格说是**路由器自己造成的问题**(索引是派生的才有窗口)——权威视图系统没有这个窗口,但这个思路对任何带异步确认的控制回路都通用。
 
@@ -91,7 +91,9 @@ EPP 是 Envoy 的 External Processing 后端,只实现 `FULL_DUPLEX_STREAMED` �
 |------|--------|
 | 前缀亲和 | `precise-prefix-cache-scorer`(精确,走事件索引)、`prefix-cache-scorer`(近似)、`no-hit-lru-scorer`、`mm-embeddings-cache-scorer`(多模态) |
 | 负载 | `load-aware-scorer`、`queue-scorer`、`kv-cache-utilization-scorer`、`token-load-scorer`、`running-requests-size-scorer`、`active-request-scorer` |
-| 亲和/其他 | `session-affinity-scorer`、`lora-affinity-scorer`、`latency-scorer`、`topology-affinity-scorer`、`multicluster-*` |
+| 亲和/其他 | `session-affinity-scorer`、`lora-affinity-scorer`、`latency-scorer`、`topology-affinity-scorer`、`context-length-aware`(按 pod 上下文长度标签)、`endpoint-attribute-scorer`、`header-label-affinity-scorer`、`multicluster-*` |
+
+共 20 种 scorer(含 3 个 multicluster 变体),全部注册于 `registerInTreePlugins`。
 
 组合方式:每个 scorer 得分截断到值域后乘权重累加;profile 里声明用哪些插件。
 
@@ -105,14 +107,14 @@ EPP 是 Envoy 的 External Processing 后端,只实现 `FULL_DUPLEX_STREAMED` �
 
 ![E/P/D 架构](figures/epd_architecture.png)
 
-(图源:`3rdparty/llm-d-router` 官方文档图。)
+(图源:`3rdparty/llm-d-router` 官方文档图。客户端 → Envoy → EPP 选路;prefill 与 decode 各自成组 pod、各带 sidecar 代理,两侧 vLLM 之间经 NIXL 直传 KV。)
 
 ### 6.1 路径 A:pd-sidecar(主路径)
 
 sidecar(边车)指与引擎容器跑在同一个 pod 里的配套代理容器——引擎不变,边车替它收发多阶段请求。
 
 1. EPP 侧:`disagg-profile-handler` 管整档调度;`prefix-based-pd-decider`(前缀命中够多就不拆 prefill)或 `always-disagg-pd-decider` 决定是否分离;`prefill-filter` / `decode-filter` / `encode-filter` 按角色标签筛 pod。
-2. 决策顺序:**先选 decode**,再按需选 encode,再按需选 prefill(官方文档明确此序)。
+2. 决策顺序:**先选 decode**,再按需选 encode,再按需选 prefill(`docs/disaggregation.md` 明确此序;`stageOrder` 默认 `decode-first`,可配 `prefill-first`)。
 3. 执行侧:请求先到 decode pod,pod 上的边车代理(`pkg/sidecar/proxy/proxy.go::NewProxy`)读 `x-prefiller-host-port` 等头,先向远端 prefill worker 发请求并接 KV,再本地 decode。
 
 ### 6.2 路径 B:coordinator
@@ -121,7 +123,7 @@ sidecar(边车)指与引擎容器跑在同一个 pod 里的配套代理容器—
 
 ### 6.3 官方自认的代价
 
-`docs/disaggregation.md` 的 Drawbacks 节:TTFT 上升、多一跳传输、prefill 崩溃会留下 stranded memory、必须有 timeout/retry。
+`docs/disaggregation.md` 的 Drawbacks 节:TTFT 上升、多一跳传输、prefill 崩溃会留下 stranded memory(已算好的 KV 占着显存却没有请求来用,只能等超时回收)、必须有 timeout/retry。
 
 **小结**:llm-d 的 PD 是"**部署时分开、运行时串接**"——prefill/decode 是静态角色,sidecar 把两跳串成一跳的外观。lake 的 PD 是逐请求模式选择,同一集群里分离/混部/D-direct 并存,不需要 sidecar 这个中间人;但 llm-d 把 PD 工程问题(stranded memory、超时重试、先选 decode)摆到明处,这些坑 lake 同样要过。
 

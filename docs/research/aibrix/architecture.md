@@ -75,7 +75,7 @@ AIBrix 是"近似派 vs 精确派"在同一代码库里的对照实验:
 
 ![分布式 KV 缓存架构](figures/aibrix-dist-kv-cache-arch-overview.png)
 
-(图源:AIBrix 官方文档。右上:kvcache-watcher 把 L2 集群成员表同步到 Redis,vLLM pod 里的 connector 读 Redis 拿到成员与连接信息,再经 RDMA/以太网直连 L2 节点;KVCache CR 由 controller 落成集群。)
+(图源:AIBrix 官方文档。左上:vLLM pod(内嵌 aibrix-kvcache connector)各带一个 kvcache-watcher sidecar,把 L2 集群成员表同步到 Redis;connector 读 Redis 拿成员与连接信息,经 InfiniBand/以太网直连下方 L2 集群的 aibrix-kvcache 节点;L2 集群由 KVCache CR + controller 落成;右上 Metadata Service 是平台级元数据服务,不在这条读路径上。)
 
 **小结**:形态上与 FlexKV / LMCache 完全同层(引擎 connector + 本机 L1 + 远端 L2)。对照 lake:L1 在引擎进程内、pod 重启全丢;L2 成员发现走 Redis(最终一致,但只影响"连谁",不影响命中正确性),lake 的成员与块位置都在存储控制面权威视图里;"卸哪些块"由逐出策略在引擎侧决定,而不是由池按全局热度决定。lake 可借鉴的是 **TP 对齐**与**选择性卸载的动机建模**(带宽受限场景),不照搬的是权威归属。
 
