@@ -107,7 +107,7 @@ EPP 是 Envoy 的 External Processing 后端,只实现 `FULL_DUPLEX_STREAMED` �
 
 ![E/P/D 架构](figures/epd_architecture.png)
 
-(图源:`3rdparty/llm-d-router` 官方文档图。客户端 → Envoy → EPP 选路;prefill 与 decode 各自成组 pod、各带 sidecar 代理,两侧 vLLM 之间经 NIXL 直传 KV。)
+(图源:`3rdparty/llm-d-router` `docs/disaggregation.md` 的 Diagram 节,原图 alt 为 "Disaggregated Encode/Prefill/Decode Architecture"。上游该节仅嵌图未配文字说明(原文留有 TODO);各组件事实见本节正文及所引源码。)
 
 ### 6.1 路径 A:pd-sidecar(主路径)
 

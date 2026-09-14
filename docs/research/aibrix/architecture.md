@@ -63,7 +63,7 @@ AIBrix 是"近似派 vs 精确派"在同一代码库里的对照实验:
 
 ![KV 卸载框架架构](figures/aibrix-kvcache-offloading-arch-overview.png)
 
-(图源:AIBrix 官方文档。引擎 connector 之下是 L1 DRAM 与 L2 远端后端,逐出策略层决定哪些块下沉。)
+(图源:[AIBrix 官方 KVCache Offloading Framework 文档](https://aibrix.readthedocs.io/latest/designs/aibrix-kvcache-offloading-framework.html),文中 Figure 1。原文说明:数据面经 AIBrix Offloading Connector 与推理引擎(如 vLLM)紧密集成,用优化的 CUDA 内核加速 GPU 与 CPU 间的数据搬运;多层 cache manager 在各存储层间动态均衡;逐出策略可插拔(LRU、S3FIFO 等),后端存储可选(InfiniStore 等),支持选择性卸载以缓解网络与 PCIe 争抢;cache placement 模块可与中心化的分布式 KV cache 集群管理器协同,最大化全局 KV 利用率。)
 
 1. **分层**:
    - L1 = 引擎进程内 DRAM 缓存(`l1/l1_cache.py::L1Cache`),避免频繁打远端;
@@ -75,7 +75,7 @@ AIBrix 是"近似派 vs 精确派"在同一代码库里的对照实验:
 
 ![L2 分布式 KV 缓存架构](figures/aibrix-infinistore-arch-overview.png)
 
-(图源:AIBrix 官方文档「L2 Distributed KVCache and Cross-Engine KV Reuse」节原图。左:vLLM pod 内嵌 aibrix-kvcache connector;中:Metadata Service——KV 集群元数据,部署形态是每集群一个 Redis,kvcache-watcher 监听 cache pod 变动、把成员表与一致性哈希环写进去,connector 从这里读;右:L2 K8s 集群,KVCache CR 经 controller 落成 InfiniStore 节点组。引擎经 InfiniBand/以太网直连 L2 节点读写,跨引擎 KV 复用发生在这一层。)
+(图源:同上文档「L2 Distributed KVCache and Cross-Engine KV Reuse」节原图。原文说明:AIBrix 以分布式 KV cache 服务作为 L2Cache 后端,可跨多节点水平扩展容量;通过高性能的共享分布式 KV cache 实现跨引擎 KV 复用。官方未对图中元素逐一注解,图中各框的部署事实见上文第 2 条及 `cmd/kvcache-watcher` 源码。)
 
 **小结**:形态上与 FlexKV / LMCache 完全同层(引擎 connector + 本机 L1 + 远端 L2)。对照 lake:L1 在引擎进程内、pod 重启全丢;L2 成员发现走 Redis(最终一致,但只影响"连谁",不影响命中正确性),lake 的成员与块位置都在存储控制面权威视图里;"卸哪些块"由逐出策略在引擎侧决定,而不是由池按全局热度决定。lake 可借鉴的是 **TP 对齐**与**选择性卸载的动机建模**(带宽受限场景),不照搬的是权威归属。
 

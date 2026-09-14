@@ -11,7 +11,7 @@ llm-d Router 是 K8s 上推理流量的**智能入口**:核心是 EPP(Endpoint P
 
 ![llm-d Router 架构](figures/llm-d-router.svg)
 
-(图源:`3rdparty/llm-d-router` 官方文档图。EPP 在网关路径上,经 ext-proc 与 Envoy 交互。)
+(图源:[llm-d-router README](https://github.com/llm-d/llm-d-router),原图 alt 为 "llm-d Router Architecture"。原文说明:Router 的智能来自 EPP——它经 ext-proc 协议与 Envoy 等生产级代理集成,把实时信号注入数据面以优化请求放置。)
 
 ## 项目地图:llm-d 不止路由
 
@@ -30,7 +30,7 @@ llm-d 是一个**完整的 K8s 分布式推理项目**(GitHub org 下十余个�
 
 ![llm-d 项目架构](figures/architecture.png)
 
-(图源:`3rdparty/llm-d-router` 官方文档图。注意左侧:Model Service、Infra、Benchmark、KV Cache Manager、Inference Sim 都是项目级组件;右侧才是本仓覆盖的请求路径——客户端经网关到 EPP 选路,prefill/decode 分离部署,KV 可落到本地 FS 或远端 FS。)
+(图源:[`docs/images/architecture.png`](https://github.com/llm-d/llm-d-router/blob/main/docs/images/architecture.png)(本仓 `3rdparty/llm-d-router` 同路径)。上游当前文档未引用此图、未配官方文字说明,此处仅作项目组件版图参考。)
 
 **对本仓文档的读法**:overview/architecture/pain-points 三篇深挖的是 router 仓(EPP + sidecar + coordinator);项目级组件里与 lake 关系最大的是 WVA(扩缩)与 FS 卸载后端(它选择了"上游进 vLLM"而不是自维护存储栈),在本文的关系表与对照节里覆盖。
 
