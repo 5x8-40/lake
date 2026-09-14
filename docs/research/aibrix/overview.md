@@ -10,7 +10,7 @@ AIBrix 是一套 **K8s 原生的 GenAI 推理基础设施积木**:控制面(CRD 
 
 ![AIBrix 架构](figures/aibrix-architecture-v1.jpeg)
 
-(图源:AIBrix 官方文档。左侧大框是 AIBrix 本体:上半控制面(metadata service、autoscaler、CRD controller manager),下半数据面(Envoy 网关 + gateway plugins + 带 runtime sidecar 的推理 pod);右侧是配套的基准/评测工具与 AI 应用编排(LoRA、批处理、多 agent 等,多为路线图方向)。)
+(图源:AIBrix 官方 architecture 文档。原图用来说明 AIBrix 生态与 K8s/LLM 版图的关系:左侧大框是 AIBrix 本体——上半控制面(metadata service、autoscaler、CRD controller manager),负责模型元数据注册、扩缩、模型适配器注册与策略执行;下半数据面(Envoy 网关 → gateway plugins → runtime sidecar → vLLM/SGLang pod),负责请求分发、调度与推理执行。右侧两框画在本体之外,是对接的生态:基准/评测,以及 AI 应用编排(LoRA、批处理、多 agent、异构推理、混合云)。)
 
 ## 与本系统的关系
 

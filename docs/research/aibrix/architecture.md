@@ -73,9 +73,9 @@ AIBrix 是"近似派 vs 精确派"在同一代码库里的对照实验:
 4. **选择性卸载**:逐出策略层(LRU / FIFO / S3FIFO)决定"只卸热块/只卸冷块/全卸",动机是低配集群里多 GPU 共享一张 VPC 网卡,全量卸载会打爆带宽。
 5. **传输**:`transport/rdma.py` 支持 RDMA;限制:目前只支持 FlashAttention/XFormers 后端的 KV 布局。
 
-![分布式 KV 缓存架构](figures/aibrix-dist-kv-cache-arch-overview.png)
+![L2 分布式 KV 缓存架构](figures/aibrix-infinistore-arch-overview.png)
 
-(图源:AIBrix 官方文档。左上:vLLM pod(内嵌 aibrix-kvcache connector)各带一个 kvcache-watcher sidecar,把 L2 集群成员表同步到 Redis;connector 读 Redis 拿成员与连接信息,经 InfiniBand/以太网直连下方 L2 集群的 aibrix-kvcache 节点;L2 集群由 KVCache CR + controller 落成;右上 Metadata Service 是平台级元数据服务,不在这条读路径上。)
+(图源:AIBrix 官方文档「L2 Distributed KVCache and Cross-Engine KV Reuse」节原图。左:vLLM pod 内嵌 aibrix-kvcache connector;中:Metadata Service——KV 集群元数据,部署形态是每集群一个 Redis,kvcache-watcher 监听 cache pod 变动、把成员表与一致性哈希环写进去,connector 从这里读;右:L2 K8s 集群,KVCache CR 经 controller 落成 InfiniStore 节点组。引擎经 InfiniBand/以太网直连 L2 节点读写,跨引擎 KV 复用发生在这一层。)
 
 **小结**:形态上与 FlexKV / LMCache 完全同层(引擎 connector + 本机 L1 + 远端 L2)。对照 lake:L1 在引擎进程内、pod 重启全丢;L2 成员发现走 Redis(最终一致,但只影响"连谁",不影响命中正确性),lake 的成员与块位置都在存储控制面权威视图里;"卸哪些块"由逐出策略在引擎侧决定,而不是由池按全局热度决定。lake 可借鉴的是 **TP 对齐**与**选择性卸载的动机建模**(带宽受限场景),不照搬的是权威归属。
 
