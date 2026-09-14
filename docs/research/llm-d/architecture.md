@@ -1,6 +1,7 @@
 # llm-d Router — 架构深潜
 
 > [overview.md](overview.md) · [pain-points.md](pain-points.md)。调研快照:`3rdparty/llm-d-router` @ `abb404ef`(2026-09-08)。  
+> 本文只深挖 router 仓(EPP + 边车 + coordinator);llm-d 项目级组件(WVA 扩缩、FS 卸载、模拟器/基准等)见 [overview.md](overview.md)「项目地图」。  
 > §1 请求路径 → §2 块索引 → §3 事件管线 → §4 推测索引 → §5 插件体系 → §6 PD 编排 → §7 多副本与 HA。每节末尾有小结。
 
 ## 1. 请求路径:ext-proc 回调里的完整选路
@@ -108,9 +109,11 @@ EPP 是 Envoy 的 External Processing 后端,只实现 `FULL_DUPLEX_STREAMED` �
 
 ### 6.1 路径 A:pd-sidecar(主路径)
 
+sidecar(边车)指与引擎容器跑在同一个 pod 里的配套代理容器——引擎不变,边车替它收发多阶段请求。
+
 1. EPP 侧:`disagg-profile-handler` 管整档调度;`prefix-based-pd-decider`(前缀命中够多就不拆 prefill)或 `always-disagg-pd-decider` 决定是否分离;`prefill-filter` / `decode-filter` / `encode-filter` 按角色标签筛 pod。
 2. 决策顺序:**先选 decode**,再按需选 encode,再按需选 prefill(官方文档明确此序)。
-3. 执行侧:请求先到 decode pod,pod 上的 sidecar 代理(`pkg/sidecar/proxy/proxy.go::NewProxy`)读 `x-prefiller-host-port` 等头,先向远端 prefill worker 发请求并接 KV,再本地 decode。
+3. 执行侧:请求先到 decode pod,pod 上的边车代理(`pkg/sidecar/proxy/proxy.go::NewProxy`)读 `x-prefiller-host-port` 等头,先向远端 prefill worker 发请求并接 KV,再本地 decode。
 
 ### 6.2 路径 B:coordinator
 

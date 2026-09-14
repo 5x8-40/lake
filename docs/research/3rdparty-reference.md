@@ -317,14 +317,14 @@ AIBrix 是平台层项目:Envoy 网关插件选路 + CRD 全家桶编排 + PodAu
 | 策略注册表 + 加权组合打分(`RouterManager`/`ParseMultiRouterConfig`) | Router 代价函数演化 | scorer 组合形态的最直接参照,每策略独立灰度 |
 | KV 事件管线(`pkg/cache/kvcache/zmq_client.go` + `pkg/kvevent/manager.go`) | 存储控制面消费引擎事件 | ZMQ 订阅 + msgpack 编解码 + 事件→索引转换的分层可对照 |
 | TP 感知 KV 对齐(`GroupAwareKVCacheManager`) | P5 引擎对接 | TP>1 各 rank 命中长度不齐,prefill 前必须对齐——真实工程坑的明确解法 |
-| KV 感知扩缩指标(`gpu_cache_usage_perc`/`num_requests_waiting`) | 上报信号清单 | 扩缩归外部,但这些指标就是 lake 该暴露的信号 |
+| KV 感知扩缩指标(`gpu_cache_usage_perc`/`num_requests_waiting`) | Router Autoscaler 决策输入 | lake 自己做扩缩决策(P6.5,队列深度为主),这些指标是同类参照;只有真实开机器归外部编排 |
 | prefix-cache 双路线并存(本地哈希表 vs ZMQ 事件同步) | 近似派 vs 精确派对照 | 同一仓里的天然 A/B,佐证精确路线需要引擎配合 |
 
 ### 关键差异(我们更彻底)
 
 - 路由亲和状态在网关进程内,默认不同步、可选 Redis 最终一致;lake 位置视图是存储控制面权威,Router 读镜像。
-- L1 在引擎进程内、L2 是外部集群 + Redis 成员表;lake L0–L3 统一归池。
-- PD 是 StormService 静态角色拓扑;lake PD 是逐请求运行时模式。
+- L1 在引擎进程内、L2 是外部集群(Redis 只存成员表,块级元数据在后端内部);lake L0–L3 统一归池。
+- PD 是 StormService 静态角色拓扑(自研 CRD:多角色 pod 编组整体部署);lake PD 是逐请求运行时模式。
 - 卸载由引擎侧逐出策略局部决定;lake 由池按全局热度 + 引用计数统一决定。
 
 ## 12. llm-d Router → EPP 精确缓存感知 + PD 编排
@@ -332,6 +332,8 @@ AIBrix 是平台层项目:Envoy 网关插件选路 + CRD 全家桶编排 + PodAu
 源码入口:`3rdparty/llm-d-router/`(纯 Go 单仓:EPP + pd-sidecar + coordinator)。深度分析见 [`llm-d/`](llm-d/)(overview / architecture / pain-points);路由横评见 [model-routing.md](model-routing.md) §5;四栈对比见 [serving-stack-comparison.md](serving-stack-comparison.md)。
 
 llm-d Router 是 K8s Gateway API Inference Extension 标准下的 EPP 参考实现,代表"网关侧精确派"缓存感知的最高完成度:逐块索引、介质分权重、推测索引补传播窗口、14+ 种插件化 scorer。K8s 推理路由生态(production-stack、kgateway)正在向它收敛。
+
+注意本仓只是 llm-d 项目的路由组件;项目级还有 WVA 扩缩优化器(独立仓,出目标副本数交 HPA/KEDA)、KV 索引库(已迁入本仓,#1886)、FS 卸载后端(已上游进 vLLM 多层级卸载连接器)、模拟器/基准工具链——完整地图见 [llm-d/overview.md](llm-d/overview.md)「项目地图」。
 
 ### 借鉴点
 

@@ -16,14 +16,14 @@ AIBrix 是一套 **K8s 原生的 GenAI 推理基础设施积木**:控制面(CRD 
 
 | AIBrix 概念 | 本系统对应 | 关系 |
 |-------------|-----------|------|
-| Gateway Plugins(Envoy ExtProc 选 pod) | Go Router | **同层对照**;但 AIBrix 只做"选 pod",lake Router 还要做模式选择(PD 分离/混部/D-direct)与集群级调度 |
-| `prefix-cache` 路由(进程内哈希表) | Router 读存储池位置视图镜像 | **形态可对照**;AIBrix 的索引是网关侧估计, lake 的位置视图由存储控制面权威维护 |
+| Gateway Plugins(Envoy 扩展点上的选路插件:转发前回调问它"打到哪个 pod") | Go Router | **同层对照**;但 AIBrix 只做"选 pod",lake Router 还要做模式选择(PD 分离/混部/D-direct)与集群级调度 |
+| `prefix-cache` 路由(进程内哈希表) | Router 读存储池位置视图镜像 | **形态可对照**;AIBrix 的索引是网关侧估计,lake 的位置视图由存储控制面权威维护 |
 | KV 事件同步(vLLM ZMQ → 网关索引) | 存储池位置视图推送 | **机制同源**(都消费引擎 KV 事件);lake 的事件流由存储控制面汇聚成权威视图再推镜像,AIBrix 各网关副本各自订阅、各自收敛 |
-| `aibrix_kvcache` L1(DRAM)/L2(InfiniStore/HPKV 等) | lake L1/L2 分层 | **直接对标** FlexKV/LMCache 同层;lake 的 L1/L2 归存储池统一管理,AIBrix 的 L1 在引擎进程、L2 是可插拔外部集群 |
-| PodAutoscaler(HPA/KPA/APA) | 无(lake 不做扩缩控制) | **职责边界样本**:扩缩属外部控制面;lake 只上报信号。其"按 KV 使用率/排队长度扩缩"的指标选择可参考 |
-| StormService / RoleSet(PD 角色编排) | 无(编排归 K8s/外部) | PD 角色编排的 K8s 化样本;lake 的 PD 是运行时模式,不是静态角色 |
-| Metadata Service + Redis | etcd + 存储控制面 | AIBrix 用 Redis 做用户/限流/元数据权威;lake 用 etcd 做强一致元数据 |
-| Runtime Sidecar(指标标准化/LoRA/权重下载) | Python worker 辅助面 | sidecar 不代理推理流量,只做管理;职责切分干净,可参考 |
+| `aibrix_kvcache` L1(DRAM)/L2(InfiniStore/HPKV 等外部 KV 存储集群) | lake L1/L2 分层 | **直接对标** FlexKV/LMCache 同层;lake 的 L1/L2 归存储池统一管理,AIBrix 的 L1 在引擎进程、L2 是可插拔外部集群 |
+| PodAutoscaler(HPA/KPA/APA 三种扩缩算法) | Router Autoscaler(P6.5 扩缩决策)+ KV Node 一致性哈希 join/drain(P4.9) | **同责对照**:两家都按 KV 使用率/排队长度做扩缩**决策**;分工也一致——决策在系统内,真实开机器(provision)归外部编排 |
+| StormService / RoleSet(自研 K8s CRD:把 prefill/decode 等不同角色的 pod 编成一组,当一个服务整体部署) | 无对应(lake 的 PD 是逐请求运行时模式,角色不固化) | PD 角色编排的 K8s 化样本;对照见 [architecture.md](architecture.md) §5 |
+| Metadata Service + Redis | etcd + 存储控制面 | AIBrix 用 Redis 做用户/限流/元数据;lake 用 etcd 做强一致元数据 |
+| Runtime Sidecar(边车:与引擎同 pod 的管理容器,做指标标准化/LoRA/权重下载) | Python worker 辅助面 | sidecar 不代理推理流量,只做管理;职责切分干净,可参考 |
 
 **核心结论**:AIBrix 是"**平台层**"项目——路由、扩缩、编排、卸载、元数据全覆盖,但每一块都停在"K8s 生态标准做法"的深度:路由索引在网关进程内、KV 卸载以引擎为中心、状态权威分散在 K8s etcd 与 Redis。lake 与它的根本分歧不在功能清单,而在**状态权威的归属**:lake 把 KV 位置、分层、生命周期全部收归存储池(强一致控制面),AIBrix 把它们留在网关估计、引擎进程与外部缓存集群里。
 
@@ -36,19 +36,26 @@ AIBrix 是一套 **K8s 原生的 GenAI 推理基础设施积木**:控制面(CRD 
 
 ## 架构
 
-```
-Client HTTP
-  → Envoy Gateway(Gateway API HTTPRoute;modelrouter controller 自动建路由)
-  → ExtProc gRPC → gateway-plugins
-        ├─ 鉴权 / Redis 限流(RPM/TPM)
-        ├─ 路由打分(prefix-cache / least-* / VTC / Preble … 加权组合)
-        │     ├─ 进程内 PrefixHashTable(默认)
-        │     └─ 或 KV 事件同步索引(vLLM ZMQ → SyncPrefixHashTable)
-        └─ 回写 target-pod 头 → Envoy 转发到 pod
-推理 Pod = vLLM/SGLang (+ 可选 runtime sidecar + 可选 aibrix_kvcache connector)
-        └─ aibrix_kvcache:L1 DRAM(引擎进程内) → L2 远端集群(InfiniStore/HPKV,RDMA)
-控制面(K8s controller manager):PodAutoscaler / StormService / ModelAdapter(LoRA)
-        / KVCache CR / ModelRouter;Metadata Service(Python FastAPI + Redis)
+```mermaid
+flowchart TB
+    subgraph DP["数据面(请求路径)"]
+        Client[客户端] --> Envoy["Envoy Gateway<br/>(K8s Gateway API 路由)"]
+        Envoy -->|"ext-proc gRPC:转发前问决策"| GP["gateway-plugins<br/>鉴权 / Redis 限流 / 打分选 pod"]
+        GP -->|"回写 target-pod 头"| Envoy
+        Envoy --> Pod["推理 Pod<br/>vLLM / SGLang(+ 可选管理边车)"]
+        Pod -->|"可选:KV 卸载/取回"| L1["aibrix_kvcache L1<br/>DRAM(引擎进程内)"]
+        L1 -->|"RDMA / TCP"| L2[("L2 远端集群<br/>InfiniStore / HPKV")]
+        Pod -.->|"可选:ZMQ KV 事件"| GP
+    end
+    subgraph CP["控制面(K8s)"]
+        CTRL["controllers<br/>扩缩 / 多角色编排 / LoRA / KVCache CR"]
+        META["Metadata Service<br/>(Python FastAPI)"]
+        WATCH["kvcache-watcher<br/>(watch L2 成员)"]
+    end
+    CTRL -->|"K8s API"| Pod
+    WATCH -->|"写 L2 成员表"| Redis[("Redis<br/>限流计数 / 用户 / L2 成员表<br/>/ 可选路由状态同步")]
+    GP --> Redis
+    META --> Redis
 ```
 
 | 模块 | 职责 |
@@ -73,6 +80,7 @@ Client HTTP
 - **同步机制**:路由状态默认不同步;开 `AIBRIX_STATESYNC_ENABLED` 后经 Redis 周期 pull/push(**最终一致**);KV 事件索引走另一条路——每个网关副本各自用 ZMQ 订阅全部引擎 pod 的 BlockStored/BlockRemoved 事件,各自收敛。
 - **一致性分级**:编排态强一致(etcd);用户态 Redis 单点语义;路由亲和弱一致(本地估计 + 可选最终一致同步);KV 事件索引依赖事件流完整,丢事件则亲和短暂失真。
 - **HA 与故障**:网关副本重启丢本地索引(靠重新订阅事件流/重新同步重建);Redis 挂则鉴权/限流/元数据不可用;L1 KV 随引擎 pod 消亡;L2 数据持久性取决于外部后端(InfiniStore/HPKV)。
+  - 注意 Redis 在 L2 链路里**只存成员表与连接信息**(哪个 L2 节点活着、怎么连),块级元数据在 L2 后端内部、不经 Redis。成员表陈旧的最坏后果是连不上/连到已死节点 → 读 miss → 重算,**不会错误命中**——这是可用性问题,不是一致性正确性问题。
 - **扩展性**:网关无状态可水平扩;代价是每副本全量订阅事件流、全量维护索引,副本数 × 事件吞吐是固定放大系数。
 - **与 lake 对照**:AIBrix 的"各副本各自订阅、各自收敛"与 llm-d EPP 同构,都是 lake"单写者权威 + 镜像推送"的对立面。lake 的位置视图只有存储控制面一份权威,Router 读的是权威触发推送的镜像,可回查;AIBrix 每个副本的视图都是独立估计,副本间可能给出不同选路结果,且无权威可回查。另外 lake 的 KV 索引覆盖 L0(HBM),AIBrix 的两条索引路线(哈希表/事件同步)都只是**前缀→pod** 的亲和提示,不记录块在哪层介质。
 
@@ -111,7 +119,7 @@ Client HTTP
 1. **策略注册表 + 加权组合打分**:`RouterManager` + `Register` 的插件形态,lake Router 的代价函数演化为 scorer 组合时可直接对照。
 2. **KV 事件消费的工程细节**:ZMQ 订阅、msgpack 编解码、事件→前缀索引的转换层(`pkg/cache/kvcache/`),lake 存储控制面消费引擎事件时的编解码与背压处理可参考。
 3. **TP 感知 KV 对齐**:跨引擎复用时各 TP rank 先对齐命中长度再继续,这是 lake P5 对接引擎时绕不开的问题。
-4. **职责边界样板**:限流/鉴权/扩缩全在推理系统之外(网关与 K8s 控制面),与 lake"过载控制归 gateway"的原则完全同向,可作为该原则在业界落地的证据。
+4. **职责边界样板**:限流/鉴权在网关、不进引擎,与 lake"过载控制归 gateway"的原则同向,可作为该原则在业界落地的证据;其 KV 感知扩缩指标(KV 使用率/排队长度)与 lake Router Autoscaler(P6.5)的决策输入同类。
 
 **关键差异**(lake 更彻底,不照搬):
 

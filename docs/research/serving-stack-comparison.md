@@ -6,16 +6,16 @@
 ## 1. 一句话各自是什么
 
 1. **Dynamo**(NVIDIA):完整的**分布式推理运行时**——路由、PD 分离、KV 块管理、RDMA 传输、SLA 扩缩全在一个框架里,Rust 核心。
-2. **FlexKV**(腾讯云 TACO):一个**引擎旁 KV 卸载库**——只管"GPU 放不下时把 KV 卸到 CPU/SSD/远端",以 connector 注入现有引擎,不做路由、不做扩缩。
-3. **llm-d**(Red Hat/Google/IBM 等):K8s 原生推理栈,核心是 **EPP 路由器**——挂在 Envoy 扩展点上做精确缓存感知选路,外加 PD sidecar;KV 存储本身留给引擎。
-4. **AIBrix**(字节跳动 → vllm-project):K8s **平台积木全家桶**——网关路由、自动扩缩、编排 CRD、元数据服务、KV 卸载框架,九大件可拼装。
+2. **FlexKV**(腾讯云 TACO):一个**引擎旁 KV 卸载库**——只管"GPU 放不下时把 KV 卸到 CPU/SSD/远端",以插件(connector)形态注入现有引擎,不做路由、不做扩缩。
+3. **llm-d**(Red Hat/Google/IBM 等):K8s 原生推理栈,**组织下 18 个仓**:核心是 EPP 路由器(Endpoint Picker,挂在 Envoy 扩展点上做精确缓存感知选路;我们的 submodule `llm-d-router` 就是这个仓)+ PD 边车编排,外加 WVA 扩缩优化器、KV 索引库、文件系统卸载后端(已上游进 vLLM)、延迟预测器、基准/仿真工具链。
+4. **AIBrix**(字节跳动 → vllm-project):K8s **平台积木全家桶**——网关路由、自动扩缩、编排 CRD(K8s 自定义资源)、元数据服务、KV 卸载框架,九大件可拼装。
 
 ## 2. 为什么看起来相似
 
 1. **同一个生态**:都围绕 vLLM/SGLang,都在 K8s 上跑(FlexKV 除外)。
 2. **同一个动机**:KV cache 复用是推理省钱省延迟的关键,大家都围绕它做文章。
-3. **同一批技术**:radix/哈希块索引、引擎 KV 事件(ZMQ)、RDMA 传输、Envoy/网关扩展点。
-4. **同一个收敛方向**:K8s 侧都在向 Gateway API Inference Extension 靠拢,llm-d EPP 是该标准下的参考实现,production-stack 与 kgateway 都在向它迁移。
+3. **同一批技术**:前缀树(radix)/哈希块索引、引擎 KV 事件(ZMQ)、RDMA 传输、Envoy/网关扩展点。
+4. **同一个收敛方向**:K8s 侧都在向 Gateway API Inference Extension(K8s 网关 API 的推理扩展标准)靠拢,llm-d EPP 是该标准下的参考实现,production-stack 与 kgateway 都在向它迁移。
 
 相似的是**词汇表**,不同的是**各自动的是哪一层、状态归谁**。下面两节是关键。
 
@@ -27,7 +27,7 @@
 
 1. **Dynamo 是唯一全栈**:八层都有自家组件(引擎靠对接,不自研)。
 2. **FlexKV 只做中间三层**:卸载、索引、传输;路由、扩缩、编排一概没有——它是库,不是平台。
-3. **llm-d 集中在入口与编排**:路由(EPP)、PD 编排、K8s CRD 是核心;KV 存储明确不管(引擎私有),扩缩在独立仓(WVA)。
+3. **llm-d 集中在入口与编排**:路由(EPP)、PD 编排、K8s CRD 是核心;KV 卸载走引擎原生通道(它贡献的文件系统后端已上游进 vLLM),扩缩在同组织独立仓(WVA)。
 4. **AIBrix 覆盖最广但每块停在平台常规深度**:路由、扩缩、编排、卸载都有,但卸载以引擎为中心(L1 进程内),索引是网关侧估计。
 
 ## 4. KV 状态归谁:最本质的区别
@@ -39,7 +39,7 @@
 | 项目 | 位置知识在哪 | 一致性 |
 |------|-------------|--------|
 | Dynamo | router 进程内事件视图(估计)+ 引擎 worker 进程内块管理器(KVBM→KVCR) | 事件流最终一致;块管理器私有 |
-| FlexKV | 引擎旁 connector 进程内,每层一棵 radix 树;集群级只有 Redis 周期快照(可选) | 本机权威;集群弱一致 |
+| FlexKV | 引擎旁插件进程内,每层一棵前缀树(radix);集群级只有 Redis 周期快照(可选) | 本机权威;集群弱一致 |
 | llm-d | EPP 各副本各自订阅事件流、各自维护派生索引;引擎是真相但不共享 | 各副本最终一致;幽灵条目可能 |
 | AIBrix | 分散三处:网关索引(哈希表或事件同步两条路线)、引擎进程内 L1、外部 L2 集群(Redis 成员表) | 全部最终一致 |
 
@@ -50,7 +50,7 @@
 ![定位象限](serving-stack-comparison/figures/fig3-positioning.png)
 
 - **FlexKV** 在"库 × 深存储"格:功能面最窄,KV 管理钻得深。
-- **llm-d** 在"栈 × 浅 KV"格:路由与编排做透,KV 存储不碰。
+- **llm-d** 在"栈 × 浅 KV"格:路由与编排做透,KV 只做索引,存储交给引擎原生通道。
 - **Dynamo** 在"运行时 × 中深 KV"格:什么都管,但 KV 管理仍以引擎进程为单位。
 - **AIBrix** 在"平台 × 中深 KV"格:面最广,K8s 耦合最深。
 
@@ -60,10 +60,12 @@
 
 | | Dynamo | FlexKV | llm-d | AIBrix |
 |---|---|---|---|---|
-| 形态 | 独立 router 进程 | 无 | EPP(Envoy ext-proc) | Envoy ext-proc 网关插件 |
+| 形态 | 独立 router 进程 | 无 | EPP(挂在 Envoy ext-proc 上) | Envoy ext-proc 网关插件 |
 | 索引 | 链式块哈希 + 事件流 | — | 逐块索引 + 推测条目(TTL 2s) | 本地哈希表 / 事件同步索引 |
 | 策略 | KV-aware + overlap 量化 | — | 插件 scorer 加权组合(14+ 种) | 策略集加权组合(数量最多) |
 | 多副本 | 各自维护视图 | — | 各自订阅收敛 | 默认各自为政,可选 Redis 同步 |
+
+(ext-proc = Envoy 的外部处理协议:转发请求前先调外部服务要决策。两家都挂在这同一个扩展点上。)
 
 **小结**:llm-d 与 AIBrix 都挂在 Envoy ext-proc 上,差别在索引精度(llm-d 逐块精确 + 推测补窗;AIBrix 两条路线并存)和插件体系规整度(llm-d 更规整);Dynamo 走自家 router 进程,不依赖 Envoy;FlexKV 不参赛。
 
@@ -71,9 +73,11 @@
 
 | | Dynamo | FlexKV | llm-d | AIBrix |
 |---|---|---|---|---|
-| 地位 | 一等公民,旗舰特性 | 无关 | 主路径(sidecar)+ 备选(coordinator) | 静态角色(StormService)+ 雏形 |
+| 地位 | 一等公民,旗舰特性 | 无关 | 主路径(边车代理)+ 备选(独立编排服务) | 静态角色(StormService)+ 雏形 |
 | 决策 | 部署拓扑 + planner | — | 逐请求 decider(可按前缀命中决定不拆) | 部署拓扑为主 |
-| 执行 | NIXL 直传 | — | decode 先选,sidecar 串 prefill | PD + Mooncake 传输未落地(TODO) |
+| 执行 | NIXL 直传 | — | decode 先选,边车替它串 prefill | PD + Mooncake 传输未落地(TODO) |
+
+(边车 = 与引擎同 pod 的代理容器,替 decode 引擎向 prefill 发请求、接 KV;StormService = AIBrix 自研的 K8s CRD,把 prefill/decode 等不同角色的 pod 编成一组整体部署。NIXL = NVIDIA 的 RDMA 传输库。)
 
 **小结**:Dynamo 把 PD 当默认架构;llm-d 把 PD 做成可编排的多阶段流水线,且"先选 decode 再倒推 prefill"的决策顺序最讲究;AIBrix 的 PD 更多是编排层概念;FlexKV 不涉及。
 
@@ -81,9 +85,9 @@
 
 | | Dynamo | FlexKV | llm-d | AIBrix |
 |---|---|---|---|---|
-| 组件 | Planner(框架内) | 无 | WVA(独立仓 `workload-variant-autoscaler`) | PodAutoscaler(框架内 CRD) |
+| 组件 | Planner(框架内) | 无 | WVA(Workload Variant Autoscaler,同组织独立仓) | PodAutoscaler(框架内 CRD) |
 | 信号 | SLA 反推 + profiler 标定曲线 | — | KV 利用率/队列深度/饱和度(Prometheus) | KV 使用率/排队长度/延迟 |
-| 特点 | 按 TTFT/ITL 目标反推 prefill/decode 各自副本数 | — | 变体(variant)间成本感知:便宜的先扩、贵的先缩;指标交 HPA/KEDA 执行 | HPA/KPA/APA 三算法,APA 可接 GPU Optimizer 做异构 |
+| 特点 | 按 TTFT/ITL 目标反推 prefill/decode 各自副本数 | — | 变体(variant,同模型不同硬件/配置)间成本感知:便宜的先扩、贵的先缩;只出目标副本数,交标准 HPA/KEDA 执行 | HPA/KPA/APA 三算法(K8s 原生/Knative 风格/自研),APA 可接 GPU Optimizer 做异构 |
 
 **小结**:三家都有 KV 感知的扩缩,但分工不同——Dynamo 是 SLA 反推型(要 profiler 先标定),llm-d WVA 是优化器型(出目标副本数、交给标准 HPA 执行),AIBrix 是传统控制器型(指标直接驱动副本数)。WVA 有论文(arXiv 2603.09730):比 HPA 有效吞吐 +37%、请求失败降 10×。
 
@@ -91,12 +95,14 @@
 
 | | Dynamo | FlexKV | llm-d | AIBrix |
 |---|---|---|---|---|
-| 组件 | KVBM(已 sunset)→ KVCR | FlexKV 本体 | 无(引擎私有) | aibrix_kvcache |
-| 层 | GPU→CPU→SSD→对象存储 | CPU/SSD/远端 | — | L1 DRAM + L2 外部集群 |
-| 位置 | 引擎进程内 | connector 进程内 | — | 引擎进程内 + 外部集群 |
-| 传输 | NIXL(RDMA) | io_uring/GDS/Mooncake TE | — | RDMA/TCP |
+| 组件 | KVBM(KV 块管理器,已 sunset)→ KVCR(继任者) | FlexKV 本体 | llmd-fs-backend(文件系统卸载后端) | aibrix_kvcache |
+| 层 | GPU→CPU→SSD→对象存储 | CPU/SSD/远端 | GPU↔本地盘/共享文件系统/对象存储 | L1 DRAM + L2 外部集群 |
+| 位置 | 引擎进程内 | connector 进程内 | 引擎侧(vLLM 原生卸载连接器) | 引擎进程内 + 外部集群 |
+| 传输 | NIXL(RDMA) | io_uring/GDS/Mooncake TE | 文件系统读写 | RDMA/TCP |
 
-**小结**:FlexKV 与 aibrix_kvcache 严格同层(引擎旁卸载框架),FlexKV 层数更多、引擎接入面更宽;Dynamo 的 KVBM 已官宣 sunset,继任者 KVCR 换成"引擎进程内二级存储 + router hint 驱动 P2P"的路子;llm-d 明确不做存储。
+(io_uring = Linux 异步 IO;GDS = GPU Direct Storage,盘与显存直传;KVCR 细节见 [kvcr/](kvcr/overview.md)。)
+
+**小结**:FlexKV 与 aibrix_kvcache 严格同层(引擎旁卸载框架),FlexKV 层数更多、引擎接入面更宽;Dynamo 的 KVBM 已官宣 sunset,继任者 KVCR 换成"引擎进程内二级存储 + router hint 驱动 P2P"的路子;llm-d 不自建存储栈——它做的文件系统卸载后端已上游进 vLLM 多层级卸载连接器,存储语义留在引擎原生通道里。
 
 ### 6.5 分布式模型与 HA
 
@@ -113,7 +119,7 @@
 | | Dynamo | FlexKV | llm-d | AIBrix |
 |---|---|---|---|---|
 | 语言 | Rust 核心 + Python | C++ 内核 + Python | 几乎纯 Go | Go + Python + TS |
-| K8s 耦合 | 可独立可 K8s(operator/DGD) | 无 | 深(Gateway API 标准) | 最深(全是 CRD) |
+| K8s 耦合 | 可独立可 K8s(operator + 部署 CRD) | 无 | 深(Gateway API 标准) | 最深(全是 CRD) |
 | 引擎 | vLLM/SGLang/TRT-LLM | vLLM/SGLang/TRT-LLM/Dynamo | vLLM 为主 | vLLM/SGLang |
 | 背景 | NVIDIA | 腾讯云 TACO | Red Hat/Google/IBM 等 | 字节跳动捐给 vllm-project |
 
@@ -123,12 +129,13 @@
 2. **llm-d EPP 是 K8s 路由的收敛方向**:production-stack(#1032)与 kgateway 都在向 Gateway API Inference Extension + EPP 迁移,AIBrix 自研网关长期看也面对这个标准。
 3. **llm-d 与 AIBrix 消费同一类事件**:都是 vLLM 的 ZMQ KV 事件,各自实现订阅管线;生态上可能进一步共用。
 4. **Dynamo KVBM sunset 后的空位**由 KVCR(引擎内二级存储)接,与 FlexKV/AIBrix 的卸载框架形成同层竞争。
+5. **llm-d 在把通用能力上游化**:KV 索引库从 kv-cache 仓迁入 router 仓([llm-d-router#1886](https://github.com/llm-d/llm-d-router/pull/1886)),文件系统卸载后端并入 vLLM 多层级卸载连接器——能推给标准/引擎的就不自己扛。
 
 ## 8. 怎么选(场景导向)
 
 1. **要开箱即用的完整 PD 分离栈,且在 NVIDIA 生态** → Dynamo。
 2. **已有 vLLM/SGLang 服务,只想加 KV 卸载,不想动平台** → FlexKV(免补丁、库形态)。
-3. **要 K8s 标准路线、精确缓存感知路由、可插拔策略** → llm-d(EPP + InferencePool)。
+3. **要 K8s 标准路线、精确缓存感知路由、可插拔策略** → llm-d(EPP + InferencePool);配套的无 GPU 模拟器与基准工具链也是四家里最齐的。
 4. **要从零搭平台,路由/扩缩/编排/元数据/卸载全家桶一次拿齐** → AIBrix。
 5. **只想要一块能搬走的**:路由插件形态看 llm-d;卸载框架看 FlexKV;扩缩指标选型看 AIBrix 与 WVA。
 

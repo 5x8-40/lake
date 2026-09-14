@@ -1,17 +1,38 @@
 # llm-d Router — 总览
 
-> 源码:`3rdparty/llm-d-router`(submodule,HEAD `abb404ef`,2026-09-08)。上游 [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router)(llm-d 项目的路由仓;llm-d 由 Red Hat / Google / IBM 等联合发起)。许可:**Apache-2.0**。  
+> 源码:`3rdparty/llm-d-router`(submodule,HEAD `abb404ef`,2026-09-08)。上游 [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router)。**注意:本仓只是 llm-d 项目的路由组件**;llm-d 全项目(Red Hat / Google / IBM 等联合发起,K8s 原生分布式推理栈)的完整组件地图见下文「项目地图」节。许可:**Apache-2.0**。  
 > 文档站 [llm-d.ai](https://llm-d.ai)。架构/索引/PD 细节见 [architecture.md](architecture.md);与 lake 对照见 [pain-points.md](pain-points.md)。路由策略横评见 [`../model-routing.md`](../model-routing.md) §5。
 
 ## 一句话定位
 
-llm-d Router 是 K8s 上推理流量的**智能入口**:核心是 EPP(Endpoint Picker)——挂在 Envoy ext-proc 扩展点上的选路服务,消费各引擎 pod 的 KV 事件流维护全局块索引,做精确的前缀亲和 + 负载感知选路;同仓还带 PD 分离 sidecar 与可选的多阶段编排 coordinator。
+llm-d Router 是 K8s 上推理流量的**智能入口**:核心是 EPP(Endpoint Picker,端点选择器)——挂在 Envoy ext-proc 扩展点上的选路服务(ext-proc = Envoy 的外部处理协议:转发请求前先调外部服务要决策)。EPP 消费各引擎 pod 的 KV 事件流维护全局块索引,做精确的前缀亲和 + 负载感知选路;同仓还带 PD 分离用的边车代理(sidecar:与引擎同 pod 的配套容器,负责替 decode 引擎向 prefill 发请求、接 KV)与可选的多阶段编排服务 coordinator。
 
-> 术语沿革:项目原名 Inference Scheduler,已更名 llm-d Router;EPP 代码与 `InferenceObjective`/`InferenceModelRewrite` API 从 Gateway API Inference Extension(GIE)仓并入本仓,GIE 仓现在只留 `InferencePool` API 与 EPP 协议定义。
+> 术语沿革:项目原名 Inference Scheduler,已更名 llm-d Router;EPP 代码与 `InferenceObjective`/`InferenceModelRewrite` API 从 Gateway API Inference Extension(GIE,K8s 网关 API 的推理扩展标准)仓并入本仓,GIE 仓现在只留 `InferencePool` API 与 EPP 协议定义。
 
 ![llm-d Router 架构](figures/llm-d-router.svg)
 
 (图源:`3rdparty/llm-d-router` 官方文档图。EPP 在网关路径上,经 ext-proc 与 Envoy 交互。)
+
+## 项目地图:llm-d 不止路由
+
+llm-d 是一个**完整的 K8s 分布式推理项目**(GitHub org 下 18 个仓),路由只是其中一块。主要组件:
+
+| 仓 | 干什么 | 状态 |
+|----|--------|------|
+| `llm-d/llm-d` | 主仓:文档、部署指南(well-lit paths)、CI | 活跃 |
+| `llm-d/llm-d-router` | **EPP 路由 + PD sidecar + coordinator(本 submodule)** | 活跃;原名 inference-scheduler |
+| `llm-d/llm-d-kv-cache` | KV 块位置索引库 + 文件系统卸载后端 | 索引库**已迁入 router 仓**(#1886);FS 卸载后端**已上游进 vLLM**(成为多层级卸载连接器的 FS 层) |
+| `llm-d/llm-d-workload-variant-autoscaler` | WVA:SLO 感知的扩缩优化器(按 KV 利用率/队列深度/饱和度出目标副本数,交 HPA/KEDA 执行;论文 arXiv 2603.09730) | 活跃 |
+| `llm-d/llm-d-latency-predictor` | 延迟预测服务(XGBoost 训练 + 预测) | 活跃 |
+| `llm-d/llm-d-async` / `llm-d-batch-gateway` | 异步请求处理 / OpenAI 兼容批量推理 API | 活跃 |
+| `llm-d/llm-d-benchmark` / `llm-d-inference-sim` | 基准框架 / 无 GPU 的 vLLM 模拟器 | 活跃 |
+| `llm-d/llm-d-deployer` | Helm 部署 charts(model-service operator 已废弃,功能并入 Helm) | 活跃 |
+
+![llm-d 项目架构](figures/architecture.png)
+
+(图源:`3rdparty/llm-d-router` 官方文档图。注意左侧:Model Service、Infra、Benchmark、KV Cache Manager、Inference Sim 都是项目级组件;右侧才是本仓覆盖的请求路径——客户端经网关到 EPP 选路,prefill/decode 分离部署,KV 可落到本地 FS 或远端 FS。)
+
+**对本仓文档的读法**:overview/architecture/pain-points 三篇深挖的是 router 仓(EPP + sidecar + coordinator);项目级组件里与 lake 关系最大的是 WVA(扩缩)与 FS 卸载后端(它选择了"上游进 vLLM"而不是自维护存储栈),在本文的关系表与对照节里覆盖。
 
 ## 与本系统的关系
 
@@ -19,11 +40,13 @@ llm-d Router 是 K8s 上推理流量的**智能入口**:核心是 EPP(Endpoint P
 |------------|-----------|------|
 | EPP(ext-proc 选路服务) | Go Router | **同层对照**;EPP 只选 endpoint,lake Router 还做执行模式选择(PD/混部/D-direct) |
 | `pkg/kvcache` 全局块索引 | 存储池位置视图 | **形态对照最直接**:都是"块哈希 → pod"索引;但 EPP 索引是事件流派生的**副本视图**,lake 位置视图是存储控制面的**权威状态** |
-| 推测索引(决策后先写 TTL 2s 条目) | 无对应(lake 不需要) | **思路可借鉴**:湖镜像推送若引入决策-确认窗口,同类机制可补空窗;lake 目前由权威放置直接出视图 |
+| 推测索引(决策后先写 TTL 2s 条目) | 无对应(lake 不需要) | **思路可借鉴**:lake 镜像推送若引入决策-确认窗口,同类机制可补空窗;lake 目前由权威放置直接出视图 |
 | `pkg/kvevents` ZMQ 事件管线 | 引擎 → 存储控制面的状态上报 | **机制同源**:BlockStored/BlockRemoved/AllBlocksCleared 三类事件 + gap 检测重放 |
-| pd-sidecar / coordinator(PD 编排) | lake PD 分离模式 | **两种 PD 观对照**:llm-d 把 PD 当部署拓扑(sidecar 挂在 decode 上),lake 把 PD 当逐请求选路结果 |
+| pd-sidecar / coordinator(PD 编排) | lake PD 分离模式 | **两种 PD 观对照**:llm-d 把 PD 当部署拓扑(边车挂在 decode 上串阶段),lake 把 PD 当逐请求选路结果 |
 | InferenceObjective(优先级) | SLO/优先级上报 | 优先级语义由外部声明、EPP 执行;lake 的优先级裁决归 gateway |
 | InferenceModelRewrite(模型名改写) | 无 | A/B、灰度的网关侧做法,lake 不涉及 |
+| WVA 扩缩优化器(项目级,独立仓) | Router Autoscaler(P6.5)+ KV Node join/drain(P4.9) | **同责对照**:WVA 出目标副本数、交标准 HPA/KEDA 执行;lake 决策在 Router、真实开机器归外部。WVA 的"变体间成本感知"(便宜的配置先扩)lake 没有对应 |
+| llmd-fs-backend(项目级,FS 卸载后端) | lake L2/L3 | 它选择**上游进 vLLM**(多层级卸载连接器的 FS 层)而不是自维护存储栈;lake 的 L2/L3 归存储池,引擎连接器只是接入点 |
 
 **核心结论**:llm-d Router 代表了"**网关侧精确派**"的最高完成度——事件驱动、逐块精确、推测索引补传播窗口、十余种 scorer 插件化组合。但它的索引始终是**路由器为自己决策维护的派生缓存**:引擎才是 KV 真相,EPP 只是尽可能快地逼近它。lake 把这个关系倒过来:存储池就是真相,Router 读的视图不需要"逼近"谁。
 
@@ -36,17 +59,22 @@ llm-d Router 是 K8s 上推理流量的**智能入口**:核心是 EPP(Endpoint P
 
 ## 架构
 
+```mermaid
+flowchart TB
+    Client[客户端] --> Envoy["Envoy / Gateway<br/>(HTTPRoute → InferencePool)"]
+    Envoy -->|"ext-proc gRPC"| EPP
+    subgraph EPP["EPP(选路服务)"]
+        Director["Director:header → screener →<br/>data producers → admission"]
+        Sched["Scheduler:Filter 链 →<br/>加权 Scorer 求和 → Picker"]
+        Director --> Sched
+    end
+    EPP -->|"回写目标 endpoint<br/>(+ PD 时写 prefill/encode 头)"| Envoy
+    Envoy --> Decode["decode pod<br/>vLLM + 边车代理"]
+    Decode -->|"边车按头先打远端"| Prefill["prefill / encode pod"]
+    Engine["引擎 pod"] -.->|"ZMQ KV 事件(存/删块)"| EPP
 ```
-Client → Envoy / Gateway(API HTTPRoute → InferencePool)
-  → ext-proc gRPC → EPP
-      ├─ Director:header 处理 → screener → data producers(含精确前缀)
-      │     → admission → Scheduler.Schedule
-      ├─ Profile:Filter 链 → 加权 Scorer 求和 → Picker(max-score)
-      └─ 回写目标 endpoint(+ PD 时写 x-prefiller-host-port 等头)
-  → Envoy 转发到 decode pod
-      └─ pd-sidecar:按头先打远端 encode/prefill,再本地 decode
-引擎 pod(vLLM 等)→ ZMQ PUB KV 事件 → 每个 EPP 副本各自订阅 → 各自维护块索引
-```
+
+每个 EPP 副本各自订阅全部引擎 pod 的事件流,各自维护一份块索引(详见 [architecture.md](architecture.md) §3)。
 
 | 组件 | 职责 | 入口 |
 |------|------|------|
@@ -87,6 +115,7 @@ Client → Envoy / Gateway(API HTTPRoute → InferencePool)
 2. 插件体系最规整:filter/scorer/picker/profile 四层接口清晰,加策略不改框架(`docs/create_new_filter.md` 有教程)。
 3. PD 编排给出两种可部署形态(sidecar / coordinator),并按"先选 decode、再按需 encode、再按需 prefill"的顺序做决策,工程细节(超时、stranded memory 警告)写在明处。
 4. 标准化程度最高:全部构建在 Gateway API Inference Extension 之上,是 K8s 推理路由生态收敛的方向。
+5. 项目级工具链完整:无 GPU 模拟器(inference-sim)、基准框架(benchmark)、延迟预测器(latency-predictor)、批量/异步入口——做路由/调度研究时的配套实验设施齐全。
 
 **局限**(详见 [pain-points.md](pain-points.md)):
 
@@ -145,7 +174,7 @@ Client → Envoy / Gateway(API HTTPRoute → InferencePool)
 
 ## 参考
 
-- 上游:[github.com/llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) @ `abb404ef`;父项目 [llm-d/llm-d](https://github.com/llm-d/llm-d)
+- 上游:[github.com/llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) @ `abb404ef`;父项目 [llm-d/llm-d](https://github.com/llm-d/llm-d);全组件清单见 [llm-d 组织](https://github.com/llm-d)与[官方 Artifacts 页](https://llm-d.ai/docs/api-reference/artifacts)
 - 标准:[Gateway API Inference Extension](https://gateway-api-inference-extension.sigs.k8s.io)(GIE)
 - 路由横评:[`../model-routing.md`](../model-routing.md) §5(llm-d 节)
 - 分布式模型归类:[`../distributed-models.md`](../distributed-models.md)

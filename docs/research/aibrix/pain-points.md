@@ -28,7 +28,7 @@
 | 现象 | 证据 | lake |
 |------|------|------|
 | L1 在引擎进程内,pod 重启全丢 | `l1/l1_cache.py` | L1 是池化 DRAM,与算力节点生命周期解耦 |
-| L2 成员元数据走 Redis | `cmd/kvcache-watcher`;`RedisMetaService` | 池元数据在强一致控制面(etcd 降频 checkpoint) |
+| L2 成员表走 Redis(只存"哪些节点活着、怎么连";块级元数据在 L2 后端内部,不经 Redis) | `cmd/kvcache-watcher`;`RedisMetaService` 仅 `get_cluster_metadata` | 成员与块位置都在存储控制面权威视图。注:成员表最终一致的最坏后果是连不上→miss→重算,不会错命中,这条不算缺陷 |
 | 卸哪些块由引擎侧逐出策略局部决定 | LRU/FIFO/S3FIFO 逐出层 | 池按全局热度 + 引用计数冻结统一决策 |
 | 仅支持 FlashAttention/XFormers 布局 | `kvcache-offloading.rst` warning | 池按不透明字节块存取,不绑定 attention 实现 |
 | 选择性卸载的动机是低配网卡带宽 | offload 框架 README | 借鉴:带宽约束应进入池的迁移/预放置代价模型 |
@@ -37,8 +37,8 @@
 
 | 现象 | 证据 | lake |
 |------|------|------|
-| PD 是 StormService 静态角色拓扑 | `pkg/controller/stormservice/` | PD 是逐请求运行时模式,角色不固化 |
-| Autoscaler 只支持单一指标源 | `GetPaMetricSources` 注释 | 不涉及(lake 不做扩缩);指标选择经验可采 |
+| PD 是 StormService 静态角色拓扑(自研 CRD:prefill/decode 等不同角色 pod 编成一组整体部署) | `pkg/controller/stormservice/` | PD 是逐请求运行时模式,角色不固化 |
+| Autoscaler 只支持单一指标源 | `GetPaMetricSources` 注释 | lake Router Autoscaler(P6.5)目前同样以队列深度单信号为主、TTFT/ITL 预留——单信号是两家共同现状,多信号融合是共同方向 |
 | Preble 成本模型系数按"模型×GPU"硬编码 | issue #677 | lake 模式选择的开销模型需可校准(P7),不写死 |
 
 ## 5. 工程完成度
@@ -56,7 +56,7 @@
 2. **KV 事件管线工程**:ZMQ 订阅 + msgpack 编解码 + 事件到索引的转换层分层(`zmq_client` / `kvevent.Manager` / sync indexer),lake 存储控制面消费引擎事件时可对照分层。
 3. **TP 感知对齐**:prefill 前各 TP rank 对齐已取回 KV 长度(`GroupAwareKVCacheManager`)。lake P5 对接引擎做 Pool 命中续推时必须处理同一个问题。
 4. **过载拒绝位置的证据**:RPM/TPM 限流、鉴权全在 Envoy 回调链里,引擎不操心——lake"过载控制归 gateway"原则的生产级先例。
-5. **KV 感知扩缩指标**:`gpu_cache_usage_perc`、`num_requests_waiting` 进扩缩决策;lake 定义上报信号清单时直接收录。
+5. **KV 感知扩缩指标**:`gpu_cache_usage_perc`、`num_requests_waiting` 进扩缩决策;lake Router Autoscaler 的决策输入(队列深度/命中率,TTFT/ITL 预留)可对照其指标选型。
 
 ## 明确不照搬
 

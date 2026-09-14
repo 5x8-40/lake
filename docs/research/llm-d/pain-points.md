@@ -26,7 +26,7 @@
 
 | 现象 | 证据 | lake |
 |------|------|------|
-| PD 是静态角色 + sidecar 串阶段 | `docs/disaggregation.md`;`cmd/pd-sidecar` | PD 是逐请求模式;sidecar 中间人不需要 |
+| PD 是静态角色 + 边车串阶段(边车 = 与 decode 引擎同 pod 的代理容器,替引擎向 prefill 发请求、接 KV) | `docs/disaggregation.md`;`cmd/pd-sidecar` | PD 是逐请求模式;边车中间人不需要 |
 | prefill 崩溃留 stranded memory | `disaggregation.md` Drawbacks | KV 归存储池,worker 崩溃不滞留状态 |
 | TTFT 上升、多一跳 | 同上 | D-direct 模式就是为消这跳 |
 | encode 分离是 PoC | `disaggregation.md` WARNING | 多模态阶段分离暂不跟进,先记坑 |
@@ -40,6 +40,7 @@
 | DP rank 不进索引与去重 | `event_dedup_filter.go` TODO #370 | DP/TP 拓扑是放置输入,不是事后补的维度 |
 | 内存索引按 key 数计容,非按字节 | `in_memory.go` TODO | 池按字节与配额管理 |
 | 输出长度靠静态估计 | `inflightload/token_estimator.go` TODO | 调度输入含长度分布(参考 TIE,见 model-routing.md §6) |
+| KV 卸载走引擎原生连接器(FS 后端由 llm-d-kv-cache 仓贡献,已上游进 vLLM 多层级卸载连接器),路由器不参与 | llm-d-kv-cache 仓 README | 池是必经路径,不靠引擎可选连接器;卸载决策归池不归引擎 |
 
 ## 可直接借鉴
 
@@ -52,6 +53,6 @@
 ## 明确不照搬
 
 1. 派生索引 + 多副本各自收敛的一致性模型——lake 用单写者权威替代。
-2. sidecar/coordinator 的静态 PD 编排——lake PD 是运行时逐请求模式。
+2. 边车/coordinator 的静态 PD 编排——lake PD 是运行时逐请求模式。
 3. "每 pool 单模型"的架构假设——lake 存储池模型无关是既定原则。
 4. 把介质层级折算成打分权重——lake 位置视图直接携带层信息。

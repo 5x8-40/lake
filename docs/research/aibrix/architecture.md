@@ -3,15 +3,15 @@
 > [overview.md](overview.md) · [pain-points.md](pain-points.md)。调研快照:`3rdparty/aibrix` @ `fe7db93e`(2026-09-08)。  
 > 本文按数据面(§1–§3)→ 卸载框架(§4)→ 控制面(§5–§6)展开,每节末尾有小结。
 
-## 1. 网关数据面:Envoy ExtProc 请求路径
+## 1. 网关数据面:Envoy ext-proc 请求路径
 
-AIBrix 的数据面只有一条链:**客户端 → Envoy →(ExtProc gRPC)gateway-plugins → 引擎 pod**。网关插件不代理流量本体,只在请求转发前被 Envoy 回调,返回"打到哪个 pod"的决策。
+AIBrix 的数据面只有一条链:**客户端 → Envoy →(ext-proc gRPC)gateway-plugins → 引擎 pod**。ext-proc 是 Envoy 的"外部处理"协议:转发请求前,Envoy 先调一个外部服务要决策。网关插件不代理流量本体,只在这个回调里返回"打到哪个 pod"。
 
 1. **入口**:`cmd/plugins/main.go::main` 启动 gRPC 服务,注册 `extProcPb.RegisterExternalProcessorServer`。
 2. **处理管线**(`pkg/plugins/gateway/gateway.go::Process`):
    1. `HandleRequestHeaders`:鉴权、用户识别。
    2. `checkLimits`(`gateway_ratelimit.go`):Redis 计数的 RPM/TPM 限流——**过载拒绝发生在网关,不下放给引擎**。
-   3. `HandleRequestBody`(`gateway_req_body.go`):解析模型名,`validateModelAvailability`;若模型挂了 ModelClaim,可触发 runtime 唤醒(`modelclaim_wake.go::runtimeModelWakeRequester.RequestWake`)。
+   3. `HandleRequestBody`(`gateway_req_body.go`):解析模型名,`validateModelAvailability`;若模型挂了 ModelClaim(模型声明 CRD,支持休眠/唤醒),可触发 runtime 唤醒(`modelclaim_wake.go::runtimeModelWakeRequester.RequestWake`)。
    4. `selectTargetPod`:进路由层(§2),拿到目标 pod。
    5. 回写响应头 `target-pod` / `target-pod-ip` / `routing-strategy`(`pkg/plugins/gateway/types.go`),Envoy 按头转发。
 3. **响应路径**可选再经 ExtProc:解析 usage、累计 TPM。
@@ -45,7 +45,7 @@ AIBrix 是"近似派 vs 精确派"在同一代码库里的对照实验:
 1. `least-request` / `least-latency` / `least-busy-time`:按本地计数或指标选最闲 pod。
 2. `least-kv-cache` / `least-gpu-cache`:按 KV/显存占用选。
 3. `vtc-basic`:虚拟 token 计数的租户公平(论文 2401.00588);`vtc-fair` 等变体未实现(代码 TODO)。
-4. `prefix-cache-preble`:树版 Preble(2407.00023);其成本模型系数按"模型 × GPU"硬编码,issue #677 自认换硬件要重标定。
+4. `prefix-cache-preble`:树版 Preble(前缀感知调度的学术原型,论文 2407.00023);其成本模型系数按"模型 × GPU"硬编码,issue #677 自认换硬件要重标定。
 
 **小结**:路由层对 lake 的最大借鉴是**形态**——插件注册表 + 归一化加权打分,而非任何单一策略。lake 的代价函数 `f(请求, 集群状态)` 目前是单一式,演化为 scorer 组合时可照此形态;但 lake 的输入是存储池权威位置视图,不需要路线 A 这种"见过才记下"的估计索引。
 
@@ -68,12 +68,16 @@ AIBrix 是"近似派 vs 精确派"在同一代码库里的对照实验:
 1. **分层**:
    - L1 = 引擎进程内 DRAM 缓存(`l1/l1_cache.py::L1Cache`),避免频繁打远端;
    - L2 = 外部集群(`l2/l2_cache.py::L2Cache`),connector 可插拔:InfiniStore / HPKV / RocksDB / 共享文件系统(`l2/connectors/`)。
-2. **K8s 化运营**:`KVCache` CRD(`api/orchestration/v1alpha1/kvcache_types.go`)+ `KVCacheReconciler` 建 L2 集群;`cmd/kvcache-watcher` watch 成员变化写 Redis 成员表(`hpkv_cluster_metadata` 等),connector 从 Redis 发现节点。
+2. **K8s 化运营**:`KVCache` CRD(`api/orchestration/v1alpha1/kvcache_types.go`)+ `KVCacheReconciler` 建 L2 集群;`cmd/kvcache-watcher` watch 成员变化,把**成员表**(哪些 L2 节点活着、连接地址)写进 Redis(`hpkv_cluster_metadata` 等 key),connector 从 Redis 读成员表再直连 L2 节点。注意 Redis 里**没有块级元数据**——哪个块在 L2 哪个节点,由 L2 后端(InfiniStore/HPKV)内部管理。成员表最终一致,但陈旧的最坏后果是连不上 → 读 miss → 重算,不会错误命中。
 3. **TP 感知对齐**(`cache_manager.py::GroupAwareKVCacheManager`):TP>1 时各 rank 独立从 L2 取 KV,命中长度可能不同;prefill 前必须先对齐到共同前缀长度,否则各 rank 视图不一致。这是跨引擎 KV 复用的真实工程坑,AIBrix 明确处理了。
 4. **选择性卸载**:逐出策略层(LRU / FIFO / S3FIFO)决定"只卸热块/只卸冷块/全卸",动机是低配集群里多 GPU 共享一张 VPC 网卡,全量卸载会打爆带宽。
 5. **传输**:`transport/rdma.py` 支持 RDMA;限制:目前只支持 FlashAttention/XFormers 后端的 KV 布局。
 
-**小结**:形态上与 FlexKV / LMCache 完全同层(引擎 connector + 本机 L1 + 远端 L2)。对照 lake:L1 在引擎进程内、pod 重启全丢;L2 的成员发现与元数据走 Redis 而非强一致控制面;"卸哪些块"由逐出策略在引擎侧决定,而不是由池按全局热度决定。lake 可借鉴的是 **TP 对齐**与**选择性卸载的动机建模**(带宽受限场景),不照搬的是权威归属。
+![分布式 KV 缓存架构](figures/aibrix-dist-kv-cache-arch-overview.png)
+
+(图源:AIBrix 官方文档。右上:kvcache-watcher 把 L2 集群成员表同步到 Redis,vLLM pod 里的 connector 读 Redis 拿到成员与连接信息,再经 RDMA/以太网直连 L2 节点;KVCache CR 由 controller 落成集群。)
+
+**小结**:形态上与 FlexKV / LMCache 完全同层(引擎 connector + 本机 L1 + 远端 L2)。对照 lake:L1 在引擎进程内、pod 重启全丢;L2 成员发现走 Redis(最终一致,但只影响"连谁",不影响命中正确性),lake 的成员与块位置都在存储控制面权威视图里;"卸哪些块"由逐出策略在引擎侧决定,而不是由池按全局热度决定。lake 可借鉴的是 **TP 对齐**与**选择性卸载的动机建模**(带宽受限场景),不照搬的是权威归属。
 
 ## 5. 控制面:CRD 全家桶
 
@@ -82,13 +86,13 @@ AIBrix 是"近似派 vs 精确派"在同一代码库里的对照实验:
 | CRD / controller | 干什么 | 锚点 |
 |---|---|---|
 | **PodAutoscaler** | HPA/KPA/APA 三种策略扩缩推理 pod | `pkg/controller/podautoscaler/` |
-| **StormService / RoleSet / PodSet** | 三层编排:多角色(如 prefill/decode)一组 pod 的生命周期 | `pkg/controller/stormservice/` |
+| **StormService / RoleSet / PodSet** | 自研 CRD 三层编排:把 prefill/decode 等不同角色的 pod 编成一组,当一个服务整体部署/扩缩(类比:K8s Deployment 管一类 pod,StormService 管一组多角色 pod) | `pkg/controller/stormservice/` |
 | **ModelAdapter** | LoRA adapter 的加载/卸载编排 | `pkg/controller/modeladapter/` |
 | **ModelRouter** | 按模型名自动建 Gateway API 路由 | `pkg/controller/modelrouter/` |
 | **KVCache** | L2 集群编排(§4) | `pkg/controller/kvcache/` |
 | **RayClusterFleet** | Ray 集群舰队管理 | `pkg/controller/rayclusterfleet/` |
 
-**小结**:编排期望态的权威是 K8s etcd,这是 K8s 平台的天然选择。lake 不做这一层(worker 编排归外部),但 StormService 的"多角色一组"模型值得知道——它把 PD 分离当成**静态部署拓扑**,而 lake 把 PD 分离当成**逐请求的运行时模式**,这是两种根本不同的 PD 观。
+**小结**:编排期望态的权威是 K8s etcd,这是 K8s 平台的天然选择。lake 的真实开机器(provision)同样归外部编排,但注意分工差异:lake 的扩缩**决策**与 KV Node 入出池是自己做的(P6.5 Router Autoscaler、P4.9 一致性哈希 join/drain),AIBrix 则把决策也做成 K8s 控制器。另外 StormService 的"多角色一组"模型把 PD 分离当成**静态部署拓扑**,而 lake 把 PD 分离当成**逐请求的运行时模式**,这是两种根本不同的 PD 观。
 
 ## 6. 自动扩缩:指标选择比算法更值参考
 
@@ -97,7 +101,7 @@ AIBrix 是"近似派 vs 精确派"在同一代码库里的对照实验:
 3. **决策链**:`metrics/fetcher.go` 拉指标 → `algorithm.go::NewScalingAlgorithm` 选算法 → `autoscaler.go::ComputeDesiredReplicas` 算目标副本 → `workload_scale.go::SetDesiredReplicas` 写回。
 4. **限制**:`GetPaMetricSources` 目前只支持**单一**指标源。
 
-**小结**:扩缩在 lake 的职责边界之外（归外部控制面），但"KV 使用率/排队长度是推理扩缩的一等指标"这一经验值得写进 lake 的上报信号清单——lake 推理系统要向 gateway/外部控制面暴露的正是这类信号。
+**小结**:lake 自己也做扩缩决策(Router Autoscaler,P6.5:队列深度持续超阈 + 防抖 + cooldown + min/max 边界;TTFT/ITL 输入预留 P7),只有真实开机器归外部编排。两家决策输入高度同类——AIBrix 的 `gpu_cache_usage_perc` / `num_requests_waiting` 与 lake 的队列深度/命中率统计是同一思路;AIBrix 只支持单一指标源的限制,lake 目前同样是单信号为主,多信号融合是两家共同的方向。
 
 ## 7. 与 lake 的逐层对照
 
@@ -107,8 +111,8 @@ AIBrix 是"近似派 vs 精确派"在同一代码库里的对照实验:
 | 亲和索引 | 本地哈希表 / ZMQ 事件索引，副本各自收敛 | 存储控制面权威位置视图 + Router 镜像 | 权威有无；lake 可回查 |
 | KV L0(HBM) | 引擎私有，不进任何池索引 | 存储池统一管理放置 | lake 更彻底 |
 | KV L1 | 引擎进程内 DRAM | 池化 DRAM，统一编址 | lake 的 L1 是池不是进程 |
-| KV L2 | 外部集群 + Redis 成员表 | 池化 NVMe,F4 恢复点 | 元数据权威:Redis vs 控制面 |
+| KV L2 | 外部集群;Redis 只存成员表,块级元数据在后端内部 | 池化 NVMe,F4 恢复点 | 成员与块位置都在控制面权威视图 |
 | 卸载决策 | 引擎侧逐出策略（LRU/FIFO/S3FIFO) | 池按全局热度 + 引用计数冻结 | 局部策略 vs 全局策略 |
-| 编排 | StormService 静态角色 | 运行时逐请求模式 | 静态拓扑 vs 动态选路 |
+| 编排 | StormService 静态角色(多角色 pod 编组 CRD) | 运行时逐请求模式 | 静态拓扑 vs 动态选路 |
 | 过载控制 | 网关 Redis 限流 | 同（归 gateway) | **一致**,互为证据 |
-| 扩缩 | PodAutoscaler,KV 感知指标 | 不做，只上报信号 | 职责边界一致 |
+| 扩缩 | PodAutoscaler 控制器,KV 感知指标 | Router Autoscaler 决策 + KV Node join/drain;真实开机器归外部 | 决策都在系统内,provision 都在系统外 |
