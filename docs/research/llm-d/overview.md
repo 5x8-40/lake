@@ -20,7 +20,7 @@ llm-d 是一个**完整的 K8s 分布式推理项目**(GitHub org 下十余个�
 | 仓 | 干什么 | 状态 |
 |----|--------|------|
 | `llm-d/llm-d` | 主仓:文档、部署指南(well-lit paths)、CI | 活跃 |
-| `llm-d/llm-d-router` | **EPP 路由 + PD sidecar + coordinator(本 submodule)** | 活跃;原名 inference-scheduler |
+| `llm-d/llm-d-router` | **EPP 路由 + PD sidecar + coordinator + P2P KV 共享(本 submodule)** | 活跃;原名 inference-scheduler;P2P 共享 2026-08-15 公开([博客](https://llm-d.ai/blog/p2p-kv-cache-sharing-llm-d)) |
 | `llm-d/llm-d-kv-cache` | KV 块位置索引库 + 文件系统卸载后端 | 索引库**已迁入 router 仓**(#1886);FS 卸载后端**已上游进 vLLM**(成为多层级卸载连接器的 FS 层) |
 | `llm-d/llm-d-autoscaling` | WVA(Workload Variant Autoscaler):SLO 感知的扩缩优化器(按 KV 利用率/队列深度/饱和度出目标副本数,交标准 HPA/KEDA 执行——HPA 是 K8s 原生水平扩缩控制器,KEDA 是事件驱动扩缩器;论文 arXiv 2603.09730;仓原名 workload-variant-autoscaler) | 活跃 |
 | `llm-d/llm-d-latency-predictor` | 延迟预测服务(XGBoost 训练 + 预测) | 活跃 |
@@ -47,6 +47,7 @@ llm-d 是一个**完整的 K8s 分布式推理项目**(GitHub org 下十余个�
 | InferenceModelRewrite(模型名改写) | 无 | A/B、灰度的网关侧做法,lake 不涉及 |
 | WVA 扩缩优化器(项目级,独立仓) | Router Autoscaler(P6.5)+ KV Node join/drain(P4.9) | **同责对照**:WVA 出目标副本数、交标准 HPA/KEDA 执行;lake 决策在 Router、真实开机器归外部。WVA 的"变体间成本感知"(便宜的配置先扩)lake 没有对应 |
 | llmd-fs-backend(项目级,FS 卸载后端) | lake L2/L3 | 它选择**上游进 vLLM**(多层级卸载连接器的 FS 层)而不是自维护存储栈;lake 的 L2/L3 归存储池,引擎连接器只是接入点 |
+| P2P KV 共享(`p2p-source-producer` + sidecar,NIXL CPU↔CPU) | lake 存储池统一承载 + D-direct | **组织方式对照**:llm-d 无中心 KV 数据面——KV 留在各实例 CPU 层,EPP 派生索引兼作位置目录(只作 hint,可用性握手时才由 producer 确认),locality 破裂时点对点补传输;lake 由池统一放置/预置,本地命中走 D-direct 零传输。一个是事后补传,一个是事前放置 |
 
 **核心结论**:llm-d Router 代表了"**网关侧精确派**"的最高完成度——事件驱动、逐块精确、推测索引补传播窗口、20 种 scorer 插件化组合。但它的索引始终是**路由器为自己决策维护的派生缓存**:引擎才是 KV 真相,EPP 只是尽可能快地逼近它。lake 把这个关系倒过来:存储池就是真相,Router 读的视图不需要"逼近"谁。
 
@@ -94,7 +95,12 @@ flowchart TB
 - **一致性分级**:索引最终一致且允许短暂失真;丢 remove 事件会留下幽灵条目(代码注释自认);推测条目与确认条目共存,TTL 到期只清推测。
 - **HA 与故障**:三种模式——Active-Active(但近似前缀路由下应避免,副本间不共享该状态)、Active-Passive(租约选主或 Envoy 优先级)、fail-open(EPP 全挂时 Envoy 直打后端)。peer discovery 已就位,但跨副本前缀状态同步**尚未实现**,只铺路。
 - **扩展性**:副本即订阅者,加法简单;代价是每副本全量订阅、全量索引,事件吞吐 × 副本数是固定放大。架构假设单 InferencePool 单 EPP(Envoy 限制)、每 pool 单一 base 模型。
-- **与 lake 对照**:llm-d 的多副本各自收敛,是 lake"单写者权威 + 镜像推送"的反面对照——同样消费事件流,lake 让事件流汇入存储控制面形成唯一权威,Router 副本读的是权威推送的镜像,副本间天然一致,且误判可回查权威。llm-d 没有可回查的权威点,幽灵条目只能靠后续事件自然修正。
+- **KV 层(卸载与共享)的分布式模型**——与路由索引分开看,四条路径各有一套:
+  1. **CPU 层**(vLLM 原生 OffloadingConnector):每节点私有,无分布式语义;
+  2. **FS 卸载后端**(已上游进 vLLM):数据落共享文件系统,块键即路径(内容寻址),**无独立元数据服务**,一致性 = 文件系统语义,跨节点可见性由 FS 本身保证;
+  3. **P2P 共享**(2026-08 公开):**无中心数据面**——KV 留在各实例 CPU 层,EPP 派生索引兼作位置目录(只作 hint,真实可用性由 producer 在握手时确认),consumer 发块哈希、producer 经 NIXL 把匹配块 CPU↔CPU 写过去,producer 保留副本,两侧 GPU 都不参与拷贝;
+  4. **外部连接器**(LMCache / Mooncake / KVBM):分布式模型各自自带,llm-d 不统一。
+- **与 lake 对照**:llm-d 的多副本各自收敛,是 lake"单写者权威 + 镜像推送"的反面对照——同样消费事件流,lake 让事件流汇入存储控制面形成唯一权威,Router 副本读的是权威推送的镜像,副本间天然一致,且误判可回查权威。llm-d 没有可回查的权威点,幽灵条目只能靠后续事件自然修正。KV 层同样如此:llm-d 四条路径都没有位置权威(P2P 用派生索引当目录、握手兜底),lake 的位置知识只有存储池一份权威。
 
 ## 技术栈
 
@@ -116,6 +122,7 @@ flowchart TB
 3. PD 编排给出两种可部署形态(sidecar / coordinator),并按"先选 decode、再按需 encode、再按需 prefill"的顺序做决策,工程细节(超时、stranded memory 警告)写在明处。
 4. 标准化程度最高:全部构建在 Gateway API Inference Extension 之上,是 K8s 推理路由生态收敛的方向。
 5. 项目级工具链完整:无 GPU 模拟器(inference-sim)、基准框架(benchmark)、延迟预测器(latency-predictor)、批量/异步入口——做路由/调度研究时的配套实验设施齐全。
+6. P2P KV 共享给出"locality 破裂"的标准答案:本地命中优先,命中不了就把 KV 拉过来而不是重算;官方数据(GLM-5.2,32×H200):精确路由 + P2P 成功吞吐 +11.1%,PD 多轮会话 TTFT 中位 6.83s → 1.09s。
 
 **局限**(详见 [pain-points.md](pain-points.md)):
 
@@ -132,6 +139,7 @@ flowchart TB
 2. **事件管线韧性设计**:序列号 gap 检测 + 重放 + 去重过滤器的组合,是消费引擎事件流的标准三件套。
 3. **插件配置形态**:`EndpointPickerConfig` 一份 YAML 声明插件与 profile 组合,框架零改动。
 4. **PD 决策顺序**:先选 decode(承载状态最重),再倒推 prefill——与 lake"调度器读位置视图组 batch"的方向一致。
+5. **P2P 的阈值与采样**:`minCachedTokenDelta` 用实测"传输 vs 重算"交叉点当开关(低于交叉点的短前缀拉了反而亏);多个近似持有者按**等待队列深度反比**采样 producer,避免并发拉取打爆单点——lake 的 Pool 命中传输调度可借鉴这两条。
 
 **关键差异**(lake 更彻底,不照搬):
 

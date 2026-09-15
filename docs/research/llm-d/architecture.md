@@ -2,7 +2,7 @@
 
 > [overview.md](overview.md) · [pain-points.md](pain-points.md)。调研快照:`3rdparty/llm-d-router` @ `abb404ef`(2026-09-08)。  
 > 本文只深挖 router 仓(EPP + 边车 + coordinator);llm-d 项目级组件(WVA 扩缩、FS 卸载、模拟器/基准等)见 [overview.md](overview.md)「项目地图」。  
-> §1 请求路径 → §2 块索引 → §3 事件管线 → §4 推测索引 → §5 插件体系 → §6 PD 编排 → §7 多副本与 HA。每节末尾有小结。
+> §1 请求路径 → §2 块索引 → §3 事件管线 → §4 推测索引 → §5 插件体系 → §6 PD 编排 → §7 P2P KV 共享 → §8 多副本与 HA。每节末尾有小结。
 
 ## 1. 请求路径:ext-proc 回调里的完整选路
 
@@ -127,7 +127,33 @@ sidecar(边车)指与引擎容器跑在同一个 pod 里的配套代理容器—
 
 **小结**:llm-d 的 PD 是"**部署时分开、运行时串接**"——prefill/decode 是静态角色,sidecar 把两跳串成一跳的外观。lake 的 PD 是逐请求模式选择,同一集群里分离/混部/D-direct 并存,不需要 sidecar 这个中间人;但 llm-d 把 PD 工程问题(stranded memory、超时重试、先选 decode)摆到明处,这些坑 lake 同样要过。
 
-## 7. 多副本与 HA
+## 7. P2P KV 共享:locality 破裂时的补传输
+
+2026-08-15 公开([官方博客](https://llm-d.ai/blog/p2p-kv-cache-sharing-llm-d))。要解决的问题:前缀 KV 已在集群里,但持有它的实例在排队——路由到持有者要排队,路由到空闲节点要重算,两个答案都不对。P2P 给第三条路:**按负载选最优节点,把 KV 拷过去**。
+
+### 7.1 机制
+
+- 每个参与的 vLLM 实例按请求扮两种角色:**consumer**(从对等节点拉匹配块,代替本地重算)与 **producer**(从自己的 CPU 卸载层供块)。传输是 CPU↔CPU,两侧 GPU 都不参与拷贝——供块的代价是 producer 的 CPU 内存带宽与网卡,不是 GPU 算力;producer 保留副本(拷贝,不是移动)。
+- 握手:consumer 发所需块的哈希,producer 回报哪些块还在,然后经 NIXL(UCX/RDMA)把匹配块**写**过去。**索引只作 hint,真实可用性以握手为准**。
+- EPP 侧:`p2p-source-producer` 数据插件(`pkg/epp/framework/plugins/requestcontrol/dataproducer/p2psource/producer.go`)从前缀索引选 source——"持有最多前缀的对等节点"比"选定目的地"多持有超过 `minCachedTokenDelta`(默认 1;生产应设在实测交叉点之上)才指定 source,打平或自命中保持本地。多个近似持有者按**等待队列深度反比**采样(`waitingQueueSize`),把并发拉取摊开。
+- 执行侧:EPP 把 source 写进请求头,decode pod 的 sidecar 转成引擎的 P2P 参数(`pkg/sidecar/proxy/connector_p2p.go::handleP2P` / `addP2PPullToPrefill` / `decodeWithP2PSource`;NIXL v2 连接器见 `connector_nixlv2.go`)。
+- 与 PD 分离组合:prefill worker 可以拉 decode 产生的历史 KV,只算增量部分,再走正常 PD 流程,应用无感。
+
+### 7.2 边界(官方自认)
+
+- **默认关闭**:交叉点(传输 vs 重算)随模型/KV 格式/硬件/网络而变,必须先实测校准。gpt-oss-120b @ H200 上 2K token 就赚(35ms vs 78ms),GLM-5.2(KV 约 93KB/token)上约 8.7K token 才回本。
+- **静默前提**:所有对等节点必须用相同的 block-size 与 hash-seed,否则块哈希对不上,P2P 静默退化为零命中。
+- 本地命中时 P2P 正确地不动作;索引刚重启时没有 source 可用;冷前缀首次仍需重算——它消除的是重复劳动,不是首次计算。
+
+### 7.3 效果(官方数据)
+
+- GLM-5.2-FP8(753B MoE,32×H200,PD 分离,并发 64):精确路由 + P2P 成功吞吐 +11.1%(对近似路由基线),三次重复平均 +9.6%,TTFT 中位 −25%。
+- PD 多轮会话历史跨角色搬运:TTFT 中位 6.83s → 1.09s,吞吐 +50%。
+- 文档问答(192 篇 48K token 文档 × 128 会话):负载感知放置 + P2P 对比精确亲和,p99 TTFT 25.2s → 16.6s,吞吐 +35%,冷集群客户端超时 48 → 0。
+
+**小结**:P2P 把 EPP 的派生索引从"选路依据"升级为"传输指令"——与 Dynamo KVCR 的"router hint 驱动 NIXL P2P"同构,"路由器指路 + 引擎间直传"正在收敛成公共模式。对 lake 的对照:lake 由存储池统一放置/预置,本地命中走 D-direct 零传输;llm-d 没有池,用 P2P 事后补救 locality 破裂。一个是事前放置,一个是事后补传;且 lake 的位置目录是权威视图,llm-d 的是派生索引加握手兜底。
+
+## 8. 多副本与 HA
 
 | 模式 | 做法 | 限制 |
 |------|------|------|

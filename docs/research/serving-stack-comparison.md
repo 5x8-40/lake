@@ -7,7 +7,7 @@
 
 1. **Dynamo**(NVIDIA):完整的**分布式推理运行时**——路由、PD 分离、KV 块管理、RDMA 传输、SLA 扩缩全在一个框架里,Rust 核心。
 2. **FlexKV**(腾讯云 TACO):一个**引擎旁 KV 卸载库**——只管"GPU 放不下时把 KV 卸到 CPU/SSD/远端",以插件(connector)形态注入现有引擎,不做路由、不做扩缩。
-3. **llm-d**(Red Hat/Google/IBM 等):K8s 原生推理栈,**组织下十余个仓**:核心是 EPP 路由器(Endpoint Picker,挂在 Envoy 扩展点上做精确缓存感知选路;我们的 submodule `llm-d-router` 就是这个仓)+ PD 边车编排,外加 WVA 扩缩优化器、KV 索引库、文件系统卸载后端(已上游进 vLLM)、延迟预测器、基准/仿真工具链。
+3. **llm-d**(Red Hat/Google/IBM 等):K8s 原生推理栈,**组织下十余个仓**:核心是 EPP 路由器(Endpoint Picker,挂在 Envoy 扩展点上做精确缓存感知选路;我们的 submodule `llm-d-router` 就是这个仓)+ PD 边车编排 + P2P KV 共享(2026-08 公开,实例间 NIXL 直传),外加 WVA 扩缩优化器、KV 索引库、文件系统卸载后端(已上游进 vLLM)、延迟预测器、基准/仿真工具链。
 4. **AIBrix**(字节跳动 → vllm-project):K8s **平台积木全家桶**——网关路由、自动扩缩、编排 CRD(K8s 自定义资源)、元数据服务、KV 卸载框架,可按需拼装。
 
 ## 2. 为什么看起来相似
@@ -40,7 +40,7 @@
 |------|-------------|--------|
 | Dynamo | router 进程内事件视图(估计)+ 引擎 worker 进程内块管理器(KVBM→KVCR) | 事件流最终一致;块管理器私有 |
 | FlexKV | 引擎旁插件进程内,每层一棵前缀树(radix);集群级只有 Redis 周期快照(可选) | 本机权威;集群弱一致 |
-| llm-d | EPP 各副本各自订阅事件流、各自维护派生索引;引擎是真相但不共享 | 各副本最终一致;幽灵条目可能 |
+| llm-d | EPP 各副本各自订阅事件流、各自维护派生索引;引擎是真相但不共享;P2P 共享时该索引兼作传输位置目录(只作 hint,握手确认) | 各副本最终一致;幽灵条目可能 |
 | AIBrix | 分散三处:网关索引(哈希表或事件同步两条路线)、引擎进程内 L1、外部 L2 集群(Redis 成员表) | 全部最终一致 |
 
 一句话:**没有一家有全局强一致的 KV 位置权威**——区别只在"估计"发生在哪、有几份、怎么同步。Dynamo 和 llm-d 把估计放在路由器(事件驱动);AIBrix 放在网关(估计或事件二选一);FlexKV 放在引擎旁(本机精确,集群靠快照)。
@@ -95,14 +95,14 @@
 
 | | Dynamo | FlexKV | llm-d | AIBrix |
 |---|---|---|---|---|
-| 组件 | KVBM(KV 块管理器,已 sunset)→ KVCR(继任者) | FlexKV 本体 | llmd-fs-backend(文件系统卸载后端) | aibrix_kvcache |
-| 层 | GPU→CPU→SSD→对象存储 | CPU/SSD/远端 | GPU↔本地盘/共享文件系统/对象存储 | L1 DRAM + L2 外部集群 |
-| 位置 | 引擎进程内 | connector 进程内 | 引擎侧(vLLM 原生卸载连接器) | 引擎进程内 + 外部集群 |
-| 传输 | NIXL(RDMA) | io_uring/GDS/Mooncake TE | 文件系统读写 | RDMA/TCP |
+| 组件 | KVBM(KV 块管理器,已 sunset)→ KVCR(继任者) | FlexKV 本体 | llmd-fs-backend(文件系统卸载)+ P2P 共享(实例间直传) | aibrix_kvcache |
+| 层 | GPU→CPU→SSD→对象存储 | CPU/SSD/远端 | GPU↔CPU/共享文件系统 + 对等节点 CPU 层 | L1 DRAM + L2 外部集群 |
+| 位置 | 引擎进程内 | connector 进程内 | 引擎侧(vLLM 原生卸载连接器);P2P 无中心数据面 | 引擎进程内 + 外部集群 |
+| 传输 | NIXL(RDMA) | io_uring/GDS/Mooncake TE | 文件系统读写 + NIXL(CPU↔CPU) | RDMA/TCP |
 
 (io_uring = Linux 异步 IO;GDS = GPU Direct Storage,盘与显存直传;KVCR 细节见 [kvcr/](kvcr/overview.md)。)
 
-**小结**:FlexKV 与 aibrix_kvcache 严格同层(引擎旁卸载框架),FlexKV 层数更多、引擎接入面更宽;Dynamo 的 KVBM 已官宣 sunset,继任者 KVCR 换成"引擎进程内二级存储 + router hint 驱动 P2P"的路子;llm-d 不自建存储栈——它做的文件系统卸载后端已上游进 vLLM 多层级卸载连接器,存储语义留在引擎原生通道里。
+**小结**:FlexKV 与 aibrix_kvcache 严格同层(引擎旁卸载框架),FlexKV 层数更多、引擎接入面更宽;Dynamo 的 KVBM 已官宣 sunset,继任者 KVCR 换成"引擎进程内二级存储 + router hint 驱动 P2P"的路子;llm-d 不自建存储栈——文件系统卸载后端已上游进 vLLM,跨实例共享走 P2P(EPP 索引指路 + NIXL CPU↔CPU 直传),存储语义留在引擎原生通道里。
 
 ### 6.5 分布式模型与 HA
 
@@ -130,6 +130,7 @@
 3. **llm-d 与 AIBrix 消费同一类事件**:都是 vLLM 的 ZMQ KV 事件,各自实现订阅管线;生态上可能进一步共用。
 4. **Dynamo KVBM sunset 后的空位**由 KVCR(引擎内二级存储)接,与 FlexKV/AIBrix 的卸载框架形成同层竞争。
 5. **llm-d 在把通用能力上游化**:KV 索引库从 kv-cache 仓迁入 router 仓([llm-d-router#1886](https://github.com/llm-d/llm-d-router/pull/1886)),文件系统卸载后端并入 vLLM 多层级卸载连接器——能推给标准/引擎的就不自己扛。
+6. **"路由器指路 + 引擎间 NIXL 直传"在收敛**:llm-d P2P 共享(EPP 索引当位置目录 + NIXL CPU↔CPU)与 Dynamo KVCR(router hint 驱动跨节点 P2P)同构——两家独立走到同一个模式,说明这是 PD 分离之外 KV 复用的第二个收敛点。
 
 ## 8. 怎么选(场景导向)
 

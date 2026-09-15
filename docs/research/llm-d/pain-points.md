@@ -41,6 +41,9 @@
 | 内存索引按 key 数计容,非按字节 | `in_memory.go` TODO | 池按字节与配额管理 |
 | 输出长度靠静态估计 | `.../dataproducer/inflightload/token_estimator.go` TODO(outlen) | 调度输入含长度分布(参考 TIE,见 model-routing.md §6) |
 | KV 卸载走引擎原生连接器(FS 后端由 llm-d-kv-cache 仓贡献,已上游进 vLLM 多层级卸载连接器),路由器不参与 | llm-d-kv-cache 仓 README | 池是必经路径,不靠引擎可选连接器;卸载决策归池不归引擎 |
+| P2P 共享默认关闭,"传输 vs 重算"交叉点需逐部署实测校准 | P2P 博客「Price the Transfer Before Using It」 | 传输/重算代价本就进 lake 调度代价模型(P7 校准) |
+| P2P 要求全集群相同的 block-size 与 hash-seed,不匹配则静默零命中 | P2P 博客「Silent prerequisite」 | 池统一管块格式与哈希,无此前提 |
+| P2P 只从 producer 的 CPU 卸载层供块,两侧 GPU 不参与 | P2P 博客「How P2P Works」 | 池统一编址 L0–L3,L0 本地命中走 D-direct,不经 CPU 绕行 |
 
 ## 可直接借鉴
 
@@ -49,6 +52,7 @@
 3. **插件配置形态**:`EndpointPickerConfig` 一份 YAML 组合 filter/scorer/profile,加策略不动框架(`configloader.go::InstantiateAndConfigure`)。
 4. **PD 决策顺序**:先选 decode 再倒推 prefill(`prefix_based_pd_decider.go`),与"状态最重的角色先定"的直觉一致,lake 组 batch 时同理。
 5. **介质分权重打分**:gpu=1.0/cpu=0.8 的前缀命中折算,是"命中不等于命中"的最简表达——lake 的位置视图直接带层信息,表达力更强,但这个折算系数可作调度代价模型的初值。
+6. **P2P 的阈值与采样**:`minCachedTokenDelta` 用实测交叉点当开关;近似持有者按等待队列深度反比采样 producer(`p2psource/producer.go::waitingQueueSize`);"索引只作 hint、握手确认可用性"的轻量分工——lake Pool 命中的传输调度可借鉴。
 
 ## 明确不照搬
 
