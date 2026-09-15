@@ -6,19 +6,28 @@
 
 ## 1. 请求路径:ext-proc 回调里的完整选路
 
-EPP 是 Envoy 的 External Processing 后端,只实现 `FULL_DUPLEX_STREAMED` 一种 body 模式。一个请求的处理顺序:
+EPP 是 Envoy 的 External Processing 后端,只实现 `FULL_DUPLEX_STREAMED` 一种 body 模式。一个请求的完整路径:
 
-1. `StreamingServer.Process`(`pkg/epp/handlers/server.go`)收到 ext-proc 流。
-2. `HandleRequestHeaders` → 解析请求体。
-3. `Director.HandleRequest`(`pkg/epp/requestcontrol/director.go`)编排全流程:
-   1. header 处理插件;
-   2. screener(请求能不能进);
-   3. **data producers**:为调度准备数据——`precise-prefix-cache-producer` 在这里把 prompt 切成块键、确保对该 pod 的事件订阅存在(`Extract` / `ensureSubscriber`);
-   4. admission(准入);
-   5. `Scheduler.Schedule`(`pkg/epp/scheduling/scheduler.go`)。
-4. 调度内部(`SchedulerProfile`):Filter 链筛掉不合格 pod → 各 **Scorer** 打分,`enforceScoreRange(score) × Weight` 后**累加** → Picker(默认 max-score)定终点。
-5. 决策写回 ext-proc 响应:目标 endpoint;若走 PD,同时写 `x-prefiller-host-port` / `x-encoder-hosts-ports` 等头。
-6. Envoy 转发到 decode pod;pod 上的 sidecar 按头执行多阶段编排(§6)。
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as 客户端
+    participant G as Envoy 网关
+    participant E as EPP
+    participant S as decode pod(sidecar)
+    C->>G: 推理请求
+    G->>E: ext-proc 流
+    Note over E: Director.HandleRequest 编排
+    E->>E: header 插件 → screener(准入筛查) → data producers → admission
+    Note over E: data producers 里 precise-prefix-cache-producer<br/>把 prompt 切成块键、确保对该 pod 的事件订阅存在
+    E->>E: Scheduler: Filter 筛掉不合格 pod → Scorer 加权累加 → Picker 定终点
+    E-->>G: 写回目标 endpoint;走 PD 时附 x-prefiller-host-port 等头
+    G->>S: 转发到 decode pod
+    Note over S: sidecar 读头执行多阶段编排(§6)
+    S-->>C: 流式输出 token
+```
+
+代码锚点:`StreamingServer.Process`(`pkg/epp/handlers/server.go`)→ `Director.HandleRequest`(`pkg/epp/requestcontrol/director.go`)→ `Scheduler.Schedule`(`pkg/epp/scheduling/scheduler.go`);Scorer 打分经 `enforceScoreRange(score) × Weight` 截断加权后**累加**;切块键与订阅见 `preciseprefixcache` 的 `Extract` / `ensureSubscriber`。
 
 **小结**:EPP 把"选路"做成了 Envoy 回调里的一段纯计算——无自有数据面,无自有协议。代价是 Envoy 限制(单 InferencePool 单 EPP、流式 body 模式)直接进入架构假设。
 
@@ -119,7 +128,14 @@ sidecar(边车)指与引擎容器跑在同一个 pod 里的配套代理容器—
 
 ### 6.2 路径 B:coordinator
 
-独立部署的流水线服务(`pkg/coordinator/pipeline`),**每个阶段单独过网关经 EPP 选路**,不依赖 sidecar;step 可注册扩展(`pipeline.Register` + `Step`)。encode 分离(E/P/D)标为 **PoC/experimental**。
+sidecar 路径把"先 prefill 再 decode"藏在 decode pod 里完成;coordinator 路径换了一个做法——**多阶段编排交给一个独立部署的服务**:
+
+1. 客户端请求不直接进引擎,先到 coordinator(`cmd/coordinator`,独立服务)。
+2. coordinator 把请求拆成一条**流水线**逐步执行(`pkg/coordinator/pipeline/pipeline.go::Pipeline.Execute`):`replace-media-urls`(多模态 URL 替换)→ `render` → `encode`(可选)→ `prefill` → `decode`,每一步是 `pkg/coordinator/steps/` 下的一个 `Step`,可注册扩展(`pipeline.Register`)。
+3. **每个阶段单独过一遍网关**:step 持 `gateway.Client`(指向推理网关的 HTTP 客户端)把该阶段的子请求 POST 回 Envoy,头上带阶段标记(`EPPProfileHeader: prefill` 等),由 EPP **为这个阶段单独选 pod**——不像 sidecar 路径那样一次把 prefill/decode 两个点都选好。阶段之间的 KV / 多模态缓存搬运走连接器(`pkg/coordinator/connectors/kv|ec`:NIXL 或共享存储)。
+4. 任一步失败整条流水线终止;decode 流式输出途中上游故障的错误分类也写死了(`UpstreamStreamedError`:响应已开始就不能再写错误体,只记账)。
+
+与 sidecar 的分工:sidecar 不增部署单元(嵌在 decode pod),但每个引擎 pod 都得挂边车;coordinator 不动引擎 pod,代价是多一个服务、每阶段多一次网关往返。encode 分离(E/P/D)只在这条路上,标 **PoC/experimental**。
 
 ### 6.3 官方自认的代价
 
