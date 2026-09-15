@@ -14,16 +14,16 @@ sequenceDiagram
     participant C as 客户端
     participant G as Envoy 网关
     participant E as EPP
-    participant S as decode pod(sidecar)
+    participant S as decode pod(边车)
     C->>G: 推理请求
     G->>E: ext-proc 流
     Note over E: Director.HandleRequest 编排
-    E->>E: header 插件 → screener(准入筛查) → data producers → admission
-    Note over E: data producers 里 precise-prefix-cache-producer<br/>把 prompt 切成块键、确保对该 pod 的事件订阅存在
-    E->>E: Scheduler: Filter 筛掉不合格 pod → Scorer 加权累加 → Picker 定终点
-    E-->>G: 写回目标 endpoint;走 PD 时附 x-prefiller-host-port 等头
+    E->>E: header 插件 → screener → data producers → admission
+    Note over E: data producers 把 prompt 切成块键、确保事件订阅
+    E->>E: Scheduler:Filter 筛 pod,Scorer 加权,Picker 定终点
+    E-->>G: 写回目标 endpoint,走 PD 时附 prefill 地址头
     G->>S: 转发到 decode pod
-    Note over S: sidecar 读头执行多阶段编排(§6)
+    Note over S: 边车读头执行多阶段编排(§6)
     S-->>C: 流式输出 token
 ```
 
