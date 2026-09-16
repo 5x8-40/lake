@@ -45,7 +45,7 @@
 
 | 现象 | 证据 | lake |
 |------|------|------|
-| PD + Mooncake 传输多处 TODO 未实现 | `algorithms/pd/transfer/mooncake.go` | Transfer Bus 抽象先行,后端可换 |
+| PD 传输代理的 Mooncake 后端是 TODO 空壳(NIXL/SHFS 已实现;实际传输由引擎连接器执行,网关只写参数) | `algorithms/pd/transfer/mooncake.go` | Transfer Bus 抽象先行,后端可换 |
 | ModelAdapter Scaled 相位未实现 | `modeladapter_types.go` TODO | 不涉及(LoRA 编排在外部) |
 | 部分策略变体只有名字没有实现 | `vtc_router.go` TODO | 代价函数组合演化时引以为戒:先接口后策略 |
 | GPU 故障检测只见宣传未见独立实现 | 仓内无对应核心包 | F4 故障恢复是 lake 一等公民,不贴标签了事 |

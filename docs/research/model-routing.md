@@ -363,7 +363,7 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 
 ### AIBrix
 
-[AIBrix](https://github.com/vllm-project/aibrix)(字节跳动发起,现属 vllm-project;已引入 `3rdparty/aibrix`):K8s 推理基础设施,网关插件的路由策略数量最多([文档](https://aibrix.readthedocs.io/latest/features/gateway-plugins.html))。**深度分析见 [`aibrix/`](aibrix/overview.md)**(overview / architecture / pain-points;含 KV 事件同步、卸载框架、扩缩)。
+[AIBrix](https://github.com/vllm-project/aibrix)(字节跳动发起,现属 vllm-project;已引入 `3rdparty/aibrix`):K8s 推理基础设施,网关插件的路由策略约 19 种独立实现、支持加权组合([文档](https://aibrix.readthedocs.io/latest/features/gateway-plugins.html))。**深度分析见 [`aibrix/`](aibrix/overview.md)**(overview / architecture / pain-points;含 KV 事件同步、卸载框架、扩缩)。
 
 ![AIBrix 架构](model-routing/figures/aibrix-architecture.jpeg)
 

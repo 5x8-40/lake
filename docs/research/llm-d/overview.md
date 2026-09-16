@@ -179,6 +179,8 @@ flowchart TB
 | PD 决策器 | `.../scheduling/profilehandler/disagg/prefix_based_pd_decider.go` / `always_disagg_pd_decider.go` |
 | sidecar | `cmd/pd-sidecar/main.go`;`pkg/sidecar/proxy/proxy.go`::`NewProxy` |
 | coordinator | `cmd/coordinator/main.go`;`pkg/coordinator/pipeline/pipeline.go`::`Pipeline.Execute` |
+| P2P source 选择 | `.../dataproducer/p2psource/producer.go`::`Producer.Produce` / `waitingQueueSize` / `Config.MinCachedTokenDelta` |
+| P2P 执行(边车) | `pkg/sidecar/proxy/connector_p2p.go`::`handleP2P` / `addP2PPullToPrefill`;`connector_nixlv2.go` |
 
 ## 参考
 
