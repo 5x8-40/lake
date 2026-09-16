@@ -38,7 +38,7 @@
 - **llm-d·KV 卸载**:文件系统卸载后端已上游进 vLLM,llm-d 不自维护存储栈;跨实例共享靠 P2P(见 §6.4)。
 - **llm-d·数据传输**:PD/P2P 传输由引擎与边车里的 NIXL 连接器执行,router 仓只下发决策。
 - **AIBrix·引擎**:对接 vLLM/SGLang,不自研。
-- **AIBrix·PD 分离**:只有静态角色编排(StormService),PD 间 KV 传输未落地(代码里是 TODO)。
+- **AIBrix·PD 分离**:编排层是静态角色(StormService);网关 PD 选路带传输代理抽象(`KVTransferAgent`),NIXL/SHFS 两个后端已实现,Mooncake 后端是 TODO 空壳;实际 KV 传输由引擎侧连接器执行,网关只负责往请求里写连接器参数。
 
 ## 4. KV 状态归谁:最本质的区别
 
@@ -48,7 +48,7 @@
 
 | 项目 | 本机/引擎侧的位置知识 | 远端层的位置知识 | 一致性 |
 |------|---------------------|-----------------|--------|
-| Dynamo | 两处:router 进程内事件视图(估计)+ 引擎进程内 KVCR 块管理器(记 DRAM/SSD/对象存储驻留) | **对象存储本身无索引**——KVCR 本地记账,对象存储只是字节,只做存在性检查;router 不需要对象清单做选路(KVCR `design_overview.md`) | 事件流最终一致;块管理器私有 |
+| Dynamo | 两处:router 进程内事件视图(估计)+ 引擎进程内 KVCR 块管理器(记 DRAM/SSD/对象存储驻留) | **对象存储本身无索引**——KVCR 本地记账,对象存储只是字节,只做存在性检查;路由器选路时不查对象存储里有什么,只用自己的事件视图,对象存储纯粹是兜底读(KVCR `design_overview.md`) | 事件流最终一致;块管理器私有 |
 | FlexKV | 引擎旁插件进程内,每层一棵前缀树(CPU/SSD/远端各一) | **远端(Mooncake Store)有自己的集群级元数据**,跨节点可见性靠 Mooncake 不靠 FlexKV;FlexKV 侧只有可选的 Redis 周期快照 | 本机权威;集群弱一致 |
 | llm-d | EPP 各副本各自订阅事件流、各自维护派生索引;引擎是真相但不共享 | FS 卸载**内容寻址、无独立索引**(块键即路径);P2P 共享时 EPP 索引兼作位置目录(只作 hint,握手确认) | 各副本最终一致;幽灵条目可能 |
 | AIBrix | 网关索引(哈希表或事件同步两条路线)+ 引擎进程内 L1 | **L2 外部集群有自己的内部元数据**(InfiniStore/HPKV 自管);Redis 只存成员表,不存块位置 | 全部最终一致 |
@@ -91,9 +91,9 @@
 
 | | Dynamo | FlexKV | llm-d | AIBrix |
 |---|---|---|---|---|
-| 地位 | 一等公民,旗舰特性 | 无关 | 主路径(边车代理)+ 备选(独立编排服务) | 静态角色(StormService)+ 雏形 |
+| 地位 | 一等公民,旗舰特性 | 无关 | 主路径(边车代理)+ 备选(独立编排服务) | 静态角色(StormService)+ 网关 PD 选路 |
 | 决策 | 部署拓扑 + planner | — | 逐请求 decider(可按前缀命中决定不拆) | 部署拓扑为主 |
-| 执行 | NIXL 直传 | — | decode 先选,边车替它串 prefill | PD + Mooncake 传输未落地(TODO) |
+| 执行 | NIXL 直传 | — | decode 先选,边车替它串 prefill | 网关写连接器参数,引擎连接器执行(NIXL/SHFS 已实现;Mooncake 后端是 TODO 空壳) |
 
 (边车 = 与引擎同 pod 的代理容器,替 decode 引擎向 prefill 发请求、接 KV;StormService = AIBrix 自研的 K8s CRD,把 prefill/decode 等不同角色的 pod 编成一组整体部署。NIXL = NVIDIA 的 RDMA 传输库。)
 
@@ -114,7 +114,13 @@
 | 输出 | prefill、decode **各自**的副本数 | 每个变体的目标副本数 | 整体副本数 |
 | 执行 | 框架内直接执行 | 交标准 HPA/KEDA 执行 | 框架内 CRD 直接执行 |
 
-**小结**:三家都做到了 KV 感知的扩缩,差别在建模方式——Dynamo 要先用 profiler 标定曲线(准,但要标定步骤);WVA 把扩缩当优化问题解,且考虑异构成本(有论文,arXiv 2603.09730:比 HPA 有效吞吐 +37%、请求失败降 10×);AIBrix 是传统的指标驱动控制器,算法可选。Dynamo 的 P/D 独立扩缩是三者中唯一按角色分别出副本数的。
+**同一个例子看三家的根本区别**:某模型 PD 分离部署(2 prefill + 4 decode),负载突然翻倍,KV 利用率冲到 85%、队列变长。
+
+- **AIBrix APA**:看到"KV 使用率 + 排队长度"超阈值 → 直接把总副本数加上去。它回答的问题是"**现在要不要加、加几个**",不区分加给 prefill 还是 decode(那是 StormService 部署时定的比例)。
+- **Dynamo Planner**:查 profiler 预先实测的"负载 → TTFT/ITL"曲线 → 当前负载下要守住 TTFT 目标,prefill 算力缺口大;要守住 ITL 目标,decode 缺口小 → 输出 **prefill 2→4、decode 4→5**。它回答的问题是"**要满足 SLO,每个角色各缺几个**"。
+- **llm-d WVA**:集群里同一模型有两种部署变体(H100 版:快但贵;A100 版:慢但便宜)→ 解优化问题:先把 A100 变体扩满,容量还不够再扩 H100 变体 → 把每个变体的目标副本数交给 HPA 执行。它回答的问题是"**在异构变体之间,扩谁最划算**"。
+
+一句话:AIBrix 是**反应式**(超阈值就加),Dynamo 是**模型反推式**(按 SLO 曲线算角色配比,但要先标定),WVA 是**优化式**(异构变体间算成本,只出目标数、执行交给标准组件)。WVA 有论文(arXiv 2603.09730):比 HPA 有效吞吐 +37%、请求失败降 10×。
 
 ### 6.4 KV 卸载与存储
 
@@ -147,7 +153,7 @@
 |---|---|---|---|---|
 | 语言 | Rust 核心 + Python | C++ 内核 + Python | 几乎纯 Go | Go + Python + TS |
 | K8s 耦合 | 可独立可 K8s(operator + 部署 CRD) | 无 | 深(Gateway API 标准) | 最深(全是 CRD) |
-| 引擎 | vLLM/SGLang/TRT-LLM | vLLM/SGLang/TRT-LLM/Dynamo | vLLM 为主 | vLLM/SGLang |
+| 引擎 | vLLM/SGLang/TRT-LLM | vLLM/SGLang/TRT-LLM/Dynamo | vLLM 为主;SGLang 有 KV 事件适配器与边车连接器 | vLLM/SGLang(官方各发一套增强镜像,含 NIXL+RDMA) |
 | 背景 | NVIDIA | 腾讯云 TACO | Red Hat/Google/IBM 等 | 字节跳动捐给 vllm-project |
 
 ## 7. 它们之间不是纯竞争
