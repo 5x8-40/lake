@@ -363,7 +363,7 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 
 ### AIBrix
 
-[AIBrix](https://github.com/vllm-project/aibrix)(字节跳动发起,现属 vllm-project;已引入 `3rdparty/aibrix`):K8s 推理基础设施,网关插件的路由策略数量最多([文档](https://aibrix.readthedocs.io/latest/features/gateway-plugins.html))。
+[AIBrix](https://github.com/vllm-project/aibrix)(字节跳动发起,现属 vllm-project;已引入 `3rdparty/aibrix`):K8s 推理基础设施,网关插件的路由策略约 19 种独立实现、支持加权组合([文档](https://aibrix.readthedocs.io/latest/features/gateway-plugins.html))。**深度分析见 [`aibrix/`](aibrix/overview.md)**(overview / architecture / pain-points;含 KV 事件同步、卸载框架、扩缩)。
 
 ![AIBrix 架构](model-routing/figures/aibrix-architecture.jpeg)
 
@@ -390,14 +390,14 @@ SGLang 的路由组件(`sgl-model-gateway`,Rust)的策略列表在 `src/policies
 
 **要点**:
 
-- 策略数量最多且**可组合**:归一化分数按权重加权求和,每种策略可独立灰度。
+- 策略约 19 种独立实现且**可组合**:归一化分数按权重加权求和,每种策略可独立灰度。
 - `prefix-cache` 索引是固定大小哈希表(20 万槽 × 4 token/块),正考虑转向一致性哈希+LSH。
 - 多副本状态走 Redis 增量同步,必须显式开 `AIBRIX_STATESYNC_ENABLED`:
   - 不开则各副本各算各的、路由结果不一致,是官方点名的最常见踩坑点。
 
 ### llm-d
 
-[llm-d](https://github.com/llm-d/llm-d)(Red Hat/Google/IBM 等联合,K8s 原生分布式推理):路由在 EPP(Endpoint Picker,Gateway API Inference Extension 的扩展点)里,代表"精确派"缓存感知([文档](https://llm-d.ai/docs/architecture/advanced/kv-management/kv-indexer);EPP 代码已引入 `3rdparty/llm-d-router`,索引实现见 `pkg/kvcache/`)。
+[llm-d](https://github.com/llm-d/llm-d)(Red Hat/Google/IBM 等联合,K8s 原生分布式推理):路由在 EPP(Endpoint Picker,Gateway API Inference Extension 的扩展点)里,代表"精确派"缓存感知([文档](https://llm-d.ai/docs/architecture/advanced/kv-management/kv-indexer);EPP 代码已引入 `3rdparty/llm-d-router`,索引实现见 `pkg/kvcache/`)。**深度分析见 [`llm-d/`](llm-d/overview.md)**(overview / architecture / pain-points;含推测索引、PD sidecar、多副本 HA)。
 
 ![llm-d 架构](model-routing/figures/llm-d-arch.svg)
 

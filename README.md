@@ -134,6 +134,7 @@ lake/
 │       ├── 3rdparty-reference.md    #   3rdparty 源码与本设计的逐层对应(汇总)
 │       ├── hbm-tier-and-offload.md  #   HBM 归属与 KV 卸载路径对照
 │       ├── distributed-models.md    #   各项目分布式模型对比
+│       ├── serving-stack-comparison.md # Dynamo/FlexKV/llm-d/AIBrix 四栈对比
 │       ├── dualpath.md              #   DualPath 双路径 KV 加载分析
 │       ├── nvidia-cmx.md            #   NVIDIA CMX 目标栈与边界
 │       ├── agentic-cache-workload.md #  Agentic cache 负载与仿真输入
@@ -150,7 +151,9 @@ lake/
 │       ├── ucm/                     #   UCM（统一缓存框架）
 │       ├── tensorcast/              #   TensorCast（张量状态基础设施）
 │       ├── flexkv/                  #   FlexKV（引擎旁 CPU/SSD/远端卸载）
-│       └── kvcached/                #   kvcached（GPU 虚拟内存弹性 KV）
+│       ├── kvcached/                #   kvcached（GPU 虚拟内存弹性 KV）
+│       ├── aibrix/                  #   AIBrix（K8s 推理基础设施:网关路由/自动扩缩/KV 事件同步）
+│       └── llm-d/                   #   llm-d Router（EPP 精确缓存感知 + PD sidecar）
 ├── 3rdparty/                   # 参考源码（git submodule，只读）
 │   ├── sglang/                 #   SGLang（HiCache 分层 KV + spec decode 计算层）
 │   ├── lmcache/                #   LMCache（跨实例 KV 复用）
@@ -164,7 +167,10 @@ lake/
 │   ├── ucm/                    #   UCM（统一缓存框架：可插拔 KVStore）
 │   ├── tensorcast/             #   TensorCast（张量状态基础设施层）
 │   ├── flexkv/                 #   FlexKV（引擎旁 CPU/SSD/远端 KV 卸载）
-│   └── kvcached/               #   kvcached（GPU 虚拟内存弹性 KV：VA/物理页解耦 + 跨进程超卖）
+│   ├── kvcached/               #   kvcached（GPU 虚拟内存弹性 KV：VA/物理页解耦 + 跨进程超卖）
+│   ├── production-stack/       #   vLLM production-stack（实例级路由器参考，分析见 model-routing.md §5）
+│   ├── aibrix/                 #   AIBrix（K8s 推理基础设施：网关路由策略集 + KV 事件同步）
+│   └── llm-d-router/           #   llm-d Router（EPP：KV 事件→全局块索引 + 推测索引）
 └── src/                        # 早期单进程 Python 原型（验证假设用，将被 rust/go/python 子项目取代）
 ```
 
