@@ -22,24 +22,46 @@
 
 ## 决策二:Dynamo 全组件的适配动作
 
-Dynamo 不止 Router/Worker 两块。按上游 main 的组件清单(依据 [`../../research/dynamo/overview.md`](../../research/dynamo/overview.md) 核实),逐个定动作:
+Dynamo 不止 Router/Worker 两块。按上游 main 的组件清单(依据 [`../../research/dynamo/overview.md`](../../research/dynamo/overview.md) 核实),逐个定动作,按动作分组、组内按组件名排序:
+
+**复用(不动)**
+
+| 组件 | 干什么 | 说明 |
+|------|--------|------|
+| **DistributedRuntime** | 服务发现、端点注册、请求传输、生命周期 | Rust 地基(`lib/runtime`),与硬件无关 |
+| **Fault Tolerance**(优雅退出 / 请求迁移 / canary) | worker 挂掉时在途请求带已生成 token 换机续算等 | 实现在请求处理流水线层,与硬件无关 |
+| **Frontend** | OpenAI 兼容 HTTP 入口,预处理(tokenize)/后处理 | 纯 CPU 组件,只需 tokenizer 与模型配置,不碰权重 |
+| **Infrastructure**(etcd / NATS / ZMQ / TCP) | 发现面 / 事件面 / 请求面的通信栈 | 三平面各自可插拔,均与硬件无关 |
+| **mocker / AISimulate** | 模拟引擎,不起卡也能压测路由与扩缩 | 对开发期价值大:NPU 资源紧张时控制面可先行验证 |
+| **Router**(KV-aware) | 按 KV 命中 + 负载选 worker,编排 PD 交接 | Rust 实现,与硬件无关;拓扑感知已有(Topology-Aware KV Transfer,逻辑域标签机制),昇腾增量只在 UB 域标注,见 D001 修正 #2 |
+
+**复用逻辑、适配数据**
+
+| 组件 | 干什么 | 说明 |
+|------|--------|------|
+| **Planner** | 双环自动扩缩(慢环预测定下限 + 快环救突发) | 扩缩逻辑不动;但快环依赖引擎每次前向发的 FPM 指标,vllm-ascend 侧要接上指标发布;容量估计需要 NPU 的 profiling 数据 |
+| **Profiler / AIConfigurator** | 给 Planner 供容量数据(最优 TP 度、性能插值) | 工具复用,需要 NPU 上的实测/估计数据 |
+
+**适配(要改)**
+
+| 组件 | 干什么 | 说明 |
+|------|--------|------|
+| **Grove / Dynamo Operator** | K8s 部署:拓扑感知 gang 调度、按 Planner 期望副本数调和 | 资源名从 `nvidia.com/gpu` 改为昇腾 NPU 资源标识;拓扑调度要认昇腾 UB 域 |
+| **Worker 胶水层** | 把引擎包成 Dynamo worker(注册、发 KV 事件、暴露 RPC 端点) | `dynamo.vllm` / `dynamo.sglang` 启动器对接 vllm-ascend / SGLang NPU;环境变量、torch_npu 初始化、镜像、K8s 资源名等差异清单见 D001 |
+
+**替换后端**
+
+| 组件 | 干什么 | 说明 |
+|------|--------|------|
+| **KVCR** | KV 二级存储 + router hint 驱动 P2P(KVBM 的继任者) | 策略层复用;存储后端位接 Mooncake Store 或 memcache(选型中,见 [../data-plane-options.md](../data-plane-options.md)) |
+| **NIXL** | 传输库,同一 API 搬 HBM/DRAM/SSD/远端,屏蔽互联差异 | API 不动;昇腾传输首选 NIXL + Mooncake TE 后端(TE 已有昇腾实现),待实测 |
+
+**待定 / 不用**
 
 | 组件 | 干什么 | 动作 | 说明 |
 |------|--------|------|------|
-| **Frontend** | OpenAI 兼容 HTTP 入口,预处理(tokenize)/后处理 | **复用** | 纯 CPU 组件,只需 tokenizer 与模型配置,不碰权重,与硬件无关 |
-| **Router**(KV-aware) | 按 KV 命中 + 负载选 worker,编排 PD 交接 | **复用** | Rust 实现,与硬件无关;"是否缺昇腾拓扑感知"待查,见 D001 修正 #2 |
-| **DistributedRuntime** | 服务发现、端点注册、请求传输、生命周期 | **复用** | Rust 地基(`lib/runtime`),与硬件无关 |
-| **基础设施**(etcd / NATS / ZMQ / TCP) | 发现面 / 事件面 / 请求面的通信栈 | **复用** | 三平面各自可插拔,均与硬件无关 |
-| **Planner** | 双环自动扩缩(慢环预测定下限 + 快环救突发) | **复用逻辑,适配数据** | 扩缩逻辑不动;但快环依赖引擎每次前向发的 FPM 指标,vllm-ascend 侧要接上指标发布;容量估计需要 NPU 的 profiling 数据 |
-| **Profiler / AIConfigurator** | 给 Planner 供容量数据(最优 TP 度、性能插值) | **适配数据** | 工具复用,需要 NPU 上的实测/估计数据 |
-| **Worker 胶水层** | 把引擎包成 Dynamo worker(注册、发 KV 事件、暴露 RPC 端点) | **适配** | `dynamo.vllm` / `dynamo.sglang` 启动器要对接 vllm-ascend / SGLang NPU;环境变量、torch_npu 初始化、镜像、K8s 资源名等差异清单见 D001 |
-| **NIXL** | 传输库,同一 API 搬 HBM/DRAM/SSD/远端,屏蔽互联差异 | **替换后端** | API 不动;昇腾传输首选 NIXL + Mooncake TE 后端(TE 已有昇腾实现),待实测,见 [../data-plane-options.md](../data-plane-options.md) |
-| **KVCR** | KV 二级存储 + router hint 驱动 P2P(KVBM 的继任者) | **复用策略,替换后端** | 存储后端位接 Mooncake Store 或 memcache(选型中,见上) |
-| **KVBM** | 旧 KV 管理器(G1-G4 分层 offload) | **不用** | 已被上游 sunset(DEP #11673),代码还在 main 但不再演进 |
-| **ModelExpress** | GPU 间流式传权重,加速冷启动 | **待定** | NPU 间权重传输路径未评估;前期可用共享存储 + 本地下载兜底 |
-| **Grove / Dynamo Operator** | K8s 部署:拓扑感知 gang 调度、按 Planner 期望副本数调和 | **适配** | 资源名从 `nvidia.com/gpu` 改为昇腾 NPU 资源标识;拓扑调度要认昇腾 UB 域 |
-| **容错**(优雅退出 / 请求迁移 / canary) | worker 挂掉时在途请求带已生成 token 换机续算等 | **复用** | 实现在请求处理流水线层,与硬件无关 |
-| **mocker / AISimulate** | 模拟引擎,不起卡也能压测路由与扩缩 | **复用** | 对开发期价值大:NPU 资源紧张时控制面可先行验证 |
+| **ModelExpress** | GPU 间流式传权重,加速冷启动 | 待定 | NPU 间权重传输路径未评估;前期可用共享存储 + 本地下载兜底 |
+| **KVBM** | 旧 KV 管理器(G1-G4 分层 offload) | 不用 | 已被上游 sunset(DEP #11673),代码还在 main 但不再演进 |
 
 ## 决策三:引擎侧两条路都保留
 

@@ -39,7 +39,7 @@ Worker 拉起差异清单(讨论中确认,实操时逐条核对):
 ## 修正(讨论中的过时/错误点,已对照上游源码与调研文档核实)
 
 1. **KVBM 已 sunset**:讨论中"控制面(Router/KVBM)直接复用"的说法过时——上游 KVBM 2026-07 被官方废弃(DEP #11673),继任者是 **KVCR**(引擎进程内二级存储 + router hint 驱动 P2P,分析见 [`../../research/kvcr/overview.md`](../../research/kvcr/overview.md))。存储/传输适配必须对标 KVCR 的接口与后端位,不是 KVBM。
-2. **"Dynamo Router 不感知物理拓扑"这个说法存疑**。讨论里用它论证"昇腾适配要新做拓扑感知"。但上游文档里有拓扑感知 KV 传输的专题页(`topology-aware-kv-transfer.md`),而且 NVIDIA 收购的集群调度公司 Run:ai(其产品专门按机器/机架拓扑摆放 GPU 任务)已与 Dynamo 集成——说明上游在"按物理拓扑放任务、传 KV"上已有投入,"完全没有拓扑感知"大概率不准确。所以:昇腾 UB 域(同一超节点内互联快、跨超节点慢)的拓扑感知到底要不要新做,必须先查清上游已有能力,再定增量,不能直接采信讨论结论。
+2. **"Dynamo Router 不感知物理拓扑"说法错误,上游已有拓扑感知选路**。机制为 Topology-Aware KV Transfer(experimental,`docs/fern/pages/developer-guide/knowledge-base/modular-components/router/topology-aware-kv-transfer.md`):worker 在 `ModelRuntimeConfig` 里发布 `topology_domains`(如 `{"zone": "us-east-1a", "rack": "rack-22"}`,逻辑域标签),每个域自动生成 worker 污点 `dynamo.topology/<domain>=<value>`;prefill worker 选定后,Prefill Router 把它的传输域(`kv_transfer_domain`)转成 decode 选路约束——`required` 为硬约束(推不出约束就直接拒请求,不放行),`preferred` 为加权偏好;K8s 侧经 DGD 的 `spec.experimental.kvTransferPolicy` 配置。注意这是**逻辑域标签**机制:域成员关系由部署侧标注,Router 不自动发现物理拓扑。对昇腾的增量因此明确:把 UB 超节点域映射成 topology domain 并标注到 worker 即可复用该机制,要新做的是"UB 域成员的发现与标注",不是 Router 本身。
 3. **讨论里那份"在用 Dynamo 的公司名单"不作为选型依据**。名单里我们只核实了一条:上游仓库确实有 Kimi K3 的部署示例(`docs/fern/pages/recipes/model-recipes/kimi-k3.mdx`);其余条目未逐一核实,可信度不明。选 Dynamo 的理由是控制面复用价值本身,不需要靠用户名单背书。
 
 ## 后果
