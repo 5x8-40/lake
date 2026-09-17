@@ -9,5 +9,14 @@
 
 - **决策记录**放 `decisions/`,一个决策一个文件,命名 `NNN-短标题.md`,编号递增,格式照 [`decisions/000-template.md`](decisions/000-template.md)(背景 / 选项 / 决策 / 后果)。
 - **讨论纪要**直接放本目录,命名 `YYYY-MM-DD-主题.md`。
+- **专题文档**(选型盘点、调研笔记等长期有效的)直接放本目录,命名即主题。
 - **计划主线**(阶段 / 任务 / 状态)写在 `00-plan.md`(待建,风格对齐 [`../00-plan.md`](../00-plan.md))。
 - 链接一律用相对路径;引用 lake 侧文档示例:`../research/dynamo/overview.md`。
+
+## 现有内容
+
+- 决策记录:
+  - [D001 总体路线:fork 适配而非自研框架](decisions/D001-overall-approach.md)(含 KVBM→KVCR 修正、Worker 拉起差异清单)
+  - [D002 组件边界:不动引擎内部 Scheduler/BlockAllocator](decisions/D002-component-boundary.md)
+- 专题:
+  - [昇腾数据底座候选盘点](data-plane-options.md)(memcache / UCM / Yuanrong / UB-URMA)
