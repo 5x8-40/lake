@@ -46,3 +46,6 @@
 [submodule "3rdparty/llm-d-router"]
 	path = 3rdparty/llm-d-router
 	url = https://github.com/llm-d/llm-d-router.git
+[submodule "3rdparty/dynamo-ascend"]
+	path = 3rdparty/dynamo-ascend
+	url = https://github.com/5x8-40/dynamo-ascend.git

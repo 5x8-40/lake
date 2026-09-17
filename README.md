@@ -114,6 +114,7 @@ lake/
 ├── README.md
 ├── docs/
 │   ├── 00-plan.md              # 路线图与执行计划（主线入口）
+│   ├── dynamo-ascend/          # Dynamo→昇腾适配工作区（独立计划：讨论与决策记录）
 │   ├── features/               # P0 特性设计 — 做什么
 │   │   ├── goals.md            #   目标与非目标
 │   │   ├── features.md         #   特性清单（Must/Should/Could）
