@@ -16,12 +16,13 @@ lake 是一个**探索性**仓库，目标是设计并验证一套**彻底的存
 ```
 docs/
 ├── 00-plan.md          # 路线图主线（阶段、任务、状态），改阶段进度只动这里
+├── dynamo-ascend/      # Dynamo→昇腾适配工作区（独立计划：讨论与决策记录）
 ├── features/           # P0：做什么（特性 / SLO / 非功能）
 ├── architecture/       # P1：怎么搭
 └── research/           # 相关工作
 ```
 
-- 特性 → `features/`，架构 → `architecture/`，文献 → `research/`。不要把新文档堆在 `docs/` 根。
+- 特性 → `features/`，架构 → `architecture/`，文献 → `research/`；dynamo-ascend 适配的讨论与决策 → `dynamo-ascend/`。不要把新文档堆在 `docs/` 根。
 - 文档间用**相对路径**链接（如 `[../features/features.md]`），跨目录引用要带对路径。
 - 改动设计后，检查所有相关文档的内部链接是否仍有效（grep 旧路径）。
 
@@ -77,6 +78,7 @@ docs/
 | `3rdparty/vllm` | vllm-project/vllm | **计算层**:PagedAttention、worker/`GPUModelRunner`、`KVConnectorBase_V1` 接口(存算分离接入点)、spec decode |
 | `3rdparty/transformers` | huggingface/transformers | **模型定义参考**:Qwen3/PyTorch `nn.Module` 结构、HF config 字段、decoder/model/causal-lm 分层；只作模型骨架与配置对照,不作服务端执行参考 |
 | `3rdparty/dynamo` | ai-dynamo/dynamo | **编排层/控制面**:KV-aware router、Rust 编排、多后端通信(etcd/nats/tcp/zmq);KVBM(GPU→CPU→SSD→远端 offload)已被官方 sunset(2026-07 DEP #11673),代码仍在 main 但不再演进 → 见 [`docs/research/dynamo/overview.md`](docs/research/dynamo/overview.md)「KVBM 变局」 |
+| `3rdparty/dynamo-ascend` | 5x8-40/dynamo-ascend(fork) | **Dynamo 昇腾适配**:独立计划,fork 仓内可改代码(不受 3rdparty 只读约定限制);讨论与决策记录见 [`docs/dynamo-ascend/`](docs/dynamo-ascend/) |
 | `3rdparty/kvcr` | ai-dynamo/kvcr | **KVBM 继任者**:引擎进程内 KV 二级存储(DRAM/SSD/对象存储)+ router hint 驱动跨节点 P2P(NIXL)+ Guard sidecar 容错 + 可插拔策略;不管 GPU、复用 router 全局视图 → 见 [`docs/research/kvcr/`](docs/research/kvcr/)(overview) |
 | `3rdparty/tilert` | tile-ai/TileRT | **超低延迟 decode**(tile runtime,核闭源) + **vLLM PD 插件**(`TileRTConnector`/`pd_vllm`,NIXL/Mooncake)→ 见 [`docs/research/tilert/`](docs/research/tilert/) |
 | `3rdparty/memcache` | Ascend/memcache | **昇腾分布式 KVCache 对象池**(MetaService/LocalService、HBM/DRAM/SSD、MemFabric OneCopy)→ 见 [`docs/research/memcache/`](docs/research/memcache/) |
