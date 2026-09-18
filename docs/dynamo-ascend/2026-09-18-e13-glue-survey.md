@@ -4,7 +4,7 @@
 
 ## 对齐基线
 
-- Dynamo 侧:`f5802d355b`(main 上 vllm 0.26.0 pin 的最后一个状态,即 0.27.1 bump #13059 的父提交;≈ ai-dynamo 1.4.0 发布态)。
+- Dynamo 侧:`f5802d355b`(main 上 vllm 0.26.0 pin 的最后一个状态,即 0.27.1 bump #13059 的父提交;≈ ai-dynamo 1.4.x 发布态,import 面在 1.4.0–1.4.2 间无差异)。
 - vLLM 侧:本地 `3rdparty/vllm` 检出 2026-07-16(0.26 开发期,近似;**最终以容器内 vLLM 0.26.0 为准**)。
 
 ## import 面总览与静态命中
