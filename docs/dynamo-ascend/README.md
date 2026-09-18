@@ -10,11 +10,12 @@
 - **决策记录**放 `decisions/`,一个决策一个文件,命名 `NNN-短标题.md`,编号递增,格式照 [`decisions/000-template.md`](decisions/000-template.md)(背景 / 选项 / 决策 / 后果)。
 - **讨论纪要**直接放本目录,命名 `YYYY-MM-DD-主题.md`。
 - **专题文档**(选型盘点、调研笔记等长期有效的)直接放本目录,命名即主题。
-- **计划主线**(阶段 / 任务 / 状态)写在 `00-plan.md`(待建)。
+- **计划主线**(阶段 / 任务 / 状态)写在 `00-plan.md`(待建);各线自己的任务追踪按线单独成文(如 [e-line.md](e-line.md))。
 - 链接一律用相对路径。
 
 ## 现有内容
 
+- 任务追踪:[E 引擎线](e-line.md)(任务表 + 状态 + 进展日志;**进行中**)
 - 决策记录:
   - [D001 总体路线:fork 适配而非自研框架](decisions/D001-overall-approach.md)(含 KVBM→KVCR 修正、Worker 拉起差异清单)
   - [D002 组件边界:Dynamo 全组件的适配动作划分](decisions/D002-component-boundary.md)(复用 / 适配 / 替换 / 不用,含引擎双路线)
