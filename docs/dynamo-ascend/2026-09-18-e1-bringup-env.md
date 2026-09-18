@@ -23,6 +23,8 @@
 - **对齐版本**:1.4.x 全系列(1.4.0 / 1.4.1 / 1.4.2,PyPI 已逐一核实)的 [vllm] extra 都 pin `vllm==0.26.0`,与镜像一致。**用最新 patch:ai-dynamo==1.4.2**(2026-08-28 发布)。上游 pin 演进:0.26.0(2026-07-29,#12202)→ 0.27.1(08-18,#13059)→ 0.28.0(08-31,#13846)——1.4.2 是 0.26 对齐窗口内的最后一个 patch。
 - **安装方式**:`pip install ai-dynamo==1.4.2`(**不带** [vllm] extra,用镜像自带 vLLM)。Rust 组件(frontend/router 等)在 `ai-dynamo-runtime` wheel 里,1.4.2 有 aarch64 wheel(`cp310-abi3-manylinux_2_28_aarch64`,一个 wheel 覆盖 Python 3.10–3.12),Kunpeng 920 可直接装,不需要 Rust 工具链;glibc ≥2.28(openEuler 满足)。
 - **fork 基线**:`5x8-40/dynamo-ascend` 的 `ascend-dev` 目前跟踪 main(1.5.0 / vllm 0.28)。bring-up 阶段应从上游 **v1.4.2** 切基线,与 vllm-ascend v0.26.0rc1 锁步;待 vllm-ascend 发布 0.28 对齐版(nightly 已到 0.27.1rc)再整体升。
+- **为什么不能用最新 main**:main(1.5.0)要 `vllm==0.28.0`,而 vllm-ascend 版本号跟随 vLLM、最新正式版只有 v0.26.0rc1(对齐 0.26.0)——用 main 就没有可用的昇腾引擎。1.4.2 + vLLM 0.26 + vllm-ascend v0.26.0rc1 是对齐窗口内的最新组合。
+- **KVBM sunset 与本线无关**:KVBM 已日落(DEP #11673),继任者 KVCR 是**独立仓独立包**(`nvidia-kvcr`,framework-neutral,不依赖 vllm/ai-dynamo),dynamo 侧对接面是 router hint(2026-08-07 进 main,#11695,**1.4.2 已含**)。KVCR 管 KV 卸载/P2P(K 线范畴);E 线聚合模式 bring-up 既不需要 KVBM 也不需要 KVCR。
 
 ## E1.3 摸底对象:胶水层的版本/硬件敏感点(初步清单)
 
