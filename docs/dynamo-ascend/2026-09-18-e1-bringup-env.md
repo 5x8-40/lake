@@ -40,6 +40,30 @@
 
 设备:`/dev/davinci[0-7]`、`/dev/davinci_manager`、`/dev/devmm_svm`、`/dev/hisi_hdc`;卷:`/usr/local/dcmi`、`/usr/local/bin/npu-smi`、`/usr/local/Ascend/driver/lib64`、`/usr/local/Ascend/driver/version.info`、`/etc/ascend_install.info`、`/root/.cache`(模型权重);另挂 `hccn_tool`。建议 `--net=host`、`--shm-size` 调大。
 
+### 实测可用的启动命令(2026-09-18,单卡 bring-up)
+
+```bash
+export IMAGE=quay.io/ascend/vllm-ascend:v0.26.0rc1-openeuler
+docker run --rm \
+  --name vllm-ascend \
+  --shm-size=1g \
+  --device /dev/davinci0 \
+  --device /dev/davinci_manager \
+  --device /dev/devmm_svm \
+  --device /dev/hisi_hdc \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v /root/.cache:/root/.cache \
+  -p 8000:8000 \
+  -it $IMAGE bash
+# 容器内:yum install -y curl
+```
+
+注意:只挂了 `/dev/davinci0`(单卡)。后续多卡 TP / PD 要按卡数加 `--device /dev/davinciN`,并把 `--shm-size` 调大。
+
 ## 来源
 
 - vllm-ascend v0.26.0rc1 release notes(github.com/vllm-project/vllm-ascend/releases)

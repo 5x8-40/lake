@@ -49,3 +49,4 @@ curl localhost:8000/v1/chat/completions -d '...'
 | 2026-09-17 | E 线任务拆分定稿(E1.1–E1.5 + 增强项) |
 | 2026-09-18 | E 线环境核实完成:镜像 v0.26.0rc1-openeuler、ai-dynamo==1.4.0 版本对齐、版本陷阱确认,见 [2026-09-18-e1-bringup-env.md](2026-09-18-e1-bringup-env.md);E 线开工 |
 | 2026-09-18 | E1.3 静态阶段完成:import 面 59/61 命中(2 项为双写兜底),生产胶水层无 CUDA 符号;容器内探针终验待 E1.1 镜像就绪,见 [2026-09-18-e13-glue-survey.md](2026-09-18-e13-glue-survey.md) |
+| 2026-09-18 | E1.1 进行中:镜像 `v0.26.0rc1-openeuler` 已拉取,单卡容器已拉起(启动命令见环境核实文档「实测可用」节),待 `vllm serve` 验证 |
