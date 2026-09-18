@@ -1,0 +1,46 @@
+# 2026-09-18 E1 环境核实:镜像、版本对齐与安装方式
+
+> E 线开工前的环境核实记录。结论均经官方文档 / PyPI / 上游源码核实,来源见末节。
+
+## 目标环境
+
+- 硬件:Atlas A2(`/dev/davinci[0-7]`)
+- 系统:openEuler;CPU:Kunpeng 920(**aarch64**)
+
+## 镜像
+
+- 拉取:`quay.io/ascend/vllm-ascend:v0.26.0rc1-openeuler`(A2 + openEuler 变体;Ubuntu 变体为 `v0.26.0rc1`)。国内加速:registry 前缀换 `m.daocloud.io/quay.io` 或 `quay.nju.edu.cn`,tag 原样保留。
+- 镜像内容(v0.26.0rc1,2026-09-03 发布,对齐上游 vLLM 0.26.0):
+  - CANN 9.1.0;PyTorch 2.10.0 / torch_npu 2.10.0.post4;Python ≥3.10 <3.13;Triton Ascend 3.2.2
+  - **Mooncake 0.3.11.post1 已在镜像内**(K 线传输/存储的依赖预置)
+  - vllm 与 vllm-ascend 代码在 `/vllm-workspace`,以 `pip install -e` 开发模式安装——改代码即时生效,不用重装
+- **模型受限版**:官方完整验证仅 Kimi K3 / GLM-5.2 / DeepSeek V4 Flash 0731 / DeepSeek V4 Pro 0813。bring-up 阶段直接用已验证模型,不自加变量。
+- 已知问题:triton-ascend 需 ≥3.2.0.dev20260322(官方镜像已含;手动装环境时才需要注意)。
+
+## Dynamo 安装:版本对齐是关键
+
+- **陷阱**:Dynamo main(ai-dynamo 1.5.0)的 `[vllm]` extra pin `vllm[flashinfer,runai,otel]==0.28.0`。在镜像里直接 `pip install ai-dynamo[vllm]` 会把 vLLM 0.26 顶掉,vllm-ascend 失效。
+- **对齐版本**:`ai-dynamo==1.4.0` 的 [vllm] extra pin `vllm==0.26.0`(PyPI 已核实),与镜像一致。上游 pin 演进:0.26.0(2026-07-29,#12202)→ 0.27.1(08-18,#13059)→ 0.28.0(08-31,#13846)。
+- **安装方式**:`pip install ai-dynamo==1.4.0`(**不带** [vllm] extra,用镜像自带 vLLM)。Rust 组件(frontend/router 等)在 `ai-dynamo-runtime` wheel 里,**aarch64 wheel 自 1.2.0 起提供**(manylinux_2_28,cp310–312),Kunpeng 920 可直接装,不需要 Rust 工具链;glibc ≥2.28(openEuler 满足)。
+- **fork 基线**:`5x8-40/dynamo-ascend` 的 `ascend-dev` 目前跟踪 main(1.5.0 / vllm 0.28)。bring-up 阶段应从上游 **v1.4.0** 切基线,与 vllm-ascend v0.26.0rc1 锁步;待 vllm-ascend 发布 0.28 对齐版(nightly 已到 0.27.1rc)再整体升。
+
+## E1.3 摸底对象:胶水层的版本/硬件敏感点(初步清单)
+
+`dynamo.vllm` 对 vLLM 的 import 面(上游 1.4.0 树)里,以下属版本敏感或 CUDA 专属,需逐个对照 vLLM 0.26 + vllm-ascend 核实:
+
+- `vllm.config.CUDAGraphMode`——名字即 CUDA;vllm-ascend 的等价物/是否被绕过
+- `vllm.v1.*` 内部接口:`AsyncScheduler`、`SchedulerOutput` / `CachedRequestData` / `NewRequestData`、`kv_cache_utils.get_request_block_hasher` / `init_none_hash`、`single_type_kv_cache_manager.CrossAttentionManager`
+- `vllm.distributed.kv_events`(KVEventsConfig / ZmqEventPublisher)——KV 事件发布,Router 视图的来源
+- `[vllm]` extra 的 `nixl[cu13]==1.3.2` 是 CUDA 版 NIXL,昇腾不能这么装——K1 时改源码编译 + Mooncake TE 后端
+- flashinfer extra 同理为 CUDA 生态,昇腾不需要
+
+## 容器启动挂载(A2,官方文档)
+
+设备:`/dev/davinci[0-7]`、`/dev/davinci_manager`、`/dev/devmm_svm`、`/dev/hisi_hdc`;卷:`/usr/local/dcmi`、`/usr/local/bin/npu-smi`、`/usr/local/Ascend/driver/lib64`、`/usr/local/Ascend/driver/version.info`、`/etc/ascend_install.info`、`/root/.cache`(模型权重);另挂 `hccn_tool`。建议 `--net=host`、`--shm-size` 调大。
+
+## 来源
+
+- vllm-ascend v0.26.0rc1 release notes(github.com/vllm-project/vllm-ascend/releases)
+- vllm-ascend 安装文档(docs.vllm.ai/projects/ascend → installation / quick_start)
+- PyPI `ai-dynamo` 1.4.0 / `ai-dynamo-runtime` wheel 列表;NVIDIA pypi.nvidia.com
+- 上游 dynamo 仓 `pyproject.toml` 及 pin 演进提交(#12202 / #13059 / #13846)
