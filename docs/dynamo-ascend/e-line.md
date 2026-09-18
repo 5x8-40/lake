@@ -49,8 +49,10 @@ python3 e13_probe.py                              # ALL GREEN 则 E1.3 关闭
 curl -LO https://mirrors.huaweicloud.com/etcd/v3.5.33/etcd-v3.5.33-linux-arm64.tar.gz
 tar xzf etcd-v3.5.33-linux-arm64.tar.gz && cp etcd-v3.5.33-linux-arm64/{etcd,etcdctl,etcdutl} /usr/local/bin/
 etcd > /tmp/etcd.log 2>&1 &                          # 服务发现+元数据面:worker 注册/发现、租约保活;默认 localhost:2379(无 K8s 环境的默认后端,K8s 下用 K8s API 替代)
-python3 -m dynamo.frontend > /tmp/frontend.log 2>&1 & # 控制面,纯 CPU,默认 8000 端口(容器已映射 8000)
+python3 -m dynamo.frontend --router-mode kv > /tmp/frontend.log 2>&1 & # 控制面,纯 CPU,默认 8000 端口;--router-mode kv 启用 KV-aware 选路(默认 round-robin 不消费 KV 事件)
 # worker:与 E1.1 相同的 vllm 参数原样透传(去掉 --host/--port,HTTP 入口归 frontend)
+# 必须显式传 --kv-events-config:dynamo 1.4.2 不自动创建(args.py::create_kv_events_config,用户未传则返回 None 不发事件);
+# publisher 默认 zmq、endpoint 默认 tcp://*:5557,DP 各 rank 端口自动偏移,router 按注册信息订阅
 # 观察项:DP=2 与 MTP spec decode 在 dynamo.vllm 下未验证过;若起不来,先降 --data-parallel-size 1 排障
 ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 -m dynamo.vllm \
     --model /data/models/Qwen3.8-27B \
@@ -58,6 +60,7 @@ ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 -m dynamo.vllm \
     --served-model-name qwen \
     --max-num-seqs 64 --max-model-len 256000 --max-num-batched-tokens 16384 \
     --trust-remote-code --enable-prefix-caching --gpu-memory-utilization 0.9 \
+    --kv-events-config '{"enable_kv_cache_events": true}' \
     --speculative-config '{"method": "qwen3_next_mtp", "num_speculative_tokens": 3, "enforce_eager": true}' \
     --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
     --additional-config '{"enable_cpu_binding":true}' \
