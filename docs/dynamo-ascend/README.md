@@ -19,5 +19,10 @@
 - 决策记录:
   - [D001 总体路线:fork 适配而非自研框架](decisions/D001-overall-approach.md)(含 KVBM→KVCR 修正、Worker 拉起差异清单)
   - [D002 组件边界:Dynamo 全组件的适配动作划分](decisions/D002-component-boundary.md)(复用 / 适配 / 替换 / 不用,含引擎双路线)
+- 讨论纪要:
+  - [2026-09-18 E1 环境核实](2026-09-18-e1-bringup-env.md)
+  - [2026-09-18 E1.3 胶水层摸底](2026-09-18-e13-glue-survey.md)
+  - [2026-09-18 E1.4/E1.5 容器内原生 bring-up(etcd)](2026-09-18-e14-e15-native-bringup.md)
+- 启动脚本:[`scripts/dynamo-ascend/`](../../scripts/dynamo-ascend/)(常驻容器 / etcd / FE+worker)
 - 专题:
   - [昇腾数据底座候选盘点](data-plane-options.md)(Mooncake / memcache 二选一倾向,UCM 备选,Yuanrong 暂缓,UB-URMA 待核实)

@@ -16,8 +16,8 @@
 | **E1 单机聚合跑通**(验证:OpenAI 接口出 token,Router 看到注册与 KV 事件) | E1.1 基础镜像 | 拉取 `vllm-ascend:v0.26.0rc1`(Ubuntu 变体);先 `vllm serve` 单独验证引擎出 token——不碰 Dynamo,先证引擎可用 | **完成**(Qwen3.8-27B,DP2×TP4,curl 出 token;实测命令见执行清单) |
 | | E1.2 Dynamo 装入 NPU 环境 | `pip install ai-dynamo==1.4.2`(不带 [vllm] extra);aarch64 runtime wheel 已确认存在 | **完成**(ai-dynamo==1.4.2 已装) |
 | | E1.3 胶水层兼容性摸底 | `dynamo.vllm` 对 vLLM 私有 API 的 import 链在 vllm-ascend/0.26 下静态走查,列 CUDA 假设点清单 | **完成**(静态 59/61 命中、生产面无 CUDA 符号 + 容器内 import 探针通过,见 [2026-09-18-e13-glue-survey.md](2026-09-18-e13-glue-survey.md)) |
-| | E1.4 拉起 worker | 按 [D001](decisions/D001-overall-approach.md) 差异清单配环境变量与 torch_npu 初始化,`dynamo.vllm` 起 vllm-ascend,注册进 etcd | 未开始 |
-| | E1.5 全链路连通 | Frontend → Router → worker 出 token | 未开始 |
+| | E1.4 拉起 worker | 按 [D001](decisions/D001-overall-approach.md) 差异清单配环境变量与 torch_npu 初始化,`dynamo.vllm` 起 vllm-ascend,注册进 etcd | **完成**(容器内 worker + etcd 注册 `qwen`;路径见 [2026-09-18-e14-e15-native-bringup.md](2026-09-18-e14-e15-native-bringup.md);脚本 [`scripts/dynamo-ascend/`](../../scripts/dynamo-ascend/)) |
+| | E1.5 全链路连通 | Frontend → Router → worker 出 token | **部分完成**(同容器 FE→worker etcd/tcp 出 token 已通;KV-aware `--router-mode kv` + `--kv-events-config` 尚未在本路径复验) |
 | 增强 | EX1 SGLang NPU 第二后端 | SGLang 主干自带 NPU 支持(`hardware_backend/npu`),vllm-ascend 路线跑通后接入(远期) | 未开始 |
 | 增强 | EX2 ModelExpress 权重加速 | NPU 间流式传权重;前期共享存储兜底(远期) | 未开始 |
 
@@ -43,9 +43,17 @@ pip install ai-dynamo==1.4.2                      # 不带 [vllm] extra
 # E1.3 终验探针(脚本见 2026-09-18-e13-glue-survey.md;先 import torch_npu 再跑)
 python3 e13_probe.py                              # ALL GREEN 则 E1.3 关闭
 
+# E1.4 / E1.5 一键路径(实测通过,推荐;详见 2026-09-18-e14-e15-native-bringup.md)
+# export WM_ROOT=/data/wm
+# bash scripts/dynamo-ascend/start_docker_va.sh
+# bash scripts/dynamo-ascend/start_etcd.sh
+# bash scripts/dynamo-ascend/start_dynamo_va_native.sh
+# curl -s localhost:8000/v1/models
+
 # E1.4 起 etcd + frontend + worker
 # 前置:先杀掉 E1.1 的 vllm serve——它占着 NPU 显存,dynamo worker 要重新加载模型
 # etcd 安装:jammy 起 Ubuntu 源已无 etcd-server 包,用静态二进制(国内走华为云镜像)
+# （备选）也可用 Docker 常驻:bash scripts/dynamo-ascend/start_etcd.sh
 curl -LO https://mirrors.huaweicloud.com/etcd/v3.5.33/etcd-v3.5.33-linux-arm64.tar.gz
 tar xzf etcd-v3.5.33-linux-arm64.tar.gz && cp etcd-v3.5.33-linux-arm64/{etcd,etcdctl,etcdutl} /usr/local/bin/
 etcd > /tmp/etcd.log 2>&1 &                          # 服务发现+元数据面:worker 注册/发现、租约保活;默认 localhost:2379(无 K8s 环境的默认后端,K8s 下用 K8s API 替代)
@@ -84,3 +92,4 @@ curl localhost:8000/v1/chat/completions \
 | 2026-09-18 | E1.3 关闭:容器内 import 探针通过(Ubuntu 镜像) |
 | 2026-09-18 | E1.1 关闭:`vllm serve` Qwen3.8-27B(DP2×TP4,含 MTP 投机解码 + prefix caching)出 token,curl 验证通过;实测命令已录入执行清单 |
 | 2026-09-18 | E1.2 关闭:`pip install ai-dynamo==1.4.2` 完成 |
+| 2026-09-18 | E1.4/E1.5 实测路径落地:宿主机源码编 Dynamo + `.pth` 注入容器;etcd discovery;同容器 FE+`dynamo.vllm` TP4×DP2 注册 `qwen` 并 chat 出 token。见 [2026-09-18-e14-e15-native-bringup.md](2026-09-18-e14-e15-native-bringup.md) 与 [`scripts/dynamo-ascend/`](../../scripts/dynamo-ascend/)。与清单里 pip 1.4.2 路径并存,KV-aware router 待补 |
