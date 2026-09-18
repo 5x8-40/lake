@@ -21,6 +21,27 @@
 | 增强 | EX1 SGLang NPU 第二后端 | SGLang 主干自带 NPU 支持(`hardware_backend/npu`),vllm-ascend 路线跑通后接入(远期) | 未开始 |
 | 增强 | EX2 ModelExpress 权重加速 | NPU 间流式传权重;前期共享存储兜底(远期) | 未开始 |
 
+## E1 执行清单(镜像就绪后按序执行)
+
+```bash
+# E1.1 起容器(设备与挂载清单见 2026-09-18-e1-bringup-env.md),先证引擎
+vllm serve <模型> --tensor-parallel-size <卡数>   # 出 token 即过;注意 v0.26.0rc1 是模型受限版
+
+# E1.2 装 dynamo(容器内)
+pip install ai-dynamo==1.4.2                      # 不带 [vllm] extra
+
+# E1.3 终验探针(脚本见 2026-09-18-e13-glue-survey.md;先 import torch_npu 再跑)
+python3 e13_probe.py                              # ALL GREEN 则 E1.3 关闭
+
+# E1.4 起 etcd + frontend + worker
+etcd &                                            # 本地发现面
+python3 -m dynamo.frontend &                      # 控制面,纯 CPU
+ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 python3 -m dynamo.vllm --model <模型> ...
+
+# E1.5 发请求验证
+curl localhost:8000/v1/chat/completions -d '...'
+```
+
 ## 进展日志
 
 | 日期 | 事项 |

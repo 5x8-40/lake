@@ -26,9 +26,23 @@
 
 ## 结论(静态阶段)
 
-1. **import 面在 vLLM 0.26 对齐下基本无缺口**——版本对齐策略(ai-dynamo 1.4.0 ↔ vllm-ascend v0.26.0rc1)成立。
+1. **import 面在 vLLM 0.26 对齐下基本无缺口**——版本对齐策略(ai-dynamo 1.4.x ↔ vllm-ascend v0.26.0rc1)成立。
 2. **生产胶水层无 CUDA 符号引用**;CUDA 命名 import 全部在测试代码。运行时风险不在 import,而在行为层:vllm-ascend 的 platform patch 对 `SchedulerOutput` 等结构语义的影响、KV 事件发布路径,需容器内实测。
 3. `[vllm]` extra 的 CUDA 依赖(`nixl[cu13]==1.3.2`、flashinfer)不装;NIXL 留到 K1 源码编译 + Mooncake TE 后端。
+
+## 硬件假设扫描(2026-09-18 补,回答"fork 有没有代码要改")
+
+对生产代码(排除 tests 与 trtllm/sglang/omni 后端)全量扫 `torch.cuda` / `pynvml` / `CUDA_VISIBLE_DEVICES` / `nvtx` / cudagraph:
+
+| 检查项 | 结果 |
+|--------|------|
+| `torch.cuda` / `pynvml` / `CUDA_VISIBLE_DEVICES` | **零使用** |
+| `CUDAGraphMode` / `current_platform` / `CpuPlatform` | 只在 `tests/`(测试用 CpuPlatform 兜底无卡主机) |
+| `nvtx_utils`(handlers.py) | 默认关闭(`DYN_NVTX=0`,零开销),不开即空操作 |
+| `instrumented_scheduler` 的 cudagraph 读取 | 全是 `getattr(…, "NONE")` 防御式读法,字段缺失不炸;且属 benchmark 模式 |
+| `backend_args.py` 的 "CUDA graph" 字样 | 仅 help 文本 |
+
+**结论:E1 bring-up 阶段 fork 大概率零代码改动**,要新增的是部署物(Dockerfile:FROM vllm-ascend 镜像 + `pip install ai-dynamo==1.4.2`;启动脚本/环境变量模板)。可能的补丁点(KV 事件 publisher 配置、健康检查与 vllm-ascend platform 插件的交互)只能在 E1.4 实测暴露。
 
 ## 容器内终验探针(E1.3 完成判据:全绿)
 
