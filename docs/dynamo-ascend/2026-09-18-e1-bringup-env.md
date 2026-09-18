@@ -71,6 +71,17 @@ docker run --rm \
 # 容器内(Ubuntu):apt-get update && apt-get install -y curl
 ```
 
+容器内 apt 源(国内实测好用,jammy):
+
+```
+deb http://mirrors.tools.huawei.com/ubuntu/ jammy main restricted universe multiverse
+deb http://mirrors.tools.huawei.com/ubuntu/ jammy-updates main restricted universe multiverse
+deb http://mirrors.tools.huawei.com/ubuntu/ jammy-backports main restricted universe multiverse
+deb http://mirrors.tools.huawei.com/ubuntu/ jammy-security main restricted universe multiverse
+```
+
+注意:jammy 起 Ubuntu 源已无 `etcd-server` 包,etcd 用静态二进制装(华为云镜像 `mirrors.huaweicloud.com/etcd`,命令见 e-line 执行清单 E1.4)。
+
 注意:8 卡全挂(davinci0–7),2026-09-18 实测 npu-smi 正常。`--shm-size=1g` 对多卡 TP 偏小,起多卡 worker 若报 shm 相关错误,重起容器调大(如 16g)。
 
 ## 来源

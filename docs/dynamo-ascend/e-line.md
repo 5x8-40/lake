@@ -45,7 +45,9 @@ python3 e13_probe.py                              # ALL GREEN 则 E1.3 关闭
 
 # E1.4 起 etcd + frontend + worker
 # 前置:先杀掉 E1.1 的 vllm serve——它占着 NPU 显存,dynamo worker 要重新加载模型
-# etcd 安装(Ubuntu 容器):apt-get install -y etcd-server,或下 arm64 静态二进制
+# etcd 安装:jammy 起 Ubuntu 源已无 etcd-server 包,用静态二进制(国内走华为云镜像)
+curl -LO https://mirrors.huaweicloud.com/etcd/v3.5.33/etcd-v3.5.33-linux-arm64.tar.gz
+tar xzf etcd-v3.5.33-linux-arm64.tar.gz && cp etcd-v3.5.33-linux-arm64/{etcd,etcdctl} /usr/local/bin/
 etcd > /tmp/etcd.log 2>&1 &                          # 服务发现+元数据面:worker 注册/发现、租约保活;默认 localhost:2379(无 K8s 环境的默认后端,K8s 下用 K8s API 替代)
 python3 -m dynamo.frontend > /tmp/frontend.log 2>&1 & # 控制面,纯 CPU,默认 8000 端口(容器已映射 8000)
 # worker:与 E1.1 相同的 vllm 参数原样透传(去掉 --host/--port,HTTP 入口归 frontend)
