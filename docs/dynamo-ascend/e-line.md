@@ -10,24 +10,30 @@
 | 里程碑 | 任务 | 说明 | 状态 |
 |--------|------|------|------|
 | **E1 单机聚合跑通**（2026-09-20 完成） | E1.1 基础镜像 | `vllm serve` 单独验证引擎出 token | 完成（Qwen3.8-27B，DP2×TP4） |
-| | E1.2 Dynamo 装入 NPU 环境 | 源码 v1.4.2 + `.pth` 注入（runtime .so 可拷贝） | 完成 |
+| | E1.2 Dynamo 装入 NPU 环境 | 源码 v1.4.2，容器内 editable 安装（runtime .so 可拷贝） | 完成 |
 | | E1.3 胶水层兼容性摸底 | import 面走查，结论：零代码改动 | 完成（见 [2026-09-18-e13-glue-survey.md](2026-09-18-e13-glue-survey.md)） |
 | | E1.4 拉起 worker | frontend + `dynamo.vllm` 同容器，file discovery | 完成 |
 | | E1.5 全链路连通 | chat 出 token（含 MTP + cudagraph + 256K 全配置） | 完成 |
-| **E1.6 KV 事件链** | E1.6 KV-aware 选路补验 | 已验通路线未开 KV 事件；补验方式见下节 | 未开始 |
+| **E1.6 KV 事件链** | E1.6 KV-aware 选路补验 | 脚本已内置事件参数；验证方式见下节 | 进行中 |
 | 增强 | EX1 SGLang NPU 第二后端 | SGLang 主干自带 NPU 支持，vllm-ascend 路线跑通后接入（远期） | 未开始 |
 | 增强 | EX2 ModelExpress 权重加速 | NPU 间流式传权重；前期共享存储兜底（远期） | 未开始 |
 
 ## 一次性安装（容器内，editable）
 
-源码树在宿主机（`$WM_ROOT/dynamo-ascend`，checkout v1.4.2），经 `/data` 挂载进容器；安装在容器内做，editable 方式（改 Python 代码即时生效，`.pth` 由 pip 自动管理）：
+源码树在宿主机，经 `/data` 挂载进容器；安装在容器内做，editable 方式（改 Python 代码即时生效，`.pth` 由 pip 自动管理）：
 
 ```bash
+# 宿主机:拉仓 + 锁定版本
+export WM_ROOT=/data/wm
+git clone https://github.com/5x8-40/dynamo-ascend.git $WM_ROOT/dynamo-ascend
+cd $WM_ROOT/dynamo-ascend && git checkout v1.4.2
+
+# 容器内:
 docker exec -it vllm-ascend-wcd bash
 cd /data/wm/dynamo-ascend
 
 # ① Rust runtime(二选一)
-# A. 从头编(推荐):
+# A. 从头编(推荐;缺 gcc/protoc 等系统工具时按报错 apt 装,源见环境文档):
 curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y
 source ~/.cargo/env
 pip install 'maturin[patchelf]'
@@ -39,6 +45,8 @@ cd lib/bindings/python && maturin build --release \
 pip install -e . --no-deps
 # import 若报缺包(如 kubernetes),单独 pip install 补,不要全量装依赖
 ```
+
+② 已由 `start_va_dynamo.sh` 自动化（检测到未安装时触发）；① 的 Rust 编译需手工做一次。
 
 - 仓库根 `.cargo/config.toml` 需配 `target-cpu=generic`（否则部分鲲鹏主机 `import dynamo._core` 报 Illegal instruction）；crates.io 走 rsproxy 镜像：
 
@@ -81,13 +89,12 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 | 现象 | 原因 | 处理 |
 |------|------|------|
 | `import dynamo._core` Illegal instruction | PyPI aarch64 wheel target-cpu 基线过新 | 源码编（`target-cpu=generic`）或拷贝 .so；**不要 pip 装 ai-dynamo** |
-| pip 装 dynamo 后 vllm 被替换 | `[vllm]` extra 拉 CUDA 生态顶掉镜像内 vllm | 卸载，只用 `.pth` 注入 |
+| pip 装 dynamo 后 vllm 被替换 | `[vllm]` extra 拉 CUDA 生态顶掉镜像内 vllm | 卸载，改用 editable 安装（`pip install -e . --no-deps`） |
 | file discovery 日志刷 stream end | inotify watch 上限 | `sysctl -w fs.inotify.max_user_watches=1048576`（脚本已带） |
 
-## E1.6 KV 事件链（下一任务）
+## E1.6 KV 事件链（进行中）
 
-- 已验通的路线没开 KV 事件，router 的 KV-aware 选路没实际走过。
-- 补验：worker 加 `--kv-events-config '{"enable_kv_cache_events": true, "publisher": "zmq", "topic": "kv-events"}'`，frontend 加 `--router-mode kv`。
+- 脚本已内置参数：frontend `--router-mode kv` + worker `--kv-events-config '{"enable_kv_cache_events": true, "publisher": "zmq", "topic": "kv-events"}'`，重跑 `start_va_dynamo.sh` 即开验。
 - **关键坑**：vLLM 的 `enable_kv_cache_events` 默认 `False`，不显式写 `true` 事件一律不发（dynamo 侧日志只会打一条 warning）；不给 `--kv-events-config` 则发布器不建。传输不用配：file discovery 下 event plane 自动走本地 ZMQ，无需 NATS。
 - 验证：① worker 日志出现 `KV event publisher for dp_rank=N subscribing to vLLM at tcp://127.0.0.1:5557+N`；② 同一长前缀（≥16 token）请求发两次，第二次应命中前缀 KV（APC 命中率 >0，TTFT 明显下降）。DP2 下事件按 dp_rank 发布，router 靠事件做 rank 级亲和。
 
@@ -98,3 +105,4 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 | 2026-09-17 | 计划建立 |
 | 2026-09-18 | E1.1–E1.3 完成；镜像换 Ubuntu 变体 |
 | 2026-09-20 | E1.4/E1.5 本机完成（全配置 + file discovery，单机免 etcd）；**版本锁定 1.4.2**（main 与 vllm 0.26 不兼容）；runtime .so 走拷贝绕行 |
+| 2026-09-20 | 安装改容器内 editable（`pip install -e . --no-deps`），不再手工管 `.pth`；E1.6 开验：修正事件参数（vLLM 默认 `enable_kv_cache_events=False`，须显式开），参数已入脚本 |

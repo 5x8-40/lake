@@ -60,12 +60,20 @@ set -e
 # dynamo editable 安装(幂等;pip 自动管 .pth,不动镜像依赖)
 PYPATH=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
 if [ -f "$PYPATH/dynamo-ascend.pth" ] || ! python3 -c 'import dynamo.frontend' 2>/dev/null; then
-  rm -f "$PYPATH/dynamo-ascend.pth"   # 旧的手工 .pth,迁移掉
   mkdir -p "$PYPATH/dynamo"
   if [ ! -f "$PYPATH/dynamo/_core.abi3.so" ] && [ -f "$REPO/lib/bindings/python/src/dynamo/_core.abi3.so" ]; then
     cp "$REPO/lib/bindings/python/src/dynamo/_core.abi3.so" "$PYPATH/dynamo/"
   fi
   pip install -e "$REPO" --no-deps
+  rm -f "$PYPATH/dynamo-ascend.pth"   # 旧的手工 .pth:装成功后再删,避免 pip 失败时无可用安装
+fi
+
+# 前置检查:runtime .so 必须在位,否则 frontend/worker 起不来
+if ! python3 -c 'import dynamo._core' 2>/dev/null; then
+  echo "ERROR: import dynamo._core 失败——_core.abi3.so 缺失或不兼容。" >&2
+  echo "  编译:cd $REPO/lib/bindings/python && maturin build --release && pip install target/release/wheels/ai_dynamo_runtime-*.whl" >&2
+  echo "  或拷贝编好的 .so 到 $PYPATH/dynamo/" >&2
+  exit 1
 fi
 
 ulimit -n 65535 || true
