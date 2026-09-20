@@ -1,16 +1,8 @@
-# Ascend bring-up scripts
+# Ascend bring-up 脚本
 
-单机 / 跨机 discovery 启动脚本。说明见 [`../../native-bringup.md`](../../native-bringup.md)。
+| 脚本 | 作用 |
+|------|------|
+| `start_etcd.sh` | etcd 容器创建 + 拉起（**仅跨机 discovery 需要**；单机用 file，免 etcd） |
+| `start_va_dynamo.sh` | vllm-ascend 容器创建 + 容器内拉起 dynamo frontend/worker（`stop` 参数停进程） |
 
-```bash
-export WM_ROOT=/data/wm   # dynamo-ascend 检出目录、日志、etcd 数据默认根
-
-bash scripts/ascend/start_docker_va.sh
-bash scripts/ascend/start_etcd.sh
-bash scripts/ascend/start_dynamo_va_native.sh
-
-RESTART=1 bash scripts/ascend/start_dynamo_va_native.sh
-DISCOVERY=file bash scripts/ascend/start_dynamo_va_native.sh
-ETCD_ENDPOINTS=http://<host-ip>:2379 bash scripts/ascend/start_dynamo_va_native.sh
-bash scripts/ascend/start_dynamo_va_native.sh stop
-```
+用法与参数见 [../e-line.md](../e-line.md)。

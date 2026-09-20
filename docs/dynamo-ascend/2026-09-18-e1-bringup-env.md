@@ -1,6 +1,6 @@
 # 2026-09-18 E1 环境核实:镜像与挂载
 
-> 环境事实记录。安装与启动的定稿流程见 [native-bringup.md](native-bringup.md)。
+> 环境事实记录。安装与启动的定稿流程见 [e-line.md](e-line.md)。
 
 ## 目标环境
 
@@ -20,7 +20,7 @@
 
 设备:`/dev/davinci[0-7]`、`/dev/davinci_manager`、`/dev/devmm_svm`、`/dev/hisi_hdc`;卷:`/usr/local/dcmi`、`/usr/local/bin/npu-smi`、`/usr/local/Ascend/driver/lib64`、`/usr/local/Ascend/driver/version.info`、`/etc/ascend_install.info`、`/root/.cache`(模型权重);另挂 `hccn_tool`。
 
-启动用 [scripts/ascend/start_docker_va.sh](scripts/ascend/start_docker_va.sh)(常驻容器,8 卡全挂 + `--net=host` + `-v /data:/data` + 华为 PyPI 源注入)。`--shm-size=1g` 对多卡 TP 偏小,起多卡 worker 若报 shm 相关错误,调大(如 16g)。
+启动用 [scripts/ascend/start_va_dynamo.sh](scripts/ascend/start_va_dynamo.sh)(常驻容器,8 卡全挂 + `--net=host` + `-v /data:/data` + 华为 PyPI 源注入)。`--shm-size=1g` 对多卡 TP 偏小,起多卡 worker 若报 shm 相关错误,调大(如 16g)。
 
 容器内 apt 源(国内实测好用,jammy):
 

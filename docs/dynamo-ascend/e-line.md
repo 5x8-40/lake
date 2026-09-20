@@ -1,35 +1,85 @@
-# E 引擎线:任务与进展追踪
+# E 线：引擎适配（dynamo-ascend）
 
-> E 线 = 让请求在昇腾上跑起来(引擎接入)。本文档只作任务追踪;环境与操作手册见 [native-bringup.md](native-bringup.md)。
->
-> 环境:Atlas A2(8 卡)/ openEuler / Kunpeng 920(aarch64);镜像 `vllm-ascend:v0.26.0rc1`(Ubuntu 变体);**Dynamo 版本锁定 1.4.2**(main/1.5.0 与 vllm 0.26 不兼容,需侵入式修改,不采用)。
+> 环境：Atlas A2（8 卡）/ openEuler / Kunpeng 920（aarch64）；镜像 `vllm-ascend:v0.26.0rc1`（Ubuntu 变体）。
+> **版本锁定：dynamo 1.4.2 ↔ vllm-ascend 0.26.0rc1**（main/1.5.0 与 vllm 0.26 不兼容，需侵入式修改，不用）。
+> 形态：frontend + `dynamo.vllm` worker 与 vllm-ascend 同容器；单机 file discovery（免 etcd），跨机才用 etcd。
+> 环境事实（镜像内容 / 挂载 / apt 源）见 [2026-09-18-e1-bringup-env.md](2026-09-18-e1-bringup-env.md)。
 
 ## 任务表
 
 | 里程碑 | 任务 | 说明 | 状态 |
 |--------|------|------|------|
-| **E1 单机聚合跑通**(2026-09-18 完成) | E1.1 基础镜像 | `vllm serve` 单独验证引擎出 token | 完成(Qwen3.8-27B,DP2×TP4) |
-| | E1.2 Dynamo 装入 NPU 环境 | 宿主机源码编译 + `.pth` 注入 | 完成 |
-| | E1.3 胶水层兼容性摸底 | import 面走查 + 容器探针,结论:零代码改动 | 完成(见 [2026-09-18-e13-glue-survey.md](2026-09-18-e13-glue-survey.md)) |
-| | E1.4 拉起 worker | frontend + `dynamo.vllm` 同容器,注册进发现面 | 完成(2026-09-20 本机,file discovery) |
-| | E1.5 全链路连通 | `/v1/models` 注册 `qwen`,chat 出 token | 完成(含 MTP + cudagraph + 256K 全配置) |
-| **E1.6 KV 事件链** | E1.6 KV-aware 选路补验 | 已验通路线未开 KV 事件;补验方式见下节 | 未开始 |
-| 增强 | EX1 SGLang NPU 第二后端 | SGLang 主干自带 NPU 支持,vllm-ascend 路线跑通后接入(远期) | 未开始 |
-| 增强 | EX2 ModelExpress 权重加速 | NPU 间流式传权重;前期共享存储兜底(远期) | 未开始 |
+| **E1 单机聚合跑通**（2026-09-20 完成） | E1.1 基础镜像 | `vllm serve` 单独验证引擎出 token | 完成（Qwen3.8-27B，DP2×TP4） |
+| | E1.2 Dynamo 装入 NPU 环境 | 源码 v1.4.2 + `.pth` 注入（runtime .so 可拷贝） | 完成 |
+| | E1.3 胶水层兼容性摸底 | import 面走查，结论：零代码改动 | 完成（见 [2026-09-18-e13-glue-survey.md](2026-09-18-e13-glue-survey.md)） |
+| | E1.4 拉起 worker | frontend + `dynamo.vllm` 同容器，file discovery | 完成 |
+| | E1.5 全链路连通 | chat 出 token（含 MTP + cudagraph + 256K 全配置） | 完成 |
+| **E1.6 KV 事件链** | E1.6 KV-aware 选路补验 | 已验通路线未开 KV 事件；补验方式见下节 | 未开始 |
+| 增强 | EX1 SGLang NPU 第二后端 | SGLang 主干自带 NPU 支持，vllm-ascend 路线跑通后接入（远期） | 未开始 |
+| 增强 | EX2 ModelExpress 权重加速 | NPU 间流式传权重；前期共享存储兜底（远期） | 未开始 |
 
-## E1.6 说明(KV 事件链)
+## 一次性安装（宿主机）
 
-E1 验通路线的 worker/frontend 均未开 KV 事件,Router 实际是 round-robin。补验时改 `scripts/ascend/start_dynamo_va_native.sh`:
+```bash
+export WM_ROOT=/data/wm
+git clone https://github.com/5x8-40/dynamo-ascend.git $WM_ROOT/dynamo-ascend
+cd $WM_ROOT/dynamo-ascend && git checkout v1.4.2
+```
 
-- worker 加 `--kv-events-config '{"enable_kv_cache_events": true}'`(publisher 默认 zmq、endpoint 默认 `tcp://*:5557`,DP 各 rank 端口自动偏移);
-- frontend 加 `--router-mode kv`(默认 round-robin 不消费事件);
-- 验证:同一长前缀请求发两次,第二次应命中前缀 KV(TTFT 明显下降)。
+Rust runtime（`_core.abi3.so`）二选一：
+
+- **A. 源码编**：仓库根 `.cargo/config.toml` 加下面配置，然后 `cd lib/bindings/python && maturin build --release`（或 `maturin develop`，需 venv），把 `.so` 放到 `lib/bindings/python/src/dynamo/`。
+- **B. 网络受限**：直接拷贝他人编译的 `_core.abi3.so` 到 `lib/bindings/python/src/dynamo/`（需与 v1.4.2 组件配套）。
+
+```toml
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=generic", "-C", "force-frame-pointers=yes", "--cfg", "tokio_unstable"]
+
+# 可选:crates.io 国内镜像
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+```
+
+## 拉起（两个脚本）
+
+脚本在 [scripts/ascend/](scripts/ascend/)：
+
+```bash
+./scripts/ascend/start_etcd.sh              # ① etcd 容器(仅跨机 discovery 需要;单机不用跑)
+./scripts/ascend/start_va_dynamo.sh         # ② 建 vllm-ascend 容器 + 容器内拉起 frontend/worker
+./scripts/ascend/start_va_dynamo.sh stop    # 停容器内 dynamo 进程
+```
+
+② 做的事：容器不存在则创建（8 卡挂载 + `--net=host`）；写 `.pth` 注入宿主机源码；后台起 frontend（file discovery）与 worker（agg 模式，全配置）；日志在 `$WM_ROOT/logs/`。
+
+## 验证
+
+```bash
+curl -s http://127.0.0.1:8000/v1/models    # 应见 "qwen"
+curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+  -d '{"model":"qwen","messages":[{"role":"user","content":"hello"}],"max_tokens":16}'
+```
+
+## 已知坑
+
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| `import dynamo._core` Illegal instruction | PyPI aarch64 wheel target-cpu 基线过新 | 源码编（`target-cpu=generic`）或拷贝 .so；**不要 pip 装 ai-dynamo** |
+| pip 装 dynamo 后 vllm 被替换 | `[vllm]` extra 拉 CUDA 生态顶掉镜像内 vllm | 卸载，只用 `.pth` 注入 |
+| file discovery 日志刷 stream end | inotify watch 上限 | `sysctl -w fs.inotify.max_user_watches=1048576`（脚本已带） |
+
+## E1.6 KV 事件链（下一任务）
+
+- 已验通的路线没开 KV 事件，router 的 KV-aware 选路没实际走过。
+- 补验：worker 加 `--kv-events-config '{"publisher":"zmq","topic":"kv-events"}'`，frontend 加 `--router-mode kv`（1.4.2 实参以 `--help` 为准）。
+- 验证：同一长前缀请求发两次，第二次应命中前缀 KV（TTFT 明显下降）。
 
 ## 进展日志
 
-| 日期 | 事项 |
+| 日期 | 进展 |
 |------|------|
-| 2026-09-17 | E 线任务拆分定稿 |
-| 2026-09-18 | E1 完成:Ubuntu 镜像定稿;`vllm serve` 出 token;胶水层探针通过;源码编译路线跑通 frontend + worker + etcd,chat 出 token(910B3) |
-| 2026-09-20 | 文档重组:runbook 与脚本定稿于本工作区([native-bringup.md](native-bringup.md) + [scripts/ascend/](scripts/ascend/)),dynamo-ascend 仓只留代码改动;新增 E1.6 |
-| 2026-09-20 | 本机跑通 PD 混部(agg):全配置(MTP + cudagraph + 256K)+ file discovery(单机免 etcd)。**发现 main(1.5.0)与 vllm 0.26 不兼容、需侵入式修改,版本锁定 dynamo 1.4.2 ↔ vllm-ascend 0.26.0rc1** |
+| 2026-09-17 | 计划建立 |
+| 2026-09-18 | E1.1–E1.3 完成；镜像换 Ubuntu 变体 |
+| 2026-09-20 | E1.4/E1.5 本机完成（全配置 + file discovery，单机免 etcd）；**版本锁定 1.4.2**（main 与 vllm 0.26 不兼容）；runtime .so 走拷贝绕行 |
