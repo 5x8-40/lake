@@ -23,13 +23,21 @@
 ```bash
 export WM_ROOT=/data/wm
 git clone https://github.com/5x8-40/dynamo-ascend.git $WM_ROOT/dynamo-ascend
-cd $WM_ROOT/dynamo-ascend && git checkout v1.4.2
+cd $WM_ROOT/dynamo-ascend && git checkout v1.4.2    # 版本锁定
+
+# 构建环境
+uv venv .venv --python 3.12 && source .venv/bin/activate
+uv pip install 'maturin[patchelf]'
+
+# ① 编 Rust runtime → 产出 lib/bindings/python/src/dynamo/_core.abi3.so
+cd lib/bindings/python && maturin develop --uv && cd ../..
+#   网络受限编不了时:拷贝他人编译的 _core.abi3.so 到 lib/bindings/python/src/dynamo/,跳过①
+
+# ② 装根包(纯 Python)
+uv pip install -e '.[mocker]'
 ```
 
-Rust runtime（`_core.abi3.so`）二选一：
-
-- **A. 源码编**：仓库根 `.cargo/config.toml` 加下面配置，然后 `cd lib/bindings/python && maturin build --release`（或 `maturin develop`，需 venv），把 `.so` 放到 `lib/bindings/python/src/dynamo/`。
-- **B. 网络受限**：直接拷贝他人编译的 `_core.abi3.so` 到 `lib/bindings/python/src/dynamo/`（需与 v1.4.2 组件配套）。
+- 仓库根 `.cargo/config.toml` 需配 `target-cpu=generic`（否则部分鲲鹏主机 `import dynamo._core` 报 Illegal instruction）：
 
 ```toml
 [target.aarch64-unknown-linux-gnu]
@@ -41,6 +49,10 @@ replace-with = 'rsproxy-sparse'
 [source.rsproxy-sparse]
 registry = "sparse+https://rsproxy.cn/index/"
 ```
+
+- 不用 uv：`cd lib/bindings/python && maturin build --release`（免 venv），把 `target/release/wheels/` 里 wheel 中的 `_core.abi3.so` 解到 `lib/bindings/python/src/dynamo/`；根包用 `pip install -e .`。
+- 改 Rust 代码后重编：先 `cargo clean --manifest-path lib/bindings/python/Cargo.toml`（incremental 可能不链新符号），再重跑 ①。
+- ③ `.pth` 注入容器由 `start_va_dynamo.sh` 自动做：把 `components/src` 和 `lib/bindings/python/src` 写进容器 site-packages 的 `dynamo-ascend.pth`，容器内 python 直接 import 宿主机源码。
 
 ## 拉起（两个脚本）
 
