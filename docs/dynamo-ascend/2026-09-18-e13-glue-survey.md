@@ -42,7 +42,9 @@
 | `instrumented_scheduler` 的 cudagraph 读取 | 全是 `getattr(…, "NONE")` 防御式读法,字段缺失不炸;且属 benchmark 模式 |
 | `backend_args.py` 的 "CUDA graph" 字样 | 仅 help 文本 |
 
-**结论:E1 bring-up 阶段 fork 大概率零代码改动**,要新增的是部署物(Dockerfile:FROM vllm-ascend 镜像 + `pip install ai-dynamo==1.4.2`;启动脚本/环境变量模板)。可能的补丁点(KV 事件 publisher 配置、健康检查与 vllm-ascend platform 插件的交互)只能在 E1.4 实测暴露。
+**结论:E1 bring-up 阶段 fork 大概率零代码改动**,要新增的是部署物(启动脚本/环境变量模板)。可能的补丁点(KV 事件 publisher 配置、健康检查与 vllm-ascend platform 插件的交互)只能在 E1.4 实测暴露。
+
+> 2026-09-20 注:安装方式已定稿为宿主机源码编译 ascend-dev + `.pth` 注入(PyPI aarch64 wheel 在部分鲲鹏主机 Illegal instruction),见 [native-bringup.md](native-bringup.md);本文的 import 面结论不变。
 
 ## 容器内终验探针(E1.3 完成判据:全绿)
 

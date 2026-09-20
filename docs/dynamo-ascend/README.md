@@ -16,6 +16,7 @@
 ## 现有内容
 
 - 任务追踪:[E 引擎线](e-line.md)(任务表 + 状态 + 进展日志;**进行中**)
+- 运行手册:[Ascend 原生 bring-up](native-bringup.md)(源码编译 + 常驻容器 + etcd + FE/worker 同容器,2026-09-18 验通;含启动脚本 [scripts/ascend/](scripts/ascend/))
 - 决策记录:
   - [D001 总体路线:fork 适配而非自研框架](decisions/D001-overall-approach.md)(含 KVBM→KVCR 修正、Worker 拉起差异清单)
   - [D002 组件边界:Dynamo 全组件的适配动作划分](decisions/D002-component-boundary.md)(复用 / 适配 / 替换 / 不用,含引擎双路线)

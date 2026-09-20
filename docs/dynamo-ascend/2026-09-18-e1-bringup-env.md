@@ -17,15 +17,14 @@
 - **模型受限版**:官方完整验证仅 Kimi K3 / GLM-5.2 / DeepSeek V4 Flash 0731 / DeepSeek V4 Pro 0813。bring-up 阶段直接用已验证模型,不自加变量。
 - 已知问题:triton-ascend 需 ≥3.2.0.dev20260322(官方镜像已含;手动装环境时才需要注意)。
 
-## Dynamo 安装:版本对齐是关键
+## Dynamo 安装:源码编译路线(2026-09-20 定稿)
 
-- **陷阱**:Dynamo main(ai-dynamo 1.5.0)的 `[vllm]` extra pin `vllm[flashinfer,runai,otel]==0.28.0`。在镜像里直接 `pip install ai-dynamo[vllm]` 会把 vLLM 0.26 顶掉,vllm-ascend 失效。
-- **对齐版本**:1.4.x 全系列(1.4.0 / 1.4.1 / 1.4.2,PyPI 已逐一核实)的 [vllm] extra 都 pin `vllm==0.26.0`,与镜像一致。**用最新 patch:ai-dynamo==1.4.2**(2026-08-28 发布)。上游 pin 演进:0.26.0(2026-07-29,#12202)→ 0.27.1(08-18,#13059)→ 0.28.0(08-31,#13846)——1.4.2 是 0.26 对齐窗口内的最后一个 patch。
-- **安装方式**:`pip install ai-dynamo==1.4.2`(**不带** [vllm] extra,用镜像自带 vLLM)。Rust 组件(frontend/router 等)在 `ai-dynamo-runtime` wheel 里,1.4.2 有 aarch64 wheel(`cp310-abi3-manylinux_2_28_aarch64`,一个 wheel 覆盖 Python 3.10–3.12),Kunpeng 920 可直接装,不需要 Rust 工具链;glibc ≥2.28(openEuler 满足)。
-- **base 依赖零 CUDA**(2026-09-18 PyPI 核实):base 包仅 9 项依赖——`ai-dynamo-runtime` + aiohttp / kubernetes / msgspec / prometheus-client / pyzmq / transformers≥4.56 / typing-extensions / zstandard,无 torch/vllm/CUDA;CUDA 依赖(nixl[cu13]、vllm[flashinfer]、cupy-cuda12x、tensorrt-llm)全在 extra 里,不带 extra 不引入。**NPU 环境 pip 直接装 base 包是安全的**。
-- **不源码装、不用 venv**:源码装需 Rust 工具链 + maturin 编 runtime wheel,bring-up 无收益(E1.3 结论:大概率零代码改动),待真要改 dynamo 代码再切;**禁用 uv/venv 隔离环境**——`dynamo.vllm` 必须 import 镜像内的 vllm/vllm-ascend/torch_npu,要装进镜像的系统 Python 环境。装后检查:`pip list | grep -Ei "torch|vllm|ai-dynamo"` 确认镜像原有包未被动。
-- **fork 基线**:`5x8-40/dynamo-ascend` 的 `ascend-dev` 目前跟踪 main(1.5.0 / vllm 0.28)。bring-up 阶段应从上游 **v1.4.2** 切基线,与 vllm-ascend v0.26.0rc1 锁步;待 vllm-ascend 发布 0.28 对齐版(nightly 已到 0.27.1rc)再整体升。
-- **为什么不能用最新 main**:main(1.5.0)要 `vllm==0.28.0`,而 vllm-ascend 版本号跟随 vLLM、最新正式版只有 v0.26.0rc1(对齐 0.26.0)——用 main 就没有可用的昇腾引擎。1.4.2 + vLLM 0.26 + vllm-ascend v0.26.0rc1 是对齐窗口内的最新组合。
+- **定稿路线**:宿主机源码编译 fork `ascend-dev`(跟踪上游 main)+ `.pth` 注入容器 site-packages,完整步骤见 [native-bringup.md](native-bringup.md) §2。不用 venv——`dynamo.vllm` 必须 import 镜像内的 vllm/vllm-ascend/torch_npu,注入目标是容器系统 Python。
+- **pip wheel 路线弃用**,两个原因:
+  - PyPI aarch64 wheel(`ai-dynamo-runtime`)在部分鲲鹏主机 `import dynamo._core` 报 **Illegal instruction**(wheel target-cpu 基线不兼容),需 `.cargo` 配 `target-cpu=generic` 源码重编;
+  - `pip install ai-dynamo[vllm]` 的 extra pin `vllm==0.28.0`(main)且拉 CUDA 生态(nixl[cu13]、flashinfer),会顶掉镜像里的 vLLM 0.26——任何场景都**禁止**带 [vllm] extra。
+- **版本对齐的实质**:pip 的 vllm pin 只是解析约束,源码装绕过;main 胶水在 agg 路径对 vllm 0.26 运行时兼容(2026-09-18 实测)。vllm-ascend 升级后需重验 import 面,方法见 [2026-09-18-e13-glue-survey.md](2026-09-18-e13-glue-survey.md)。
+- **fork 基线**:`5x8-40/dynamo-ascend` 的 `ascend-dev`,跟踪上游 main。
 - **KVBM sunset 与本线无关**:KVBM 已日落(DEP #11673),继任者 KVCR 是**独立仓独立包**(`nvidia-kvcr`,framework-neutral,不依赖 vllm/ai-dynamo),dynamo 侧对接面是 router hint(2026-08-07 进 main,#11695,**1.4.2 已含**)。KVCR 管 KV 卸载/P2P(K 线范畴);E 线聚合模式 bring-up 既不需要 KVBM 也不需要 KVCR。
 
 ## E1.3 摸底对象:胶水层的版本/硬件敏感点(初步清单)
@@ -42,34 +41,9 @@
 
 设备:`/dev/davinci[0-7]`、`/dev/davinci_manager`、`/dev/devmm_svm`、`/dev/hisi_hdc`;卷:`/usr/local/dcmi`、`/usr/local/bin/npu-smi`、`/usr/local/Ascend/driver/lib64`、`/usr/local/Ascend/driver/version.info`、`/etc/ascend_install.info`、`/root/.cache`(模型权重);另挂 `hccn_tool`。建议 `--net=host`、`--shm-size` 调大。
 
-### 实测可用的启动命令(2026-09-18,8 卡全挂)
+### 容器启动(定稿:常驻脚本)
 
-```bash
-export IMAGE=quay.io/ascend/vllm-ascend:v0.26.0rc1
-docker run --rm \
-  --name vllm-ascend \
-  --shm-size=1g \
-  --device /dev/davinci0 \
-  --device /dev/davinci1 \
-  --device /dev/davinci2 \
-  --device /dev/davinci3 \
-  --device /dev/davinci4 \
-  --device /dev/davinci5 \
-  --device /dev/davinci6 \
-  --device /dev/davinci7 \
-  --device /dev/davinci_manager \
-  --device /dev/devmm_svm \
-  --device /dev/hisi_hdc \
-  -v /usr/local/dcmi:/usr/local/dcmi \
-  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
-  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
-  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
-  -v /etc/ascend_install.info:/etc/ascend_install.info \
-  -v /root/.cache:/root/.cache \
-  -p 8000:8000 \
-  -it $IMAGE bash
-# 容器内(Ubuntu):apt-get update && apt-get install -y curl
-```
+用 [scripts/ascend/start_docker_va.sh](scripts/ascend/start_docker_va.sh) 起**常驻**容器(`sleep infinity`;不要 `docker run --rm -it`,Ctrl+D 容器即销毁):8 卡全挂 + `--net=host` + `-v /data:/data` + hccn_tool + 华为 PyPI 源注入,设备与挂载清单即上节所列。`--shm-size=1g` 对多卡 TP 偏小,起多卡 worker 若报 shm 相关错误,调大(如 16g)。
 
 容器内 apt 源(国内实测好用,jammy):
 
@@ -80,9 +54,7 @@ deb http://mirrors.tools.huawei.com/ubuntu/ jammy-backports main restricted univ
 deb http://mirrors.tools.huawei.com/ubuntu/ jammy-security main restricted universe multiverse
 ```
 
-注意:jammy 起 Ubuntu 源已无 `etcd-server` 包,etcd 用静态二进制装(华为云镜像 `mirrors.huaweicloud.com/etcd`,命令见 e-line 执行清单 E1.4)。
-
-注意:8 卡全挂(davinci0–7),2026-09-18 实测 npu-smi 正常。`--shm-size=1g` 对多卡 TP 偏小,起多卡 worker 若报 shm 相关错误,重起容器调大(如 16g)。
+etcd 用 [scripts/ascend/start_etcd.sh](scripts/ascend/start_etcd.sh) 起 Docker 常驻单节点(`quay.io/coreos/etcd:v3.5.16`,`--net=host`;跨机把 `ETCD_ENDPOINTS` 指到宿主 IP)。jammy 起 Ubuntu 源已无 `etcd-server` 包;容器内静态二进制装法(华为云镜像 `mirrors.huaweicloud.com/etcd`)仅作备选。
 
 ## 来源
 
