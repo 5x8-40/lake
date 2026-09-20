@@ -1,12 +1,8 @@
 # Ascend 原生 bring-up：容器内 frontend + dynamo.vllm（etcd）
 
-> 验证日期：2026-09-18
-> 迁移自 [dearsunlight/dynamo-ascend#1](https://github.com/dearsunlight/dynamo-ascend/pull/1)(2026-09-20):dynamo-ascend 仓只维护代码改动,操作流程文档固化前由本工作区维护。
-
-> E 线 bring-up 实测记录。在 Ascend 910B3（8 卡）上，用 `vllm-ascend:v0.26.0rc1` 把 **Dynamo frontend + `dynamo.vllm` worker 全部跑进同一容器**，discovery 用 **etcd**，`curl :8000` chat 验通。  
+> E 线 bring-up 实测记录（验证日期 2026-09-18，Ascend 910B3 8 卡）。用 `vllm-ascend:v0.26.0rc1` 把 **Dynamo frontend + `dynamo.vllm` worker 全部跑进同一容器**，discovery 用 **etcd**，`curl :8000` chat 验通。  
 > 路径以本机 `WM_ROOT=/data/wm` 为例；脚本在 [`scripts/ascend/`](scripts/ascend/)。
 
-**验证日期**：2026-09-18  
 **目标模型**：`/data/models/Qwen3.8-27B`，served name `qwen`，TP4 × DP2  
 **结果**：`/v1/models` 注册 `qwen`；`/v1/chat/completions` 返回 token
 
@@ -30,6 +26,7 @@
 - Discovery 默认 **etcd**（`ETCD_ENDPOINTS`）；单机可退回 `DISCOVERY=file`。
 - Request/response plane 用 **tcp** 时不依赖 NATS（event plane 默认可走 zmq）。
 - Worker 入口：`python -m dynamo.vllm`（无 OpenAI HTTP bridge）。
+- KV 事件链（`--router-mode kv` + `--kv-events-config`）本路径未开，作为 E1.6 补齐（见 [e-line.md](e-line.md)）。
 
 脚本：
 
@@ -206,11 +203,3 @@ bash scripts/ascend/start_etcd.sh
 bash scripts/ascend/start_dynamo_va_native.sh
 curl -s localhost:8000/v1/models
 ```
-
----
-
-## 路线说明
-
-- E1.4（worker 注册进 etcd）与 E1.5（frontend 出 token）在本记录路径下已实测通过。
-- KV 事件链（`--router-mode kv` + `--kv-events-config`）本次未开，KV-aware 选路作为 E1.6 补齐（见 [e-line.md](e-line.md)）。
-- 编排层代码用 fork `ascend-dev`（跟踪上游 main）源码编译：可用最新代码，且规避 PyPI aarch64 wheel 的 Illegal instruction 问题。
