@@ -98,6 +98,14 @@ uv pip install -e '.[mocker]'
 
 不用 uv 的等价写法：`python3.12 -m venv .venv`（宿主机需自装 python3.12；产物是 abi3，≥3.10 即可）+ `pip install ...` + `maturin develop`（去掉 `--uv`）。
 
+连 venv 也不想用（只要产物、不在宿主机跑 dynamo）：`maturin build` 不需要 venv，但只产 wheel，需把 `.so` 解进源码树（`.pth` 注入读的是源码树）：
+
+```bash
+cd lib/bindings/python
+maturin build
+unzip -o target/wheels/ai_dynamo_runtime-*.whl 'dynamo/_core*' -d src/
+```
+
 ### 2.5 修改后重编
 
 Rust 编译只由 `lib/bindings/python` 下的 maturin 触发（根包安装命令不编 Rust）：
