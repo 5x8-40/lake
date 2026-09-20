@@ -76,7 +76,8 @@ sleep 2
 
 mkdir -p "$WM_ROOT/logs"
 nohup python3 -m dynamo.frontend --http-port "$HTTP_PORT" \
-  --discovery-backend file > "$WM_ROOT/logs/frontend.log" 2>&1 &
+  --discovery-backend file --router-mode kv \
+  > "$WM_ROOT/logs/frontend.log" 2>&1 &
 
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 nohup python3 -m dynamo.vllm \
@@ -87,6 +88,7 @@ nohup python3 -m dynamo.vllm \
   --speculative-config '{"method": "qwen3_next_mtp", "num_speculative_tokens": 3, "enforce_eager": true}' \
   --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
   --additional-config '{"enable_cpu_binding":true}' \
+  --kv-events-config '{"enable_kv_cache_events": true, "publisher": "zmq", "topic": "kv-events"}' \
   --discovery-backend file --disaggregation-mode agg \
   > "$WM_ROOT/logs/worker.log" 2>&1 &
 
