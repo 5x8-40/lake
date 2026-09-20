@@ -87,8 +87,9 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 ## E1.6 KV 事件链（下一任务）
 
 - 已验通的路线没开 KV 事件，router 的 KV-aware 选路没实际走过。
-- 补验：worker 加 `--kv-events-config '{"publisher":"zmq","topic":"kv-events"}'`，frontend 加 `--router-mode kv`（1.4.2 实参以 `--help` 为准）。
-- 验证：同一长前缀请求发两次，第二次应命中前缀 KV（TTFT 明显下降）。
+- 补验：worker 加 `--kv-events-config '{"enable_kv_cache_events": true, "publisher": "zmq", "topic": "kv-events"}'`，frontend 加 `--router-mode kv`。
+- **关键坑**：vLLM 的 `enable_kv_cache_events` 默认 `False`，不显式写 `true` 事件一律不发（dynamo 侧日志只会打一条 warning）；不给 `--kv-events-config` 则发布器不建。传输不用配：file discovery 下 event plane 自动走本地 ZMQ，无需 NATS。
+- 验证：① worker 日志出现 `KV event publisher for dp_rank=N subscribing to vLLM at tcp://127.0.0.1:5557+N`；② 同一长前缀（≥16 token）请求发两次，第二次应命中前缀 KV（APC 命中率 >0，TTFT 明显下降）。DP2 下事件按 dp_rank 发布，router 靠事件做 rank 级亲和。
 
 ## 进展日志
 
