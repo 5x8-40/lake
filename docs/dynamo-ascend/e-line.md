@@ -72,6 +72,17 @@ curl localhost:8000/v1/chat/completions \
   -d '{"model":"qwen","messages":[{"role":"user","content":"hi"}]}'
 ```
 
+## 并行线实测:dearsunlight 源码编译路线(2026-09-18 验通)
+
+同事在 [dearsunlight/dynamo-ascend#1](https://github.com/dearsunlight/dynamo-ascend/pull/1) 已验通 E1.4/E1.5(910B3 8 卡,FE+worker 同容器 + etcd,curl 出 token),路线与本线原计划有分歧,要点:
+
+- **安装**:不用 pip wheel——**PyPI aarch64 wheel 在部分鲲鹏主机 `import dynamo._core` 报 Illegal instruction**;改为宿主机源码编译(rustc 1.96 + maturin + Python 3.12 + protoc 28.3,`.cargo` 配 `target-cpu=generic`),产物经 `.pth` 注入容器 site-packages。pip 路线开工前必须先跑 `python3 -c "import dynamo._core"` 验证,炸则切此路线。
+- **基线**:编的是 fork `ascend-dev`(跟踪 main/1.5.0)配 vllm 0.26 跑通——vllm pin 只是 pip 解析约束,源码装绕过;main 胶水在 agg 路径对 0.26 运行时兼容。
+- **网络面**:`--request-plane tcp --response-plane tcp` 后不依赖 NATS。
+- **运维**:容器 `sleep infinity` 常驻(不用 `--rm -it`);孤儿 `VLLM::*` 进程占 NPU,stop 需 `pkill -9 -f 'VLLM::'`;discovery 有 `file` 模式可免 etcd(单机)。
+- **未覆盖**:KV 事件链未开(无 `--router-mode kv` / `--kv-events-config`),KV-aware 选路未验;其命令的 `--discovery-backend` 等标志为 main 基线 CLI,1.4.2 路线参数形态不同,不可照抄。
+- 脚本与完整记录:该 PR 内 `docs/ascend/native-bringup.md` + `scripts/ascend/`。
+
 ## 进展日志
 
 | 日期 | 事项 |
@@ -84,3 +95,4 @@ curl localhost:8000/v1/chat/completions \
 | 2026-09-18 | E1.3 关闭:容器内 import 探针通过(Ubuntu 镜像) |
 | 2026-09-18 | E1.1 关闭:`vllm serve` Qwen3.8-27B(DP2×TP4,含 MTP 投机解码 + prefix caching)出 token,curl 验证通过;实测命令已录入执行清单 |
 | 2026-09-18 | E1.2 关闭:`pip install ai-dynamo==1.4.2` 完成 |
+| 2026-09-20 | 同事并行线(dearsunlight/dynamo-ascend#1)E1.4/E1.5 已验通,源码编译路线,要点见上文「并行线实测」节;本机 E1.4 开工前先验证 `import dynamo._core` 是否 Illegal instruction |
