@@ -1,6 +1,6 @@
 # Ascend 原生 bring-up：容器内 frontend + dynamo.vllm（etcd）
 
-> E 线 bring-up 实测记录（验证日期 2026-09-18，Ascend 910B3 8 卡）。用 `vllm-ascend:v0.26.0rc1` 把 **Dynamo frontend + `dynamo.vllm` worker 全部跑进同一容器**，discovery 用 **etcd**，`curl :8000` chat 验通。  
+> E 线 bring-up 实测记录（2026-09-18 首验，910B3 8 卡；2026-09-20 本机复验，dynamo 1.4.2 + 全配置 + file discovery）。用 `vllm-ascend:v0.26.0rc1` 把 **Dynamo frontend + `dynamo.vllm` worker 全部跑进同一容器**，`curl :8000` chat 验通。  
 > 路径以本机 `WM_ROOT=/data/wm` 为例；脚本在 [`scripts/ascend/`](scripts/ascend/)。
 
 **目标模型**：`/data/models/Qwen3.8-27B`，served name `qwen`，TP4 × DP2  
@@ -21,9 +21,10 @@
 
 要点：
 
+- **版本锁定**：dynamo **1.4.2** ↔ vllm-ascend **0.26.0rc1**。dynamo main（1.5.0）与 vllm 0.26 不兼容（胶水层需侵入式修改），不要用。
 - **推理栈**用昇腾官方 `vllm-ascend` 镜像（CANN / `torch_npu` 已齐）。
 - **编排层**在宿主机源码编译 Dynamo，经 `.pth` 注入容器 Python；不要装 PyPI 的 `ai-dynamo` wheel（[vllm] extra 会拉 CUDA vLLM 顶掉镜像，aarch64 wheel 在部分鲲鹏主机 Illegal instruction）。
-- Discovery 默认 **etcd**（`ETCD_ENDPOINTS`）；单机可退回 `DISCOVERY=file`。
+- Discovery：单机用 **file**（免 etcd）；跨机用 **etcd**（`ETCD_ENDPOINTS`）。
 - Request/response plane 用 **tcp** 时不依赖 NATS（event plane 默认可走 zmq）。
 - Worker 入口：`python -m dynamo.vllm`（无 OpenAI HTTP bridge）。
 - KV 事件链（`--router-mode kv` + `--kv-events-config`）本路径未开，作为 E1.6 补齐（见 [e-line.md](e-line.md)）。
@@ -61,8 +62,9 @@
 
 ```bash
 export WM_ROOT=/data/wm
-git clone --branch ascend-dev https://github.com/5x8-40/dynamo-ascend.git $WM_ROOT/dynamo-ascend
+git clone https://github.com/5x8-40/dynamo-ascend.git $WM_ROOT/dynamo-ascend
 cd $WM_ROOT/dynamo-ascend
+git checkout v1.4.2    # 版本锁定:main(1.5.0)与 vllm 0.26 不兼容
 ```
 
 ### 2.3 aarch64：`target-cpu=generic`
@@ -72,9 +74,17 @@ cd $WM_ROOT/dynamo-ascend
 ```toml
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=generic", "-C", "force-frame-pointers=yes", "--cfg", "tokio_unstable"]
+
+# 可选:crates.io 国内镜像(网络受限时)
+[source.crates-io]
+replace-with = 'rsproxy-sparse'
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
 ```
 
 代理走环境变量，**不要把代理密码写进仓库**。
+
+网络实在不通时的绕行：拷贝他人编译的 `_core.abi3.so` 放入 `lib/bindings/python/src/dynamo/`（runtime 产物需与组件版本配套，本文档配套 v1.4.2），然后跳过 §2.4 直接进 §4。
 
 ### 2.4 编译
 
@@ -179,22 +189,23 @@ RESTART=1 bash scripts/ascend/start_dynamo_va_native.sh
 bash scripts/ascend/start_dynamo_va_native.sh stop
 ```
 
-关键参数（容器内）：
+关键参数（容器内，2026-09-20 本机实测，dynamo 1.4.2 + 全配置）：
 
 ```bash
-export ETCD_ENDPOINTS=http://127.0.0.1:2379
-export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
+# 单机用 file discovery,免 etcd;跨机才需要 etcd(见 §5.1)
 python3 -m dynamo.frontend --http-port 8000 \
-  --discovery-backend etcd --request-plane tcp --response-plane tcp
+  --discovery-backend file > frontend.log 2>&1 &
 
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
 python3 -m dynamo.vllm \
   --model /data/models/Qwen3.8-27B --served-model-name qwen \
-  --tensor-parallel-size 4 --data-parallel-size 2 \
-  --discovery-backend etcd --request-plane tcp --response-plane tcp \
-  --disaggregation-mode agg --trust-remote-code \
-  --gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-seqs 64 \
-  --enable-prefix-caching --dyn-tool-call-parser qwen3_coder
+  --data-parallel-size 2 --tensor-parallel-size 4 \
+  --max-num-seqs 64 --max-model-len 256000 --max-num-batched-tokens 16384 \
+  --trust-remote-code --enable-prefix-caching --gpu-memory-utilization 0.9 \
+  --speculative-config '{"method": "qwen3_next_mtp", "num_speculative_tokens": 3, "enforce_eager": true}' \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY"}' \
+  --additional-config '{"enable_cpu_binding":true}' \
+  --discovery-backend file --disaggregation-mode agg
 ```
 
 日志：`$WM_ROOT/dynamo-native-logs/`。加载模型数分钟属正常。
