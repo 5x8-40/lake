@@ -26,7 +26,7 @@
 要点：
 
 - **推理栈**用昇腾官方 `vllm-ascend` 镜像（CANN / `torch_npu` 已齐）。
-- **编排层**在宿主机源码编译 Dynamo，经 `.pth` 注入容器 Python；**不要** `pip install ai-dynamo[vllm]`（会拉 CUDA vLLM）。
+- **编排层**在宿主机源码编译 Dynamo，经 `.pth` 注入容器 Python；不要装 PyPI 的 `ai-dynamo` wheel（[vllm] extra 会拉 CUDA vLLM 顶掉镜像，aarch64 wheel 在部分鲲鹏主机 Illegal instruction）。
 - Discovery 默认 **etcd**（`ETCD_ENDPOINTS`）；单机可退回 `DISCOVERY=file`。
 - Request/response plane 用 **tcp** 时不依赖 NATS（event plane 默认可走 zmq）。
 - Worker 入口：`python -m dynamo.vllm`（无 OpenAI HTTP bridge）。
@@ -128,7 +128,7 @@ bash scripts/ascend/start_docker_va.sh
 0.26 镜像 site-packages：`/usr/local/python3.12.13/lib/python3.12/site-packages/`。  
 `start_dynamo_va_native.sh` 每次启动会重写。
 
-**注意**：容器里若 pip 装过 `ai-dynamo`/`ai-dynamo-runtime`，先 `pip uninstall -y ai-dynamo ai-dynamo-runtime`——site-packages 里的已装包优先于 `.pth` 注入的路径，不卸载会 shadow 源码版本。
+**注意**：容器里若装过 PyPI 的 `ai-dynamo`/`ai-dynamo-runtime`，先卸载——site-packages 里的已装包优先于 `.pth` 注入的路径，不卸会 shadow 源码版本。
 
 ---
 
@@ -211,11 +211,6 @@ curl -s localhost:8000/v1/models
 
 ## 路线说明
 
-| 项 | 原 pip 计划（已弃） | 本路线（定稿） |
-|----|---------------------|----------------|
-| Dynamo 安装 | 容器内 `pip install ai-dynamo==1.4.2` | 宿主机源码编 + `.pth` 注入（规避 aarch64 wheel Illegal instruction；可用 fork 最新代码） |
-| Discovery | etcd（静态二进制） | etcd Docker 常驻（`start_etcd.sh`），跨机改 `ETCD_ENDPOINTS` |
-| FE / worker 位置 | 未强制 | **同容器**（`--net=host`） |
-| Router KV 事件 | `--router-mode kv` + `--kv-events-config` | 本次先验通注册与出 token；KV-aware 选路作为 E1.6 补齐 |
-
-E1.4（worker 注册进 etcd）与 E1.5（frontend 出 token）在本记录路径下已实测通过。
+- E1.4（worker 注册进 etcd）与 E1.5（frontend 出 token）在本记录路径下已实测通过。
+- KV 事件链（`--router-mode kv` + `--kv-events-config`）本次未开，KV-aware 选路作为 E1.6 补齐（见 [e-line.md](e-line.md)）。
+- 编排层代码用 fork `ascend-dev`（跟踪上游 main）源码编译：可用最新代码，且规避 PyPI aarch64 wheel 的 Illegal instruction 问题。

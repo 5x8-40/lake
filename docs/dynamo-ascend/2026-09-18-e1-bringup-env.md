@@ -20,10 +20,10 @@
 ## Dynamo 安装:源码编译路线(2026-09-20 定稿)
 
 - **定稿路线**:宿主机源码编译 fork `ascend-dev`(跟踪上游 main)+ `.pth` 注入容器 site-packages,完整步骤见 [native-bringup.md](native-bringup.md) §2。不用 venv——`dynamo.vllm` 必须 import 镜像内的 vllm/vllm-ascend/torch_npu,注入目标是容器系统 Python。
-- **pip wheel 路线弃用**,两个原因:
-  - PyPI aarch64 wheel(`ai-dynamo-runtime`)在部分鲲鹏主机 `import dynamo._core` 报 **Illegal instruction**(wheel target-cpu 基线不兼容),需 `.cargo` 配 `target-cpu=generic` 源码重编;
-  - `pip install ai-dynamo[vllm]` 的 extra pin `vllm==0.28.0`(main)且拉 CUDA 生态(nixl[cu13]、flashinfer),会顶掉镜像里的 vLLM 0.26——任何场景都**禁止**带 [vllm] extra。
-- **版本对齐的实质**:pip 的 vllm pin 只是解析约束,源码装绕过;main 胶水在 agg 路径对 vllm 0.26 运行时兼容(2026-09-18 实测)。vllm-ascend 升级后需重验 import 面,方法见 [2026-09-18-e13-glue-survey.md](2026-09-18-e13-glue-survey.md)。
+- **PyPI wheel 不可用**,两个原因:
+  - aarch64 wheel(`ai-dynamo-runtime`)在部分鲲鹏主机 `import dynamo._core` 报 **Illegal instruction**(wheel target-cpu 基线不兼容),需 `.cargo` 配 `target-cpu=generic` 源码重编;
+  - `ai-dynamo` 的 [vllm] extra pin `vllm==0.28.0`(main)且拉 CUDA 生态(nixl[cu13]、flashinfer),会顶掉镜像里的 vLLM 0.26——任何场景都**禁止**带 [vllm] extra 安装。
+- **版本对齐的实质**:包依赖里的 vllm 版本 pin 只是解析约束,源码装与之无关;main 胶水在 agg 路径对 vllm 0.26 运行时兼容(2026-09-18 实测)。vllm-ascend 升级后需重验 import 面,方法见 [2026-09-18-e13-glue-survey.md](2026-09-18-e13-glue-survey.md)。
 - **fork 基线**:`5x8-40/dynamo-ascend` 的 `ascend-dev`,跟踪上游 main。
 - **KVBM sunset 与本线无关**:KVBM 已日落(DEP #11673),继任者 KVCR 是**独立仓独立包**(`nvidia-kvcr`,framework-neutral,不依赖 vllm/ai-dynamo),dynamo 侧对接面是 router hint(2026-08-07 进 main,#11695,**1.4.2 已含**)。KVCR 管 KV 卸载/P2P(K 线范畴);E 线聚合模式 bring-up 既不需要 KVBM 也不需要 KVCR。
 

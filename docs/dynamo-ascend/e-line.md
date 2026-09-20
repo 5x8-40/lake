@@ -6,8 +6,8 @@
 
 - 硬件:Atlas A2 / openEuler / Kunpeng 920(aarch64)
 - 镜像:`quay.io/ascend/vllm-ascend:v0.26.0rc1`(**Ubuntu 变体**;openEuler 变体容器内 `npu-smi info` 卡住、import 报线程错误,已弃用)。vLLM 0.26.0 + CANN 9.1.0 + torch_npu 2.10.0.post4,Mooncake 0.3.11.post1 已在镜像内
-- Dynamo 安装(**定稿**):宿主机源码编译 fork `ascend-dev` + `.pth` 注入容器,运行手册见 [native-bringup.md](native-bringup.md);**pip wheel 路线已弃**(PyPI aarch64 wheel 在部分鲲鹏主机 `import dynamo._core` Illegal instruction)
-- fork 基线:`ascend-dev` 跟踪上游 main;源码装绕过 pip 的 vllm pin,main 胶水在 agg 路径对 vllm 0.26 运行时兼容(2026-09-18 实测)
+- Dynamo 安装(**定稿**):宿主机源码编译 fork `ascend-dev` + `.pth` 注入容器,运行手册见 [native-bringup.md](native-bringup.md)(PyPI aarch64 wheel 在部分鲲鹏主机 `import dynamo._core` Illegal instruction,不可用)
+- fork 基线:`ascend-dev` 跟踪上游 main;源码装与包依赖的 vllm 版本 pin 无关,main 胶水在 agg 路径对 vllm 0.26 运行时兼容(2026-09-18 实测)
 
 ## 任务表
 
@@ -38,7 +38,6 @@ curl -s localhost:8000/v1/models              # 出现 qwen 即通
 前置注意:
 
 - 本机若已有占满 NPU 的 `vllm serve` 先停掉;孤儿 `VLLM::*` 进程需 `pkill -9 -f 'VLLM::'`(脚本 `stop` 子命令已含)。
-- 早前 pip 装的 `ai-dynamo==1.4.2` 建议卸载(`pip uninstall -y ai-dynamo ai-dynamo-runtime`):site-packages 已装包优先于 `.pth` 注入路径,不卸会 shadow 源码版本。
 
 ## E1.6 增量(KV 事件链)
 
@@ -58,6 +57,5 @@ curl -s localhost:8000/v1/models              # 出现 qwen 即通
 | 2026-09-18 | E1.1 波折:openEuler 变体容器内 `npu-smi info` 卡住、Python import 报 "can't start new thread";换 Ubuntu 变体 `v0.26.0rc1` 后 npu-smi 正常、import 探针通过 |
 | 2026-09-18 | E1.3 关闭:容器内 import 探针通过(Ubuntu 镜像) |
 | 2026-09-18 | E1.1 关闭:`vllm serve` Qwen3.8-27B(DP2×TP4,含 MTP 投机解码 + prefix caching)出 token,curl 验证通过 |
-| 2026-09-18 | E1.2(pip 路线)完成:`pip install ai-dynamo==1.4.2`;后被源码编译路线取代 |
 | 2026-09-18 | 并行线(dearsunlight,910B3)验通 E1.4/E1.5:源码编译 ascend-dev + `.pth` 注入,FE+worker 同容器 + etcd,curl 出 token |
-| 2026-09-20 | **路线定稿**:采用源码编译路线,pip wheel 路线弃用;并行线 runbook 与脚本迁入本工作区([native-bringup.md](native-bringup.md) + [scripts/ascend/](scripts/ascend/),源 [dearsunlight/dynamo-ascend#1](https://github.com/dearsunlight/dynamo-ascend/pull/1)),dynamo-ascend 仓只留代码改动;新增 E1.6(KV 事件链补验) |
+| 2026-09-20 | **路线定稿**:采用源码编译路线;并行线 runbook 与脚本迁入本工作区([native-bringup.md](native-bringup.md) + [scripts/ascend/](scripts/ascend/),源 [dearsunlight/dynamo-ascend#1](https://github.com/dearsunlight/dynamo-ascend/pull/1)),dynamo-ascend 仓只留代码改动;新增 E1.6(KV 事件链补验) |
