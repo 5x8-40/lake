@@ -78,11 +78,18 @@ rustflags = ["-C", "target-cpu=generic", "-C", "force-frame-pointers=yes", "--cf
 
 ### 2.4 编译
 
+仓库是两个独立包：根包 `ai-dynamo`（hatchling，纯 Python，构建钩子只写版本文件，**不编 Rust**）；Rust runtime 是独立包 `ai-dynamo-runtime`（`lib/bindings/python/`，maturin backend，独立 cargo workspace）。所以必须分两步：
+
 ```bash
 cd $WM_ROOT/dynamo-ascend
 uv venv .venv --python 3.12
 source .venv/bin/activate
-# maturin 编 bindings → lib/bindings/python/src/dynamo/_core.abi3.so
+uv pip install 'maturin[patchelf]'
+
+# ① 编 Rust runtime → 产出 lib/bindings/python/src/dynamo/_core.abi3.so
+cd lib/bindings/python && maturin develop --uv && cd ../../..
+
+# ② 装根包(纯 Python;① 已装好 ai-dynamo-runtime==1.5.0,依赖被满足,不会从 PyPI 拉 wheel)
 uv pip install -e '.[mocker]'
 ```
 
@@ -91,8 +98,16 @@ uv pip install -e '.[mocker]'
 
 ### 2.5 修改后重编
 
-- 改了 `.cargo/config.toml`（rustflags / target-cpu）：**必须 `cargo clean` 后全量重编**——cargo 不跟踪 rustflags 变化，不清则旧产物直接被复用，修改不生效。
-- 改了 `Cargo.toml`（依赖 / feature）：不用 clean，直接重跑 `uv pip install -e '.[mocker]'`。
+Rust 编译只由 `lib/bindings/python` 下的 maturin 触发（根包安装命令不编 Rust）：
+
+```bash
+cd $WM_ROOT/dynamo-ascend/lib/bindings/python
+source ../../../.venv/bin/activate
+cargo clean                # 仅当改了 .cargo/config.toml(rustflags/target-cpu):cargo 不跟踪 flag 变化,不清则复用旧产物
+maturin develop --uv
+```
+
+- 只改 Python 代码（`components/` 等）：不用编，`.pth` 直读源码，重启进程即可。
 - 容器侧无需重装（`/data` 挂载 + `.pth` 注入，新 `.so` 即刻可见），`RESTART=1 bash scripts/ascend/start_dynamo_va_native.sh` 重启进程即可。
 
 ---
