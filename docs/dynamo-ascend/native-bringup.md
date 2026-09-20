@@ -96,6 +96,8 @@ uv pip install -e '.[mocker]'
 成功标志：`import dynamo._core`；`python -m dynamo.frontend --help`。  
 本机 `_core.abi3.so` ~1.9GB（带 debug）属正常。
 
+不用 uv 的等价写法：`python3.12 -m venv .venv`（宿主机需自装 python3.12；产物是 abi3，≥3.10 即可）+ `pip install ...` + `maturin develop`（去掉 `--uv`）。
+
 ### 2.5 修改后重编
 
 Rust 编译只由 `lib/bindings/python` 下的 maturin 触发（根包安装命令不编 Rust）：
