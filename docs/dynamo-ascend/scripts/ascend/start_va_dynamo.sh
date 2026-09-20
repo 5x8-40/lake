@@ -57,9 +57,16 @@ docker exec -i \
   -e MODEL_NAME="$MODEL_NAME" -e HTTP_PORT="$HTTP_PORT" \
   "$NAME" bash -s <<'EOS'
 set -e
-# .pth 注入(幂等):dynamo 组件 + runtime(_core.abi3.so 所在目录)
+# dynamo editable 安装(幂等;pip 自动管 .pth,不动镜像依赖)
 PYPATH=$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')
-printf '%s\n' "$REPO/components/src" "$REPO/lib/bindings/python/src" > "$PYPATH/dynamo-ascend.pth"
+if [ -f "$PYPATH/dynamo-ascend.pth" ] || ! python3 -c 'import dynamo.frontend' 2>/dev/null; then
+  rm -f "$PYPATH/dynamo-ascend.pth"   # 旧的手工 .pth,迁移掉
+  mkdir -p "$PYPATH/dynamo"
+  if [ ! -f "$PYPATH/dynamo/_core.abi3.so" ] && [ -f "$REPO/lib/bindings/python/src/dynamo/_core.abi3.so" ]; then
+    cp "$REPO/lib/bindings/python/src/dynamo/_core.abi3.so" "$PYPATH/dynamo/"
+  fi
+  pip install -e "$REPO" --no-deps
+fi
 
 ulimit -n 65535 || true
 sysctl -w fs.inotify.max_user_watches=1048576 || true

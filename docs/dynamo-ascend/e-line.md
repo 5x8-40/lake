@@ -18,41 +18,43 @@
 | 增强 | EX1 SGLang NPU 第二后端 | SGLang 主干自带 NPU 支持，vllm-ascend 路线跑通后接入（远期） | 未开始 |
 | 增强 | EX2 ModelExpress 权重加速 | NPU 间流式传权重；前期共享存储兜底（远期） | 未开始 |
 
-## 一次性安装（宿主机）
+## 一次性安装（容器内，editable）
+
+源码树在宿主机（`$WM_ROOT/dynamo-ascend`，checkout v1.4.2），经 `/data` 挂载进容器；安装在容器内做，editable 方式（改 Python 代码即时生效，`.pth` 由 pip 自动管理）：
 
 ```bash
-export WM_ROOT=/data/wm
-git clone https://github.com/5x8-40/dynamo-ascend.git $WM_ROOT/dynamo-ascend
-cd $WM_ROOT/dynamo-ascend && git checkout v1.4.2    # 版本锁定
+docker exec -it vllm-ascend-wcd bash
+cd /data/wm/dynamo-ascend
 
-# 构建环境
-uv venv .venv --python 3.12 && source .venv/bin/activate
-uv pip install 'maturin[patchelf]'
+# ① Rust runtime(二选一)
+# A. 从头编(推荐):
+curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y
+source ~/.cargo/env
+pip install 'maturin[patchelf]'
+cd lib/bindings/python && maturin build --release \
+  && pip install target/release/wheels/ai_dynamo_runtime-*.whl && cd ../..
+# B. 网络受限:把编好的 _core.abi3.so 拷进容器 site-packages 的 dynamo/ 目录
 
-# ① 编 Rust runtime → 产出 lib/bindings/python/src/dynamo/_core.abi3.so
-cd lib/bindings/python && maturin develop --uv && cd ../..
-#   网络受限编不了时:拷贝他人编译的 _core.abi3.so 到 lib/bindings/python/src/dynamo/,跳过①
-
-# ② 装根包(纯 Python)
-uv pip install -e '.[mocker]'
+# ② 根包 editable 安装(必须 --no-deps:不动镜像里 pin 好的 vllm/transformers)
+pip install -e . --no-deps
+# import 若报缺包(如 kubernetes),单独 pip install 补,不要全量装依赖
 ```
 
-- 仓库根 `.cargo/config.toml` 需配 `target-cpu=generic`（否则部分鲲鹏主机 `import dynamo._core` 报 Illegal instruction）：
+- 仓库根 `.cargo/config.toml` 需配 `target-cpu=generic`（否则部分鲲鹏主机 `import dynamo._core` 报 Illegal instruction）；crates.io 走 rsproxy 镜像：
 
 ```toml
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=generic", "-C", "force-frame-pointers=yes", "--cfg", "tokio_unstable"]
 
-# 可选:crates.io 国内镜像
 [source.crates-io]
 replace-with = 'rsproxy-sparse'
 [source.rsproxy-sparse]
 registry = "sparse+https://rsproxy.cn/index/"
 ```
 
-- 不用 uv：`cd lib/bindings/python && maturin build --release`（免 venv），把 `target/release/wheels/` 里 wheel 中的 `_core.abi3.so` 解到 `lib/bindings/python/src/dynamo/`；根包用 `pip install -e .`。
-- 改 Rust 代码后重编：先 `cargo clean --manifest-path lib/bindings/python/Cargo.toml`（incremental 可能不链新符号），再重跑 ①。
-- ③ `.pth` 注入容器由 `start_va_dynamo.sh` 自动做：把 `components/src` 和 `lib/bindings/python/src` 写进容器 site-packages 的 `dynamo-ascend.pth`，容器内 python 直接 import 宿主机源码。
+- 两个 `dynamo` 目录（`components/src` 与 `lib/bindings/python/src`）都是 namespace 包（无 `__init__.py`），editable 安装后自动合并：组件代码走源码树，`_core.abi3.so` 走 site-packages。
+- 改 Rust 代码后重编：先 `cargo clean --manifest-path lib/bindings/python/Cargo.toml`（incremental 可能不链新符号），再重跑 ①A。
+- **禁止** `pip install ai-dynamo` / 带 `[vllm]` extra：PyPI wheel 有 Illegal instruction 风险，且 extra 会拉 CUDA 生态顶掉镜像内 vllm。
 
 ## 拉起（两个脚本）
 
@@ -64,7 +66,7 @@ registry = "sparse+https://rsproxy.cn/index/"
 ./scripts/ascend/start_va_dynamo.sh stop    # 停容器内 dynamo 进程
 ```
 
-② 做的事：容器不存在则创建（8 卡挂载 + `--net=host`）；写 `.pth` 注入宿主机源码；后台起 frontend（file discovery）与 worker（agg 模式，全配置）；日志在 `$WM_ROOT/logs/`。
+② 做的事：容器不存在则创建（8 卡挂载 + `--net=host`）；若 dynamo 未装则做 editable 安装（含旧手工 `.pth` 迁移、`.so` 兜底拷贝）；后台起 frontend（file discovery）与 worker（agg 模式，全配置）；日志在 `$WM_ROOT/logs/`。
 
 ## 验证
 
