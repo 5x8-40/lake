@@ -89,6 +89,12 @@ uv pip install -e '.[mocker]'
 成功标志：`import dynamo._core`；`python -m dynamo.frontend --help`。  
 本机 `_core.abi3.so` ~1.9GB（带 debug）属正常。
 
+### 2.5 修改后重编
+
+- 改了 `.cargo/config.toml`（rustflags / target-cpu）：**必须 `cargo clean` 后全量重编**——cargo 不跟踪 rustflags 变化，不清则旧产物直接被复用，修改不生效。
+- 改了 `Cargo.toml`（依赖 / feature）：不用 clean，直接重跑 `uv pip install -e '.[mocker]'`。
+- 容器侧无需重装（`/data` 挂载 + `.pth` 注入，新 `.so` 即刻可见），`RESTART=1 bash scripts/ascend/start_dynamo_va_native.sh` 重启进程即可。
+
 ---
 
 ## 3. （可选）宿主机 mock 冒烟
