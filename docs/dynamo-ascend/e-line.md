@@ -48,16 +48,27 @@ pip install -e . --no-deps
 
 ② 已由 `start_va_dynamo.sh` 自动化（检测到未安装时触发）；① 的 Rust 编译需手工做一次。
 
-- 仓库根 `.cargo/config.toml` 需配 `target-cpu=generic`（否则部分鲲鹏主机 `import dynamo._core` 报 Illegal instruction）；crates.io 走 rsproxy 镜像：
+- 仓库根 `.cargo/config.toml` 需配 `target-cpu=generic`（否则部分鲲鹏主机 `import dynamo._core` 报 Illegal instruction）；crates.io 镜像二选一（华为内网用 innersource，已验证；外网用 rsproxy）：
 
 ```toml
 [target.aarch64-unknown-linux-gnu]
 rustflags = ["-C", "target-cpu=generic", "-C", "force-frame-pointers=yes", "--cfg", "tokio_unstable"]
 
+# 华为内网(2026-09-21 实测可用;另需 echo "insecure" >> ~/.curlrc)
+[net]
+git-fetch-with-cli = true
+[http]
+check-revoke = false
 [source.crates-io]
-replace-with = 'rsproxy-sparse'
-[source.rsproxy-sparse]
-registry = "sparse+https://rsproxy.cn/index/"
+replace-with = 'innersource'
+[source.innersource]
+registry = 'https://szv-open.codehub.huawei.com/rust/crates.io-index.git'
+
+# 外网备选:
+# [source.crates-io]
+# replace-with = 'rsproxy-sparse'
+# [source.rsproxy-sparse]
+# registry = "sparse+https://rsproxy.cn/index/"
 ```
 
 - 两个 `dynamo` 目录（`components/src` 与 `lib/bindings/python/src`）都是 namespace 包（无 `__init__.py`），editable 安装后自动合并：组件代码走源码树，`_core.abi3.so` 走 site-packages。
