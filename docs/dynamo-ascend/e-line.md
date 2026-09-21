@@ -115,7 +115,7 @@ curl -s http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/
 
 - 脚本已内置参数：frontend `--router-mode kv` + worker `--kv-events-config '{"enable_kv_cache_events": true, "publisher": "zmq", "topic": "kv-events"}'`，重跑 `start_va_dynamo.sh` 即开验。
 - **关键坑**：vLLM 的 `enable_kv_cache_events` 默认 `False`，不显式写 `true` 事件一律不发（dynamo 侧日志只会打一条 warning）；不给 `--kv-events-config` 则发布器不建。传输不用配：file discovery 下 event plane 自动走本地 ZMQ，无需 NATS。
-- 验证：① **启动早期**（参数解析时）worker 日志出现 `Using kv_events_config ... enable_kv_cache_events=True ... (use_kv_events=True)`——若为 `None`/`False` 说明参数没生效；② **模型加载完之后**（publisher 在 engine 初始化后才装配，加载期间 grep 不到属正常）出现 `KV event publisher for dp_rank=N subscribing to vLLM at tcp://127.0.0.1:5557+N`；③ 同一长前缀（≥16 token）请求发两次，第二次应命中前缀 KV（APC 命中率 >0，TTFT 明显下降）。DP2 下事件按 dp_rank 发布，router 靠事件做 rank 级亲和。
+- 验证：① **启动早期**（参数解析时）worker 日志出现 `Using kv_events_config ... enable_kv_cache_events=True ... (use_kv_events=True)`——若为 `None`/`False` 说明参数没生效；② **模型加载完之后**（publisher 在 engine 初始化后才装配，加载期间 grep 不到属正常）出现 `KV event publisher for dp_rank=N subscribing to vLLM at tcp://127.0.0.1:5557+N`；③ **frontend 收到事件**：`curl -s :8000/metrics | grep -E "ingress|kv_hit"`——`router_kv_zmq_ingress_sources`>0（已订阅事件源）、`router_kv_zmq_ingress_batches_total` 持续增长（事件在流）；worker 侧事件计数在 `curl -s :8782/metrics | grep kv_publisher`（脚本已带 `DYN_SYSTEM_PORT=8782`）；④ 同一长前缀（≥16 token）请求发两次，第二次应命中前缀 KV（`router_kv_hit_rate` 非零、APC 命中率 >0、TTFT 明显下降）。DP2 下事件按 dp_rank 发布，router 靠事件做 rank 级亲和。
 
 ## 进展日志
 

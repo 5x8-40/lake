@@ -88,6 +88,7 @@ nohup python3 -m dynamo.frontend --http-port "$HTTP_PORT" \
   > "$WM_ROOT/logs/frontend.log" 2>&1 &
 
 export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export DYN_SYSTEM_PORT=8782    # worker 的 metrics 端口(curl :8782/metrics);frontend 不用,它的 /metrics 在 :8000 上
 nohup python3 -m dynamo.vllm \
   --model "$MODEL" --served-model-name "$MODEL_NAME" \
   --data-parallel-size 2 --tensor-parallel-size 4 \
