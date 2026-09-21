@@ -20,3 +20,4 @@
   - [D002 组件边界:Dynamo 全组件的适配动作划分](decisions/D002-component-boundary.md)(复用 / 适配 / 替换 / 不用,含引擎双路线)
 - 专题:
   - [昇腾数据底座候选盘点](data-plane-options.md)(Mooncake / memcache 二选一倾向,UCM 备选,Yuanrong 暂缓,UB-URMA 待核实)
+- 可交付 bring-up（单仓 + 容器内编译）: [bringup.md](bringup.md)；脚本在 [`../../scripts/dynamo-ascend/`](../../scripts/dynamo-ascend/)
