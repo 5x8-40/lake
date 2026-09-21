@@ -32,21 +32,29 @@ cd $WM_ROOT/dynamo-ascend && git checkout v1.4.2
 docker exec -it vllm-ascend-wcd bash
 cd /data/wm/dynamo-ascend
 
+# ⓪ 新容器先拿依赖(老容器已装过 ai-dynamo 则跳过):
+pip install ai-dynamo==1.4.2
+#   装完确认 vllm 没被顶:python3 -c "import vllm; print(vllm.__version__)" 应为 0.26.0
+
 # ① Rust runtime(二选一)
 # A. 从头编(推荐;缺 gcc/protoc 等系统工具时按报错 apt 装,源见环境文档):
 curl --proto '=https' --tlsv1.2 -sSf https://rsproxy.cn/rustup-init.sh | sh -s -- -y
 source ~/.cargo/env
 pip install 'maturin[patchelf]'
-cd lib/bindings/python && maturin build --release \
-  && pip install target/release/wheels/ai_dynamo_runtime-*.whl && cd ../..
-# B. 网络受限:把编好的 _core.abi3.so 拷进容器 site-packages 的 dynamo/ 目录
+cd lib/bindings/python && maturin build --release && cd ../..
+# B. 网络受限:拿别人编好的 ai_dynamo_runtime wheel(或裸 _core.abi3.so)
 
-# ② 根包 editable 安装(必须 --no-deps:不动镜像里 pin 好的 vllm/transformers)
+# ② 装本地 runtime(覆盖 ⓪ 拉到的 PyPI wheel——Illegal instruction 风险源):
+pip install --force-reinstall --no-deps \
+  lib/bindings/python/target/release/wheels/ai_dynamo_runtime-*.whl
+#   (B 路线只有裸 .so 时:直接拷进 site-packages 的 dynamo/ 目录,跳过本步)
+
+# ③ 根包 editable 安装(自动替换 ⓪ 装的 ai-dynamo;--no-deps 不动镜像里 pin 好的包)
 pip install -e . --no-deps
 # import 若报缺包(如 kubernetes),单独 pip install 补,不要全量装依赖
 ```
 
-② 已由 `start_va_dynamo.sh` 自动化（检测到未安装时触发）；① 的 Rust 编译需手工做一次。
+③ 已由 `start_va_dynamo.sh` 自动化（检测到未安装时触发）；⓪①② 需手工做一次（新容器重建后要重做）。
 
 - 仓库根 `.cargo/config.toml` 需配 `target-cpu=generic`（否则部分鲲鹏主机 `import dynamo._core` 报 Illegal instruction）；crates.io 镜像二选一（华为内网用 innersource，已验证；外网用 rsproxy）：
 
