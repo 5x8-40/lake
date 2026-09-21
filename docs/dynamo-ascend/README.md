@@ -21,3 +21,5 @@
 - 专题:
   - [昇腾数据底座候选盘点](data-plane-options.md)(Mooncake / memcache 二选一倾向,UCM 备选,Yuanrong 暂缓,UB-URMA 待核实)
 - 可交付 bring-up（单仓 + 容器内编译）: [bringup.md](bringup.md)；脚本在 [`../../scripts/dynamo-ascend/`](../../scripts/dynamo-ascend/)
+- PD + Mooncake（1.4.2 最小协议补丁）: [pd-mooncake.md](pd-mooncake.md)
+- 计划主线: [00-plan.md](00-plan.md)

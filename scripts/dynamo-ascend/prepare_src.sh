@@ -13,3 +13,7 @@ else
   git -C "$SRC" checkout -B "$REF" "FETCH_HEAD"
 fi
 echo "SRC=$SRC  $(git -C "$SRC" rev-parse --abbrev-ref HEAD)  $(git -C "$SRC" rev-parse --short HEAD)"
+
+# Ascend PD needs MooncakeConnectorV1 registered (minimal 1.4.2 delta).
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SRC="$SRC" bash "$SCRIPT_DIR/apply_protocol_patch.sh"

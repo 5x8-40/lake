@@ -1,0 +1,34 @@
+diff --git a/components/src/dynamo/vllm/kv_connector_protocols.py b/components/src/dynamo/vllm/kv_connector_protocols.py
+index 6c2f0d8d7..fdb07380b 100644
+--- a/components/src/dynamo/vllm/kv_connector_protocols.py
++++ b/components/src/dynamo/vllm/kv_connector_protocols.py
+@@ -109,7 +109,12 @@ class MooncakeConnectorProtocol(KvConnectorProtocol):
+ # Keyed by ``KVTransferConfig.kv_connector``. One entry per connector.
+ KV_CONNECTOR_PROTOCOLS: Dict[str, Type[KvConnectorProtocol]] = {
+     "NixlConnector": NixlConnectorProtocol,
++    # Upstream GPU Mooncake is push-based (transfer_id + bootstrap).
+     "MooncakeConnector": MooncakeConnectorProtocol,
++    # Ascend vllm-ascend MooncakeConnectorV1 is pull-based (remote_host/
++    # remote_port/remote_block_ids from prefill response), same wire shape
++    # as NIXL — not the upstream Mooncake bootstrap protocol.
++    "MooncakeConnectorV1": NixlConnectorProtocol,
+ }
+ 
+ # Wrapper connectors that compose sub-connectors under
+diff --git a/components/src/dynamo/vllm/tests/test_vllm_kv_connector_protocols.py b/components/src/dynamo/vllm/tests/test_vllm_kv_connector_protocols.py
+index f6e026b7f..bf457cbe3 100644
+--- a/components/src/dynamo/vllm/tests/test_vllm_kv_connector_protocols.py
++++ b/components/src/dynamo/vllm/tests/test_vllm_kv_connector_protocols.py
+@@ -475,7 +475,11 @@ def test_make_kv_connector_protocol_raises_on_unknown_connector():
+ def test_registry_keys_match_vllm_connector_names():
+     """Wire-format guard: KV_CONNECTOR_PROTOCOLS keys must match the strings
+     vLLM uses in ``KVTransferConfig.kv_connector``."""
+-    assert set(KV_CONNECTOR_PROTOCOLS) == {"NixlConnector", "MooncakeConnector"}
++    assert set(KV_CONNECTOR_PROTOCOLS) == {
++        "NixlConnector",
++        "MooncakeConnector",
++        "MooncakeConnectorV1",
++    }
+     for cls in KV_CONNECTOR_PROTOCOLS.values():
+         assert issubclass(cls, KvConnectorProtocol)
+ 

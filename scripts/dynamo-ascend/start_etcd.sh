@@ -17,8 +17,9 @@ fi
 if docker ps -a --format '{{.Names}}' | grep -qx "$NAME"; then
   docker start "$NAME"; exit 0
 fi
+ADVERTISE_CLIENT_URL=${ADVERTISE_CLIENT_URL:-http://127.0.0.1:2379}
 docker run -d --name "$NAME" --net=host --restart unless-stopped \
   -v "$DATA_DIR:/etcd-data" "$IMAGE" \
   etcd --data-dir=/etcd-data --listen-client-urls=http://0.0.0.0:2379 \
-  --advertise-client-urls=http://127.0.0.1:2379
-echo "started: $NAME"
+  --advertise-client-urls="$ADVERTISE_CLIENT_URL"
+echo "started: $NAME (advertise=$ADVERTISE_CLIENT_URL)"

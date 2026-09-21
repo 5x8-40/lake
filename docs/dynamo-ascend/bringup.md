@@ -13,7 +13,7 @@ export WM_ROOT=/data/wm
 # export PROXY=http://user:pass@host:port
 # export SSL_CERT_FILE=/path/to/ca-bundle.crt
 
-bash scripts/dynamo-ascend/prepare_src.sh
+bash scripts/dynamo-ascend/prepare_src.sh          # 1.4.2 + MooncakeConnectorV1 补丁
 WITH_NPU=0 bash scripts/dynamo-ascend/start_docker.sh   # 可先无 NPU 编译
 PROXY=$PROXY bash scripts/dynamo-ascend/build_install.sh
 bash scripts/dynamo-ascend/start_etcd.sh
@@ -22,6 +22,8 @@ bash scripts/dynamo-ascend/start_etcd.sh
 bash scripts/dynamo-ascend/start.sh
 curl -s localhost:8000/v1/models
 ```
+
+PD / KV / 跨机见 [pd-mooncake.md](pd-mooncake.md)（`start_pd.sh` / `start_pd_multi.sh`）。
 
 ## 脚本已自动处理的坑
 
@@ -37,11 +39,15 @@ curl -s localhost:8000/v1/models
 
 | 脚本 | 作用 |
 |------|------|
-| `prepare_src.sh` | clone/checkout **一个** Dynamo 仓到 `$SRC` |
+| `prepare_src.sh` | clone/checkout **一个** Dynamo 仓到 `$SRC`，并打 Ascend 协议补丁 |
+| `apply_protocol_patch.sh` | 注册 `MooncakeConnectorV1`（幂等） |
 | `start_docker.sh` | 常驻 `vllm-ascend` 容器（`WITH_NPU=0/1`） |
 | `build_install.sh` | 容器内 rustup + maturin release 编译并安装 |
-| `start_etcd.sh` | discovery |
-| `start.sh` | 容器内 FE + `dynamo.vllm` |
+| `install_src.sh` | 刷新 editable 安装并断言协议 |
+| `start_etcd.sh` | discovery（可设 `ADVERTISE_CLIENT_URL`） |
+| `start.sh` | 容器内 FE + 聚合 `dynamo.vllm` |
+| `start_pd.sh` | 单机 Prefill/Decode + Mooncake + KV router |
+| `start_pd_multi.sh` | 跨机 `ROLE=p\|d` |
 
 环境变量：`SRC`（默认 `$WM_ROOT/dynamo`）、`REF`（默认 `release/1.4.2`）、`REPO`（默认 `ai-dynamo/dynamo`）、`NAME`、`PROXY`、`SSL_CERT_FILE`。
 
