@@ -6,7 +6,10 @@ NAME=${NAME:-vllm-ascend-lake-test}
 SRC=${SRC:-${WM_ROOT:-/data/wm}/dynamo}
 SP=/usr/local/python3.12.13/lib/python3.12/site-packages
 
-[[ -d "$SRC/.git" ]] || { echo "missing $SRC" >&2; exit 1; }
+[[ -f "$SRC/components/src/dynamo/vllm/kv_connector_protocols.py" ]] || {
+  echo "missing $SRC (kv_connector_protocols.py)" >&2
+  exit 1
+}
 grep -q MooncakeConnectorV1 "$SRC/components/src/dynamo/vllm/kv_connector_protocols.py" || {
   echo "SRC missing MooncakeConnectorV1 — run apply_protocol_patch.sh" >&2
   exit 1

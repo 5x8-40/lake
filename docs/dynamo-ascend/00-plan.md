@@ -11,6 +11,6 @@
 | #1 | 容器内编装 1.4.2 + 聚合 FE/worker | ✅ models + chat |
 | #2 | PD Mooncake：`apply_protocol_patch` + `start_pd` + docs | ✅ models + chat（1.4.2+协议补丁） |
 | #3 | KV router：`start_pd` 默认 `--router-mode kv` + kv-events | ✅ FE/worker metrics 可见 |
-| #4 | multi-host：`start_pd_multi` ROLE=p\|d | ✅ 脚本语法/ROLE 校验；跨机 E2E 待第二台机 |
+| #4 | multi-host：`start_pd_multi` ROLE=p\|d | ✅ 跨机 1P1D chat（P=106.153 D=108.153） |
 
 协议补丁：[`../scripts/dynamo-ascend/patches/0001-mooncake-connector-v1-protocol.patch`](../../scripts/dynamo-ascend/patches/0001-mooncake-connector-v1-protocol.patch)。说明见 [pd-mooncake.md](pd-mooncake.md)。

@@ -73,6 +73,14 @@ RESTART=1 ROLE=d bash scripts/dynamo-ascend/start_pd_multi.sh
 - FE `--router-mode kv`；`/metrics` 有 `dynamo_component_kv_cache_*`；worker `:8782/metrics` 有 `kv_publisher_*`
 - Worker 日志：`AscendMultiConnector`（vllm-ascend 对 MultiConnector 的包装）
 
+## 跨机验证（2026-09-22）
+
+- P=`7.242.106.153`，D=`7.242.108.153`，1P1D TP4（`P_NPU_GROUPS`/`D_NPU_GROUPS=0,1,2,3`）
+- etcd advertise：`http://7.242.106.153:2379`；`MC_MASTER_ADDRESS=7.242.106.153`；`PREFER_SAME_NODE=false`
+- 容器需挂 `hccn_tool` / `npu-smi` / `hccn.conf`（`start_docker.sh` 已补），否则 Ascend 直连 KV 会 `Mooncake transfer failed, ret: -1`
+- Decode `kv_port` 默认基址 `20101`（避开 Prefill TP 占用的 `20001..20001+TP-1`）
+- 结果：`/v1/models` → `qwen`；跨机 chat HTTP 200 出 token
+
 ## 脚本
 
 | 脚本 | 作用 |
