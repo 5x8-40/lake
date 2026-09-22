@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Single-host Ascend PD: FE + Prefill + Decode inside lake container.
 # Uses release/1.4.2 + MooncakeConnectorV1 protocol patch (no dynamo-ascend 1.5 tree).
-# MultiConnector: MooncakeConnectorV1 (P↔D) + AscendStoreConnector (prefix cache).
+# MultiConnector:
+#   MooncakeConnectorV1  — P↔D KV transfer
+#   AscendStoreConnector — prefix Store (requires mooncake_master started by this script)
+#   OffloadingConnector  — NPU→CPU offload (ENABLE_KV_OFFLOAD=1 default)
 # Default ROUTER_MODE=kv with kv-events ZMQ (set ROUTER_MODE=round-robin to disable).
 #
 # Prereqs: prepare_src + apply_protocol_patch, start_docker (WITH_NPU=1),
@@ -40,6 +43,17 @@ MC_LIB_DIR=${MC_LIB_DIR:-/usr/local/Ascend/ascend-toolkit/latest/python/site-pac
 KV_PORT_PREFILL=${KV_PORT_PREFILL:-20001}
 KV_PORT_DECODE=${KV_PORT_DECODE:-20002}
 
+# MultiConnector children:
+#   1) MooncakeConnectorV1 — P↔D KV transfer (only PD-capable child)
+#   2) AscendStoreConnector — prefix Store; requires mooncake_master (started below)
+#   3) OffloadingConnector — NPU→CPU KV offload (optional; ENABLE_KV_OFFLOAD=1)
+ENABLE_KV_OFFLOAD=${ENABLE_KV_OFFLOAD:-1}
+# Image-matched path: AscendSimpleCPUOffloadConnector (ships in v0.26.0rc1).
+# Newer AscendOffloadingConnector+NPUOffloadingSpec needs newer vllm pairing.
+OFFLOAD_CPU_BYTES=${OFFLOAD_CPU_BYTES:-8589934592}
+OFFLOAD_CONNECTOR=${OFFLOAD_CONNECTOR:-AscendSimpleCPUOffloadConnector}
+OFFLOAD_CONNECTOR_MODULE=${OFFLOAD_CONNECTOR_MODULE:-vllm_ascend.distributed.kv_transfer.kv_pool.simple_cpu_offload.simple_cpu_offload_connector}
+
 ROUTER_MODE=${ROUTER_MODE:-kv}
 P_SYSTEM_PORT=${P_SYSTEM_PORT:-8782}
 D_SYSTEM_PORT=${D_SYSTEM_PORT:-8783}
@@ -47,6 +61,17 @@ P_KV_EVENT_PORT=${P_KV_EVENT_PORT:-20082}
 D_KV_EVENT_PORT=${D_KV_EVENT_PORT:-20083}
 P_KV_EVENTS_CONFIG=${P_KV_EVENTS_CONFIG:-"{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:${P_KV_EVENT_PORT}\",\"enable_kv_cache_events\":true}"}
 D_KV_EVENTS_CONFIG=${D_KV_EVENTS_CONFIG:-"{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:${D_KV_EVENT_PORT}\",\"enable_kv_cache_events\":true}"}
+
+# role=kv_producer|kv_consumer  kv_port=...  lookup=...
+kv_transfer_config_json() {
+  local role=$1 kv_port=$2 lookup=$3
+  local offload=""
+  if [[ "${ENABLE_KV_OFFLOAD}" == "1" ]]; then
+    offload=",{\"kv_connector\":\"${OFFLOAD_CONNECTOR}\",\"kv_connector_module_path\":\"${OFFLOAD_CONNECTOR_MODULE}\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${OFFLOAD_CPU_BYTES}}}"
+  fi
+  printf '{"kv_connector":"MultiConnector","kv_role":"%s","kv_connector_extra_config":{"connectors":[{"kv_connector":"MooncakeConnectorV1","kv_role":"%s","kv_port":"%s","kv_connector_extra_config":{"prefill":{"dp_size":%s,"tp_size":%s},"decode":{"dp_size":%s,"tp_size":%s}}},{"kv_connector":"AscendStoreConnector","kv_role":"%s","kv_connector_extra_config":{"backend":"mooncake","lookup_rpc_port":"%s"}}%s]}}' \
+    "$role" "$role" "$kv_port" "$P_DP" "$P_TP" "$D_DP" "$D_TP" "$role" "$lookup" "$offload"
+}
 
 ensure_container() {
   if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
@@ -146,6 +171,9 @@ else
   DISCOVERY_ENV="export DYN_DISCOVERY_BACKEND=file DYN_FILE_KV='$STORE'"
 fi
 
+PREFILL_KV_CFG=$(kv_transfer_config_json kv_producer "$KV_PORT_PREFILL" 0)
+DECODE_KV_CFG=$(kv_transfer_config_json kv_consumer "$KV_PORT_DECODE" 1)
+
 docker exec -d "$NAME" bash -lc "
 set -e
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
@@ -167,6 +195,7 @@ finally:
   s.close()
 PY
 }
+# AscendStoreConnector needs mooncake_master; starting them separately is useless.
 if ! port_open $MOONCAKE_RPC_PORT; then
   nohup mooncake_master --rpc_port $MOONCAKE_RPC_PORT \
     --eviction_high_watermark_ratio 0.9 --rpc_thread_num 32 \
@@ -193,7 +222,7 @@ nohup python3 -m dynamo.vllm \
   --disaggregation-mode prefill --trust-remote-code \
   --gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-seqs 64 \
   --enable-prefix-caching --kv-events-config '$P_KV_EVENTS_CONFIG' \
-  --kv-transfer-config '{\"kv_connector\": \"MultiConnector\", \"kv_role\": \"kv_producer\", \"kv_connector_extra_config\": {\"connectors\": [{\"kv_connector\": \"MooncakeConnectorV1\", \"kv_role\": \"kv_producer\", \"kv_port\": \"$KV_PORT_PREFILL\", \"kv_connector_extra_config\": {\"prefill\": {\"dp_size\": $P_DP, \"tp_size\": $P_TP}, \"decode\": {\"dp_size\": $D_DP, \"tp_size\": $D_TP}}}, {\"kv_connector\": \"AscendStoreConnector\", \"kv_role\": \"kv_producer\", \"kv_connector_extra_config\": {\"backend\": \"mooncake\", \"lookup_rpc_port\": \"0\"}}]}}' \
+  --kv-transfer-config '$PREFILL_KV_CFG' \
   > '$LOGDIR/worker_prefill.log' 2>&1 &
 echo \$! > '$LOGDIR/worker_prefill.pid'
 sleep 5
@@ -207,12 +236,12 @@ nohup python3 -m dynamo.vllm \
   --disaggregation-mode decode --trust-remote-code \
   --gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-seqs 64 \
   --enable-prefix-caching --kv-events-config '$D_KV_EVENTS_CONFIG' \
-  --kv-transfer-config '{\"kv_connector\": \"MultiConnector\", \"kv_role\": \"kv_consumer\", \"kv_connector_extra_config\": {\"connectors\": [{\"kv_connector\": \"MooncakeConnectorV1\", \"kv_role\": \"kv_consumer\", \"kv_port\": \"$KV_PORT_DECODE\", \"kv_connector_extra_config\": {\"prefill\": {\"dp_size\": $P_DP, \"tp_size\": $P_TP}, \"decode\": {\"dp_size\": $D_DP, \"tp_size\": $D_TP}}}, {\"kv_connector\": \"AscendStoreConnector\", \"kv_role\": \"kv_consumer\", \"kv_connector_extra_config\": {\"backend\": \"mooncake\", \"lookup_rpc_port\": \"1\"}}]}}' \
+  --kv-transfer-config '$DECODE_KV_CFG' \
   > '$LOGDIR/worker_decode.log' 2>&1 &
 echo \$! > '$LOGDIR/worker_decode.pid'
 "
 
-echo "started PD inside $NAME (FE :$PORT router=$ROUTER_MODE P=[$P_NPU] D=[$D_NPU])"
+echo "started PD inside $NAME (FE :$PORT router=$ROUTER_MODE offload=$ENABLE_KV_OFFLOAD P=[$P_NPU] D=[$D_NPU])"
 echo "waiting for model registry (workers may take several minutes)..."
 ok=0
 for i in $(seq 1 240); do

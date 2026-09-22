@@ -48,6 +48,23 @@ D_SYSTEM_PORT_BASE=${D_SYSTEM_PORT_BASE:-8783}
 P_KV_EVENT_PORT_BASE=${P_KV_EVENT_PORT_BASE:-20082}
 D_KV_EVENT_PORT_BASE=${D_KV_EVENT_PORT_BASE:-20083}
 ROUTER_MODE=${ROUTER_MODE:-kv}
+ENABLE_KV_OFFLOAD=${ENABLE_KV_OFFLOAD:-1}
+# Image-matched path: AscendSimpleCPUOffloadConnector (ships in v0.26.0rc1).
+# Newer AscendOffloadingConnector+NPUOffloadingSpec needs newer vllm pairing.
+OFFLOAD_CPU_BYTES=${OFFLOAD_CPU_BYTES:-8589934592}
+OFFLOAD_CONNECTOR=${OFFLOAD_CONNECTOR:-AscendSimpleCPUOffloadConnector}
+OFFLOAD_CONNECTOR_MODULE=${OFFLOAD_CONNECTOR_MODULE:-vllm_ascend.distributed.kv_transfer.kv_pool.simple_cpu_offload.simple_cpu_offload_connector}
+
+# role kv_port lookup — MultiConnector: transfer + AscendStore(+master) + optional offload
+kv_transfer_config_json() {
+  local role=$1 kv_port=$2 lookup=$3
+  local offload=""
+  if [[ "${ENABLE_KV_OFFLOAD}" == "1" ]]; then
+    offload=",{\"kv_connector\":\"${OFFLOAD_CONNECTOR}\",\"kv_connector_module_path\":\"${OFFLOAD_CONNECTOR_MODULE}\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${OFFLOAD_CPU_BYTES}}}"
+  fi
+  printf '{"kv_connector":"MultiConnector","kv_role":"%s","kv_connector_extra_config":{"connectors":[{"kv_connector":"MooncakeConnectorV1","kv_role":"%s","kv_port":"%s","kv_connector_extra_config":{"prefill":{"dp_size":%s,"tp_size":%s},"decode":{"dp_size":%s,"tp_size":%s}}},{"kv_connector":"AscendStoreConnector","kv_role":"%s","kv_connector_extra_config":{"backend":"mooncake","lookup_rpc_port":"%s"}}%s]}}' \
+    "$role" "$role" "$kv_port" "$P_DP" "$P_TP" "$D_DP" "$D_TP" "$role" "$lookup" "$offload"
+}
 
 ensure_container() {
   if ! docker ps --format '{{.Names}}' | grep -qx "$NAME"; then
@@ -148,8 +165,9 @@ echo \$! > '$LOGDIR/frontend.pid'
 
 start_prefill_worker() {
   local idx=$1 npu=$2 kv_port=$3 sys_port=$4 ev_port=$5 lookup=$6
-  local kv_events
+  local kv_events kv_cfg
   kv_events="{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:${ev_port}\",\"enable_kv_cache_events\":true}"
+  kv_cfg=$(kv_transfer_config_json kv_producer "$kv_port" "$lookup")
   docker exec -d "$NAME" bash -lc "
 set -e
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONHASHSEED=0
@@ -165,7 +183,7 @@ nohup python3 -m dynamo.vllm \
   --disaggregation-mode prefill --trust-remote-code \
   --gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-seqs 64 \
   --enable-prefix-caching --kv-events-config '$kv_events' \
-  --kv-transfer-config '{\"kv_connector\": \"MultiConnector\", \"kv_role\": \"kv_producer\", \"kv_connector_extra_config\": {\"connectors\": [{\"kv_connector\": \"MooncakeConnectorV1\", \"kv_role\": \"kv_producer\", \"kv_port\": \"$kv_port\", \"kv_connector_extra_config\": {\"prefill\": {\"dp_size\": $P_DP, \"tp_size\": $P_TP}, \"decode\": {\"dp_size\": $D_DP, \"tp_size\": $D_TP}}}, {\"kv_connector\": \"AscendStoreConnector\", \"kv_role\": \"kv_producer\", \"kv_connector_extra_config\": {\"backend\": \"mooncake\", \"lookup_rpc_port\": \"$lookup\"}}]}}' \
+  --kv-transfer-config '$kv_cfg' \
   > '$LOGDIR/worker_prefill_${idx}.log' 2>&1 &
 echo \$! > '$LOGDIR/worker_prefill_${idx}.pid'
 "
@@ -173,8 +191,9 @@ echo \$! > '$LOGDIR/worker_prefill_${idx}.pid'
 
 start_decode_worker() {
   local idx=$1 npu=$2 kv_port=$3 sys_port=$4 ev_port=$5 lookup=$6
-  local kv_events
+  local kv_events kv_cfg
   kv_events="{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:${ev_port}\",\"enable_kv_cache_events\":true}"
+  kv_cfg=$(kv_transfer_config_json kv_consumer "$kv_port" "$lookup")
   docker exec -d "$NAME" bash -lc "
 set -e
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONHASHSEED=0
@@ -190,7 +209,7 @@ nohup python3 -m dynamo.vllm \
   --disaggregation-mode decode --trust-remote-code \
   --gpu-memory-utilization 0.9 --max-model-len 32768 --max-num-seqs 64 \
   --enable-prefix-caching --kv-events-config '$kv_events' \
-  --kv-transfer-config '{\"kv_connector\": \"MultiConnector\", \"kv_role\": \"kv_consumer\", \"kv_connector_extra_config\": {\"connectors\": [{\"kv_connector\": \"MooncakeConnectorV1\", \"kv_role\": \"kv_consumer\", \"kv_port\": \"$kv_port\", \"kv_connector_extra_config\": {\"prefill\": {\"dp_size\": $P_DP, \"tp_size\": $P_TP}, \"decode\": {\"dp_size\": $D_DP, \"tp_size\": $D_TP}}}, {\"kv_connector\": \"AscendStoreConnector\", \"kv_role\": \"kv_consumer\", \"kv_connector_extra_config\": {\"backend\": \"mooncake\", \"lookup_rpc_port\": \"$lookup\"}}]}}' \
+  --kv-transfer-config '$kv_cfg' \
   > '$LOGDIR/worker_decode_${idx}.log' 2>&1 &
 echo \$! > '$LOGDIR/worker_decode_${idx}.pid'
 "

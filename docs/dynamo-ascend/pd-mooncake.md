@@ -15,6 +15,17 @@
 
 1.4.2 CLI 注意：有 `--request-plane`，**没有** `--response-plane`（那是更新树里的旗标）。
 
+## MultiConnector 分工
+
+| 子连接器 | 作用 | 依赖 |
+|----------|------|------|
+| `MooncakeConnectorV1` | P↔D **KV 传输**（唯一产出 PD `kv_transfer_params` 的子项） | — |
+| `AscendStoreConnector` | **前缀 Store**（`backend=mooncake`） | 必须同起 **`mooncake_master`**；单独开 Store 或单独开 master 都没用 |
+| `OffloadingConnector` | **NPU→CPU KV 卸载**（本镜像用 `AscendSimpleCPUOffloadConnector`） | 默认开（`ENABLE_KV_OFFLOAD=1`）；`ENABLE_KV_OFFLOAD=0` 可关 |
+
+关闭卸载：`ENABLE_KV_OFFLOAD=0 bash scripts/dynamo-ascend/start_pd.sh`。  
+调 CPU 池：`OFFLOAD_CPU_BYTES`（默认 8GiB）。
+
 ## 单机 PD
 
 ```bash
