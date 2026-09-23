@@ -1,0 +1,4 @@
+logs/
+etcd-data/
+store_kv/
+mooncake_conf/
