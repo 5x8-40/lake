@@ -26,7 +26,7 @@ PD / KV / 跨机 / 卸载见 [pd-mooncake.md](pd-mooncake.md)。
 2. `build_install.sh`：`maturin build --release` → 安装 `ai-dynamo-runtime` wheel → `pip install -e` 安装 Python 包
 3. 运行时直接 `python3 -m dynamo.*`，不维护 `.pth` 注入
 
-若 aarch64 树仍带 `target-cpu=neoverse-n1`，构建脚本会临时改成 `generic`（Kunpeng SIGILL）；长期应在 dynamo-ascend 仓内改 `.cargo`。
+aarch64：`dynamo-ascend` 的 `.cargo` 已用 `target-cpu=generic`（避免 Kunpeng 上 `neoverse-n1` SIGILL）；lake 不再做 sed workaround。
 
 ## 脚本
 

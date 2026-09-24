@@ -47,11 +47,7 @@ git-fetch-with-cli = true
 EOF
 
 cd "$SRC"
-# If the tree still ships neoverse-n1, force generic for this build (SIGILL on Kunpeng).
-# Prefer fixing .cargo in dynamo-ascend itself; this is a local safety net only.
-if [[ -f .cargo/config.toml ]]; then
-  sed -i "s/target-cpu=neoverse-n1/target-cpu=generic/g" .cargo/config.toml
-fi
+# aarch64 target-cpu is set in dynamo-ascend .cargo (generic; avoids Kunpeng SIGILL).
 export PYO3_PYTHON="$(command -v python3)"
 
 # release wheel for ai-dynamo-runtime
