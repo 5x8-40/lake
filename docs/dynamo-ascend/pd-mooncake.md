@@ -10,11 +10,15 @@ Dynamo 的 `KvConnectorProtocol` 按 **`kv_transfer_params` 线格式**选型，
 
 | 引擎侧 `kv_connector` | 线格式 | Dynamo protocol |
 |----------------------|--------|-----------------|
-| `NixlConnector` | pull：`remote_host` / `remote_port` / `remote_block_ids` | `NixlConnectorProtocol` |
+| `NixlConnector`（0.26 为 Pull 兼容别名；另有 `NixlPullConnector` / `NixlPushConnector`） | pull：`remote_host` / `remote_port` / `remote_block_ids`（push 另有 writer 线程 + PUSH_REG + RDMA WRITE） | `NixlConnectorProtocol` |
 | `MooncakeConnector`（上游 GPU） | push：`transfer_id` + bootstrap | `MooncakeConnectorProtocol` |
-| `MooncakeConnectorV1`（Ascend） | **与 NIXL 相同的 pull 包** | **`NixlConnectorProtocol`** |
+| `MooncakeConnectorV1`（Ascend） | **与 NIXL pull 相同的包** | **`NixlConnectorProtocol`** |
 
 因此 Ascend V1 必须注册为 Nixl 协议类；挂 `MooncakeConnectorProtocol` 会按 bootstrap/push 解析，PD 对不上。
+
+**结构性耦合**：dynamo 协议表按连接器**名字字符串**匹配。上游每改名/新增一次（例如 NIXL 拆 Pull/Push），dynamo 侧就要补登记。
+
+**Ascend 注册面**：vllm-ascend `register_connector()` 约 11 个名字（含覆盖上游的 `MultiConnector` / `SimpleCPUOffloadConnector`）。dynamo 目前只显式认识 **`MooncakeConnectorV1`**。另有 `MooncakeLayerwiseConnector`（按层推，`do_remote_prefill` + metaserver）是**第三种线格式**，现有两个协议类都套不上；若要走 dynamo 需单写协议类。
 
 ## MultiConnector：当前层级结构（并行，非分级）
 
@@ -31,15 +35,24 @@ MultiConnector
 | 子连接器 | 职责 | 与其它子项关系 |
 |----------|------|----------------|
 | `MooncakeConnectorV1` | Prefill→Decode **块传输** | PD 热路径；与 Store/Offload **无关** |
-| `AscendStoreConnector` | **前缀命中**读写（mooncake backend） | **必须**配 `mooncake_master`；master 管的是 Store 段，**不**感知 SimpleCPU offload 池 |
-| `AscendSimpleCPUOffloadConnector` | 引擎侧 **NPU→CPU** 卸载 | 独立 DRAM 池；**不会**自动晋升/降级到 Store，也**不是** G1→G2→G3 |
+| `AscendStoreConnector` | **前缀命中**读写（mooncake backend） | **必须**配 `mooncake_master`；索引/分配/驱逐归 master，连接器只是客户端 |
+| `AscendSimpleCPUOffloadConnector` | 引擎侧 **NPU→CPU** 卸载 | 无后端钩子；驱逐即丢弃；**不可能**级联到 mooncake |
 
-要点（对应评审「卸载后 mooncake_master 怎么知道」）：
+要点：
 
-- **不知道，也不需要知道。** master 只服务 AscendStore；SimpleCPU offload 是 worker 进程内另一条路径。
-- 当前实现是 **功能并列**，不是 Dynamo KVBM 那种统一分层。真分级（统一调度 / 跨层迁移）未做，后续若要做再单独立项。
+- **并列 = 广播写**：`MultiConnector.save_kv_layer` 对所有子连接器广播；Store 与 SimpleCPU **都会写**，两池都在 DRAM，内容易重叠。
+- **生产配置宜二选一**：要跨实例留前缀 → 开 Store（可关 `ENABLE_KV_OFFLOAD=0`）；单节点只要本机 CPU 池 → 关 Store 子项、开 SimpleCPU。默认双开偏演示，不是推荐生产形态。
+- **master 不感知 SimpleCPU**：Store 走 mooncake master；SimpleCPU 是 worker 进程内另一条路径。单用 Store 时，master 内部已有 DRAM→SSD 一类分级；并联 CPU 池反而绕开了它。
 
 关闭卸载：`ENABLE_KV_OFFLOAD=0`。调 CPU 池：`OFFLOAD_CPU_BYTES`（默认 8GiB）。
+
+### `lookup_rpc_port`（脚本里的 0/1）
+
+AscendStore 配置字段名是 `lookup_rpc_port`，脚本传入的 `0`（Prefill）/ `1`（Decode）**不是 TCP 端口**，而是拼本地 IPC 路径的 **lookup id 后缀**（`lookup_rpc_port_{id}_dp_rank`）。Prefill 侧基本不做 lookup；Decode 用各自本地端点。脚本变量按 `lookup_id` 命名，避免当成网络端口。
+
+### 真分级（未做；后续方向）
+
+不要另起炉灶。上游 0.26 已有 HiCache 式框架：`OffloadingConnector` + `OffloadingSpecFactory`（`spec_module_path` 热加载）+ `TieringOffloadingSpec`（CPU 主层作 GPU 网关 + 可插拔二级 fs/obj/p2p）。镜像注释里的更新线 **`AscendOffloadingConnector` + `NPUOffloadingSpec`** 即这条；当前默认仍用 `AscendSimpleCPUOffloadConnector`（与 v0.26.0rc1 配对）。
 
 ## 单机 PD
 
@@ -59,13 +72,13 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
 
 ## 如何核实 KV-aware router
 
-1. FE 启动参数含 `--router-mode kv`（脚本默认）。
+1. FE 启动参数含 `--router-mode kv`（脚本默认；聚合 `start.sh` 已对齐）。
 2. Worker 带 `--kv-events-config`（ZMQ）与 `DYN_SYSTEM_PORT`。
 3. 探针：
    ```bash
    # FE：路由/组件指标
    curl -s localhost:8000/metrics | grep -E 'router_kv_|dynamo_component_kv_cache' || true
-   # Prefill worker system port（默认 8782）
+   # Prefill / 聚合 worker system port（PD 默认 8782；agg 默认 8782）
    curl -s localhost:8782/metrics | grep kv_publisher || true
    ```
 4. 发几条**共享前缀**的 chat 后，再看上述指标是否增长；也可用 `ROUTER_MODE=round-robin` 对照。
@@ -108,6 +121,6 @@ RESTART=1 ROLE=d bash scripts/dynamo-ascend/start_pd_multi.sh
 
 | 脚本 | 作用 |
 |------|------|
-| `install_src.sh` | 断言协议已安装 |
+| `verify_protocol.sh` | 容器内断言已安装树含 `MooncakeConnectorV1` |
 | `start_pd.sh` | 单机 PD + Mooncake + KV router + 可选卸载 |
 | `start_pd_multi.sh` | `ROLE=p\|d` 跨机 |

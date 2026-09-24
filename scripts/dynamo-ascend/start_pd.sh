@@ -60,15 +60,18 @@ D_KV_EVENT_PORT=${D_KV_EVENT_PORT:-20083}
 P_KV_EVENTS_CONFIG=${P_KV_EVENTS_CONFIG:-"{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:${P_KV_EVENT_PORT}\",\"enable_kv_cache_events\":true}"}
 D_KV_EVENTS_CONFIG=${D_KV_EVENTS_CONFIG:-"{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:${D_KV_EVENT_PORT}\",\"enable_kv_cache_events\":true}"}
 
-# role=kv_producer|kv_consumer  kv_port=...  lookup=...
+# role=kv_producer|kv_consumer  kv_port=...  lookup_id=...
+# lookup_id feeds AscendStoreConnector.lookup_rpc_port — engine field name is
+# historical; value is an IPC path suffix (lookup_rpc_port_{id}_dp_rank), NOT a TCP port.
+# Prefill uses 0, Decode uses 1 so local lookup endpoints do not collide.
 kv_transfer_config_json() {
-  local role=$1 kv_port=$2 lookup=$3
+  local role=$1 kv_port=$2 lookup_id=$3
   local offload=""
   if [[ "${ENABLE_KV_OFFLOAD}" == "1" ]]; then
     offload=",{\"kv_connector\":\"${OFFLOAD_CONNECTOR}\",\"kv_connector_module_path\":\"${OFFLOAD_CONNECTOR_MODULE}\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${OFFLOAD_CPU_BYTES}}}"
   fi
   printf '{"kv_connector":"MultiConnector","kv_role":"%s","kv_connector_extra_config":{"connectors":[{"kv_connector":"MooncakeConnectorV1","kv_role":"%s","kv_port":"%s","kv_connector_extra_config":{"prefill":{"dp_size":%s,"tp_size":%s},"decode":{"dp_size":%s,"tp_size":%s}}},{"kv_connector":"AscendStoreConnector","kv_role":"%s","kv_connector_extra_config":{"backend":"mooncake","lookup_rpc_port":"%s"}}%s]}}' \
-    "$role" "$role" "$kv_port" "$P_DP" "$P_TP" "$D_DP" "$D_TP" "$role" "$lookup" "$offload"
+    "$role" "$role" "$kv_port" "$P_DP" "$P_TP" "$D_DP" "$D_TP" "$role" "$lookup_id" "$offload"
 }
 
 ensure_container() {
@@ -133,7 +136,7 @@ fi
 ensure_container
 ensure_etcd
 # Assert protocol is visible from the installed dynamo-ascend tree
-SRC=${SRC:-$LAKE_ROOT/3rdparty/dynamo-ascend} bash "$SCRIPT_DIR/install_src.sh"
+SRC=${SRC:-$LAKE_ROOT/3rdparty/dynamo-ascend} bash "$SCRIPT_DIR/verify_protocol.sh"
 
 if [[ "$RESTART" == "1" ]]; then
   stop_inside
@@ -169,8 +172,8 @@ else
   DISCOVERY_ENV="export DYN_DISCOVERY_BACKEND=file DYN_FILE_KV='$STORE'"
 fi
 
-PREFILL_KV_CFG=$(kv_transfer_config_json kv_producer "$KV_PORT_PREFILL" 0)
-DECODE_KV_CFG=$(kv_transfer_config_json kv_consumer "$KV_PORT_DECODE" 1)
+PREFILL_KV_CFG=$(kv_transfer_config_json kv_producer "$KV_PORT_PREFILL" 0)   # lookup_id=0
+DECODE_KV_CFG=$(kv_transfer_config_json kv_consumer "$KV_PORT_DECODE" 1)     # lookup_id=1
 
 docker exec -d "$NAME" bash -lc "
 set -e

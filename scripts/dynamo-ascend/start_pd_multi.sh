@@ -55,15 +55,16 @@ OFFLOAD_CPU_BYTES=${OFFLOAD_CPU_BYTES:-8589934592}
 OFFLOAD_CONNECTOR=${OFFLOAD_CONNECTOR:-AscendSimpleCPUOffloadConnector}
 OFFLOAD_CONNECTOR_MODULE=${OFFLOAD_CONNECTOR_MODULE:-vllm_ascend.distributed.kv_transfer.kv_pool.simple_cpu_offload.simple_cpu_offload_connector}
 
-# role kv_port lookup — MultiConnector: transfer + AscendStore(+master) + optional offload
+# role kv_port lookup_id — MultiConnector: transfer + AscendStore(+master) + optional offload
+# lookup_id → AscendStoreConnector.lookup_rpc_port (IPC path suffix, not a TCP port).
 kv_transfer_config_json() {
-  local role=$1 kv_port=$2 lookup=$3
+  local role=$1 kv_port=$2 lookup_id=$3
   local offload=""
   if [[ "${ENABLE_KV_OFFLOAD}" == "1" ]]; then
     offload=",{\"kv_connector\":\"${OFFLOAD_CONNECTOR}\",\"kv_connector_module_path\":\"${OFFLOAD_CONNECTOR_MODULE}\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${OFFLOAD_CPU_BYTES}}}"
   fi
   printf '{"kv_connector":"MultiConnector","kv_role":"%s","kv_connector_extra_config":{"connectors":[{"kv_connector":"MooncakeConnectorV1","kv_role":"%s","kv_port":"%s","kv_connector_extra_config":{"prefill":{"dp_size":%s,"tp_size":%s},"decode":{"dp_size":%s,"tp_size":%s}}},{"kv_connector":"AscendStoreConnector","kv_role":"%s","kv_connector_extra_config":{"backend":"mooncake","lookup_rpc_port":"%s"}}%s]}}' \
-    "$role" "$role" "$kv_port" "$P_DP" "$P_TP" "$D_DP" "$D_TP" "$role" "$lookup" "$offload"
+    "$role" "$role" "$kv_port" "$P_DP" "$P_TP" "$D_DP" "$D_TP" "$role" "$lookup_id" "$offload"
 }
 
 ensure_container() {
@@ -164,10 +165,10 @@ echo \$! > '$LOGDIR/frontend.pid'
 }
 
 start_prefill_worker() {
-  local idx=$1 npu=$2 kv_port=$3 sys_port=$4 ev_port=$5 lookup=$6
+  local idx=$1 npu=$2 kv_port=$3 sys_port=$4 ev_port=$5 lookup_id=$6
   local kv_events kv_cfg
   kv_events="{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:${ev_port}\",\"enable_kv_cache_events\":true}"
-  kv_cfg=$(kv_transfer_config_json kv_producer "$kv_port" "$lookup")
+  kv_cfg=$(kv_transfer_config_json kv_producer "$kv_port" "$lookup_id")
   docker exec -d "$NAME" bash -lc "
 set -e
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONHASHSEED=0
@@ -190,10 +191,10 @@ echo \$! > '$LOGDIR/worker_prefill_${idx}.pid'
 }
 
 start_decode_worker() {
-  local idx=$1 npu=$2 kv_port=$3 sys_port=$4 ev_port=$5 lookup=$6
+  local idx=$1 npu=$2 kv_port=$3 sys_port=$4 ev_port=$5 lookup_id=$6
   local kv_events kv_cfg
   kv_events="{\"publisher\":\"zmq\",\"topic\":\"kv-events\",\"endpoint\":\"tcp://*:${ev_port}\",\"enable_kv_cache_events\":true}"
-  kv_cfg=$(kv_transfer_config_json kv_consumer "$kv_port" "$lookup")
+  kv_cfg=$(kv_transfer_config_json kv_consumer "$kv_port" "$lookup_id")
   docker exec -d "$NAME" bash -lc "
 set -e
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 PYTHONHASHSEED=0
@@ -232,7 +233,7 @@ cmd=${1:-start}
 [[ "$DISCOVERY" == "etcd" ]] || { echo "cross-host requires etcd" >&2; exit 2; }
 
 ensure_container
-SRC=${SRC:-$LAKE_ROOT/3rdparty/dynamo-ascend} bash "$SCRIPT_DIR/install_src.sh"
+SRC=${SRC:-$LAKE_ROOT/3rdparty/dynamo-ascend} bash "$SCRIPT_DIR/verify_protocol.sh"
 mkdir -p "$STORE" "$LOGDIR"
 
 if [[ "$cmd" == "stop" ]]; then

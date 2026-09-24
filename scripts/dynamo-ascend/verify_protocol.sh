@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Assert MooncakeConnectorV1 is importable from the installed dynamo-ascend tree.
-# Prefer a normal container install (build_install.sh); this only verifies the protocol.
+# Verify MooncakeConnectorV1 is importable inside the container (does not install).
+# Host-side path checks: prepare_src.sh; install-time assert: build_install.sh.
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LAKE_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
@@ -9,10 +9,6 @@ SRC=${SRC:-$LAKE_ROOT/3rdparty/dynamo-ascend}
 
 [[ -f "$SRC/components/src/dynamo/vllm/kv_connector_protocols.py" ]] || {
   echo "missing $SRC — run prepare_src.sh first" >&2
-  exit 1
-}
-grep -q MooncakeConnectorV1 "$SRC/components/src/dynamo/vllm/kv_connector_protocols.py" || {
-  echo "SRC missing MooncakeConnectorV1 — need dynamo-ascend with protocol PR" >&2
   exit 1
 }
 
