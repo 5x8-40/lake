@@ -22,11 +22,11 @@ PD / KV / 跨机 / 卸载见 [pd-mooncake.md](pd-mooncake.md)。
 
 ## 安装流程（正常路径）
 
-1. `prepare_src.sh`：checkout dynamo-ascend（须含 `MooncakeConnectorV1` 协议，见 [dynamo-ascend#2](https://github.com/5x8-40/dynamo-ascend/pull/2)）
+1. `prepare_src.sh`：checkout **`ascend-dev-1.4.2`**（1.4.2 交付线，含 `MooncakeConnectorV1` + Kunpeng `generic`）
 2. `build_install.sh`：`maturin build --release` → 安装 `ai-dynamo-runtime` wheel → `pip install -e` 安装 Python 包
 3. 运行时直接 `python3 -m dynamo.*`，不维护 `.pth` 注入
 
-aarch64：`dynamo-ascend` 的 `.cargo` 已用 `target-cpu=generic`（避免 Kunpeng 上 `neoverse-n1` SIGILL）；lake 不再做 sed workaround。
+aarch64：`ascend-dev-1.4.2` 的 `.cargo` 已用 `target-cpu=generic`（避免 Kunpeng SIGILL）。
 
 ## 脚本
 
@@ -40,4 +40,4 @@ aarch64：`dynamo-ascend` 的 `.cargo` 已用 `target-cpu=generic`（避免 Kunp
 | `start.sh` | FE + 聚合 `dynamo.vllm` |
 | `start_pd.sh` / `start_pd_multi.sh` | PD 路径 |
 
-常用变量：`SRC`、`REF`（默认协议分支，合入后改 `ascend-dev`）、`REPO`、`NAME`、`MODEL`、`MODEL_HOST_DIR`、`LOGDIR`、`PROXY`。
+常用变量：`SRC`、`REF`（默认 `ascend-dev-1.4.2`）、`REPO`、`NAME`、`MODEL`、`MODEL_HOST_DIR`、`LOGDIR`、`PROXY`。
