@@ -1,6 +1,6 @@
 # Ascend bring-up（可交付）
 
-在 **vllm-ascend 容器内**编译并安装 [5x8-40/dynamo-ascend](https://github.com/5x8-40/dynamo-ascend)（默认分支 **`ascend-dev-1.4.2`**），再拉聚合 FE + worker。路径默认相对 lake 仓（`SRC=lake/3rdparty/dynamo-ascend`），可用环境变量覆盖，不依赖个人机器根目录。
+在 **vllm-ascend 容器内**编译并安装 [5x8-40/dynamo-ascend](https://github.com/5x8-40/dynamo-ascend)（默认分支 **`feat/ascend-1.4.2-protocol-kunpeng`**），再拉聚合 FE + worker。路径默认相对 lake 仓（`SRC=lake/3rdparty/dynamo-ascend`），可用环境变量覆盖，不依赖个人机器根目录。
 
 > 需要 NPU。frontend 单测可用 mock；本路径不做「无 NPU 再 docker commit」的绕路。
 
@@ -25,11 +25,11 @@ PD / 跨机 / Store / 卸载见 [pd-mooncake.md](pd-mooncake.md)。
 
 ## 安装流程（正常路径）
 
-1. `prepare_src.sh`：checkout **`ascend-dev-1.4.2`**（1.4.2 交付线，含 `MooncakeConnectorV1` + Kunpeng `generic`）
+1. `prepare_src.sh`：checkout **`feat/ascend-1.4.2-protocol-kunpeng`**（1.4.2 交付线，含 `MooncakeConnectorV1` + Kunpeng `generic`）
 2. `build_install.sh`：`maturin build --release` → 安装 `ai-dynamo-runtime` wheel → `pip install -e` 安装 Python 包
 3. 运行时直接 `python3 -m dynamo.*`，不维护 `.pth` 注入
 
-aarch64：`ascend-dev-1.4.2` 的 `.cargo` 已用 `target-cpu=generic`（避免 Kunpeng SIGILL）。
+aarch64：`feat/ascend-1.4.2-protocol-kunpeng` 的 `.cargo` 已用 `target-cpu=generic`（避免 Kunpeng SIGILL）。
 
 ## 脚本
 
@@ -43,4 +43,4 @@ aarch64：`ascend-dev-1.4.2` 的 `.cargo` 已用 `target-cpu=generic`（避免 K
 | `start.sh` | FE + 聚合 worker（默认 KV router + kv-events + `DYN_SYSTEM_PORT`） |
 | `start_pd.sh` / `start_pd_multi.sh` | PD 路径 |
 
-常用变量：`SRC`、`REF`（默认 `ascend-dev-1.4.2`）、`REPO`、`NAME`、`MODEL`、`MODEL_HOST_DIR`、`LOGDIR`、`PROXY`、`ROUTER_MODE`。
+常用变量：`SRC`、`REF`（默认 `feat/ascend-1.4.2-protocol-kunpeng`）、`REPO`、`NAME`、`MODEL`、`MODEL_HOST_DIR`、`LOGDIR`、`PROXY`、`ROUTER_MODE`。

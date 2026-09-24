@@ -4,7 +4,7 @@
 
 | 仓 | 放什么 |
 |----|--------|
-| [5x8-40/dynamo-ascend](https://github.com/5x8-40/dynamo-ascend) **`ascend-dev-1.4.2`** | 1.4.2 交付线代码（`MooncakeConnectorV1` 协议 + Kunpeng `generic` aarch64） |
+| [5x8-40/dynamo-ascend](https://github.com/5x8-40/dynamo-ascend) **`feat/ascend-1.4.2-protocol-kunpeng`** → [`PR #3`](https://github.com/5x8-40/dynamo-ascend/pull/3) into `release/1.4.2` | 1.4.2 最小补丁（协议 + Kunpeng）；合入后改用 `release/1.4.2` |
 | **本目录 + `scripts/dynamo-ascend/`** | 文档与拉起脚本；**不**再维护 protocol patch |
 
 > 不用 `ascend-dev`（当前 1.5.0）。本机验证与版本锁定：**dynamo 1.4.2 ↔ vllm-ascend 0.26.0rc1**。
@@ -17,5 +17,5 @@
 ## 依赖
 
 - 镜像：`quay.io/ascend/vllm-ascend:v0.26.0rc1`（需 NPU）
-- 源码：`5x8-40/dynamo-ascend` @ **`ascend-dev-1.4.2`**
+- 源码：`5x8-40/dynamo-ascend` @ **`feat/ascend-1.4.2-protocol-kunpeng`**（合入后 `release/1.4.2`）
 - 协议：在该分支内，**lake 无 patch**

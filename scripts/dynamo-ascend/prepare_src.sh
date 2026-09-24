@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Clone/checkout 5x8-40/dynamo-ascend into $SRC (default: lake/3rdparty/dynamo-ascend).
 # Protocol registration for MooncakeConnectorV1 lives in dynamo-ascend (not a lake patch).
-# Default REF=ascend-dev-1.4.2 — 1.4.2 delivery line (vllm-ascend 0.26), not ascend-dev (1.5.0).
+# Default REF=feat/ascend-1.4.2-protocol-kunpeng (PR → release/1.4.2).
+# After merge: REF=release/1.4.2. Do not use ascend-dev (1.5.0).
 set -euo pipefail
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 LAKE_ROOT=$(cd "$SCRIPT_DIR/../.." && pwd)
 SRC=${SRC:-$LAKE_ROOT/3rdparty/dynamo-ascend}
-REF=${REF:-ascend-dev-1.4.2}
+REF=${REF:-feat/ascend-1.4.2-protocol-kunpeng}
 REPO=${REPO:-https://github.com/5x8-40/dynamo-ascend.git}
 
 if [[ ! -d "$SRC/.git" ]]; then
