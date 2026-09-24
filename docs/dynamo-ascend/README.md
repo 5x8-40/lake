@@ -9,11 +9,12 @@
 
 - **决策记录**放 `decisions/`，格式照 [`decisions/000-template.md`](decisions/000-template.md)。
 - **讨论纪要**命名 `YYYY-MM-DD-主题.md`。
-- **计划主线**：[00-plan.md](00-plan.md)
+- **计划主线**：[00-plan.md](00-plan.md)；各线任务追踪按线单独成文（如 [e-line.md](e-line.md)）。
 - 链接用相对路径。
 
 ## 现有内容
 
+- 任务追踪：[E 引擎线](e-line.md)（任务表 + 本机实测补充 + 进展日志）
 - 决策：
   - [D001 总体路线](decisions/D001-overall-approach.md)
   - [D002 组件边界](decisions/D002-component-boundary.md)
