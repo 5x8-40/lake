@@ -1,6 +1,6 @@
 # Ascend PD + Mooncake
 
-基线：**5x8-40/dynamo-ascend @ `feat/ascend-1.4.2-protocol-kunpeng`**（`release/1.4.2` 源码树 + `MooncakeConnectorV1` → `NixlConnectorProtocol` + Kunpeng `generic`）。对齐镜像 **vllm-ascend 0.26.0rc1**。lake **只**提供文档与脚本，**不再**打 protocol patch。勿用 `ascend-dev`（1.5.0）。
+基线：**5x8-40/dynamo-ascend @ `release/1.4.2`**（含 `MooncakeConnectorV1` → `NixlConnectorProtocol` + Kunpeng `generic`，PR #3 已合入）。对齐镜像 **vllm-ascend 0.26.0rc1**。lake **只**提供文档与脚本，**不再**打 protocol patch。勿用 `ascend-dev`（1.5.0）。
 
 不要用上游 GPU 名 `MooncakeConnector`（Ascend KV 无 CUDA `data_ptr()`）。
 
@@ -107,7 +107,7 @@ RESTART=1 ROLE=d bash scripts/dynamo-ascend/start_pd_multi.sh
 
 **单机（2026-09-21）**
 
-- 源码基线：**dynamo `release/1.4.2` + MooncakeConnectorV1 协议**（现已落在 `feat/ascend-1.4.2-protocol-kunpeng`，非 `ascend-dev`/1.5.0）
+- 源码基线：**dynamo `release/1.4.2` + MooncakeConnectorV1 协议**（PR #3 已合入该分支，非 `ascend-dev`/1.5.0）
 - `/v1/models` → `qwen`；`/v1/chat/completions` 出 token
 - FE `--router-mode kv`；metrics 可见 `dynamo_component_kv_cache_*` / worker `kv_publisher_*`
 
