@@ -31,6 +31,30 @@ PD / 跨机 / Store / 卸载见 [pd-mooncake.md](pd-mooncake.md)。
 
 aarch64：`release/1.4.2` 的 `.cargo` 已用 `target-cpu=generic`（避免 Kunpeng SIGILL）。
 
+## 实测补充（A2 / 华为内网）
+
+- **新容器先拿依赖**：先 `pip install ai-dynamo==1.4.2` 再做 editable 替换（`--no-deps` 在全新容器上不够）；装完确认 `vllm.__version__` 仍是 0.26.0。
+- **禁止** `pip install ai-dynamo`（PyPI wheel 有 SIGILL 风险）与 `[vllm]` extra（拉 CUDA 生态顶掉镜像内 vllm）。
+- crates.io 华为内网镜像（2026-09-21 实测；另需 `echo "insecure" >> ~/.curlrc`）：
+
+```toml
+[net]
+git-fetch-with-cli = true
+[http]
+check-revoke = false
+[source.crates-io]
+replace-with = 'innersource'
+[source.innersource]
+registry = 'https://szv-open.codehub.huawei.com/rust/crates.io-index.git'
+# 外网备选: rsproxy-sparse = "sparse+https://rsproxy.cn/index/"
+```
+
+- 网络受限兜底：用成品 `ai_dynamo_runtime` wheel；只有裸 `_core.abi3.so` 时直接拷进 site-packages 的 `dynamo/`。x86 编的 .so 不能用于 aarch64。
+- 两个 `dynamo` 目录（`components/src`、`lib/bindings/python/src`）均为 namespace 包，editable 安装后自动合并。
+- 改 Rust 后重编先 `cargo clean --manifest-path lib/bindings/python/Cargo.toml`（incremental 可能不链新符号）。
+- file discovery 日志刷 stream end → `sysctl -w fs.inotify.max_user_watches=1048576`。
+- 本机 E1 验证变体：file discovery（单机免 etcd）+ MTP + cudagraph `FULL_DECODE_ONLY` + `--max-model-len 262144`，DP2×TP4。
+
 ## 脚本
 
 | 脚本 | 作用 |
