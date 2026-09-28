@@ -11,6 +11,8 @@
 
 代码核实基线：vllm-ascend 源码 `~/vllm-ascend-0.26`；Mooncake submodule `3rdparty/mooncake` @ a2966b6a（2026-07-13）；上游 vLLM `3rdparty/vllm` @ 027b6f3a2（2026-09-28）。
 
+**为什么调度行为引用上游 vLLM 代码**：vllm-ascend 是插件，默认调度器就是上游 vLLM 的 `Scheduler`/`AsyncScheduler`——vllm-ascend 自带的调度器子类（ShortRequestFirst / Recompute / DyntraLB / ProfilingChunk / BatchJobAware）全部继承上游且均为条件启用（`platform.py:1051/1122/1359/1365/1377`），默认配置一个都不开。因此 `WAITING_FOR_REMOTE_KVS` 状态机等调度行为，引用上游 `scheduler.py` 就是引用 vllm-ascend 0.26 实际运行的代码；行号以上述快照为准。
+
 ## 两种模式的分野
 
 `AscendStoreConnector` 两种用法，预取的目标介质不同：
@@ -21,11 +23,14 @@
 | 读路径 | 整对象 `batch_get_into_multi_buffers` 直读进 HBM block（`mooncake_backend.py:484` `MooncakeBackend.get`；`kv_transfer.py:1293`） | 每层计算前 range 读 `batch_get_into_multi_buffer_ranges` 进本地 block（`mooncake_backend.py:410` `batch_copy_get`；适配文档 §3.2） |
 | 预取目标介质 | **HBM**（APC 前缀缓存） | **本机 DRAM**（池副本 / 客户端热缓存） |
 
-layerwise 目标介质必须是本机 DRAM 的依据：
+layerwise 目标介质必须是本机 DRAM 的依据——分两种场景，机制完全不同：
 
-- chunked prefill 后续 chunk 会逐层重读已提交前缀（适配文档 §3.3；代码类名 `LayerwiseSessionTracker`，`session_tracker.py:24`，文档中写作 `MooncakeSessionTracker`，同一物）
-- layerwise 模式即使本地 APC 命中也强制从池加载：`force_layerwise_load = self.use_layerwise and store_skip_tokens > 0`（`pool_scheduler.py:726`）
-- 副本不在本机 → 每个 chunk 的每层都远端 RDMA；副本在本机 DRAM → 本地读
+- **同机写读**（chunked prefill 主场景）：靠**写路径 local-first**，与热缓存无关。`_build_replicate_config` 带 `prefer_alloc_in_same_node`（默认 true）与 `preferred_segment=local_seg`（需 mooncake.json 显式配 `preferred_segment:true`，默认 false）（`mooncake_backend.py:346-351`）；layerwise PutStart 同样传入（`mooncake_backend.py:376-383`）。chunk 1 写完落本机 segment → chunk 2+ 重读命中本机副本（`SelectBestReplica` local-first，`real_client.cpp:292-296`）。不爆炸
+- **跨机**（副本在别的节点：他机写入的会话复用、P≠D、故障迁移）：**默认代码没有任何机制把读到的 KV 留在本机**——
+  - 读路径只把数据读进 HBM，不建本机 DRAM 副本；`BatchGetWhenPreferSameNode` 名字有"prefer"，实际只是按源 segment 聚合批量传输，不建副本（`client_service.cpp:1221-1270`）
+  - `skip_save`（`metadata.py:1150-1151`）保证加载过的前缀不回写本机
+  - chunked prefill 后续 chunk 逐层重读已提交前缀（适配文档 §3.3；代码类名 `LayerwiseSessionTracker`，`session_tracker.py:24`，文档中写作 `MooncakeSessionTracker`，同一物）；layerwise 模式即使本地 APC 命中也强制从池加载（`force_layerwise_load`，`pool_scheduler.py:726`）
+  - → 每个 chunk 的每层都远端 RDMA，性能爆炸。**跨机场景的本机落地就是本方案要补的空白**：自动回填只有 LocalHotCache（默认关），否则只能显式 `create_copy_task`
 
 ## 方案 A：非 layerwise → 预取进 HBM
 
