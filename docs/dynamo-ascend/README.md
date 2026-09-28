@@ -17,6 +17,7 @@
 - 决策：
   - [D001 总体路线](decisions/D001-overall-approach.md)
   - [D002 组件边界](decisions/D002-component-boundary.md)
+  - [D003 KV 预取](decisions/D003-kv-prefetch.md)
 - 专题：[昇腾数据底座候选盘点](data-plane-options.md)
 - 可交付：
   - [bringup.md](bringup.md) — 容器内安装 + 聚合拉起
