@@ -33,8 +33,7 @@ aarch64：`release/1.4.2` 的 `.cargo` 已用 `target-cpu=generic`（避免 Kunp
 
 ## 实测补充（A2 / 华为内网）
 
-- **新容器先拿依赖**：先 `pip install ai-dynamo==1.4.2` 再做 editable 替换（`--no-deps` 在全新容器上不够）；装完确认 `vllm.__version__` 仍是 0.26.0。
-- **禁止** `pip install ai-dynamo`（PyPI wheel 有 SIGILL 风险）与 `[vllm]` extra（拉 CUDA 生态顶掉镜像内 vllm）。
+- **依赖**：`build_install.sh` 已装核心依赖清单，全新容器够用；若 import 仍报缺包（如 `kubernetes`）按报错单独补，或 `pip install ai-dynamo==1.4.2` 拿全量——但其自带 runtime .so 在鲲鹏有 SIGILL 风险，必须被本地编的 wheel 覆盖（`build_install.sh` 的 `--force-reinstall` 即干这个）后才可运行。`[vllm]` extra 任何场景禁止（拉 CUDA 生态顶掉镜像内 vllm）。
 - crates.io 华为内网镜像（2026-09-21 实测；另需 `echo "insecure" >> ~/.curlrc`）：
 
 ```toml

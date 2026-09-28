@@ -20,7 +20,7 @@
 
 设备:`/dev/davinci[0-7]`、`/dev/davinci_manager`、`/dev/devmm_svm`、`/dev/hisi_hdc`;卷:`/usr/local/dcmi`、`/usr/local/bin/npu-smi`、`/usr/local/Ascend/driver/lib64`、`/usr/local/Ascend/driver/version.info`、`/etc/ascend_install.info`、`/root/.cache`(模型权重);另挂 `hccn_tool`。
 
-启动用 [`scripts/dynamo-ascend/start_docker.sh`](../../scripts/dynamo-ascend/start_docker.sh)(常驻容器,8 卡全挂 + `--net=host` + 华为 PyPI 源注入;设备与驱动挂载按宿主机存在性自动跳过)。`--shm-size=1g` 对多卡 TP 偏小,起多卡 worker 若报 shm 相关错误,调大(如 16g)。
+启动用 [`scripts/dynamo-ascend/start_docker.sh`](../../scripts/dynamo-ascend/start_docker.sh)(常驻容器,davinci0-7 按需挂载 + `--net=host` + 华为 PyPI 源注入;设备与驱动挂载按宿主机存在性自动跳过)。`--shm-size=1g` 对多卡 TP 偏小,起多卡 worker 若报 shm 相关错误,调大(如 16g)。
 
 容器内 apt 源(国内实测好用,jammy):
 
