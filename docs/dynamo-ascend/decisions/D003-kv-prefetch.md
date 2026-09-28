@@ -31,6 +31,7 @@ layerwise 目标介质必须是本机 DRAM 的依据——分两种场景，机�
   - `skip_save`（`metadata.py:1150-1151`）保证加载过的前缀不回写本机
   - chunked prefill 后续 chunk 逐层重读已提交前缀（适配文档 §3.3；代码类名 `LayerwiseSessionTracker`，`session_tracker.py:24`，文档中写作 `MooncakeSessionTracker`，同一物）；layerwise 模式即使本地 APC 命中也强制从池加载（`force_layerwise_load`，`pool_scheduler.py:726`）
   - → 每个 chunk 的每层都远端 RDMA，性能爆炸。**跨机场景的本机落地就是本方案要补的空白**：自动回填只有 LocalHotCache（默认关），否则只能显式 `create_copy_task`
+  - 注意区分 master 侧 promotion-on-hit（`--promotion_on_hit`，默认 false，`master_config.h:126`）：它只把 **SSD-only** 对象在读命中后晋升回 DRAM（`master_service.cpp:375-407`），不管远端 DRAM→本机 DRAM，与本问题无关
 
 ## 方案 A：非 layerwise → 预取进 HBM
 
