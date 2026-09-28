@@ -102,10 +102,10 @@ flowchart TB
         SL["_session_leaves:<br/>S1 → {C}, S2 → {D}"]
     end
     subgraph TREE["token 前缀树（节点标注 component_data）"]
-        R["ROOT"] --> A["系统 prompt<br/>session_ref=2"]
-        A --> B["turn1<br/>session_ref=2"]
-        B --> C["S1 turn2（S1 的 frontier）<br/>session_ref=1 · session_ids={S1}"]
-        B --> D["S2 turn2（S2 的 frontier）<br/>session_ref=1 · session_ids={S2}"]
+        R["ROOT"] --> A["A：系统 prompt<br/>session_ref=2"]
+        A --> B["B：turn1<br/>session_ref=2"]
+        B --> C["C：S1 turn2（S1 的 frontier）<br/>session_ref=1 · session_ids={S1}"]
+        B --> D["D：S2 turn2（S2 的 frontier）<br/>session_ref=1 · session_ids={S2}"]
     end
     SL -. S1 .-> C
     SL -. S2 .-> D
