@@ -15,27 +15,33 @@
 
 ## 两种模式的分野
 
-`AscendStoreConnector` 两种用法，预取的目标介质不同：
+`AscendStoreConnector` 两种用法，读路径与本地命中处理不同；**预取目标介质相同——HBM（APC）与本机 DRAM 两层皆有效**：
 
-| | 非 layerwise | layerwise |
+| | 非 layerwise | layerwise（Mooncake block_key 数据面） |
 |---|---|---|
 | 配置 | `use_layerwise=false`（默认） | `use_layerwise=true` |
-| 读路径 | 整对象 `batch_get_into_multi_buffers` 直读进 HBM block（`mooncake_backend.py:484` `MooncakeBackend.get`；`kv_transfer.py:1293`） | 每层计算前 range 读 `batch_get_into_multi_buffer_ranges` 进本地 block（`mooncake_backend.py:410` `batch_copy_get`；适配文档 §3.2） |
-| 预取目标介质 | **HBM**（APC 前缀缓存） | **本机 DRAM**（池副本） |
+| 读路径 | 整对象 `batch_get_into_multi_buffers` 直读进 HBM block（`mooncake_backend.py:484` `MooncakeBackend.get`；`kv_transfer.py:1293`） | 每层计算前 range 读 `batch_get_into_multi_buffer_ranges` 进请求的 HBM block（`mooncake_backend.py:410` `batch_copy_get`；适配文档 §3.2） |
+| 异步加载 | `load_async=true` 时进 `WAITING_FOR_REMOTE_KVS`（**默认 false**） | 强制同步加载（`load_async` 返回值 `self.load_async and not self.use_layerwise`，`pool_scheduler.py:747`），逐层 range 读夹带在 prefill forward 里 |
+| 本地 APC 命中处理 | 调度器侧：APC 命中的 token 不进池加载 | worker 侧：加载起点 `start_block = vllm_cached_tokens // block_size`（`pool_worker.py:2229`；hybrid 路径 `mooncake_layerwise.py:345`），本地已缓存块不重读；本地全命中 → 加载列表为空 → **零池读** |
 
-layerwise 目标介质必须是本机 DRAM 的依据——分两种场景，机制完全不同：
+两个"强制重读"机制容易被误判为"layerwise 本地命中无效"，对 Mooncake block_key 路径均不成立：
+
+- `layerwise_offload=True` 时 worker 强制从 block 0 整前缀重读（`pool_worker.py:1795`）——但它只在 **gva 数据面 + 层复用布局**下被赋值（`pool_worker.py:224` `use_layerwise_transfer` 门控，L585/L601）；Mooncake block_key 路径恒为 False（L576 初始化后不变）。gva+层复用必须重读的原因：物理块是共享 staging buffer，APC "命中"的块并不真持有该前缀 KV；block_key 路径用标准完整 KV cache 布局，APC 命中 = 数据真在 HBM
+- `force_layerwise_load`（`pool_scheduler.py:726`）在池有命中时强制建 load spec——但只建 spec；worker 侧 `start_block` 机制兜底，本地全命中时加载列表为空，实际零池读
+
+本机 DRAM 层（池副本）的现状——分两种场景，机制完全不同：
 
 - **同机写读**（chunked prefill 主场景）：靠**写路径 local-first**。`_build_replicate_config` 带 `prefer_alloc_in_same_node`（默认 true）与 `preferred_segment=local_seg`（需 mooncake.json 显式配 `preferred_segment:true`，默认 false）（`mooncake_backend.py:346-351`）；layerwise PutStart 同样传入（`mooncake_backend.py:376-383`）。chunk 1 写完落本机 segment → chunk 2+ 重读命中本机副本（副本选择 local-first，`replica_selection.h:122` `SelectBestReplica`，L149-151 本机内存副本优先）。不爆炸
-- **跨机**（副本在别的节点：他机写入的会话复用、P≠D、故障迁移）：**默认代码没有任何机制把读到的 KV 留在本机**——
+- **跨机**（副本在别的节点：他机写入的会话复用、P≠D、故障迁移）：**默认代码没有任何机制把读到的 KV 留在本机 DRAM**——
   - 读路径只把数据读进 HBM，不建本机 DRAM 副本；`BatchGetWhenPreferSameNode` 名字有"prefer"，实际只是按源 segment 聚合批量传输，不建副本（`client_service.cpp:1493`）
   - `skip_save`（`metadata.py:1150-1151`）保证加载过的前缀不回写本机
-  - chunked prefill 后续 chunk 逐层重读已提交前缀（适配文档 §3.3；代码类名 `LayerwiseSessionTracker`，`session_tracker.py:24`，文档中写作 `MooncakeSessionTracker`，同一物）；layerwise 模式即使本地 APC 命中也强制从池加载（`force_layerwise_load`，`pool_scheduler.py:726`）
-  - → 每个 chunk 的每层都远端 RDMA，性能爆炸。**跨机场景的本机落地就是本方案要补的空白**
+  - 同请求 chunked prefill 后续 chunk 逐层重读已提交前缀（适配文档 §3.3；`session_tracker.py:46-53` `commit_put_keys` 把本请求已提交的 key 加回未来加载集）——跨机时每个 chunk 每层都远端 RDMA
+  - → HBM APC 容量小且 LRU 可驱逐，DRAM 又不留副本 → 长预热窗口 / 大前缀场景每次使用都远端读。**跨机场景的本机 DRAM 落地就是方案 B 要补的空白**
   - 注意区分两个无关机制：master 侧 promotion-on-hit（`--promotion_on_hit`，默认 false，`master_config.h:202`）只把 **SSD-only** 对象在读命中后晋升回 DRAM（`master_service.cpp:395`），不管远端 DRAM→本机 DRAM；客户端 LocalHotCache 只挂在整对象读路径上，layerwise 的 range 读用不到（见 B1 节证伪）
 
-## 方案 A：非 layerwise → 预取进 HBM
+## 方案 A：预取请求 → 预取进 HBM（两种模式通用）
 
-机制链（全部已核实，上游 = `3rdparty/vllm`）：
+机制链（全部已核实，上游 = `3rdparty/vllm`；按非 layerwise 写，layerwise 变体见本节末）：
 
 1. 发预取请求。调度器 `get_num_new_matched_tokens` 查池命中（`pool_scheduler.py:624`）；全命中时少记 1 个 token——末 token 必重算（`pool_scheduler.py:703-704`）
 2. `load_async=true`（`kv_connector_extra_config`，**默认 false**，`pool_scheduler.py:107`；返回值 `self.load_async and not self.use_layerwise`，`pool_scheduler.py:747`）时请求进 `WAITING_FOR_REMOTE_KVS`（`scheduler.py:1267`）：
@@ -56,7 +62,13 @@ layerwise 目标介质必须是本机 DRAM 的依据——分两种场景，机�
 - 预取进 APC 后是标准前缀缓存：LRU、无 pin、压力下可驱逐 → 预取与使用的时间窗要短
 - 池命中即 `skip_save=True`（`metadata.py:1150-1151`），预取请求不回写池；对已存在的 key，Put 是静默 no-op（`client_service.cpp:1958-1961`，`OBJECT_ALREADY_EXISTS` 按成功返回）
 
-## 方案 B：layerwise → 预取进本机 DRAM
+layerwise 变体（同一预取请求形态，三点差异）：
+
+- 同步加载：`load_async` 强制 false（`pool_scheduler.py:747`），壳请求占 running 槽，逐层 range 读夹带在 prefill forward 中完成（每层计算前读该层）
+- 加载落点同样是壳请求的 HBM block（`pool_worker.py:2263`，目标 = `request.block_ids[block_index]`），`max_tokens=1` 结束后块同样入 APC
+- 真实请求本地全命中 → `start_block = end_block`（`pool_worker.py:2229`）→ 加载列表为空、零池读，直接复用 HBM
+
+## 方案 B：本机 DRAM 层 → 显式副本复制（两种模式通用）
 
 ### B1: LocalHotCache 读路径自动回填——**已证伪（layerwise 不适用）**
 
@@ -91,8 +103,8 @@ Mooncake 客户端有本地热缓存（`LocalHotCache`，`local_hot_cache.h`）�
 
 ## 决策
 
-- 预取统一定义为"把目标前缀的 KV 副本放到目标节点的目标介质"：非 layerwise = 方案 A（预取请求进 HBM/APC）；layerwise = 方案 B2（`create_copy_task` 建本机 DRAM 副本）
-- B1（LocalHotCache）已证伪：range 读绕过热缓存（证据链见 B1 节）
+- 预取 = 两层可叠加，两种模式皆有效：**HBM 层**（方案 A 预取请求进 HBM/APC，零额外通道、窗口短）+ **本机 DRAM 层**（方案 B2 `create_copy_task` 建本机副本，容量大、窗口长、需带外 API 调用）
+- B1（LocalHotCache）已证伪：layerwise range 读绕过热缓存；非 layerwise 有"HBM 目的缓冲区被主机 memcpy"风险（证据链见 B1 节）
 - 不加新的带外传输通道；不改池的放置策略；不做 pin（HBM APC 是 LRU；池副本受池级驱逐策略管理）
 - 代码改动总量：A 路径一个可选 patch（finish-at-promotion）；B2 零改动（预取器用现成 Python API）
 
@@ -100,8 +112,9 @@ Mooncake 客户端有本地热缓存（`LocalHotCache`，`local_hot_cache.h`）�
 
 落地前实测清单（按序）：
 
-1. A 路径端到端：预取请求 → 真实请求 APC 命中
-2. B2 端到端：`create_copy_task` → 本机副本 → layerwise get session 选中本机副本（用 `batch_get_replica_desc` + 读路径日志核验）
+1. A 路径端到端（非 layerwise）：预取请求 → 真实请求 APC 命中
+2. A 路径端到端（layerwise）：预取请求 → 真实请求本地全命中、加载列表为空（`start_block` 全覆盖，读路径日志核验零池读）
+3. B2 端到端：`create_copy_task` → 本机副本 → layerwise get session 选中本机副本（用 `batch_get_replica_desc` + 读路径日志核验）
 
 风险：
 
