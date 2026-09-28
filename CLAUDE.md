@@ -127,6 +127,7 @@ docs/
    - **Guided / structured decoding**(xgrammar 库边界、overlap/async 同步、spec+grammar) → `docs/research/vllm_vs_sglang/guided-decoding.md`
    - **Sampling 参数对照**(SGLang × vLLM;`n`≠beam;spec 兼容;penalty 空泡;状态归属与前缀共享) → `docs/research/vllm_vs_sglang/sampling-params.md`
    - **Scheduler→Worker 字段**(vLLM `SchedulerOutput` × SGLang `ScheduleBatch`/`ForwardBatch`、架构根因) → `docs/research/vllm_vs_sglang/scheduler-worker-interface.md`
+ - **Agent 场景 KV 对比**(session 停顿/分支/可编程 hint 四问题框架;KvHint 信封两侧落地状态) → `docs/research/vllm_vs_sglang/agent-kv-cache.md`
    - 跨实例复用 + 多存储后端 + 内容寻址 + 控制器元数据 + Rust 裸设备 I/O → `docs/research/lmcache/{overview,sharing-and-backends}.md`
    - RDMA 零拷贝传输 + 多 NIC 聚合 + 对象级 KV store + 分配策略 + HA → `docs/research/mooncake/{overview,transfer-engine,kv-store}.md`
    - **昇腾 KV 对象池**(MemCache):Meta/Local、HBM/DRAM/SSD、MemFabric OneCopy → `docs/research/memcache/{overview,architecture,pain-points}.md`（与 Mooncake store 同层对照；非 radix 控制面）
