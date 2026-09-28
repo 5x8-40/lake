@@ -23,6 +23,9 @@
 | 读路径 | 整对象 `batch_get_into_multi_buffers` 直读进 HBM block（`mooncake_backend.py:484` `MooncakeBackend.get`；`kv_transfer.py:1293`） | 每层计算前 range 读 `batch_get_into_multi_buffer_ranges` 进请求的 HBM block（`mooncake_backend.py:410` `batch_copy_get`；适配文档 §3.2） |
 | 异步加载 | `load_async=true` 时进 `WAITING_FOR_REMOTE_KVS`（**默认 false**） | 强制同步加载（`load_async` 返回值 `self.load_async and not self.use_layerwise`，`pool_scheduler.py:747`），逐层 range 读夹带在 prefill forward 里 |
 | 本地 APC 命中处理 | 调度器侧：APC 命中的 token 不进池加载 | worker 侧：加载起点 `start_block = vllm_cached_tokens // block_size`（`pool_worker.py:2229`；hybrid 路径 `mooncake_layerwise.py:345`），本地已缓存块不重读；本地全命中 → 加载列表为空 → **零池读** |
+| HBM 布局 | 标准全层 KV cache | **同左，全层**。block_key 显式不做物理层复用（`mooncake_layerwise.py:77-80` `extract_layout_config` 返回 None，docstring 原文 "Block-key transfer does not opt into GVA-backed physical reuse"）→ worker 不建共享 buffer、不做显存缩放（`worker.py:635-636`）；「逐层」只是**传输流水线**——layer 0 先提交前 `num_prefetch_layers`（默认 2）层的读，之后每算一层提交下一层（`pool_worker.py:2619`），读进请求自己的 block（`pool_worker.py:2263`）后驻留，供后续 chunk 与 decode 使用 |
+
+"逐层计算、加载下一层、卸载上一层"是 **gva 数据面 + 层复用**（`layerwise_num_shared_buffers` < 层数）的行为：物理 HBM 只持有 `num_shared_buffers` 个 staging buffer 轮转复用（`layerwise_cache_layout.py:173-183`），显存预算按比例放大（`worker.py:641-652`）。Mooncake block_key 路径没有这套机制——decode 每步需要全部层的 KV，HBM 不放全层则每个 token 都要从池重读全部层，显然不成立。
 
 两个"强制重读"机制容易被误判为"layerwise 本地命中无效"，对 Mooncake block_key 路径均不成立：
 
