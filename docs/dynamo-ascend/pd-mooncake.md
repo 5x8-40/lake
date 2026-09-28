@@ -18,7 +18,7 @@ Dynamo 的 `KvConnectorProtocol` 按 **`kv_transfer_params` 线格式**选型，
 
 **结构性耦合**：dynamo 协议表按连接器**名字字符串**匹配。上游每改名/新增一次（例如 NIXL 拆 Pull/Push），dynamo 侧就要补登记。
 
-**Ascend 注册面**：vllm-ascend `register_connector()` 约 11 个名字（含覆盖上游的 `MultiConnector` / `SimpleCPUOffloadConnector`）。dynamo 目前只显式认识 **`MooncakeConnectorV1`**。另有 `MooncakeLayerwiseConnector`（按层推，`do_remote_prefill` + metaserver）是**第三种线格式**，现有两个协议类都套不上；若要走 dynamo 需单写协议类。
+**Ascend 注册面**：vllm-ascend `register_connector()` 约 11 个名字（含覆盖上游的 `MultiConnector` / `SimpleCPUOffloadConnector`）。dynamo 目前只显式认识 **`MooncakeConnectorV1`**。另有 `MooncakeLayerwiseConnector`（按层推，`do_remote_prefill` + metaserver）是**第三种线格式**，现有两个协议类都套不上；若要走 dynamo 需单写协议类。它与 `AscendStoreConnector` 的池 layerwise 是两个机制，辨析见 [layerwise-taxonomy.md](layerwise-taxonomy.md)。
 
 ## MultiConnector：当前层级结构（并行，非分级）
 

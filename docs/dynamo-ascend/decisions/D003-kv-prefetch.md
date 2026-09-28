@@ -15,6 +15,8 @@
 
 ## 两种模式的分野
 
+> 「layerwise」在 vllm-ascend 0.26 里有三个同名机制（PD P2P 直推 / 池 block_key / 池 gva 层复用），本文只涉及 `AscendStoreConnector` 的池 layerwise。完整辨析（含 mermaid 图）见 [`../layerwise-taxonomy.md`](../layerwise-taxonomy.md)。
+
 `AscendStoreConnector` 两种用法，读路径与本地命中处理不同；**预取目标介质相同——HBM（APC）与本机 DRAM 两层皆有效**：
 
 | | 非 layerwise | layerwise（Mooncake block_key 数据面） |
