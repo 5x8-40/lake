@@ -27,6 +27,11 @@
 
 "逐层计算、加载下一层、卸载上一层"是 **gva 数据面 + 层复用**（`layerwise_num_shared_buffers` < 层数）的行为：物理 HBM 只持有 `num_shared_buffers` 个 staging buffer 轮转复用（`layerwise_cache_layout.py:173-183`），显存预算按比例放大（`worker.py:641-652`）。Mooncake block_key 路径没有这套机制——decode 每步需要全部层的 KV，HBM 不放全层则每个 token 都要从池重读全部层，显然不成立。
 
+官方文档锚点（两个"layerwise"同名不同物，都是 KV 卸载，区别在数据面）：
+
+- [分层与稀疏KV缓存卸载设计](https://docs.vllm.ai/projects/ascend/zh-cn/latest/developer_guide/Design_Documents/layerwise_and_sparse_kv_cache_offloading.html)：Prefill 卸载的 NPU 驻留数据 = "少量可复用的层缓冲区"（N 逻辑层 → I+min(B,R) 物理 buffer）——这是 **Memcache/gva** 设计。其 §8 明确："逐层共享缓冲区卸载需要 **Memcache 后端**和 eager 模式"、"逐层缓冲区重用**目前无法与 `MooncakeLayerwiseConnector` 结合使用**，因为它不提供逐缓冲区传输完成门"
+- [Mooncake 分层适配与优化](https://docs.vllm.ai/projects/ascend/zh-cn/latest/user_guide/feature_guide/mooncake_layerwise_adaptation_and_optimization.html)（即本文的"适配文档"）§3.2：加载落点是"将该层的范围加载到**本地 block**"；§2："分层传输改变了传输时机和范围"——没有 HBM 减量语义
+
 两个"强制重读"机制容易被误判为"layerwise 本地命中无效"，对 Mooncake block_key 路径均不成立：
 
 - `layerwise_offload=True` 时 worker 强制从 block 0 整前缀重读（`pool_worker.py:1795`）——但它只在 **gva 数据面 + 层复用布局**下被赋值（`pool_worker.py:224` `use_layerwise_transfer` 门控，L585/L601）；Mooncake block_key 路径恒为 False（L576 初始化后不变）。gva+层复用必须重读的原因：物理块是共享 staging buffer，APC "命中"的块并不真持有该前缀 KV；block_key 路径用标准完整 KV cache 布局，APC 命中 = 数据真在 HBM
