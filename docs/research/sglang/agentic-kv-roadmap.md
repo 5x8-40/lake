@@ -78,7 +78,10 @@
 
 **状态（2026-09-28）**：roadmap ☐；代码已落地（submodule present）：
 
-- 打标：`UnifiedSessionRefTracker` 按 `session_id` 给树节点挂 session 引用；带 generation 与 8192 条关闭 tombstone，防止 close/reopen 之后陈旧请求再挂引用。
+- 打标：`UnifiedSessionRefTracker` 按 `session_id` 给树节点挂 session 引用（`register_session_ref`，请求结束时调用）。
+- 防陈旧引用：会话关闭时属于它的请求可能还在跑，这些请求结束时会走正常路径把引用**重新挂回去**——等于刚释放的保护又被加上，KV 泄漏成永久软保护。引擎对此有两道防护（`session_ref_tracker.py`）：
+  - **generation**：同一 `session_id` 每次 open 分配一个递增编号，请求携带自己启动时的编号；请求结束时编号对不上（会话已关闭、或关闭后又重开了一代），就跳过挂引用并打 warning。
+  - **关闭 tombstone**：已关闭的 `session_id` 进黑名单，一律不再接受挂引用。黑名单是上限 8192 条的 LRU——超出后最老的记录被遗忘（拿有界内存换近似防护，极端迟到的请求仍可能挂上）；显式重新 open 会清掉对应墓碑，允许故意复用同一 id。
 - 驱逐：`unified_tree_core.py` 维护 session 分区，`session_ref>0` 的节点经 `_session_lru_predicate` 延后驱逐——软保护，不是硬 pin。
 - 入口：顶层 `GenerateReqInput.session_id`（与旧 `session_params` 互斥）；`/close_session` HTTP 端点释放会话引用。
 - 旧实现 `session_radix_cache.py` 已移除；仍不含 L3。
@@ -95,6 +98,8 @@
 
 - [#25760](https://github.com/sgl-project/sglang/issues/25760) SessionAware Router：bucket 分发 → `sticky→cache_aware→load` → 接 agent hint（Step 0–1 已勾；Step 2–5 未完）。  
 - [#27574](https://github.com/sgl-project/sglang/issues/27574) soft hint：`SHARE` / `PREFETCH` / `DEMOTE` / `PIN` / `RETAIN`；编排出策略，引擎可 clip/defer/reject；L3（Mooncake）作共享 retention。
+  - **PIN 与 RETAIN 不是一回事**，区别在「保证 vs 偏置」：PIN 是有界租约——TTL 内保证不驱逐，但不要求驻留 GPU，可只在冷层留副本；RETAIN 只是驱逐优先级偏置——压力来了比低优先级块后驱逐，零保证。
+  - 命名坑：POC 在 API 里把 PIN 叫作 "retention"（沿用 OpenAI `prompt_cache_retention` / Anthropic `cache_control` 的 provider 术语），机制上却是 L3 TTL 租约；RFC 自己点明了这点，读代码和文档时注意区分。
   - Pin POC 实测（MiniMax M2.7，H100，A/B 对比）：内存压力下共驱逐 24.18 GB / 95,232 个 key。之后两侧各发一个冷 Worker 探针请求恢复会话——未做 retain 的一侧前缀已丢，10,032 个 token 全部重算；做了 1 小时 retain 的一侧从 L3 恢复 10,016 个 token，只有 16 个 token 需要重算。
 - [#36224](https://github.com/sgl-project/sglang/issues/36224)（2026-08-24）把 hint 面定稿为**带版本信封**：
   - 信封结构：外层 `protocol_version` + `message_id`；内层每个 action 带 `action_id`（幂等键）、`action_type`（如 `kv.demote`）、`action_version`、`payload`。

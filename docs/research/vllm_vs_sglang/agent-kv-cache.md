@@ -65,11 +65,13 @@ hint 动词表（两社区共用一套 taxonomy——#51428 开篇声明「align
 
 | 动词 | 语义 |
 |------|------|
-| Pin | 有界 TTL 防普通驱逐；**不要求驻留 HBM**，可落在冷层实现 |
-| Retain | 驱逐优先级偏置（refcount 归零后不立即进候选），非租约保护 |
+| Pin | **有界保证**：TTL 内保证不被驱逐（超配额的 pin 引擎可裁剪/拒绝）；但**不要求驻留 HBM**——可只在冷层（如 L3）留副本，GPU/Host 副本照常可驱逐 |
+| Retain | **优先级偏置**：只改驱逐顺序，压力来了比低优先级块后驱逐；无任何保证 |
 | Prefetch | 访问到来前从 L2/L3 异步拉回热层 |
 | Demote | 不销毁，主动下沉一层（HBM→Host→SSD） |
 | Release / Deref | 允许回收销毁该前缀（SGLang 初始 action 名 `kv.deref`） |
+
+Pin 与 Retain 常被混为一谈，区别在「保证 vs 偏置」。命名上有个坑：SGLang 的 Pin POC 在 API 里叫 "retention"（沿用 OpenAI `prompt_cache_retention` / Anthropic `cache_control` 的 provider 术语），机制上却是 L3 TTL 租约——即 taxonomy 里的 Pin；#27574 自己点明了这一点。
 
 核心原则（#27574 原文）：「Engine keeps ownership of scheduling and memory and is free to clip, defer, or reject any hint」——**hint ≠ command**。
 
@@ -91,6 +93,7 @@ hint 动词表（两社区共用一套 taxonomy——#51428 开篇声明「align
 1. 文章标 #27574 / #51428「未落地 / RFC 阶段」——**信封 transport 2026-09 已双双合入 main**；未落地的是 action 执行语义与结果回报。
 2. 文章「vLLM 的 session 停顿方案还在演进」——结论不变（#37003 仍 open），但坐标与可见性已先行落地（`session_id` + 事件回显），缺的只剩 Retention 执行器。
 3. 文章称 UnifiedRadixCache「v0.5.19 起全模型默认（#35081）」——版本号未核实；代码事实是它是 `default_radix_cache_factory` 的默认 fall-through（radix 开启时），例外仅 ChunkCache（radix 关闭）/ PureSWA / LMCache / FlexKV 变体。
+4. 文章把 Pin 定义为「强制驻留 HBM、禁止 swap out、禁止驱逐」——与 RFC 不一致：#27574 / #51428 都明确 Pin 是**有界** TTL 且**不要求 HBM 驻留**（可在冷层实现）；文章的 Retain（refcount 归零后多留一段时间）介于两者之间。本文 §2 问题④的动词表以 RFC 定义为准。
 
 ## 4. 对 lake 的读数
 

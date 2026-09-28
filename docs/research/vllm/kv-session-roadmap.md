@@ -175,7 +175,7 @@ RFC 链到 llm-d 系列（Google Docs）：Agentic Northstar、KV-Cache Orchestr
 
 2026-08-07 的 RFC（karen-sy），把 #48501 的「指令」面收敛为**窄的 router 发起 hint 面**：orchestrator 表达策略意图，vLLM 对照真实缓存状态解析并执行，可 accept / clip / defer / reject / report-missing。设计原则与 SGLang #27574 逐条对齐（orchestrator 拥有策略、零开销默认、hint 软且有界、router 默认发起）。
 
-**Hint taxonomy**：`target × action × bounds` 三元组；action 五种——`Share | Prefetch | Demote | Pin | Retain`。Pin 有界 TTL、不要求 G1 驻留；Retain 只是驱逐优先级偏置（沿用 #37003）。
+**Hint taxonomy**：`target × action × bounds` 三元组；action 五种——`Share | Prefetch | Demote | Pin | Retain`。其中 Pin 与 Retain 的区别是「保证 vs 偏置」：Pin 是有界租约（TTL 内保证不驱逐，超配额可裁剪/拒绝；不要求 G1 驻留，可在 G2 实现）；Retain 只是驱逐优先级偏置（压力下后驱逐，零保证，沿用 #37003）。
 
 **三阶段**：
 
