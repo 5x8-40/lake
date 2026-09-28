@@ -76,7 +76,12 @@
 - session generation + 关闭 tombstone，防 close/reopen 后陈旧 in-flight 再挂引用。  
 - **不含 L3**。
 
-**状态（2026-09-28）**：roadmap ☐ · **submodule present**——`UnifiedRadixCache` 内建 session 支持：`UnifiedSessionRefTracker`（`register_session_ref` / `open_radix_session` / `ensure_session_generation` / `release_radix_session`，generation + 8192 条关闭 tombstone）；驱逐侧 `unified_tree_core.py` 维护 session 分区（`session_ref>0` 的节点经 `_session_lru_predicate` 延后驱逐，软保护非硬 pin）；`/close_session` HTTP 端点 present；顶层 `GenerateReqInput.session_id` present（与 `session_params` 互斥）。旧 `session_radix_cache.py` 已移除。不含 L3 不变。
+**状态（2026-09-28）**：roadmap ☐；代码已落地（submodule present）：
+
+- 打标：`UnifiedSessionRefTracker` 按 `session_id` 给树节点挂 session 引用；带 generation 与 8192 条关闭 tombstone，防止 close/reopen 之后陈旧请求再挂引用。
+- 驱逐：`unified_tree_core.py` 维护 session 分区，`session_ref>0` 的节点经 `_session_lru_predicate` 延后驱逐——软保护，不是硬 pin。
+- 入口：顶层 `GenerateReqInput.session_id`（与旧 `session_params` 互斥）；`/close_session` HTTP 端点释放会话引用。
+- 旧实现 `session_radix_cache.py` 已移除；仍不含 L3。
 
 **锚点**：`unified_cache/session_ref_tracker.py::UnifiedSessionRefTracker` · `unified_tree_core.py::_session_lru_predicate` · `http_server.py::close_session` · `--enable-session-radix-cache`。
 
@@ -89,11 +94,22 @@
 **方案**：
 
 - [#25760](https://github.com/sgl-project/sglang/issues/25760) SessionAware Router：bucket 分发 → `sticky→cache_aware→load` → 接 agent hint（Step 0–1 已勾；Step 2–5 未完）。  
-- [#27574](https://github.com/sgl-project/sglang/issues/27574) soft hint：`SHARE` / `PREFETCH` / `DEMOTE` / `PIN` / `RETAIN`；编排出策略，引擎可 clip/defer/reject；L3（Mooncake）作共享 retention。Pin POC 实测（MiniMax M2.7 H100 A/B）：压力下驱逐 24.18 GB / 95,232 keys，未 retain 探针重算 10,032 tokens，1 小时 retain 探针从 L3 恢复 10,016 tokens、只算 16。  
-- [#36224](https://github.com/sgl-project/sglang/issues/36224)（2026-08-24）把 hint 面定稿为**带版本信封**：`KvHints{protocol_version, message_id, actions:[{action_id, action_type, action_version, payload}]}`；初始 action `kv.deref` / `kv.demote` / `kv.prefetch`；`/server_info` 暴露能力位；handler 有界且 fail-open。  
+- [#27574](https://github.com/sgl-project/sglang/issues/27574) soft hint：`SHARE` / `PREFETCH` / `DEMOTE` / `PIN` / `RETAIN`；编排出策略，引擎可 clip/defer/reject；L3（Mooncake）作共享 retention。
+  - Pin POC 实测（MiniMax M2.7，H100，A/B 对比）：内存压力下共驱逐 24.18 GB / 95,232 个 key。之后两侧各发一个冷 Worker 探针请求恢复会话——未做 retain 的一侧前缀已丢，10,032 个 token 全部重算；做了 1 小时 retain 的一侧从 L3 恢复 10,016 个 token，只有 16 个 token 需要重算。
+- [#36224](https://github.com/sgl-project/sglang/issues/36224)（2026-08-24）把 hint 面定稿为**带版本信封**：
+  - 信封结构：外层 `protocol_version` + `message_id`；内层每个 action 带 `action_id`（幂等键）、`action_type`（如 `kv.demote`）、`action_version`、`payload`。
+  - 初始 action 三个：`kv.deref`（释放会话本地 KV）/ `kv.demote`（发布到存储后放开本地副本）/ `kv.prefetch`（请求级存储恢复，可低于常规 prefetch 阈值）。
+  - 配套：`/server_info` 暴露能力位；handler 有界且 fail-open——action 失败回退为普通缓存查找 + 重算，不影响正确性。
 - Phase：session 打标 → `KvHintEnvelope` → Pin→L3 lease POC → 再生产化 Prefetch/Demote。
 
-**状态（2026-09-28）**：roadmap ☐ · RFC open · submodule：**信封 transport present**——`managers/kv_hints.py::KvHintsEnvelope` / `KvHintAction` / `decode_kv_hints_envelope`（#38595/#38891 系），携带链 `GenerateReqInput.kv_hints`（入口校验 malformed 即拒）→ `tokenizer_manager` → scheduler `Req`；OpenAI 兼容端点协议**尚未**带 `kv_hints` 字段。**无 action handler**（`kv.deref/demote/prefetch` 均未实现）；Mooncake L3 retain（#30796 / Mooncake#2835 `retain_groups`）未合 main（`mooncake_store.py` 无 retain/lease 路径）。`agent_hints`（#24656）字段仍 absent。
+**状态（2026-09-28）**：roadmap ☐ · RFC open · 代码部分落地：
+
+- **已落地（transport）**：信封类型在 `managers/kv_hints.py`（`KvHintsEnvelope` / `KvHintAction` / `decode_kv_hints_envelope`，#38595/#38891 系）；携带链为 `GenerateReqInput.kv_hints`（入口校验，格式错误直接拒请求）→ `tokenizer_manager` → scheduler `Req`。
+- **未落地**：
+  - action handler——`kv.deref` / `kv.demote` / `kv.prefetch` 都没实现，信封传进引擎后无人消费；
+  - OpenAI 兼容端点——协议里还没有 `kv_hints` 字段，只能走原生 `/generate` 或 Python API；
+  - Mooncake L3 retain（#30796 / Mooncake#2835 `retain_groups`）——`mooncake_store.py` 无 retain/lease 路径；
+  - `agent_hints`（#24656）字段仍不存在。
 
 **对 lake**：原则同「gateway 可有意图、池/引擎执行」；lake 放置权威更硬（池放置·调度读视图），不靠 soft pin 撑全局共享。
 
@@ -376,7 +392,11 @@ Scheduler → UnifiedRadixCache（策略+IO+拥有 components）
 
 **方案**：见 [§2.2](#22-kv-orchestrator--prefetchdemotepin)；与 #24656 互补——前者偏 API 元数据进树，后者偏 Router soft hint + L3 retention。信封格式由 [#36224](https://github.com/sgl-project/sglang/issues/36224) 定稿（带版本、逐 action 独立版本、fail-open）。
 
-**状态（2026-09-28）**：roadmap ☐ · RFC open · submodule **partial**：信封 transport 已合 main（`managers/kv_hints.py`，携带到 scheduler `Req`）；action handler（`kv.deref`/`kv.demote`/`kv.prefetch`）、`/server_info` 能力位、Mooncake L3 retain 均未合。KVCR 作 HiCache L3 后端（#32903 / PR #36409）推进中，是未来 remote-fetch/share action 的执行底座。
+**状态（2026-09-28）**：roadmap ☐ · RFC open · 代码部分落地：
+
+- 已合 main：信封 transport（`managers/kv_hints.py`，携带到 scheduler `Req`）。
+- 未合：action handler（`kv.deref` / `kv.demote` / `kv.prefetch`）、`/server_info` 能力位、Mooncake L3 retain。
+- 推进中：KVCR 作 HiCache L3 后端（#32903 / PR #36409），是未来 remote-fetch / share action 的执行底座。
 
 ---
 

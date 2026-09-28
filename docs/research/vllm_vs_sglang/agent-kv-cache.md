@@ -32,15 +32,28 @@ Agent session = 多 turn + 工具调用停顿（秒到分钟级，不产生新 K
 
 ### 问题①：KV 在哪个 Worker
 
-- **SGLang**：引擎内 `UnifiedRadixCache` 是真实 KV 拓扑（`default_radix_cache_factory` 的 fall-through 默认路径）；router（`sgl-model-gateway`）的 `cache_aware` 策略按请求历史为每个 Worker 维护**近似 radix 树**，预测各 Worker 前缀命中率选点，负载严重不均时退回最短队列（`policies/cache_aware.rs`）。近似树 ≠ 真实树——prefix locality 被显式建模为路由策略的输入，而不是 router 直读真实树。
-- **vLLM**：引擎只承诺暴露 block 级事实流（KV Events：`BlockStored` / `BlockRemoved` + `parent_block_hash`）；prefix/session 视图由外部系统重建——Dynamo 的 KV Router 消费 KV events，其 KvIndexer 内部就是一棵 radix 树；llm-d 是 KVEvents → KV-Block Index → Prefix Index 两层架构。
+- **SGLang**：prefix locality 直接是路由输入。
+  - 引擎内：`UnifiedRadixCache` 是真实 KV 拓扑（`default_radix_cache_factory` 的默认 fall-through）。
+  - Router 侧（`sgl-model-gateway`）：`cache_aware` 策略按请求历史为每个 Worker 维护一棵**近似 radix 树**，据此预测各 Worker 的前缀命中率来选点；负载严重不均时退回最短队列（`policies/cache_aware.rs`）。
+  - 近似树 ≠ 真实树：router 不直读引擎状态，locality 是被显式建模的路由输入。
+- **vLLM**：引擎只暴露事实，视图在外部重建。
+  - 引擎承诺的只有 block 级事实流：KV Events（`BlockStored` / `BlockRemoved` + `parent_block_hash`）。
+  - prefix/session 视图由外部系统重建：Dynamo 的 KV Router 消费 KV events，其 KvIndexer 内部就是一棵 radix 树；llm-d 是 KVEvents → KV-Block Index → Prefix Index 两层架构。
 
 读数：**radix 拓扑对 prefix 管理不可避免**——vLLM 生态的控制面在外部重造了它。SGLang 更直接（locality → routing），vLLM 更分层（block state → event → index → routing），代价是最终一致性与重建带宽。
 
 ### 问题②：session 停顿
 
-- **SGLang（已落地）**：`--enable-session-radix-cache`。session 对前缀持 **Session Reference**——介于「请求锁（正在用，不可回收）」与「无引用（最先驱逐）」之间的**软保护**。实现：`UnifiedSessionRefTracker`（`register_session_ref` / `release_radix_session`，generation + 关闭 tombstone 防陈旧引用）+ 驱逐侧 session 分区（`session_ref>0` 节点经 `_session_lru_predicate` 延后驱逐）+ `/close_session` HTTP 端点。叠加 HiCache 形成 session → 引用 → 驱逐优先级 → 驻留层（GPU/Host/L3）的完整链条。**soft protection ≠ pin**：内存极端不足时 referenced 仍后被驱逐。
-- **vLLM（未落地）**：#37003 Retention API——token 区间指令 `RetentionDirective{start, end, priority 0-100, duration}` + 两结构 evictor（现有 LRU 队列不动，带优先级的块进 min-heap，lazy TTL 过期）+ `retention_scope`（任意 scope 可升优先级，仅属主可降/清）。issue 自称有工作实现，截至快照未合 main。
+- **SGLang（已落地）**：`--enable-session-radix-cache`，session 对前缀持 **Session Reference**——介于「请求锁（正在用，不可回收）」与「无引用（最先驱逐）」之间的**软保护**。
+  - 打标：`UnifiedSessionRefTracker`（generation + 关闭 tombstone，防 close/reopen 后陈旧请求再挂引用）。
+  - 驱逐：`session_ref>0` 的节点经 `_session_lru_predicate` 延后驱逐；内存极端不足时仍可驱逐——soft protection ≠ pin。
+  - 入口：`/close_session` HTTP 端点释放会话引用。
+  - 叠加 HiCache 后形成完整链条：session → 引用 → 驱逐优先级 → 驻留层（GPU/Host/L3）。
+- **vLLM（未落地）**：#37003 Retention API。
+  - 指令形态：token 区间 `RetentionDirective{start, end, priority 0-100, duration}`，请求可携带多条。
+  - 实现形态：两结构 evictor——现有 LRU 队列不动，带优先级的块进 min-heap，TTL 惰性过期。
+  - 多租户：`retention_scope`——任意 scope 可升优先级，仅属主 scope 可降/清。
+  - 状态：issue 自称有工作实现，截至快照未合 main。
 
 ### 问题③：branch
 
@@ -62,11 +75,16 @@ hint 动词表（两社区共用一套 taxonomy——#51428 开篇声明「align
 
 **落地状态（2026-09-28 核实）**：
 
-| 面 | vLLM | SGLang |
-|----|------|--------|
-| 信封 transport | **已合 main**：`v1/kv_hints/protocol.py`（`KvHintsEnvelope` / `KvHintAction`，#53421 系）；经 Python 引擎 API（`LLMEngine` / `AsyncLLM.generate` kwargs）携带，OpenAI HTTP 未接 | **已合 main**：`managers/kv_hints.py`（#36224 定稿的同构格式 + 入口校验）；`GenerateReqInput.kv_hints` 携带到 scheduler `Req`，OpenAI 端点未接 |
-| action 执行器 | 无；唯一消费者是 KVCR tier（`on_new_request` → `submit_hint`） | 无；`kv.deref` / `kv.demote` / `kv.prefetch` 均未实现 |
-| 配套坐标 | `session_id`（#48048）+ `BlockStored.session_id` 回显 + `kv_cache_report_mode` 已落地；Retention（#37003）未合 | session radix（问题②）已落地；Mooncake L3 retain（#30796 / Mooncake#2835）未合 |
+- **vLLM**：
+  - 信封 transport 已合 main：`v1/kv_hints/protocol.py`（`KvHintsEnvelope` / `KvHintAction`，#53421 系）。
+  - 入口：只走 Python 引擎 API（`LLMEngine` / `AsyncLLM.generate` kwargs）；OpenAI HTTP 未接。
+  - 消费方：引擎自身不消费任何 action；唯一消费者是 KVCR tier（`on_new_request` → `submit_hint`）。
+  - 配套坐标：`session_id`（#48048）、`BlockStored.session_id` 回显、`kv_cache_report_mode` 已落地；Retention（#37003）未合。
+- **SGLang**：
+  - 信封 transport 已合 main：`managers/kv_hints.py`（#36224 定稿的同构格式 + 入口校验）。
+  - 入口：`GenerateReqInput.kv_hints` 携带到 scheduler `Req`；OpenAI 端点未接。
+  - 消费方：`kv.deref` / `kv.demote` / `kv.prefetch` 三个 action handler 均未实现。
+  - 配套：session radix（问题②）已落地；Mooncake L3 retain（#30796 / Mooncake#2835）未合。
 
 ## 3. 与文章的差异（时效性纠正）
 

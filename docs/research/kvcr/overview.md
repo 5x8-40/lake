@@ -207,11 +207,16 @@ hint 是 router 把全局 KV 知识按请求捎给数据面的元数据约定。
 
 | RFC | 状态 |
 |-----|------|
-| [dynamo#13134](https://github.com/ai-dynamo/dynamo/pull/13134) typed KV hint contract | open;review 中格式大改——从扁平的 4 字段 JSON 改为带版本号的信封格式(外层 `protocol_version`,内部每个动作带 `action_type`/`action_version`) |
-| [vllm#53421](https://github.com/vllm-project/vllm/issues/53421) KV Hint Envelope | **transport 已合 vLLM main**:`v1/kv_hints/protocol.py`(`KvHintsEnvelope`/`KvHintAction`,与 KVCR 信封同构),请求链全程携带;KVCR 后端适配([#53624](https://github.com/vllm-project/vllm/pull/53624))亦已落地(`v1/kv_offload/tiering/kvcr/manager.py`,`on_new_request`→`submit_hint`);引擎自身 action handler 未合 |
-| [sglang#36224](https://github.com/sgl-project/sglang/issues/36224) KV Hint Envelope | **transport 已合 SGLang main**:`managers/kv_hints.py`(同构信封 + 入口校验),携带到 scheduler `Req`(#38595/#38891 系);`kv.deref/demote/prefetch` action handler 未合 |
+| [dynamo#13134](https://github.com/ai-dynamo/dynamo/pull/13134) typed KV hint contract | open;review 中格式大改——从扁平的 4 字段 JSON 改为带版本号的信封格式 |
+| [vllm#53421](https://github.com/vllm-project/vllm/issues/53421) KV Hint Envelope | **transport 已合 vLLM main**(细节见下) |
+| [sglang#36224](https://github.com/sgl-project/sglang/issues/36224) KV Hint Envelope | **transport 已合 SGLang main**(细节见下) |
 | [TRT-LLM#18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151) router hint P2P | open,零评论 |
 | [kvcr#18](https://github.com/ai-dynamo/kvcr/pull/18) 解析器适配新版信封格式(取第一个 `kv.fetch` 取数动作) | open,与 dynamo#13134 需同步合并;版本不匹配只告警不拒绝 |
+
+两家引擎落地的细节:
+
+- **vLLM**:`v1/kv_hints/protocol.py` 定义信封结构体(`KvHintsEnvelope`/`KvHintAction`,与 KVCR 信封同构),请求链全程携带。KVCR 后端适配([#53624](https://github.com/vllm-project/vllm/pull/53624))也已落地:`v1/kv_offload/tiering/kvcr/manager.py` 在请求到达时把信封 `submit_hint` 给 KVCR 库。引擎自身的 action handler 未合。
+- **SGLang**:`managers/kv_hints.py` 定义同构信封 + 入口校验,携带到 scheduler `Req`(#38595/#38891 系);`kv.deref`/`kv.demote`/`kv.prefetch` 三个 action handler 未合。
 
 即:信封**外层格式**(版本化 envelope + 逐 action 版本)已成事实标准——vLLM/SGLang 合入的结构体与 KVCR 信封逐字段同构;但**action 语义层**各家都还没接(`kv.fetch` 只有 KVCR 自己消费),跨引擎对接前仍需核对当时支持的 action 集。
 
