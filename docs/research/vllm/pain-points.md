@@ -110,8 +110,9 @@ hybrid KV cache config(full + SWA + Mamba 多 group)是 bug 重灾区:
 | Issue | 缺口 |
 |-------|------|
 | [#48501](https://github.com/vllm-project/vllm/issues/48501) | 引擎只有 hash+refcount,无 session/lineage;router 想 evict 已退出 subagent 的 KV、prefetch 即将回来的 KV,引擎猜不到 |
+| [#51428](https://github.com/vllm-project/vllm/issues/51428) | KvHint 面:Share/Prefetch/Demote/Pin/Retain 软 hint + `SessionPrefixIndex`;2026-09 信封 transport 已合 main(`v1/kv_hints/protocol.py`),action 执行语义未合 |
 | [#45036](https://github.com/vllm-project/vllm/issues/45036) | KV Events 传播给编排层做 cache-aware 路由(进行中) |
-| #48168 roadmap | agent hint(Session-ID/Correlation-ID)+ 选择性 offload/驱逐/预取指令 |
+| #48168 roadmap | agent hint(Session-ID/Correlation-ID)+ 选择性 offload/驱逐/预取指令;`session_id`(#48048)与 `BlockStored.session_id` 回显已落地 |
 
 评论共识(SGLang [#27574](https://github.com/sgl-project/sglang/issues/27574) 同向):subagent 跑数分钟时 main-agent KV 被慢慢驱逐,需**显式 evict + 回来时 prefetch**——智能放编排层,引擎只执行。
 
@@ -124,7 +125,7 @@ hybrid KV cache config(full + SWA + Mamba 多 group)是 bug 重灾区:
 1. KV/调度/元数据仍 **per-instance**(`kv_offload` 跑在引擎 Scheduler 进程内,tier 私有);无集群权威池(#48168 在重设计)。
 2. 多层 offload 是**单实例内级联**(GPU↔CPU↔NVMe/Obj 同机),非跨节点池。
 3. **无 radix**——APC hash 顺序匹配 + `OffloadKey` 平铺键,断链即停。
-4. **无集群位置视图/本地命中**——KV Events `medium` 仅单实例介质标记;`session_id`/`continuation_id` 是 RFC(#48501)。
+4. **无集群位置视图/本地命中**——KV Events `medium` 仅单实例介质标记;`session_id` 已落地(含 `BlockStored` 回显),`continuation_id` 仍是 RFC(#48501)。
 5. HBM **引擎自分配**(offload/connector 只借传输)——池放置·调度读视图"池管 HBM 放置"无对应。
 6. MLA/混合 attention 的 per-layer 连续性要求与 connector cross-layer 传输冲突(#45997)。
 

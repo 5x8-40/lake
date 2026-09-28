@@ -95,7 +95,7 @@ PD 总路线 [#21703](https://github.com/sgl-project/sglang/issues/21703) 另缺
 
 | Issue | 缺口 |
 |-------|------|
-| [#27574](https://github.com/sgl-project/sglang/issues/27574) | Router 知道 tool gap / subagent 生命周期;引擎只有 hash+refcount。缺 Pin/Prefetch/Demote/Share 等软 hint |
+| [#27574](https://github.com/sgl-project/sglang/issues/27574) | Router 知道 tool gap / subagent 生命周期;引擎只有 hash+refcount。缺 Pin/Prefetch/Demote/Share 等软 hint（2026-09：信封 transport 已合 main，见 [#36224](https://github.com/sgl-project/sglang/issues/36224)；action 执行器未合） |
 | [#24656](https://github.com/sgl-project/sglang/issues/24656) | Phase 1 仅 `agent_hints` 元数据与驱逐原型;不解决跨进程协调、HiCache 继承、生产打分 |
 | [#29099](https://github.com/sgl-project/sglang/issues/29099) | `StreamingSession` 把 KV 钉在 slot,空闲会话可饿死新请求;session 级抢占与「跨 session 前缀共享」互斥 |
 
@@ -178,8 +178,8 @@ PD 总路线 [#21703](https://github.com/sgl-project/sglang/issues/21703) 另缺
 **(c) 真·分布式共享池 + 全局元数据(RFC / 跨仓)**:
 
 - [#31458](https://github.com/sgl-project/sglang/issues/31458) **KV Indexer**(见 1.2):独立 Rust 服务维护 `hash→worker→tier`,旁路、最终一致。
-- [#27574](https://github.com/sgl-project/sglang/issues/27574) Programmatic KV(agentic):跨请求/跨实例显式 KV 管理的需求源头。
-- [#30796](https://github.com/sgl-project/sglang/pull/30796) `kv_hints` 保留整 prompt KV 到 **Mooncake 共享 L3**(配套 Dynamo #11534 + Mooncake #2835)。
+- [#27574](https://github.com/sgl-project/sglang/issues/27574) Programmatic KV(agentic):跨请求/跨实例显式 KV 管理的需求源头;[#36224](https://github.com/sgl-project/sglang/issues/36224) 把 hint 定稿为带版本信封,transport 已合 main(`managers/kv_hints.py`)。
+- [#30796](https://github.com/sgl-project/sglang/pull/30796) `kv_hints` 保留整 prompt KV 到 **Mooncake 共享 L3**(配套 Dynamo #11534 + Mooncake #2835);2026-09-28 核实未合 main(`mooncake_store.py` 无 retain/lease 路径)。
 - Mooncake `Group Semantics`([kvcache-ai/Mooncake#1887](https://github.com/kvcache-ai/Mooncake/issues/1887)):把 L2/L3 做成共享对象池的分组可见性/驱逐语义。
 
 **对 lake 的读数**:进展不对称——**同机去重**已正面解决;**跨机共享 L1/L2** 上游选择不做(用直传+路由绕);**全局强一致 KV 目录** SGLang 自身仍缺(靠旁路 Indexer + Mooncake 外部 store)。这正是 lake"存储池统一编址 L0–L3 + 控制面强一致位置视图"想补的空白(见第 4 节)。

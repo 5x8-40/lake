@@ -161,7 +161,7 @@ flowchart TB
 |------|-----------|----------|
 | **L3 删除可观测** | [#29709](https://github.com/sgl-project/sglang/issues/29709) KV Events for L3 | 现状 L3 evict 引擎无感。Phase 1 backup ack 发 `BlockStored(EXTERNAL)`;Phase 3 后端 TTL/eviction 反发 `BlockRemoved(EXTERNAL)`,router 才能清陈旧条目。**把"彻底放弃"变成事件** |
 | **调度器感知 + 可插拔驱逐** | [#27898](https://github.com/sgl-project/sglang/issues/27898) MORI-UMBP | 现状后端是 passive byte store、驱逐硬编码 LRU。目标:master 维护全 tier 位置 + 访问历史 + **depth-aware eviction**,offload/load/eviction/replication 做成**可插拔策略接口** |
-| **编排层显式控制释放** | [#27574](https://github.com/sgl-project/sglang/issues/27574) Programmatic KV | 现状释放全靠被动 LRU。目标:router 主动下 **Pin/Prefetch/Demote/Evict** hint——subagent 退出即显式 evict main-agent KV,不等被动驱逐 |
+| **编排层显式控制释放** | [#27574](https://github.com/sgl-project/sglang/issues/27574) Programmatic KV | 现状释放全靠被动 LRU。目标:router 主动下 **Pin/Prefetch/Demote/Evict** hint——subagent 退出即显式 evict main-agent KV,不等被动驱逐。2026-09 进展:带版本信封 transport 已合 main([#36224](https://github.com/sgl-project/sglang/issues/36224),`managers/kv_hints.py`),`kv.deref` 等 action handler 未合 |
 | **session 级抢占释放** | [#29099](https://github.com/sgl-project/sglang/issues/29099) | 现状 `StreamingSession` 把 KV 钉死、空闲会话饿死新请求。目标:内存压力下 **soft-evict 空闲 session KV**(可插拔启发式),下轮重算 |
 | **驱逐扫描提速** | [#24072](https://github.com/sgl-project/sglang/issues/24072) | UnifiedRadix LRU 从 O(M×K) restart 扫描改 O(1) 游标续扫 |
 | **SWA tombstone(部分放弃)** | UnifiedRadix([#26577](https://github.com/sgl-project/sglang/issues/26577)) | 混合模型里 SWA 分量**独立于 FULL** 被驱逐(tombstone/hole),FULL KV 保留、prefix 仍可命中——即"部分放弃"一个 block |

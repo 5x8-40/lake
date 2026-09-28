@@ -203,17 +203,17 @@ hint 是 router 把全局 KV 知识按请求捎给数据面的元数据约定。
 - **请求级生命周期**:`submit_hint(hints, request_id)` 注册,`discard_hint` 丢弃;源地址信息只活在请求作用域内,不进入任何全局状态——KVCR 侧因此永远不需要维护其他节点的库存。
 - **可扩展**:解析器注释说明"其他字段待 KVCR 消费时再加"——先把外层格式定下来,字段逐步增加。
 
-**标准化状态(2026-09-04 核实):未达成一致,是 NVIDIA 单方推动的早期提案。** Dynamo 团队在同一周(08-12 ~ 08-24)向四个社区同时发出 RFC,目前无一被接受:
+**标准化状态(2026-09-28 核实):带版本信封格式已被 vLLM / SGLang 接受并合入各自 main,TRT-LLM 仍无响应。** Dynamo 团队在 08-12 ~ 08-24 向四个社区同时发出 RFC,一个月内两家引擎落地:
 
 | RFC | 状态 |
 |-----|------|
 | [dynamo#13134](https://github.com/ai-dynamo/dynamo/pull/13134) typed KV hint contract | open;review 中格式大改——从扁平的 4 字段 JSON 改为带版本号的信封格式(外层 `protocol_version`,内部每个动作带 `action_type`/`action_version`) |
-| [vllm#53421](https://github.com/vllm-project/vllm/issues/53421) KV Hint Envelope | open,零评论 |
-| [sglang#36224](https://github.com/sgl-project/sglang/issues/36224) KV Hint Envelope | open,零评论 |
+| [vllm#53421](https://github.com/vllm-project/vllm/issues/53421) KV Hint Envelope | **transport 已合 vLLM main**:`v1/kv_hints/protocol.py`(`KvHintsEnvelope`/`KvHintAction`,与 KVCR 信封同构),请求链全程携带;KVCR 后端适配([#53624](https://github.com/vllm-project/vllm/pull/53624))亦已落地(`v1/kv_offload/tiering/kvcr/manager.py`,`on_new_request`→`submit_hint`);引擎自身 action handler 未合 |
+| [sglang#36224](https://github.com/sgl-project/sglang/issues/36224) KV Hint Envelope | **transport 已合 SGLang main**:`managers/kv_hints.py`(同构信封 + 入口校验),携带到 scheduler `Req`(#38595/#38891 系);`kv.deref/demote/prefetch` action handler 未合 |
 | [TRT-LLM#18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151) router hint P2P | open,零评论 |
 | [kvcr#18](https://github.com/ai-dynamo/kvcr/pull/18) 解析器适配新版信封格式(取第一个 `kv.fetch` 取数动作) | open,与 dynamo#13134 需同步合并;版本不匹配只告警不拒绝 |
 
-即:外部社区尚无响应,格式本身还在演化(扁平 → 带版本的信封),短期内以 Dynamo/KVCR 自家实现为准,对接其他引擎前需重新核对当时格式。
+即:信封**外层格式**(版本化 envelope + 逐 action 版本)已成事实标准——vLLM/SGLang 合入的结构体与 KVCR 信封逐字段同构;但**action 语义层**各家都还没接(`kv.fetch` 只有 KVCR 自己消费),跨引擎对接前仍需核对当时支持的 action 集。
 
 ### router 负载与扩展性
 
@@ -290,7 +290,7 @@ KVCR 把"收不收、放哪层、驱逐谁、驱逐时怎么处置"全部抽象�
 | 2026-08-21 / 08-24 | KVCR 仓初始化 / 在 DEP #11673 公开 |
 | 2026-08-27 | [dynamo#12993](https://github.com/ai-dynamo/dynamo/pull/12993) 文档将 KVBM 从 offload 推荐后端撤下 |
 | 2026-09-03 | [kvcr#16](https://github.com/ai-dynamo/kvcr/pull/16) NIXL 后端按路径可配;[kvcr#17](https://github.com/ai-dynamo/kvcr/pull/17) Guard 多池改造(认领协议改为按 Guard 索引,不兼容变更) |
-| 并行 | 生态对接(以下 RFC 截至 2026-09-04 均 open,外部社区尚无响应,详见「hint 协议」节):TRT-LLM [#18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151)(router hint 点对点传输)、vLLM [#53421](https://github.com/vllm-project/vllm/issues/53421)(hint 信封格式)与 [#53624](https://github.com/vllm-project/vllm/pull/53624)(KVCR 后端适配)、SGLang [#36224](https://github.com/sgl-project/sglang/issues/36224)(hint)与 [#32903](https://github.com/sgl-project/sglang/issues/32903)(KVCR 作 HiCache 后端)、Dynamo router [#13134](https://github.com/ai-dynamo/dynamo/pull/13134)(hint 契约) |
+| 并行 | 生态对接(详见「hint 协议」节):TRT-LLM [#18151](https://github.com/NVIDIA/TensorRT-LLM/issues/18151)(router hint 点对点传输,仍 open 零评论)、vLLM [#53421](https://github.com/vllm-project/vllm/issues/53421)(hint 信封,**2026-09 已合 main**)与 [#53624](https://github.com/vllm-project/vllm/pull/53624)(KVCR 后端适配,已落地 `kv_offload/tiering/kvcr/`)、SGLang [#36224](https://github.com/sgl-project/sglang/issues/36224)(hint 信封,**transport 已合 main**)与 [#32903](https://github.com/sgl-project/sglang/issues/32903)(KVCR 作 HiCache 后端,PR #36409 推进中)、Dynamo router [#13134](https://github.com/ai-dynamo/dynamo/pull/13134)(hint 契约) |
 
 外部贡献者曾给 KVBM 提交点对点传输实现([#7879](https://github.com/ai-dynamo/dynamo/pull/7879),g2pb global peer offloading,draft),因官方转向 KVCR 而搁置。
 
