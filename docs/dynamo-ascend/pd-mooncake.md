@@ -73,15 +73,16 @@ curl -s localhost:8000/v1/chat/completions -H 'Content-Type: application/json' \
 ## 如何核实 KV-aware router
 
 1. FE 启动参数含 `--router-mode kv`（脚本默认；聚合 `start.sh` 已对齐）。
-2. Worker 带 `--kv-events-config`（ZMQ）与 `DYN_SYSTEM_PORT`。
+2. Worker 带 `--kv-events-config`（ZMQ）与 `DYN_SYSTEM_PORT`。**关键坑**：vLLM 的 `enable_kv_cache_events` 默认 `False`，不显式写 `true` 事件一律不发；publisher 在 engine 初始化后才装配，模型加载期间 grep 不到属正常。
 3. 探针：
    ```bash
-   # FE：路由/组件指标
+   # FE：router_kv_zmq_ingress_sources>0（已订阅事件源）、
+   #     router_kv_zmq_ingress_batches_total 持续增长（事件在流）
    curl -s localhost:8000/metrics | grep -E 'router_kv_|dynamo_component_kv_cache' || true
-   # Prefill / 聚合 worker system port（PD 默认 8782；agg 默认 8782）
+   # worker（PD 8782/8783，agg 8782）：kv_publisher_*
    curl -s localhost:8782/metrics | grep kv_publisher || true
    ```
-4. 发几条**共享前缀**的 chat 后，再看上述指标是否增长；也可用 `ROUTER_MODE=round-robin` 对照。
+4. 发几条**共享前缀**（≥16 token）的 chat 后看指标增长（`router_kv_hit_rate` 非零）；也可用 `ROUTER_MODE=round-robin` 对照。
 
 ## 如何核实 KV 卸载
 
