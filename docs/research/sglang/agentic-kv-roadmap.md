@@ -78,6 +78,34 @@
 
 **状态（2026-09-28）**：roadmap ☐；代码已落地（submodule present）：
 
+**session_id 与树的配合结构**：
+
+```mermaid
+flowchart TB
+    subgraph IDX["session 索引（UnifiedSessionRefTracker）"]
+        S1["S1 → frontier {C}，generation 3"]
+        S2["S2 → frontier {D}，generation 1"]
+    end
+    subgraph TREE["UnifiedRadixCache（token 前缀树）"]
+        R["ROOT"] --> A["系统 prompt 节点<br/>session_ref=2"]
+        A --> B["turn1 节点<br/>session_ref=2"]
+        B --> C["S1 turn2 节点<br/>session_ids={S1}"]
+        B --> D["S2 turn2 节点<br/>session_ids={S2}"]
+    end
+    S1 -.锚定.-> C
+    S2 -.锚定.-> D
+```
+
+配合规则（`unified_cache/components/base.py`）：
+
+- **frontier 制**：session 不标记路径上每个节点，只锚定 frontier leaf；路径节点的 `session_ref` 计数由 coverage 推进维护。同一 session 的下一 turn 把 frontier 从旧祖先**前移**到新 leaf（`_advance_session_coverage`），旧祖先摘标记——标记不随 turn 数膨胀。
+- **共享即计数**：两个 session 共享的祖先路径各计一份 `session_ref`，各自的 frontier 挂在各自分支上——branch 场景天然成立。
+- **驱逐分区**：每个 component 的 LRU 链表以 `mid` 节点分两段——`[head..mid)` 是 `session_ref>0` 的软保护区，`(mid..tail]` 是无引用区；驱逐从 tail 往 head 扫，无引用的先走。
+- **被驱逐也保 frontier**：session 锚定的 leaf 若在压力下仍被驱逐，coverage 回退到最近的可复用祖先（`_recede_session_coverage`），session 标记不丢。
+- **close**：`release_session` 摘掉该 session 全部 frontier 的 coverage，节点回到无引用区。
+
+落地清单：
+
 - 打标：`UnifiedSessionRefTracker` 按 `session_id` 给树节点挂 session 引用（`register_session_ref`，请求结束时调用）。
 - 防陈旧引用：会话关闭时属于它的请求可能还在跑，这些请求结束时会走正常路径把引用**重新挂回去**——等于刚释放的保护又被加上，KV 泄漏成永久软保护。引擎对此有两道防护（`session_ref_tracker.py`）：
   - **generation**：同一 `session_id` 每次 open 分配一个递增编号，请求携带自己启动时的编号；请求结束时编号对不上（会话已关闭、或关闭后又重开了一代），就跳过挂引用并打 warning。

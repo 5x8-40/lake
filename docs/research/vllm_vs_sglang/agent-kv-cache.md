@@ -41,6 +41,12 @@ Agent session = 多 turn + 工具调用停顿（秒到分钟级，不产生新 K
   - 引擎内：`UnifiedRadixCache` 是真实 KV 拓扑，也是 radix 开启时的默认实现（`default_radix_cache_factory` 的 fall-through；例外只有 ChunkCache（radix 关闭）、纯 SWA、LMCache/FlexKV 变体）。
   - Router 侧（`sgl-model-gateway`）：`cache_aware` 策略按「自己路由过的请求历史」为每个 Worker 维护一棵近似 radix 树（`policies/tree.rs::Tree`），据此预测各 Worker 的前缀命中率选点；负载严重不均时退回最短队列。
   - 引擎**也有** KV 事件流：与 vLLM 同款三件套 `BlockStored` / `BlockRemoved` / `AllBlocksCleared`，从 mem_cache 层产生（`mem_cache/events.py`），经 ZMQ PUB 发布（`SchedulerKvEventsPublisher`），`/server_info` 可发现。但自家 gateway **不消费**它——事件是给外部 indexer（如 #31458 KV Indexer）准备的。
+  - 事件更精确，gateway 为什么不用？前两条是事实，后三条是工程分析：
+    - 历史顺序：`cache_aware` 近似树是先有的设计，KV events 后加（随 PD / 外部 indexer 需求），gateway 一直没有切换。
+    - 同步性：路由是毫秒级决策，router 自己路由过的历史在决策瞬间同步可见；事件流是异步的，刚路由出去的请求对应的 `BlockStored` 还没到达。
+    - 运维面：订阅 N 个 worker 的事件流要处理重连、乱序、缺口、worker 上下线；请求历史零依赖。
+    - 误差结构可控：近似树对「我路由过的」是准的，看不见的是引擎内驱逐（树内用时间戳堆做老化近似）和别的 router 副本路由的请求；而路由只需要「哪个 Worker 最可能命中」的相对排序——视图不准的代价是命中率次优，不是正确性。
+    - 事件路线并未被否定：#31458 KV Indexer 就是事件流方案；AIBrix 也存在本地表与 ZMQ 事件同步双路线并存。
 - **vLLM**：引擎只暴露事实，路由视图在外部重建。
   - 引擎承诺的只有 block 级事实流：KV Events（`BlockStored` / `BlockRemoved` + `parent_block_hash`）。
   - prefix/session 视图由外部系统重建：Dynamo 的 KV Router 消费 KV events，其 KvIndexer 内部就是一棵 radix 树；llm-d 是 KVEvents → KV-Block Index → Prefix Index 两层架构。
@@ -49,8 +55,8 @@ Agent session = 多 turn + 工具调用停顿（秒到分钟级，不产生新 K
 
 ### 问题②：session 停顿
 
-- **SGLang（已落地）**：`--enable-session-radix-cache`，session 对前缀持 **Session Reference**——介于「请求锁（正在用，不可回收）」与「无引用（最先驱逐）」之间的**软保护**。
-  - 打标：`UnifiedSessionRefTracker` 按 `session_id` 给树节点挂引用；会话关闭后仍在跑的请求结束时可能把引用重新挂回（保护泄漏），引擎用 generation 编号 + 关闭黑名单挡住（机制细节见 [../sglang/agentic-kv-roadmap.md](../sglang/agentic-kv-roadmap.md) §2.1）。
+- **SGLang（已落地）**：`--enable-session-radix-cache`，session 对前缀持 **Session Reference**——介于「请求锁（正在用，不可回收）」与「无引用（最先驱逐）」之间的**软保护**。结构图与配合规则（frontier 制、coverage 前移、驱逐分区）见 [../sglang/agentic-kv-roadmap.md](../sglang/agentic-kv-roadmap.md) §2.1。
+  - 打标：`UnifiedSessionRefTracker` 按 `session_id` 锚定 frontier leaf，路径节点计 `session_ref`；会话关闭后仍在跑的请求结束时可能把引用重新挂回（保护泄漏），引擎用 generation 编号 + 关闭黑名单挡住。
   - 驱逐：`session_ref>0` 的节点经 `_session_lru_predicate` 延后驱逐；内存极端不足时仍可驱逐——soft protection ≠ pin。
   - 入口：`/close_session` HTTP 端点释放会话引用。
   - 叠加 HiCache 后形成完整链条：session → 引用 → 驱逐优先级 → 驻留层（GPU/Host/L3）。
