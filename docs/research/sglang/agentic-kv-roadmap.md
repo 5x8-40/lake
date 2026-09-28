@@ -80,29 +80,46 @@
 
 **session_id 与树的配合结构**：
 
+先定义图里出现的每个字段（全部对应代码符号）：
+
+- **树节点**：每个节点带一份 per-component `component_data`，其中两个 session 字段（`components/base.py`）：
+  - `session_ref: int`——有多少个 session 的 coverage 路径经过本节点；
+  - `session_ids: set`——只在 frontier 节点上非空：锚定在本节点的是哪些 session。
+- **component 侧索引** `_session_leaves: dict[str, set[节点]]`——`session_id → 该 session 的 frontier 节点集合`。注意值是**集合**不是单点：一个 session 可以在多条分支上各有一个 frontier（见下「branch 即多 frontier」）。
+- **tracker**（`UnifiedSessionRefTracker`）只管两件事，**不存 frontier 指针**：
+  - `_session_generations: dict[str, int]`——每个 id 当前是第几代（每次 open 分配递增编号）；
+  - `_closed_session_ids`——已关闭 id 的黑名单（tombstone）。
+
+场景设定：S1、S2 共享系统 prompt 和 turn1，各自接了自己的 turn2；S1 这个 id 被 open 过 3 次（当前 generation=3），S2 是首次 open（generation=1）。
+
 ```mermaid
 flowchart TB
-    subgraph IDX["session 索引（UnifiedSessionRefTracker）"]
-        S1["S1 → frontier {C}，generation 3"]
-        S2["S2 → frontier {D}，generation 1"]
+    subgraph TRK["UnifiedSessionRefTracker"]
+        GEN["_session_generations:<br/>S1 → 3, S2 → 1"]
+        TOMB["_closed_session_ids:<br/>（空）"]
     end
-    subgraph TREE["UnifiedRadixCache（token 前缀树）"]
-        R["ROOT"] --> A["系统 prompt 节点<br/>session_ref=2"]
-        A --> B["turn1 节点<br/>session_ref=2"]
-        B --> C["S1 turn2 节点<br/>session_ids={S1}"]
-        B --> D["S2 turn2 节点<br/>session_ids={S2}"]
+    subgraph CMP["component 侧索引"]
+        SL["_session_leaves:<br/>S1 → {C}, S2 → {D}"]
     end
-    S1 -.锚定.-> C
-    S2 -.锚定.-> D
+    subgraph TREE["token 前缀树（节点标注 component_data）"]
+        R["ROOT"] --> A["系统 prompt<br/>session_ref=2"]
+        A --> B["turn1<br/>session_ref=2"]
+        B --> C["S1 turn2（S1 的 frontier）<br/>session_ref=1 · session_ids={S1}"]
+        B --> D["S2 turn2（S2 的 frontier）<br/>session_ref=1 · session_ids={S2}"]
+    end
+    SL -. S1 .-> C
+    SL -. S2 .-> D
 ```
 
-配合规则（`unified_cache/components/base.py`）：
+配合规则（对照上图，代码在 `unified_cache/components/base.py`）：
 
-- **frontier 制**：session 不标记路径上每个节点，只锚定 frontier leaf；路径节点的 `session_ref` 计数由 coverage 推进维护。同一 session 的下一 turn 把 frontier 从旧祖先**前移**到新 leaf（`_advance_session_coverage`），旧祖先摘标记——标记不随 turn 数膨胀。
-- **共享即计数**：两个 session 共享的祖先路径各计一份 `session_ref`，各自的 frontier 挂在各自分支上——branch 场景天然成立。
-- **驱逐分区**：每个 component 的 LRU 链表以 `mid` 节点分两段——`[head..mid)` 是 `session_ref>0` 的软保护区，`(mid..tail]` 是无引用区；驱逐从 tail 往 head 扫，无引用的先走。
-- **被驱逐也保 frontier**：session 锚定的 leaf 若在压力下仍被驱逐，coverage 回退到最近的可复用祖先（`_recede_session_coverage`），session 标记不丢。
-- **close**：`release_session` 摘掉该 session 全部 frontier 的 coverage，节点回到无引用区。
+- **frontier 制**：session 的标记 = frontier 节点（图中 C、D），不是路径上每个节点。从 ROOT 到 frontier 的整条路径叫该 session 的 **coverage**；路径上每个节点的 `session_ref` 各计 1——所以共享段 A、B 是 2，独占段 C、D 是 1。
+- **coverage 前移**：S1 的下一 turn 结束、插入到更深的新 leaf C′ 时，`register_session_leaf` 从 C′ 沿父链向上找，找到已在 `_session_leaves[S1]` 里的最近祖先 C（`_nearest_session_ancestor`），然后把 C→C′ 沿途节点 `session_ref` +1（`_advance_session_coverage`），frontier 标记从 C 摘下、挂到 C′——每条分支始终只有一个 frontier，标记数量不随 turn 数膨胀。
+- **branch 即多 frontier**：若 S1 的 turn3 从 B 分叉（不接在 C 后面），`_session_leaves[S1]` 变成 `{C, E}` 两个 frontier，B 的 `session_ref` 升为 2——这就是索引值是 set 的原因。
+- **驱逐分区**：每个 component 的 LRU 链表以 `mid` 节点分两段——`[head..mid)` 是 `session_ref>0` 的软保护区，`(mid..tail]` 是无引用区；驱逐从 tail 往 head 扫，无引用的先走（`unified_tree_core.py::_session_lru_predicate`）。
+- **被驱逐也保 frontier**：C 若在内存压力下仍被驱逐，S1 的 coverage 回退到路径上最近的可复用祖先（`_recede_session_coverage`），`_session_leaves[S1]` 改指那个祖先——session 记录不丢，下一 turn 从祖先处继续。
+- **close**：`release_session` 遍历 `_session_leaves[S1]`，逐个 `_dec_session_coverage`（沿途 `session_ref` -1）并摘 frontier 标记，A/B/C 计数归位，节点回到无引用区。
+- **generation 挡陈旧引用**：图中 S1 的 generation=3 表示这个 id 是第 3 次 open；在跑请求启动时记下当时的编号，结束时编号对不上（已 close 或已换代）就跳过挂引用——完整机制见下「落地清单」的防陈旧引用条。
 
 落地清单：
 
