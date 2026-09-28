@@ -7,7 +7,7 @@
 
 ## 0. 一句话
 
-Agent 场景下 KV 从「请求结束即释放的临时资源」变成跨 turn / 跨时间 / 跨 Worker 的会话状态。SGLang 把会话语义做进**引擎内**的 radix 树，router 用近似树直接按前缀匹配选点；vLLM 把块级事实流抛给**外部**控制面，由外部系统重建前缀索引再用于路由——分歧不在要不要 radix 拓扑，而在它住引擎内还是引擎外。
+Agent 场景下 KV 从「请求结束即释放的临时资源」变成跨 turn / 跨时间 / 跨 Worker 的会话状态。两家引擎都能发块级 KV 事件；真正的分歧是路由视图从哪来——SGLang 的 router 用请求历史自建近似树选点，vLLM 生态的 router 消费事件流在外部重建前缀索引。前缀管理的 radix 拓扑两家都绕不开，区别只是它住引擎内还是引擎外。
 
 ## 1. 场景与失效模式
 
@@ -32,15 +32,20 @@ Agent session = 多 turn + 工具调用停顿（秒到分钟级，不产生新 K
 
 ### 问题①：KV 在哪个 Worker
 
-- **SGLang**：前缀匹配度直接是路由输入。
+先分清两棵树（两个进程、两个用途）：
+
+- **引擎树**：引擎内的 radix 树只做一件事——KV cache 命中匹配，是权威拓扑。
+- **router 树**：路由进程里另有一棵树，只为选点服务，是近似视图。两家都有这棵树，分歧在**它的数据从哪来**。
+
+- **SGLang**：router 树来自请求历史。
   - 引擎内：`UnifiedRadixCache` 是真实 KV 拓扑，也是 radix 开启时的默认实现（`default_radix_cache_factory` 的 fall-through；例外只有 ChunkCache（radix 关闭）、纯 SWA、LMCache/FlexKV 变体）。
-  - Router 侧（`sgl-model-gateway`）：`cache_aware` 策略按请求历史为每个 Worker 维护一棵**近似 radix 树**，据此预测各 Worker 的前缀命中率来选点；负载严重不均时退回最短队列（`policies/cache_aware.rs`）。
-  - 近似树 ≠ 真实树：router 不直读引擎状态，而是自己用请求历史建模前缀分布。
-- **vLLM**：引擎只暴露事实，视图在外部重建。
+  - Router 侧（`sgl-model-gateway`）：`cache_aware` 策略按「自己路由过的请求历史」为每个 Worker 维护一棵近似 radix 树（`policies/tree.rs::Tree`），据此预测各 Worker 的前缀命中率选点；负载严重不均时退回最短队列。
+  - 引擎**也有** KV 事件流：与 vLLM 同款三件套 `BlockStored` / `BlockRemoved` / `AllBlocksCleared`，从 mem_cache 层产生（`mem_cache/events.py`），经 ZMQ PUB 发布（`SchedulerKvEventsPublisher`），`/server_info` 可发现。但自家 gateway **不消费**它——事件是给外部 indexer（如 #31458 KV Indexer）准备的。
+- **vLLM**：引擎只暴露事实，路由视图在外部重建。
   - 引擎承诺的只有 block 级事实流：KV Events（`BlockStored` / `BlockRemoved` + `parent_block_hash`）。
   - prefix/session 视图由外部系统重建：Dynamo 的 KV Router 消费 KV events，其 KvIndexer 内部就是一棵 radix 树；llm-d 是 KVEvents → KV-Block Index → Prefix Index 两层架构。
 
-读数：**radix 拓扑对 prefix 管理不可避免**——vLLM 把事件抛出来，控制面还是得在外部重造一棵 radix 树。两条路径的长短不同：SGLang 的 router 拿请求历史直接维护近似树，前缀匹配度就是选点依据，中间没有转手；vLLM 多绕两层——引擎发 block 事件，外部 indexer 消费事件重建前缀视图，路由再查这个视图。多出来的环节换来引擎零负担，付出的是视图只能最终一致（可能陈旧）和事件重建的带宽。
+读数：**radix 拓扑对 prefix 管理不可避免**——vLLM 生态的控制面在外部重造了它。两家引擎都能发 block 事件，真正的分歧是 router 的视图从哪来：SGLang 自家 router 用请求历史做近似——零事件依赖、实现简单，但视图是「我路由过什么」，不是「引擎里真实有什么」（引擎内因驱逐/命中产生的变化它看不见）；vLLM 生态用事件流重建——视图贴近真实缓存状态，代价是最终一致性与重建带宽。
 
 ### 问题②：session 停顿
 
@@ -101,7 +106,8 @@ Pin 与 Retain 常被混为一谈，区别在「保证 vs 偏置」。命名上�
 | SGLang 默认树选择 | `mem_cache/registry.py::default_radix_cache_factory` |
 | SGLang session 软保护 | `mem_cache/unified_cache/session_ref_tracker.py::UnifiedSessionRefTracker` · `unified_tree_core.py::_session_lru_predicate` |
 | SGLang close 端点 | `entrypoints/http_server.py::close_session` |
-| SGLang router 近似树 | `sgl-model-gateway/src/policies/cache_aware.rs` |
+| SGLang router 近似树 | `sgl-model-gateway/src/policies/tree.rs::Tree` · `cache_aware.rs` |
+| SGLang KV 事件 | `disaggregation/kv_events.py::BlockStored` / `BlockRemoved` · `scheduler_components/kv_events_publisher.py::SchedulerKvEventsPublisher` |
 | SGLang KvHint 信封 | `managers/kv_hints.py::KvHintsEnvelope` / `decode_kv_hints_envelope` |
 | vLLM KV 事件 | `distributed/kv_events.py::BlockStored`（含 `session_id` 回显） |
 | vLLM KvHint 信封 | `v1/kv_hints/protocol.py::KvHintsEnvelope` / `KvHintAction` |
