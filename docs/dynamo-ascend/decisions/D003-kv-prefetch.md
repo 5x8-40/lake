@@ -113,7 +113,7 @@ Mooncake 客户端有本地热缓存（`LocalHotCache`，`local_hot_cache.h`）�
 
 前提：Mooncake 支持一个 key 多个副本（已核实）——
 
-- 写时副本数：`ReplicateConfig.replica_num`（`replica.h:105`，默认 1）
+- 写时副本数：`ReplicateConfig.replica_num`（`replica.h:105`，默认 1）。**默认 1 不影响 B2 生效**：`replica_num` 管的是写入时一次性建几个副本；`create_copy_task` 是事后追加副本的独立通道，master 侧只校验 key 存在、目标 segment 已挂载且可分配（`master_service.cpp:13677` `CreateCopyTask`），不要求写入时多副本。vllm-ascend 写入路径未设 `replica_num`（`mooncake_backend.py:346` `_build_replicate_config`），即默认 1——B2 复制后该 key 有 2 个副本
 - 查询返回副本列表：`QueryResult.replicas`（`client_service.h:47`）
 - 已存在的 key 再 Put 是幂等 no-op（`OBJECT_ALREADY_EXISTS` 按成功返回，`client_service.cpp:1958-1961`）→ **建第二副本不能用 Put，必须用 `create_copy_task`**
 
@@ -152,6 +152,7 @@ flowchart LR
     subgraph Before[复制前]
         R1[目标节点读] --> REM[远端副本<br/>跨机 RDMA]
     end
+    Before ==>|create_copy_task 完成| After
     subgraph After[复制后]
         R2[目标节点读] -->|local-first| LOC[本机副本<br/>本机 DRAM 读]
     end
@@ -161,10 +162,32 @@ flowchart LR
 
 #### 约束
 
-- **时序**：`create_copy_task` 必须在目标节点的 get session 建立**之前**完成——session 建立时锁定单副本，复制晚于 session 则该请求仍读远端。预取-使用窗口归控制面把握
+- **时序**：`create_copy_task` 必须在目标节点的 get session 建立**之前**完成——session 建立时锁定单副本，复制晚于 session 则该请求仍读远端。进阶联动见下节
 - **目标指定**：segment 名 = worker 的 `local_seg`（`hostname:rpc_port`，`mooncake_backend.py:263`；fabric-mem 路径为裸 hostname，L276）
-- **key 名单**：自行按格式 `model@block_hash@rank` 逐 key 计算（适配文档 §2）；`QueryByRegex` 无 Python 绑定；放置结果用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）
+- **key 名单**：**不要从头写 hash 链**——copy 与 put/get/exists 共用同一 key 字符串命名空间，直接复用 vllm-ascend 调度侧的现成计算（纯 Python，可移植进预取进程）：`get_block_hashes`（`pool_scheduler.py:478` 调用处）+ `block_hash_to_str` + `make_hit_check_keys`（`pool_scheduler.py:377`，按 block hash 枚举全 rank 的 key）；非 layerwise 路径对照 `_generate_store_query_keys`。`QueryByRegex` 无 Python 绑定；放置结果用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）
 - **依赖**：源属主客户端必须在线（即贡献了源 segment 的 worker 进程内客户端）
+
+#### 进阶：与请求调度联动（解决时序约束）
+
+时序约束的解法在控制面，引擎不改。编排顺序：
+
+```mermaid
+sequenceDiagram
+    participant CP as 控制面预取器
+    participant M as Mooncake master
+    participant G as gateway / router
+    participant E as 目标节点引擎
+    CP->>M: create_copy_task(key 名单)
+    CP->>M: 轮询 QueryTask / batch_get_replica_desc
+    M-->>CP: 本机副本就绪
+    CP->>G: 放行：该前缀的请求可路由到目标节点
+    G->>E: 真实请求（或方案 A 壳请求）
+    E->>E: get session 建立时选中本机副本
+```
+
+- **与方案 A 的联动**：layerwise 下壳请求自己也会建 get session——壳请求若先于复制完成到达，session 锁定远端副本，本次复制对它无效。正确顺序：先 B2 复制完成，再发壳请求（壳请求读本机副本进 HBM，传输也更快）
+- **错过时序的缓解**：session 随请求结束释放，下一个请求重新选副本——错过只影响当前请求，不自毁
+- **职责边界**：确认就绪再放行是 gateway/router 侧编排，推理引擎无改动
 
 ## 决策
 
