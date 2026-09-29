@@ -139,7 +139,7 @@ lake/
 │       ├── dualpath.md              #   DualPath 双路径 KV 加载分析
 │       ├── nvidia-cmx.md            #   NVIDIA CMX 目标栈与边界
 │       ├── agentic-cache-workload.md #  Agentic cache 负载与仿真输入
-│       ├── vllm_vs_sglang/          #   vLLM × SGLang 对比(PD 分离控制/guided decoding/采样参数/Scheduler→Worker 字段)
+│       ├── vllm_vs_sglang/          #   vLLM × SGLang 对比(PD 分离控制/guided decoding/采样参数/Scheduler→Worker 字段/Agent 场景 KV)
 │       ├── sglang/                  #   SGLang HiCache 深度分析(+ 上游痛点)
 │       ├── lmcache/                 #   LMCache 深度分析
 │       ├── mooncake/                #   Mooncake 深度分析

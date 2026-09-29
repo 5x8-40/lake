@@ -3,7 +3,8 @@
 > **上游**：  
 > - [#48168](https://github.com/vllm-project/vllm/issues/48168) `[Roadmap] vLLM Roadmap Q3 2026`（open）  
 > - [#48501](https://github.com/vllm-project/vllm/issues/48501) `[RFC]: Session-centric KV-cache orchestration over typed session identity`（open, RFC）  
-> **调研快照**：2026-07-24 · submodule `3rdparty/vllm` @ `f3e9497e9`（文档旧注 `ab132ee98` 亦可对读）。  
+> - [#51428](https://github.com/vllm-project/vllm/issues/51428) `[RFC]: Programmatic Session-Aware KV Cache Management`（open, RFC；KvHint 面，见 §2.7）  
+> **调研快照**：2026-09-28 · submodule `3rdparty/vllm` @ `027b6f3a2`（旧快照 2026-07-24 @ `f3e9497e9`）。  
 > **相关基线**：[overview.md](overview.md) · [compute.md](compute.md) · [block-lifecycle.md](block-lifecycle.md) · [pain-points.md](pain-points.md)。  
 > **范围**：只深挖 **KV / 缓存 / session 调度 / 控制面指令**；Flat Model、Omni、CI 等非本专文重点（#48168 清单里仅点名）。  
 > **对照**：SGLang agentic 总路线见 [`../sglang/agentic-kv-roadmap.md`](../sglang/agentic-kv-roadmap.md)。
@@ -61,7 +62,11 @@
 | [#48501](https://github.com/vllm-project/vllm/issues/48501) | `continuation_id` + 事件回显 + 指令坐标化 |
 | [#37003](https://github.com/vllm-project/vllm/issues/37003) | Retention API（优先级/TTL，**不硬 pin**）——指令族第一刀 |
 
-**HEAD**：`session_id`/`continuation_id`/`agent hint` **absent**；已有 streaming session（`Request.resumable` / `_update_request_as_session`）≠ agent KV 坐标。
+**HEAD（2026-09-28 核实）**：
+
+- 已落地：`session_id`（#48048，携带链 `Request` → `EngineCoreRequest` → OpenAI 三端点协议字段）；`BlockStored.session_id` 事件回显；KvHint 信封 transport（`v1/kv_hints/protocol.py`，见 §2.7）。
+- 未落地：`continuation_id`、Retention 指令、hint action 执行语义。
+- 不变：streaming session（`Request.resumable` / `_update_request_as_session`）是暂停槽位机制，≠ agent KV 坐标。
 
 ### 1.4 SIG Spec / Quant（KV 相关点到为止）
 
@@ -131,12 +136,22 @@ Agent = 有状态程序；KV = 工作内存（工具定义、跨 turn 前缀、�
 - 建议 `EventBatch.publisher_epoch`：引擎重启 nonce，避免 indexer 幽灵覆盖。  
 - 未落地前：ZMQ `seq` 回绕作 reset（晚重连可能漏）。
 
+#### 落地状态（2026-09-28 @ `027b6f3a2`）
+
+V1a **已落地（session_id 部分）**：
+
+- `BlockStored.session_id` 字段 present（`kv_events.py`）。docstring 语义明确：标识触发本次 store/reuse 报告的请求上下文，**不是**块的独占归属——块可跨 session 共享。
+- 打标签点两处：`block_pool.py` 的 admission 与 reuse 报告均写 `session_id=request.session_id`。
+- `kv_cache_report_mode` present：`Request` 从 `sampling_params.extra_args` 读取；`incremental`（默认，只在 admission 时报）/ `full`（reuse 命中也补报，`kv_cache_manager.py` 按 mode 门控）；`"coordinates"` 模式未实现。
+- 仍 **absent**：`continuation_id`（全仓零匹配）、`publisher_epoch`、V1b 移除归因（`hash_to_continuation`）。
+
 ### 2.4 指令：控制面 → 引擎
 
 | 指令 | 状态 | 语义 |
 |------|------|------|
-| **Retention** | [#37003](https://github.com/vllm-project/vllm/issues/37003) / PR #38514 | 驱逐优先级偏置 + 可选 TTL；**禁止硬 pin**（agent 暂停时 block 无 ref，LRU 会杀前缀） |
+| **Retention** | [#37003](https://github.com/vllm-project/vllm/issues/37003) / PR #38514；**HEAD 仍未合**（core 无 eviction priority/TTL API） | 驱逐优先级偏置 + 可选 TTL；**禁止硬 pin**（agent 暂停时 block 无 ref，LRU 会杀前缀） |
 | Offload / Move / Discard / Prefetch | roadmap 后续 | 同一坐标寻址；**不在 #48501 必做范围** |
+| **KvHint 信封 transport** | **present**（#53421/#53423 系，2026-09 合入） | `v1/kv_hints/protocol.py::KvHintsEnvelope`；请求链全程携带，执行语义见 §2.7 |
 
 边界：引擎只做形状校验；**gateway 铸造坐标并剥离客户端伪造**（否则 retention 可被带偏）。坐标是 identity，不是 priority/lifecycle 语义——语义留在控制面 indexer。
 
@@ -156,6 +171,31 @@ Agent = 有状态程序；KV = 工作内存（工具定义、跨 turn 前缀、�
 
 RFC 链到 llm-d 系列（Google Docs）：Agentic Northstar、KV-Cache Orchestration、Session-Graph、Session-Centric Affinity——描述控制面如何用坐标做 retention/offload/move 与 session-block 图。
 
+### 2.7 #51428 — KvHint：Programmatic Session-Aware KV Management
+
+2026-08-07 的 RFC（karen-sy），把 #48501 的「指令」面收敛为**窄的 router 发起 hint 面**：orchestrator 表达策略意图，vLLM 对照真实缓存状态解析并执行，可 accept / clip / defer / reject / report-missing。设计原则与 SGLang #27574 逐条对齐（orchestrator 拥有策略、零开销默认、hint 软且有界、router 默认发起）。
+
+**Hint taxonomy**：`target × action × bounds` 三元组；action 五种——`Share | Prefetch | Demote | Pin | Retain`。其中 Pin 与 Retain 的区别是「保证 vs 偏置」：Pin 是有界租约（TTL 内保证不驱逐，超配额可裁剪/拒绝；不要求 G1 驻留，可在 G2 实现）；Retain 只是驱逐优先级偏置（压力下后驱逐，零保证，沿用 #37003）。
+
+**三阶段**：
+
+1. **Phase 1 — Session-addressable KV**：
+   - 建 `SessionPrefixIndex`（`--enable-session-to-block-indexing`）：worker 本地维护 `BlockHash→parent` 链与 `session_id→frontier` 集合的多对多索引，在 prefix lookup / admission / decode 完成时同步维护。
+   - task 1a（请求级 `session_id`，#48048）**已完成**。
+   - 备选方案：orchestrator 外部维护 session→block 索引，hint 直接带精确 block hash 列表（Dynamo 走这条，见 dynamo#13279）——省掉引擎内索引，代价是外部快照可能陈旧。
+2. **Phase 2 — KvHint 消费**：定义 provider-neutral 信封并贯穿请求链；按 `SessionPrefixIndex` 或精确 hash 解析目标，校验 G1/G2 实际状态后执行/推迟/拒绝并回报。
+3. **Phase 3 — 编排框架集成**：与 Dynamo KVCC 库（dynamo#11673）API 兼容，Dynamo router 的 KvHint 可直接 lowering 到 vLLM。
+
+**HEAD 落地（2026-09-28）**：
+
+- 信封 transport **已合 main**：`v1/kv_hints/protocol.py` 定义 `KvHintsEnvelope`（外层 `protocol_version` / `message_id` / `actions`）与 `KvHintAction`（`action_id` / `action_type` / `action_version` / `payload`），与 SGLang #36224 的信封同构（同一批人推动，sglang#36224 评论区交叉引用 vllm#53423）。
+- 携带链：`Request.kv_hints` → `EngineCoreRequest` → scheduler 透传 → connector `ReqContext`。
+- 入口面不对称：`session_id` 有 OpenAI chat/completion/responses 协议字段；`kv_hints` 只走 Python 引擎 API（`LLMEngine` / `AsyncLLM.generate` kwargs），OpenAI HTTP 层未接。
+- 唯一消费者是 KVCR tier：`kv_offload/tiering/kvcr/manager.py::on_new_request` 把信封 `submit_hint` 给 KVCR 库，请求结束 `discard_hint`；vLLM 自身 scheduler / cache manager 不消费任何 action。KVCR tier 内另有 `_FrameworkPinAdapter`（`request_pin` / `release_pin`）供传输期锁块。
+- 未落地：`SessionPrefixIndex`、五个 action 的引擎内执行语义、结果回报通道。
+
+**旁系 RFC**：#52113（`agent_hint` 具体提案）、#57103（Programmable KV: Composable Policies）。控制面侧 [agentic-api PR#195](https://github.com/vllm-project/agentic-api/pull/195)（server-managed prompt-cache）给出 directional benchmark：受控 `responses` 路由下 KV 命中率 49.54%→99.08%，continuation 延迟 811ms→约 315ms。
+
 ---
 
 ## 3. 关联 RFC/PR 速查（KV/调度）
@@ -163,25 +203,32 @@ RFC 链到 llm-d 系列（Google Docs）：Agentic Northstar、KV-Cache Orchestr
 | ID | 标题 | 与 #48501/#48168 |
 |----|------|------------------|
 | [#48049](https://github.com/vllm-project/vllm/issues/48049) | First-class session id | 身份原语；Dynamo + 未来内部调度 |
-| [#48048](https://github.com/vllm-project/vllm/pull/48048) | session_id plumbing | PR#1：只接线，**无策略** |
-| [#37003](https://github.com/vllm-project/vllm/issues/37003) | Context-Aware Retention | 暂停 agent 被 LRU 杀前缀；优先级/TTL |
+| [#48048](https://github.com/vllm-project/vllm/pull/48048) | session_id plumbing | PR#1：只接线，**无策略**；**已合** |
+| [#51428](https://github.com/vllm-project/vllm/issues/51428) | Programmatic Session-Aware KV（KvHint） | 指令面 RFC，见 §2.7 |
+| [#53421](https://github.com/vllm-project/vllm/issues/53421) | KvHint 信封标准化 | transport **已合 main**（`v1/kv_hints/protocol.py`） |
+| [#52113](https://github.com/vllm-project/vllm/issues/52113) | agent_hint RFC | 与 #51428 并行的具体提案 |
+| [#57103](https://github.com/vllm-project/vllm/issues/57103) | Programmable KV: Composable Policies | 策略面后续 |
+| [#37003](https://github.com/vllm-project/vllm/issues/37003) | Context-Aware Retention | 暂停 agent 被 LRU 杀前缀；优先级/TTL；**未合** |
 | [#45036](https://github.com/vllm-project/vllm/issues/45036) | Mooncake connector 总栈 | 分布式 KV + Events→路由 |
 | [#48203](https://github.com/vllm-project/vllm/issues/48203) | Layerwise/Sparse offload | 长序列/稀疏 offload API |
 
 ---
 
-## 4. HEAD 落地对照（`f3e9497e9`）
+## 4. HEAD 落地对照（`027b6f3a2`，2026-09-28）
 
 | 能力 | 状态 | 锚点 |
 |------|------|------|
-| KV Events（hash/medium/group） | **present** | `kv_events.py::BlockStored` / `BlockRemoved` |
+| KV Events（hash/medium/group） | **present** | `kv_events.py::BlockStored` / `BlockRemoved`（新增 `locality`/`ownership`/`kv_cache_spec_*`/`session_id` 字段） |
 | `kv_offload` 多层 | **present** | `kv_offload/base.py::OffloadingManager` · CPU/FS/Obj · `LookupResult` |
 | Selective / prompt-only offload | **present** | `OffloadPolicy.BLOCK_LEVEL` · `offload_prompt_only` |
 | P2P secondary tier | **partial** | `kv_offload/tiering/p2p/` |
+| KVCR tier（引擎内二级存储 + hint 消费） | **present** | `kv_offload/tiering/kvcr/manager.py` · `_FrameworkPinAdapter` |
 | Streaming session（暂停槽位） | **present** | `Request.resumable` · `Scheduler._update_request_as_session` |
-| `session_id` / `continuation_id` | **absent** | — |
-| 事件上回显 session 坐标 | **absent** | — |
-| Retention / Prefetch by coordinate | **absent** | （仅有 SWA 类 `PREFIX_CACHE_RETENTION_INTERVAL` 等无关语义） |
+| `session_id` | **present**（#48048） | `Request.session_id` · `EngineCoreRequest.session_id` · OpenAI chat/completion/responses 协议字段 |
+| `continuation_id` | **absent** | 全仓零匹配 |
+| 事件上回显 session 坐标 | **partial** | `BlockStored.session_id` + `kv_cache_report_mode`（incremental/full）已落地；continuation 归因、`publisher_epoch` 未有 |
+| KvHint 信封 transport | **present**（无 action handler） | `v1/kv_hints/protocol.py::KvHintsEnvelope`；唯一消费者 KVCR tier（`submit_hint`/`discard_hint`） |
+| Retention / Prefetch by coordinate | **absent** | #37003 未合（`cache_config.prefix_cache_retention_interval` 是全局周期语义，无关） |
 | Agent hint 调度 | **absent** | — |
 | KVCacheManager「集群级」重设计 | **absent** | 仅有 coordinator 分型 |
 
@@ -220,8 +267,11 @@ RFC 链到 llm-d 系列（Google Docs）：Agentic Northstar、KV-Cache Orchestr
 
 | 概念 | 文件:符号 |
 |------|-----------|
-| KV 事件 | `vllm/distributed/kv_events.py`::`BlockStored` / `BlockRemoved` / `KVEventAggregator` |
+| KV 事件 | `vllm/distributed/kv_events.py`::`BlockStored`（含 `session_id` 回显）/ `BlockRemoved` / `KVEventAggregator` |
 | Block 池发事件 | `v1/core/block_pool.py`::`_build_block_stored_event` / `emit_cached_block_events` |
+| KvHint 信封 | `v1/kv_hints/protocol.py`::`KvHintsEnvelope` / `KvHintAction` |
+| 请求坐标 | `v1/request.py`::`Request.session_id` / `kv_hints` / `kv_cache_report_mode` |
+| hint 消费者（KVCR tier） | `v1/kv_offload/tiering/kvcr/manager.py`::`on_new_request` / `_FrameworkPinAdapter` |
 | Offload 管理器 | `v1/kv_offload/base.py`::`OffloadingManager` / `LookupResult` / `OffloadKey` |
 | Offload 调度壳 | `kv_connector/v1/offloading/scheduler.py::OffloadingConnectorScheduler` |
 | KV 管理门面 | `v1/core/kv_cache_manager.py::KVCacheManager` |
@@ -235,12 +285,15 @@ RFC 链到 llm-d 系列（Google Docs）：Agentic Northstar、KV-Cache Orchestr
 
 | 优先级 | 链接 | 看什么 |
 |--------|------|--------|
-| P0 | [#48501](https://github.com/vllm-project/vllm/issues/48501) | V1a 标签落地、V1b 移除归因 |
-| P0 | [#48048](https://github.com/vllm-project/vllm/pull/48048) / [#48049](https://github.com/vllm-project/vllm/issues/48049) | `session_id` 合入 |
-| P0 | [#37003](https://github.com/vllm-project/vllm/issues/37003) | Retention 指令 |
+| P0 | [#51428](https://github.com/vllm-project/vllm/issues/51428) | `SessionPrefixIndex`、五个 action 的执行语义与回报通道 |
+| P0 | [#48501](https://github.com/vllm-project/vllm/issues/48501) | V1a 已落地（session_id 回显 + report mode）；剩 `continuation_id`、V1b 移除归因、`publisher_epoch` |
+| P0 | [#37003](https://github.com/vllm-project/vllm/issues/37003) | Retention 指令（未合） |
 | P0 | [#48168](https://github.com/vllm-project/vllm/issues/48168) | KV Manager redesign / Scheduler refactor / agent prefix 勾选 |
+| P1 | [#53421](https://github.com/vllm-project/vllm/issues/53421) / [#57103](https://github.com/vllm-project/vllm/issues/57103) | 信封后续版本、策略面 |
 | P1 | [#45036](https://github.com/vllm-project/vllm/issues/45036) | Mooncake Events→路由 |
 | P1 | [#48203](https://github.com/vllm-project/vllm/issues/48203) | Layerwise/sparse offload |
+
+已闭环：#48048 `session_id` 合入；KvHint 信封 transport（#53421/#53423 系）合入；KVCR tier 入 main。
 
 ---
 

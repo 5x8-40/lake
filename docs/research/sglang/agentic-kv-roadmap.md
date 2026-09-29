@@ -1,7 +1,7 @@
 # SGLang #21846 — 子方案逐项调研
 
 > **上游**：[sgl-project/sglang#21846](https://github.com/sgl-project/sglang/issues/21846) `[Roadmap]: SGLang Distributed KVCache System For Agentic Workload`。  
-> **调研快照**：2026-07-24（二次深挖）· submodule `3rdparty/sglang` @ `37f94cb7a0`。  
+> **调研快照**：2026-09-28 · submodule `3rdparty/sglang` @ `55cc90b533`（旧快照 2026-07-24 @ `37f94cb7a0`）。  
 > **机制基线**：[overview.md](overview.md) · [hicache.md](hicache.md) · [pain-points.md](pain-points.md)。  
 > **范围**：issue 正文勾选的**每一个子项**各一节（含无独立 PR 链接的条目）；状态分三列——roadmap 勾选 / GitHub / 本仓 submodule。
 
@@ -22,10 +22,10 @@
 
 ## 1. 完整清单（与 issue 勾选 1:1）
 
-| ID | 子项 | roadmap | GitHub | submodule@37f94cb | 专节 |
+| ID | 子项 | roadmap | GitHub | submodule@55cc90b533 | 专节 |
 |----|------|---------|--------|-------------------|------|
-| Q3-A1 | Session-aware RadixTree/HiCache | ☐ | [#29173](https://github.com/sgl-project/sglang/pull/29173) open | partial（legacy session mixin；非 #29173 驱逐） | [§2.1](#21-session-aware-radixtree--hicache-29173) |
-| Q3-A2 | KV orchestrator + PREFETCH/DEMOTE/PIN | ☐ | [#25760](https://github.com/sgl-project/sglang/issues/25760) + [#27574](https://github.com/sgl-project/sglang/issues/27574) | absent（无 KvHint） | [§2.2](#22-kv-orchestrator--prefetchdemotepin) |
+| Q3-A1 | Session-aware RadixTree/HiCache | ☐ | [#29173](https://github.com/sgl-project/sglang/pull/29173) | **present**（`UnifiedSessionRefTracker` + session 分区驱逐 + `/close_session`） | [§2.1](#21-session-aware-radixtree--hicache-29173) |
+| Q3-A2 | KV orchestrator + PREFETCH/DEMOTE/PIN | ☐ | [#25760](https://github.com/sgl-project/sglang/issues/25760) + [#27574](https://github.com/sgl-project/sglang/issues/27574) + [#36224](https://github.com/sgl-project/sglang/issues/36224) | partial（KvHint 信封 transport 落地；无 action handler） | [§2.2](#22-kv-orchestrator--prefetchdemotepin) |
 | Q3-A3 | Direct L3 cache mode | ☐ | [#20535](https://github.com/sgl-project/sglang/pull/20535) open（实质载体） | absent（无 `buffer_only` 旗标） | [§2.3](#23-direct-l3-cache-mode--buffer_only-20535) |
 | Q3-A4 | CPU-only KV simulator | ☐ | [#21891](https://github.com/sgl-project/sglang/issues/21891) | partial（schedule sim ≠ 全量） | [§2.4](#24-cpu-only-kv-cache-simulator-21891) |
 | Q3-A5 | Sequence Split | ☐ | [#30501](https://github.com/sgl-project/sglang/pull/30501) open | partial（CP layer-split 有；整方案未入树） | [§2.5](#25-kvcache-sequence-split-30501) |
@@ -53,7 +53,7 @@
 | Q2-P2 | PD Host TransferMode | ☑ | [#21591](https://github.com/sgl-project/sglang/pull/21591) merged | present | [§8.2](#82-pd-host-transfermode-21591) |
 | Q2-P3 | Large decode batches | ☐ | 无独立 PR | present（mixin 状态机）/ 产品化 open | [§8.3](#83-large-decode-batches) |
 | Q2-G1 | Agent-Aware Phase 1 | ☐ | [#24656](https://github.com/sgl-project/sglang/issues/24656) | absent | [§9.1](#91-agent-aware-kv-phase-1-24656) |
-| Q2-G2 | Programmatic KV hints | ☐ | [#27574](https://github.com/sgl-project/sglang/issues/27574) | absent | [§9.2](#92-programmatic-kv-cache-hints-27574) |
+| Q2-G2 | Programmatic KV hints | ☐ | [#27574](https://github.com/sgl-project/sglang/issues/27574) + [#36224](https://github.com/sgl-project/sglang/issues/36224) | partial（信封 transport present） | [§9.2](#92-programmatic-kv-cache-hints-27574) |
 | Q2-C1 | PP × HiCache | ☐ | [#22607](https://github.com/sgl-project/sglang/issues/22607) | partial | [§10.1](#101-pp--hicache-22607) |
 | Q2-C2 | MTP × HiCache | ☐ | [#21125](https://github.com/sgl-project/sglang/pull/21125) merged · [#30393](https://github.com/sgl-project/sglang/pull/30393) | partial | [§10.2](#102-mtp--hicache-21125--30393) |
 | Q2-C3 | EP & DP × HiCache | ☑ | （勾选） | present（组合仍脆） | [§10.3](#103-ep--dp--hicache) |
@@ -76,9 +76,62 @@
 - session generation + 关闭 tombstone，防 close/reopen 后陈旧 in-flight 再挂引用。  
 - **不含 L3**。
 
-**状态**：roadmap ☐ · PR open · submodule：仅有 legacy `SessionRadixCacheMixin`（普通 `RadixCache`），**无** `SessionUnifiedRadixCacheMixin` / session-aware 驱逐排序。
+**状态（2026-09-28）**：roadmap ☐；代码已落地（submodule present）：
 
-**锚点**：`session_radix_cache.py::SessionRadixCacheMixin` · `release_radix_session` · `--enable-session-radix-cache`。
+**session_id 与树的配合结构**：
+
+先定义图里出现的每个字段（全部对应代码符号）：
+
+- **树节点**：每个节点带一份 per-component `component_data`，其中两个 session 字段（`components/base.py`）：
+  - `session_ref: int`——有多少个 session 的 coverage 路径经过本节点；
+  - `session_ids: set`——只在 frontier 节点上非空：锚定在本节点的是哪些 session。
+- **component 侧索引** `_session_leaves: dict[str, set[节点]]`——`session_id → 该 session 的 frontier 节点集合`。注意值是**集合**不是单点：一个 session 可以在多条分支上各有一个 frontier（见下「branch 即多 frontier」）。
+- **tracker**（`UnifiedSessionRefTracker`）只管两件事，**不存 frontier 指针**：
+  - `_session_generations: dict[str, int]`——每个 id 当前是第几代（每次 open 分配递增编号）；
+  - `_closed_session_ids`——已关闭 id 的黑名单（tombstone）。
+
+场景设定：S1、S2 共享系统 prompt 和 turn1，各自接了自己的 turn2；S1 这个 id 被 open 过 3 次（当前 generation=3），S2 是首次 open（generation=1）。
+
+```mermaid
+flowchart TB
+    subgraph TRK["UnifiedSessionRefTracker"]
+        GEN["_session_generations:<br/>S1 → 3, S2 → 1"]
+        TOMB["_closed_session_ids:<br/>（空）"]
+    end
+    subgraph CMP["component 侧索引"]
+        SL["_session_leaves:<br/>S1 → {C}, S2 → {D}"]
+    end
+    subgraph TREE["token 前缀树（节点标注 component_data）"]
+        R["ROOT"] --> A["A：系统 prompt<br/>session_ref=2"]
+        A --> B["B：turn1<br/>session_ref=2"]
+        B --> C["C：S1 turn2（S1 的 frontier）<br/>session_ref=1 · session_ids={S1}"]
+        B --> D["D：S2 turn2（S2 的 frontier）<br/>session_ref=1 · session_ids={S2}"]
+    end
+    SL -. S1 .-> C
+    SL -. S2 .-> D
+```
+
+配合规则（对照上图，代码在 `unified_cache/components/base.py`）：
+
+- **frontier 制**：session 的标记 = frontier 节点（图中 C、D），不是路径上每个节点。从 ROOT 到 frontier 的整条路径叫该 session 的 **coverage**；路径上每个节点的 `session_ref` 各计 1——所以共享段 A、B 是 2，独占段 C、D 是 1。
+- **coverage 前移**：S1 的下一 turn 结束、插入到更深的新 leaf C′ 时，`register_session_leaf` 从 C′ 沿父链向上找，找到已在 `_session_leaves[S1]` 里的最近祖先 C（`_nearest_session_ancestor`），然后把 C→C′ 沿途节点 `session_ref` +1（`_advance_session_coverage`），frontier 标记从 C 摘下、挂到 C′——每条分支始终只有一个 frontier，标记数量不随 turn 数膨胀。
+- **branch 即多 frontier**：若 S1 的 turn3 从 B 分叉（不接在 C 后面），`_session_leaves[S1]` 变成 `{C, E}` 两个 frontier，B 的 `session_ref` 升为 2——这就是索引值是 set 的原因。
+- **驱逐分区**：每个 component 的 LRU 链表以 `mid` 节点分两段——`[head..mid)` 是 `session_ref>0` 的软保护区，`(mid..tail]` 是无引用区；驱逐从 tail 往 head 扫，无引用的先走（`unified_tree_core.py::_session_lru_predicate`）。
+- **被驱逐也保 frontier**：C 若在内存压力下仍被驱逐，S1 的 coverage 回退到路径上最近的可复用祖先（`_recede_session_coverage`），`_session_leaves[S1]` 改指那个祖先——session 记录不丢，下一 turn 从祖先处继续。
+- **close**：`release_session` 遍历 `_session_leaves[S1]`，逐个 `_dec_session_coverage`（沿途 `session_ref` -1）并摘 frontier 标记，A/B/C 计数归位，节点回到无引用区。
+- **generation 挡陈旧引用**：图中 S1 的 generation=3 表示这个 id 是第 3 次 open；在跑请求启动时记下当时的编号，结束时编号对不上（已 close 或已换代）就跳过挂引用——完整机制见下「落地清单」的防陈旧引用条。
+
+落地清单：
+
+- 打标：`UnifiedSessionRefTracker` 按 `session_id` 给树节点挂 session 引用（`register_session_ref`，请求结束时调用）。
+- 防陈旧引用：会话关闭时属于它的请求可能还在跑，这些请求结束时会走正常路径把引用**重新挂回去**——等于刚释放的保护又被加上，KV 泄漏成永久软保护。引擎对此有两道防护（`session_ref_tracker.py`）：
+  - **generation**：同一 `session_id` 每次 open 分配一个递增编号，请求携带自己启动时的编号；请求结束时编号对不上（会话已关闭、或关闭后又重开了一代），就跳过挂引用并打 warning。
+  - **关闭 tombstone**：已关闭的 `session_id` 进黑名单，一律不再接受挂引用。黑名单是上限 8192 条的 LRU——超出后最老的记录被遗忘（拿有界内存换近似防护，极端迟到的请求仍可能挂上）；显式重新 open 会清掉对应墓碑，允许故意复用同一 id。
+- 驱逐：`unified_tree_core.py` 维护 session 分区，`session_ref>0` 的节点经 `_session_lru_predicate` 延后驱逐——软保护，不是硬 pin。
+- 入口：顶层 `GenerateReqInput.session_id`（与旧 `session_params` 互斥）；`/close_session` HTTP 端点释放会话引用。
+- 旧实现 `session_radix_cache.py` 已移除；仍不含 L3。
+
+**锚点**：`unified_cache/session_ref_tracker.py::UnifiedSessionRefTracker` · `unified_tree_core.py::_session_lru_predicate` · `http_server.py::close_session` · `--enable-session-radix-cache`。
 
 **对 lake**：对齐「`ref>0` 冻结 + 前缀亲和」；lake 引用权威在池，不绑引擎 session API。
 
@@ -89,10 +142,24 @@
 **方案**：
 
 - [#25760](https://github.com/sgl-project/sglang/issues/25760) SessionAware Router：bucket 分发 → `sticky→cache_aware→load` → 接 agent hint（Step 0–1 已勾；Step 2–5 未完）。  
-- [#27574](https://github.com/sgl-project/sglang/issues/27574) soft hint：`SHARE` / `PREFETCH` / `DEMOTE` / `PIN`；编排出策略，引擎可 clip/defer/reject；L3（Mooncake）作共享 retention。  
+- [#27574](https://github.com/sgl-project/sglang/issues/27574) soft hint：`SHARE` / `PREFETCH` / `DEMOTE` / `PIN` / `RETAIN`；编排出策略，引擎可 clip/defer/reject；L3（Mooncake）作共享 retention。
+  - **PIN 与 RETAIN 不是一回事**，区别在「保证 vs 偏置」：PIN 是有界租约——TTL 内保证不驱逐，但不要求驻留 GPU，可只在冷层留副本；RETAIN 只是驱逐优先级偏置——压力来了比低优先级块后驱逐，零保证。
+  - 命名坑：POC 在 API 里把 PIN 叫作 "retention"（沿用 OpenAI `prompt_cache_retention` / Anthropic `cache_control` 的 provider 术语），机制上却是 L3 TTL 租约；RFC 自己点明了这点，读代码和文档时注意区分。
+  - Pin POC 实测（MiniMax M2.7，H100，A/B 对比）：内存压力下共驱逐 24.18 GB / 95,232 个 key。之后两侧各发一个冷 Worker 探针请求恢复会话——未做 retain 的一侧前缀已丢，10,032 个 token 全部重算；做了 1 小时 retain 的一侧从 L3 恢复 10,016 个 token，只有 16 个 token 需要重算。
+- [#36224](https://github.com/sgl-project/sglang/issues/36224)（2026-08-24）把 hint 面定稿为**带版本信封**：
+  - 信封结构：外层 `protocol_version` + `message_id`；内层每个 action 带 `action_id`（幂等键）、`action_type`（如 `kv.demote`）、`action_version`、`payload`。
+  - 初始 action 三个：`kv.deref`（释放会话本地 KV）/ `kv.demote`（发布到存储后放开本地副本）/ `kv.prefetch`（请求级存储恢复，可低于常规 prefetch 阈值）。
+  - 配套：`/server_info` 暴露能力位；handler 有界且 fail-open——action 失败回退为普通缓存查找 + 重算，不影响正确性。
 - Phase：session 打标 → `KvHintEnvelope` → Pin→L3 lease POC → 再生产化 Prefetch/Demote。
 
-**状态**：roadmap ☐ · RFC open · submodule：**无** `KvHint` / `agent_hints` 字段。
+**状态（2026-09-28）**：roadmap ☐ · RFC open · 代码部分落地：
+
+- **已落地（transport）**：信封类型在 `managers/kv_hints.py`（`KvHintsEnvelope` / `KvHintAction` / `decode_kv_hints_envelope`，#38595/#38891 系）；携带链为 `GenerateReqInput.kv_hints`（入口校验，格式错误直接拒请求）→ `tokenizer_manager` → scheduler `Req`。
+- **未落地**：
+  - action handler——`kv.deref` / `kv.demote` / `kv.prefetch` 都没实现，信封传进引擎后无人消费；
+  - OpenAI 兼容端点——协议里还没有 `kv_hints` 字段，只能走原生 `/generate` 或 Python API；
+  - Mooncake L3 retain（#30796 / Mooncake#2835 `retain_groups`）——`mooncake_store.py` 无 retain/lease 路径；
+  - `agent_hints`（#24656）字段仍不存在。
 
 **对 lake**：原则同「gateway 可有意图、池/引擎执行」；lake 放置权威更硬（池放置·调度读视图），不靠 soft pin 撑全局共享。
 
@@ -373,9 +440,13 @@ Scheduler → UnifiedRadixCache（策略+IO+拥有 components）
 
 ### 9.2 Programmatic KV Cache hints (#27574)
 
-**方案**：见 [§2.2](#22-kv-orchestrator--prefetchdemotepin)；与 #24656 互补——前者偏 API 元数据进树，后者偏 Router soft hint + L3 retention。
+**方案**：见 [§2.2](#22-kv-orchestrator--prefetchdemotepin)；与 #24656 互补——前者偏 API 元数据进树，后者偏 Router soft hint + L3 retention。信封格式由 [#36224](https://github.com/sgl-project/sglang/issues/36224) 定稿（带版本、逐 action 独立版本、fail-open）。
 
-**状态**：roadmap ☐ · RFC open · submodule **absent**。
+**状态（2026-09-28）**：roadmap ☐ · RFC open · 代码部分落地：
+
+- 已合 main：信封 transport（`managers/kv_hints.py`，携带到 scheduler `Req`）。
+- 未合：action handler（`kv.deref` / `kv.demote` / `kv.prefetch`）、`/server_info` 能力位、Mooncake L3 retain。
+- 推进中：KVCR 作 HiCache L3 后端（#32903 / PR #36409），是未来 remote-fetch / share action 的执行底座。
 
 ---
 
@@ -432,7 +503,8 @@ WIP 多项 PR（L3 fix #27010 等仍 open）。
 
 | 子项 | 文件:符号 |
 |------|-----------|
-| Session（legacy） | `session_radix_cache.py::SessionRadixCacheMixin` |
+| Session | `unified_cache/session_ref_tracker.py::UnifiedSessionRefTracker` · `unified_tree_core.py::_session_lru_predicate`（旧 `session_radix_cache.py` 已移除） |
+| KvHint 信封 | `managers/kv_hints.py::KvHintsEnvelope` / `decode_kv_hints_envelope` · `io_struct.py::GenerateReqInput.kv_hints` |
 | Incremental PD | `TransferInfo.decode_prefix_len` · `prefill.py::finalize_bootstrap` |
 | Decode prefetch | `decode_hicache_mixin.py::_start_hicache_prefetch` |
 | Large batch restore | `decode_hicache_mixin.py::HiCacheRestoreResult` |

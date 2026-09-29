@@ -41,6 +41,8 @@
   - SGLang × vLLM 字段对照;`n`≠beam;spec 兼容矩阵;penalty 空泡与 V2;采样状态归属(不进 KV 池)与 `n` 前缀共享。
 - **Scheduler→Worker 接口** → [`scheduler-worker-interface.md`](vllm_vs_sglang/scheduler-worker-interface.md)
   - vLLM `SchedulerOutput` 与 SGLang `ScheduleBatch`/`ForwardBatch` 字段全集、差异与架构根因;供 lake `SchedulerOutput` D1 对照。
+- **Agent 场景 KV** → [`agent-kv-cache.md`](vllm_vs_sglang/agent-kv-cache.md)
+  - SGLang × vLLM:session 停顿/分支/可编程 hint 的四问题框架;session 软保护 vs Retention API;KvHint 信封两侧落地状态(2026-09-28 核实)。
 
 与本系统逐层对应、借鉴点、关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
 
