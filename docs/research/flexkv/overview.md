@@ -61,7 +61,9 @@ FlexKV 原假设所有层 KV shape 一致（统一 `num_kv_heads`/`head_size`，
 - 解法（**两条物理通道，分池分块**）：
  - **主 KV 通道**：C4（CSA 4×）/ C128（HCA 128×）/ indexer 各成 layer group，组级多一个 `compress_ratio` 维度——每块只存 `tokens_per_block / compress_ratio` 行；`compress_ratio=0` 标记不缓存层（如 DSv4 第 0/1 层）。块内按组拼接，与 Gemma4 同机制（上游 main 在 pin 之后又做了 GLM5.2 IndexCache 层组去重，[#293](https://github.com/taco-project/FlexKV/pull/293)）；
  - **SWA 通道**：SWA KV + attention/indexer 两组 score 三个组打包成另一种 byte-flat 块；score 搭 SWA page 做 sidecar——同一逻辑 page id 承载 SWA KV + state，PUT/GET 共用一份 `swa_slot_mapping`；
- - state 做的是**快照 offload/restore**（不是 restore 后重算）；恢复语义是否满足继续 decode，文档自述仍需精度实验确认。
+ - state 做的是**快照 offload/restore**（不是 restore 后重算）；恢复语义是否满足继续 decode，文档自述仍需精度实验确认；
+ - state 是 ring buffer、窗口有界——每 SWA page 捎带 `ring_size` 行（该页边界的整环快照），存储量不随前缀增长；
+ - **覆盖缺口**：上游文档只注册两组 state（C4 attention / C4 indexer）；若模型还有其他 compressor state（如 C128 路径的 state_cache），其 restore 覆盖需向上游核实。
 - 能复用 radix/block 机制的前提：这两组 state **按 token/page 寻址**（挂在 page 上），与 KV 同生命周期。
 - SWA 侧**不**浪费窗口外空间（与 Gemma4 路径的关键区别）：物理上 SWA 与主 KV **分池分块**，"挂载"只是 radix 节点的元数据链接（节点多记一个 `swa_host_slot`），不是同块打包（`cache/radixtree.py`，HiCache `swa_radix_cache` 风格）——
  - I0：每节点最多一份 SWA 快照，只存最后一页（trailing window），窗口外 SWA 不落盘；
