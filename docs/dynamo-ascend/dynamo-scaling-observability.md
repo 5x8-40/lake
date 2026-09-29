@@ -1577,43 +1577,96 @@ Dynamo 涉及 NCCL 的地方有两层，职责完全不同，需要分开看：
 
 ### 5.2 Dynamo 自身的 KV Cache 跨卡传输 — 需要适配
 
-Dynamo 有自己独立的 NCCL 代码路径，用于 **KV cache block 在 TP 组内的广播**（MLA 场景：rank 0 从 G2/G3 加载 KV block，然后 broadcast 给同 TP 组其他 rank）。这是 Dynamo 控制面自己的数据传输，不归引擎管。
+### 5.2.1 KV Cache 广播是什么
 
-涉及的代码：
+这是 Dynamo 独有的数据传输层，和推理引擎的 TP 集体通信**完全独立**。
 
-| 文件 | 用途 | NCCL 依赖 |
+**背景：MLA（Multi-head Latent Attention）模型**
+
+MLA 架构（DeepSeek v3/v4, Kimi K3 等）的 KV cache 是一个融合后的 latent vector，在 TP 组内**不切分**——每个 GPU 都需要完整的 KV 数据。
+
+**问题场景：**
+
+当 KV block 从持久化存储（G2 host memory / G3 disk）加载到 GPU（G1 device memory）时，如果每个 rank 都独立从 G2/G3 读取：
+- 浪费 I/O 带宽（同样的数据读 N 次）
+- 非 rank 0 的 worker 还需要维护 G2/G3 存储
+
+**Dynamo 的优化方案（replicated 模式）：**
+
+```
+Rank 0:   G3(disk) <---> G2(host) <---> G1(GPU) ===broadcast==> 其他 rank 的 G1
+Rank 1-N: [无需 G2/G3]               G1(GPU) <==================================
+```
+
+- 只有 rank 0 从 G2/G3 加载数据
+- rank 0 通过 NCCL broadcast 把数据发给同 TP 组所有 rank
+- 非 rank 0 的 worker 可以不需要 G2/G3 存储
+
+### 5.2.2 代码架构
+
+Dynamo 有两套广播实现（v1 生产路径 + v2 开发中）：
+
+**v1 生产路径（当前在用）：**
+
+| 文件 | 职责 | NCCL 调用 |
 |------|------|----------|
-| `lib/kvbm-engine/src/collectives/nccl.rs` | KV block 广播，实现了 `CollectiveOps` trait | `ncclBcast` + CUDA stream/event |
-| `lib/llm/src/block_manager/block/transfer/nccl.rs` | 旧版 KV block 传输 v1 API | `ncclBcast`, `ncclGroupStart/End` |
-| `lib/llm/src/block_manager/distributed/nccl_bootstrap.rs` | Dynamo 独立的 KVBM 通信器 bootstrap | `ncclGetUniqueId`, `ncclCommInitRankConfig` |
-| `lib/bindings/kvbm/src/block_manager/distributed/worker.rs` | Python 绑定，从引擎借 `nccl_comm_ptr` | 借用引擎的 NCCL communicator |
+| `lib/llm/src/block_manager/distributed/transfer.rs` | 调度层，`execute_transfer_spmd_replicated()` 判断是否 broadcast | 无 |
+| `lib/llm/src/block_manager/block/transfer/nccl.rs` | 底层 `bcast_block()` / `bcast_layer()` | `ncclBcast`, `ncclGroupStart/End` |
+| `lib/llm/src/block_manager/distributed/nccl_bootstrap.rs` | Dynamo 独立 KVBM 通信器 bootstrap | `ncclGetUniqueId`, `ncclCommInitRankConfig` |
 
-### 关键设计：Dynamo 借用引擎的 communicator
+触发流程：
+```
+KvbmWorker (ZMQ listener)
+  → BlockTransferDispatch → BlockTransferHandler.handle()
+    → execute_transfer_direct()
+      → TransferMode::Replicated
+        → execute_transfer_spmd_replicated()
+          → rank 0 做 G2/G3 → G1 传输
+            → broadcast_device_blocks()
+              → bcast_block() / bcast_layer() [ncclBcast]
+```
 
-生产模式下，Dynamo **不自己创建** TP 组的 NCCL communicator，而是从 Python 层（运行在引擎进程内）借一个 `ncclComm_t` 指针过来。 communicator 的所有权归引擎，Dynamo 只是借用。
+**v2 开发中路径（CollectiveOps trait 抽象）：**
 
-这意味着：
+| 文件 | 职责 |
+|------|------|
+| `lib/kvbm-engine/src/collectives/mod.rs` | `CollectiveOps` trait 定义（broadcast/rank/world_size） |
+| `lib/kvbm-engine/src/collectives/nccl.rs` | `NcclCollectives` 实现 |
+| `lib/kvbm-engine/src/collectives/stub.rs` | `StubCollectiveOps` 空实现（测试用） |
+| `lib/kvbm-engine/src/worker/physical/replicated.rs` | `ReplicatedDataWorker`（部分 unimplemented） |
+
+### 5.2.3 为什么 vLLM Ascend 适配了还不够
+
+vLLM 的 TP 管的是**模型权重并行**（attention all-reduce, linear layer column/row parallel）。
+Dynamo 的 broadcast 管的是**KV cache 块级数据传输**（KVBM 层）。
+
+这是两层完全独立的数据流：
+- vLLM Ascend 用 HCCL 做模型推理通信 → 已在引擎层完成
+- Dynamo 用 NCCL 做 KV cache broadcast → 需要 Dynamo 层适配
+
+**但适配成本不高。**
+
+### 5.2.4 Ascend 适配路径
+
+好消息是 `CollectiveOps` 已经有 trait 抽象。适配路径：
 
 ```
-如果 vLLM Ascend 已经提供了 HCCL communicator →
-Dynamo 只需把"借 nccl_comm_ptr"改为"借 hccl_comm_ptr" →
-然后在 CollectiveOps 后端实现 HCCL 版本的 broadcast
+vLLM Ascend 已提供 HCCL communicator
+  → Dynamo Python 绑定层从 vLLM 借 hccl_comm_ptr（代替 nccl_comm_ptr）
+  → 新增 CollectiveOps 的 HCCL 后端实现
+  → v1 的 block/transfer/nccl.rs 同样需要 HCCL 等价实现
 ```
 
-好消息：`CollectiveOps` 已经有 trait 抽象（`lib/kvbm-engine/src/collectives/mod.rs`），目前有两个实现：
-- `NcclCollectives` — NCCL 后端（生产用）
-- `StubCollectiveOps` — 空实现（测试用）
+具体需要做的事情：
 
-所以 Ascend 适配只需新增一个 `HcclCollectives` 实现，用 Cargo feature 门控即可。
-
-```
-需要做的事情:
-1. 新增 CollectiveOps 的 HCCL 后端实现（lib/kvbm-engine/src/collectives/hccl.rs）
-2. Python 绑定层接受 hccl_comm_ptr 而非 nccl_comm_ptr
-3. 旧版 block/transfer/nccl.rs 也需要 HCCL 等价实现
-4. nccl_bootstrap.rs 改为 hccl_bootstrap.rs（Dynamo 独立的 KVBM 通信器）
-5. 设备枚举 nvml.rs 替换为 Ascend NPU 管理库
-```
+| 改动 | 工作量 | 说明 |
+|------|--------|------|
+| `collectives/hccl.rs` | 中 | 新增 `HcclCollectives` 实现 `CollectiveOps`，对标 `nccl.rs` |
+| `block/transfer/hccl.rs` | 中 | v1 API 的 `bcast_block/bcast_layer` HCCL 版本 |
+| `hccl_bootstrap.rs` | 小 | 对标 `nccl_bootstrap.rs`，用 `hcclGetUniqueId` / `hcclCommInitRank` |
+| Python 绑定层 | 小 | 接受 `hccl_comm_ref` 参数，传递 HCCL communicator |
+| `Cargo.toml` feature | 小 | `#[cfg(feature = "hccl")]` 门控，与 `nccl` feature 互斥 |
+| `nvml.rs` 设备枚举 | 小 | 替换为 Ascend NPU 管理接口 |
 
 ## 6. VirtualConnector (非 K8s 部署)
 
