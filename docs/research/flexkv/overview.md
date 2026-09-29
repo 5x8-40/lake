@@ -57,13 +57,13 @@ FlexKV 原假设所有层 KV shape 一致（统一 `num_kv_heads`/`head_size`，
 
 ### 多 KV 池 + per-token state sidecar：DSV4（[#225](https://github.com/taco-project/FlexKV/pull/225)，`docs/dsv4_compress_state_io_zh.md`）
 
-- 模型：DSA 注意力，C4 KV / C4 indexer KV / SWA KV 三种 KV 池，外加两组运行时 score（attention / indexer compress state）——DSA decode 除 KV 外还读这两组 per-token 选择分数（indexer 据此做 top-k 稀疏选择），它们不由 KV 现算：只恢复 KV 不恢复 score 即"正确 KV + 错误 score"，稀疏选择会选错块。
+- 模型：DSA 注意力，C4 KV / C4 indexer KV / SWA KV 三种 KV 池，外加两组 compressor state（attention / indexer）。state 语义是**压缩流水线的在制品**：待压缩尾块 + overlap 上下文（SGLang `c4_state_transfer_indices`：live tail = `seq_len%4 + 4` 行），窗口有界、不随前缀增长；decode 时 DSA 会读这段尚未压入 KV 的尾部，只回 KV 不回 state 即"正确 KV + 错误 state"。
 - 解法（**两条物理通道，分池分块**）：
  - **主 KV 通道**：C4（CSA 4×）/ C128（HCA 128×）/ indexer 各成 layer group，组级多一个 `compress_ratio` 维度——每块只存 `tokens_per_block / compress_ratio` 行；`compress_ratio=0` 标记不缓存层（如 DSv4 第 0/1 层）。块内按组拼接，与 Gemma4 同机制（上游 main 在 pin 之后又做了 GLM5.2 IndexCache 层组去重，[#293](https://github.com/taco-project/FlexKV/pull/293)）；
  - **SWA 通道**：SWA KV + attention/indexer 两组 score 三个组打包成另一种 byte-flat 块；score 搭 SWA page 做 sidecar——同一逻辑 page id 承载 SWA KV + state，PUT/GET 共用一份 `swa_slot_mapping`；
  - state 做的是**快照 offload/restore**（不是 restore 后重算）；恢复语义是否满足继续 decode，文档自述仍需精度实验确认；
  - state 是 ring buffer、窗口有界——每 SWA page 捎带 `ring_size` 行（该页边界的整环快照），存储量不随前缀增长；
- - **覆盖缺口**：上游文档只注册两组 state（C4 attention / C4 indexer）；若模型还有其他 compressor state（如 C128 路径的 state_cache），其 restore 覆盖需向上游核实。
+ - **C128 路径的 state 未注册，证据指向有意而非遗漏**：SGLang 侧 C128 compressor state 是 `request_scoped`（每请求一页、非前缀共享），其 PD 传输函数明示"块边界无待恢复项"（`deepseek_v4_compress_state.py`::`request_scoped_state_transfer_indices`："Nothing pends at a block boundary"）——与 C4 的跨边界 overlap 尾语义不同。剩余疑点（未证实）：restore 点落在非 128 边界时，尾部在制品是否由引擎从原始 token 重建。
 - 能复用 radix/block 机制的前提：这两组 state **按 token/page 寻址**（挂在 page 上），与 KV 同生命周期。
 - SWA 侧**不**浪费窗口外空间（与 Gemma4 路径的关键区别）：物理上 SWA 与主 KV **分池分块**，"挂载"只是 radix 节点的元数据链接（节点多记一个 `swa_host_slot`），不是同块打包（`cache/radixtree.py`，HiCache `swa_radix_cache` 风格）——
  - I0：每节点最多一份 SWA 快照，只存最后一页（trailing window），窗口外 SWA 不落盘；
