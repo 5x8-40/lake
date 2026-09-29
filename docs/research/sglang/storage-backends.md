@@ -37,7 +37,7 @@ L3 后端统一抽象,位于 `hicache_storage.py:141`。三套接口代际并存
 ## 非后端注册的替代方案
 
 - `lmcache`(`LMCRadixCache` 继承 `RadixCache`,非 `HiCacheStorage`)— radix-cache 层集成,`--enable-lmcache` + `--lmcache-config-file`。见 [../lmcache/overview.md](../lmcache/overview.md)。
-- `flexkv`(`FlexKVRadixCache` 继承 `RadixCache`)— `--enable-flexkv`,rank-0 leader 模式 + eventfd layerwise。源码与 HBM 角色见 [`../flexkv/`](../flexkv/)。
+- `flexkv`(`FlexKVRadixCache` 继承 `RadixCache`)— `--enable-flexkv`,rank-0 leader 模式 + eventfd layerwise。[PR #29701](https://github.com/sgl-project/sglang/pull/29701)(2026-07 合入);因 FlexKV 索引/淘汰在自己的 server 进程,做不了 HiRadixTree 下的哑后端,只能与 HiRadixCache 平行——代价是 scheduler 钩子要 OR `enable_hierarchical_cache`/`enable_flexkv` 两个 flag(该 PR 合入时即修了 `check_hicache_events` 漏 tick 导致锁不释放的卡死)。源码与 HBM 角色见 [`../flexkv/`](../flexkv/)。
 
 ## 异构 TP(`tp_lcm_size`)
 

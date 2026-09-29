@@ -51,6 +51,8 @@ abort 默认不 put；`offload_kv_on_finish` 可强制卸。
 
 C++ `CRadixTreeIndex` 节点记 physical block、hash 链、lock、ready。SWA 挂在同一节点上（slot / tombstone），不是第二棵 GPU 树。
 
+**异构层组的存储布局**（Gemma4 引入，`docs/gemma4_support.md`）：层 shape 不一致时按 `(num_kv_heads, head_size)` 分成若干 `LayerGroupSpec`，但 block 仍统一定长——单一 BLOCKFIRST CPU buffer，每个 block 内按组顺序拼接：`[g0_L0_K|g0_L0_V|…|g0_Ln_V | g1_L0_K|…]`。`token_size_in_bytes` 按组求和；`get_layer_stride()` 等多组下无单一值的接口直接抛错，改用 `get_group_strides()` 拿每组 `(offset, layer_stride, kv_stride, chunk_size)`。两个时序坑：StorageEngine 必须延迟到 GPU 注册（拿到 layer_groups）后创建，否则按 max×max 高估 token 大小（实测 16GB 分出 546 块 vs 正确 1191）；GPU 端 stride 要从 tensor 实际 `stride()` 探测，不能信 layout 配置（triton 与 flash_attn 的 dim0/1 互换）。SSD/GDS/REMOTE 的多组传输框架已搭，C++ 层参数未齐，暂不可用。
+
 Mooncake store 作 REMOTE 时走 `MooncakeStoreCacheEngine`：`match`/`insert` 对齐 `CacheEngineAccel`，键是内容寻址对象，不是节点挂槽。文档：REMOTE2H 只走 prefetch，compute GET 忽略 remote，从本机 ready 层 H2D。
 
 ## 4. 传输
@@ -95,3 +97,6 @@ FlexKV 文档：Dynamo KV events 与 namespace isolation、与 distributed reuse
 | 图绑定引擎 slot | `common/transfer.py`::`set_gpu_blocks` |
 | 每层驱逐 | `docs/eviction_policy/README_zh.md`；`csrc/radix_tree.cpp`::`CRadixTreeIndex::evict` |
 | 事件 medium | `integration/dynamo/collector.py`::`publish_stored`（默认 `CPU`） |
+| 异构层组 | `common/config.py`::`LayerGroupSpec`；`common/storage.py`::`KVCacheLayout.get_group_strides` |
+| stride 自探测 | `transfer/worker.py`::`GPUCPUTransferWorker._get_gpu_strides_from_tensor` |
+| 延迟建 StorageEngine | `transfer_manager.py`::`TransferManager.initialize_transfer_engine` |
