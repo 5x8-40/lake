@@ -115,7 +115,8 @@ flowchart LR
 关键事实：
 
 - N 逻辑层映射到 I+min(B,R) 个物理 buffer，层轮转复用（`layerwise_cache_layout.py:173-183`）；显存预算按比例放大（`worker.py:641-652`）
-- 复用不变量：buffer 被覆盖前，前一层的存必须完成（官方设计文档 §3.3）
+- 复用不变量与「逐缓冲区传输完成门」：物理 buffer 被覆盖（给 layer i+B 用）之前，上一任内容的所有消费者必须完成——① 上一任层的 attention 算完；② 其 KV 存回主机池完成；③（联合 PD 部署）decode 侧远端读完这个 buffer。代码形态：load 任务带 `wait_for_save_layer` 字段，等前一任的 save 完成才启动（`pool_worker.py:2610-2615`），完成状态按**物理存储槽位**而非逻辑层名跟踪（多个逻辑层可指向同一 NPU 地址）
+- 官方设计文档 §8「`MooncakeLayerwiseConnector` 不提供逐缓冲区传输完成门」的含义：①（P2P 直推）只负责把层推给 D，没有按 buffer 回报「内容已被消费、可以覆盖」的同步机制，所以层复用挂不上它
 - APC「命中」的块不真持有 KV → `layerwise_offload=True` 强制整前缀从池重读（`pool_worker.py:1795`；赋值点 L585/L601，门控 `use_layerwise_transfer` L224）
 - 官方设计文档 §8：逐层共享缓冲区卸载**需要 Memcache 后端**和 eager 模式
 - → 这条路径上 **HBM 预热不成立**，只能暖本机 DRAM（D003 方案 B2）

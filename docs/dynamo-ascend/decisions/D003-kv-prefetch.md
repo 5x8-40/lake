@@ -39,15 +39,32 @@
 - `layerwise_offload=True` 时 worker 强制从 block 0 整前缀重读（`pool_worker.py:1795`）——但它只在 **gva 数据面 + 层复用布局**下被赋值（`pool_worker.py:224` `use_layerwise_transfer` 门控，L585/L601）；Mooncake block_key 路径恒为 False（L576 初始化后不变）。gva+层复用必须重读的原因：物理块是共享 staging buffer，APC "命中"的块并不真持有该前缀 KV；block_key 路径用标准完整 KV cache 布局，APC 命中 = 数据真在 HBM
 - `force_layerwise_load`（`pool_scheduler.py:726`）在池有命中时强制建 load spec——但只建 spec；worker 侧 `start_block` 机制兜底，本地全命中时加载列表为空，实际零池读
 
-本机 DRAM 层（池副本）的现状——分两种场景，机制完全不同：
+本机 DRAM 层（池副本）的现状——分两种场景：
 
-- **同机写读**（chunked prefill 主场景）：靠**写路径 local-first**。`_build_replicate_config` 带 `prefer_alloc_in_same_node`（默认 true）与 `preferred_segment=local_seg`（需 mooncake.json 显式配 `preferred_segment:true`，默认 false）（`mooncake_backend.py:346-351`）；layerwise PutStart 同样传入（`mooncake_backend.py:376-383`）。chunk 1 写完落本机 segment → chunk 2+ 重读命中本机副本（副本选择 local-first，`replica_selection.h:122` `SelectBestReplica`，L149-151 本机内存副本优先）。不爆炸
-- **跨机**（副本在别的节点：他机写入的会话复用、P≠D、故障迁移）：**默认代码没有任何机制把读到的 KV 留在本机 DRAM**——
-  - 读路径只把数据读进 HBM，不建本机 DRAM 副本；`BatchGetWhenPreferSameNode` 名字有"prefer"，实际只是按源 segment 聚合批量传输，不建副本（`client_service.cpp:1493`）
-  - `skip_save`（`metadata.py:1150-1151`）保证加载过的前缀不回写本机
-  - 同请求 chunked prefill 后续 chunk 逐层重读已提交前缀（适配文档 §3.3；`session_tracker.py:46-53` `commit_put_keys` 把本请求已提交的 key 加回未来加载集）——跨机时每个 chunk 每层都远端 RDMA
-  - → HBM APC 容量小且 LRU 可驱逐，DRAM 又不留副本 → 长预热窗口 / 大前缀场景每次使用都远端读。**跨机场景的本机 DRAM 落地就是方案 B 要补的空白**
-  - 注意区分两个无关机制：master 侧 promotion-on-hit（`--promotion_on_hit`，默认 false，`master_config.h:202`）只把 **SSD-only** 对象在读命中后晋升回 DRAM（`master_service.cpp:395`），不管远端 DRAM→本机 DRAM；客户端 LocalHotCache 只挂在整对象读路径上，layerwise 的 range 读用不到（见 B1 节证伪）
+- **场景一：同机写读**（chunked prefill 主场景）——写路径 local-first，天然有本机副本
+  - 写：`_build_replicate_config` 带两个放置参数（`mooncake_backend.py:346-351`；layerwise PutStart 同，L376-383）：
+    - `prefer_alloc_in_same_node`：默认 true
+    - `preferred_segment=local_seg`：需 mooncake.json 显式配 `preferred_segment:true`（默认 false——不配则 local-first 落空）
+  - 读：副本选择 local-first（`replica_selection.h:122` `SelectBestReplica`，L149-151 本机内存副本优先）
+  - 结果：本节点写出的 KV 落本机 segment，后续读（含 chunk 间重读，见下）命中本机副本，无跨机流量
+- **场景二：跨机**（副本在别的节点：他机写入的会话复用、P≠D、故障迁移）——默认代码没有任何机制把读到的 KV 留在本机 DRAM
+  - 读路径只进 HBM，不建本机 DRAM 副本：`BatchGetWhenPreferSameNode` 名字有 prefer，实际只是按源 segment 聚合批量传输，不建副本（`client_service.cpp:1493`）
+  - 加载过的前缀不回写本机：`skip_save`（`metadata.py:1150-1151`）
+  - HBM 侧也留不住：APC 是 LRU，**驱逐即丢弃，没有"驱逐时写回本机 DRAM"的机制**
+    - 本节点自己算出的 KV：计算时已写池（写穿），local-first 配置下本机 segment 有副本 → 驱逐无所谓
+    - 池命中加载的 KV：`skip_save` 不写回 → 驱逐后本地无任何副本，下次使用重新远端读
+  - → **跨机场景的本机 DRAM 落地就是方案 B 要补的空白**
+
+chunk 间重读机制的准确图景（易误读，单独说清）：
+
+- 机制：同请求 chunked prefill，已加载/已提交的 key 留在该请求的加载集里，后续每个 chunk 都逐层重读（`session_tracker.py:46-71` `commit_put_keys` + `prepare_load_entries`；适配文档 §3.3）
+- 看似冗余：继续中的 chunk，其前缀 KV 仍在请求的 HBM block 里（block 随请求持有），重读 = 覆盖相同数据。设计目的是抢占/重试的统一处理（`release_for_retry` 保留 entries 供重试），正常路径上确实多读了
+- 重读的源分两部分，成本完全不同：
+  - 本请求自算部分：local-first 写 → 重读命中**本机副本** → 本机 DRAM 读，无 RDMA
+  - 跨机池命中部分：副本在他机 → **每个 chunk 每层都是远端 RDMA** ← 性能问题在这里
+- 两个无关机制，不要误当成解决方案：
+  - master promotion-on-hit（`--promotion_on_hit`，默认 false，`master_config.h:202`）：只把 **SSD-only** 对象在读命中后晋升回 DRAM（`master_service.cpp:395`），不管远端 DRAM→本机 DRAM
+  - 客户端 LocalHotCache：只挂整对象读路径，layerwise 的 range 读用不到（见 B1 节证伪）
 
 ## 方案 A：预取请求 → 预取进 HBM（两种模式通用）
 
@@ -64,7 +81,7 @@
 释放方式两选：
 
 - **零代码**：`max_tokens=1` 自然结束。代价 = 1 token prefill（末 token 重算）+ 1 token decode + 短暂占一个 running 槽
-- **patch（finish-at-promotion）**：`_try_promote_blocked_waiting_request` 提升成功即结束请求。零计算零槽位，但要改调度器
+- **patch（finish-at-promotion）**：改上游**现有**函数 `_try_promote_blocked_waiting_request`（`scheduler.py:3079`，现职责 = 把加载完的请求从 `WAITING_FOR_REMOTE_KVS` 提升回 WAITING），提升成功即结束请求。零计算零槽位，但要改调度器
 
 注意：
 
@@ -92,24 +109,32 @@ Mooncake 客户端有本地热缓存（`LocalHotCache`，`local_hot_cache.h`）�
 
 ### B2: 显式副本复制 `create_copy_task`（全 Python API，无引擎参与）——**选定**
 
-不依赖热缓存，直接让池在目标节点 segment 建一个正式副本：
+一句话：调 Mooncake 的副本复制 API，让池把指定 key 复制一份到目标节点的 segment；之后该节点的读自动走本机副本。
 
-1. 独立预取进程（任意机器）建 store 客户端，调 `create_copy_task(key, [目标segment])`（Python 绑定 `store_py.cpp:3362`）
-2. master 校验后把 REPLICA_COPY 任务派给源副本所在 segment 的属主客户端（`master_service.cpp:13677` `CreateCopyTask`；源 segment 从现有副本中随机选）
+前提：Mooncake 支持一个 key 多个副本（已核实）——
+
+- 写时副本数：`ReplicateConfig.replica_num`（`replica.h:105`，默认 1）
+- 查询返回副本列表：`QueryResult.replicas`（`client_service.h:47`）
+- 已存在的 key 再 Put 是幂等 no-op（`OBJECT_ALREADY_EXISTS` 按成功返回，`client_service.cpp:1958-1961`）→ **建第二副本不能用 Put，必须用 `create_copy_task`**
+
+步骤：
+
+1. 预取进程（独立进程，任意机器）建 store 客户端，调 `create_copy_task(key, [目标segment])`（Python 绑定 `store_py.cpp:3362`）
+2. master 校验后把 REPLICA_COPY 任务派给源副本所在 segment 的属主客户端（`master_service.cpp:13677` `CreateCopyTask`；源 segment 从现有副本随机选）
 3. 源客户端后台线程每 1s 拉任务并执行（`client_service.cpp:4983` `TaskPollThreadMain` → `FetchTasks` L4961 → `ExecuteReplicaTransfer` L4273，要求源在本机内存 L4297）
-4. 完成后目标节点读路径自动选本机副本：
+4. 完成后目标节点持有本机副本，读路径自动选中：
    - 非 layerwise 整对象读：`SelectBestReplica` local-first（`replica_selection.h:122`，L149-151）
-   - **layerwise range 读（已核实）**：副本选择在 get session 建立时——`batch_get_session_start`（`real_client.cpp:6361`）→ `SelectSessionReplica`（`real_client.cpp:490`）→ `SelectCompleteMemoryReplica`（`real_client.cpp:470-488`，本机内存副本优先）；session 锁定单副本（`real_client.cpp:6470-6474`，多副本直接报错）→ 之后每层 range 读都用这个本机副本
+   - layerwise range 读：get session 建立时选副本，本机内存副本优先（`real_client.cpp:470-488` `SelectCompleteMemoryReplica`）；session 锁定单副本（`real_client.cpp:6470-6474`），之后每层 range 读都用它
 
-要点：
+约束：
 
 - 目标 segment 名 = worker 的 `local_seg`（`hostname:rpc_port`，`mooncake_backend.py:263`；fabric-mem 路径为裸 hostname，L276）
-- key 名单：按 key 格式 `model@block_hash@rank`（适配文档 §2）自行计算；`QueryByRegex` 无 Python 绑定，只能逐 key 算。放置结果可用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）
+- key 名单自行计算：格式 `model@block_hash@rank`（适配文档 §2）；`QueryByRegex` 无 Python 绑定，只能逐 key 算；放置结果用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）
+- 复制粒度 = 整个对象（全层），不是单层 range——对预取正好
+- 时序约束：`create_copy_task` 必须在目标节点的 get session 建立**之前**完成，否则 session 已锁定远端副本——预取-使用窗口归控制面把握
+- 源属主客户端必须在线（即贡献了 segment 的 worker 进程内客户端）
 - 任务状态可查：`QueryTask`（`master_service.h:915`）
-- 复制粒度是整个对象（全层），不是单层 range——对预取正好
-- 产出是池正式副本，不受热缓存 LRU 影响，只受池级驱逐策略影响
-- 源属主客户端必须在线（vllm-ascend 部署中即贡献了 segment 的 worker 进程内客户端）
-- 时序约束：`create_copy_task` 必须在目标节点的 get session 建立**之前**完成，否则 session 已锁定远端副本——预取-使用窗口仍归控制面把握
+- 产出是池正式副本：不受热缓存 LRU 影响，只受池级驱逐策略影响
 
 ## 决策
 
@@ -117,7 +142,7 @@ Mooncake 客户端有本地热缓存（`LocalHotCache`，`local_hot_cache.h`）�
 
 - **容量**：HBM 可用于 KV 的空间（几十 GB 级）<< 本机 DRAM（数百 GB 级）。要预热的前缀集超过 HBM 可容纳量时，只能落 DRAM
 - **窗口**：APC 是 LRU 无 pin，真实流量会挤出预取前缀；DRAM 副本只受池级驱逐，存活周期长得多。agent 会话停顿这类长窗口场景，HBM 层收益流失
-- **成本**：壳请求是真实请求——走调度、占槽（layerwise 下同步占槽）、执行一次 forward；批量预热时与真实流量竞争引擎资源。B2 是带外 API（独立进程、任意机器），复制走源端后台线程，对引擎零侵入、可限速
+- **成本**（分路径，已核实）：非 layerwise + `load_async=true` 时壳请求传输期不占槽零计算，patch 释放路径零 forward——成本≈0；零代码释放（`max_tokens=1`）需 1 token prefill + 1 token decode + 短暂占槽；**layerwise 下壳请求同步占槽，槽位被占满整个逐层传输期**，批量预热时与真实流量竞争。B2 完全不经引擎（带外 API，复制走源端后台线程，可限速）
 - **兜底**：layerwise 跨机默认无本机落地（见「两种模式的分野」）；HBM 层失效（驱逐/未预热）时，本机 DRAM 副本把「每层远端 RDMA」降为「本机 DRAM 读」（get session 建立时本机副本优先）
 
 因此不是二选一：**A 为主**（短窗口、小前缀集、即时预热），**B 为容量/窗口层**（长窗口、大前缀集、批量预热）。
