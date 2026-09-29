@@ -54,7 +54,8 @@
 | 统一切块靠"块内分组拼接"保住 | 单一 BLOCKFIRST buffer，block 内按组顺序排各层 K/V，`token_size_in_bytes` 按组求和，传输按组各调一次 `transfer_kv_blocks()` | lake block 同样定长；若边缘侧要承载异构层模型，这是候选打包模式 |
 | 布局假设会踩坑 | triton `[N,2,B,H,D]` vs flash_attn `[2,N,B,H,D]` dim0/1 互换，信配置算错 stride → 改为从 tensor 实际 `stride()` 探测 | 布局元数据必须由注册方实测上报，控制面不内置假设 |
 | 注册前不知道组 → buffer 估算错 | max(head)×max(dim) 高估 2.18 倍，16GB 分 546 块 vs 正确 1191；修复为延迟创建 StorageEngine | 池按注册配额算账，容量视图以注册后实测为准 |
-| Mamba/线性注意力 state 不支持 | 全仓 `mamba|conv_state|recurrent|linear_attn` 零命中（2026-09-29）；抽象是 per-token 块，递归 state 需块边界快照 | lake 已声明 t-type/r-type：block 内装逐 token KV 还是紧凑 state 快照由布局元数据声明（[`../../architecture/storage-layer.md`](../../architecture/storage-layer.md)） |
+| per-token 非 KV state 已支持 | DSV4 两组 compress score 搭 SWA page 做 sidecar，同一 page id 承载 KV+state，快照式 offload/restore（[#225](https://github.com/taco-project/FlexKV/pull/225)，`docs/dsv4_compress_state_io_zh.md`） | 与 lake"block 内装什么由布局元数据声明"同思路；sidecar 是边缘侧打包的一种实现 |
+| 递归 state（Mamba/GDN/KDN）不支持 | 本地 pin 全仓 grep + 上游 main（至 2026-09-20）代码搜索 `gdn`/`kdn`/`gated_delta`/`mamba` 均无实现（2026-09-29 核实）；递归 state 每序列定长、随 decode 更新，需块边界快照语义，与 per-token 块抽象不同 | lake 已声明 t-type/r-type：block 内装逐 token KV 还是紧凑 state 快照由布局元数据声明（[`../../architecture/storage-layer.md`](../../architecture/storage-layer.md)） |
 | 引擎侧 hybrid 管理被旁路 | vLLM 开 `--kv-transfer-config` 即禁用 Hybrid KV Cache Manager，SWA 窗口外 KV 照存 | connector 是必经路径时，窗口/稀疏语义应由布局元数据保留，而不是靠引擎管理器兜底 |
 
 ## 可直接借鉴

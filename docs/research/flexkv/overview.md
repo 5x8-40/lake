@@ -36,13 +36,38 @@ SGLang 侧有两种形态，注意区分：
 - 通过 connector 注入，不自研 serving 引擎。
 - 默认可库内直调；DP>1 或多实例走 ZMQ server-client。
 
-## 异构 KV 与 Mamba 边界
+## 异构 KV 与 state 边界
 
-FlexKV 原假设所有层 KV shape 一致（统一 `num_kv_heads`/`head_size`，贯穿配置、buffer、stride、传输）。2026-07 起陆续打破：
+FlexKV 原假设所有层 KV shape 一致（统一 `num_kv_heads`/`head_size`，贯穿配置、buffer、stride、传输）。2026-07 起被三类异构需求打破，处理手法各不相同。
 
-- **Gemma4 31B**（`docs/gemma4_support.md`）：50 层 SWA（16 head×256）+ 10 层 full attention（4 head×512）。解法是 `LayerGroupSpec`（按 `(num_kv_heads, head_size)` 分组），但**统一切块被保住**：单一 BLOCKFIRST CPU buffer，每个 block 内按组顺序拼接各层 K/V，`token_size_in_bytes` 按组求和；异构性只体现为组内 `(offset, layer_stride, kv_stride, chunk_size)`（`get_group_strides()`），传输时每组各调一次 `transfer_kv_blocks()`。两个配套修复值得记：GPU stride 从 tensor 实际 `stride()` 探测（triton `[N,2,B,H,D]` vs flash_attn `[2,N,B,H,D]` 布局 dim0/1 互换，信配置会算错）；`StorageEngine` 延迟到 GPU 注册后创建（否则按 max×max 估算 token 大小，16GB 只分出 546 块 vs 正确值 1191）。vLLM 侧代价：开 `--kv-transfer-config` 后 vLLM 禁用自己的 Hybrid KV Cache Manager，connector 看到全部层完整 per-token KV，SWA 滑窗语义被放弃（窗口外 KV 照存，浪费但正确）。
-- **DeepSeek-V4**（[#225](https://github.com/taco-project/FlexKV/pull/225)，`docs/dsv4_compress_state_io_zh.md`）：异构 C4/C128/indexer KV group + FullKV/SWA 双缓存 + attention/indexer compress-state sidecar + 逐层恢复。与 Gemma4 同属"混合注意力"一族的层组化。
-- **Mamba / 线性注意力 state：不支持**（2026-09-29 全仓核实，`mamba|conv_state|recurrent|linear_attn` 零命中）。FlexKV 的抽象是"每 token 定长 KV 块 + radix 前缀匹配"；递归 state 每序列定长、不随 token 增长，前缀复用需要块边界 state 快照，概念体系不同。DSV4 的 compress-state sidecar 是稀疏注意力 indexer 状态，仍属注意力家族，不算递归 state 支持。对照：SGLang `HiCacheStorage` v2 用**物理分池**承载 Mamba/SWA/DSA/Draft（见 [`../sglang/storage-backends.md`](../sglang/storage-backends.md)）；lake 的对应答案是 t-type/r-type 布局元数据（[`../../architecture/storage-layer.md`](../../architecture/storage-layer.md) "KV 类型"节）。
+### 层 shape 异构：Gemma4（`docs/gemma4_support.md`）
+
+- 模型：50 层 SWA（16 head×256）+ 10 层 full attention（4 head×512）。
+- 解法：`LayerGroupSpec` 按 `(num_kv_heads, head_size)` 分组，**统一定长块不变**，异构性收进 block 内部：
+ - 存储：单一 BLOCKFIRST buffer，block 内按组顺序拼接各层 K/V；`token_size_in_bytes` 按组求和；
+ - 寻址：组级 `(offset, layer_stride, kv_stride, chunk_size)` 由 `get_group_strides()` 给出；
+ - 传输：每组各调一次 `transfer_kv_blocks()`。
+- 两个配套修复：
+ - GPU stride 从 tensor 实际 `stride()` 探测——triton `[N,2,B,H,D]` 与 flash_attn `[2,N,B,H,D]` dim0/1 互换，信配置会算错；
+ - `StorageEngine` 延迟到 GPU 注册后创建——否则按 max×max 高估 token 大小（实测 16GB 分出 546 块 vs 正确 1191）。
+- vLLM 侧代价：开 `--kv-transfer-config` 即禁用 Hybrid KV Cache Manager，SWA 滑窗语义被放弃，窗口外 KV 照存（浪费但正确）。
+
+### 多 KV 池 + per-token state sidecar：DSV4（[#225](https://github.com/taco-project/FlexKV/pull/225)，`docs/dsv4_compress_state_io_zh.md`）
+
+- 模型：DSA 注意力，C4 KV / C4 indexer KV / SWA KV 三种 KV 池，外加两组运行时 score（attention / indexer compress state）。
+- 解法：
+ - 三种 KV 各成 layer group（上游 main 在 pin 之后又做了 GLM5.2 IndexCache 层组去重，[#293](https://github.com/taco-project/FlexKV/pull/293)）；
+ - score state 搭 SWA page 做 sidecar——同一逻辑 page id 同时承载 SWA KV bytes + 两组 state bytes，PUT/GET 共用一份 `swa_slot_mapping`；
+ - 做的是 **state 快照的 offload/restore**（不是 restore 后重算）；恢复后的 state 是否满足继续 decode 的语义，文档自述仍需精度实验确认。
+- 能复用 radix/block 机制的前提：这两组 state **按 token/page 寻址**（挂在 page 上），与 KV 同生命周期。
+
+### 递归 state（Mamba / GDN / KDN 等线性注意力）：不支持
+
+- 核实（2026-09-29）：本地 pin `a5c8f12` 全仓 grep 零命中；上游 main（至 2026-09-20 `738ddc1`）代码搜索 `gdn`/`kdn`/`gated_delta`/`mamba` 亦无实现（唯一 `mamba` 命中是树外 SGLang patch 里的 SGLang 侧上下文行，非 FlexKV 代码）。
+- 原因：复用单元是"每 token 定长块 + radix 前缀匹配"；递归 state 每序列定长、随 decode 衰减更新，前缀复用需要"块边界 state 快照"语义，概念体系不同。DSV4 的 score sidecar 之所以能成，正因为它按 page 寻址、不是递归 state。
+- 对照：
+ - SGLang `HiCacheStorage` v2 用物理分池承载 Mamba/SWA/DSA/Draft（见 [`../sglang/storage-backends.md`](../sglang/storage-backends.md)）；
+ - lake 的对应答案是 t-type/r-type 布局元数据（[`../../architecture/storage-layer.md`](../../architecture/storage-layer.md) "KV 类型"节）。
 
 ## 架构
 
