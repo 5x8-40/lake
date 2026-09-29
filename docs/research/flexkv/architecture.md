@@ -57,6 +57,8 @@ C++ `CRadixTreeIndex` 节点记 physical block、hash 链、lock、ready。SWA �
 - I3：`full_lock_ref ≥ swa_lock_ref` 恒成立；
 - SWA 有独立 LRU 与 `evict_swa()`：可单独驱逐 SWA 而不动 Full KV；结构变更释放的 SWA slot 经 `_freed_swa_slots` 归还 SWA host pool。
 
+SWA 池容量与主 KV **独立配置、互不折算**（`common/config.py`::`SWAPoolConfig`）：主 KV 池按 GB 预算换算块数；SWA 池按显式槽数（`num_slots`，默认 1024；SSD/REMOTE 另算，默认 0=不开）。1 槽 = 1 page trailing window（+ sidecar），槽字节 = `num_swa_layers × bytes_per_token_per_layer × tokens_per_block`（DSv4：61×584B×256 ≈ 9.1MB/槽）。由 I0 得规划口径：SWA 槽数 ≈ 可同时挂窗口的前缀节点数上限。
+
 挂同一棵树（而非独立索引）是为了统一两池驱逐、避免漂移——可复用前缀 = `min(full_hit, swa_hit)`，漂移直接侵蚀命中率。
 
 **异构层组的存储布局**（Gemma4 引入，`docs/gemma4_support.md`）：

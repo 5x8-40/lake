@@ -57,7 +57,7 @@ FlexKV 原假设所有层 KV shape 一致（统一 `num_kv_heads`/`head_size`，
 
 ### 多 KV 池 + per-token state sidecar：DSV4（[#225](https://github.com/taco-project/FlexKV/pull/225)，`docs/dsv4_compress_state_io_zh.md`）
 
-- 模型：DSA 注意力，C4 KV / C4 indexer KV / SWA KV 三种 KV 池，外加两组运行时 score（attention / indexer compress state）。
+- 模型：DSA 注意力，C4 KV / C4 indexer KV / SWA KV 三种 KV 池，外加两组运行时 score（attention / indexer compress state）——DSA decode 除 KV 外还读这两组 per-token 选择分数（indexer 据此做 top-k 稀疏选择），它们不由 KV 现算：只恢复 KV 不恢复 score 即"正确 KV + 错误 score"，稀疏选择会选错块。
 - 解法（**两条物理通道，分池分块**）：
  - **主 KV 通道**：C4（CSA 4×）/ C128（HCA 128×）/ indexer 各成 layer group，组级多一个 `compress_ratio` 维度——每块只存 `tokens_per_block / compress_ratio` 行；`compress_ratio=0` 标记不缓存层（如 DSv4 第 0/1 层）。块内按组拼接，与 Gemma4 同机制（上游 main 在 pin 之后又做了 GLM5.2 IndexCache 层组去重，[#293](https://github.com/taco-project/FlexKV/pull/293)）；
  - **SWA 通道**：SWA KV + attention/indexer 两组 score 三个组打包成另一种 byte-flat 块；score 搭 SWA page 做 sidecar——同一逻辑 page id 承载 SWA KV + state，PUT/GET 共用一份 `swa_slot_mapping`；
