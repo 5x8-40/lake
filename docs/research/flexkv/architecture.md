@@ -49,7 +49,30 @@ abort 默认不 put；`offload_kv_on_finish` 可强制卸。
 
 驱逐策略：lru（默认）/ lfu / slru / fifo / mru / filo；水位 `evict_start_threshold`、每次 `evict_ratio`。
 
-C++ `CRadixTreeIndex` 节点记 physical block、hash 链、lock、ready。SWA 挂在同一节点上（slot / tombstone），不是第二棵 GPU 树。
+C++ `CRadixTreeIndex` 节点记 physical block、hash 链、lock、ready。SWA 挂在同一节点上（slot / tombstone），不是第二棵 GPU 树。**注意"挂载"只是 radix 节点的元数据链接**（节点多记一个 `swa_host_slot` + tombstone 标志）：物理上 SWA 与主 KV 分池分块（DSv4 中主 KV 通道与 SWA 通道各自注册、各自 byte-flat 块），所以两者生命周期可以独立。节点挂载 SWA 的不变量（`cache/radixtree.py` 文件头注释，C++ 版同构，DSv4 用 C++ 版）：
+
+- I0：每节点最多一份 SWA 快照，只存**最后一页**（trailing window）——窗口外 SWA 不落盘；
+- I1：SWA ⊂ Full——释放节点 Full KV 必连带释放其 SWA slot；
+- I2：叶子必须有活 SWA，除非 Full 被 lock（失 SWA 又未锁的叶子无意义，级联删除）；
+- I3：`full_lock_ref ≥ swa_lock_ref` 恒成立；
+- SWA 有独立 LRU 与 `evict_swa()`：可单独驱逐 SWA 而不动 Full KV；结构变更释放的 SWA slot 经 `_freed_swa_slots` 归还 SWA host pool。
+
+SWA 池容量与主 KV **独立配置、互不折算**（`common/config.py`::`SWAPoolConfig`）：主 KV 池按 GB 预算换算块数；SWA 池按显式槽数（`num_slots`，默认 1024；SSD/REMOTE 另算，默认 0=不开）。1 槽 = 1 page trailing window（+ sidecar），槽字节 = `num_swa_layers × bytes_per_token_per_layer × tokens_per_block`（DSv4：61×584B×256 ≈ 9.1MB/槽）。由 I0 得规划口径：SWA 槽数 ≈ 可同时挂窗口的前缀节点数上限。
+
+挂同一棵树（而非独立索引）是为了统一两池驱逐、避免漂移——可复用前缀 = `min(full_hit, swa_hit)`，漂移直接侵蚀命中率。
+
+**异构层组的存储布局**（Gemma4 引入，`docs/gemma4_support.md`）：
+
+- 分组：层 shape 不一致时按 `(num_kv_heads, head_size)` 分成若干 `LayerGroupSpec`。
+- 池结构：**通道 × 介质**。主 KV 与 SWA 两通道各自在 CPU/SSD/REMOTE 建独立 layout/buffer（`storage_engine.py` 的 `_cpu/_ssd/_remote_layout` 与 `_swa_*_layout`，SSD/Remote layout 类型被强制与 CPU 一致），DSv4 全开即 6 个物理池；GPU 永远不是池。
+- 布局：**统一定长是池内性质**——每池 byte-flat `[num_blocks, bytes_per_block]`，主 KV 块与 SWA 块长度不同。块内按组**拼接**（不是 padding）：每组按真实字节数（`层数 × kv_dim × (tpb/compress_ratio) × heads × head_size × dtype`）依次占 byte offset，不拉齐不填充——C128 组每块行数是 C4 组的 1/32，区域天然小。
+- 接口：`get_layer_stride()` 等多组下无单一值的接口直接抛错，改用 `get_group_strides()` 拿每组 `(offset, layer_stride, kv_stride, chunk_size)`。
+- 压缩率维度（DSV4 引入）：组级 `compress_ratio`——每块只存 `tokens_per_block / compress_ratio` 行（CSA 4× / HCA 128×）；`compress_ratio=0` 标记不缓存层（如 DSv4 第 0/1 层）。
+- 下层不透明：CPU↔SSD/Remote 把每个 page 当 opaque byte block 整块读写，不再解析 group——组语义只存在于 GPU↔CPU 边缘侧，往下即字节块（与 lake"池不解释布局"在存储层收敛一致）。
+- 两个时序坑：
+ - StorageEngine 必须延迟到 GPU 注册（拿到 layer_groups）后创建，否则按 max×max 高估 token 大小（实测 16GB 分出 546 块 vs 正确 1191）；
+ - GPU 端 stride 要从 tensor 实际 `stride()` 探测，不能信 layout 配置（triton 与 flash_attn 的 dim0/1 互换）。
+- 边界：SSD/GDS/REMOTE 的多组传输框架已搭，C++ 层参数未齐，pin 版本暂不可用。
 
 Mooncake store 作 REMOTE 时走 `MooncakeStoreCacheEngine`：`match`/`insert` 对齐 `CacheEngineAccel`，键是内容寻址对象，不是节点挂槽。文档：REMOTE2H 只走 prefetch，compute GET 忽略 remote，从本机 ready 层 H2D。
 
@@ -95,3 +118,7 @@ FlexKV 文档：Dynamo KV events 与 namespace isolation、与 distributed reuse
 | 图绑定引擎 slot | `common/transfer.py`::`set_gpu_blocks` |
 | 每层驱逐 | `docs/eviction_policy/README_zh.md`；`csrc/radix_tree.cpp`::`CRadixTreeIndex::evict` |
 | 事件 medium | `integration/dynamo/collector.py`::`publish_stored`（默认 `CPU`） |
+| 异构层组 | `common/config.py`::`LayerGroupSpec`；`common/storage.py`::`KVCacheLayout.get_group_strides` |
+| SWA 节点挂载 | `cache/radixtree.py` 文件头（不变量 I0–I4）；`evict_swa`；`csrc/radix_tree.cpp` 同构 |
+| stride 自探测 | `transfer/worker.py`::`GPUCPUTransferWorker._get_gpu_strides_from_tensor` |
+| 延迟建 StorageEngine | `transfer_manager.py`::`TransferManager.initialize_transfer_engine` |
