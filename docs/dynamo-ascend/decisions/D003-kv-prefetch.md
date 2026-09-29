@@ -117,24 +117,54 @@ Mooncake 客户端有本地热缓存（`LocalHotCache`，`local_hot_cache.h`）�
 - 查询返回副本列表：`QueryResult.replicas`（`client_service.h:47`）
 - 已存在的 key 再 Put 是幂等 no-op（`OBJECT_ALREADY_EXISTS` 按成功返回，`client_service.cpp:1958-1961`）→ **建第二副本不能用 Put，必须用 `create_copy_task`**
 
-步骤：
+#### 复制流程
 
-1. 预取进程（独立进程，任意机器）建 store 客户端，调 `create_copy_task(key, [目标segment])`（Python 绑定 `store_py.cpp:3362`）
-2. master 校验后把 REPLICA_COPY 任务派给源副本所在 segment 的属主客户端（`master_service.cpp:13677` `CreateCopyTask`；源 segment 从现有副本随机选）
-3. 源客户端后台线程每 1s 拉任务并执行（`client_service.cpp:4983` `TaskPollThreadMain` → `FetchTasks` L4961 → `ExecuteReplicaTransfer` L4273，要求源在本机内存 L4297）
-4. 完成后目标节点持有本机副本，读路径自动选中：
-   - 非 layerwise 整对象读：`SelectBestReplica` local-first（`replica_selection.h:122`，L149-151）
-   - layerwise range 读：get session 建立时选副本，本机内存副本优先（`real_client.cpp:470-488` `SelectCompleteMemoryReplica`）；session 锁定单副本（`real_client.cpp:6470-6474`），之后每层 range 读都用它
+```mermaid
+sequenceDiagram
+    participant W as 预取进程（独立，任意机器）
+    participant M as Mooncake master
+    participant S as 源节点 store 客户端<br/>（源 segment 属主）
+    participant T as 目标节点 segment<br/>（目标 worker 进程内客户端贡献）
+    W->>M: create_copy_task(key, [目标 segment])<br/>Python 绑定 store_py.cpp:3362
+    M->>M: 校验；从现有副本随机选源<br/>master_service.cpp:13677 CreateCopyTask
+    M-->>S: 挂 REPLICA_COPY 任务
+    S->>M: 后台线程每 1s 拉任务<br/>client_service.cpp:4983 TaskPollThreadMain
+    M-->>S: 下发任务
+    S->>T: ExecuteReplicaTransfer：读源副本 → 写目标 segment<br/>client_service.cpp:4273（要求源在本机内存，L4297）
+    S->>M: 上报完成（QueryTask 可查进度，master_service.h:915）
+```
 
-约束：
+要点：
 
-- 目标 segment 名 = worker 的 `local_seg`（`hostname:rpc_port`，`mooncake_backend.py:263`；fabric-mem 路径为裸 hostname，L276）
-- key 名单自行计算：格式 `model@block_hash@rank`（适配文档 §2）；`QueryByRegex` 无 Python 绑定，只能逐 key 算；放置结果用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）
-- 复制粒度 = 整个对象（全层），不是单层 range——对预取正好
-- 时序约束：`create_copy_task` 必须在目标节点的 get session 建立**之前**完成，否则 session 已锁定远端副本——预取-使用窗口归控制面把握
-- 源属主客户端必须在线（即贡献了 segment 的 worker 进程内客户端）
-- 任务状态可查：`QueryTask`（`master_service.h:915`）
+- 引擎（vllm worker）全程不参与计算与调度：复制是 store 客户端之间的后台传输
+- 复制粒度 = 整个对象（全层 KV），不是单层 range——对预取正好
 - 产出是池正式副本：不受热缓存 LRU 影响，只受池级驱逐策略影响
+
+#### 生效原理：读路径自动选中本机副本
+
+副本选择是读路径的既有行为，不需任何配置：
+
+- **非 layerwise**（整对象读）：`SelectBestReplica` local-first（`replica_selection.h:122`，L149-151 本机内存副本优先）
+- **layerwise**（range 读）：get session 建立时选一次副本，本机内存副本优先（`real_client.cpp:470-488` `SelectCompleteMemoryReplica`）；session 锁定该副本（`real_client.cpp:6470-6474`），之后每层 range 读都用它
+
+```mermaid
+flowchart LR
+    subgraph Before[复制前]
+        R1[目标节点读] --> REM[远端副本<br/>跨机 RDMA]
+    end
+    subgraph After[复制后]
+        R2[目标节点读] -->|local-first| LOC[本机副本<br/>本机 DRAM 读]
+    end
+```
+
+复制不删远端副本——远端副本仍在池中作冗余，读路径只是优先选本机。
+
+#### 约束
+
+- **时序**：`create_copy_task` 必须在目标节点的 get session 建立**之前**完成——session 建立时锁定单副本，复制晚于 session 则该请求仍读远端。预取-使用窗口归控制面把握
+- **目标指定**：segment 名 = worker 的 `local_seg`（`hostname:rpc_port`，`mooncake_backend.py:263`；fabric-mem 路径为裸 hostname，L276）
+- **key 名单**：自行按格式 `model@block_hash@rank` 逐 key 计算（适配文档 §2）；`QueryByRegex` 无 Python 绑定；放置结果用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）
+- **依赖**：源属主客户端必须在线（即贡献了源 segment 的 worker 进程内客户端）
 
 ## 决策
 
