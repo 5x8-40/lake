@@ -63,7 +63,12 @@ FlexKV 原假设所有层 KV shape 一致（统一 `num_kv_heads`/`head_size`，
  - **SWA 通道**：SWA KV + attention/indexer 两组 score 三个组打包成另一种 byte-flat 块；score 搭 SWA page 做 sidecar——同一逻辑 page id 承载 SWA KV + state，PUT/GET 共用一份 `swa_slot_mapping`；
  - state 做的是**快照 offload/restore**（不是 restore 后重算）；恢复语义是否满足继续 decode，文档自述仍需精度实验确认；
  - state 是 ring buffer、窗口有界——每 SWA page 捎带 `ring_size` 行（该页边界的整环快照），存储量不随前缀增长；
- - **C128 路径的 state 未注册，证据指向有意而非遗漏**：SGLang 侧 C128 compressor state 是 `request_scoped`（每请求一页、非前缀共享），其 PD 传输函数明示"块边界无待恢复项"（`deepseek_v4_compress_state.py`::`request_scoped_state_transfer_indices`："Nothing pends at a block boundary"）——与 C4 的跨边界 overlap 尾语义不同。剩余疑点（未证实）：restore 点落在非 128 边界时，尾部在制品是否由引擎从原始 token 重建。
+ - **C128 路径的 state 未注册——是取舍，且在缓存复用路径下是开放问题**：
+   - SGLang 侧 C128 compressor state 是 `request_scoped`（每请求一页），其 PD 传输函数明示"块边界无待恢复项"（`deepseek_v4_compress_state.py`::`request_scoped_state_transfer_indices`）——但这是 128 对齐的 PD 语境；
+   - FlexKV restore 粒度 = SWA page（如 64 token），64 ∤ 128 → 命中点一般不在 C128 边界，尾部 ≤127 token 的在制品存在却未存；
+   - 不存的代价沿层传导：重建某层的待压尾需要前层输出 → 尾部 token 的 mini-prefill 沿 C128 层栈传播（量级 ≈ 尾部 token 数 × C128 层数）；
+   - 存的代价：每 radix 节点 ≈ C128 层数 × 128 行 × 1024 × fp32（约 10MB/节点，数倍于 SWA 页）——当前实现把成本放在了 restore 侧；
+   - 开放问题：restore 路径对这段尾部是自动重建（正确但慢）、不重建（错）、还是强制对齐 128 边界截短命中（正确但损命中率）——需实测或问上游。
 - 能复用 radix/block 机制的前提：这两组 state **按 token/page 寻址**（挂在 page 上），与 KV 同生命周期。
 - SWA 侧**不**浪费窗口外空间（与 Gemma4 路径的关键区别）：物理上 SWA 与主 KV **分池分块**，"挂载"只是 radix 节点的元数据链接（节点多记一个 `swa_host_slot`），不是同块打包（`cache/radixtree.py`，HiCache `swa_radix_cache` 风格）——
  - I0：每节点最多一份 SWA 快照，只存最后一页（trailing window），窗口外 SWA 不落盘；
