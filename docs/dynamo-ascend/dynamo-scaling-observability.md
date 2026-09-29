@@ -1668,6 +1668,127 @@ vLLM Ascend 已提供 HCCL communicator
 | `Cargo.toml` feature | 小 | `#[cfg(feature = "hccl")]` 门控，与 `nccl` feature 互斥 |
 | `nvml.rs` 设备枚举 | 小 | 替换为 Ascend NPU 管理接口 |
 
+### 5.2.5 详细接口映射（代码级审计）
+
+以下映射来自对 Dynamo 源码的逐文件审计（`lib/kvbm-engine/src/collectives/`, `lib/llm/src/block_manager/`, `lib/bindings/kvbm/`）。
+
+#### NCCL → HCCL C API 调用对照
+
+| NCCL 函数 | 调用位置 | HCCL 等价值 |
+|-----------|---------|-------------|
+| `ncclGetUniqueId` | `bootstrap.rs:105` (kvbm-engine), `nccl_bootstrap.rs:85` (llm) | `hcclGetUniqueId` |
+| `ncclCommInitRank` | `bootstrap.rs:215` (kvbm-engine) | `hcclCommInitRank` |
+| `ncclCommInitRankConfig` | `nccl_bootstrap.rs:213` (llm) | `hcclCommInitRankConfig` |
+| `ncclCommInitAll` | `nccl.rs:519` (测试代码) | `hcclCommInitAll` |
+| `ncclCommDestroy` | `nccl.rs:477` (kvbm-engine), `nccl_bootstrap.rs:272` (llm) | `hcclCommDestroy` |
+| `ncclBcast` | `nccl.rs:338` (kvbm-engine), `nccl.rs:141/201` (llm) | `hcclBroadcast` |
+| `ncclGroupStart` | `nccl.rs:329` (kvbm-engine), `nccl.rs:66` (llm) | `hcclGroupStart` |
+| `ncclGroupEnd` | `nccl.rs:351` (kvbm-engine), `nccl.rs:85/99` (llm) | `hcclGroupEnd` |
+| `ncclGetVersion` | `nccl_bootstrap.rs:169` (llm) | `hcclGetVersion` |
+
+#### 需要映射的类型
+
+| NCCL/cudarc 类型 | 使用范围 | HCCL/CANN 等价值 |
+|-----------------|---------|-----------------|
+| `ncclComm_t` | 全部 5 个 NCCL 文件 | `hcclComm_t` |
+| `ncclUniqueId` | bootstrap 文件 | `hcclUniqueId` |
+| `ncclConfig_t` | `nccl_bootstrap.rs` | `hcclConfig_t` |
+| `ncclResult_t` | 全部 NCCL 文件 | `hcclResult_t` |
+| `ncclDataType_t::ncclChar` | broadcast 调用 | `hcclDataType_t::hcclInt8` |
+| `CUstream` | 全部 NCCL 文件 + transfer.rs | `aclvtStream` |
+| `CudaStream` / `CudaContext` | nccl.rs, context.rs | Ascend Context/Stream |
+| `CudaEvent` | nccl.rs, cuda_event.rs | `aclvtEvent` |
+| `cudaMemcpy` / `cuMemcpyHtoDAsync_v2` | fill.rs, checksum.rs, offload.rs, cuda.rs | `aclrtMemcpy` / `aclrtMemcpyAsync` |
+
+#### Cargo.toml 改动
+
+**`lib/kvbm-engine/Cargo.toml`**（现有 66-68 行）：
+```toml
+# 现有
+collectives = ["nccl"]
+nccl = ["dep:cudarc"]
+
+# 新增
+hccl = ["dep:hccl-sys"]
+# collectives 改为: collectives = ["nccl", "hccl"]  （或互斥选择）
+```
+
+**`lib/llm/Cargo.toml`**（现有第 26 行）：
+```toml
+# 现有
+nccl = ["dep:cudarc", "cudarc/nccl"]
+
+# 新增
+hccl = ["dep:hccl-sys", "dep:cann-driver"]
+```
+
+**`lib/bindings/kvbm/Cargo.toml`**（现有第 25 行）：
+```toml
+# 现有
+nccl = ["block-manager", "dynamo-llm/nccl", "cudarc/nccl"]
+
+# 新增
+hccl = ["block-manager", "dynamo-llm/hccl"]
+```
+
+#### CollectiveOps trait（已有，后端无关）
+
+trait 定义本身完全不依赖 NCCL（`lib/kvbm-engine/src/collectives/mod.rs`）：
+```rust
+pub trait CollectiveOps: Send + Sync {
+    fn broadcast(&self, src: LogicalLayoutHandle, dst: LogicalLayoutHandle,
+                 src_block_ids: &[BlockId], dst_block_ids: &[BlockId],
+                 layer_range: Option<Range<usize>>) -> Result<TransferCompleteNotification>;
+    fn rank(&self) -> usize;
+    fn world_size(&self) -> usize;
+}
+```
+
+新增 `HcclCollectives` 实现此 trait 即可接入 v2 路径。
+
+#### Python 绑定层接口改动
+
+**`KvbmWorker.__init__`**（`worker.rs:202`）：
+```python
+# 现有参数: rank, world_size, nccl_comm_ref
+# 新增参数:
+hccl_comm_ref=None       # HCCL communicator 指针
+collective_backend="nccl"  # 或 "hccl"，决定后端选择
+```
+
+**新增 Python 类**：
+- `PyHcclBootstrap` — 对标 `PyNcclBootstrap`，提供 `generate()`, `serialize()`, `deserialize()`, `init_communicator()`, `world_size()`
+- `PyHcclCommRef` — 对标 `PyNcclCommRef`，提供 `as_raw()`
+
+**`build_nccl_config()`**（`worker.rs:21-67`）— 重构为 `build_collective_config(backend, comm_ptr)` 分发。
+
+#### 环境变量
+
+| 现有变量 | 位置 | Ascend 等价值 |
+|----------|------|--------------|
+| `DYN_KVBM_NCCL_MAX_CTAS` | `nccl_bootstrap.rs:175` | HCCL config 参数 |
+| `DYN_KVBM_NCCL_MLA_MODE` | `kvbm_connector_worker.py:153` | 统一为 `DYN_KVBM_COLLECTIVES_MLA_MODE` |
+| `NCCL_DEBUG` | 错误提示中提及 | `HCCL_DEBUG` |
+| `NCCL_IB_DISABLE` / `NCCL_P2P_DISABLE` | Operator 透传 | HCCL 等价环境变量 |
+
+#### vLLM Ascend 必须提供的接口
+
+Dynamo 需要向 vLLM Ascend 借用以下句柄：
+
+1. **HCCL Communicator** (`hcclComm_t` raw pointer) — 用于 KV cache broadcast
+2. **NPU Stream** (`aclvtStream`) — 用于异步 DMA / broadcast 同步
+3. **生命周期管理** — HCCL communicator 的创建/销毁由 vLLM Ascend 管理，Dynamo 仅借用
+
+#### 两种接入方案对比
+
+| 维度 | 方案 A：并行模块 | 方案 B：抽象 Communicator trait |
+|------|----------------|-------------------------------|
+| 做法 | 新增 `hccl.rs` 模块，`#[cfg(feature)]` 切换 | 抽象 `Communicator` trait，NCCL/HCCL 均实现 |
+| 侵入性 | 低 — 仅新增文件，不改动现有 NCCL 代码 | 中 — 需重构现有 NCCL 代码为 trait 实现 |
+| 维护性 | 中等 — 两份实现需同步更新 | 高 — 单一接口，新增后端只加实现 |
+| 与 CollectiveOps 一致性 | 不一致 — v1 仍是具象 NCCL | 一致 — 全链路 trait 抽象 |
+| 推荐 | 短期快速验证 | 长期维护方向 |
+
 ## 6. VirtualConnector (非 K8s 部署)
 
 **可直接使用，无需改动。** `components/src/dynamo/planner/connectors/virtual.py` 是纯平台无关代码：
