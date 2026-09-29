@@ -1561,181 +1561,95 @@ FPM 的数据管线（Schema + 消息中继）是纯 Python/Rust，不涉及 GPU
 
 **可直接使用，无需改动。** 健康检查 (`components/src/dynamo/vllm/health_check.py`) 通过发送测试 prompt 验证引擎响应，不依赖 GPU 特定 API。
 
-## 5. 通信域 (TP/EP) — 两层分离
+## 5. 扩缩容控制面 — 逐层验证零 GPU 依赖
 
-Dynamo 涉及 NCCL 的地方有两层，职责完全不同，需要分开看：
+对 Dynamo 非 K8s（VirtualConnector）扩缩容完整链路做了逐文件审计。结论：**扩缩容控制面完全不依赖 CUDA/NCCL/GPU 硬件。**
 
-### 5.1 推理引擎的 TP/EP 集体通信 — 不是 Dynamo 的事
+### 5.1 扩缩容执行链路
 
-**Dynamo 完全不参与。** 模型推理的 TP/EP 集体通信（forward/backward 时的 all-reduce 等）由推理引擎（vLLM Ascend / SGLang Ascend）内部处理。Dynamo 在 K8s Operator 层只做配置透传：
+扩容（加节点）：
+```
+Planner 读 FPM/Traffic 指标（纯数字运算，零 CUDA）
+  → set_component_replicas(target) 写入 etcd
+    → VirtualConnectorCoordinator 写 etcd:
+        v1/{ns}/planner/num_prefill_workers
+        v1/{ns}/planner/num_decode_workers
+        v1/{ns}/planner/decision_id
+    → 外部部署进程 VirtualConnectorClient 读 etcd
+      → 启动 dynamo.vllm 进程
+        → WorkerFactory.create()（纯控制流分发，零 GPU 调用）
+          → AsyncLLM.from_vllm_config() ← 唯一 GPU 调用（引擎层，vLLM Ascend 负责）
+            → register_model() 写 etcd: v1/mdc/{ns}/{comp}/{ep}/{instance_id}
+              → serve_endpoint() 写 etcd: v1/instances/{ns}/{comp}/{ep}/{instance_id}
+                → 前端 etcd watch 发现新 worker，开始路由
+```
+
+缩容（减节点）反向：停进程 → etcd 租约过期 → 前端发现下线 → 不再路由。
+
+**逐层审计结果：**
+
+| 层 | 文件 | GPU/CUDA 调用 | 结论 |
+|----|------|-------------|------|
+| Planner 决策 | `planner/core/load_scaling.py` | 无 — 纯 FpmObservation 数字运算 | 零依赖 |
+| VirtualConnector | `planner/connectors/virtual.py` | 无 — etcd 读写 | 零依赖 |
+| VirtualConnectorCoordinator | `lib/bindings/python/rust/planner.rs` | 无 — etcd 读写 | 零依赖 |
+| WorkerFactory.create() | `vllm/worker_factory.py:723-783` | 无 — 纯控制流分发 | 零依赖 |
+| register_model() | `lib/bindings/python/rust/lib.rs:610` | 无 — 序列化 + etcd 写入 | 零依赖 |
+| serve_endpoint() | `lib/runtime/src/component/endpoint.rs` | 无 — NATS/TCP 监听注册 | 零依赖 |
+| FPM 采集管线 | `lib/llm/src/fpm_publisher/` + `planner/environment/metrics_provider/` | 无 — ZMQ → 事件平面 → Planner 全链路 CPU 侧 | 零依赖 |
+| 前端发现 | `lib/runtime/src/discovery/` | 无 — etcd watch | 零依赖 |
+| **引擎初始化** | `vllm/main.py:750` `AsyncLLM.from_vllm_config()` | **有 — CUDA context + 权重加载 + KV 分配** | **引擎层，vLLM Ascend 适配** |
+
+### 5.2 需要关注的边缘细节
+
+| 项目 | 代码位置 | 影响程度 | 说明 |
+|------|---------|---------|------|
+| `DeviceType` 枚举只有 `Cpu/Cuda` | `component.rs:93-98` | 极低 | `endpoint_device_type()` 只读环境变量（`CUDA_VISIBLE_DEVICES`），不调用任何 CUDA API。Ascend worker 会被标为 `Cuda`。仅 `DeviceAwareWeighted` 路由模式使用此字段做 CPU/Accelerator 区分；标准路由（RoundRobin/LeastLoaded/KV）完全忽略 |
+| NVTX 配置文件标注 | `lib/runtime/src/nvtx.rs` | 可忽略 | `#[cfg(feature = "nvtx")]` 门控，默认关闭 |
+| Benchmark 模式 | `vllm/benchmark_worker.py:132` | 可忽略 | `torch.cuda.current_stream()` 仅在 `--benchmark-mode` 时执行 |
+
+### 5.3 推理引擎的 TP/EP 集体通信 — 不是 Dynamo 的事
+
+**Dynamo 完全不参与。** 模型推理的 TP/EP 集体通信（forward 时的 all-reduce 等）由推理引擎（vLLM Ascend / SGLang Ascend）内部处理。Dynamo 在 K8s Operator 层只做配置透传：
 
 - 设置环境变量：`NCCL_DEBUG`、`NCCL_IB_DISABLE`、`NCCL_P2P_DISABLE`（operator 的 `backend_trtllm.go:239`）
 - 注入启动参数：`--tensor-parallel-size`、`--distributed-executor-backend mp`、`--distributed-port`（`backend_vllm.go`）
 - **不调用任何 NCCL API**，不创建 NCCL communicator
 
-> **结论**: TP/EP 作为功能层，由 vLLM Ascend 适配 HCCL。Dynamo 侧只需把 NCCL 相关的环境变量名改为 HCCL 等价名。
+> **结论**: TP/EP 由 vLLM Ascend 适配 HCCL。Dynamo 侧只需把 NCCL 相关的环境变量名改为 HCCL 等价名。
 
-### 5.2 Dynamo 自身的 KV Cache 跨卡传输 — 仅在 MLA + KV 恢复场景触发
+### 5.4 Dynamo 自身的 KV Cache 跨卡广播 — 条件性触发
 
-**这是 Dynamo 独有的数据传输层，和推理引擎的 TP 集体通信完全独立。**
+**触发条件：MLA 模型（DeepSeek v3/v4 等）+ KV 从持久化存储（G2/G3）恢复。** 基本扩缩容不触发此路径。
 
-**重要：基本扩缩容（多拉/少拉节点）不触发此路径。** 每个节点独立拉起、各自服务即可（参见 PR #43 的拉起方式）。KV broadcast 只在 MLA 模型的 KV 从持久化存储（G2/G3）恢复到 GPU（G1）时才执行 — 属于可选优化功能，不影响基本扩缩容能力。
+**背景：MLA 模型的 KV cache 是融合后的 latent vector，在 TP 组内不切分。** 每个 GPU 都需要完整 KV 数据。
 
-### 5.2.1 KV Cache 广播是什么
-
-**背景：MLA（Multi-head Latent Attention）模型**
-
-MLA 架构（DeepSeek v3/v4, Kimi K3 等）的 KV cache 是一个融合后的 latent vector，在 TP 组内**不切分**——每个 GPU 都需要完整的 KV 数据。
-
-**问题场景：**
-
-当 KV block 从持久化存储（G2 host memory / G3 disk）加载到 GPU（G1 device memory）时，如果每个 rank 都独立从 G2/G3 读取：
-- 浪费 I/O 带宽（同样的数据读 N 次）
-- 非 rank 0 的 worker 还需要维护 G2/G3 存储
-
-**Dynamo 的优化方案（replicated 模式）：**
-
+Dynamo 的优化方案（replicated 模式）：
 ```
-Rank 0:   G3(disk) <---> G2(host) <---> G1(GPU) ===broadcast==> 其他 rank 的 G1
+Rank 0:   G3(disk) ← G2(host) ← G1(GPU) ===broadcast==> 其他 rank 的 G1
 Rank 1-N: [无需 G2/G3]               G1(GPU) <==================================
 ```
 
-- 只有 rank 0 从 G2/G3 加载数据
-- rank 0 通过 NCCL broadcast 把数据发给同 TP 组所有 rank
-- 非 rank 0 的 worker 可以不需要 G2/G3 存储
+只有 rank 0 从存储加载数据，然后通过 NCCL broadcast 发给同 TP 组所有 rank。
 
-### 5.2.2 代码架构
+**两层独立数据流：**
+- vLLM Ascend 用 HCCL 做模型推理通信 → 引擎层已完成
+- Dynamo 用 NCCL 做 KV cache broadcast → 需 Dynamo 层适配（但仅在 MLA + KV 恢复时触发）
 
-Dynamo 有两套广播实现（v1 生产路径 + v2 开发中）：
+**代码架构（v1 生产路径 + v2 开发中）：**
 
-**v1 生产路径（当前在用）：**
+| 路径 | 关键文件 | NCCL 调用 |
+|------|---------|----------|
+| v1 生产 | `lib/llm/src/block_manager/block/transfer/nccl.rs` | `ncclBcast`, `ncclGroupStart/End` |
+| v1 bootstrap | `lib/llm/src/block_manager/distributed/nccl_bootstrap.rs` | `ncclGetUniqueId`, `ncclCommInitRankConfig` |
+| v2 抽象 | `lib/kvbm-engine/src/collectives/mod.rs` | `CollectiveOps` trait（后端无关） |
+| v2 NCCL 实现 | `lib/kvbm-engine/src/collectives/nccl.rs` | `NcclCollectives` |
 
-| 文件 | 职责 | NCCL 调用 |
-|------|------|----------|
-| `lib/llm/src/block_manager/distributed/transfer.rs` | 调度层，`execute_transfer_spmd_replicated()` 判断是否 broadcast | 无 |
-| `lib/llm/src/block_manager/block/transfer/nccl.rs` | 底层 `bcast_block()` / `bcast_layer()` | `ncclBcast`, `ncclGroupStart/End` |
-| `lib/llm/src/block_manager/distributed/nccl_bootstrap.rs` | Dynamo 独立 KVBM 通信器 bootstrap | `ncclGetUniqueId`, `ncclCommInitRankConfig` |
+**所有 CUDA/NCCL 代码在 `lib/llm/src/block_manager/` 中都被 `#[cfg(feature = "block-manager")]` 门控。** 不使用 KV 传输功能时不编译。
 
-触发流程：
-```
-KvbmWorker (ZMQ listener)
-  → BlockTransferDispatch → BlockTransferHandler.handle()
-    → execute_transfer_direct()
-      → TransferMode::Replicated
-        → execute_transfer_spmd_replicated()
-          → rank 0 做 G2/G3 → G1 传输
-            → broadcast_device_blocks()
-              → bcast_block() / bcast_layer() [ncclBcast]
-```
+### 5.4.1 Ascend 适配路径（如需 MLA + KV 恢复场景）
 
-**v2 开发中路径（CollectiveOps trait 抽象）：**
-
-| 文件 | 职责 |
-|------|------|
-| `lib/kvbm-engine/src/collectives/mod.rs` | `CollectiveOps` trait 定义（broadcast/rank/world_size） |
-| `lib/kvbm-engine/src/collectives/nccl.rs` | `NcclCollectives` 实现 |
-| `lib/kvbm-engine/src/collectives/stub.rs` | `StubCollectiveOps` 空实现（测试用） |
-| `lib/kvbm-engine/src/worker/physical/replicated.rs` | `ReplicatedDataWorker`（部分 unimplemented） |
-
-### 5.2.3 为什么 vLLM Ascend 适配了还不够
-
-vLLM 的 TP 管的是**模型权重并行**（attention all-reduce, linear layer column/row parallel）。
-Dynamo 的 broadcast 管的是**KV cache 块级数据传输**（KVBM 层）。
-
-这是两层完全独立的数据流：
-- vLLM Ascend 用 HCCL 做模型推理通信 → 已在引擎层完成
-- Dynamo 用 NCCL 做 KV cache broadcast → 需要 Dynamo 层适配
-
-**但适配成本不高。**
-
-### 5.2.4 Ascend 适配路径
-
-好消息是 `CollectiveOps` 已经有 trait 抽象。适配路径：
-
-```
-vLLM Ascend 已提供 HCCL communicator
-  → Dynamo Python 绑定层从 vLLM 借 hccl_comm_ptr（代替 nccl_comm_ptr）
-  → 新增 CollectiveOps 的 HCCL 后端实现
-  → v1 的 block/transfer/nccl.rs 同样需要 HCCL 等价实现
-```
-
-具体需要做的事情：
-
-| 改动 | 工作量 | 说明 |
-|------|--------|------|
-| `collectives/hccl.rs` | 中 | 新增 `HcclCollectives` 实现 `CollectiveOps`，对标 `nccl.rs` |
-| `block/transfer/hccl.rs` | 中 | v1 API 的 `bcast_block/bcast_layer` HCCL 版本 |
-| `hccl_bootstrap.rs` | 小 | 对标 `nccl_bootstrap.rs`，用 `hcclGetUniqueId` / `hcclCommInitRank` |
-| Python 绑定层 | 小 | 接受 `hccl_comm_ref` 参数，传递 HCCL communicator |
-| `Cargo.toml` feature | 小 | `#[cfg(feature = "hccl")]` 门控，与 `nccl` feature 互斥 |
-| `nvml.rs` 设备枚举 | 小 | 替换为 Ascend NPU 管理接口 |
-
-### 5.2.5 详细接口映射（代码级审计）
-
-以下映射来自对 Dynamo 源码的逐文件审计（`lib/kvbm-engine/src/collectives/`, `lib/llm/src/block_manager/`, `lib/bindings/kvbm/`）。
-
-#### NCCL → HCCL C API 调用对照
-
-| NCCL 函数 | 调用位置 | HCCL 等价值 |
-|-----------|---------|-------------|
-| `ncclGetUniqueId` | `bootstrap.rs:105` (kvbm-engine), `nccl_bootstrap.rs:85` (llm) | `hcclGetUniqueId` |
-| `ncclCommInitRank` | `bootstrap.rs:215` (kvbm-engine) | `hcclCommInitRank` |
-| `ncclCommInitRankConfig` | `nccl_bootstrap.rs:213` (llm) | `hcclCommInitRankConfig` |
-| `ncclCommInitAll` | `nccl.rs:519` (测试代码) | `hcclCommInitAll` |
-| `ncclCommDestroy` | `nccl.rs:477` (kvbm-engine), `nccl_bootstrap.rs:272` (llm) | `hcclCommDestroy` |
-| `ncclBcast` | `nccl.rs:338` (kvbm-engine), `nccl.rs:141/201` (llm) | `hcclBroadcast` |
-| `ncclGroupStart` | `nccl.rs:329` (kvbm-engine), `nccl.rs:66` (llm) | `hcclGroupStart` |
-| `ncclGroupEnd` | `nccl.rs:351` (kvbm-engine), `nccl.rs:85/99` (llm) | `hcclGroupEnd` |
-| `ncclGetVersion` | `nccl_bootstrap.rs:169` (llm) | `hcclGetVersion` |
-
-#### 需要映射的类型
-
-| NCCL/cudarc 类型 | 使用范围 | HCCL/CANN 等价值 |
-|-----------------|---------|-----------------|
-| `ncclComm_t` | 全部 5 个 NCCL 文件 | `hcclComm_t` |
-| `ncclUniqueId` | bootstrap 文件 | `hcclUniqueId` |
-| `ncclConfig_t` | `nccl_bootstrap.rs` | `hcclConfig_t` |
-| `ncclResult_t` | 全部 NCCL 文件 | `hcclResult_t` |
-| `ncclDataType_t::ncclChar` | broadcast 调用 | `hcclDataType_t::hcclInt8` |
-| `CUstream` | 全部 NCCL 文件 + transfer.rs | `aclvtStream` |
-| `CudaStream` / `CudaContext` | nccl.rs, context.rs | Ascend Context/Stream |
-| `CudaEvent` | nccl.rs, cuda_event.rs | `aclvtEvent` |
-| `cudaMemcpy` / `cuMemcpyHtoDAsync_v2` | fill.rs, checksum.rs, offload.rs, cuda.rs | `aclrtMemcpy` / `aclrtMemcpyAsync` |
-
-#### Cargo.toml 改动
-
-**`lib/kvbm-engine/Cargo.toml`**（现有 66-68 行）：
-```toml
-# 现有
-collectives = ["nccl"]
-nccl = ["dep:cudarc"]
-
-# 新增
-hccl = ["dep:hccl-sys"]
-# collectives 改为: collectives = ["nccl", "hccl"]  （或互斥选择）
-```
-
-**`lib/llm/Cargo.toml`**（现有第 26 行）：
-```toml
-# 现有
-nccl = ["dep:cudarc", "cudarc/nccl"]
-
-# 新增
-hccl = ["dep:hccl-sys", "dep:cann-driver"]
-```
-
-**`lib/bindings/kvbm/Cargo.toml`**（现有第 25 行）：
-```toml
-# 现有
-nccl = ["block-manager", "dynamo-llm/nccl", "cudarc/nccl"]
-
-# 新增
-hccl = ["block-manager", "dynamo-llm/hccl"]
-```
-
-#### CollectiveOps trait（已有，后端无关）
-
-trait 定义本身完全不依赖 NCCL（`lib/kvbm-engine/src/collectives/mod.rs`）：
+`CollectiveOps` trait 已后端无关（`lib/kvbm-engine/src/collectives/mod.rs`）：
 ```rust
 pub trait CollectiveOps: Send + Sync {
     fn broadcast(&self, src: LogicalLayoutHandle, dst: LogicalLayoutHandle,
@@ -1746,91 +1660,86 @@ pub trait CollectiveOps: Send + Sync {
 }
 ```
 
-新增 `HcclCollectives` 实现此 trait 即可接入 v2 路径。
+新增 `HcclCollectives` 实现即可接入 v2 路径。
 
-#### Python 绑定层接口改动
+**9 个 NCCL C API 调用映射：**
 
-**`KvbmWorker.__init__`**（`worker.rs:202`）：
-```python
-# 现有参数: rank, world_size, nccl_comm_ref
-# 新增参数:
-hccl_comm_ref=None       # HCCL communicator 指针
-collective_backend="nccl"  # 或 "hccl"，决定后端选择
-```
+| NCCL 函数 | 调用位置 | HCCL 等价值 |
+|-----------|---------|-------------|
+| `ncclGetUniqueId` | bootstrap.rs:105 (kvbm-engine), nccl_bootstrap.rs:85 (llm) | `hcclGetUniqueId` |
+| `ncclCommInitRank` | bootstrap.rs:215 (kvbm-engine) | `hcclCommInitRank` |
+| `ncclCommInitRankConfig` | nccl_bootstrap.rs:213 (llm) | `hcclCommInitRankConfig` |
+| `ncclCommInitAll` | nccl.rs:519 (测试) | `hcclCommInitAll` |
+| `ncclCommDestroy` | nccl.rs:477 (kvbm-engine), nccl_bootstrap.rs:272 (llm) | `hcclCommDestroy` |
+| `ncclBcast` | nccl.rs:338 (kvbm-engine), nccl.rs:141/201 (llm) | `hcclBroadcast` |
+| `ncclGroupStart` | nccl.rs:329 (kvbm-engine), nccl.rs:66 (llm) | `hcclGroupStart` |
+| `ncclGroupEnd` | nccl.rs:351 (kvbm-engine), nccl.rs:85/99 (llm) | `hcclGroupEnd` |
+| `ncclGetVersion` | nccl_bootstrap.rs:169 (llm) | `hcclGetVersion` |
 
-**新增 Python 类**：
-- `PyHcclBootstrap` — 对标 `PyNcclBootstrap`，提供 `generate()`, `serialize()`, `deserialize()`, `init_communicator()`, `world_size()`
-- `PyHcclCommRef` — 对标 `PyNcclCommRef`，提供 `as_raw()`
+**Cargo.toml 改动：**
 
-**`build_nccl_config()`**（`worker.rs:21-67`）— 重构为 `build_collective_config(backend, comm_ptr)` 分发。
+| 文件 | 现有 feature | 新增 |
+|------|-------------|------|
+| `lib/kvbm-engine/Cargo.toml` | `nccl = ["dep:cudarc"]` | `hccl = ["dep:hccl-sys"]` |
+| `lib/llm/Cargo.toml` | `nccl = ["dep:cudarc", "cudarc/nccl"]` | `hccl = ["dep:hccl-sys", "dep:cann-driver"]` |
+| `lib/bindings/kvbm/Cargo.toml` | `nccl = ["block-manager", "dynamo-llm/nccl", "cudarc/nccl"]` | `hccl = ["block-manager", "dynamo-llm/hccl"]` |
 
-#### 环境变量
-
-| 现有变量 | 位置 | Ascend 等价值 |
-|----------|------|--------------|
-| `DYN_KVBM_NCCL_MAX_CTAS` | `nccl_bootstrap.rs:175` | HCCL config 参数 |
-| `DYN_KVBM_NCCL_MLA_MODE` | `kvbm_connector_worker.py:153` | 统一为 `DYN_KVBM_COLLECTIVES_MLA_MODE` |
-| `NCCL_DEBUG` | 错误提示中提及 | `HCCL_DEBUG` |
-| `NCCL_IB_DISABLE` / `NCCL_P2P_DISABLE` | Operator 透传 | HCCL 等价环境变量 |
-
-#### vLLM Ascend 必须提供的接口
-
-Dynamo 需要向 vLLM Ascend 借用以下句柄：
-
-1. **HCCL Communicator** (`hcclComm_t` raw pointer) — 用于 KV cache broadcast
-2. **NPU Stream** (`aclvtStream`) — 用于异步 DMA / broadcast 同步
-3. **生命周期管理** — HCCL communicator 的创建/销毁由 vLLM Ascend 管理，Dynamo 仅借用
-
-#### 两种接入方案对比
-
-| 维度 | 方案 A：并行模块 | 方案 B：抽象 Communicator trait |
-|------|----------------|-------------------------------|
-| 做法 | 新增 `hccl.rs` 模块，`#[cfg(feature)]` 切换 | 抽象 `Communicator` trait，NCCL/HCCL 均实现 |
-| 侵入性 | 低 — 仅新增文件，不改动现有 NCCL 代码 | 中 — 需重构现有 NCCL 代码为 trait 实现 |
-| 维护性 | 中等 — 两份实现需同步更新 | 高 — 单一接口，新增后端只加实现 |
-| 与 CollectiveOps 一致性 | 不一致 — v1 仍是具象 NCCL | 一致 — 全链路 trait 抽象 |
-| 推荐 | 短期快速验证 | 长期维护方向 |
+**vLLM Ascend 必须提供的接口（Dynamo 借用）：**
+1. HCCL Communicator (`hcclComm_t` raw pointer)
+2. NPU Stream (`aclvtStream`)
+3. 生命周期管理（vLLM Ascend 管理创建/销毁，Dynamo 仅借用）
 
 ## 6. VirtualConnector (非 K8s 部署)
 
-**可直接使用，无需改动。** `components/src/dynamo/planner/connectors/virtual.py` 是纯平台无关代码：
+**可直接使用，无需改动。** 完整扩缩容链路（§5.1）已逐层验证零 GPU 依赖。
 
-- `get_gpu_counts()` 返回 `(None, None)` — 明确标注 "Virtual deployments do not expose GPU shape"
-- `get_gpu_shapes()` 同理
-- 所有协调通过 etcd 进行，不依赖 K8s GPU 资源 API
+`components/src/dynamo/planner/connectors/virtual.py` 是纯平台无关代码：
+- `get_gpu_counts()` / `get_gpu_shapes()` 返回 `None` — 明确标注 "Virtual deployments do not expose GPU shape"
+- `validate_deployment()` 是空实现
+- 所有协调通过 etcd，不依赖 K8s GPU 资源 API
 
-## 7. 修正后的约束总览
+etcd 协调 key 结构：
+```
+v1/{ns}/planner/num_prefill_workers   — Planner 写入期望数量
+v1/{ns}/planner/num_decode_workers    — 同上
+v1/{ns}/planner/decision_id           — 单调递增决策 ID
+v1/{ns}/planner/scaled_decision_id    — 部署进程完成后回写确认
+v1/instances/{ns}/{comp}/{ep}/{id}    — worker 实例注册
+v1/mdc/{ns}/{comp}/{ep}/{id}          — 模型部署卡片
+```
 
-基于两层分离分析，重新评估：
+## 7. 约束总览（代码级审计后）
 
-| 模块 | Dynamo 自身依赖 | 引擎层依赖 | Ascend 影响 |
-|------|----------------|-----------|-------------|
-| K8s Operator 扩缩容 | `nvidia.com/gpu` 硬编码 110+ 处 | 无 | 需配置化资源名 + NPU 发现 |
-| Prometheus 监控栈 | DCGM exporter 部署 | 无 | 需 npu-smi 指标导出器 |
-| FPM 指标采集 | 设备身份走 CUDA | 调度层指标本身可用 | 采集管线可用，设备层需适配 |
-| 通信域 TP/EP 集体通信 | **无**（引擎负责） | HCCL by vLLM Ascend | **已由引擎层适配** |
-| KV Cache 跨卡广播（MLA场景） | NCCL broadcast | 借引擎 communicator | 可选适配 — 非 MLA 模型不触发 |
-| 健康检查 | 无 | 无 | 直接可用 |
-| Tracing/Request Trace | 无 | 无 | 直接可用 |
-| VirtualConnector | 无 | 无 | 直接可用 |
+| 模块 | 代码验证结论 | Ascend 影响 |
+|------|-------------|-------------|
+| **扩缩容控制面** | Planner → VirtualConnector → etcd → worker 注册 → 前端发现，全链路零 CUDA | **直接可用** |
+| **FPM 指标采集** | vLLM 调度器 → ZMQ → FpmEventRelay → 事件平面 → Planner，全链路 CPU 侧 | **直接可用** |
+| **Worker 注册/发现** | `register_model()` + `serve_endpoint()` 纯序列化 + etcd 写入 | **直接可用** |
+| **健康检查** | 发送测试 prompt 验证引擎响应，不依赖 GPU API | **直接可用** |
+| **Tracing/Request Trace** | OTLP 导出和请求审计，纯平台无关 | **直接可用** |
+| **推理引擎 GPU 初始化** | `AsyncLLM.from_vllm_config()` — CUDA context + 权重加载 + KV 分配 | **引擎层适配**（vLLM Ascend） |
+| **TP/EP 集体通信** | Dynamo 零 NCCL 调用，仅透传环境变量 | **引擎层适配**（vLLM Ascend HCCL） |
+| **KV Cache 跨卡广播** | `#[cfg(feature = "block-manager")]` 门控，仅 MLA + KV 恢复触发 | **可选适配** |
+| **K8s Operator** | `nvidia.com/gpu` 硬编码 110+ 处 | 需配置化（仅 K8s 部署） |
+| **Prometheus 监控栈** | DCGM exporter 部署 | 需 npu-smi 指标导出器 |
+| **DeviceType 元数据** | 只有 `Cpu/Cuda`，Ascend worker 标为 `Cuda` | 极低影响，仅 DeviceAwareWeighted 路由用到 |
 
-### 近期可运行的部分
+### 近期可直接运行的能力
 
 | 能力 | 状态 |
 |------|------|
 | 单卡推理 | 可用（vLLM Ascend 后端直接工作） |
 | 多卡 TP 推理 | 可用（vLLM Ascend 已适配 HCCL，Dynamo 仅透传配置） |
-| 基本扩缩容（多拉/少拉节点） | 可用（各节点独立拉起，不触发 KV broadcast） |
-| 健康检查端点 | 可用（`/health`、`/live` 纯引擎响应检查） |
-| 非 K8s 扩缩容框架 | 可用（VirtualConnector + etcd 协调） |
-| Tracing/Request Trace | 可用（OTLP 导出和请求审计不依赖 GPU 硬件） |
+| 扩缩容（多拉/少拉节点） | 可用（控制面全链路零 GPU 依赖） |
+| 健康检查端点 | 可用（`/health`、`/live`） |
 | FPM 数据管线 | 可用（Schema + ZMQ 传输纯平台无关） |
+| Tracing/Request Trace | 可用（OTLP 导出和请求审计不依赖 GPU 硬件） |
+| 非 K8s 部署框架 | 可用（VirtualConnector + etcd 协调） |
 
 ### 需要适配的部分
 
 | 能力 | 工作量 | 说明 |
 |------|--------|------|
-| K8s 扩缩容 | 中 | `nvidia.com/gpu` 配置化 + NPU 节点发现 |
+| K8s 扩缩容 | 中 | `nvidia.com/gpu` 配置化 + NPU 节点发现（仅 K8s 部署） |
 | Prometheus 监控 | 中 | DCGM → npu-smi 指标导出器 |
-| FPM 设备识别 | 小 | `gpu_memory_service` 设备层适配 |
-| KV Cache 跨卡广播（MLA场景） | 中（可选） | `CollectiveOps` trait 已有抽象，新增 HCCL 后端即可。非 MLA 模型不触发 |
+| KV Cache 跨卡广播 | 中（可选） | 仅 MLA + KV 恢复场景触发；`CollectiveOps` trait 已有抽象 |
