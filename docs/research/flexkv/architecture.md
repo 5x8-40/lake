@@ -49,7 +49,15 @@ abort 默认不 put；`offload_kv_on_finish` 可强制卸。
 
 驱逐策略：lru（默认）/ lfu / slru / fifo / mru / filo；水位 `evict_start_threshold`、每次 `evict_ratio`。
 
-C++ `CRadixTreeIndex` 节点记 physical block、hash 链、lock、ready。SWA 挂在同一节点上（slot / tombstone），不是第二棵 GPU 树。
+C++ `CRadixTreeIndex` 节点记 physical block、hash 链、lock、ready。SWA 挂在同一节点上（slot / tombstone），不是第二棵 GPU 树。节点挂载 SWA 的不变量（`cache/radixtree.py` 文件头注释，C++ 版同构，DSv4 用 C++ 版）：
+
+- I0：每节点最多一份 SWA 快照，只存**最后一页**（trailing window）——窗口外 SWA 不落盘；
+- I1：SWA ⊂ Full——释放节点 Full KV 必连带释放其 SWA slot；
+- I2：叶子必须有活 SWA，除非 Full 被 lock（失 SWA 又未锁的叶子无意义，级联删除）；
+- I3：`full_lock_ref ≥ swa_lock_ref` 恒成立；
+- SWA 有独立 LRU 与 `evict_swa()`：可单独驱逐 SWA 而不动 Full KV；结构变更释放的 SWA slot 经 `_freed_swa_slots` 归还 SWA host pool。
+
+挂同一棵树（而非独立索引）是为了统一两池驱逐、避免漂移——可复用前缀 = `min(full_hit, swa_hit)`，漂移直接侵蚀命中率。
 
 **异构层组的存储布局**（Gemma4 引入，`docs/gemma4_support.md`）：
 
@@ -106,5 +114,6 @@ FlexKV 文档：Dynamo KV events 与 namespace isolation、与 distributed reuse
 | 每层驱逐 | `docs/eviction_policy/README_zh.md`；`csrc/radix_tree.cpp`::`CRadixTreeIndex::evict` |
 | 事件 medium | `integration/dynamo/collector.py`::`publish_stored`（默认 `CPU`） |
 | 异构层组 | `common/config.py`::`LayerGroupSpec`；`common/storage.py`::`KVCacheLayout.get_group_strides` |
+| SWA 节点挂载 | `cache/radixtree.py` 文件头（不变量 I0–I4）；`evict_swa`；`csrc/radix_tree.cpp` 同构 |
 | stride 自探测 | `transfer/worker.py`::`GPUCPUTransferWorker._get_gpu_strides_from_tensor` |
 | 延迟建 StorageEngine | `transfer_manager.py`::`TransferManager.initialize_transfer_engine` |

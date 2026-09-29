@@ -12,7 +12,7 @@ FlexKV 是挂在推理引擎上的 **CPU / SSD / 远端 多级 KV 卸载库**：
 
 SGLang 侧有两种形态，注意区分：
 
-- **主干原生**（[sglang#29701](https://github.com/sgl-project/sglang/pull/29701)，2026-07-07 合入）：`FlexKVRadixCache` 继承 `RadixCache`，经 `mem_cache/registry.py` 注册，`--enable-flexkv` 单 flag 启用。它**不是** `HiCacheStorage` 后端——FlexKV 的 radix 索引与淘汰策略在自己的 server 进程里，没法当 HiRadixTree 下的哑字节后端，只能与 HiRadixCache **平行**存在。代价已在合入时显现：scheduler 只在 `enable_hierarchical_cache` 时 tick `check_hicache_events()`，FlexKV 的异步 store 锁无人释放导致集群卡死，修复方式是把该钩子（及 `NO_TOKEN` 软处理）改成 OR 两个 flag——树内两套平行缓存层级，每个 scheduler 钩子都要记得两边。
+- **主干原生**（[sglang#29701](https://github.com/sgl-project/sglang/pull/29701)，2026-07-07 合入）：`FlexKVRadixCache` 继承 `RadixCache`，经 `mem_cache/registry.py` 注册，`--enable-flexkv` 单 flag 启用。它**不是** `HiCacheStorage` 后端——`HiCacheStorage` 接口只做纯字节存取（`batch_get`/`batch_set`/`batch_exists`），索引与前缀匹配全在引擎侧 HiRadixTree；而 FlexKV 的 radix 索引与淘汰策略在自己的 server 进程里，塞不进这个形态，只能与 HiRadixCache **平行**存在。代价已在合入时显现：scheduler 只在 `enable_hierarchical_cache` 时 tick `check_hicache_events()`，FlexKV 的异步 store 锁无人释放导致集群卡死，修复方式是把该钩子（及 `NO_TOKEN` 软处理）改成 OR 两个 flag——树内两套平行缓存层级，每个 scheduler 钩子都要记得两边（该条件现已膨胀为四个 flag 的 OR 链）。
 - **树外 connector**（`integration/sglang/connector.py`）：早期接入路径，仍随 FlexKV 仓分发。
 
 ## 与本系统的关系
@@ -50,7 +50,10 @@ FlexKV 原假设所有层 KV shape 一致（统一 `num_kv_heads`/`head_size`，
 - 两个配套修复：
  - GPU stride 从 tensor 实际 `stride()` 探测——triton `[N,2,B,H,D]` 与 flash_attn `[2,N,B,H,D]` dim0/1 互换，信配置会算错；
  - `StorageEngine` 延迟到 GPU 注册后创建——否则按 max×max 高估 token 大小（实测 16GB 分出 546 块 vs 正确 1191）。
-- vLLM 侧代价：开 `--kv-transfer-config` 即禁用 Hybrid KV Cache Manager，SWA 滑窗语义被放弃，窗口外 KV 照存（浪费但正确）。
+- vLLM 侧代价（**空间浪费值得警惕**）：开 `--kv-transfer-config` 即禁用 Hybrid KV Cache Manager，SWA 滑窗语义被抹平——
+ - 50 层 SWA 与普通层一样 per-token 全存；窗口外的 SWA KV 解码时永远不会被读，但 block 是驱逐最小单位，无法单独释放其中的 SWA 部分；
+ - 量级：Gemma4 31B 每 token ≈ 900KB 中 SWA 占 ≈ 91%（50×16×256×2×2=819KB vs 10×4×512×2×2=82KB），长前缀场景绝大部分是死字节；
+ - DSV4/SGLang 路径有专门的 SWA 挂载设计可避免此浪费（见下节），Gemma4 走不到它——引擎侧已把 SWA 语义抹平，FlexKV 看到的只是两组 shape 不同的普通 KV。
 
 ### 多 KV 池 + per-token state sidecar：DSV4（[#225](https://github.com/taco-project/FlexKV/pull/225)，`docs/dsv4_compress_state_io_zh.md`）
 
@@ -60,6 +63,11 @@ FlexKV 原假设所有层 KV shape 一致（统一 `num_kv_heads`/`head_size`，
  - score state 搭 SWA page 做 sidecar——同一逻辑 page id 同时承载 SWA KV bytes + 两组 state bytes，PUT/GET 共用一份 `swa_slot_mapping`；
  - 做的是 **state 快照的 offload/restore**（不是 restore 后重算）；恢复后的 state 是否满足继续 decode 的语义，文档自述仍需精度实验确认。
 - 能复用 radix/block 机制的前提：这两组 state **按 token/page 寻址**（挂在 page 上），与 KV 同生命周期。
+- SWA 侧**不**浪费窗口外空间（与 Gemma4 路径的关键区别）：SWA 挂载在 Full-KV radix 节点上（`cache/radixtree.py`，HiCache `swa_radix_cache` 风格）——
+ - I0：每节点最多一份 SWA 快照，只存最后一页（trailing window），窗口外 SWA 不落盘；
+ - I1：SWA ⊂ Full——释放节点 Full KV 必连带释放其 SWA slot；
+ - SWA 有独立 LRU 与 `evict_swa()`：**可以单独驱逐 SWA 而不动 Full KV**；
+ - 挂载同一棵树（而非独立索引）的目的：统一两池驱逐、避免漂移——可复用前缀 = `min(full_hit, swa_hit)`，漂移会直接侵蚀命中率。
 
 ### 递归 state（Mamba / GDN / KDN 等线性注意力）：不支持
 
