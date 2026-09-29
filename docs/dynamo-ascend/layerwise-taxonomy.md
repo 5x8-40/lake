@@ -93,6 +93,11 @@ sequenceDiagram
 
 ## ③ 池 layerwise（gva 层复用）：`AscendStoreConnector` + Memcache
 
+先拆词：「gva 层复用」= **gva 数据面** + **层复用**两件事，没有「gva 层」这个东西：
+
+- **GVA** = Global Virtual Address，MemFabric 的全局虚拟编址：把集群各节点的 HBM/DRAM 编进统一地址空间，传输按 GVA 地址跨机跨介质直接读写（OneCopy：RH2D/D2RH 等）；memcache 元数据里 key → 副本位置 + 介质 + GVA（见 [`../research/memcache/architecture.md`](../research/memcache/architecture.md)）
+- **层复用** = 物理 HBM buffer 跨层轮转复用（下述）
+
 「逐层计算、加载下一层、卸载上一层」描述的是这条路径——**真卸载，HBM 减量**：
 
 ```mermaid
@@ -114,6 +119,29 @@ flowchart LR
 - APC「命中」的块不真持有 KV → `layerwise_offload=True` 强制整前缀从池重读（`pool_worker.py:1795`；赋值点 L585/L601，门控 `use_layerwise_transfer` L224）
 - 官方设计文档 §8：逐层共享缓冲区卸载**需要 Memcache 后端**和 eager 模式
 - → 这条路径上 **HBM 预热不成立**，只能暖本机 DRAM（D003 方案 B2）
+
+## ② 的逐层流水线 vs 异步整体加载
+
+疑问：② 既然 HBM 全层驻留，逐层流水线省不了显存；每层远端读又慢，遮掩不住还拖住整个 batch——为什么不用「异步整体加载、先算别的请求、加载完再算」？
+
+**流水线的目的本来就不是省 HBM，是 TTFT 与传输-计算重叠**：
+
+- 整体加载：该请求延迟 = 全前缀传输 + 全前缀计算（串行）
+- 逐层流水线：layer 0 到了就开算，延迟 ≈ max(传输, 计算)；长前缀传输是秒级，差异巨大
+- 遮掩可行性：prefill 每层计算量随前缀长增长（attention O(T²)），百 Gbps RDMA 下每层 KV 传输通常小于每层计算——官方设计文档的立论即"Prefill 有足够的每层计算量来隐藏大部分加载和保存延迟"
+
+**但「遮掩不住」的场景真实存在**，代价也确实是全 batch 算力：
+
+- 短前缀（每层计算量小）、网络拥塞、decode（每 token 计算量极小——所以官方设计里 decode 不用逐层，用稀疏 top-k）
+- 遮掩不住时：`wait_for_layer_load` 在 attention 层路径上**同步阻塞**（`attention/utils.py:475`），一个请求的层读没到，整个 batch 的 forward 停在层边界——浪费的是全 batch 的算力，不只是该请求的
+
+**「异步整体加载、加载完再算」的形态已经存在——就是非 layerwise + `load_async=true`**：
+
+- 请求进 `WAITING_FOR_REMOTE_KVS`：不占 `max_num_seqs` 槽（`scheduler.py:877-879`）、零计算（`scheduler.py:890-898`）、传输完 `cache_blocks` 入 APC 再调度（`scheduler.py:3032/3064`）
+- vllm-ascend 对 layerwise **强制** `load_async=false`（`pool_scheduler.py:747`）——layerwise 模式下该形态不可用，这是它的真实短板
+- 因此是部署时的模式选择：追 TTFT、前缀长、网络好 → layerwise；保吞吐、求稳、网络不可控 → 非 layerwise + `load_async=true`
+
+对 D003 预取的含义：壳请求在 layerwise 下同步占槽，批量预热会与真实流量竞争——这正是方案 B2（带外复制、零引擎侵入）的成本优势场景；若部署形态主要为预取服务，非 layerwise + `load_async=true` 是更干净的壳请求路径。
 
 ## 与 D003 的关系
 
