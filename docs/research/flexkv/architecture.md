@@ -49,7 +49,7 @@ abort 默认不 put；`offload_kv_on_finish` 可强制卸。
 
 驱逐策略：lru（默认）/ lfu / slru / fifo / mru / filo；水位 `evict_start_threshold`、每次 `evict_ratio`。
 
-C++ `CRadixTreeIndex` 节点记 physical block、hash 链、lock、ready。SWA 挂在同一节点上（slot / tombstone），不是第二棵 GPU 树。节点挂载 SWA 的不变量（`cache/radixtree.py` 文件头注释，C++ 版同构，DSv4 用 C++ 版）：
+C++ `CRadixTreeIndex` 节点记 physical block、hash 链、lock、ready。SWA 挂在同一节点上（slot / tombstone），不是第二棵 GPU 树。**注意"挂载"只是 radix 节点的元数据链接**（节点多记一个 `swa_host_slot` + tombstone 标志）：物理上 SWA 与主 KV 分池分块（DSv4 中主 KV 通道与 SWA 通道各自注册、各自 byte-flat 块），所以两者生命周期可以独立。节点挂载 SWA 的不变量（`cache/radixtree.py` 文件头注释，C++ 版同构，DSv4 用 C++ 版）：
 
 - I0：每节点最多一份 SWA 快照，只存**最后一页**（trailing window）——窗口外 SWA 不落盘；
 - I1：SWA ⊂ Full——释放节点 Full KV 必连带释放其 SWA slot；
@@ -64,6 +64,8 @@ C++ `CRadixTreeIndex` 节点记 physical block、hash 链、lock、ready。SWA �
 - 分组：层 shape 不一致时按 `(num_kv_heads, head_size)` 分成若干 `LayerGroupSpec`。
 - 布局：block 仍统一定长——单一 BLOCKFIRST CPU buffer，每个 block 内按组顺序拼接 `[g0_L0_K|g0_L0_V|…|g0_Ln_V | g1_L0_K|…]`；`token_size_in_bytes` 按组求和。
 - 接口：`get_layer_stride()` 等多组下无单一值的接口直接抛错，改用 `get_group_strides()` 拿每组 `(offset, layer_stride, kv_stride, chunk_size)`。
+- 压缩率维度（DSV4 引入）：组级 `compress_ratio`——每块只存 `tokens_per_block / compress_ratio` 行（CSA 4× / HCA 128×）；`compress_ratio=0` 标记不缓存层（如 DSv4 第 0/1 层）。
+- 下层不透明：CPU↔SSD/Remote 把每个 page 当 opaque byte block 整块读写，不再解析 group——组语义只存在于 GPU↔CPU 边缘侧，往下即字节块（与 lake"池不解释布局"在存储层收敛一致）。
 - 两个时序坑：
  - StorageEngine 必须延迟到 GPU 注册（拿到 layer_groups）后创建，否则按 max×max 高估 token 大小（实测 16GB 分出 546 块 vs 正确 1191）；
  - GPU 端 stride 要从 tensor 实际 `stride()` 探测，不能信 layout 配置（triton 与 flash_attn 的 dim0/1 互换）。

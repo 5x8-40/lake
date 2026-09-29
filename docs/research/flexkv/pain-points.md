@@ -55,7 +55,7 @@
 | 布局假设会踩坑 | triton `[N,2,B,H,D]` vs flash_attn `[2,N,B,H,D]` dim0/1 互换，信配置算错 stride → 改为从 tensor 实际 `stride()` 探测 | 布局元数据必须由注册方实测上报，控制面不内置假设 |
 | 注册前不知道组 → buffer 估算错 | max(head)×max(dim) 高估 2.18 倍，16GB 分 546 块 vs 正确 1191；修复为延迟创建 StorageEngine | 池按注册配额算账，容量视图以注册后实测为准 |
 | per-token 非 KV state 已支持 | DSV4 两组 compress score 搭 SWA page 做 sidecar，同一 page id 承载 KV+state，快照式 offload/restore（[#225](https://github.com/taco-project/FlexKV/pull/225)，`docs/dsv4_compress_state_io_zh.md`） | 与 lake"block 内装什么由布局元数据声明"同思路；sidecar 是边缘侧打包的一种实现 |
-| 递归 state（Mamba/GDN/KDN）不支持 | 本地 pin 全仓 grep + 上游 main（至 2026-09-20）代码搜索 `gdn`/`kdn`/`gated_delta`/`mamba` 均无实现（2026-09-29 核实）；递归 state 每序列定长、随 decode 更新，需块边界快照语义，与 per-token 块抽象不同 | lake 已声明 t-type/r-type：block 内装逐 token KV 还是紧凑 state 快照由布局元数据声明（[`../../architecture/storage-layer.md`](../../architecture/storage-layer.md)） |
+| 递归 state（Mamba/GDN/KDN）未实现，但非结构性限制 | 本地 pin + 上游 main（至 2026-09-20）均无实现（2026-09-29 核实）；周期快照卸载是成立模式——SGLang `MambaCheckpointPool`（`mem_cache/mamba_checkpoint_pool.py`）把 KDA/GDN/Mamba2 state 以 int8 压缩、每 radix 节点一份存进前缀缓存；FlexKV 的 SWA 节点挂载（每节点一份边界快照）形态同构，缺的是引擎 connector 的 state save/restore API 与 FlexKV 侧 state pool 注册 | lake 已声明 t-type/r-type：block 内装逐 token KV 还是紧凑 state 快照由布局元数据声明（[`../../architecture/storage-layer.md`](../../architecture/storage-layer.md)） |
 | 引擎侧 hybrid 管理被旁路 | vLLM 开 `--kv-transfer-config` 即禁用 Hybrid KV Cache Manager，SWA 窗口外 KV 照存（Gemma4 31B 每 token ≈900KB 中 SWA 占 ≈91%，长前缀下绝大部分是死字节）；对照 DSV4/SGLang 路径的 SWA 节点挂载（I0：只存 trailing window + `evict_swa` 独立驱逐，`cache/radixtree.py`） | connector 是必经路径时，窗口/稀疏语义应由布局元数据保留，而不是靠引擎管理器兜底 |
 
 ## 可直接借鉴

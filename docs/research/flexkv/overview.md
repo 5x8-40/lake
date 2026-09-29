@@ -58,24 +58,26 @@ FlexKV 原假设所有层 KV shape 一致（统一 `num_kv_heads`/`head_size`，
 ### 多 KV 池 + per-token state sidecar：DSV4（[#225](https://github.com/taco-project/FlexKV/pull/225)，`docs/dsv4_compress_state_io_zh.md`）
 
 - 模型：DSA 注意力，C4 KV / C4 indexer KV / SWA KV 三种 KV 池，外加两组运行时 score（attention / indexer compress state）。
-- 解法：
- - 三种 KV 各成 layer group（上游 main 在 pin 之后又做了 GLM5.2 IndexCache 层组去重，[#293](https://github.com/taco-project/FlexKV/pull/293)）；
- - score state 搭 SWA page 做 sidecar——同一逻辑 page id 同时承载 SWA KV bytes + 两组 state bytes，PUT/GET 共用一份 `swa_slot_mapping`；
- - 做的是 **state 快照的 offload/restore**（不是 restore 后重算）；恢复后的 state 是否满足继续 decode 的语义，文档自述仍需精度实验确认。
+- 解法（**两条物理通道，分池分块**）：
+ - **主 KV 通道**：C4（CSA 4×）/ C128（HCA 128×）/ indexer 各成 layer group，组级多一个 `compress_ratio` 维度——每块只存 `tokens_per_block / compress_ratio` 行；`compress_ratio=0` 标记不缓存层（如 DSv4 第 0/1 层）。块内按组拼接，与 Gemma4 同机制（上游 main 在 pin 之后又做了 GLM5.2 IndexCache 层组去重，[#293](https://github.com/taco-project/FlexKV/pull/293)）；
+ - **SWA 通道**：SWA KV + attention/indexer 两组 score 三个组打包成另一种 byte-flat 块；score 搭 SWA page 做 sidecar——同一逻辑 page id 承载 SWA KV + state，PUT/GET 共用一份 `swa_slot_mapping`；
+ - state 做的是**快照 offload/restore**（不是 restore 后重算）；恢复语义是否满足继续 decode，文档自述仍需精度实验确认。
 - 能复用 radix/block 机制的前提：这两组 state **按 token/page 寻址**（挂在 page 上），与 KV 同生命周期。
-- SWA 侧**不**浪费窗口外空间（与 Gemma4 路径的关键区别）：SWA 挂载在 Full-KV radix 节点上（`cache/radixtree.py`，HiCache `swa_radix_cache` 风格）——
+- SWA 侧**不**浪费窗口外空间（与 Gemma4 路径的关键区别）：物理上 SWA 与主 KV **分池分块**，"挂载"只是 radix 节点的元数据链接（节点多记一个 `swa_host_slot`），不是同块打包（`cache/radixtree.py`，HiCache `swa_radix_cache` 风格）——
  - I0：每节点最多一份 SWA 快照，只存最后一页（trailing window），窗口外 SWA 不落盘；
  - I1：SWA ⊂ Full——释放节点 Full KV 必连带释放其 SWA slot；
  - SWA 有独立 LRU 与 `evict_swa()`：**可以单独驱逐 SWA 而不动 Full KV**；
  - 挂载同一棵树（而非独立索引）的目的：统一两池驱逐、避免漂移——可复用前缀 = `min(full_hit, swa_hit)`，漂移会直接侵蚀命中率。
 
-### 递归 state（Mamba / GDN / KDN 等线性注意力）：不支持
+### 递归 state（Mamba / GDN / KDN 等线性注意力）：未实现，但非结构性限制
 
 - 核实（2026-09-29）：本地 pin `a5c8f12` 全仓 grep 零命中；上游 main（至 2026-09-20 `738ddc1`）代码搜索 `gdn`/`kdn`/`gated_delta`/`mamba` 亦无实现（唯一 `mamba` 命中是树外 SGLang patch 里的 SGLang 侧上下文行，非 FlexKV 代码）。
-- 原因：复用单元是"每 token 定长块 + radix 前缀匹配"；递归 state 每序列定长、随 decode 衰减更新，前缀复用需要"块边界 state 快照"语义，概念体系不同。DSV4 的 score sidecar 之所以能成，正因为它按 page 寻址、不是递归 state。
-- 对照：
- - SGLang `HiCacheStorage` v2 用物理分池承载 Mamba/SWA/DSA/Draft（见 [`../sglang/storage-backends.md`](../sglang/storage-backends.md)）；
- - lake 的对应答案是 t-type/r-type 布局元数据（[`../../architecture/storage-layer.md`](../../architecture/storage-layer.md) "KV 类型"节）。
+- 但"周期快照卸载"是成立的模式，引擎侧已有实践：SGLang `MambaCheckpointPool`（`mem_cache/mamba_checkpoint_pool.py`）把 KDA / GDN / Mamba2 的递归 state 以 **int8 压缩、每 radix 节点一份**存进前缀缓存，命中时反量化回 active `MambaPool`；`HiCacheStorage` v2 也为 Mamba 开了独立 pool（见 [`../sglang/storage-backends.md`](../sglang/storage-backends.md)）。
+- 形态上 FlexKV 并不缺机制：递归 state 的复用单元是"命中前缀末端节点的一份边界快照"，与 SWA 节点挂载（I0：每节点一份、挂在末页）同构。缺的是三处胶水：
+ - 引擎 connector 暴露 state 的边界快照 save/restore；
+ - FlexKV 注册 state pool（可复用 sidecar / 多组通道）；
+ - match 语义返回"末端节点快照"而非逐块数据。
+- lake 的对应答案是 t-type/r-type 布局元数据（[`../../architecture/storage-layer.md`](../../architecture/storage-layer.md) "KV 类型"节）。
 
 ## 架构
 
