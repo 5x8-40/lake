@@ -62,7 +62,8 @@ C++ `CRadixTreeIndex` 节点记 physical block、hash 链、lock、ready。SWA �
 **异构层组的存储布局**（Gemma4 引入，`docs/gemma4_support.md`）：
 
 - 分组：层 shape 不一致时按 `(num_kv_heads, head_size)` 分成若干 `LayerGroupSpec`。
-- 布局：block 仍统一定长——单一 BLOCKFIRST CPU buffer，每个 block 内按组顺序拼接 `[g0_L0_K|g0_L0_V|…|g0_Ln_V | g1_L0_K|…]`；`token_size_in_bytes` 按组求和。
+- 池结构：**通道 × 介质**。主 KV 与 SWA 两通道各自在 CPU/SSD/REMOTE 建独立 layout/buffer（`storage_engine.py` 的 `_cpu/_ssd/_remote_layout` 与 `_swa_*_layout`，SSD/Remote layout 类型被强制与 CPU 一致），DSv4 全开即 6 个物理池；GPU 永远不是池。
+- 布局：**统一定长是池内性质**——每池 byte-flat `[num_blocks, bytes_per_block]`，主 KV 块与 SWA 块长度不同。块内按组**拼接**（不是 padding）：每组按真实字节数（`层数 × kv_dim × (tpb/compress_ratio) × heads × head_size × dtype`）依次占 byte offset，不拉齐不填充——C128 组每块行数是 C4 组的 1/32，区域天然小。
 - 接口：`get_layer_stride()` 等多组下无单一值的接口直接抛错，改用 `get_group_strides()` 拿每组 `(offset, layer_stride, kv_stride, chunk_size)`。
 - 压缩率维度（DSV4 引入）：组级 `compress_ratio`——每块只存 `tokens_per_block / compress_ratio` 行（CSA 4× / HCA 128×）；`compress_ratio=0` 标记不缓存层（如 DSv4 第 0/1 层）。
 - 下层不透明：CPU↔SSD/Remote 把每个 page 当 opaque byte block 整块读写，不再解析 group——组语义只存在于 GPU↔CPU 边缘侧，往下即字节块（与 lake"池不解释布局"在存储层收敛一致）。
