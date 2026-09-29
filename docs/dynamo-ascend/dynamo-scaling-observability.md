@@ -1464,3 +1464,154 @@ DYN_SYSTEM_PORT=8081 python -m dynamo.vllm --model $MODEL
 **非 K8s 扩缩容:** 通过 PlannerConnector 抽象层切换到 VirtualConnector，etcd 协调（Coordinator 写决策 → Client 消费决策 → 执行启停），完整协议包含 decision\_id/scaled\_decision\_id 握手机制。
 
 **可观测性:** 三管齐下 — Metrics（Prometheus Pull / OTLP Push 双通道，四层层次结构自动标签，10+ Grafana 仪表板）、Tracing（W3C traceparent 跨进程传播，Tempo 存储，Grafana 查看）、Request Trace（逐请求审计日志，广播 Bus 多 Sink）。FPM 是扩缩容的数据源，从 GPU 到决策的完整链路：InstrumentedScheduler → ZMQ → Planner → 回归模型 → 扩缩容决策。
+
+---
+
+# Ascend 迁移约束审视
+
+Dynamo 原生于 NVIDIA GPU 平台。迁移到 Ascend NPU 后，扩缩容和可观测性的关键模块存在大量 NVIDIA 硬依赖。以下是代码级排查结果。
+
+## 总览
+
+| 模块 | NVIDIA 依赖 | Ascend 可用性 | 改动工作量 |
+|------|------------|--------------|-----------|
+| FPM 指标采集 | 部分（设备身份识别走 CUDA） | 部分可用 | 中 |
+| Prometheus 可观测栈 | 全部（DCGM exporter、NVML/DCGM actuator） | 不可用 | 大 |
+| K8s Operator 扩缩容 | 全部（`nvidia.com/gpu` 资源名硬编码 110+ 处） | 不可用 | 大 |
+| Worker 健康检查 | 无 | 可用 | 无 |
+| 通信域 (TP/EP) | 全部（NCCL 直接调用 543+ 处，无 HCCL） | 不可用 | 大 |
+| VirtualConnector (非 K8s) | 无 | 可用 | 无 |
+
+## 1. FPM 指标采集
+
+### 可用部分
+
+FPM 的数据管线（Schema + 消息中继）是纯 Python/Rust，不涉及 GPU 硬件：
+
+- Schema: `components/src/dynamo/common/forward_pass_metrics.py` — 纯 msgspec 结构体
+- 发布器: `lib/llm/src/fpm_publisher.rs` — 纯 ZMQ 消息转发
+- 采集: `InstrumentedScheduler` 从调度器读取 `sum_prefill_tokens`、`kv_utilization` 等调度层指标，不直接读 GPU 内存
+
+### 不可用部分
+
+- **设备身份识别**: `gpu_memory_service/v1/device.py` 使用 `cuda.bindings.driver` (cuda-python) 调用 `cuDeviceGet()` 和 `cuDeviceGetUuid()` 获取设备标识。Ascend 上没有 cuda-python，会直接报错。
+- **CUDA Graph 字段**: `InstrumentedScheduler` 记录了 `cudagraph_mode`、`cudagraph_capture_sizes` 等配置值。这些来自 vLLM 编译配置对象而非硬件读取，字段名在 NPU 上有误导。
+
+### 适配要点
+
+```
+需要做的事情:
+1. gpu_memory_service 的设备识别层需要适配 Ascend（使用 CANN/npu-smi 替代 cuda.bindings.driver）
+2. FPM Schema 中的 CUDA Graph 相关字段在 Ascend 上置 None 或重命名
+3. FPM 的 ZMQ 传输层和 Planner 消费逻辑本身不需要改
+```
+
+## 2. Prometheus 可观测栈
+
+### 问题
+
+整个可观测性部署脚本 `deploy/observability/setup-monitoring.sh` 依赖 NVIDIA 生态：
+
+- 部署 `nvidia-dcgm-exporter` 通过 NVIDIA GPU Operator Helm chart
+- 自定义指标文件 `dcgm-metrics-with-nvlink.csv` 全部是 DCGM field ID（`DCGM_FI_DEV_SM_CLOCK`、`DCGM_FI_DEV_GPU_TEMP`、`DCGM_FI_DEV_POWER_USAGE` 等）
+- 功耗代理 `deploy/power-agent/actuator.py` 两个实现 `NvmlActuator`（`pynvml`）和 `DcgmActuator`（`pydcgm`）全部是 NVIDIA 专有
+
+### 适配要点
+
+```
+需要做的事情:
+1. 替换 DCGM exporter → Ascend NPU 指标导出器（npu-smi 或 Ascend Manager）
+2. 重写 Prometheus 抓取配置，指向 NPU 指标端点
+3. 功耗管理: 用 Ascend 功耗 API 替换 pynvml/pydcgm
+4. Grafana 仪表板需要重新映射指标名（dynamo_gpu_* → dynamo_npu_*）
+```
+
+## 3. K8s Operator 扩缩容
+
+### 问题
+
+这是约束最重的模块。`nvidia.com/gpu` 在 operator 代码中被硬编码了 110 次，分布在 27 个文件中。
+
+关键硬编码点：
+
+| 文件 | 硬编码内容 |
+|------|-----------|
+| `internal/consts/consts.go:149` | `KubeResourceGPUNvidia = "nvidia.com/gpu"` 常量 |
+| `internal/consts/consts.go:68` | `dynamo.nvidia.com/gpu-power-limit` 注解 |
+| `internal/gpu/discovery.go` | GPU 发现全走 DCGM exporter pod (`:9400/metrics`)，解析 DCGM 字段；GPU 型号推断只识别 NVIDIA 型号（GB200/H100/A100）和 AMD MI300，没有 Ascend 型号 |
+| `internal/dynamo/failover.go:265` | failover toleration 硬编码 `Key: "nvidia.com/gpu"` |
+| `internal/dra/dra.go` | GPU 节点 taint `nvidia.com/gpu=NoSchedule`，MIG 形状 `nvidia.com/mig-3g.20gb` |
+
+### 适配要点
+
+```
+需要做的事情:
+1. KubeResourceGPUNvidia 常量改为可配置（通过 Helm values 或环境变量注入），
+   Ascend 对应资源名: "ascend.npu" 或 "huawei.com/ascend"（取决于设备插件）
+2. GPU 发现层: 替换 DCGM exporter 查询 → Ascend NPU 发现机制
+   （使用 Ascend device plugin 标注的节点标签）
+3. GPU 型号推断表: 加入 Ascend 910B/910C 型号
+4. failover toleration: 使用配置的资源名而非硬编码
+5. 功耗注解: 将 dynamo.nvidia.com/ 改为通用命名空间
+6. CRD 示例文件中 nvidia.com/gpu 全部替换
+```
+
+## 4. Worker 健康检查
+
+**可直接使用，无需改动。** 健康检查 (`components/src/dynamo/vllm/health_check.py`) 通过发送测试 prompt 验证引擎响应，不依赖 GPU 特定 API。
+
+## 5. 通信域 (TP/EP) — NCCL vs HCCL
+
+### 问题
+
+这是最核心的依赖。Dynamo 的集体通信层 100% 绑定 NCCL：
+
+- `lib/kvbm-engine/src/collectives/nccl.rs`: 直接导入 `cudarc::nccl::sys`（`ncclBcast`, `ncclComm_t`, `ncclCommDestroy`, `ncclDataType_t`, `ncclGroupEnd`, `ncclGroupStart`），无任何 trait 抽象
+- `lib/llm/src/block_manager/distributed/nccl_bootstrap.rs`: NCCL bootstrap，62 处 NCCL 引用
+- `lib/llm/src/block_manager/block/transfer/nccl.rs`: NCCL 数据传输
+- `lib/memory/src/numa/nvml.rs`: GPU 枚举走 NVML FFI (`libnvidia-ml.so.1`)
+- Rust 代码总计 543+ 处 NCCL 引用，**零处 HCCL 引用**
+- `dynamo-ascend` fork 中同样零处 HCCL 适配
+
+### 影响
+
+NCCL 是 NVIDIA 专有的多 GPU 集体通信库。Ascend 的等价物是 HCCL（Huawei Collective Communication Library），两者 API 不兼容。
+
+```
+需要做的事情:
+1. 集体通信层需要 trait 抽象（CollectiveOps），然后实现 NCCL 和 HCCL 两个后端
+2. 或用 Cargo feature 门控条件编译（#[cfg(feature = "hccl")]）
+3. 设备枚举层（nvml.rs）替换为 Ascend NPU 管理库
+4. CUDA stream/event（cudarc）替换为 Ascend stream/event
+5. 这是一个底层运行时改造，影响范围广，建议作为独立 milestone
+```
+
+## 6. VirtualConnector (非 K8s 部署)
+
+**可直接使用，无需改动。** `components/src/dynamo/planner/connectors/virtual.py` 是纯平台无关代码：
+
+- `get_gpu_counts()` 返回 `(None, None)` — 明确标注 "Virtual deployments do not expose GPU shape"
+- `get_gpu_shapes()` 同理
+- 所有协调通过 etcd 进行，不依赖 K8s GPU 资源 API
+
+## 7. 实际部署建议
+
+基于以上分析，Ascend 平台的可运行路径如下：
+
+### 近期可运行的部分
+
+| 能力 | 状态 |
+|------|------|
+| 单卡推理 | 可用（vLLM Ascend 后端直接工作，不依赖 Dynamo 扩缩容/可观测） |
+| 健康检查端点 | 可用（`/health`、`/live` 纯引擎响应检查） |
+| 非 K8s 扩缩容框架 | 可用（VirtualConnector + etcd 协调，但 GPU 发现需要补实现） |
+| Tracing/Request Trace | 可用（OTLP 导出和请求审计不依赖 GPU 硬件） |
+
+### 需要适配才能运行的部分
+
+| 能力 | 阻塞点 |
+|------|--------|
+| K8s 扩缩容 | `nvidia.com/gpu` 硬编码 — 需要配置化资源名 + NPU 发现 |
+| Prometheus 监控 | DCGM 依赖 — 需要 NPU 指标导出器 |
+| FPM 驱动的自动扩缩 | 设备身份识别 — 需要 Ascend 设备层 |
+| 多卡通信域 (TP/EP) | NCCL 硬编码 — 需要 HCCL 后端（最大工作量） |
