@@ -1459,7 +1459,7 @@ DYN_SYSTEM_PORT=8081 python -m dynamo.vllm --model $MODEL
 
 **扩缩容:** 四层联动 — K8s Adapter 管 Pod（唯一入口防冲突），Planner 管决策（SLA 回归预测 + 缩容安全校验），KV Hash Ring 管数据迁移（两阶段 drain + 热数据预热），FPM 管数据源（GPU → ZMQ → 回归模型）。扩缩策略分 agg（组合）/ disagg（独立 prefill/decode）/ single（单一组件），算法分 Easy（静态阈值）和 SLA（回归模型预测）两档，粒度为每 5s ±1 副本。
 
-**通信域:** TP/PP 固定（固定生命周期），EP 弹性（支持 live resize）。故障时 inter-pod 级联删除全组（NCCL 无法部分恢复）、intra-pod 单 rank 恢复（standby 接管 + GMS 加速）。
+**通信域:** TP/PP 固定（固定生命周期），EP 弹性（支持 live resize）。故障时 inter-pod 级联删除全组、intra-pod 单 rank 恢复（standby 接管 + GMS 加速）。TP/EP 集体通信由推理引擎负责（vLLM Ascend 已适配 HCCL），Dynamo 仅透传配置参数。
 
 **非 K8s 扩缩容:** 通过 PlannerConnector 抽象层切换到 VirtualConnector，etcd 协调（Coordinator 写决策 → Client 消费决策 → 执行启停），完整协议包含 decision\_id/scaled\_decision\_id 握手机制。
 
@@ -1475,11 +1475,12 @@ Dynamo 原生于 NVIDIA GPU 平台。迁移到 Ascend NPU 后，扩缩容和可�
 
 | 模块 | NVIDIA 依赖 | Ascend 可用性 | 改动工作量 |
 |------|------------|--------------|-----------|
-| FPM 指标采集 | 部分（设备身份识别走 CUDA） | 部分可用 | 中 |
-| Prometheus 可观测栈 | 全部（DCGM exporter、NVML/DCGM actuator） | 不可用 | 大 |
-| K8s Operator 扩缩容 | 全部（`nvidia.com/gpu` 资源名硬编码 110+ 处） | 不可用 | 大 |
+| FPM 指标采集 | 部分（设备身份识别走 CUDA） | 部分可用 | 小 |
+| Prometheus 可观测栈 | 全部（DCGM exporter、NVML/DCGM actuator） | 不可用 | 中 |
+| K8s Operator 扩缩容 | 全部（`nvidia.com/gpu` 资源名硬编码 110+ 处） | 不可用 | 中 |
 | Worker 健康检查 | 无 | 可用 | 无 |
-| 通信域 (TP/EP) | 全部（NCCL 直接调用 543+ 处，无 HCCL） | 不可用 | 大 |
+| 通信域 TP/EP 集体通信 | **无**（引擎层负责，Dynamo 仅透传配置） | **可用** | 无 |
+| KV Cache 跨卡广播 | NCCL broadcast（Dynamo 自有，CollectiveOps trait 已抽象） | 需新增 HCCL 后端 | 中 |
 | VirtualConnector (非 K8s) | 无 | 可用 | 无 |
 
 ## 1. FPM 指标采集
@@ -1560,30 +1561,58 @@ FPM 的数据管线（Schema + 消息中继）是纯 Python/Rust，不涉及 GPU
 
 **可直接使用，无需改动。** 健康检查 (`components/src/dynamo/vllm/health_check.py`) 通过发送测试 prompt 验证引擎响应，不依赖 GPU 特定 API。
 
-## 5. 通信域 (TP/EP) — NCCL vs HCCL
+## 5. 通信域 (TP/EP) — 两层分离
 
-### 问题
+Dynamo 涉及 NCCL 的地方有两层，职责完全不同，需要分开看：
 
-这是最核心的依赖。Dynamo 的集体通信层 100% 绑定 NCCL：
+### 5.1 推理引擎的 TP/EP 集体通信 — 不是 Dynamo 的事
 
-- `lib/kvbm-engine/src/collectives/nccl.rs`: 直接导入 `cudarc::nccl::sys`（`ncclBcast`, `ncclComm_t`, `ncclCommDestroy`, `ncclDataType_t`, `ncclGroupEnd`, `ncclGroupStart`），无任何 trait 抽象
-- `lib/llm/src/block_manager/distributed/nccl_bootstrap.rs`: NCCL bootstrap，62 处 NCCL 引用
-- `lib/llm/src/block_manager/block/transfer/nccl.rs`: NCCL 数据传输
-- `lib/memory/src/numa/nvml.rs`: GPU 枚举走 NVML FFI (`libnvidia-ml.so.1`)
-- Rust 代码总计 543+ 处 NCCL 引用，**零处 HCCL 引用**
-- `dynamo-ascend` fork 中同样零处 HCCL 适配
+**Dynamo 完全不参与。** 模型推理的 TP/EP 集体通信（forward/backward 时的 all-reduce 等）由推理引擎（vLLM Ascend / SGLang Ascend）内部处理。Dynamo 在 K8s Operator 层只做配置透传：
 
-### 影响
+- 设置环境变量：`NCCL_DEBUG`、`NCCL_IB_DISABLE`、`NCCL_P2P_DISABLE`（operator 的 `backend_trtllm.go:239`）
+- 注入启动参数：`--tensor-parallel-size`、`--distributed-executor-backend mp`、`--distributed-port`（`backend_vllm.go`）
+- **不调用任何 NCCL API**，不创建 NCCL communicator
 
-NCCL 是 NVIDIA 专有的多 GPU 集体通信库。Ascend 的等价物是 HCCL（Huawei Collective Communication Library），两者 API 不兼容。
+> **结论**: TP/EP 作为功能层，由 vLLM Ascend 适配 HCCL。Dynamo 侧只需把 NCCL 相关的环境变量名改为 HCCL 等价名。
+
+### 5.2 Dynamo 自身的 KV Cache 跨卡传输 — 需要适配
+
+Dynamo 有自己独立的 NCCL 代码路径，用于 **KV cache block 在 TP 组内的广播**（MLA 场景：rank 0 从 G2/G3 加载 KV block，然后 broadcast 给同 TP 组其他 rank）。这是 Dynamo 控制面自己的数据传输，不归引擎管。
+
+涉及的代码：
+
+| 文件 | 用途 | NCCL 依赖 |
+|------|------|----------|
+| `lib/kvbm-engine/src/collectives/nccl.rs` | KV block 广播，实现了 `CollectiveOps` trait | `ncclBcast` + CUDA stream/event |
+| `lib/llm/src/block_manager/block/transfer/nccl.rs` | 旧版 KV block 传输 v1 API | `ncclBcast`, `ncclGroupStart/End` |
+| `lib/llm/src/block_manager/distributed/nccl_bootstrap.rs` | Dynamo 独立的 KVBM 通信器 bootstrap | `ncclGetUniqueId`, `ncclCommInitRankConfig` |
+| `lib/bindings/kvbm/src/block_manager/distributed/worker.rs` | Python 绑定，从引擎借 `nccl_comm_ptr` | 借用引擎的 NCCL communicator |
+
+### 关键设计：Dynamo 借用引擎的 communicator
+
+生产模式下，Dynamo **不自己创建** TP 组的 NCCL communicator，而是从 Python 层（运行在引擎进程内）借一个 `ncclComm_t` 指针过来。 communicator 的所有权归引擎，Dynamo 只是借用。
+
+这意味着：
+
+```
+如果 vLLM Ascend 已经提供了 HCCL communicator →
+Dynamo 只需把"借 nccl_comm_ptr"改为"借 hccl_comm_ptr" →
+然后在 CollectiveOps 后端实现 HCCL 版本的 broadcast
+```
+
+好消息：`CollectiveOps` 已经有 trait 抽象（`lib/kvbm-engine/src/collectives/mod.rs`），目前有两个实现：
+- `NcclCollectives` — NCCL 后端（生产用）
+- `StubCollectiveOps` — 空实现（测试用）
+
+所以 Ascend 适配只需新增一个 `HcclCollectives` 实现，用 Cargo feature 门控即可。
 
 ```
 需要做的事情:
-1. 集体通信层需要 trait 抽象（CollectiveOps），然后实现 NCCL 和 HCCL 两个后端
-2. 或用 Cargo feature 门控条件编译（#[cfg(feature = "hccl")]）
-3. 设备枚举层（nvml.rs）替换为 Ascend NPU 管理库
-4. CUDA stream/event（cudarc）替换为 Ascend stream/event
-5. 这是一个底层运行时改造，影响范围广，建议作为独立 milestone
+1. 新增 CollectiveOps 的 HCCL 后端实现（lib/kvbm-engine/src/collectives/hccl.rs）
+2. Python 绑定层接受 hccl_comm_ptr 而非 nccl_comm_ptr
+3. 旧版 block/transfer/nccl.rs 也需要 HCCL 等价实现
+4. nccl_bootstrap.rs 改为 hccl_bootstrap.rs（Dynamo 独立的 KVBM 通信器）
+5. 设备枚举 nvml.rs 替换为 Ascend NPU 管理库
 ```
 
 ## 6. VirtualConnector (非 K8s 部署)
@@ -1594,24 +1623,37 @@ NCCL 是 NVIDIA 专有的多 GPU 集体通信库。Ascend 的等价物是 HCCL�
 - `get_gpu_shapes()` 同理
 - 所有协调通过 etcd 进行，不依赖 K8s GPU 资源 API
 
-## 7. 实际部署建议
+## 7. 修正后的约束总览
 
-基于以上分析，Ascend 平台的可运行路径如下：
+基于两层分离分析，重新评估：
+
+| 模块 | Dynamo 自身依赖 | 引擎层依赖 | Ascend 影响 |
+|------|----------------|-----------|-------------|
+| K8s Operator 扩缩容 | `nvidia.com/gpu` 硬编码 110+ 处 | 无 | 需配置化资源名 + NPU 发现 |
+| Prometheus 监控栈 | DCGM exporter 部署 | 无 | 需 npu-smi 指标导出器 |
+| FPM 指标采集 | 设备身份走 CUDA | 调度层指标本身可用 | 采集管线可用，设备层需适配 |
+| 通信域 TP/EP 集体通信 | **无**（引擎负责） | HCCL by vLLM Ascend | **已由引擎层适配** |
+| KV Cache 跨卡传输 | NCCL broadcast | 借引擎 communicator | 需 HCCL CollectiveOps 后端 |
+| 健康检查 | 无 | 无 | 直接可用 |
+| Tracing/Request Trace | 无 | 无 | 直接可用 |
+| VirtualConnector | 无 | 无 | 直接可用 |
 
 ### 近期可运行的部分
 
 | 能力 | 状态 |
 |------|------|
-| 单卡推理 | 可用（vLLM Ascend 后端直接工作，不依赖 Dynamo 扩缩容/可观测） |
+| 单卡推理 | 可用（vLLM Ascend 后端直接工作） |
+| 多卡 TP 推理 | 可用（vLLM Ascend 已适配 HCCL，Dynamo 仅透传配置） |
 | 健康检查端点 | 可用（`/health`、`/live` 纯引擎响应检查） |
-| 非 K8s 扩缩容框架 | 可用（VirtualConnector + etcd 协调，但 GPU 发现需要补实现） |
+| 非 K8s 扩缩容框架 | 可用（VirtualConnector + etcd 协调） |
 | Tracing/Request Trace | 可用（OTLP 导出和请求审计不依赖 GPU 硬件） |
+| FPM 数据管线 | 可用（Schema + ZMQ 传输纯平台无关） |
 
-### 需要适配才能运行的部分
+### 需要适配的部分
 
-| 能力 | 阻塞点 |
-|------|--------|
-| K8s 扩缩容 | `nvidia.com/gpu` 硬编码 — 需要配置化资源名 + NPU 发现 |
-| Prometheus 监控 | DCGM 依赖 — 需要 NPU 指标导出器 |
-| FPM 驱动的自动扩缩 | 设备身份识别 — 需要 Ascend 设备层 |
-| 多卡通信域 (TP/EP) | NCCL 硬编码 — 需要 HCCL 后端（最大工作量） |
+| 能力 | 工作量 | 说明 |
+|------|--------|------|
+| K8s 扩缩容 | 中 | `nvidia.com/gpu` 配置化 + NPU 节点发现 |
+| Prometheus 监控 | 中 | DCGM → npu-smi 指标导出器 |
+| FPM 设备识别 | 小 | `gpu_memory_service` 设备层适配 |
+| KV Cache 跨卡广播 | 中 | `CollectiveOps` trait 已有抽象，新增 HCCL 后端即可 |
