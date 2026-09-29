@@ -1575,11 +1575,13 @@ Dynamo 涉及 NCCL 的地方有两层，职责完全不同，需要分开看：
 
 > **结论**: TP/EP 作为功能层，由 vLLM Ascend 适配 HCCL。Dynamo 侧只需把 NCCL 相关的环境变量名改为 HCCL 等价名。
 
-### 5.2 Dynamo 自身的 KV Cache 跨卡传输 — 需要适配
+### 5.2 Dynamo 自身的 KV Cache 跨卡传输 — 仅在 MLA + KV 恢复场景触发
+
+**这是 Dynamo 独有的数据传输层，和推理引擎的 TP 集体通信完全独立。**
+
+**重要：基本扩缩容（多拉/少拉节点）不触发此路径。** 每个节点独立拉起、各自服务即可（参见 PR #43 的拉起方式）。KV broadcast 只在 MLA 模型的 KV 从持久化存储（G2/G3）恢复到 GPU（G1）时才执行 — 属于可选优化功能，不影响基本扩缩容能力。
 
 ### 5.2.1 KV Cache 广播是什么
-
-这是 Dynamo 独有的数据传输层，和推理引擎的 TP 集体通信**完全独立**。
 
 **背景：MLA（Multi-head Latent Attention）模型**
 
@@ -1807,7 +1809,7 @@ Dynamo 需要向 vLLM Ascend 借用以下句柄：
 | Prometheus 监控栈 | DCGM exporter 部署 | 无 | 需 npu-smi 指标导出器 |
 | FPM 指标采集 | 设备身份走 CUDA | 调度层指标本身可用 | 采集管线可用，设备层需适配 |
 | 通信域 TP/EP 集体通信 | **无**（引擎负责） | HCCL by vLLM Ascend | **已由引擎层适配** |
-| KV Cache 跨卡传输 | NCCL broadcast | 借引擎 communicator | 需 HCCL CollectiveOps 后端 |
+| KV Cache 跨卡广播（MLA场景） | NCCL broadcast | 借引擎 communicator | 可选适配 — 非 MLA 模型不触发 |
 | 健康检查 | 无 | 无 | 直接可用 |
 | Tracing/Request Trace | 无 | 无 | 直接可用 |
 | VirtualConnector | 无 | 无 | 直接可用 |
@@ -1818,6 +1820,7 @@ Dynamo 需要向 vLLM Ascend 借用以下句柄：
 |------|------|
 | 单卡推理 | 可用（vLLM Ascend 后端直接工作） |
 | 多卡 TP 推理 | 可用（vLLM Ascend 已适配 HCCL，Dynamo 仅透传配置） |
+| 基本扩缩容（多拉/少拉节点） | 可用（各节点独立拉起，不触发 KV broadcast） |
 | 健康检查端点 | 可用（`/health`、`/live` 纯引擎响应检查） |
 | 非 K8s 扩缩容框架 | 可用（VirtualConnector + etcd 协调） |
 | Tracing/Request Trace | 可用（OTLP 导出和请求审计不依赖 GPU 硬件） |
@@ -1830,4 +1833,4 @@ Dynamo 需要向 vLLM Ascend 借用以下句柄：
 | K8s 扩缩容 | 中 | `nvidia.com/gpu` 配置化 + NPU 节点发现 |
 | Prometheus 监控 | 中 | DCGM → npu-smi 指标导出器 |
 | FPM 设备识别 | 小 | `gpu_memory_service` 设备层适配 |
-| KV Cache 跨卡广播 | 中 | `CollectiveOps` trait 已有抽象，新增 HCCL 后端即可 |
+| KV Cache 跨卡广播（MLA场景） | 中（可选） | `CollectiveOps` trait 已有抽象，新增 HCCL 后端即可。非 MLA 模型不触发 |
