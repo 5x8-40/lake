@@ -88,6 +88,10 @@ FlexKV 原假设所有层 KV shape 一致（统一 `num_kv_heads`/`head_size`，
 
 ## 架构
 
+![FlexKV 架构：StorageEngine / GlobalCacheEngine / TransferEngine 三模块与 GPU→CPU→SSD→远端分层（上游 README，Apache-2.0）](img/flexkv_architecture.png)
+
+上图为上游官方架构图（三模块 + 分层 + GET/PUT 流向）；下图是本仓视角的请求路径简化：
+
 ```
 vLLM / SGLang / TRT-LLM / Dynamo worker
   ├─ 引擎 APC + allocate_slots / free     ← GPU 槽的唯一所有者
