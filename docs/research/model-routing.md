@@ -213,13 +213,29 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
 
 [NVIDIA-NeMo/Switchyard](https://github.com/NVIDIA-NeMo/Switchyard)(Apache 2.0,2026):agent 场景的模型路由库,两种部署形态——独立代理(agent 把 base_url 指过来)或进程内中间件。内置三类路由器,按"要不要额外调模型、要不要训练"区分([NVIDIA 博客](https://developer.nvidia.com/blog/route-ai-agent-workloads-across-models-with-nvidia-nemo-switchyard/)):
 
+![NeMo Switchyard 架构](model-routing/figures/switchyard-arch.png)
+
+(图源:[NVIDIA 博客](https://developer.nvidia.com/blog/route-ai-agent-workloads-across-models-with-nvidia-nemo-switchyard/) Figure 3。Switchyard Server 内嵌 Routing Core(路由策略)、Session Manager(会话状态)、Usage & Telemetry(用量计量),向上接 agent/应用,向下接各模型提供方;路由配置、策略、会话存储、遥测导出构成控制面。)
+
 1. **LLM classifier(免训练)**:一个小 judge 模型辅助决策,三种模式——capability(逐调用选目标)、**escalation**(每个任务都从便宜模型开始,judge 逐轮读已完成轮次投票,连续两次否定把该任务升档到贵模型,单向门不再降回)、custom(自定义)。
 2. **Stage router(免训练,启发式)**:不加任何模型调用,读工具调用/返回信号、错误模式、推理模式、token 数,按工作流阶段路由;延迟接近零,但只在 agent 流量里确实有这些信号时有效。
 3. **Prefill-activation MLP(可训练,研究阶段)**:读模型内部状态做路由——prefill 时抽残差流激活,shared-trunk MLP 预测池里每个模型答对的成功率,再按策略把预测准确率与成本、延迟混合打分。
 
+![Prefill router 的准确率-成本前沿](model-routing/figures/switchyard-prefill-router.png)
+
+(图源:NVIDIA 博客,同上,Figure 5。读法:横轴 = 测试集总成本,纵轴 = 准确率;散点是池子里各个固定模型,折线是训练后的 prefill router 在不同成本预算下的表现——routing 不是总选最强模型,而是在预算约束下选"最可能达标"的模型,折线全程压在单模型点族的左上方。)
+
 LangChain 的独立实测([博客](https://www.langchain.com/blog/switchyard-agent-routing-benchmark),2026-08,escalation 模式,145 个多步 agent 任务、平均 6.3 次调用)值得记三个数字:
 
+![Escalation 路由流程](model-routing/figures/switchyard-escalation-flow.png)
+
+(图源:[LangChain 博客](https://www.langchain.com/blog/switchyard-agent-routing-benchmark)。escalation 是单向门:任务从便宜模型开始,judge 逐轮投票,连续两次否定后该任务永久升档到贵模型。)
+
 1. **93% 的调用由 30B 模型完成,只占 10.4% 的花费;7% 升档到 Opus 的调用占 68.4%**——"多少轮次真的需要旗舰模型"在这个 workload 上的答案是 7%。路由后比全跑 Opus 便宜 74%,准确率低 6 个点(86.0% → 80.0%)。
+
+![调用量占比 vs 花费占比](model-routing/figures/switchyard-spend-chart.png)
+
+(图源:LangChain 博客,同上。读法:左环是调用量分布,右环是花费分布——30B 模型接了 93% 的调用只花 10.4% 的钱;judge 模型调用不多但占 21.2% 的花费,因为它每轮都跑且吃不到 prompt 缓存。)
 2. **judge 模型吃掉路由后花费的 21.2%**:它在每个未升档的轮次都要跑,且享受不到 prompt 缓存——"做判断的组件必须比省下的钱便宜"的又一次量化。博客给出判据公式:最小卸载比例 = judge 成本 ÷(贵便宜模型的单价差);价差小到这个比例超过 100% 时,路由必然亏本。
 3. **路由 vs 全跑便宜模型**:+2.3 分准确率、4.2 倍成本,小于 run 间波动(±2.7 分)——在这个偏简单的饱和 workload 上,路由赢的是"不用提前猜哪题难",不是稳赢便宜模型。
 
@@ -290,6 +306,10 @@ LangChain 的独立实测([博客](https://www.langchain.com/blog/switchyard-age
 - [TwinRouterBench](https://arxiv.org/abs/2605.18859)(2026,CommonstackAI,[代码与数据](https://github.com/CommonstackAI/TwinRouterBench),Apache 2.0):**步级**(step-level)路由评测,补前两个 benchmark 的盲区——RouterBench/LLMRouterBench 都是"一个完整 prompt 选一次模型",而 agent 场景路由器真正面对的决策是"给定当前完整前缀(对话 + 工具返回 + 检索 + 日志),下一次调用该用哪档模型"。双轨制:
   1. **静态轨**:970 个"路由器可见前缀"快照,来自 520 个实例、5 种 workload(SWE-bench / BFCL / mtRAG / QMSum / PinchBench);每条标注"最便宜够用档"(low/mid/mid_high/high 四档),标签由 downgrade-and-cascade 协议生成(从高档逐步降档 + 混合模型执行验证,确认降档后任务仍成功);打分是确定性算术(档位标签 × 轨迹归属 × token 成本),**评测侧不用在线 LLM judge**。
   2. **动态轨**:live 跑 SWE-bench Verified(论文报告 100 例 held-out,与静态轨的 SWE 监督切分不相交),每次调用路由器从锁定模型池选具体模型,按官方 resolution 判定 + 实际 API 花费(含缓存计费)+ 未解决罚分结算。
+
+  ![TwinRouterBench 双轨结构](model-routing/figures/twinrouterbench-overview.png)
+
+  (图源:[TwinRouterBench 论文](https://arxiv.org/abs/2605.18859) Figure 1。读法:上路是静态轨——从成功轨迹里逐步降档、执行验证,产出带"最便宜够用档"标签的 970 个步级快照,供离线快速迭代;下路是动态轨——路由器接进 live agent  harness 跑完整 SWE-bench,按任务解决率与实际账单结算。)
 
   头部数字:训练出的路由器 75/100、$25.66,全 Opus 参照 74/100、$54.73——质量持平、省 53.1%。注意这个 benchmark 与 UncommonRoute 同源(§2),读其"训练路由器"结果时留意自评属性。三个评测集连起来看,形态演进是:单轮离线回放(RouterBench)→ 大规模统一重测(LLMRouterBench)→ 步级 agentic 双轨(TwinRouterBench)。
 - [RouterArena](https://arxiv.org/abs/2510.00202)(ICLR 2026,[排行榜](https://routeworks.github.io/)):实时排行榜形态,把路由器当黑盒测(各家用各自的模型池),主指标 Arena Score 是准确率与 log₂ 成本的加权调和平均。榜单滚动更新、榜首更迭很快,以下以 **2026-09-29 的榜单数据**为准(9 月初的榜首 Paix2 已被暂时除名,见第 4 条):
