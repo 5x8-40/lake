@@ -249,6 +249,39 @@ LangChain 的独立实测([博客](https://www.langchain.com/blog/switchyard-age
 
 两个设计与 §7 的结论呼应:**会话不绑定模型**(逐步重选,但遵守 Anthropic thinking 续段等协议约束);**本地反馈学习**——高置信的一致决策用来扩充嵌入索引,低置信预测直接升档,而不是静默发给弱模型。自报数字(注意自评属性):SWE-bench Verified 100 例 held-out 上 75/100(Opus 单模型 74/100)、成本 $25.66 vs $54.73,省 53.1%;评测基建是同团队开源的 TwinRouterBench(§3)。
 
+### openJiuwen model-router(华为,开源路由内核)
+
+[openJiuwen-ai/model-router](https://github.com/openJiuwen-ai/model-router)(Apache 2.0,2026-09 开源)是华为 openJiuwen agent 框架([论文](https://arxiv.org/abs/2608.27969))的模型路由内核。与前面各家的最大不同:它做的不是"一个路由器",而是**路由内核 + 算法槽**——算法是可替换的纯函数,内核只管契约、状态与装配。Rust 核心(protocol / state / algorithms / runtime 四层 crate)+ PyO3 的 Python 门面;端云同一套决策契约,差异只落在 TOML profile(端侧进程内 state / 云侧远程 state)。
+
+内核的四条设计纪律([架构文档](https://github.com/openJiuwen-ai/model-router/blob/main/docs/zh/architecture.md)):
+
+1. **决策与执行分离**:算法只返回 `selected_model_id` 加 `reasoning`,模型调用由宿主自己完成,路由器不经手流量,不会成为瓶颈。
+2. **算法是纯函数**:同样的 (request, ctx) 必须给出同样的决策;算法不持有可变状态、不调用目标模型。
+3. **状态是外置的 hint**:跨请求记忆全部放在 StateProvider(snapshot / report);状态丢失只降质为冷路由,远程 state 硬超时返回空视图,而不是让请求失败。
+4. **反馈驱动排除**:宿主 report 的 Feedback(Overflow / Unavailable)写入排除 hint,下次 route 自动避开故障模型。
+
+```mermaid
+flowchart LR
+    H["宿主(agent / 网关)"] -->|"route(请求, hint)"| R["Router 内核<br/>纯函数 decide"]
+    S[("StateProvider<br/>外置,可丢失")] -->|snapshot| R
+    R -->|"Decision(只含 model_id)"| H
+    H -->|"自己调用模型"| M["模型后端"]
+    H -->|"report(Feedback)"| S
+```
+
+(按官方架构文档的时序图重绘:route/report 闭环。注意 State 与 Algorithm 之间无直接调用,唯一耦合是 RouteContext 里的视图数据。)
+
+自带的生产级算法是 **x-router**(Python 侧,[README](https://github.com/openJiuwen-ai/model-router/blob/main/python/openjiuwen/x_router/README.md)):
+
+1. **分档**:进程内小分类器(Qwen3-0.6B,greedy 解码保证同请求同档)把会话打进 SIMPLE / MEDIUM / COMPLEX / RESEARCH / REASONING 五档;不高于本地能力线的留本地模型,超出的按档位映射到云端模型。
+2. **失败只降不升**("No failure escalates"):分类器缺失、超时、输出解析失败,都降级到本地模型或启发式,绝不因路由故障把请求发到更贵的模型。决策的 `reasoning` 是稳定的 key=value(rule + source 两个独立事实),source 里 `heuristic_fallback` / `parse_failed` 的速率就是分类器健康度的免费监控指标。
+3. **可选 bandit 层**(默认关):记住历史会话的结果,当"相似请求在另一档上持续表现更好"(相似近邻 ≥5 且分差 >0.3)时覆盖分类器的档位;效用函数 U = 质量 − λ×成本——正是 §3"机制展开"里的效用式成本感知选择;每轮质量由 judge 模型(本地 1.7B+ 或任意 OpenAI 兼容 API)在 report 返回后异步打分,打分队列满则丢而不是阻塞。
+4. **状态侧配套**:k-NN 检索历史闭环记录(top_k=10、相似度阈值 0.5),forgetting_gamma 折扣旧策略版本的记录;免费档位必须上报 cost=0——成本未知的档位在成本有权时永不入选。
+
+与 lake 的对照:这是模型级路由,但设计纪律与 lake 实例级 Router 的原则同构——Router 是纯函数 f(请求, 状态快照)、状态外置、决策与执行分离。差异在状态的可靠性假设:model-router 把状态显式设计成可丢失的 hint(硬超时返回空视图),因为选错档只影响成本;lake Router 读的是存储池的权威位置视图,由存储控制面保证可用——位置视图是执行模式选择的输入,降质成"可丢失"会把 D-direct 决策变成猜测。
+
+当前状态(2026-09-30):仓库是按蓝图搭好的骨架——契约、装配、一条可跑的 ReAct 验证路径已对齐;加权算法、远程 state gRPC、完整 PyO3 绑定仍是桩;`evolving/mf.rs` 的矩阵分解在线演进算法只有空壳(`fit` 返回空工件)——MF 在路线图里,尚未落地。
+
 ### LiteLLM / Portkey 等 AI 网关
 
 路由策略是负载均衡与容错型(least-busy、最低延迟、成本上限、顺序 fallback),不做"这个请求哪个模型答得好"的质量预测。与模型级路由是近邻但不同类。
@@ -753,7 +786,7 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
 
 6. **命中阈值与失衡切换**。短请求设命中阈值,不做亲和查询直接负载均衡(production-stack 默认 2000 token);负载严重失衡时缓存亲和整体让位(SGLang 的双阈值切换)。lake 的亲和信息更可靠(存储池权威视图,非推测),这些阈值与切换逻辑可以直接移植。
 7. **推测索引**(llm-d)。路由决策到 KV 位置视图更新之间存在窗口期,连续同前缀请求会在窗口期内失去亲和。llm-d 的做法是决策后立即写入短期预测条目(TTL 2 秒),等确认或过期。lake Router 读存储池位置视图,同样有"决策-放置"窗口,这个机制可直接借用。
-8. **无状态保底**(KubeAI CHWBL)。位置视图不可用或存储池控制面故障时,Router 可以退到"前缀+模型/LoRA 一致性哈希"——零状态、天然多副本一致、仍保前缀亲和,优于随机,也比"按负载预测"的降级路径更便宜。
+8. **无状态保底**(KubeAI CHWBL)。位置视图不可用或存储池控制面故障时,Router 可以退到"前缀+模型/LoRA 一致性哈希"——零状态、天然多副本一致、仍保前缀亲和,优于随机,也比"按负载预测"的降级路径更便宜。模型级侧的同款思路:openJiuwen model-router 的远程 state 硬超时返回空视图、降质为冷路由而不是让请求失败(§2)。
 9. **公平与局部性兼得**(D²LPM)。租户公平(按历史用量排队,用量少的优先)与前缀亲和(尽量发给存着该前缀的 worker)天然冲突:严格公平会把请求发到没有它缓存的 worker 上。D²LPM 的解法(机制展开见 §6):先按"亏欠账"找出最亏欠的租户,再只在持有其前缀的 worker 里选,并用"(租户 × worker)"配额防止某个热门租户把单个 worker 打爆。lake 里公平性决策归 gateway,这套算法是 gateway 侧现成的参考。
 
 **上线与运维的注意事项**
@@ -819,6 +852,7 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
   - Jev Router:[模型页](https://openrouter.ai/typesafe/jev-router)、[Jev 文档](https://openrouter.ai/docs/guides/community/jev)、[第三方逆向分析(BestHub)](https://www.besthub.dev/articles/reverse-engineering-jev-10k-api-calls-expose-closed-source-model-architecture-27085f944485)
 - SwitchYard(NVIDIA):[仓库](https://github.com/NVIDIA-NeMo/Switchyard)、[NVIDIA 博客](https://developer.nvidia.com/blog/route-ai-agent-workloads-across-models-with-nvidia-nemo-switchyard/)、[LangChain 实测](https://www.langchain.com/blog/switchyard-agent-routing-benchmark)
 - UncommonRoute:[仓库](https://github.com/CommonstackAI/UncommonRoute)
+- openJiuwen model-router(华为):[仓库](https://github.com/openJiuwen-ai/model-router)([架构文档](https://github.com/openJiuwen-ai/model-router/blob/main/docs/zh/architecture.md)、[x-router README](https://github.com/openJiuwen-ai/model-router/blob/main/python/openjiuwen/x_router/README.md))、[openJiuwen 论文](https://arxiv.org/abs/2608.27969)
 - OpenSquilla:
   - [GitHub](https://github.com/TokenRhythm/opensquilla)
   - [技术报告](https://aixiv.science/abs/aixiv.260822.000001)([中文](https://chinaxiv.org/abs/202608.00176))
