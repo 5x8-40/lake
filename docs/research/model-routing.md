@@ -173,6 +173,16 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
 
 (图源:[OpenRouter 公告](https://openrouter.ai/blog/announcements/introducing-the-new-auto-router/)。读法:**行是用户指定的 `cost_tier` 价格档**——`default` 表示不指定档位,low/medium/high/xhigh/max 是五档价格带;**列是任务类别**;格子是该价格档 × 该类别下平台消费份额最高的模型及份额。同一类别在不同价格档下胜出者不同,路由就是把请求分到对应格子的胜出者。)
 
+2026 年 9 月底,OpenRouter 上线第二个自动路由 [`typesafe/jev-router`](https://openrouter.ai/typesafe/jev-router)(2026-09-25 发布,免费,与 auto-beta 并存),由第三方 TypeSafe 的决策模型 **Jev** 驱动:
+
+- **Jev 不是生成模型,是"决策模型"**(TypeSafe 称之为 System One model):输入一段状态文本加一组带候选答案的问题,输出各答案的概率分布,不生成文本([Jev 文档](https://openrouter.ai/docs/guides/community/jev))。第三方逆向分析([BestHub,未经官方证实](https://www.besthub.dev/articles/reverse-engineering-jev-10k-api-calls-expose-closed-source-model-architecture-27085f944485))指向两个实现特征:分类头直接从最终隐向量出概率(不做逐 token 解码);共享前缀推理——同一份 state 编码一次,多个问题分支复用 KV。
+- **路由策略逐轮、缓存感知**:每轮读对话文本,对任务类型、难度、精度要求、"更大模型或更多推理是否有帮助"、"更便宜模型是否够"、"任务是否变了"分别打分,然后:
+  1. 当前模型仍胜任就**保持**(会话粘连);
+  2. 只调推理档位(reasoning effort)能解决的**不换模型**;
+  3. 只在预期质量收益大于切换成本时才换模型,**切换成本显式包含丢失的 prompt cache**——第一家把"换模型=丢缓存"写进公开路由策略的产品(对照 §4 Anthropic 从 provider 侧给的解释)。
+- **数字(官方口径,未经第三方复测)**:423 个 agent 任务上解出 237 个,对照 Auto Router 的 130 个。
+- 零数据保留(ZDR),附件不送给 Jev;LiteLLM 的 Auto Router 已支持 `classifier_type: jev` 接入。
+
 反例:**Martian** 是最早做模型路由的创业公司(2023 年种子轮 $9M,NEA/General Catalyst 投资)。
 
 1. **思路**:"model mapping"——用可解释性方法分析各模型的内部表示,**不运行模型就预测**"这个请求哪个模型能答好";自称可解释性的第一个商业应用,还开源了 RouterBench(§3)。
@@ -199,6 +209,30 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
 
 最终 16K token 的路由 108ms 完成,路由器显存占用 <800MB——可以与 LLM 服务共享一张卡,不需要独占加速器。
 
+### SwitchYard(NVIDIA,开源)
+
+[NVIDIA-NeMo/Switchyard](https://github.com/NVIDIA-NeMo/Switchyard)(Apache 2.0,2026):agent 场景的模型路由库,两种部署形态——独立代理(agent 把 base_url 指过来)或进程内中间件。内置三类路由器,按"要不要额外调模型、要不要训练"区分([NVIDIA 博客](https://developer.nvidia.com/blog/route-ai-agent-workloads-across-models-with-nvidia-nemo-switchyard/)):
+
+1. **LLM classifier(免训练)**:一个小 judge 模型辅助决策,三种模式——capability(逐调用选目标)、**escalation**(每个任务都从便宜模型开始,judge 逐轮读已完成轮次投票,连续两次否定把该任务升档到贵模型,单向门不再降回)、custom(自定义)。
+2. **Stage router(免训练,启发式)**:不加任何模型调用,读工具调用/返回信号、错误模式、推理模式、token 数,按工作流阶段路由;延迟接近零,但只在 agent 流量里确实有这些信号时有效。
+3. **Prefill-activation MLP(可训练,研究阶段)**:读模型内部状态做路由——prefill 时抽残差流激活,shared-trunk MLP 预测池里每个模型答对的成功率,再按策略把预测准确率与成本、延迟混合打分。
+
+LangChain 的独立实测([博客](https://www.langchain.com/blog/switchyard-agent-routing-benchmark),2026-08,escalation 模式,145 个多步 agent 任务、平均 6.3 次调用)值得记三个数字:
+
+1. **93% 的调用由 30B 模型完成,只占 10.4% 的花费;7% 升档到 Opus 的调用占 68.4%**——"多少轮次真的需要旗舰模型"在这个 workload 上的答案是 7%。路由后比全跑 Opus 便宜 74%,准确率低 6 个点(86.0% → 80.0%)。
+2. **judge 模型吃掉路由后花费的 21.2%**:它在每个未升档的轮次都要跑,且享受不到 prompt 缓存——"做判断的组件必须比省下的钱便宜"的又一次量化。博客给出判据公式:最小卸载比例 = judge 成本 ÷(贵便宜模型的单价差);价差小到这个比例超过 100% 时,路由必然亏本。
+3. **路由 vs 全跑便宜模型**:+2.3 分准确率、4.2 倍成本,小于 run 间波动(±2.7 分)——在这个偏简单的饱和 workload 上,路由赢的是"不用提前猜哪题难",不是稳赢便宜模型。
+
+### UncommonRoute(开源,agent 步级)
+
+[CommonstackAI/UncommonRoute](https://github.com/CommonstackAI/UncommonRoute)(MIT):本地运行的 OpenAI 协议代理,即插到 Claude Code / Cursor / Codex。每个请求(每个 agent 步)过三个本地信号,投票出复杂度档位,再从用户配置的上游里挑能力匹配的最便宜模型:
+
+1. **元数据信号**:会话结构、工具使用、上下文深度,开销极低;
+2. **嵌入信号**:BGE 分类器读请求 + 近期 agent 状态 + 元数据,不确定时 KNN 回退;
+3. **结构信号**:文本与会话复杂度,按需激活,平时影子跟踪。
+
+两个设计与 §7 的结论呼应:**会话不绑定模型**(逐步重选,但遵守 Anthropic thinking 续段等协议约束);**本地反馈学习**——高置信的一致决策用来扩充嵌入索引,低置信预测直接升档,而不是静默发给弱模型。自报数字(注意自评属性):SWE-bench Verified 100 例 held-out 上 75/100(Opus 单模型 74/100)、成本 $25.66 vs $54.73,省 53.1%;评测基建是同团队开源的 TwinRouterBench(§3)。
+
 ### LiteLLM / Portkey 等 AI 网关
 
 路由策略是负载均衡与容错型(least-busy、最低延迟、成本上限、顺序 fallback),不做"这个请求哪个模型答得好"的质量预测。与模型级路由是近邻但不同类。
@@ -215,11 +249,26 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
 | GraphRouter([ICLR 2025](https://arxiv.org/abs/2410.03834)) | 2025 | 把任务、查询、模型建成异构图的节点,"某模型能答好某查询"是边;路由变成预测边——相似任务之间可以互相提供证据 | 利用任务间结构信息 |
 | Avengers([arXiv 2408.12683](https://arxiv.org/abs/2408.12683)) | 2024 | 最简单的一支:把历史查询按嵌入**聚类**(嵌入后按向量距离分组),统计每个簇里哪个小模型历史平均分最高;新查询落入哪个簇,就用那个簇的冠军 | 不训练任何神经网络也有竞争力 |
 | Avengers-Pro([arXiv 2508.12631](https://arxiv.org/abs/2508.12631)) | 2025 | Avengers 的成本版,三步轻量操作:嵌入(Qwen3-embedding-8B)→ k-means 聚成 60 簇 → 每个簇给每个模型算"性能-效率分"(参数 α 加权该簇上的准确率与成本);推理时把查询嵌入选最近的 4 个簇,按簇分数加总选模型。调 α 就在"更准"与"更省"之间滑动 | 6 个 benchmark、8 个旗舰模型上:同等成本比 GPT-5-medium 高 +7% 准确率,同等质量省 27% 成本;LLMRouterBench 里表现最好的方法(见下) |
+| LLMRank([arXiv 2510.01234](https://arxiv.org/abs/2510.01234)) | 2025 | 特征驱动排序:从 prompt 抽**人可读**特征(任务类型、推理模式、复杂度指示、句法线索、轻量代理求解器的信号),神经排序模型预测每个模型的效用(质量 − λ×成本);训练目标是 pointwise 回归 + listwise KL 的混合(见下"机制展开") | RouterBench 上达 89.2% 的 oracle 效用;可解释归因——能说清"因为哪个特征选了这个模型" |
 | 综述([arXiv 2603.04445](https://arxiv.org/html/2603.04445v2)) | 2026 | 路由/级联统一分类 | 入门地图 |
 
 ![RouteLLM 在 MT-Bench 上的成本-质量权衡](model-routing/figures/routellm-mt-bench.png)
 
 (图源:[RouteLLM 论文](https://arxiv.org/abs/2406.18665) Figure 2。读法:横轴 = 调用强模型(GPT-4)的比例,近似成本;纵轴 = MT-Bench 质量。四条实线是论文训练的四种路由器——SW ranking = 相似度加权排名,Matrix factorization = 矩阵分解,BERT / Causal LLM = 两种分类器,**(A) = 训练时做了数据增强**;灰色虚线是"按同样比例随机调用 GPT-4"的基线。曲线越靠左上越好:花同样的强模型调用比例,拿到更高的质量。)
+
+### 机制展开:质量预测 + 成本感知选择(MF 与 ListNet)
+
+上表里的单轮路由器,多数可以拆成同一个三步结构:**给每个候选模型预测质量分 → 按成本做选择 → 用排序损失训练**。围绕这三步有几个反复出现的术语,集中解释一次:
+
+1. **MF(矩阵分解)是什么**:从推荐系统借来的质量预测器。把"查询 × 模型"的质量矩阵分解成低秩嵌入的乘积,学一个隐评分函数 δ(M,q) 表示"模型 M 答查询 q 的质量"。RouteLLM 的 MF 路由器是双线性形式:模型嵌入与查询嵌入(投影到同维)逐位相乘,再过线性层出标量分;EmbedLLM 同样用 MF 学模型的紧凑嵌入,路由时预测"哪个模型能答对"。优点是极小、推理微秒级;缺点是**新模型入池要重训**(冷启动问题,见"评测"节的 MonoScale)。
+2. **ListNet 是什么**:learning-to-rank 的 listwise 损失(Cao et al., 2007)。把一个查询下所有候选模型的预测分过 softmax 变成概率分布,与真实效用(谁答对、答得多好)的分布算交叉熵,直接对齐"整个候选列表的排序"。它的两个对照范式:
+   - **pointwise**:逐个模型独立回归分数,不管相对顺序;
+   - **pairwise**:两两比大小——RouteLLM 的 sigmoid 胜率(强模型胜过弱模型的概率)就是 pairwise。
+3. **怎么用在 router 里**:质量预测头(MF 或其他)出分之后,**成本感知选择**有两种常见形式:
+   - **阈值式**:RouteLLM——预测"强模型胜率"超过阈值才调强模型,阈值就是成本旋钮;
+   - **效用式**:选 argmax(质量 − λ×成本),λ 是成本旋钮——LLMRank 用的这种。
+   
+   训练目标的选取与池子大小有关:二元池(强/弱两个模型)用 pairwise 就够;**多模型池更适合 listwise**——pairwise 只学相对胜负、比较对数随池子平方增长,listwise 直接对整个候选分布对齐。LLMRank 是"质量预测 + listwise 训练 + 成本效用选择"三者齐备的具体例子(RouterBench 上训练,89.2% oracle 效用)。
 
 ### 评测:方法多,有效的少
 
@@ -233,26 +282,37 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
   3. 对部署友好的结论:Avengers 不训练神经网络(纯聚类)也在第一梯队;embedding 骨干换成弱模型几乎不影响结果;**模型池越大收益越递减,精心挑选的小池子更划算**——原因是路由的收益来自模型间的互补(各有所长):Oracle 曲线显示从 2 个模型加到 4-6 个时上限提升最大,之后新模型擅长的领域大多已被覆盖,边际互补趋零;同时候选越多,路由器选错的概率越高。按"覆盖更多领域"挑 4-6 个互补的模型,比堆 20 个更划算。
 
   **设定二:性能-成本设定**(13 个旗舰模型池,参照系 Best Single = GPT-5)。指标:PerfGain(质量相对 GPT-5 的增减)与 CostSave(质量不低于 GPT-5 前提下的最大省钱幅度)。结果:**OpenRouter 的 PerfGain 是 −24.7%**——质量比"所有请求都发给 GPT-5"还差 24.7%,质量不达标所以 CostSave 记 N/A(论文脚注:OpenRouter 用自己平台的模型池,不可配置)。这与设定一不矛盾:Dataset Oracle 是轻量池里的上界参照,−24.7% 是旗舰池里相对 GPT-5 基线的差距,两个设定两批模型。表现最好的 **Avengers-Pro**:PerfGain +4.0%、CostSave +31.7%,几乎独占 Pareto 前沿(机制见上表);RouteLLM +2.6% / +11.4%;HybridLLM、FrugalGPT 两个二分类级联/路由器都是负收益。
-- [RouterArena](https://arxiv.org/abs/2510.00202)(ICLR 2026,[排行榜](https://routeworks.github.io/)):实时排行榜形态,把路由器当黑盒测(各家用各自的模型池),主指标 Arena Score 是准确率与 log₂ 成本的加权调和平均。榜单滚动更新、榜首更迭很快,以下以 **2026-09 的榜单**为准:
+- **模型池不是越大越好**(2026 年的四篇后续研究,把上面设定一结论 3 往深推了一层):
+  1. **OrchSLM**([arXiv 2609.13470](https://arxiv.org/abs/2609.13470)):小模型编排的系统扫描——oracle 覆盖率随池子规模持续上升,但**路由准确率通常在 3-4 个模型时见顶**;再加模型会引入"稳定的错误支持"(某些模型稳定地给出同一个错答案),让正确答案更难被识别。池子构成变化还会改变最优路由策略本身——选池与选路由策略是耦合决策,不是先后两个阶段。
+  2. **Mo' Models, Mo' Problems**([arXiv 2609.17306](https://arxiv.org/abs/2609.17306)):多智能体系统(路由/多数投票/LLM judge 三种形态)里,**扩大候选池几乎总是损害性能**;按"同家族、答案多样性"等预言指标精选的小池子反而最好。
+  3. **MonoScale**([arXiv 2601.23219](https://arxiv.org/abs/2601.23219)):池子**动态扩大**时的失败模式是冷启动误路由——新模型入池,路由器对它没有经验,naive 扩池直接塌(GAIA 上 DeepSeek-V3.2 从 5 个 agent 的 0.558 掉到 10 个的 0.491);给路由器加"熟悉化任务 + 记忆更新"后,扩展才恢复单调收益。即使把路由器换成 GPT-5 级,面对含故障成员的噪声池一样崩。
+  4. **The Routing Plateau**([arXiv 2606.07587](https://arxiv.org/abs/2606.07587)):从另一侧印证——把路由训练数据从 3 万扩到 30 万、编码器从 ModernBERT-base 升到 large、端到端微调,三招合计只多补 2.13 个百分点(oracle gap 的 14.6%);剩余差距需要"模型池感知的目标函数"和超越静态查询表示的信号。
+- [TwinRouterBench](https://arxiv.org/abs/2605.18859)(2026,CommonstackAI,[代码与数据](https://github.com/CommonstackAI/TwinRouterBench),Apache 2.0):**步级**(step-level)路由评测,补前两个 benchmark 的盲区——RouterBench/LLMRouterBench 都是"一个完整 prompt 选一次模型",而 agent 场景路由器真正面对的决策是"给定当前完整前缀(对话 + 工具返回 + 检索 + 日志),下一次调用该用哪档模型"。双轨制:
+  1. **静态轨**:970 个"路由器可见前缀"快照,来自 520 个实例、5 种 workload(SWE-bench / BFCL / mtRAG / QMSum / PinchBench);每条标注"最便宜够用档"(low/mid/mid_high/high 四档),标签由 downgrade-and-cascade 协议生成(从高档逐步降档 + 混合模型执行验证,确认降档后任务仍成功);打分是确定性算术(档位标签 × 轨迹归属 × token 成本),**评测侧不用在线 LLM judge**。
+  2. **动态轨**:live 跑 SWE-bench Verified(论文报告 100 例 held-out,与静态轨的 SWE 监督切分不相交),每次调用路由器从锁定模型池选具体模型,按官方 resolution 判定 + 实际 API 花费(含缓存计费)+ 未解决罚分结算。
 
-  1. **前五名**(Paix2 77.63 / KT-ModelRouter 76.28 / Sqwish 76.21 / Divyam 75.85 / Cross-Router 75.75):全部是个人或商业提交,路由原理均未公开。但提交以 PR 形式进 [RouteWorks/RouterArena](https://github.com/RouteWorks/RouterArena) 仓,`router_inference/config/` 下的配置文件公开了各家的**模型池**——这本身就很有信息量:
-     - **Paix2**(第 1):池子只有 4 个——MiniMax-M3 / agnes-2.0-flash / DeepSeek-R1-Qwen3-8B / GLM-4-9B,全是小模型便宜模型($0.27/1K 查询)。**成绩有诚信争议**(两个 issue 截至 2026-09 仍 open):[#190](https://github.com/RouteWorks/RouterArena/issues/190) 指其提交在已记录全部候选答案与分数之后修改了 294 题的路由选择,"最优选择率"从 66.35% 跳到 89.68%、最优准确率变成 100%——疑似看了评测结果再定路由(榜单规则明确禁止在评测数据上调路由器);[#203](https://github.com/RouteWorks/RouterArena/issues/203) 指其 MiniMax-M3 结果经 OpenRouter 复现不出(84.12% vs 65–69%,输入 token 数也对不上)。
-     - **KT-ModelRouter**(第 2):池子 5 个(deepseek-v4-flash/pro、gemma-4-31b、gemini-3-flash、qwen3-235b),描述只有一句"内部训练的路由策略"。
-     - **Sqwish**(第 3):商业,池子 5 个(qwen3-235b、qwen3-next-80b、Qwen3-Coder-Next、gemini-3.1-flash-lite、deepseek-v4-flash)。
-     - **Divyam**(第 4)/ **Cross-Router**(第 5):个人提交,池子 4 / 7 个,原理未公开。
+  头部数字:训练出的路由器 75/100、$25.66,全 Opus 参照 74/100、$54.73——质量持平、省 53.1%。注意这个 benchmark 与 UncommonRoute 同源(§2),读其"训练路由器"结果时留意自评属性。三个评测集连起来看,形态演进是:单轮离线回放(RouterBench)→ 大规模统一重测(LLMRouterBench)→ 步级 agentic 双轨(TwinRouterBench)。
+- [RouterArena](https://arxiv.org/abs/2510.00202)(ICLR 2026,[排行榜](https://routeworks.github.io/)):实时排行榜形态,把路由器当黑盒测(各家用各自的模型池),主指标 Arena Score 是准确率与 log₂ 成本的加权调和平均。榜单滚动更新、榜首更迭很快,以下以 **2026-09-29 的榜单数据**为准(9 月初的榜首 Paix2 已被暂时除名,见第 4 条):
+
+  1. **前五名**(KT-ModelRouter 76.28 / Sqwish 76.21 / Divyam 75.85 / Cross-Router 75.75 / LLM Router 75.69):全部是个人或商业提交,路由原理均未公开。但提交以 PR 形式进 [RouteWorks/RouterArena](https://github.com/RouteWorks/RouterArena) 仓,`router_inference/config/` 下的配置文件公开了各家的**模型池**——这本身就很有信息量:
+     - **KT-ModelRouter**(第 1):池子 5 个(deepseek-v4-flash/pro、gemma-4-31b、gemini-3-flash、qwen3-235b),描述只有一句"内部训练的路由策略"。
+     - **Sqwish**(第 2):商业,池子 5 个(qwen3-235b、qwen3-next-80b、Qwen3-Coder-Next、gemini-3.1-flash-lite、deepseek-v4-flash)。
+     - **Divyam**(第 3)/ **Cross-Router**(第 4):个人提交,池子 4 / 7 个,原理未公开。
+     - **LLM Router**(第 5):池子 5 个(qwen3-235b、qwen3-next-80b、Qwen3-Coder-Next、gemini-3.1-flash-lite、deepseek-v4-flash——与 Sqwish 的池子完全重合),原理未公开。
   2. **公开原理的最高名次**:
-     - **vLLM-SR**(第 6,74.86):ModernBERT 多分类器(见 §2)。
-     - **nadir-caliper**(第 7,74.55):Nadir 作者的校准变体,细节未公开。
-     - **Weave Router**(第 10,72.82,[源码可得](https://github.com/workweave/router),Elastic License):**Avengers-Pro 的产品化**——进程内 ONNX 小模型做嵌入,对冻结的意图簇中心打分(簇打分器从 Avengers-Pro 改来,用生产流量重训),选该簇上历史表现追平旗舰的最便宜模型;按 action(单次 API 请求)路由,带会话粘连保缓存;决策 <50ms。
-     - **Nadir Router**(第 11,72.29,[开源](https://github.com/NadirRouter/NadirClaw)):嵌入质心二分类——all-MiniLM-L6-v2 嵌入后与"简单/复杂"两个质心比余弦相似度,再叠加规则覆盖(检测到工具调用强制走强模型、检测到推理标记走推理模型、超长换长上下文模型、会话内保持同模型)。
-     - **OrcaRouter-Adaptive**(第 12,72.08,[开源](https://github.com/Continuum-AI-Corp/OrcaRouter-Lite)+[论文](https://arxiv.org/abs/2605.30736)):**LinUCB 上下文 bandit**——用词法 + 句嵌入特征,离线阶段在精选 prompt 集上全信息评估每个候选模型、每臂拟合一个岭回归,上线后按 bandit 反馈只更新被选中那一臂。
-  3. **知名商业/旗舰反而靠后**:GPT-5 第 24(64.32,贵),NotDiamond 第 28(57.29,频繁选贵模型)。
+     - **vLLM-SR**(第 8,74.86):ModernBERT 多分类器(见 §2)。
+     - **nadir-caliper**(第 9,74.55):Nadir 作者的校准变体,细节未公开。
+     - **Weave Router**(第 12,72.82,[源码可得](https://github.com/workweave/router),Elastic License):**Avengers-Pro 的产品化**——进程内 ONNX 小模型做嵌入,对冻结的意图簇中心打分(簇打分器从 Avengers-Pro 改来,用生产流量重训),选该簇上历史表现追平旗舰的最便宜模型;按 action(单次 API 请求)路由,带会话粘连保缓存;决策 <50ms。
+     - **Nadir Router**(第 13,72.29,[开源](https://github.com/NadirRouter/NadirClaw)):嵌入质心二分类——all-MiniLM-L6-v2 嵌入后与"简单/复杂"两个质心比余弦相似度,再叠加规则覆盖(检测到工具调用强制走强模型、检测到推理标记走推理模型、超长换长上下文模型、会话内保持同模型)。
+     - **OrcaRouter-Adaptive**(第 14,72.08,[开源](https://github.com/Continuum-AI-Corp/OrcaRouter-Lite)+[论文](https://arxiv.org/abs/2605.30736)):**LinUCB 上下文 bandit**——用词法 + 句嵌入特征,离线阶段在精选 prompt 集上全信息评估每个候选模型、每臂拟合一个岭回归,上线后按 bandit 反馈只更新被选中那一臂。
+  3. **知名商业/旗舰反而靠后**:**OpenRouter Auto Router 第 20**(70.05,$0.12/1K——便宜但准确率平平)、GPT-5 第 25(64.32,贵)、NotDiamond 第 29(57.29,频繁选贵模型);学术基线整体垫底(carrot 第 26、routerbench_mlp 第 28、graphrouter 第 30、routellm 第 32、RouterDC 第 33)。
+  4. **Paix2 事件(榜首被除名)**:9 月初的榜首 Paix2(77.63,池子只有 4 个小模型——MiniMax-M3 / agnes-2.0-flash / DeepSeek-R1-Qwen3-8B / GLM-4-9B)被两个 issue 质疑:[#190](https://github.com/RouteWorks/RouterArena/issues/190) 指其提交在已记录全部候选答案与分数之后修改了 294 题的路由选择,"最优选择率"从 66.35% 跳到 89.68%、最优准确率变成 100%——疑似看了评测结果再定路由(榜单规则明确禁止在评测数据上调路由器);[#203](https://github.com/RouteWorks/RouterArena/issues/203) 指其 MiniMax-M3 结果经 OpenRouter 复现不出(84.12% vs 65–69%,输入 token 数也对不上)。两个 issue 截至 2026-09-30 仍 open,官方已将 Paix2 **暂时移出榜单**等待诚信审查(审查跟踪:[#211](https://github.com/RouteWorks/RouterArena/issues/211))。
 
   从这份榜单能读出三个结论:
 
   1. **头部全是"小而便宜的精选池"**(4-7 个模型,以 flash/小杯为主)——正是上文 LLMRouterBench"精心挑选的小池子更划算"结论的实战版。
   2. **公开原理的上榜者仍是"嵌入特征 + 轻量分类/回归/bandit"一族**,与 LLMRouterBench 里 Avengers 系表现最好互相印证。
-  3. **黑盒榜单防不住"看了答案再路由"**:Paix2 争议是"评测比方法难"(§7)的极端案例——只交预测文件不交代码的赛制,区分不了"真会路由"和"拟合了评测集"。
+  3. **黑盒榜单防不住"看了答案再路由"**:Paix2 从榜首到除名是"评测比方法难"(§7)的极端案例——只交预测文件不交代码的赛制,区分不了"真会路由"和"拟合了评测集";榜单方的处理(暂时除名 + 公开审查)是目前唯一的防线。
 
   论文总结的共同短板:现有路由器都不擅长识别"这题便宜模型就够了"的查询。
 - **数字打架,怎么理解**(梳理而非堆砌):关于路由能省多少钱,四类来源的数字差出一个数量级——
@@ -646,8 +706,8 @@ PD 分离一系(DistServe / Splitwise / PD-Serve 等)与本文主题相邻但已
 
 ## 7. 跨层结论
 
-1. **路由粒度受缓存约束**。逐请求换模型/换实例都会破坏缓存命中:Databricks 因此选任务级,OpenRouter 提供 `session_id` 粘连,Anthropic 从 provider 侧给出原因(换模型=重建整个前缀缓存),SGLang/production-stack 用一致性哈希和 session 策略做粘连。"换档要在缓存失效点做"是共同的纪律。OpenSquilla 的轮次级路由是反例,但它用缓存隔离+自适应提示词把换档代价本身改小了——粒度之争的实质是缓存代价之争。
-2. **评测比方法难**。benchmark 任务太规整,真实会话首轮 prompt 欠定义(Databricks 原话);LLMRouterBench 显示大量发表方法无效;RouterArena 榜首的 Paix2 争议(§3)进一步说明:黑盒榜单连"真会路由"和"拟合了评测集"都区分不了。任何路由策略上线前都要用真实 trace 回放评测。
+1. **路由粒度受缓存约束**。逐请求换模型/换实例都会破坏缓存命中:Databricks 因此选任务级,OpenRouter 提供 `session_id` 粘连、jev-router 把丢失的 prompt cache 显式计入换模型成本(§2),Anthropic 从 provider 侧给出原因(换模型=重建整个前缀缓存),SGLang/production-stack 用一致性哈希和 session 策略做粘连。"换档要在缓存失效点做"是共同的纪律。OpenSquilla 的轮次级路由是反例,但它用缓存隔离+自适应提示词把换档代价本身改小了——粒度之争的实质是缓存代价之争。
+2. **评测比方法难**。benchmark 任务太规整,真实会话首轮 prompt 欠定义(Databricks 原话);LLMRouterBench 显示大量发表方法无效;RouterArena 榜首 Paix2 从争议到除名(§3)进一步说明:黑盒榜单连"真会路由"和"拟合了评测集"都区分不了。任何路由策略上线前都要用真实 trace 回放评测。
 3. **缓存命中率是一等运维指标**。Anthropic 把命中率下跌当事故(SEV)处理;harness 的提示词排布、工具集恒定、压缩 fork 都是围绕命中率的设计纪律;小米 MiMo 把同会话 99%、跨会话 95% 的命中率当产品卖点公布。推理系统侧同理:命中率应进 SLO 与告警,而不只是性能计数器。
 
 ## 8. 对 Dynamo / lake Router 的借鉴
@@ -736,6 +796,9 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
 - OpenRouter:
   - [Auto Router 公告](https://openrouter.ai/blog/announcements/introducing-the-new-auto-router/)
   - [文档](https://openrouter.ai/docs/guides/routing/routers/auto-router)
+  - Jev Router:[模型页](https://openrouter.ai/typesafe/jev-router)、[Jev 文档](https://openrouter.ai/docs/guides/community/jev)、[第三方逆向分析(BestHub)](https://www.besthub.dev/articles/reverse-engineering-jev-10k-api-calls-expose-closed-source-model-architecture-27085f944485)
+- SwitchYard(NVIDIA):[仓库](https://github.com/NVIDIA-NeMo/Switchyard)、[NVIDIA 博客](https://developer.nvidia.com/blog/route-ai-agent-workloads-across-models-with-nvidia-nemo-switchyard/)、[LangChain 实测](https://www.langchain.com/blog/switchyard-agent-routing-benchmark)
+- UncommonRoute:[仓库](https://github.com/CommonstackAI/UncommonRoute)
 - OpenSquilla:
   - [GitHub](https://github.com/TokenRhythm/opensquilla)
   - [技术报告](https://aixiv.science/abs/aixiv.260822.000001)([中文](https://chinaxiv.org/abs/202608.00176))
@@ -779,14 +842,23 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
 - GraphRouter [2410.03834](https://arxiv.org/abs/2410.03834)
 - Avengers [2408.12683](https://arxiv.org/abs/2408.12683)
 - Avengers-Pro [2508.12631](https://arxiv.org/abs/2508.12631)
+- LLMRank [2510.01234](https://arxiv.org/abs/2510.01234)
 - When to Reason [2510.08731](https://arxiv.org/abs/2510.08731)
 
 **论文:评测**
 
 - RouterBench [2403.12031](https://arxiv.org/abs/2403.12031)
 - LLMRouterBench [ACL 2026](https://aclanthology.org/2026.findings-acl.1881.pdf)
-- RouterArena [2510.00202](https://arxiv.org/abs/2510.00202)([排行榜](https://routeworks.github.io/);[提交仓 RouteWorks/RouterArena](https://github.com/RouteWorks/RouterArena)——各路由器的模型池配置在 `router_inference/config/`;Paix2 争议:[issue #190](https://github.com/RouteWorks/RouterArena/issues/190)、[#203](https://github.com/RouteWorks/RouterArena/issues/203))
+- TwinRouterBench [2605.18859](https://arxiv.org/abs/2605.18859)([代码与数据](https://github.com/CommonstackAI/TwinRouterBench))
+- RouterArena [2510.00202](https://arxiv.org/abs/2510.00202)([排行榜](https://routeworks.github.io/);[提交仓 RouteWorks/RouterArena](https://github.com/RouteWorks/RouterArena)——各路由器的模型池配置在 `router_inference/config/`;Paix2 争议:[issue #190](https://github.com/RouteWorks/RouterArena/issues/190)、[#203](https://github.com/RouteWorks/RouterArena/issues/203),除名审查 [#211](https://github.com/RouteWorks/RouterArena/issues/211))
 - 路由综述 [2603.04445](https://arxiv.org/html/2603.04445v2)
+
+**论文:模型池规模**
+
+- OrchSLM [2609.13470](https://arxiv.org/abs/2609.13470)
+- Mo' Models, Mo' Problems [2609.17306](https://arxiv.org/abs/2609.17306)
+- MonoScale [2601.23219](https://arxiv.org/abs/2601.23219)
+- The Routing Plateau [2606.07587](https://arxiv.org/abs/2606.07587)
 
 **论文:输出长度预测**
 
