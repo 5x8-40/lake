@@ -379,6 +379,46 @@ flowchart LR
 
   梳理后的结论:省钱幅度 ≈ **池子档差 × 简单流量占比**。论文数字大是因为池子两极化(旗舰和 7B 差百倍价格)且题目里简单题占大头;生产池档差小、难题占比高,所以 20–25% 才是可信区间。OpenSquilla 自报的 88.9% 看着夸张,但按这个公式反而说得通:它的池子有"单轮成本趋近于零"的超廉价档(档差极大),且 agent 流量里机械轮次占大头(简单流量占比极高)——两个因子都拉满。所以凡是声称 90% 的,先问它池子和流量分布。
 
+### 路由器的自我演进(RSI × 路由)
+
+上面的方法都把路由器当静态工件:离线训练、上线冻结、池子变了再重训。2026 年出现的一条新线是把它接进**递归自我改进(RSI)**的环。RSI 一脉([STOP](https://arxiv.org/abs/2310.02304)、[Darwin Gödel Machine](https://arxiv.org/abs/2505.22954))证明系统可以改写自身的 scaffold 与代码;路由场景的特殊之处是**路由日志天然是训练标签**——路由器每步都在记录"预测的能力需求 → 实际派发的模型 → 任务结果",这正是特化训练要的难度估计与缺陷信号;反过来模型变强后,路由器的质量模型必须跟着更新。闭环天然存在,相关工作按闭环层级分三层:
+
+**闭环整体:NeoHorse-1**([arXiv 2609.08183](https://arxiv.org/abs/2609.08183),2026-09,[代码](https://github.com/TokenRhythm/NeoHorse))。标题即命题——"RSI via Agentic Post-Training **with Routing Harness**";出自 TokenRhythm(即 OpenSquilla 团队,§2),产出是一族 agent-native 模型(4B/9B)。机制要点:
+
+1. harness(执行层)的路由模块记录每个用户轮的 predicted / selected / actually-served 三个能力档,与轨迹对齐成 prediction–action–outcome 记录。
+2. **刻意不把实际派发的档位当难度标签**——派发还受用户覆盖、服务可用性、部署策略影响;路由估计只用于课程排序,结果字段(任务完成 / 验证反馈 / 恢复成本)做缺陷信号,指导下一轮数据配比。
+3. 三阶段 SFT 课程(按路由分数渐进引入高需求样本、保留低分覆盖)+ 同一 progression 调度起始上下文的 on-policy 蒸馏。
+4. 新 checkpoint 回到 harness,新轨迹暴露下一批能力缺口,闭合 evaluation–selection–update 环——原话 "what the system learns to do influences what it learns from next"。
+
+![NeoHorse-1 的 routing-guided RSI 闭环](model-routing/figures/neohorse-rsi-loop.png)
+
+(图源:[NeoHorse-1 论文](https://arxiv.org/abs/2609.08183) Figure 2。读法:harness 带 agentic routing 服务真实流量,逐用户轮落盘;数据引擎做质量打分、场景刻画、路由信号对齐;分配层按课程与能力缺口配数据;更新层 SFT + on-policy 蒸馏出新模型,回到 harness。)
+
+注意:自评属性强——团队、harness(OpenSquilla)、数据飞轮论文([arXiv 2607.11399](https://arxiv.org/abs/2607.11399),§2 参考链接已收录)同源,评测(QwenClawBench / PinchBench)也跑在自家 harness 上,结果待独立复现。
+
+**共同进化(路由器 ↔ 被路由对象)**:
+
+- [EvolveRouter](https://arxiv.org/abs/2604.05149)(2026-04):路由器训练时收集各 agent 的失败模式 → 生成指令修订、只保留可靠改进 → 改进后的 agent 反过来提供更干净的监督信号重训路由器,交替共进化;推理侧按 router 加权一致度动态决定参与 agent 数 K。
+- [EvoRoute](https://aclanthology.org/2026.acl-long.1771/)(ACL 2026):经验库驱动的自路由——每步从不断膨胀的历史记录里检索候选、按模型聚合(精度/成本/延迟)后做 Pareto 筛选;GAIA / BrowseComp+ 上成本最高 −80%、延迟 −70% 以上。
+- [NVIDIA Data Flywheel Blueprint](https://github.com/NVIDIA-AI-Blueprints/data-flywheel):工业版飞轮——生产日志带 workload 标识落 Elasticsearch,分层抽样出训练/评测集,LoRA 蒸馏小模型,LLM-judge 打分后晋升。定位是"发现与晋升服务",晋升前人工评审,不是全自动替换;路由器的 workload 标签正是它分层抽样的依据。
+
+**路由器在线学习(闭环的下半圈,最成熟)**:上下文 bandit 一脉——[PILOT](https://aclanthology.org/2025.findings-emnlp.1301/)(EMNLP 2025,LinUCB + 偏好先验 + 预算背包)、[BaRP](https://arxiv.org/abs/2510.07429)(bandit 反馈 + 偏好向量,测试时免重训调权衡,比离线路由器至少 +12.46%)、[MixLLM](https://aclanthology.org/2025.naacl-long.545/)(NAACL 2025,持续学习 + 池可变,GPT-4 质量的 97.25% @ 24.18% 成本)、[ParetoBandit](https://arxiv.org/abs/2604.00136)(在线对偶变量做预算 pacing + **几何遗忘对抗非平稳** + 模型热插拔)、[StageRoute](https://arxiv.org/abs/2506.17254)(联合优化"部署哪些模型"与"怎么路由",regret Õ(T^2/3) 带匹配下界)。工程化样本:[VDF 自演进路由器白皮书](https://vdf.ai/white-papers/the-self-evolving-model-router/)——六级 dispatcher 逐层 feature-gate、信号缺失时降级到更简单策略;LinUCB 逐请求 Sherman–Morrison 秩一更新;失败不丢弃、折算 0.15 惩罚;**challenger 双路由**(小比例流量同时打两个模型做活体偏好学习);离线批量重导先验、原子热替换进在线策略;作者明确"不过度声称实测收益"。§2 openJiuwen 的 bandit 层(forgetting_gamma 折扣旧策略版本)与本节 RouterArena 第 14 名 OrcaRouter-Adaptive(LinUCB)都是这一层的实例。
+
+**支撑:池演化与新模型冷启动**。[Universal Model Routing](https://arxiv.org/abs/2502.08773)用"代表性 prompt 集上的预测正确向量"表示模型,新模型免重训接入,带 excess risk 上界;[RouteProfile](https://arxiv.org/abs/2605.00180)从 model card 公开信号(家族/描述/benchmark 分数)构图做零交互冷启动,结论是"新模型接入需要 profile–router 协同设计";[SemiRouter](https://aclanthology.org/2026.eacl-long.228/)(EACL 2026)冻结骨干 + 轻量 adapter,稀疏数据下接入新模型。反面证据见上文"模型池不是越大越好"组的 MonoScale:池动态扩大时冷启动误路由直接塌,要给路由器加记忆。
+
+读穿这层工作,联合演进成立有四个条件:
+
+1. **非平稳性是核心敌人**。模型一更新,路由器的质量模型就过期。已有答案:几何遗忘(ParetoBandit)、策略版本折扣(openJiuwen)、原子热替换(VDF)——共同前提是**策略是版本化数据,不是代码**。
+2. **部分可观测**。bandit 反馈只见所选模型的结果;反事实评估要么靠 judge(贵——LangChain 实测 judge 吃掉 21.2% 路由花费,§2),要么靠探索流量(VDF challenger 是真金白银)。
+3. **数据与池都不是越多越好**。The Routing Plateau:数据扩 10 倍只 +2.13pp;OrchSLM:路由准确率 3–4 个模型见顶(均见上文)。共同演进不应无限扩池、无限堆数据。
+4. **自指风险**。路由器用自己的 judge 打分、用自己的日志训练,回路会放大自身偏差;需要锚定外部执行验证(TwinRouterBench 动态轨这类)。
+
+对 lake 的意义:
+
+- openJiuwen 的"算法纯函数 + 状态外置 + artifact 版本化"(§2)正是让在线演进安全的架构——策略可原子热替换、状态丢失降质为冷路由;VDF 的 priors 热替换、TensorCast 的 binding 版本热替换([tensorcast/architecture.md](tensorcast/architecture.md))同构。
+- lake 存储池把 `(model_id, revision)` 当一等公民,共同演进环里"新 revision 注册、旧 revision GC"有现成机制;路由质量模型按 revision 键控,模型更新不污染旧键。
+- 独有角度:上面所有工作都在**文本层**复用经验(日志 → 数据集)。lake 的存算分离让经验可以在 **KV 层**复用——成功轨迹的前缀 KV 进存储池,下次同类请求 D-direct 零传输命中。训练时飞轮(慢循环)× 推理时 KV 复用(快循环)× 纯函数路由器,这个三层叠合目前没人做过,是 lake 可以占的位置。
+
 ## 4. 实例级路由的约束来源:缓存命中率
 
 实例级路由为什么以缓存命中为核心变量,两个层面各有原因:harness 侧的设计纪律决定前缀的形态(能不能命中),调度侧的策略决定请求落到哪个实例(命中发生在哪)。本节先看 harness 侧,下一节看调度侧。
@@ -913,6 +953,23 @@ Dynamo Router 是实例级路由([分析见 dynamo/overview.md](dynamo/overview.
 - Mo' Models, Mo' Problems [2609.17306](https://arxiv.org/abs/2609.17306)
 - MonoScale [2601.23219](https://arxiv.org/abs/2601.23219)
 - The Routing Plateau [2606.07587](https://arxiv.org/abs/2606.07587)
+
+**论文:路由器的自我演进与在线学习**
+
+- NeoHorse-1 [2609.08183](https://arxiv.org/abs/2609.08183)([代码](https://github.com/TokenRhythm/NeoHorse))
+- EvolveRouter [2604.05149](https://arxiv.org/abs/2604.05149)
+- EvoRoute [ACL 2026](https://aclanthology.org/2026.acl-long.1771/)
+- PILOT [EMNLP 2025 Findings](https://aclanthology.org/2025.findings-emnlp.1301/)
+- BaRP [2510.07429](https://arxiv.org/abs/2510.07429)
+- MixLLM [NAACL 2025](https://aclanthology.org/2025.naacl-long.545/)
+- ParetoBandit [2604.00136](https://arxiv.org/abs/2604.00136)
+- StageRoute [2506.17254](https://arxiv.org/abs/2506.17254)
+- Universal Model Routing [2502.08773](https://arxiv.org/abs/2502.08773)
+- RouteProfile [2605.00180](https://arxiv.org/abs/2605.00180)
+- SemiRouter [EACL 2026](https://aclanthology.org/2026.eacl-long.228/)
+- VDF:[The Self-Evolving Model Router 白皮书](https://vdf.ai/white-papers/the-self-evolving-model-router/)
+- NVIDIA [Data Flywheel Blueprint](https://github.com/NVIDIA-AI-Blueprints/data-flywheel)
+- RSI 背景:STOP [2310.02304](https://arxiv.org/abs/2310.02304)、Darwin Gödel Machine [2505.22954](https://arxiv.org/abs/2505.22954)
 
 **论文:输出长度预测**
 
