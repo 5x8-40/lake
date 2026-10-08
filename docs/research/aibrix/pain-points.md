@@ -2,7 +2,7 @@
 
 > 调研快照:2026-09-11;`3rdparty/aibrix` @ `fe7db93e`。  
 > [overview.md](overview.md) · [architecture.md](architecture.md)。  
-> 对照:[`../model-routing.md`](../model-routing.md) §5、[`../flexkv/pain-points.md`](../flexkv/pain-points.md)、[`../../architecture/kv-cache-pool.md`](../../architecture/kv-cache-pool.md)。
+> 对照:[`../model-routing/instance-level.md`](../model-routing/instance-level.md)、[`../flexkv/pain-points.md`](../flexkv/pain-points.md)、[`../../architecture/kv-cache-pool.md`](../../architecture/kv-cache-pool.md)。
 
 ## 1. 状态权威
 

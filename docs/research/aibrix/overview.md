@@ -2,7 +2,7 @@
 
 > 源码:`3rdparty/aibrix`(submodule,HEAD `fe7db93e`,2026-09-08)。上游 [vllm-project/aibrix](https://github.com/vllm-project/aibrix)(字节跳动发起并捐赠,现属 vllm-project)。许可:**Apache-2.0**。  
 > 白皮书:arXiv [2504.03648](https://arxiv.org/abs/2504.03648);官网文档 [aibrix.readthedocs.io](https://aibrix.readthedocs.io)。  
-> 网关路由/事件同步/卸载框架细节见 [architecture.md](architecture.md);与 lake 对照见 [pain-points.md](pain-points.md)。路由策略横评见 [`../model-routing.md`](../model-routing.md) §5。
+> 网关路由/事件同步/卸载框架细节见 [architecture.md](architecture.md);与 lake 对照见 [pain-points.md](pain-points.md)。路由策略横评见 [`../model-routing/instance-level.md`](../model-routing/instance-level.md)。
 
 ## 一句话定位
 
@@ -163,7 +163,7 @@ flowchart TB
 
 - 上游:[github.com/vllm-project/aibrix](https://github.com/vllm-project/aibrix) @ `fe7db93e`
 - 白皮书:arXiv [2504.03648](https://arxiv.org/abs/2504.03648)(仓内 `docs/paper/` 有 PDF)
-- 路由横评:[`../model-routing.md`](../model-routing.md) §5(AIBrix 节)
+- 路由横评:[`../model-routing/instance-level.md`](../model-routing/instance-level.md)(AIBrix 节)
 - 卸载层对照:[`../flexkv/overview.md`](../flexkv/overview.md)、[`../hbm-tier-and-offload.md`](../hbm-tier-and-offload.md)
 - 分布式模型归类:[`../distributed-models.md`](../distributed-models.md)
 - 四栈对比(Dynamo / FlexKV / llm-d / AIBrix):[`../serving-stack-comparison.md`](../serving-stack-comparison.md)

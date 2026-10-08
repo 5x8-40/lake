@@ -169,7 +169,7 @@ lake/
 │   ├── tensorcast/             #   TensorCast（张量状态基础设施层）
 │   ├── flexkv/                 #   FlexKV（引擎旁 CPU/SSD/远端 KV 卸载）
 │   ├── kvcached/               #   kvcached（GPU 虚拟内存弹性 KV：VA/物理页解耦 + 跨进程超卖）
-│   ├── production-stack/       #   vLLM production-stack（实例级路由器参考，分析见 model-routing.md §5）
+│   ├── production-stack/       #   vLLM production-stack（实例级路由器参考，分析见 model-routing/instance-level.md）
 │   ├── aibrix/                 #   AIBrix（K8s 推理基础设施：网关路由策略集 + KV 事件同步）
 │   └── llm-d-router/           #   llm-d Router（EPP：KV 事件→全局块索引 + 推测索引）
 └── src/                        # 早期单进程 Python 原型（验证假设用，将被 rust/go/python 子项目取代）

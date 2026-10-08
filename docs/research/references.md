@@ -57,7 +57,7 @@
 - **TensorCast** (tensorcast-ai): 张量状态基础设施层——把权重/KV/checkpoint/RL 参数从应用进程抽取为分布式 artifact,Global Store(控制面)规划放置与 fanout,Store Daemon(数据面)持本地张量内存 + CUDA IPC 同机零拷贝 + RDMA/TCP P2P 跨机;policy 预设(cache/durable/ha/cold/warm/pinned)定放置与持久化,retrieval source(local/disk/p2p)定取数路径。**源码已引入** `3rdparty/tensorcast`,与 lake 存储层 + 权重缓存同构,见 [`tensorcast/overview.md`](tensorcast/overview.md)。
 - **llm-d Router** (Red Hat/Google/IBM 等): K8s 原生分布式推理栈的路由仓——EPP(Envoy ext-proc)精确缓存感知选路 + pd-sidecar/coordinator 的 PD(/EPD)编排;扩缩在独立仓 WVA(KV 利用率/队列深度驱动,指标交 HPA/KEDA 执行)。**源码已引入** `3rdparty/llm-d-router`,见 [`llm-d/`](llm-d/)。
 - **AIBrix** (字节跳动 → vllm-project): K8s 推理平台积木——网关路由策略集、KV 事件同步、KV 感知扩缩、StormService 角色编排(PD 为静态拓扑)、aibrix_kvcache 卸载框架。**源码已引入** `3rdparty/aibrix`,见 [`aibrix/`](aibrix/)。
-- **Dynamo / FlexKV / llm-d / AIBrix 四栈对比**: 四者词汇表相似(KV 复用/路由/PD),区别在覆盖层与 KV 状态归属。见 [`serving-stack-comparison.md`](serving-stack-comparison.md);路由维度细评见 [`model-routing.md`](model-routing.md) §5。
+- **Dynamo / FlexKV / llm-d / AIBrix 四栈对比**: 四者词汇表相似(KV 复用/路由/PD),区别在覆盖层与 KV 状态归属。见 [`serving-stack-comparison.md`](serving-stack-comparison.md);路由维度细评见 [`model-routing/instance-level.md`](model-routing/instance-level.md)。
 
 ## KV Cache 复用与传输
 

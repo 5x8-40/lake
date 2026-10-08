@@ -38,7 +38,7 @@ AIBrix 是"近似派 vs 精确派"在同一代码库里的对照实验:
 | 变体 | `prefix_cache_and_load.go` 换 RadixTree;`prefix_cache_preble.go` 树版 Preble | — |
 | 开启 | 默认 | `AIBRIX_PREFIX_CACHE_KV_EVENT_SYNC_ENABLED=true` + `-tags=zmq` 构建 |
 
-两条路线的分野正是 model-routing.md §5 归纳的"自己记 vs 引擎上报"。路线 B 的管线:引擎 ZMQ PUB → `pkg/cache/kvcache/zmq_client.go`(msgpack 解码)→ `pkg/kvevent/manager.go::Manager` → `ProcessBlockStored` 更新同步索引。依赖 remote tokenizer 把 prompt 切成与引擎一致的块键。
+两条路线的分野正是 [`../model-routing/instance-level.md`](../model-routing/instance-level.md) 归纳的"自己记 vs 引擎上报"。路线 B 的管线:引擎 ZMQ PUB → `pkg/cache/kvcache/zmq_client.go`(msgpack 解码)→ `pkg/kvevent/manager.go::Manager` → `ProcessBlockStored` 更新同步索引。依赖 remote tokenizer 把 prompt 切成与引擎一致的块键。
 
 ### 2.3 其余策略(一句话各)
 

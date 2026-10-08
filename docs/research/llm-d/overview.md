@@ -1,7 +1,7 @@
 # llm-d Router — 总览
 
 > 源码:`3rdparty/llm-d-router`(submodule,HEAD `abb404ef`,2026-09-08)。上游 [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router)。**注意:本仓只是 llm-d 项目的路由组件**;llm-d 全项目(Red Hat / Google / IBM 等联合发起,K8s 原生分布式推理栈)的完整组件地图见下文「项目地图」节。许可:**Apache-2.0**。  
-> 文档站 [llm-d.ai](https://llm-d.ai)。架构/索引/PD 细节见 [architecture.md](architecture.md);与 lake 对照见 [pain-points.md](pain-points.md)。路由策略横评见 [`../model-routing.md`](../model-routing.md) §5。
+> 文档站 [llm-d.ai](https://llm-d.ai)。架构/索引/PD 细节见 [architecture.md](architecture.md);与 lake 对照见 [pain-points.md](pain-points.md)。路由策略横评见 [`../model-routing/instance-level.md`](../model-routing/instance-level.md)。
 
 ## 一句话定位
 
@@ -186,6 +186,6 @@ flowchart TB
 
 - 上游:[github.com/llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) @ `abb404ef`;父项目 [llm-d/llm-d](https://github.com/llm-d/llm-d);全组件清单见 [llm-d 组织](https://github.com/llm-d)与[官方 Artifacts 页](https://llm-d.ai/docs/api-reference/artifacts)
 - 标准:[Gateway API Inference Extension](https://gateway-api-inference-extension.sigs.k8s.io)(GIE)
-- 路由横评:[`../model-routing.md`](../model-routing.md) §5(llm-d 节)
+- 路由横评:[`../model-routing/instance-level.md`](../model-routing/instance-level.md)(llm-d 节)
 - 分布式模型归类:[`../distributed-models.md`](../distributed-models.md)
 - 四栈对比(Dynamo / FlexKV / llm-d / AIBrix):[`../serving-stack-comparison.md`](../serving-stack-comparison.md)
