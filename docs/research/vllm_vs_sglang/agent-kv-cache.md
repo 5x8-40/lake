@@ -3,7 +3,7 @@
 > **素材**：[知乎专栏《Sglang 和 vllm 深度比较：从 kv cache 展开到推理框架》](https://zhuanlan.zhihu.com/p/2082926853241696898)第 6 节（四问题框架与对比叙事）；本文论断以代码快照核实为准。  
 > **代码快照**：2026-09-28 · `3rdparty/vllm` @ `027b6f3a2` · `3rdparty/sglang` @ `55cc90b533`。  
 > **上游 issue**：vLLM [#37003](https://github.com/vllm-project/vllm/issues/37003)（Retention API）· [#51428](https://github.com/vllm-project/vllm/issues/51428)（KvHint）· SGLang [#27574](https://github.com/sgl-project/sglang/issues/27574)（Programmatic KV）· [#36224](https://github.com/sgl-project/sglang/issues/36224)（KvHint 信封）。  
-> **相关**：[../vllm/kv-session-roadmap.md](../vllm/kv-session-roadmap.md)（vLLM 侧落地细节）· [../sglang/agentic-kv-roadmap.md](../sglang/agentic-kv-roadmap.md)（SGLang 侧落地细节）· [../model-routing.md](../model-routing.md)（实例级路由）。
+> **相关**：[../vllm/kv-session-roadmap.md](../vllm/kv-session-roadmap.md)（vLLM 侧落地细节）· [../sglang/agentic-kv-roadmap.md](../sglang/agentic-kv-roadmap.md)（SGLang 侧落地细节）· [../model-routing/instance-level.md](../model-routing/instance-level.md)（实例级路由）。
 
 ## 0. 一句话
 

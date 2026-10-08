@@ -2,7 +2,7 @@
 
 > 调研快照:2026-09-11;`3rdparty/llm-d-router` @ `abb404ef`。  
 > [overview.md](overview.md) · [architecture.md](architecture.md)。  
-> 对照:[`../model-routing.md`](../model-routing.md) §5、[`../dynamo/overview.md`](../dynamo/overview.md)、[`../../architecture/kv-cache-pool.md`](../../architecture/kv-cache-pool.md)。
+> 对照:[`../model-routing/instance-level.md`](../model-routing/instance-level.md)、[`../dynamo/overview.md`](../dynamo/overview.md)、[`../../architecture/kv-cache-pool.md`](../../architecture/kv-cache-pool.md)。
 
 ## 1. 索引权威
 
@@ -39,7 +39,7 @@
 | 每 pool 单一 base 模型 | 同上 | 存储池模型无关,多 `(model_id, revision)` 共存 |
 | DP(数据并行)rank 不进索引与去重 | `event_dedup_filter.go` TODO #370 | DP/TP 拓扑是放置输入,不是事后补的维度 |
 | 内存索引按 key 数计容,非按字节 | `in_memory.go` TODO | 池按字节与配额管理 |
-| 输出长度靠静态估计 | `.../dataproducer/inflightload/token_estimator.go` TODO(outlen) | 调度输入含长度分布(参考 TIE,见 model-routing.md §6) |
+| 输出长度靠静态估计 | `.../dataproducer/inflightload/token_estimator.go` TODO(outlen) | 调度输入含长度分布(参考 TIE,见 [`../model-routing/instance-level.md`](../model-routing/instance-level.md)) |
 | KV 卸载走引擎原生连接器(FS 后端由 llm-d-kv-cache 仓贡献,已上游进 vLLM 多层级卸载连接器),路由器不参与 | llm-d-kv-cache 仓 README | 池是必经路径,不靠引擎可选连接器;卸载决策归池不归引擎 |
 | P2P 共享默认关闭,"传输 vs 重算"交叉点需逐部署实测校准 | P2P 博客「Price the Transfer Before Using It」 | 传输/重算代价本就进 lake 调度代价模型(P7 校准) |
 | P2P 要求全集群相同的 block-size 与 hash-seed,不匹配则静默零命中 | P2P 博客「Silent prerequisite」 | 池统一管块格式与哈希,无此前提 |

@@ -41,7 +41,7 @@
 | `3rdparty/tensorcast` | [tensorcast-ai/tensorcast](https://github.com/tensorcast-ai/tensorcast) | main HEAD (`19f54d60`, v0.1.0+6) | **张量状态基础设施层** artifact + Global Store/Store Daemon + CUDA IPC + RDMA/TCP P2P + policy 放置契约 + binding 热替换;见 [tensorcast/](tensorcast/) |
 | `3rdparty/flexkv` | [taco-project/FlexKV](https://github.com/taco-project/FlexKV) | main HEAD (`a5c8f12`, 2026-08-27) | **引擎旁多层 KV 卸载** CPU/SSD/REMOTE radix + GPU IPC 映射 + vLLM/SGLang/Dynamo/TRT connector;见 [flexkv/](flexkv/) |
 | `3rdparty/kvcached` | [ovg-project/kvcached](https://github.com/ovg-project/kvcached) | main HEAD (`60cad94`, 2026-08-22, v0.1.5) | **GPU VMM 弹性 KV**:VA/物理页解耦 + 跨进程超卖(driver 仲裁,无 daemon)+ kvctl 配额;见 [kvcached/](kvcached/) |
-| `3rdparty/production-stack` | [vllm-project/production-stack](https://github.com/vllm-project/production-stack) | main HEAD (`fc00f98b`, 2026-09-08) | **实例级路由器**:`vllm_router` 的 session/prefixaware/kvaware 策略与 issue 教训;见 [model-routing.md](model-routing.md) §5 |
+| `3rdparty/production-stack` | [vllm-project/production-stack](https://github.com/vllm-project/production-stack) | main HEAD (`fc00f98b`, 2026-09-08) | **实例级路由器**:`vllm_router` 的 session/prefixaware/kvaware 策略与 issue 教训;见 [model-routing/instance-level.md](model-routing/instance-level.md) |
 | `3rdparty/aibrix` | [vllm-project/aibrix](https://github.com/vllm-project/aibrix) | main HEAD (`fe7db93e`, 2026-09-08) | **K8s 推理平台积木**:网关路由策略集 + KV 事件同步 + KV 感知扩缩 + aibrix_kvcache 卸载框架;深度分析见 [aibrix/](aibrix/) |
 | `3rdparty/llm-d-router` | [llm-d/llm-d-router](https://github.com/llm-d/llm-d-router) | main HEAD (`abb404ef`, 2026-09-08) | **EPP 精确缓存感知 + PD 编排**:KV 事件 → 全局块索引 + 推测索引(`pkg/kvcache/`)、插件化 scorer、pd-sidecar/coordinator;深度分析见 [llm-d/](llm-d/) |
 
@@ -306,7 +306,7 @@ kvcached 与其他参考项目不在同一层:不分层、不索引前缀、不�
 
 ## 11. AIBrix → K8s 推理平台积木(网关路由 / 扩缩 / KV 卸载)
 
-源码入口:`3rdparty/aibrix/`(Go 控制面/网关 + Python runtime/`aibrix_kvcache`)。深度分析见 [`aibrix/`](aibrix/)(overview / architecture / pain-points);路由策略横评见 [model-routing.md](model-routing.md) §5;四栈对比见 [serving-stack-comparison.md](serving-stack-comparison.md)。
+源码入口:`3rdparty/aibrix/`(Go 控制面/网关 + Python runtime/`aibrix_kvcache`)。深度分析见 [`aibrix/`](aibrix/)(overview / architecture / pain-points);路由策略横评见 [model-routing/instance-level.md](model-routing/instance-level.md);四栈对比见 [serving-stack-comparison.md](serving-stack-comparison.md)。
 
 AIBrix 是平台层项目:Envoy 网关插件选路 + CRD 全家桶编排 + PodAutoscaler + 引擎旁 KV 卸载框架。对 lake 的价值不在某一层的最深实现,而在**完整平台的职责切分样本**(限流/鉴权/扩缩全在推理系统之外,与 lake 职责边界原则同向)和 **KV 事件同步的工程实现**。
 
@@ -329,7 +329,7 @@ AIBrix 是平台层项目:Envoy 网关插件选路 + CRD 全家桶编排 + PodAu
 
 ## 12. llm-d Router → EPP 精确缓存感知 + PD 编排
 
-源码入口:`3rdparty/llm-d-router/`(纯 Go 单仓:EPP + pd-sidecar + coordinator)。深度分析见 [`llm-d/`](llm-d/)(overview / architecture / pain-points);路由横评见 [model-routing.md](model-routing.md) §5;四栈对比见 [serving-stack-comparison.md](serving-stack-comparison.md)。
+源码入口:`3rdparty/llm-d-router/`(纯 Go 单仓:EPP + pd-sidecar + coordinator)。深度分析见 [`llm-d/`](llm-d/)(overview / architecture / pain-points);路由横评见 [model-routing/instance-level.md](model-routing/instance-level.md);四栈对比见 [serving-stack-comparison.md](serving-stack-comparison.md)。
 
 llm-d Router 是 K8s Gateway API Inference Extension 标准下的 EPP 参考实现,代表"网关侧精确派"缓存感知的最高完成度:逐块索引、介质分权重、推测索引补传播窗口、20 种插件化 scorer。K8s 推理路由生态(production-stack、kgateway)正在向它收敛。
 
