@@ -343,7 +343,12 @@ flowchart LR
   2. **Mo' Models, Mo' Problems**([arXiv 2609.17306](https://arxiv.org/abs/2609.17306)):多智能体系统(路由/多数投票/LLM judge 三种形态)里,**扩大候选池几乎总是损害性能**;按"同家族、答案多样性"等预言指标精选的小池子反而最好。
   3. **MonoScale**([arXiv 2601.23219](https://arxiv.org/abs/2601.23219)):池子**动态扩大**时的失败模式是冷启动误路由——新模型入池,路由器对它没有经验,naive 扩池直接塌(GAIA 上 DeepSeek-V3.2 从 5 个 agent 的 0.558 掉到 10 个的 0.491);给路由器加"熟悉化任务 + 记忆更新"后,扩展才恢复单调收益。即使把路由器换成 GPT-5 级,面对含故障成员的噪声池一样崩。
   4. **The Routing Plateau**([arXiv 2606.07587](https://arxiv.org/abs/2606.07587)):从另一侧印证——把路由训练数据从 3 万扩到 30 万、编码器从 ModernBERT-base 升到 large、端到端微调,三招合计只多补 2.13 个百分点(oracle gap 的 14.6%);剩余差距需要"模型池感知的目标函数"和超越静态查询表示的信号。
-- [TwinRouterBench](https://arxiv.org/abs/2605.18859)(2026,CommonstackAI,[代码与数据](https://github.com/CommonstackAI/TwinRouterBench),Apache 2.0):**步级**(step-level)路由评测,补前两个 benchmark 的盲区。要分清两种粒度——RouterBench/LLMRouterBench 的每个样本是**一次独立请求**:一道自包含的题,选一次模型就结束;而 agent 场景里一个任务包含几十次模型调用,它们共享一个不断增长的前缀,路由器要在**每一步**重新决策:"给定当前完整前缀(对话历史 + 工具返回 + 检索结果 + 日志),下一次调用该用哪档模型"。所以差别不是"任务级 vs 请求级"——两种评测都是按请求选模型;差别在于前者的请求彼此独立、信息自包含,后者的请求是长序列里的一环:输入是长前缀,难度信号藏在里面,而且同一任务内各步难度天差地别(一个 SWE-bench 修复里,"读一下这个文件"和"想清楚这个测试为什么挂"是相邻的两步),"整个任务选一次模型"表达不了这种差异。双轨制:
+- [TwinRouterBench](https://arxiv.org/abs/2605.18859)(2026,CommonstackAI,[代码与数据](https://github.com/CommonstackAI/TwinRouterBench),Apache 2.0):**步级**(step-level)路由评测,补前两个 benchmark 的盲区。用一个例子说清两种评测的样本长什么样:
+
+- RouterBench/LLMRouterBench 的一个样本 = **一道独立的题**:"证明 √2 是无理数" → 路由器选一个模型 → 结束、记分。样本之间互相独立,每道题只决策一次。
+- TwinRouterBench 的一个样本 = **一个任务进行到一半的断面**:"[系统提示 + 用户报的 bug + 前 17 步的模型输出与工具返回 + 刚跑挂的测试日志]——第 18 次调用该用哪档模型?"同一任务的第 19 步是另一个样本。
+
+差别有两层:一是**输入形态**(自包含的短问题 vs 累积的长前缀);二是**决策结构**(一道题决策一次 vs 一个任务连续决策几十次,且各步难度天差地别——"读一下这个文件"和"想清楚这个测试为什么挂"是同一任务里的相邻两步)。旧 benchmark 的盲区主要在第二层:agent 的账单是几十次调用的总和,大部分是机械步、少数是关键步;"整任务选一次模型"的评测测不出路由器能不能在长前缀里认出"当前这步是机械步、便宜档就够"。双轨制:
   1. **静态轨**:970 个"路由器可见前缀"快照,来自 520 个实例、5 种 workload(SWE-bench / BFCL / mtRAG / QMSum / PinchBench);每条标注"最便宜够用档"(low/mid/mid_high/high 四档),标签由 downgrade-and-cascade 协议生成(从高档逐步降档 + 混合模型执行验证,确认降档后任务仍成功);打分是确定性算术(档位标签 × 轨迹归属 × token 成本),**评测侧不用在线 LLM judge**。
   2. **动态轨**:live 跑 SWE-bench Verified(论文报告 100 例 held-out,与静态轨的 SWE 监督切分不相交),每次调用路由器从锁定模型池选具体模型,按官方 resolution 判定 + 实际 API 花费(含缓存计费)+ 未解决罚分结算。
 
