@@ -181,7 +181,7 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
   2. 只调推理档位(reasoning effort)能解决的**不换模型**;
   3. 只在预期质量收益大于切换成本时才换模型,**切换成本显式包含丢失的 prompt cache**——第一家把"换模型=丢缓存"写进公开路由策略的产品(对照 §4 Anthropic 从 provider 侧给的解释)。
 - **数字(官方口径,未经第三方复测)**:423 个 agent 任务上解出 237 个,对照 Auto Router 的 130 个。
-- 零数据保留(ZDR),附件不送给 Jev;LiteLLM 的 Auto Router 已支持 `classifier_type: jev` 接入。
+- 零数据保留(ZDR);**附件不进路由决策**——jev-router 端点接受图片/PDF 等附件并随请求转发给最终模型,但 Jev 本身的输入只有文本(state + questions,32K 上下文),路由判断看不到附件内容;LiteLLM 的 Auto Router 已支持 `classifier_type: jev` 接入。
 
 反例:**Martian** 是最早做模型路由的创业公司(2023 年种子轮 $9M,NEA/General Catalyst 投资)。
 
@@ -218,8 +218,8 @@ OpenRouter 是 API 聚合商:一个 key 调各家的模型,按选中模型的原
 (图源:[NVIDIA 博客](https://developer.nvidia.com/blog/route-ai-agent-workloads-across-models-with-nvidia-nemo-switchyard/) Figure 3。Switchyard Server 内嵌 Routing Core(路由策略)、Session Manager(会话状态)、Usage & Telemetry(用量计量),向上接 agent/应用,向下接各模型提供方;路由配置、策略、会话存储、遥测导出构成控制面。)
 
 1. **LLM classifier(免训练)**:一个小 judge 模型辅助决策,三种模式——capability(逐调用选目标)、**escalation**(每个任务都从便宜模型开始,judge 逐轮读已完成轮次投票,连续两次否定把该任务升档到贵模型,单向门不再降回)、custom(自定义)。
-2. **Stage router(免训练,启发式)**:不加任何模型调用,读工具调用/返回信号、错误模式、推理模式、token 数,按工作流阶段路由;延迟接近零,但只在 agent 流量里确实有这些信号时有效。
-3. **Prefill-activation MLP(可训练,研究阶段)**:读模型内部状态做路由——prefill 时抽残差流激活,shared-trunk MLP 预测池里每个模型答对的成功率,再按策略把预测准确率与成本、延迟混合打分。
+2. **Stage router(免训练,启发式)**:不加任何模型调用,纯规则判断"agent 当前处于工作流的哪个阶段"——以编码 agent 为例:前期在探索代码库、从错误里恢复(需要强模型),后期进入机械的写改实现(便宜模型就够)。它逐轮检查最近的工具活动:严重错误、反复无效劳动、长时间探索 → 推向强模型;稳定写入/编辑、测试已通过 → 推向便宜模型;信号不明确时可再问一次 LLM judge,仍不明则落默认档。延迟接近零,但只在 agent 流量里确实有这些信号时有效(LangChain 的实测没覆盖它)。
+3. **Prefill-activation MLP(可训练,研究阶段)**:不读请求文本,读**模型读到这个请求时的内部状态**。做法:让模型对请求做 prefill,抽出残差流激活(这是比文本表面特征更丰富的难度信号;用哪个模型的 prefill,博客未披露),送给一个 **shared-trunk MLP**——"共享主干 + 每个候选模型一个输出头"的 MLP:主干做共享的特征变换,每个头预测池里对应模型"能答对这个请求"的成功率。再按策略把各模型的预测成功率与成本、延迟混合打分,选分最高的。
 
 ![Prefill router 的准确率-成本前沿](model-routing/figures/switchyard-prefill-router.png)
 
@@ -236,16 +236,16 @@ LangChain 的独立实测([博客](https://www.langchain.com/blog/switchyard-age
 ![调用量占比 vs 花费占比](model-routing/figures/switchyard-spend-chart.png)
 
 (图源:LangChain 博客,同上。读法:左环是调用量分布,右环是花费分布——30B 模型接了 93% 的调用只花 10.4% 的钱;judge 模型调用不多但占 21.2% 的花费,因为它每轮都跑且吃不到 prompt 缓存。)
-2. **judge 模型吃掉路由后花费的 21.2%**:它在每个未升档的轮次都要跑,且享受不到 prompt 缓存——"做判断的组件必须比省下的钱便宜"的又一次量化。博客给出判据公式:最小卸载比例 = judge 成本 ÷(贵便宜模型的单价差);价差小到这个比例超过 100% 时,路由必然亏本。
-3. **路由 vs 全跑便宜模型**:+2.3 分准确率、4.2 倍成本,小于 run 间波动(±2.7 分)——在这个偏简单的饱和 workload 上,路由赢的是"不用提前猜哪题难",不是稳赢便宜模型。
+2. **judge 模型吃掉路由后花费的 21.2%**:它在每个未升档的轮次都要跑,且"享受不到 prompt 缓存"——这是博客原文的实测陈述;机制上说得通(博客未展开,以下为合理推断):judge 是独立的第三个模型(本次是 Gemini Flash Lite),每轮评审都要自己把整段对话 prefill 一遍,而对话文本是在 Nemotron/Opus 上生成的、缓存留在那两家;前沿模型自己的多轮会话是前缀递增的,轮轮命中缓存。这是"做判断的组件必须比省下的钱便宜"的又一次量化。博客给出判据公式:**最小卸载比例 = judge 成本 ÷(贵模型与便宜模型的每轮价差)**。读法:judge 是每 run 的固定税(本次 $0.64/run),只有卸载到便宜模型的轮次才省钱(每轮省一份价差,本次 $10.73/run),盈亏平衡要求卸载比例 > 0.64/10.73 ≈ 5.9%(实际卸载 93%,16 倍过线)。若两个模型价差很小,算出的最小卸载比例会超过 100%——即使把请求全部发给便宜模型,省下的钱也抵不上 judge 税,路由必然亏本;例外是便宜模型自托管(推理成本趋零,价差重新拉大)。
+3. **路由 vs 全跑便宜模型**:+2.3 分准确率、4.2 倍成本,小于 run 间波动(±2.7 分)——不能宣称路由稳赢便宜模型。路由的价值在博客的"事后诸葛"论证里:评测分数是事后才知道的,生产里请求刚到达时你不知道它难还是易,全跑便宜模型就得在难题上也接受它的答案;路由是"不用提前猜哪题难"的保险费,同时压低花费上限(最差的一次路由 run $3.61,约为全跑 Opus 的三分之一)。
 
 ### UncommonRoute(开源,agent 步级)
 
 [CommonstackAI/UncommonRoute](https://github.com/CommonstackAI/UncommonRoute)(MIT):本地运行的 OpenAI 协议代理,即插到 Claude Code / Cursor / Codex。每个请求(每个 agent 步)过三个本地信号,投票出复杂度档位,再从用户配置的上游里挑能力匹配的最便宜模型:
 
 1. **元数据信号**:会话结构、工具使用、上下文深度,开销极低;
-2. **嵌入信号**:BGE 分类器读请求 + 近期 agent 状态 + 元数据,不确定时 KNN 回退;
-3. **结构信号**:文本与会话复杂度,按需激活,平时影子跟踪。
+2. **嵌入信号**:BGE 分类器读请求 + 近期 agent 状态 + 元数据;**KNN 回退**指分类器置信度低时退到 k 近邻投票——把请求嵌入后,在历史请求索引里找最相似的 k 条,用它们的复杂度标签投票(这个索引靠高置信决策持续扩充,见下);
+3. **结构信号**:文本与会话复杂度。README 原话 "active only when needed, shadow-tracked otherwise":平时只做廉价的后台跟踪(影子模式——算出结果但不参与投票),其他信号不确定时才激活参与决策。
 
 两个设计与 §7 的结论呼应:**会话不绑定模型**(逐步重选,但遵守 Anthropic thinking 续段等协议约束);**本地反馈学习**——高置信的一致决策用来扩充嵌入索引,低置信预测直接升档,而不是静默发给弱模型。自报数字(注意自评属性):SWE-bench Verified 100 例 held-out 上 75/100(Opus 单模型 74/100)、成本 $25.66 vs $54.73,省 53.1%;评测基建是同团队开源的 TwinRouterBench(§3)。
 
@@ -274,7 +274,7 @@ flowchart LR
 自带的生产级算法是 **x-router**(Python 侧,[README](https://github.com/openJiuwen-ai/model-router/blob/main/python/openjiuwen/x_router/README.md)):
 
 1. **分档**:进程内小分类器(Qwen3-0.6B,greedy 解码保证同请求同档)把会话打进 SIMPLE / MEDIUM / COMPLEX / RESEARCH / REASONING 五档;不高于本地能力线的留本地模型,超出的按档位映射到云端模型。
-2. **失败只降不升**("No failure escalates"):分类器缺失、超时、输出解析失败,都降级到本地模型或启发式,绝不因路由故障把请求发到更贵的模型。决策的 `reasoning` 是稳定的 key=value(rule + source 两个独立事实),source 里 `heuristic_fallback` / `parse_failed` 的速率就是分类器健康度的免费监控指标。
+2. **失败只降不升**("No failure escalates"):分类器缺失、超时、输出解析失败,都降级到本地模型或启发式,绝不因路由故障把请求发到更贵的模型。每次决策带一个格式稳定的 `reasoning` 字符串,记两个独立事实:`rule=` 命中了哪条规则、`source=` 决策来自哪(classifier / heuristic_fallback / parse_failed)。格式稳定就可聚合——统计日志里 `source=heuristic_fallback` 和 `source=parse_failed` 的占比,就是分类器故障率的免费监控指标,不用额外埋点。
 3. **可选 bandit 层**(默认关):记住历史会话的结果,当"相似请求在另一档上持续表现更好"(相似近邻 ≥5 且分差 >0.3)时覆盖分类器的档位;效用函数 U = 质量 − λ×成本——正是 §3"机制展开"里的效用式成本感知选择;每轮质量由 judge 模型(本地 1.7B+ 或任意 OpenAI 兼容 API)在 report 返回后异步打分,打分队列满则丢而不是阻塞。
 4. **状态侧配套**:k-NN 检索历史闭环记录(top_k=10、相似度阈值 0.5),forgetting_gamma 折扣旧策略版本的记录;免费档位必须上报 cost=0——成本未知的档位在成本有权时永不入选。
 
@@ -307,7 +307,7 @@ flowchart LR
 
 ### 机制展开:质量预测 + 成本感知选择(MF 与 ListNet)
 
-上表里的单轮路由器,多数可以拆成同一个三步结构:**给每个候选模型预测质量分 → 按成本做选择 → 用排序损失训练**。围绕这三步有几个反复出现的术语,集中解释一次:
+上表的路由方法里,除 FrugalGPT 是级联(拿到回答后再决定要不要升级)外,其余都是**单轮路由器**(调用前一次选定模型)。它们多数可以拆成同一个三步结构:**给每个候选模型预测质量分 → 按成本做选择 → 用排序损失训练**。围绕这三步有几个反复出现的术语,集中解释一次:
 
 1. **MF(矩阵分解)是什么**:从推荐系统借来的质量预测器。把"查询 × 模型"的质量矩阵分解成低秩嵌入的乘积,学一个隐评分函数 δ(M,q) 表示"模型 M 答查询 q 的质量"。RouteLLM 的 MF 路由器是双线性形式:模型嵌入与查询嵌入(投影到同维)逐位相乘,再过线性层出标量分;EmbedLLM 同样用 MF 学模型的紧凑嵌入,路由时预测"哪个模型能答对"。优点是极小、推理微秒级;缺点是**新模型入池要重训**(冷启动问题,见"评测"节的 MonoScale)。
 2. **ListNet 是什么**:learning-to-rank 的 listwise 损失(Cao et al., 2007)。把一个查询下所有候选模型的预测分过 softmax 变成概率分布,与真实效用(谁答对、答得多好)的分布算交叉熵,直接对齐"整个候选列表的排序"。它的两个对照范式:
@@ -318,6 +318,7 @@ flowchart LR
    - **效用式**:选 argmax(质量 − λ×成本),λ 是成本旋钮——LLMRank 用的这种。
    
    训练目标的选取与池子大小有关:二元池(强/弱两个模型)用 pairwise 就够;**多模型池更适合 listwise**——pairwise 只学相对胜负、比较对数随池子平方增长,listwise 直接对整个候选分布对齐。LLMRank 是"质量预测 + listwise 训练 + 成本效用选择"三者齐备的具体例子(RouterBench 上训练,89.2% oracle 效用)。
+4. **bandit(赌博机)是什么**:上面三步都是离线训练视角;上线后要边服务边学,标准框架是 bandit。把每个候选模型看作老虎机的一条臂:路由一次 = 拉一条臂,奖励 = 这次调用的质量/成本结果。与全监督训练的根本区别是**部分可观测**——只能看到被选中那条臂的奖励,看不到"如果当时选了别的模型会怎样",所以要在**利用**(选当前估计最优的臂)与**探索**(偶尔试别的臂获取信息)之间权衡。**上下文 bandit**(contextual bandit)= 拉臂前能看请求特征;经典算法 LinUCB 给每条臂维护一个线性回归加置信上界,选上界最高的臂。好处是不需要"每个模型 × 每个查询"的完整标注就能上线;代价是反事实评估难(见下"路由器的自我演进"节)。§2 openJiuwen 的 bandit 层、§3 RouterArena 的 OrcaRouter-Adaptive、自我演进节的 PILOT / BaRP / ParetoBandit 都是这一族。
 
 ### 评测:方法多,有效的少
 
@@ -336,7 +337,7 @@ flowchart LR
   2. **Mo' Models, Mo' Problems**([arXiv 2609.17306](https://arxiv.org/abs/2609.17306)):多智能体系统(路由/多数投票/LLM judge 三种形态)里,**扩大候选池几乎总是损害性能**;按"同家族、答案多样性"等预言指标精选的小池子反而最好。
   3. **MonoScale**([arXiv 2601.23219](https://arxiv.org/abs/2601.23219)):池子**动态扩大**时的失败模式是冷启动误路由——新模型入池,路由器对它没有经验,naive 扩池直接塌(GAIA 上 DeepSeek-V3.2 从 5 个 agent 的 0.558 掉到 10 个的 0.491);给路由器加"熟悉化任务 + 记忆更新"后,扩展才恢复单调收益。即使把路由器换成 GPT-5 级,面对含故障成员的噪声池一样崩。
   4. **The Routing Plateau**([arXiv 2606.07587](https://arxiv.org/abs/2606.07587)):从另一侧印证——把路由训练数据从 3 万扩到 30 万、编码器从 ModernBERT-base 升到 large、端到端微调,三招合计只多补 2.13 个百分点(oracle gap 的 14.6%);剩余差距需要"模型池感知的目标函数"和超越静态查询表示的信号。
-- [TwinRouterBench](https://arxiv.org/abs/2605.18859)(2026,CommonstackAI,[代码与数据](https://github.com/CommonstackAI/TwinRouterBench),Apache 2.0):**步级**(step-level)路由评测,补前两个 benchmark 的盲区——RouterBench/LLMRouterBench 都是"一个完整 prompt 选一次模型",而 agent 场景路由器真正面对的决策是"给定当前完整前缀(对话 + 工具返回 + 检索 + 日志),下一次调用该用哪档模型"。双轨制:
+- [TwinRouterBench](https://arxiv.org/abs/2605.18859)(2026,CommonstackAI,[代码与数据](https://github.com/CommonstackAI/TwinRouterBench),Apache 2.0):**步级**(step-level)路由评测,补前两个 benchmark 的盲区。RouterBench/LLMRouterBench 的评测单元是"一个完整 prompt,选一次模型";但 agent 场景里一个任务有几十次模型调用,路由器真正面对的决策是逐步做出的:"给定当前完整前缀(对话历史 + 工具返回 + 检索结果 + 日志),**下一次**调用该用哪档模型"。同一个任务里,"读一下这个文件"和"想清楚这个测试为什么挂"两步的难度天差地别,按整个任务选一次模型表达不了这种差异。双轨制:
   1. **静态轨**:970 个"路由器可见前缀"快照,来自 520 个实例、5 种 workload(SWE-bench / BFCL / mtRAG / QMSum / PinchBench);每条标注"最便宜够用档"(low/mid/mid_high/high 四档),标签由 downgrade-and-cascade 协议生成(从高档逐步降档 + 混合模型执行验证,确认降档后任务仍成功);打分是确定性算术(档位标签 × 轨迹归属 × token 成本),**评测侧不用在线 LLM judge**。
   2. **动态轨**:live 跑 SWE-bench Verified(论文报告 100 例 held-out,与静态轨的 SWE 监督切分不相交),每次调用路由器从锁定模型池选具体模型,按官方 resolution 判定 + 实际 API 花费(含缓存计费)+ 未解决罚分结算。
 
@@ -385,10 +386,10 @@ flowchart LR
 
 **闭环整体:NeoHorse-1**([arXiv 2609.08183](https://arxiv.org/abs/2609.08183),2026-09,[代码](https://github.com/TokenRhythm/NeoHorse))。标题即命题——"RSI via Agentic Post-Training **with Routing Harness**";出自 TokenRhythm(即 OpenSquilla 团队,§2),产出是一族 agent-native 模型(4B/9B)。机制要点:
 
-1. harness(执行层)的路由模块记录每个用户轮的 predicted / selected / actually-served 三个能力档,与轨迹对齐成 prediction–action–outcome 记录。
-2. **刻意不把实际派发的档位当难度标签**——派发还受用户覆盖、服务可用性、部署策略影响;路由估计只用于课程排序,结果字段(任务完成 / 验证反馈 / 恢复成本)做缺陷信号,指导下一轮数据配比。
-3. 三阶段 SFT 课程(按路由分数渐进引入高需求样本、保留低分覆盖)+ 同一 progression 调度起始上下文的 on-policy 蒸馏。
-4. 新 checkpoint 回到 harness,新轨迹暴露下一批能力缺口,闭合 evaluation–selection–update 环——原话 "what the system learns to do influences what it learns from next"。
+1. **每轮记三个数**:harness(执行层)的路由模块对每个用户轮次分别记录——预测档(路由器估计"这轮需要多强的模型")、派发档(实际用了哪个模型)、结果(任务完成 / 验证反馈 / 恢复成本),与轨迹对齐成"预测–动作–结果"三元组。
+2. **预测档当难度标签,派发档不当**:实际派发会被人工覆盖、服务可用性、部署策略污染("派了弱模型"不等于"这轮简单"),所以训练时只用预测档给样本排序——按难度从低到高排成三阶段 SFT 课程,同一套难度顺序再用来调度 on-policy 蒸馏的起始上下文。
+3. **结果字段当缺陷信号**:哪类轮次老失败,下一轮训练数据就多配哪类(能力导向的数据配比)。
+4. **闭环**:新 checkpoint 回到 harness 继续服务,新轨迹暴露下一批能力缺口,回到第 1 步——原话 "what the system learns to do influences what it learns from next"(系统学会了什么,决定它接下来从什么里学)。
 
 ![NeoHorse-1 的 routing-guided RSI 闭环](model-routing/figures/neohorse-rsi-loop.png)
 
@@ -402,13 +403,31 @@ flowchart LR
 - [EvoRoute](https://aclanthology.org/2026.acl-long.1771/)(ACL 2026):经验库驱动的自路由——每步从不断膨胀的历史记录里检索候选、按模型聚合(精度/成本/延迟)后做 Pareto 筛选;GAIA / BrowseComp+ 上成本最高 −80%、延迟 −70% 以上。
 - [NVIDIA Data Flywheel Blueprint](https://github.com/NVIDIA-AI-Blueprints/data-flywheel):工业版飞轮——生产日志带 workload 标识落 Elasticsearch,分层抽样出训练/评测集,LoRA 蒸馏小模型,LLM-judge 打分后晋升。定位是"发现与晋升服务",晋升前人工评审,不是全自动替换;路由器的 workload 标签正是它分层抽样的依据。
 
-**路由器在线学习(闭环的下半圈,最成熟)**:上下文 bandit 一脉——[PILOT](https://aclanthology.org/2025.findings-emnlp.1301/)(EMNLP 2025,LinUCB + 偏好先验 + 预算背包)、[BaRP](https://arxiv.org/abs/2510.07429)(bandit 反馈 + 偏好向量,测试时免重训调权衡,比离线路由器至少 +12.46%)、[MixLLM](https://aclanthology.org/2025.naacl-long.545/)(NAACL 2025,持续学习 + 池可变,GPT-4 质量的 97.25% @ 24.18% 成本)、[ParetoBandit](https://arxiv.org/abs/2604.00136)(在线对偶变量做预算 pacing + **几何遗忘对抗非平稳** + 模型热插拔)、[StageRoute](https://arxiv.org/abs/2506.17254)(联合优化"部署哪些模型"与"怎么路由",regret Õ(T^2/3) 带匹配下界)。工程化样本:[VDF 自演进路由器白皮书](https://vdf.ai/white-papers/the-self-evolving-model-router/)——六级 dispatcher 逐层 feature-gate、信号缺失时降级到更简单策略;LinUCB 逐请求 Sherman–Morrison 秩一更新;失败不丢弃、折算 0.15 惩罚;**challenger 双路由**(小比例流量同时打两个模型做活体偏好学习);离线批量重导先验、原子热替换进在线策略;作者明确"不过度声称实测收益"。§2 openJiuwen 的 bandit 层(forgetting_gamma 折扣旧策略版本)与本节 RouterArena 第 14 名 OrcaRouter-Adaptive(LinUCB)都是这一层的实例。
+**路由器在线学习(闭环的下半圈,最成熟)**——上下文 bandit 一脉(术语见"机制展开"第 4 条):
 
-**支撑:池演化与新模型冷启动**。[Universal Model Routing](https://arxiv.org/abs/2502.08773)用"代表性 prompt 集上的预测正确向量"表示模型,新模型免重训接入,带 excess risk 上界;[RouteProfile](https://arxiv.org/abs/2605.00180)从 model card 公开信号(家族/描述/benchmark 分数)构图做零交互冷启动,结论是"新模型接入需要 profile–router 协同设计";[SemiRouter](https://aclanthology.org/2026.eacl-long.228/)(EACL 2026)冻结骨干 + 轻量 adapter,稀疏数据下接入新模型。反面证据见上文"模型池不是越大越好"组的 MonoScale:池动态扩大时冷启动误路由直接塌,要给路由器加记忆。
+- [PILOT](https://aclanthology.org/2025.findings-emnlp.1301/)(EMNLP 2025):LinUCB + 离线偏好数据预训练的共享嵌入空间,上线后用 bandit 反馈持续微调;用户预算建模成多选背包。
+- [BaRP](https://arxiv.org/abs/2510.07429):bandit 反馈 + 偏好向量条件化,测试时免重训调节质量-成本权衡;比离线路由器至少 +12.46%。
+- [MixLLM](https://aclanthology.org/2025.naacl-long.545/)(NAACL 2025):持续学习 + 候选池可变;GPT-4 质量的 97.25% @ 24.18% 成本。
+- [ParetoBandit](https://arxiv.org/abs/2604.00136):在线对偶变量做预算 pacing + **几何遗忘**对抗非平稳 + 模型热插拔。
+- [StageRoute](https://arxiv.org/abs/2506.17254):联合优化"部署哪些模型"与"怎么路由",regret Õ(T^2/3) 带匹配下界。
+- 工程化样本:[VDF 自演进路由器白皮书](https://vdf.ai/white-papers/the-self-evolving-model-router/)——六级 dispatcher 逐层 feature-gate、信号缺失时降级到更简单策略;LinUCB 逐请求 Sherman–Morrison 秩一更新;失败不丢弃、折算 0.15 惩罚;**challenger 双路由**(小比例流量同时打两个模型做活体偏好学习);离线批量重导先验、原子热替换进在线策略;作者明确"不过度声称实测收益"。
+- 文档内的同族实例:§2 openJiuwen 的 bandit 层(forgetting_gamma 折扣旧策略版本)、本节 RouterArena 第 14 名 OrcaRouter-Adaptive(LinUCB)。
+
+**支撑:池演化与新模型冷启动**——池子会变(新模型上线、旧模型下线),路由器不能每变一次就重训:
+
+- [Universal Model Routing](https://arxiv.org/abs/2502.08773):用"代表性 prompt 集上的预测正确向量"表示模型——新模型只需在一小撮代表性 prompt 上跑一遍、记下对错向量,就能接入路由,免重训;带 excess risk 上界。
+- [RouteProfile](https://arxiv.org/abs/2605.00180):从 model card 公开信号(家族/描述/benchmark 分数)构图,做零交互冷启动;结论是"新模型接入需要 profile–router 协同设计"。
+- [SemiRouter](https://aclanthology.org/2026.eacl-long.228/)(EACL 2026):冻结骨干 + 轻量 adapter,稀疏数据下接入新模型。
+- 反面证据见上文"模型池不是越大越好"组的 MonoScale:池动态扩大时冷启动误路由直接塌,要给路由器加记忆。
 
 读穿这层工作,联合演进成立有四个条件:
 
-1. **非平稳性是核心敌人**。模型一更新,路由器的质量模型就过期。已有答案:几何遗忘(ParetoBandit)、策略版本折扣(openJiuwen)、原子热替换(VDF)——共同前提是**策略是版本化数据,不是代码**。
+1. **非平稳性是核心敌人**。模型一更新,路由器的质量模型就过期——"这个模型擅长什么"的答案随时间变化,而路由器的知识全部来自历史反馈。三种解法对应三种变化时间尺度:
+   - **几何遗忘**(ParetoBandit)治**缓慢漂移**:每条臂的历史统计按指数衰减加权,越旧的观测权重越小;模型更新后旧观测自动淡出,路由器跟着近期数据走。
+   - **策略版本折扣**(openJiuwen forgetting_gamma)治**版本切换**:每条历史记录打上"产生它时的策略/模型版本",检索相似记录时旧版本记录按比例折扣;模型换版后旧记录自然失效,不用清库。
+   - **原子热替换**(VDF)治**结构突变**:新模型入池、特征空间变化这类事不在在线路径上边服务边改,而是离线批量重训出新先验,整个原子换进在线策略(hot-reload),出问题可回滚。
+
+   共同前提:**策略是版本化数据,不是代码**——策略能当数据换,热替换和回滚才可能。
 2. **部分可观测**。bandit 反馈只见所选模型的结果;反事实评估要么靠 judge(贵——LangChain 实测 judge 吃掉 21.2% 路由花费,§2),要么靠探索流量(VDF challenger 是真金白银)。
 3. **数据与池都不是越多越好**。The Routing Plateau:数据扩 10 倍只 +2.13pp;OrchSLM:路由准确率 3–4 个模型见顶(均见上文)。共同演进不应无限扩池、无限堆数据。
 4. **自指风险**。路由器用自己的 judge 打分、用自己的日志训练,回路会放大自身偏差;需要锚定外部执行验证(TwinRouterBench 动态轨这类)。
