@@ -21,7 +21,7 @@
 | 异构同机 双向 TP2↔TP4（2026-10-09，需容器补丁） | **通过**：24/24 key 对号，95.9%，零 invalid，A/B 输出逐字一致 |
 | 异构跨机 245(TP2)→217(TP4)（2026-10-09，需容器补丁） | **通过** + **杀源实例法铁证读本机副本**（仅剩 217 副本时 B 首中 768 token 全部外部 get 成功） |
 
-完整实验史（总表 12 条 + 异构实录 + 撤回记录）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定金标准见 [REPRODUCE.md](REPRODUCE.md)。未做：layerwise、编排层、落盘、copy 并行（见「开放问题」）。
+完整实验史（总表 12 条 + 异构实录 + 撤回记录）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定金标准见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」「开放问题」。
 
 ## 快速开始
 
@@ -141,9 +141,17 @@ B2：请求前把前缀 KV 放到目标实例本机 DRAM。先把三个对象讲
 
 ### 三个对象
 
-- **key —— KV 在池里的存取单位**。KV 不是作为一个整体进池的：引擎把它按 block 切开（本模型一块 = 128 token），**每个满块、每个 rank 的切片，各是池里一个独立对象，各配一把 key**。801 token 前缀 = 6 个满块 × 2 个 rank = **12 把 key**；余下 33 个 token 不满一块不进池——所以命中只有 768/801 ≈ 95.9%，尾巴由引擎重算补齐。预取的本质：把这 12 把 key 对应的对象逐个复制到目标侧。
-- **seg —— KV 的物理落点**。worker 每个 rank 起机时在本机 DRAM 划一块区域注册进池，这块区域叫一个 segment（seg），名字就是它的地址 `IP:rpc_port`。**一个 rank 一个 seg**（TP=2 的实例有 2 个 seg）。master 记录「每把 key 的副本落在哪些 seg 上」，get 时按这个视图选副本。所谓 local-first：key 在**本 rank 自己的 seg** 上有副本 → 读本机 DRAM，不走网络。
-- **head_or_tp_rank —— key 尾部的切片编号**。TP 下每个 rank 只持有 KV head 的一部分（8 KV head ÷ TP=2 → 每 rank 4 个 head 的 KV）。同一 block 在不同 rank 上的切片内容不同，key 尾部带编号区分「这是哪个 rank 的切片」，避免撞名——这就是 `head_or_tp_rank`，通常等于 `tp_rank`（rank0 的块 → `…@head_or_tp_rank:0@…`，rank1 → `:1@…`）。例外：KV head 数比 TP 还小时（如 MLA 只 1 个 KV head，各 rank 内容相同），多个 rank 共用一个编号（`put_step` 折叠，全 rank 都写 `:0@`）——所以枚举 key 的编号范围是 `0 .. N/put_step-1`，不一定是 `0..N-1`。
+- **key —— KV 在池里的存取单位**
+  - 粒度：KV 按 block 切开（本模型 128 token/块），**每个满块 × 每个 rank 的切片 = 池里一个独立对象 = 一把 key**。
+  - 例：801 token 前缀 × TP=2 → 6 满块 × 2 rank = **12 把 key**；余 33 token 不满一块不进池 → 命中 768/801 ≈ 95.9%，尾巴由引擎重算补齐。
+  - 预取本质：把这 12 把 key 对应的对象逐个复制到目标侧。
+- **seg —— KV 的物理落点**
+  - 每个 rank 起机时在本机 DRAM 划一块区域注册进池，即一个 segment（seg），名即地址 `IP:rpc_port`；**一个 rank 一个 seg**。
+  - master 记录「每把 key 的副本落在哪些 seg」，get 按此视图选副本。
+  - local-first：key 在**本 rank 自己的 seg** 上有副本 → 读本机 DRAM，不走网络。
+- **head_or_tp_rank —— key 尾部的切片编号**
+  - TP 下每个 rank 只持有一部分 KV head（8 ÷ TP=2 → 4 head/rank）；同一 block 在不同 rank 的切片内容不同，key 尾带编号区分（`…@head_or_tp_rank:0@…` / `:1@…`），通常 = `tp_rank`。
+  - 例外：KV head 数 < TP（如 MLA 仅 1 KV head，各 rank 内容相同）→ `put_step` 折叠，全 rank 共用 `:0@`；枚举范围是 `0 .. N/put_step-1`，不一定是 `0..N-1`。
 
 | 项 | 现状 |
 |----|------|
@@ -278,7 +286,7 @@ flowchart LR
 
 **上游已修**：[vllm-ascend #15835](https://github.com/vllm-project/vllm-ascend/pull/15835)（fix #15842，2026-09-09 合入 main，merge commit `9f8773ea`；根因 = #11444 重构丢了 #11582 引入的接线）。除两处线程构造补 `worker=self if self.tp_mismatch else None`，还恢复了 `start_load_kv` 同步 load 的 mismatch 分发。**rc1 / rc2 均不含，仅 main 有**。
 
-补丁：`patch_tp_mismatch_worker.patch`（标准 unified diff，三处 hunk 锚定 rc1 唯一上下文）——**#15835 完整版 backport 到 rc1**：两处线程构造补 `worker=self if self.tp_mismatch else None`（同 TP 传 None、不碰普通路径）+ `start_load_kv` 恢复同步 load 的 mismatch 分发。容器内应用：`cd /vllm-workspace/vllm-ascend && git apply --check patch_tp_mismatch_worker.patch && git apply -v patch_tp_mismatch_worker.patch`（或 `patch -p1`）；`git apply -R --check` 探测是否已打。打上后小 TP 消费者同步 load 亦可走 `_load_kv_tp_mismatch`，**`LOAD_ASYNC=1` 由硬约束降为推荐项**（异步仍是 overlap 更优路径）。注意：本目录全部异构实测在旧 python 子集补丁 + 异步路径下完成（[EXPERIMENTS.md](EXPERIMENTS.md) #5/#6/#8/#12），同步 mismatch 路径按上游修复恢复、未在本测试床单独复测；0.26 rc 镜像必须打本补丁（rc1/rc2 均不含上游修复）。
+补丁：`patch_tp_mismatch_worker.patch` = **#15835 完整版的 rc1 backport**（标准 unified diff，三处 hunk 锚定 rc1 唯一上下文；同 TP 传 None、不碰普通路径）。容器内应用：`cd /vllm-workspace/vllm-ascend && git apply --check patch_tp_mismatch_worker.patch && git apply -v patch_tp_mismatch_worker.patch`（或 `patch -p1`）；`git apply -R --check` 探测是否已打。打上后小 TP 消费者同步 load 亦可走 `_load_kv_tp_mismatch`，**`LOAD_ASYNC=1` 由硬约束降为推荐项**（异步仍是 overlap 更优路径；本测试床全部异构实测走异步路径，见 [EXPERIMENTS.md](EXPERIMENTS.md) #5/#6/#8/#12，同步 mismatch 未单独复测）。
 
 参考：`pool_worker.py`（`put_step`/`head_or_tp_rank`/`_build_tp_mismatch_keys_and_addrs`）；`docs/research/sglang/storage-backends.md`。
 
@@ -342,11 +350,11 @@ va-precopy/
 
 ### Key 与 segment（操作指针）
 
-概念见「怎么运作 · 三个对象」，这里是操作指针：
+概念与机制见「怎么运作 · 三个对象 / 数据来源与日志边界」，这里只列命令：
 
-- **key 枚举**：`precopy/keys.py --model ... --prefix ...`（prompt 模式）、`--chunk-hashes`（离线）或 `--keys-file`（读留档 key 文件，配 `--check-master` 做事后逐 key 副本取证）——hash 链与 PoolKey 格式都 **import 上游权威实现**（见「数据来源与日志边界」）；内置镜像仅离线 fallback。
-- **seg 解析**：`precopy/resolve.py --role B --tp N` 可单跑（调试）；产品路径由 `precopy.py` 内嵌调用（**不读日志**）：名单 = `GET :9003/get_all_segments`；对号 = `logs/worker_B.pid` → 进程树 → `ss -ltnp` 端口 ∩ 名单；rank 号取进程名 `VLLM::Worker_TP<N>`（TP=1 不需要）。任何一步对不上即 fail loud。跨机：`--ssh 'ssh root@B_IP' --pidfile <B 机路径>`（把 resolve.py 源码 pipe 到 B 机 `python3 -` 执行，不依赖远端路径）。
-- **chunk hash**：`--hash-algo`（默认 sha256）与引擎 `prefix_caching_hash_algo` 一致即可；`PYTHONHASHSEED=0` 只在 algo=builtin 时才需要（legacy 防御）。
+- **key 枚举**：`precopy/keys.py --model ... --prefix ...`（prompt 模式）/ `--chunk-hashes`（离线）/ `--keys-file <留档> --check-master`（事后逐 key 副本取证）。
+- **seg 解析**：`precopy/resolve.py --role B --tp N` 可单跑调试；产品路径由 `precopy.py` 内嵌调用。跨机加 `--ssh 'ssh root@B_IP' --pidfile <B 机路径>`（resolve.py 源码 pipe 到 B 机 `python3 -` 执行，不依赖远端路径）。
+- **hash 对齐**：`--hash-algo`（默认 sha256）与引擎 `prefix_caching_hash_algo` 一致即可。
 
 ### 验收
 
@@ -361,15 +369,16 @@ va-precopy/
 
 ## 边界与已知限制
 
-- `protocol`：store 半程可用 `tcp`；接 vllm-ascend NPU 集群用 `ascend`，须与 `mooncake.json` 一致。
-- 控制面发起 `create_copy_task`；`mooncake_master` 调度；引擎不调用该 API。
-- 本目录只验证 **非 layerwise** + **本机 DRAM**；生成物已 `.gitignore`。
-- 同构 **TP=2 rank↔seg** 已通过；TP=4 新路径未重跑。旧 key×N 历史结果仍有效作对照。
-- copy 仍按 key **串行**；未做并行 / 本机扩散 / 带宽限速（与在线读共享带宽）。
-- 副本 **无 pin**：READY 后仍可能被池驱逐；源属主客户端（worker-A）必须在线，掉线则 copy 失败。
-- `precopy/resolve.py` 的依赖：master admin `:9003` 在线（`cluster/start_master.sh` 默认开）；`cluster/start_worker.sh` 写的 pidfile（跨机经 `--ssh` 在 B 机读）；TP>1 时 rank 号依赖 vLLM 进程名 `VLLM::Worker_TP<N>`——vLLM 改命名会 **fail loud**（不会静默错配），届时按 `pgrep -af 'VLLM::'` 实际输出更新模块内模式。
-- `precopy.py` 退出期偶发 allocator abort / 挂起：**已修复**（READY 后显式 `store.close()`，与 keys `--check-master` / store_demo 对齐；此前 precopy 是唯一不 close 的脚本）。根因 = 客户端退出期 teardown 竞态：GC/atexit 触发的乱序析构与在途收尾操作（copy-task 收尾连接、重连协程）竞争，0.3.11.post1 缺上游 #3943（teardown drain）等修复；旧日志中出现时 READY 已打印即可忽略。
-- **异构 TP（A/B 不同 tp_size）**：AscendStore **原生支持**（`prefill_tp_size`/`decode_tp_size` → tp_mismatch sub-key），但 v0.26.0rc1 put 路径有 bug 需补丁（见「怎么运作 · 异构 TP」）。
+- **验证覆盖面**
+  - 只验证 **非 layerwise** + **本机 DRAM** 目标；layerwise / 落盘 / 编排集成见「开放问题」。
+  - 新路径（rank↔seg 对号）只重跑过同构同机 TP=2，同构跨机与 TP=4 仍是 10/08 旧 key×N 路径结果（见「验证状态」表注）。
+- **复制与副本**
+  - copy 按 key **串行**；未做并行 / 本机扩散 / 带宽限速（与在线读共享带宽）。
+  - 副本 **无 pin**：READY 后可能被池驱逐；源属主客户端（worker-A）必须在线，掉线则 copy 失败。
+- **控制面依赖**
+  - `protocol` 须与 `mooncake.json` 一致（store 半程可 `tcp`，NPU 集群用 `ascend`）。
+  - `resolve.py`：master admin `:9003` 在线（`start_master.sh` 默认开）；`start_worker.sh` 写的 pidfile（跨机经 `--ssh` 读 B 机）；TP>1 时 rank 号依赖进程名 `VLLM::Worker_TP<N>`——vLLM 改命名会 **fail loud**（不静默错配），届时按 `pgrep -af 'VLLM::'` 实际输出更新模块内模式。
+- **异构 TP**：0.26 rc 镜像（rc1/rc2）必打 `patch_tp_mismatch_worker.patch`；tp_mismatch 不支持 MLA / layerwise / sparse / hybrid（机制与补丁见「怎么运作 · 异构 TP」）。
 
 ## 开放问题（待讨论）
 
@@ -400,7 +409,7 @@ B2 目标是 worker 挂载的 **DRAM segment**。Mooncake 可有 DRAM→SSD 分�
 
 ### 4. 其它生产缺口（短清单）
 
-- **B 侧重复请求偶发 1-token 贪心翻转**（仅前置实验 B 非 DEBUG 实例出现：同 prompt 奇数次输出与 A 一致、偶数次在近平局 token 处偏移；A 稳定、B 冷 prompt 稳定、DEBUG 新实例 3 连跑未复现）——疑外部 KV 加载路径与 local 路径交替时的数值扰动，非字节错乱（纯外部读首请求输出与 A 逐字一致）；复现条件与根因待查，**生产化前必须闭环**
+- **B 侧重复请求偶发 1-token 贪心翻转**：仅 10/09 旧非 DEBUG 实例出现，新 DEBUG 实例未复现；疑外部加载与 local 路径交替的数值扰动，非字节错乱——复现条件与根因待查，**生产化前必须闭环**（实验记录见 [EXPERIMENTS.md](EXPERIMENTS.md) #10）
 - EP：持 KV 的 rank/多机拓扑尚未测
 - master HA、监控（READY 延迟、copy 失败率、external hit）
 - 源 worker 掉线则 copy 失败，与故障重路由如何衔接

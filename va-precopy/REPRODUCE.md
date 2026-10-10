@@ -16,15 +16,17 @@
 | 同机多 worker | `preferred_segment: true` | 否则写路径可能把 KV 分到同机另一 worker 的 segment，预复制场景退化 |
 | 取证日志 | `VLLM_LOGGING_LEVEL=DEBUG` | 非 DEBUG 无分 rank `MooncakeBackend.get enter keys=` 证据 |
 
-**已知上游 bug（异构 TP 场景必打补丁）**：v0.26.0rc1 的 `pool_worker.py::_start_kv_transfer_threads` 构造发送/接收线程时漏传 `worker=self`，导致 tp_mismatch 的 put/get 分支是**死代码**。必须先打 `patch_tp_mismatch_worker.patch`（容器内 `cd /vllm-workspace/vllm-ascend && git apply --check <补丁> && git apply -v <补丁>`，或 `patch -p1`；`git apply -R --check` 探测是否已打）。同构场景不受影响，无需补丁。上游已在 main 修复（[#15835](https://github.com/vllm-project/vllm-ascend/pull/15835)，2026-09-09 合入，`9f8773ea`），但 **rc1 / rc2 均不含**，0.26 rc 镜像仍须打本补丁；本补丁为 #15835 完整版的 rc1 backport（含同步 load 分发）。若容器已打过旧 `.py` 子集补丁，先恢复其 `.bak.<时间戳>` 备份（或重建容器）再打，否则上下文不匹配。
+**已知上游 bug（异构 TP 场景必打补丁）**：v0.26.0rc1 的 tp_mismatch put/get 分支因线程构造漏传 `worker=self` 而是**死代码**（根因与机制见 [README.md](README.md)「怎么运作 · 异构 TP」）。**rc1 / rc2 均不含上游修复**（main 已修，[#15835](https://github.com/vllm-project/vllm-ascend/pull/15835)），0.26 rc 镜像必打本补丁（#15835 完整版 rc1 backport）；同构场景无需补丁。容器内：`cd /vllm-workspace/vllm-ascend && git apply --check patch_tp_mismatch_worker.patch && git apply -v patch_tp_mismatch_worker.patch`（或 `patch -p1`；`git apply -R --check` 探测是否已打）。若容器打过旧 `.py` 子集补丁，先恢复其 `.bak.<时间戳>` 备份（或重建容器）再打，否则上下文不匹配。
 
 **操作要点**：
 
-- 残留 worker 清理：vLLM 进程经 `setproctitle` 后名为 `VLLM::EngineCore/Worker_TP/APIServer`，`ps | grep python` 搜不到；用 `pgrep -f "VLLM::[W]"`（括号防自匹配）+ 显式 kill，再用 `npu-smi info -t usages -i <id>` 确认 HBM 释放（<10%）。旧实例残留在目标端口会让新实例「假 READY」。
-- `precopy.py` 客户端退出偶发 allocator abort（RC=134）或挂起：**已通过显式 `store.close()` 修复**（2026-10-10，根因 = 退出期 teardown 竞态，0.3.11.post1 缺上游 #3943）。旧环境若仍出现：READY 已打印即拷贝完成，可忽略。
-- seg 解析：`precopy/resolve.py`（`precopy.py` 缺省内嵌调用）走 master admin `:9003/get_all_segments` + pidfile/进程树 `ss` 对号，**不读任何日志**（旧版读 master 日志的坑——轮转、旧进程无 mount 行——随之消失）；跨机加 `--ssh 'ssh root@B_IP' --pidfile <B 机克隆路径>/logs/worker_B.pid`。
-- 两机**非共享存储**：各自 clone 本目录并同步。
-- 跨机 ssh 高频连接触发对端限速（认证后断连/KEX 卡死）：控制操作合并成批执行，或改控制台人工执行。
+- **残留 worker 清理**
+  - vLLM 进程 `setproctitle` 后名为 `VLLM::EngineCore/Worker_TP/APIServer`，`ps | grep python` 搜不到；旧实例残留端口/显存会让新实例「假 READY」。
+  - 用 `pgrep -f "VLLM::[W]"`（括号防自匹配）+ 显式 kill，再 `npu-smi info -t usages -i <id>` 确认 HBM 释放（<10%）。
+- **环境**
+  - 两机**非共享存储**：各自 clone 本目录并同步。
+  - 跨机 ssh 高频连接触发对端限速（认证后断连/KEX 卡死）：控制操作合并成批，或改控制台人工执行。
+- **已知修复**：`precopy.py` 退出偶发 allocator abort 已通过显式 `store.close()` 修复（2026-10-10）；旧环境若仍出现，READY 已打印即拷贝完成，可忽略。
 
 ## 1. 四类场景总览
 
@@ -72,9 +74,9 @@ A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`dec
 | 角色 | put（生产） | get（消费） |
 |------|-------------|-------------|
 | TP = effective_tp 的大 TP 端 | plain put（无需 sub-key） | 同步 load 即可 |
-| TP < effective_tp 的小 TP 端 | 需补丁后 sub-key put | sub-key get（实测 `LOAD_ASYNC=1` 异步路径；完整补丁后同步亦可，未复测） |
+| TP < effective_tp 的小 TP 端 | 需补丁后 sub-key put | sub-key get（`LOAD_ASYNC=1` 异步路径） |
 
-注：旧子集补丁（仅 `worker=self`，无同步 load 分发）下小 TP 消费者**必须** `LOAD_ASYNC=1`——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中）。当前补丁已是 #15835 完整版 backport，同步分发已恢复，该硬约束解除；异步仍是推荐的 overlap 路径。本测试床异构实测均走异步路径，同步 mismatch 未单独复测。
+注：小 TP 消费者走异步的原因——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中，见 §3）；异步路径才走 `_load_kv_tp_mismatch`。当前补丁（#15835 完整版 backport）已恢复同步 load 的 mismatch 分发，硬约束解除，`LOAD_ASYNC=1` 降为推荐；本测试床异构实测均走异步，同步 mismatch 未单独复测。
 
 **配置陷阱（反向方向最易错）**：`infer_tp_mismatch_info` 对 `kv_producer`/`kv_both` 读的是 **`decode_tp_size`** 作为 peer size（`kv_consumer` 才读 `prefill_tp_size`）。反向（A=TP4→B=TP2）时 B 侧必须配 `decode_tp_size=4`（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
 
@@ -118,8 +120,6 @@ python3 precopy/precopy.py --master A_IP:50088 --protocol ascend \
 
 ## 4. 已知问题与边界
 
-- **B 侧重复请求偶发 1-token 贪心翻转**：仅旧非 DEBUG 实例出现（同 prompt 偶数次输出在近平局 token 处偏 1 个字符）；A 稳定、B 冷 prompt 稳定、DEBUG 新实例未复现。疑外部 KV 加载路径与 local 路径交替的数值扰动，非字节错乱（外部读首请求与 A 逐字一致）。复现条件与根因待查。
-- **副本无 pin**：READY 后仍可能被池驱逐；源 worker-A 必须在线，掉线则 copy 失败。
-- copy 按 key 串行，未做并行；未做 layerwise、落盘（SSD）、编排层集成。
-- **Mamba 异构不支持**（hybrid 模型被 tp_mismatch gate 排除）；Mamba 同构 TP=4 跨机已通过（`--block-size 1536`）。
-- 源属主客户端与读共享带宽，无限速。
+- **B 侧重复请求偶发 1-token 贪心翻转**：仅 10/09 旧非 DEBUG 实例出现（同 prompt 偶数次输出在近平局 token 处偏 1 个字符），新 DEBUG 实例未复现；非字节错乱，复现条件与根因待查（实验记录见 [EXPERIMENTS.md](EXPERIMENTS.md) #10）。
+- **Mamba 异构不支持**（hybrid 模型被 tp_mismatch gate 排除，见 §2③）；Mamba 同构 TP=4 跨机已通过（`--block-size 1536`）。
+- 通用边界（副本无 pin、串行 copy、源属主须在线、带宽共享、验证覆盖面）见 [README.md](README.md)「边界与已知限制」。
