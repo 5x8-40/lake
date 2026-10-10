@@ -16,7 +16,7 @@
 | 同机多 worker | `preferred_segment: true` | 否则写路径可能把 KV 分到同机另一 worker 的 segment，预复制场景退化 |
 | 取证日志 | `VLLM_LOGGING_LEVEL=DEBUG` | 非 DEBUG 无分 rank `MooncakeBackend.get enter keys=` 证据 |
 
-**已知上游 bug（异构 TP 场景必打补丁）**：v0.26.0rc1 的 `pool_worker.py::_start_kv_transfer_threads` 构造发送/接收线程时漏传 `worker=self`，导致 tp_mismatch 的 put/get 分支是**死代码**。必须先打 `patch_tp_mismatch_worker.py`（幂等、自动备份，容器内执行）。同构场景不受影响，无需补丁。上游已在 main 修复（[#15835](https://github.com/vllm-project/vllm-ascend/pull/15835)，2026-09-09 合入，`9f8773ea`），但 **rc1 / rc2 均不含**，0.26 rc 镜像仍须打本补丁；本补丁是 #15835 的子集（缺同步 load 分发，即下文 `LOAD_ASYNC=1` 约束的根因），后续可整体替换为上游完整版。
+**已知上游 bug（异构 TP 场景必打补丁）**：v0.26.0rc1 的 `pool_worker.py::_start_kv_transfer_threads` 构造发送/接收线程时漏传 `worker=self`，导致 tp_mismatch 的 put/get 分支是**死代码**。必须先打 `patch_tp_mismatch_worker.py`（幂等、自动备份，容器内执行）。同构场景不受影响，无需补丁。上游已在 main 修复（[#15835](https://github.com/vllm-project/vllm-ascend/pull/15835)，2026-09-09 合入，`9f8773ea`），但 **rc1 / rc2 均不含**，0.26 rc 镜像仍须打本补丁；本补丁为 #15835 完整版的 rc1 backport（含同步 load 分发，自动升级旧子集补丁）。
 
 **操作要点**：
 
@@ -72,9 +72,9 @@ A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`dec
 | 角色 | put（生产） | get（消费） |
 |------|-------------|-------------|
 | TP = effective_tp 的大 TP 端 | plain put（无需 sub-key） | 同步 load 即可 |
-| TP < effective_tp 的小 TP 端 | 需补丁后 sub-key put | **必须 `LOAD_ASYNC=1`**（同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算） |
+| TP < effective_tp 的小 TP 端 | 需补丁后 sub-key put | sub-key get（实测 `LOAD_ASYNC=1` 异步路径；完整补丁后同步亦可，未复测） |
 
-注：`LOAD_ASYNC=1` 约束源于本目录补丁是上游 #15835 的子集（缺同步 load 的 mismatch 分发）；换用上游完整修复后同步 load 可用，该要求取消。
+注：旧子集补丁（仅 `worker=self`，无同步 load 分发）下小 TP 消费者**必须** `LOAD_ASYNC=1`——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中）。当前补丁已是 #15835 完整版 backport，同步分发已恢复，该硬约束解除；异步仍是推荐的 overlap 路径。本测试床异构实测均走异步路径，同步 mismatch 未单独复测。
 
 **配置陷阱（反向方向最易错）**：`infer_tp_mismatch_info` 对 `kv_producer`/`kv_both` 读的是 **`decode_tp_size`** 作为 peer size（`kv_consumer` 才读 `prefill_tp_size`）。反向（A=TP4→B=TP2）时 B 侧必须配 `decode_tp_size=4`（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
 

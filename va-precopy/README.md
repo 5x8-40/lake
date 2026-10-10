@@ -38,7 +38,7 @@
 
 完整实验总表（12 条，2026-10-08 ~ 10-09，含撤回历史）与踩坑记录见 [EXPERIMENTS.md](EXPERIMENTS.md)。
 
-**进度决策（2026-10-09）**：同构 rank↔seg 已验证；**异构 TP 双向（TP2→TP4 / TP4→TP2）已验证**（见下节；需容器补丁 + 小 TP 消费者 `load_async=1`）；**跨机异构 TP2(245)→TP4(217) 已验证且读本机副本经杀源实例法铁证**（[EXPERIMENTS.md](EXPERIMENTS.md) #12）。未做：layerwise、编排层、落盘、copy 并行。
+**进度决策（2026-10-09）**：同构 rank↔seg 已验证；**异构 TP 双向（TP2→TP4 / TP4→TP2）已验证**（见下节；需容器补丁；实测小 TP 消费者走 `load_async=1`）；**跨机异构 TP2(245)→TP4(217) 已验证且读本机副本经杀源实例法铁证**（[EXPERIMENTS.md](EXPERIMENTS.md) #12）。未做：layerwise、编排层、落盘、copy 并行。
 
 ## 实现现状（同构多 TP / 多 key）
 
@@ -346,7 +346,7 @@ flowchart LR
 
 **上游已修**：[vllm-ascend #15835](https://github.com/vllm-project/vllm-ascend/pull/15835)（fix #15842，2026-09-09 合入 main，merge commit `9f8773ea`；根因 = #11444 重构丢了 #11582 引入的接线）。除两处线程构造补 `worker=self if self.tp_mismatch else None`，还恢复了 `start_load_kv` 同步 load 的 mismatch 分发。**rc1 / rc2 均不含，仅 main 有**。
 
-补丁：`patch_tp_mismatch_worker.py`（两处构造补 `worker=self`，幂等，自动备份）——为 #15835 的**子集**，缺同步 load 分发，这正是「小 TP 消费者必须 `LOAD_ASYNC=1`」的根因；换用上游完整修复后同步路径可用，该要求取消。补丁已在容器 `quay.io/ascend/vllm-ascend:v0.26.0rc1` 实测生效；0.26 rc 镜像仍需本补丁，后续可整体替换为 #15835 版本或 cherry-pick `9f8773ea`。
+补丁：`patch_tp_mismatch_worker.py`（幂等，自动备份）——**#15835 完整版 backport 到 rc1**：两处线程构造补 `worker=self if self.tp_mismatch else None`（同 TP 传 None、不碰普通路径）+ `start_load_kv` 恢复同步 load 的 mismatch 分发；已打过旧子集补丁（仅 `worker=self`）的容器会被自动升级。打上后小 TP 消费者同步 load 亦可走 `_load_kv_tp_mismatch`，**`LOAD_ASYNC=1` 由硬约束降为推荐项**（异步仍是 overlap 更优路径）。注意：本目录全部异构实测在旧子集补丁 + 异步路径下完成（[EXPERIMENTS.md](EXPERIMENTS.md) #5/#6/#8/#12），同步 mismatch 路径按上游修复恢复、未在本测试床单独复测；0.26 rc 镜像必须打本补丁（rc1/rc2 均不含上游修复）。
 
 ### 异构 e2e 实测（2026-10-09，单机 245，A2 RoCE）
 
@@ -378,7 +378,7 @@ flowchart LR
 - B：`External prefix cache hit rate: 95.9%`、零 invalid；TP0/TP1 各 `tp_mismatch get keys=12`（6 块 × 2 sub-key）成功；
 - A(TP4)/B(TP2) 同 prompt 贪心 16 token 输出逐字一致。
 
-**方向差异小结**：eff=4 时，A=TP2 生产者靠补丁后的 sub-key **put**；B=TP4 消费者同步 load 即可；A=TP4 生产者 plain put 即可；B=TP2 消费者**必须** `load_async=1`。即：**小 TP 端需要 sub-key 读写（put 已由补丁修通，get 需异步路径）**；大 TP（=effective_tp）端两条路径都退化为普通行为。（`load_async=1` 约束源于本目录补丁未含上游 #15835 的同步 load 分发修复；换完整补丁后 B=TP2 同步 load 亦可。）
+**方向差异小结**：eff=4 时，A=TP2 生产者靠补丁后的 sub-key **put**；B=TP4 消费者同步 load 即可；A=TP4 生产者 plain put 即可；B=TP2 消费者**必须** `load_async=1`。即：**小 TP 端需要 sub-key 读写（put 已由补丁修通，get 需异步路径）**；大 TP（=effective_tp）端两条路径都退化为普通行为。（B=TP2 实测走异步路径 `load_async=1`；补丁已升级为 #15835 完整版、同步 load 已恢复 mismatch 分发，`load_async=1` 从硬约束降为推荐项，同步路径未单独复测。）
 
 **决策（2026-10-09）**：异构 TP 单机双向（TP2→TP4、TP4→TP2）已验证；**跨机异构 TP2(245)→TP4(217) 已验证**（见上节）。tp_mismatch 与 layerwise/sparse 互斥，生产组合需评估。
 
