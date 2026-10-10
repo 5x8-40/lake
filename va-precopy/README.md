@@ -98,7 +98,7 @@ sequenceDiagram
     A->>M: rank i put 自己的 KV 分片<br/>key@rank:i 落 A seg_i（preferred_segment 钉住）
 
     Note over CP,B: 阶段 2 · 控制面预复制（B2，引擎不参与）
-    CP->>CP: collect：import vllm hash 链 +<br/>vllm-ascend PoolKey 展开全 rank key<br/>【脚手架特有：生产由调度侧给 key】
+    CP->>CP: collect：import vllm hash 链 +<br/>vllm-ascend PoolKey 展开全 rank key<br/>【重算=外部控制面标准做法（同 Dynamo router）；<br/>生产化=逻辑搬进控制面或引擎 KV 事件流】
     CP->>M: batch_is_exist 核对（格式漂移哨兵）
     CP->>M: GET :9003/get_all_segments（seg 名单）
     CP->>B: pidfile+进程树+ss 对号 rank→seg<br/>与名单求交，不符即 fail loud<br/>【脚手架特有：生产由编排层掌握拓扑】
