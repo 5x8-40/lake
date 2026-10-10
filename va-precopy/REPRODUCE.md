@@ -57,7 +57,7 @@ A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`dec
 | TP = effective_tp 的大 TP 端 | plain put（无需 sub-key） | 同步 load 即可 |
 | TP < effective_tp 的小 TP 端 | 需补丁后 sub-key put | sub-key get（`LOAD_ASYNC=1` 异步路径） |
 
-注：小 TP 消费者走异步的原因——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中，见 §3）；异步路径才走 `_load_kv_tp_mismatch`。当前补丁（#15835 完整版 backport）已恢复同步 load 的 mismatch 分发，硬约束解除，`LOAD_ASYNC=1` 降为推荐；本测试床异构实测均走异步，同步 mismatch 未单独复测。
+注：小 TP 消费者走异步的原因——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中，见 §3）；异步路径才走 `_load_kv_tp_mismatch`。当前补丁（#15835 完整版 backport）已恢复同步 load 的 mismatch 分发，硬约束解除，`LOAD_ASYNC=1` 降为推荐；本测试床异构实测均走异步，同步 mismatch 未单独复测。`run_e2e.sh` 反向（TP_A>TP_B）已自动给 B 注入 `LOAD_ASYNC=1`；手动分步（README 快速开始 C）需自行 export。
 
 **配置陷阱（反向方向最易错）**：`infer_tp_mismatch_info` 对 `kv_producer`/`kv_both` 读的是 **`decode_tp_size`** 作为 peer size（`kv_consumer` 才读 `prefill_tp_size`）。反向（A=TP4→B=TP2）时 B 侧必须配 `decode_tp_size=4`（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
 

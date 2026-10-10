@@ -65,6 +65,12 @@ def query_task_until_complete(
         time.sleep(poll_s)
 
 
+def entry_exists(e) -> bool:
+    """batch_is_exist entry truthiness — the single definition used by both
+    keys.py --check-master and precopy.py's prompt-mode check."""
+    return e == 1 or e is True or (isinstance(e, int) and e > 0)
+
+
 def memory_replica_endpoints(store: MooncakeDistributedStore, key: str) -> list[str]:
     """Return transport endpoints of memory replicas for one key."""
     endpoints: list[str] = []

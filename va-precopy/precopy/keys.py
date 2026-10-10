@@ -350,7 +350,7 @@ def _check_master(keys: list[str], args: argparse.Namespace) -> int:
 
         torch.npu.set_device(args.device)
 
-    from common import memory_replica_endpoints, setup_store
+    from common import entry_exists, memory_replica_endpoints, setup_store
 
     local_ip = os.environ.get("LOCAL_IP") or os.environ.get("HCCL_IF_IP") or "127.0.0.1"
     host = args.coord_hostname or f"{local_ip}:13021"
@@ -366,7 +366,7 @@ def _check_master(keys: list[str], args: argparse.Namespace) -> int:
         ex = store.batch_is_exist(keys)
         n_ok = 0
         for k, e in zip(keys, ex):
-            ok = e == 1 or e is True or (isinstance(e, int) and e > 0)
+            ok = entry_exists(e)
             n_ok += bool(ok)
             try:
                 rank = str(parse_head_or_tp_rank(k))

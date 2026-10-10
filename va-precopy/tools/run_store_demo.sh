@@ -41,17 +41,9 @@ port=${MC_MASTER##*:}
 
 if [[ "$SKIP_MASTER" != "1" ]]; then
   if ! port_open "$host" "$port"; then
-    echo "[run] starting master on :$port"
-    # Prefer rpc_port (port is deprecated on recent mooncake_master).
-    if mooncake_master --help 2>&1 | grep -q -- '--rpc_port'; then
-      nohup mooncake_master --rpc_port "$port" \
-        --eviction_high_watermark_ratio 0.9 --rpc_thread_num 8 \
-        >>"$LOGDIR/mooncake_master.log" 2>&1 &
-      echo $! >"$LOGDIR/mooncake_master.pid"
-      sleep 1
-    else
-      MC_PORT=$port bash "$ROOT/cluster/start_master.sh"
-    fi
+    # Single source for master startup (flags + rpc_port detection + pidfile):
+    echo "[run] starting master on :$port (via cluster/start_master.sh)"
+    MC_PORT=$port bash "$ROOT/cluster/start_master.sh"
   else
     echo "[run] master already up at $MC_MASTER"
   fi

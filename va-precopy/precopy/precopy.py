@@ -289,6 +289,7 @@ def main() -> int:
     from common import (
         assert_targets_have_replicas,
         create_copy_and_wait,
+        entry_exists,
         memory_replica_endpoints,
         setup_store,
     )
@@ -308,7 +309,7 @@ def main() -> int:
             # keys must ALL be in the pool (warm covered the full prefix, hash
             # algo matches engine, key format not drifted) or copying is moot.
             ex = store.batch_is_exist(keys)
-            n_ok = sum(1 for e in ex if e == 1 or e is True or (isinstance(e, int) and e > 0))
+            n_ok = sum(1 for e in ex if entry_exists(e))
             print(f"[precopy] exist check: {n_ok}/{len(keys)}")
             if n_ok != len(keys):
                 print(

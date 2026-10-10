@@ -62,7 +62,9 @@ KV_CONFIG=$(cat <<EOF
 EOF
 )
 # Optional hetero TP: peer TP size so both sides address pool at effective_tp=max(local,peer).
-if [[ -n "$PREFILL_TP_SIZE" || -n "$DECODE_TP_SIZE" ]]; then
+# LOAD_ASYNC is honored here too — it must NOT be gated on the hetero vars alone,
+# or a same-TP LOAD_ASYNC=1 would be silently dropped.
+if [[ -n "$PREFILL_TP_SIZE" || -n "$DECODE_TP_SIZE" || -n "${LOAD_ASYNC:-}" ]]; then
   KV_CONFIG=$(KV_CONFIG="$KV_CONFIG" PREFILL_TP_SIZE="$PREFILL_TP_SIZE" DECODE_TP_SIZE="$DECODE_TP_SIZE" python3 - <<'PY'
 import json, os
 cfg = json.loads(os.environ["KV_CONFIG"])

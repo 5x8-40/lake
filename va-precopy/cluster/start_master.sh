@@ -11,6 +11,10 @@ mkdir -p "$LOGDIR"
 MC_PORT=${MC_PORT:-50088}
 MC_BIN=${MC_BIN:-mooncake_master}
 
+# NOTE: precopy/resolve.py depends on the master ADMIN endpoint
+# (GET :9003/get_all_segments) — it is mooncake Master's built-in default
+# (no flag needed here); keep 9003 free on the master host.
+
 if pgrep -f "$MC_BIN.*${MC_PORT}" >/dev/null 2>&1; then
   echo "[master] already running on :$MC_PORT"
   exit 0
