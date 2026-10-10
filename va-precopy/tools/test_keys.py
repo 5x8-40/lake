@@ -21,6 +21,7 @@ if _PRECOPY not in sys.path:
 import keys as km
 from keys import (
     KeySpec,
+    _load_keys_file,
     expand_store_keys,
     group_keys_by_rank,
     parse_head_or_tp_rank,
@@ -135,6 +136,18 @@ def test_upstream_parity() -> None:
     )
 
 
+def test_load_keys_file() -> None:
+    import tempfile
+
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# comment\n\nkey_a\n  key_b  \n")
+        path = f.name
+    try:
+        assert _load_keys_file(path) == ["key_a", "key_b"]
+    finally:
+        os.unlink(path)
+
+
 TESTS = [
     test_pool_key_format,
     test_layer_key_format,
@@ -142,6 +155,7 @@ TESTS = [
     test_expand_tp4_two_blocks,
     test_parse_and_group,
     test_expand_layerwise,
+    test_load_keys_file,
     test_upstream_parity,
 ]
 

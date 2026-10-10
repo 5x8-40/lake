@@ -21,7 +21,9 @@ Offline (vllm_ascend not importable): falls back to the built-in rc1 mirror
 
 CLI input modes (mutually exclusive):
   --model PATH --prefix ...   prompt mode: tokenize + hash chain + expand
-  --chunk-hashes h0,h1,...    offline: expand known hexes only
+  --chunk-hashes h0,h1,...    offline: expand known hexes
+  --keys-file FILE            post-hoc forensics: full PoolKey strings from a
+                              dump file; only meaningful with --check-master
 """
 
 from __future__ import annotations
@@ -339,7 +341,9 @@ def collect_keys(
 
 
 def _check_master(keys: list[str], args: argparse.Namespace) -> int:
-    """batch_is_exist all keys against the pool (drift sentinel)."""
+    """batch_is_exist all keys against the pool (drift sentinel / forensics).
+
+    Prints one line per key: rank / exists / hash tail / replica endpoints."""
     if args.protocol == "ascend":
         import torch
         import torch_npu  # noqa: F401
@@ -360,21 +364,34 @@ def _check_master(keys: list[str], args: argparse.Namespace) -> int:
     )
     try:
         ex = store.batch_is_exist(keys)
-        present = [
-            k
-            for k, e in zip(keys, ex)
-            if e == 1 or e is True or (isinstance(e, int) and e > 0)
-        ]
-        print(f"exists={ex}")
-        print(f"present={len(present)}/{len(keys)}")
-        for k in present[: min(8, len(present))]:
-            print("replicas", k[-40:], memory_replica_endpoints(store, k))
-        if len(present) != len(keys):
+        n_ok = 0
+        for k, e in zip(keys, ex):
+            ok = e == 1 or e is True or (isinstance(e, int) and e > 0)
+            n_ok += bool(ok)
+            try:
+                rank = str(parse_head_or_tp_rank(k))
+            except ValueError:
+                rank = "?"
+            reps = memory_replica_endpoints(store, k) if ok else []
+            print(f"rank={rank} exists={1 if ok else 0} hash=..{k[-12:]} replicas={reps}")
+        print(f"present={n_ok}/{len(keys)}")
+        if n_ok != len(keys):
             print("[keys] ERROR: some keys missing in store", file=sys.stderr)
             return 2
     finally:
         store.close()
     return 0
+
+
+def _load_keys_file(path: str) -> list[str]:
+    """Full PoolKey strings from a dump file (one per line; # comments ok)."""
+    keys: list[str] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                keys.append(line)
+    return keys
 
 
 def main() -> int:
@@ -386,6 +403,11 @@ def main() -> int:
         help="offline mode: comma-separated block hash hex (no 0x prefix)",
     )
     p.add_argument("--model", default="", help="prompt mode: HF model path (tokenizer)")
+    p.add_argument(
+        "--keys-file",
+        default="",
+        help="forensics mode: file with one full PoolKey per line (use with --check-master)",
+    )
     p.add_argument(
         "--prefix",
         default="va-precopy shared prefix for store warmup. ",
@@ -443,12 +465,16 @@ def main() -> int:
     args = p.parse_args()
 
     prompt_mode = bool(args.model)
-    if prompt_mode == bool(args.chunk_hashes):
-        print("ERROR: exactly one of --model (prompt) / --chunk-hashes (offline)", file=sys.stderr)
+    file_mode = bool(args.keys_file)
+    if sum([prompt_mode, bool(args.chunk_hashes), file_mode]) != 1:
+        print(
+            "ERROR: exactly one of --model (prompt) / --chunk-hashes (offline) / --keys-file (forensics)",
+            file=sys.stderr,
+        )
         return 2
     if prompt_mode and not args.model_name:
         args.model_name = os.path.basename(args.model.rstrip("/"))
-    if not args.model_name:
+    if not file_mode and not args.model_name:
         print("ERROR: --model-name required in --chunk-hashes mode", file=sys.stderr)
         return 2
     if args.hash_algo == "builtin" and os.environ.get("PYTHONHASHSEED") is None:
@@ -470,6 +496,11 @@ def main() -> int:
             hash_algo=args.hash_algo,
         )
         print(" ".join(f"{k}={v}" for k, v in info.items()), file=sys.stderr)
+    elif file_mode:
+        keys = _load_keys_file(args.keys_file)
+        if not keys:
+            print(f"ERROR: no keys in {args.keys_file}", file=sys.stderr)
+            return 2
     else:
         keys = expand_store_keys(
             model_name=args.model_name,

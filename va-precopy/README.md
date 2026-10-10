@@ -138,7 +138,7 @@ sequenceDiagram
 
 ## 目录
 
-按调用链归位（2026-10-10 二次重组）：控制面 = `precopy/` 一个 Python 包，三个能力各一模块（keys/resolve/common），编排 = `precopy.py`；`cluster/` 只剩集群生命周期；历史章节中的 `collect_prefix_keys.py`（→`precopy/keys.py`）与 `cluster/resolve_segments.sh`（→`precopy/resolve.py`）按此映射。
+按调用链归位（2026-10-10 二次重组）：控制面 = `precopy/` 一个 Python 包，三个能力各一模块（keys/resolve/common），编排 = `precopy.py`；`cluster/` 只剩集群生命周期；历史章节中的 `collect_prefix_keys.py`（→`precopy/keys.py`）、`cluster/resolve_segments.sh`（→`precopy/resolve.py`）与 `tools/check_exists.py`（→`keys.py --keys-file --check-master`）按此映射。
 
 ```text
 va-precopy/
@@ -154,7 +154,6 @@ va-precopy/
 │   ├── stop_cluster.sh   #   停 worker（可选停 master）
 │   └── env_ascend_a2.sh  #   A2 RoCE 环境（HCCL_INTRA_ROCE_ENABLE 等），供 source
 ├── tools/                # 调试 / 演示 / 测试
-│   ├── check_exists.py   #   batch_is_exist 逐 key 核对 + replica 端点
 │   ├── store_demo.py     #   Store 半程（无 vLLM）
 │   ├── run_store_demo.sh #   跑 store 半程
 │   ├── test_keys.py      #   keys.py 单测 + 容器内 upstream 一致性哨兵
@@ -297,7 +296,7 @@ python3 precopy/precopy.py \
 
 概念见「实现现状 · 三个对象」，这里是操作指针：
 
-- **key 枚举**：`precopy/keys.py --model ... --prefix ...`（prompt 模式）或 `--chunk-hashes`（离线）——hash 链与 PoolKey 格式都 **import 上游权威实现**（见「数据来源与日志边界」）；内置镜像仅离线 fallback。
+- **key 枚举**：`precopy/keys.py --model ... --prefix ...`（prompt 模式）、`--chunk-hashes`（离线）或 `--keys-file`（读留档 key 文件，配 `--check-master` 做事后逐 key 副本取证）——hash 链与 PoolKey 格式都 **import 上游权威实现**（见「数据来源与日志边界」）；内置镜像仅离线 fallback。
 - **seg 解析**：`precopy/resolve.py --role B --tp N` 可单跑（调试）；产品路径由 `precopy.py` 内嵌调用（**不读日志**）：名单 = `GET :9003/get_all_segments`；对号 = `logs/worker_B.pid` → 进程树 → `ss -ltnp` 端口 ∩ 名单；rank 号取进程名 `VLLM::Worker_TP<N>`（TP=1 不需要）。任何一步对不上即 fail loud。跨机：`--ssh 'ssh root@B_IP' --pidfile <B 机路径>`（把 resolve.py 源码 pipe 到 B 机 `python3 -` 执行，不依赖远端路径）。
 - **chunk hash**：`--hash-algo`（默认 sha256）与引擎 `prefix_caching_hash_algo` 一致即可；`PYTHONHASHSEED=0` 只在 algo=builtin 时才需要（legacy 防御）。
 
@@ -317,7 +316,7 @@ python3 precopy/precopy.py \
 - 同构 **TP=2 rank↔seg** 已通过（见上）；TP=4 新路径未重跑。旧 key×N 历史结果仍有效作对照。
 - copy 仍按 key **串行**；未做并行 / 本机扩散。
 - `precopy/resolve.py` 的依赖：master admin `:9003` 在线（`cluster/start_master.sh` 默认开）；`cluster/start_worker.sh` 写的 pidfile（跨机经 `--ssh` 在 B 机读）；TP>1 时 rank 号依赖 vLLM 进程名 `VLLM::Worker_TP<N>`——vLLM 改命名会 **fail loud**（不会静默错配），届时按 `pgrep -af 'VLLM::'` 实际输出更新模块内模式。
-- `precopy.py` 退出期偶发 allocator abort / 挂起：**已修复**（READY 后显式 `store.close()`，与 check_exists / collect / store_demo 对齐；此前 precopy 是唯一不 close 的脚本）。根因 = 客户端退出期 teardown 竞态：GC/atexit 触发的乱序析构与在途收尾操作（copy-task 收尾连接、重连协程）竞争，0.3.11.post1 缺上游 #3943（teardown drain）等修复；旧日志中出现时 READY 已打印即可忽略。
+- `precopy.py` 退出期偶发 allocator abort / 挂起：**已修复**（READY 后显式 `store.close()`，与 keys `--check-master` / store_demo 对齐；此前 precopy 是唯一不 close 的脚本）。根因 = 客户端退出期 teardown 竞态：GC/atexit 触发的乱序析构与在途收尾操作（copy-task 收尾连接、重连协程）竞争，0.3.11.post1 缺上游 #3943（teardown drain）等修复；旧日志中出现时 READY 已打印即可忽略。
 - 源属主客户端（worker-A）必须在线；副本 **无 pin**；与读共享带宽。
 - 生成物已 `.gitignore`；本目录只验证 **非 layerwise** + **本机 DRAM**。
 - **异构 TP（A/B 不同 tp_size）**：AscendStore **原生支持**（`prefill_tp_size`/`decode_tp_size` → tp_mismatch sub-key），但 v0.26.0rc1 put 路径有 bug 需补丁，见下节。
