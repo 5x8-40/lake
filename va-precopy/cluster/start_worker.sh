@@ -9,8 +9,9 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-LOGDIR=${LOGDIR:-$SCRIPT_DIR/logs}
-CONF_DIR=${CONF_DIR:-$SCRIPT_DIR/conf}
+ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+LOGDIR=${LOGDIR:-$ROOT/logs}
+CONF_DIR=${CONF_DIR:-$ROOT/conf}
 mkdir -p "$LOGDIR" "$CONF_DIR"
 
 ROLE=${ROLE:-A}

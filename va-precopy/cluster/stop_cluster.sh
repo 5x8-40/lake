@@ -6,7 +6,8 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-LOGDIR=${LOGDIR:-$SCRIPT_DIR/logs}
+ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+LOGDIR=${LOGDIR:-$ROOT/logs}
 STOP_MASTER=${STOP_MASTER:-0}
 
 _kill_pidfile() {

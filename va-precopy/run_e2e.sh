@@ -54,7 +54,7 @@ fi
 
 if [[ "$ENABLE_ASCEND_A2" == "1" && "$PROTOCOL" == "ascend" && "$DRY_RUN" != "1" ]]; then
   # shellcheck source=env_ascend_a2.sh
-  source "$SCRIPT_DIR/env_ascend_a2.sh"
+  source "$SCRIPT_DIR/cluster/env_ascend_a2.sh"
 fi
 
 WARM_PROMPT=$(PREFIX="$PREFIX" PREFIX_REPEAT="$PREFIX_REPEAT" python3 - <<'PY'
@@ -78,9 +78,9 @@ EOF
 
 step "1. mooncake_master"
 if [[ "$DRY_RUN" == "1" ]]; then
-  echo "DRY_RUN: MC_PORT=$MC_PORT bash $SCRIPT_DIR/start_master.sh"
+  echo "DRY_RUN: MC_PORT=$MC_PORT bash $SCRIPT_DIR/cluster/start_master.sh"
 else
-  MC_PORT=$MC_PORT bash "$SCRIPT_DIR/start_master.sh"
+  MC_PORT=$MC_PORT bash "$SCRIPT_DIR/cluster/start_master.sh"
 fi
 
 step "2. worker-A (source)"
@@ -91,7 +91,7 @@ _start_worker() {
     MOONCAKE_PROTOCOL=$PROTOCOL TP=$tp MAX_MODEL_LEN=$MAX_MODEL_LEN \
     PREFILL_TP_SIZE=$PREFILL_TP_SIZE DECODE_TP_SIZE=$DECODE_TP_SIZE \
     ENABLE_ASCEND_A2=$ENABLE_ASCEND_A2 DRY_RUN=$DRY_RUN \
-    bash "$SCRIPT_DIR/start_worker.sh"
+    bash "$SCRIPT_DIR/cluster/start_worker.sh"
 }
 _start_worker A "$PORT_A" 0 "$DEVICES_A" "$TP_A"
 
@@ -141,7 +141,7 @@ if [[ "$AUTO_PRECOPY" != "1" ]]; then
   exit 0
 fi
 
-export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="$SCRIPT_DIR/precopy:${PYTHONPATH:-}"
 export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
 
 if [[ -z "$TARGET_SEGMENTS" ]]; then
@@ -150,12 +150,12 @@ if [[ -z "$TARGET_SEGMENTS" ]]; then
   [[ -n "$RESOLVE_TARGET_IP" ]] && RESOLVE_ARGS+=(--target-ip "$RESOLVE_TARGET_IP")
   [[ -n "${RESOLVE_SSH:-}" ]] && RESOLVE_ARGS+=(--ssh "$RESOLVE_SSH")
   [[ -n "${RESOLVE_PIDFILE:-}" ]] && RESOLVE_ARGS+=(--pidfile "$RESOLVE_PIDFILE")
-  eval "$(bash "$SCRIPT_DIR/resolve_segments.sh" "${RESOLVE_ARGS[@]}")"
+  eval "$(bash "$SCRIPT_DIR/cluster/resolve_segments.sh" "${RESOLVE_ARGS[@]}")"
   echo "[e2e] auto TARGET_SEGMENTS=$TARGET_SEGMENTS (SEG_A=$SEG_A)"
 fi
 
 # Single-entry precopy: warm prompt → in-process keys → exist check → copy.
-if ! python3 "$SCRIPT_DIR/precopy.py" \
+if ! python3 "$SCRIPT_DIR/precopy/precopy.py" \
   --master "$MC_MASTER" \
   --protocol "$PROTOCOL" \
   --targets "$TARGET_SEGMENTS" \

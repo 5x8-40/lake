@@ -5,7 +5,8 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-LOGDIR=${LOGDIR:-$SCRIPT_DIR/logs}
+ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+LOGDIR=${LOGDIR:-$ROOT/logs}
 mkdir -p "$LOGDIR"
 
 MC_PORT=${MC_PORT:-50088}
@@ -49,7 +50,7 @@ if [[ "$SKIP_MASTER" != "1" ]]; then
       echo $! >"$LOGDIR/mooncake_master.pid"
       sleep 1
     else
-      MC_PORT=$port bash "$SCRIPT_DIR/start_master.sh"
+      MC_PORT=$port bash "$ROOT/cluster/start_master.sh"
     fi
   else
     echo "[run] master already up at $MC_MASTER"
@@ -64,5 +65,5 @@ if [[ "$PROTOCOL" == "ascend" ]]; then
   echo "[run] ascend mode HOST_IP=$HOST_IP devices=$SOURCE_DEVICE/$TARGET_DEVICE/$COORD_DEVICE"
 fi
 
-export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
+export PYTHONPATH="$ROOT/precopy:${PYTHONPATH:-}"
 exec python3 "$SCRIPT_DIR/store_demo.py" --master "$MC_MASTER" --protocol "$PROTOCOL"

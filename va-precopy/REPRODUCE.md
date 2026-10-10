@@ -22,7 +22,7 @@
 
 - 残留 worker 清理：vLLM 进程经 `setproctitle` 后名为 `VLLM::EngineCore/Worker_TP/APIServer`，`ps | grep python` 搜不到；用 `pgrep -f "VLLM::[W]"`（括号防自匹配）+ 显式 kill，再用 `npu-smi info -t usages -i <id>` 确认 HBM 释放（<10%）。旧实例残留在目标端口会让新实例「假 READY」。
 - `precopy.py` 客户端退出偶发 allocator abort（RC=134）或挂起：**已通过显式 `store.close()` 修复**（2026-10-10，根因 = 退出期 teardown 竞态，0.3.11.post1 缺上游 #3943）。旧环境若仍出现：READY 已打印即拷贝完成，可忽略。
-- seg 解析：`resolve_segments.sh` 走 master admin `:9003/get_all_segments` + pidfile/进程树 `ss` 对号，**不读任何日志**（旧版读 master 日志的坑——轮转、旧进程无 mount 行——随之消失）；跨机加 `--ssh 'ssh root@B_IP' --pidfile <B 机克隆路径>/logs/worker_B.pid`。
+- seg 解析：`cluster/resolve_segments.sh` 走 master admin `:9003/get_all_segments` + pidfile/进程树 `ss` 对号，**不读任何日志**（旧版读 master 日志的坑——轮转、旧进程无 mount 行——随之消失）；跨机加 `--ssh 'ssh root@B_IP' --pidfile <B 机克隆路径>/logs/worker_B.pid`。
 - 两机**非共享存储**：各自 clone 本目录并同步。
 - 跨机 ssh 高频连接触发对端限速（认证后断连/KEX 卡死）：控制操作合并成批执行，或改控制台人工执行。
 
@@ -47,15 +47,15 @@ A/B 同 `tp_size`，同机不同卡组。**无需补丁**。
 # 一键（TP=1）：
 bash run_e2e.sh
 # 多 TP 分步（单入口：prompt→key→核对→copy 进程内完成）：
-eval "$(bash resolve_segments.sh --export --role B --tp 2)"
-python3 precopy.py --master 127.0.0.1:50088 --protocol ascend \
+eval "$(bash cluster/resolve_segments.sh --export --role B --tp 2)"
+python3 precopy/precopy.py --master 127.0.0.1:50088 --protocol ascend \
   --targets "$TARGET_SEGMENTS" \
   --model /data/models/Qwen3-VL-8B-w8a8c16 \
   --prefix "va-precopy shared prefix for store warmup. " \
   --prefix-repeat 80 --tp-size 2
 ```
 
-注意：`--targets` 按 rank 序传（rank i 的 key 只 copy 到 `targets[i]`）；rank↔seg 对号由 `resolve_segments.sh` 自动完成（admin API + pidfile/ss 求交，不读日志，对不上即 fail loud）。
+注意：`--targets` 按 rank 序传（rank i 的 key 只 copy 到 `targets[i]`）；rank↔seg 对号由 `cluster/resolve_segments.sh` 自动完成（admin API + pidfile/ss 求交，不读日志，对不上即 fail loud）。
 
 ### ② 同构跨机
 
@@ -88,7 +88,7 @@ precopy 映射：eff rank i → B seg `i // num_sub_keys`。B=TP2（num_sub_keys
 流程与③完全一致，叠加②的跨机配置：master 在源机、B 机容器先打补丁、ssh 操作合并成批。resolve 一步改为 B 机探测：
 
 ```bash
-eval "$(bash resolve_segments.sh --export --role B --tp 4 --master A_IP:50088 \
+eval "$(bash cluster/resolve_segments.sh --export --role B --tp 4 --master A_IP:50088 \
   --ssh 'ssh root@B_IP' --pidfile /root/va-precopy/logs/worker_B.pid)"
 ```
 

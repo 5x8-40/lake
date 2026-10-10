@@ -10,6 +10,14 @@ the fallback). It skips silently outside a vllm-ascend container.
 
 from __future__ import annotations
 
+import os
+import sys
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PRECOPY = os.path.join(os.path.dirname(_HERE), "precopy")
+if _PRECOPY not in sys.path:
+    sys.path.insert(0, _PRECOPY)
+
 import keys as km
 from keys import (
     KeySpec,

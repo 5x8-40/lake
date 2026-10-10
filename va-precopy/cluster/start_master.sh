@@ -4,7 +4,8 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-LOGDIR=${LOGDIR:-$SCRIPT_DIR/logs}
+ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+LOGDIR=${LOGDIR:-$ROOT/logs}
 mkdir -p "$LOGDIR"
 
 MC_PORT=${MC_PORT:-50088}

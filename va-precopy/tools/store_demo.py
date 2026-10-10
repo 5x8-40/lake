@@ -38,8 +38,9 @@ from multiprocessing.queues import Queue as MpQueue
 from multiprocessing.synchronize import Event as MpEvent
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-if _HERE not in sys.path:
-    sys.path.insert(0, _HERE)
+_PRECOPY = os.path.join(os.path.dirname(_HERE), "precopy")
+if _PRECOPY not in sys.path:
+    sys.path.insert(0, _PRECOPY)
 
 from mooncake.store import ReplicateConfig
 

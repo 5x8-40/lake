@@ -23,7 +23,8 @@
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-LOGDIR=${LOGDIR:-$SCRIPT_DIR/logs}
+ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+LOGDIR=${LOGDIR:-$ROOT/logs}
 EXPORT=0
 ROLE=${ROLE:-B}
 TP=${TP:-1}

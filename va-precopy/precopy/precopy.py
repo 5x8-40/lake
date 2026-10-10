@@ -22,7 +22,7 @@ in-process; keys never touch a file unless --dump-keys is given:
       --prefix "shared prefix. " --prefix-repeat 80 --tp-size 2
 
 Debug paths (keys from outside): --keys / --keys-file, or standalone
-collect_prefix_keys.py + test_keys.py.
+collect.py + ../tools/test_keys.py.
 
 Examples:
   # TP=1
@@ -159,7 +159,7 @@ def main() -> int:
         )
         return 2
     if computed:
-        from collect_prefix_keys import collect_keys
+        from collect import collect_keys
 
         keys, info = collect_keys(
             model_path=args.model,
