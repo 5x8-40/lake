@@ -12,17 +12,19 @@ to targets[i] (not the same key broadcast to every seg).
 Finish copy BEFORE the target worker opens a get session for the real
 request. After READY, send traffic to that worker.
 
-Single entry (prompt mode): hand it the warm prompt — key computation
-(import vllm/vllm-ascend), batch_is_exist check, copy and READY all happen
-in-process; keys never touch a file unless --dump-keys is given:
+Single entry (prompt mode): hand it the warm prompt and the target worker —
+key computation (import vllm/vllm-ascend), segment resolution (admin API +
+pidfile/ss), batch_is_exist check, copy and READY all happen in-process;
+keys never touch a file unless --dump-keys is given:
 
   python3 precopy.py --master 127.0.0.1:50088 --protocol ascend \\
-      --targets "B:p0,B:p1" \\
+      --role B --tp-size 2 \\
       --model /data/models/Qwen3-VL-8B-w8a8c16 \\
-      --prefix "shared prefix. " --prefix-repeat 80 --tp-size 2
+      --prefix "shared prefix. " --prefix-repeat 80
 
-Debug paths (keys from outside): --keys / --keys-file, or standalone
-collect.py + ../tools/test_keys.py.
+Debug paths: --targets/--target to skip resolution (segments known);
+--keys / --keys-file to skip key computation; standalone keys.py /
+resolve.py CLIs + ../tools/test_keys.py.
 
 Examples:
   # TP=1
@@ -71,7 +73,7 @@ def _load_keys(args: argparse.Namespace) -> list[str]:
     return out
 
 
-def _parse_targets(args: argparse.Namespace) -> list[str]:
+def _parse_targets(args: argparse.Namespace, master: str) -> list[str]:
     if args.targets:
         targets = [t.strip() for t in args.targets.split(",") if t.strip()]
         if not targets:
@@ -79,7 +81,29 @@ def _parse_targets(args: argparse.Namespace) -> list[str]:
         return targets
     if args.target:
         return [args.target]
-    raise SystemExit("ERROR: provide --target (TP=1) or --targets (homogeneous TP)")
+    # No explicit segments: resolve in-process (admin API + pidfile/ss probe).
+    from resolve import ResolveError, resolve_segments
+
+    try:
+        targets, info = resolve_segments(
+            role=args.role,
+            tp=args.tp_size,
+            target_ip=args.target_ip,
+            master=master,
+            admin=args.admin,
+            admin_port=args.admin_port,
+            pidfile=args.pidfile,
+            ssh=args.ssh,
+        )
+    except ResolveError as e:
+        raise SystemExit(f"ERROR: resolve failed: {e}")
+    print(
+        f"[precopy] resolve: admin={info['admin']} probe={info['probe']} "
+        f"pidfile={info['pidfile']}"
+    )
+    for rank, seg in info["rank_seg"].items():
+        print(f"[precopy]   rank {rank} -> {seg}")
+    return targets
 
 
 def main() -> int:
@@ -97,13 +121,25 @@ def main() -> int:
     p.add_argument(
         "--target",
         default="",
-        help="single target segment (TP=1); all keys copy here",
+        help="single target segment (TP=1); all keys copy here; skips resolution",
     )
     p.add_argument(
         "--targets",
         default=os.environ.get("TARGET_SEGMENTS", ""),
-        help="comma-separated B local_seg list; key rank i → targets[i]",
+        help="comma-separated B local_seg list; key rank i → targets[i]; skips resolution",
     )
+    # Segment resolution (in-process; used when neither --target/--targets given)
+    p.add_argument("--role", default=os.environ.get("ROLE", "B"),
+                   help="target worker role for default pidfile logs/worker_<role>.pid")
+    p.add_argument("--target-ip", default=os.environ.get("RESOLVE_TARGET_IP", ""),
+                   help="restrict segments to this ip (multi-worker clusters)")
+    p.add_argument("--ssh", default=os.environ.get("RESOLVE_SSH", ""),
+                   help="probe target host over ssh, e.g. 'ssh root@B_IP'")
+    p.add_argument("--pidfile", default=os.environ.get("RESOLVE_PIDFILE", ""),
+                   help="worker pidfile path (on the target host when --ssh)")
+    p.add_argument("--admin", default=os.environ.get("MC_ADMIN", ""),
+                   help="master admin base URL (default: http://<master-host>:<admin-port>)")
+    p.add_argument("--admin-port", type=int, default=int(os.environ.get("MC_ADMIN_PORT", "9003")))
     p.add_argument("--keys", default="", help="comma-separated object keys (debug)")
     p.add_argument("--keys-file", default="", help="file with one key per line (debug)")
     # Prompt mode: compute keys in-process from the warm prompt (product path).
@@ -116,7 +152,7 @@ def main() -> int:
                    help="PoolKey model_name (default: basename of --model)")
     p.add_argument("--block-size", type=int, default=int(os.environ.get("BLOCK_SIZE", "128")))
     p.add_argument("--tp-size", type=int, default=int(os.environ.get("TP_SIZE", os.environ.get("TP", "1"))),
-                   help="target (B) TP size for rank expansion")
+                   help="target (B) TP size: drives key rank expansion AND segment resolution")
     p.add_argument("--peer-tp-size", type=int,
                    default=int(os.environ.get("PEER_TP_SIZE", "0")) or None,
                    help="source (A) TP size for tp_mismatch; effective_tp=max(local,peer)")
@@ -159,7 +195,7 @@ def main() -> int:
         )
         return 2
     if computed:
-        from collect import collect_keys
+        from keys import collect_keys
 
         keys, info = collect_keys(
             model_path=args.model,
@@ -185,7 +221,7 @@ def main() -> int:
         )
         return 2
 
-    targets = _parse_targets(args)
+    targets = _parse_targets(args, master)
     by_rank = group_keys_by_rank(keys)
     max_rank = max(by_rank) if by_rank else -1
     if len(targets) == 1 and max_rank <= 0:
@@ -250,7 +286,7 @@ def main() -> int:
 
     try:
         if computed and not args.skip_exist_check:
-            # Same batch_is_exist semantics as collect --check-master: computed
+            # Same batch_is_exist semantics as keys.py --check-master: computed
             # keys must ALL be in the pool (warm covered the full prefix, hash
             # algo matches engine, key format not drifted) or copying is moot.
             ex = store.batch_is_exist(keys)

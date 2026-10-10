@@ -1,23 +1,34 @@
 #!/usr/bin/env python3
-"""Build Mooncake object keys matching vllm-ascend AscendStoreConnector.
+"""Key computation for va-precopy: prompt -> block hashes -> PoolKey strings.
 
-Key string format is OWNED by vllm-ascend ``PoolKey.to_string()``
-(rc1: ``.../ascend_store/config_data.py``; main: ``.../ascend_store/metadata.py``).
+Everything about the key format or hash algorithm is IMPORTED from upstream,
+nothing reimplemented:
+
+- block hash chain: vllm ``kv_cache_utils.hash_block_tokens`` +
+  ``get_hash_fn_by_name`` (``_hash_prompt``; container-only)
+- PoolKey string format: vllm-ascend ``PoolKey.to_string()``
+  (rc1: ``.../ascend_store/config_data.py``; main: ``.../ascend_store/metadata.py``)
+
 Inside a vllm-ascend container this module IMPORTS the upstream classes and
 constructs keys **by field name** (``dataclasses.fields``), so upstream format
 changes — e.g. rc1 ``KeyMetadata.pcp_rank`` / ``@pcp:`` in to_string, both
 removed on main — are followed automatically instead of silently drifting.
 
 Offline (vllm_ascend not importable): falls back to the built-in rc1 mirror
-``KeySpec`` with a loud stderr warning. Drift sentinel in-container:
-``collect_prefix_keys.py --check-master`` (batch_is_exist must be 100%),
-plus ``test_keys.py::test_upstream_parity``.
+``KeySpec`` with a loud stderr warning. Drift sentinels in-container:
+``--check-master`` (batch_is_exist must be 100%) plus
+``tools/test_keys.py::test_upstream_parity``.
+
+CLI input modes (mutually exclusive):
+  --model PATH --prefix ...   prompt mode: tokenize + hash chain + expand
+  --chunk-hashes h0,h1,...    offline: expand known hexes only
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 from collections import defaultdict
@@ -244,15 +255,162 @@ def expand_store_keys(
     return keys
 
 
+# ---------------------------------------------------------------------------
+# Prompt mode: hash chain imported from vllm (container-only)
+# ---------------------------------------------------------------------------
+
+
+def _hash_prompt(
+    model_path: str, prefix: str, block_size: int, hash_algo: str
+) -> tuple[list[str], int]:
+    from transformers import AutoTokenizer
+    from vllm.utils.hashing import get_hash_fn_by_name
+    from vllm.v1.core import kv_cache_utils as ku
+
+    try:  # v0.26 rc1/rc2 layout
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+            block_hash_to_str,
+        )
+    except ImportError:  # main layout (config_data.py renamed metadata.py)
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+            block_hash_to_str,
+        )
+
+    hash_fn = get_hash_fn_by_name(hash_algo)
+    ku.init_none_hash(hash_fn)
+
+    tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    ids = tok.encode(prefix)
+    hashes: list = []
+    parent = None
+    n_full = (len(ids) // block_size) * block_size
+    for i in range(0, n_full, block_size):
+        chunk = ids[i : i + block_size]
+        h = ku.hash_block_tokens(hash_fn, parent, chunk, None)
+        hashes.append(h)
+        parent = h
+    return [block_hash_to_str(h) for h in hashes], len(ids)
+
+
+def collect_keys(
+    *,
+    model_path: str,
+    prefix: str,
+    model_name: str = "",
+    block_size: int = 128,
+    tp_size: int = 1,
+    peer_tp_size: int | None = None,
+    put_step: int = 1,
+    hash_algo: str = "sha256",
+) -> tuple[list[str], dict]:
+    """prompt -> expanded PoolKey list (in-process API; precopy.py calls this).
+
+    Returns (keys, info). Hash chain and PoolKey format are imported from
+    vllm / vllm-ascend — nothing reimplemented. Container-only (needs
+    transformers + vllm + vllm_ascend).
+    """
+    model_name = model_name or os.path.basename(model_path.rstrip("/"))
+    hexes, n_tokens = _hash_prompt(model_path, prefix, block_size, hash_algo)
+    effective_tp = tp_size
+    if peer_tp_size and peer_tp_size != tp_size:
+        effective_tp = max(tp_size, peer_tp_size)
+    keys = expand_store_keys(
+        model_name=model_name,
+        chunk_hashes=hexes,
+        tp_size=effective_tp,
+        put_step=put_step,
+    )
+    info = {
+        "n_tokens": n_tokens,
+        "n_full_blocks": len(hexes),
+        "tp_size": tp_size,
+        "peer_tp_size": peer_tp_size,
+        "effective_tp": effective_tp,
+        "put_step": put_step,
+        "model_name": model_name,
+        "hash_algo": hash_algo,
+        "key_format": (
+            "upstream(vllm_ascend.PoolKey)"
+            if upstream_key_classes() is not None
+            else "builtin-mirror(OFFLINE, drift risk!)"
+        ),
+    }
+    return keys, info
+
+
+def _check_master(keys: list[str], args: argparse.Namespace) -> int:
+    """batch_is_exist all keys against the pool (drift sentinel)."""
+    if args.protocol == "ascend":
+        import torch
+        import torch_npu  # noqa: F401
+
+        torch.npu.set_device(args.device)
+
+    from common import memory_replica_endpoints, setup_store
+
+    local_ip = os.environ.get("LOCAL_IP") or os.environ.get("HCCL_IF_IP") or "127.0.0.1"
+    host = args.coord_hostname or f"{local_ip}:13021"
+    store = setup_store(
+        local_hostname=host,
+        master_server_address=args.check_master,
+        global_segment_size=0,
+        local_buffer_size=32 * 1024 * 1024,
+        protocol=args.protocol,
+        device_name="",
+    )
+    try:
+        ex = store.batch_is_exist(keys)
+        present = [
+            k
+            for k, e in zip(keys, ex)
+            if e == 1 or e is True or (isinstance(e, int) and e > 0)
+        ]
+        print(f"exists={ex}")
+        print(f"present={len(present)}/{len(keys)}")
+        for k in present[: min(8, len(present))]:
+            print("replicas", k[-40:], memory_replica_endpoints(store, k))
+        if len(present) != len(keys):
+            print("[keys] ERROR: some keys missing in store", file=sys.stderr)
+            return 2
+    finally:
+        store.close()
+    return 0
+
+
 def main() -> int:
-    p = argparse.ArgumentParser(description="Emit AscendStore Mooncake keys")
-    p.add_argument("--model-name", required=True, help="served model name in keys")
+    p = argparse.ArgumentParser(description="Compute AscendStore Mooncake keys")
+    # Input mode (exactly one required)
     p.add_argument(
         "--chunk-hashes",
-        required=True,
-        help="comma-separated block hash hex (no 0x prefix)",
+        default="",
+        help="offline mode: comma-separated block hash hex (no 0x prefix)",
     )
-    p.add_argument("--tp-size", type=int, default=1)
+    p.add_argument("--model", default="", help="prompt mode: HF model path (tokenizer)")
+    p.add_argument(
+        "--prefix",
+        default="va-precopy shared prefix for store warmup. ",
+        help="prompt mode: base prefix string before repeat",
+    )
+    p.add_argument("--prefix-repeat", type=int, default=80)
+    p.add_argument("--block-size", type=int, default=128)
+    p.add_argument(
+        "--hash-algo",
+        default=os.environ.get("PREFIX_CACHING_HASH_ALGO", "sha256"),
+        help="must match engine prefix_caching_hash_algo (vllm default: sha256)",
+    )
+    # Key expansion
+    p.add_argument(
+        "--model-name",
+        default="",
+        help="PoolKey model_name (default: basename of --model)",
+    )
+    p.add_argument("--tp-size", type=int, default=int(os.environ.get("TP", "1")))
+    p.add_argument(
+        "--peer-tp-size",
+        type=int,
+        default=int(os.environ.get("PEER_TP_SIZE", "0")) or None,
+        help="peer TP size for tp_mismatch; effective_tp = max(local, peer)",
+    )
     p.add_argument("--put-step", type=int, default=1)
     p.add_argument("--pcp-size", type=int, default=1)
     p.add_argument("--dcp-size", type=int, default=1)
@@ -267,25 +425,71 @@ def main() -> int:
         default=True,
         help="import vllm-ascend PoolKey (default; --no-prefer-upstream forces mirror)",
     )
+    # Output / verification
     p.add_argument("--out", default="", help="write keys one per line; default stdout")
     p.add_argument("--json", action="store_true", help="print JSON array")
-    args = p.parse_args()
-    args.chunk_hashes = [h.strip() for h in args.chunk_hashes.split(",") if h.strip()]
-
-    keys = expand_store_keys(
-        model_name=args.model_name,
-        chunk_hashes=args.chunk_hashes,
-        tp_size=args.tp_size,
-        put_step=args.put_step,
-        pcp_size=args.pcp_size,
-        dcp_size=args.dcp_size,
-        pp_size=args.pp_size,
-        include_layers=args.include_layers,
-        num_layers=args.num_layers,
-        kv_cache_group_id=args.group_id,
-        cache_family=args.cache_family,
-        prefer_upstream=args.prefer_upstream,
+    p.add_argument(
+        "--check-master",
+        default="",
+        help="if set, batch_is_exist all keys against this mooncake_master",
     )
+    p.add_argument("--protocol", default=os.environ.get("MOONCAKE_PROTOCOL", "ascend"))
+    p.add_argument(
+        "--coord-hostname",
+        default="",
+        help="local_hostname for check client (default: LOCAL_IP:13021)",
+    )
+    p.add_argument("--device", type=int, default=0, help="NPU for ascend setup_store")
+    args = p.parse_args()
+
+    prompt_mode = bool(args.model)
+    if prompt_mode == bool(args.chunk_hashes):
+        print("ERROR: exactly one of --model (prompt) / --chunk-hashes (offline)", file=sys.stderr)
+        return 2
+    if prompt_mode and not args.model_name:
+        args.model_name = os.path.basename(args.model.rstrip("/"))
+    if not args.model_name:
+        print("ERROR: --model-name required in --chunk-hashes mode", file=sys.stderr)
+        return 2
+    if args.hash_algo == "builtin" and os.environ.get("PYTHONHASHSEED") is None:
+        print(
+            "[keys] WARN: hash-algo=builtin but PYTHONHASHSEED unset; "
+            "engine used PYTHONHASHSEED=0 — set the same or hashes will miss",
+            file=sys.stderr,
+        )
+
+    if prompt_mode:
+        keys, info = collect_keys(
+            model_path=args.model,
+            model_name=args.model_name,
+            prefix=args.prefix * args.prefix_repeat,
+            block_size=args.block_size,
+            tp_size=args.tp_size,
+            peer_tp_size=args.peer_tp_size,
+            put_step=args.put_step,
+            hash_algo=args.hash_algo,
+        )
+        print(" ".join(f"{k}={v}" for k, v in info.items()), file=sys.stderr)
+    else:
+        keys = expand_store_keys(
+            model_name=args.model_name,
+            chunk_hashes=[h.strip() for h in args.chunk_hashes.split(",") if h.strip()],
+            tp_size=args.tp_size,
+            put_step=args.put_step,
+            pcp_size=args.pcp_size,
+            dcp_size=args.dcp_size,
+            pp_size=args.pp_size,
+            include_layers=args.include_layers,
+            num_layers=args.num_layers,
+            kv_cache_group_id=args.group_id,
+            cache_family=args.cache_family,
+            prefer_upstream=args.prefer_upstream,
+        )
+
+    by_rank = group_keys_by_rank(keys)
+    print(f"keys={len(keys)} ranks={sorted(by_rank)}", file=sys.stderr)
+    for r, rkeys in by_rank.items():
+        print(f"  rank {r}: {len(rkeys)} keys", file=sys.stderr)
 
     if args.json:
         text = json.dumps(keys, ensure_ascii=False, indent=2)
@@ -297,6 +501,9 @@ def main() -> int:
         print(f"wrote {len(keys)} keys -> {args.out}", file=sys.stderr)
     else:
         sys.stdout.write(text)
+
+    if args.check_master:
+        return _check_master(keys, args)
     return 0
 
 

@@ -12,7 +12,7 @@
 | mooncake wheel | `mooncake_transfer_engine_npu-0.3.11.post1` | **勿升级 0.3.13.post1**：mount segment 后 EngineCore 挂起 15+ 分钟（疑与旧 master 兼容性），实测失败已回退 |
 | master | 245 宿主机 `mooncake_master 0.0.0.0:50088` | 跨机时 B 侧配 `MC_MASTER=A_IP:50088`、`LOCAL_IP=B_IP`、`HCCL_IF_IP=B_IP` |
 | A2 RoCE | `HCCL_INTRA_ROCE_ENABLE=1` + `env_ascend_a2.sh` 全套 | **缺则跨卡 copy 直接失败（`HcclBatchPut=4`）**。业务网卡 `NIC_NAME=enp67s0f5`（两台同名） |
-| hash 对齐 | collect `--hash-algo sha256`（默认） | 与引擎 `prefix_caching_hash_algo` 一致即可；`PYTHONHASHSEED=0` 仅 algo=builtin 时需要（legacy 防御） |
+| hash 对齐 | precopy/keys `--hash-algo sha256`（默认） | 与引擎 `prefix_caching_hash_algo` 一致即可；`PYTHONHASHSEED=0` 仅 algo=builtin 时需要（legacy 防御） |
 | 同机多 worker | `preferred_segment: true` | 否则写路径可能把 KV 分到同机另一 worker 的 segment，预复制场景退化 |
 | 取证日志 | `VLLM_LOGGING_LEVEL=DEBUG` | 非 DEBUG 无分 rank `MooncakeBackend.get enter keys=` 证据 |
 
@@ -22,7 +22,7 @@
 
 - 残留 worker 清理：vLLM 进程经 `setproctitle` 后名为 `VLLM::EngineCore/Worker_TP/APIServer`，`ps | grep python` 搜不到；用 `pgrep -f "VLLM::[W]"`（括号防自匹配）+ 显式 kill，再用 `npu-smi info -t usages -i <id>` 确认 HBM 释放（<10%）。旧实例残留在目标端口会让新实例「假 READY」。
 - `precopy.py` 客户端退出偶发 allocator abort（RC=134）或挂起：**已通过显式 `store.close()` 修复**（2026-10-10，根因 = 退出期 teardown 竞态，0.3.11.post1 缺上游 #3943）。旧环境若仍出现：READY 已打印即拷贝完成，可忽略。
-- seg 解析：`cluster/resolve_segments.sh` 走 master admin `:9003/get_all_segments` + pidfile/进程树 `ss` 对号，**不读任何日志**（旧版读 master 日志的坑——轮转、旧进程无 mount 行——随之消失）；跨机加 `--ssh 'ssh root@B_IP' --pidfile <B 机克隆路径>/logs/worker_B.pid`。
+- seg 解析：`precopy/resolve.py`（`precopy.py` 缺省内嵌调用）走 master admin `:9003/get_all_segments` + pidfile/进程树 `ss` 对号，**不读任何日志**（旧版读 master 日志的坑——轮转、旧进程无 mount 行——随之消失）；跨机加 `--ssh 'ssh root@B_IP' --pidfile <B 机克隆路径>/logs/worker_B.pid`。
 - 两机**非共享存储**：各自 clone 本目录并同步。
 - 跨机 ssh 高频连接触发对端限速（认证后断连/KEX 卡死）：控制操作合并成批执行，或改控制台人工执行。
 
@@ -46,16 +46,15 @@ A/B 同 `tp_size`，同机不同卡组。**无需补丁**。
 ```bash
 # 一键（TP=1）：
 bash run_e2e.sh
-# 多 TP 分步（单入口：prompt→key→核对→copy 进程内完成）：
-eval "$(bash cluster/resolve_segments.sh --export --role B --tp 2)"
+# 多 TP 分步（单入口：resolve seg→算 key→核对→copy 进程内完成）：
 python3 precopy/precopy.py --master 127.0.0.1:50088 --protocol ascend \
-  --targets "$TARGET_SEGMENTS" \
+  --role B --tp-size 2 \
   --model /data/models/Qwen3-VL-8B-w8a8c16 \
   --prefix "va-precopy shared prefix for store warmup. " \
-  --prefix-repeat 80 --tp-size 2
+  --prefix-repeat 80
 ```
 
-注意：`--targets` 按 rank 序传（rank i 的 key 只 copy 到 `targets[i]`）；rank↔seg 对号由 `cluster/resolve_segments.sh` 自动完成（admin API + pidfile/ss 求交，不读日志，对不上即 fail loud）。
+注意：rank↔seg 对号由 precopy 内嵌的 `precopy/resolve.py` 完成（admin API + pidfile/ss 求交，不读日志，对不上即 fail loud）；已知拓扑时显式 `--targets seg0,seg1,...`（按 rank 序）跳过解析。
 
 ### ② 同构跨机
 
@@ -79,17 +78,19 @@ A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`dec
 
 **配置陷阱（反向方向最易错）**：`infer_tp_mismatch_info` 对 `kv_producer`/`kv_both` 读的是 **`decode_tp_size`** 作为 peer size（`kv_consumer` 才读 `prefill_tp_size`）。反向（A=TP4→B=TP2）时 B 侧必须配 `decode_tp_size=4`（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
 
-precopy 映射：eff rank i → B seg `i // num_sub_keys`。B=TP2（num_sub_keys=2）时传重复列表 `seg0,seg0,seg1,seg1`；B=TP4（=eff）时平铺 `seg0,seg1,seg2,seg3`。collect 用 `--tp-size <eff> --peer-tp-size <小 TP>`（24 keys = 6 满块 × 4 eff rank）。
+precopy 映射：eff rank i → B seg `i // num_sub_keys`。B=TP2（num_sub_keys=2）时传重复列表 `seg0,seg0,seg1,seg1`；B=TP4（=eff）时平铺 `seg0,seg1,seg2,seg3`。key 计算用 `--tp-size <eff> --peer-tp-size <小 TP>`（24 keys = 6 满块 × 4 eff rank）。
 
 限制：tp_mismatch 不支持 MLA、layerwise、sparse、hybrid（**Mamba/线性注意力结构被代码 gate 显式排除，异构不支持**；Mamba 同构可用）。
 
 ### ④ 异构跨机
 
-流程与③完全一致，叠加②的跨机配置：master 在源机、B 机容器先打补丁、ssh 操作合并成批。resolve 一步改为 B 机探测：
+流程与③完全一致，叠加②的跨机配置：master 在源机、B 机容器先打补丁、ssh 操作合并成批。precopy 加 ssh 探测参数即可（B 机探测，无需先 eval）：
 
 ```bash
-eval "$(bash cluster/resolve_segments.sh --export --role B --tp 4 --master A_IP:50088 \
-  --ssh 'ssh root@B_IP' --pidfile /root/va-precopy/logs/worker_B.pid)"
+python3 precopy/precopy.py --master A_IP:50088 --protocol ascend \
+  --role B --tp-size 4 \
+  --ssh 'ssh root@B_IP' --pidfile /root/va-precopy/logs/worker_B.pid \
+  --model ... --prefix ... --prefix-repeat 80
 ```
 
 已验证配置：245(A=TP2，卡0,1，:8001) → 217(B=TP4，卡0-3，:8002)，三轮 precopy 各 24/24 `replica_copy_success`（A 侧 ~1 key/s），副本对号落 217 四个 seg（每 key 双副本：源 seg + 目标 seg，`check_exists` 逐 key 取证）。

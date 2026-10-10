@@ -4,9 +4,10 @@
 #   DRY_RUN=1 bash run_e2e.sh
 #   LOCAL_IP=... NIC_NAME=... MODEL=... bash run_e2e.sh
 #
-# Auto path (after workers ready): warm → resolve_segments → precopy → hit B.
-# precopy prompt mode computes keys in-process (import vllm/vllm-ascend), checks
-# batch_is_exist, then copies: rank i keys → B segs[i]. No intermediate key file.
+# Auto path (after workers ready): warm → precopy → hit B.
+# precopy.py is the single control-plane entry: resolves B's rank→seg in-process
+# (master admin API + pidfile/ss, no log parsing), computes keys (import
+# vllm/vllm-ascend), checks batch_is_exist, then copies: rank i keys → B segs[i].
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -26,7 +27,6 @@ DEVICES_A=${DEVICES_A:-0}
 DEVICES_B=${DEVICES_B:-1}
 TP=${TP:-1}
 MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
-TARGET_SEGMENT=${TARGET_SEGMENT:-}
 TARGET_SEGMENTS=${TARGET_SEGMENTS:-}
 RESOLVE_TARGET_IP=${RESOLVE_TARGET_IP:-${LOCAL_IP:-}}
 KEYS_FILE=${KEYS_FILE:-$SCRIPT_DIR/prefix_keys.txt}
@@ -71,9 +71,9 @@ cat <<EOF
   protocol:   $PROTOCOL  ENABLE_ASCEND_A2=$ENABLE_ASCEND_A2
   model:      $MODEL (served=$SERVED_NAME pool_model_name=$MODEL_NAME)
   prefix:     len=${#WARM_PROMPT} (base*${PREFIX_REPEAT})
-  precopy:    rank i keys → TARGET_SEGMENTS[i] (homogeneous TP)
+  precopy:    rank i keys → B segs[i] (segments resolved in-process unless given)
   AUTO_PRECOPY=$AUTO_PRECOPY KEYS_FILE=$KEYS_FILE
-  TARGET_SEGMENTS=${TARGET_SEGMENTS:-<auto>} TARGET_SEGMENT=${TARGET_SEGMENT:-<auto>}
+  TARGET_SEGMENTS=${TARGET_SEGMENTS:-<auto>}
 EOF
 
 step "1. mooncake_master"
@@ -130,47 +130,47 @@ PY
   echo
 fi
 
-step "5. resolve target segments + precopy (compute keys → check → copy)"
+step "5. precopy (resolve segs → compute keys → check → copy, all in-process)"
 if [[ "$DRY_RUN" == "1" ]]; then
-  echo "DRY_RUN: resolve_segments.sh + precopy.py (prompt mode: keys computed in-process)"
+  echo "DRY_RUN: precopy.py prompt mode (segments + keys resolved in-process)"
   exit 0
 fi
 
 if [[ "$AUTO_PRECOPY" != "1" ]]; then
-  echo "AUTO_PRECOPY=0 — skip precopy. Set TARGET_SEGMENTS and run precopy.py manually (--prefix or --keys-file)."
+  echo "AUTO_PRECOPY=0 — skip precopy. Run precopy.py manually (--role B, or --targets to skip resolution)."
   exit 0
 fi
 
 export PYTHONPATH="$SCRIPT_DIR/precopy:${PYTHONPATH:-}"
 export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
 
-if [[ -z "$TARGET_SEGMENTS" ]]; then
-  # resolve_segments.sh: master admin API + pidfile/ss cross-check (no log parsing).
-  RESOLVE_ARGS=(--export --role B --tp "$TP_B")
-  [[ -n "$RESOLVE_TARGET_IP" ]] && RESOLVE_ARGS+=(--target-ip "$RESOLVE_TARGET_IP")
-  [[ -n "${RESOLVE_SSH:-}" ]] && RESOLVE_ARGS+=(--ssh "$RESOLVE_SSH")
-  [[ -n "${RESOLVE_PIDFILE:-}" ]] && RESOLVE_ARGS+=(--pidfile "$RESOLVE_PIDFILE")
-  eval "$(bash "$SCRIPT_DIR/cluster/resolve_segments.sh" "${RESOLVE_ARGS[@]}")"
-  echo "[e2e] auto TARGET_SEGMENTS=$TARGET_SEGMENTS (SEG_A=$SEG_A)"
+# Single-entry precopy: warm prompt → in-process seg resolution + keys → check → copy.
+PRECOPY_ARGS=(
+  --master "$MC_MASTER"
+  --protocol "$PROTOCOL"
+  --model "$MODEL"
+  --model-name "$MODEL_NAME"
+  --prefix "$PREFIX"
+  --prefix-repeat "$PREFIX_REPEAT"
+  --block-size "$BLOCK_SIZE"
+  --tp-size "$TP_B"
+  --peer-tp-size "$TP_A"
+  --put-step "$PUT_STEP"
+  --device "${DEVICES_A%%,*}"
+  --dump-keys "$KEYS_FILE"
+  --dry-show-before
+)
+if [[ -n "$TARGET_SEGMENTS" ]]; then
+  PRECOPY_ARGS+=(--targets "$TARGET_SEGMENTS")
+else
+  # In-process resolution: admin API + pidfile/ss cross-check (no log parsing).
+  PRECOPY_ARGS+=(--role B)
+  [[ -n "$RESOLVE_TARGET_IP" ]] && PRECOPY_ARGS+=(--target-ip "$RESOLVE_TARGET_IP")
+  [[ -n "${RESOLVE_SSH:-}" ]] && PRECOPY_ARGS+=(--ssh "$RESOLVE_SSH")
+  [[ -n "${RESOLVE_PIDFILE:-}" ]] && PRECOPY_ARGS+=(--pidfile "$RESOLVE_PIDFILE")
 fi
-
-# Single-entry precopy: warm prompt → in-process keys → exist check → copy.
-if ! python3 "$SCRIPT_DIR/precopy/precopy.py" \
-  --master "$MC_MASTER" \
-  --protocol "$PROTOCOL" \
-  --targets "$TARGET_SEGMENTS" \
-  --model "$MODEL" \
-  --model-name "$MODEL_NAME" \
-  --prefix "$PREFIX" \
-  --prefix-repeat "$PREFIX_REPEAT" \
-  --block-size "$BLOCK_SIZE" \
-  --tp-size "$TP_B" \
-  --peer-tp-size "$TP_A" \
-  --put-step "$PUT_STEP" \
-  --device "${DEVICES_A%%,*}" \
-  --dump-keys "$KEYS_FILE" \
-  --dry-show-before; then
-  echo "[e2e] ERROR: precopy failed (keys missing = warm 未覆盖, or hash/key drift)." >&2
+if ! python3 "$SCRIPT_DIR/precopy/precopy.py" "${PRECOPY_ARGS[@]}"; then
+  echo "[e2e] ERROR: precopy failed (keys missing = warm 未覆盖, or hash/key drift, or seg 解析失败)." >&2
   echo "[e2e] HINT: heterogeneous TP needs patch_tp_mismatch_worker.patch applied in the container (upstream tp_mismatch put is dead code otherwise)." >&2
   exit 1
 fi
