@@ -18,15 +18,7 @@
 
 **已知上游 bug（异构 TP 场景必打补丁）**：v0.26.0rc1 的 tp_mismatch put/get 分支因线程构造漏传 `worker=self` 而是**死代码**（根因与机制见 [README.md](README.md)「怎么运作 · 异构 TP」）。**rc1 / rc2 均不含上游修复**（main 已修，[#15835](https://github.com/vllm-project/vllm-ascend/pull/15835)），0.26 rc 镜像必打本补丁（#15835 完整版 rc1 backport）；同构场景无需补丁。容器内：`cd /vllm-workspace/vllm-ascend && git apply --check patch_tp_mismatch_worker.patch && git apply -v patch_tp_mismatch_worker.patch`（或 `patch -p1`；`git apply -R --check` 探测是否已打）。若容器打过旧 `.py` 子集补丁，先恢复其 `.bak.<时间戳>` 备份（或重建容器）再打，否则上下文不匹配。
 
-**操作要点**：
-
-- **残留 worker 清理**
-  - vLLM 进程 `setproctitle` 后名为 `VLLM::EngineCore/Worker_TP/APIServer`，`ps | grep python` 搜不到；旧实例残留端口/显存会让新实例「假 READY」。
-  - 用 `pgrep -f "VLLM::[W]"`（括号防自匹配）+ 显式 kill，再 `npu-smi info -t usages -i <id>` 确认 HBM 释放（<10%）。
-- **环境**
-  - 两机**非共享存储**：各自 clone 本目录并同步。
-  - 跨机 ssh 高频连接触发对端限速（认证后断连/KEX 卡死）：控制操作合并成批，或改控制台人工执行。
-- **已知修复**：`precopy.py` 退出偶发 allocator abort 已通过显式 `store.close()` 修复（2026-10-10）；旧环境若仍出现，READY 已打印即拷贝完成，可忽略。
+**操作陷阱**：残留实例假 READY 与清理、跨机 SSH 限速、两机非共享存储等**现行坑**见 [README.md](README.md)「操作注意事项」；判定环节的陷阱（假命中、全新 prompt、TTL、netdev）见 §3；已修复问题（退出 abort 等）见 [EXPERIMENTS.md](EXPERIMENTS.md)「勘误与演进」。
 
 ## 1. 四类场景总览
 
@@ -43,20 +35,9 @@
 
 ### ① 同构同机
 
-A/B 同 `tp_size`，同机不同卡组。**无需补丁**。
+A/B 同 `tp_size`，同机不同卡组。**无需补丁**。流程见 [README.md](README.md)「快速开始 B/C」（TP=1 一键 `run_e2e.sh`；多 TP 分步 `precopy.py --role B --tp-size 2`，rank↔seg 对号内嵌完成）。
 
-```bash
-# 一键（TP=1）：
-bash run_e2e.sh
-# 多 TP 分步（单入口：resolve seg→算 key→核对→copy 进程内完成）：
-python3 precopy/precopy.py --master 127.0.0.1:50088 --protocol ascend \
-  --role B --tp-size 2 \
-  --model /data/models/Qwen3-VL-8B-w8a8c16 \
-  --prefix "va-precopy shared prefix for store warmup. " \
-  --prefix-repeat 80
-```
-
-注意：rank↔seg 对号由 precopy 内嵌的 `precopy/resolve.py` 完成（admin API + pidfile/ss 求交，不读日志，对不上即 fail loud）；已知拓扑时显式 `--targets seg0,seg1,...`（按 rank 序）跳过解析。
+验收：`External prefix cache hit rate` ≈95.9%（768/801）、零 invalid（分层判据见 §3）。
 
 ### ② 同构跨机
 
@@ -86,14 +67,7 @@ precopy 映射：eff rank i → B seg `i // num_sub_keys`。B=TP2（num_sub_keys
 
 ### ④ 异构跨机
 
-流程与③完全一致，叠加②的跨机配置：master 在源机、B 机容器先打补丁、ssh 操作合并成批。precopy 加 ssh 探测参数即可（B 机探测，无需先 eval）：
-
-```bash
-python3 precopy/precopy.py --master A_IP:50088 --protocol ascend \
-  --role B --tp-size 4 \
-  --ssh 'ssh root@B_IP' --pidfile /root/va-precopy/logs/worker_B.pid \
-  --model ... --prefix ... --prefix-repeat 80
-```
+流程 = ③ 的异构配置 + ② 的跨机配置（master 在源机、B 机容器先打补丁、ssh 操作成批）；precopy 跨机探测参数（`--ssh`/`--pidfile`）与命令样例见 [README.md](README.md)「快速开始 D」。
 
 已验证配置：245(A=TP2，卡0,1，:8001) → 217(B=TP4，卡0-3，:8002)，三轮 precopy 各 24/24 `replica_copy_success`（A 侧 ~1 key/s），副本对号落 217 四个 seg（每 key 双副本：源 seg + 目标 seg，逐 key 取证——当时用 `check_exists`，现并入 `keys.py --keys-file <留档> --check-master`）。
 

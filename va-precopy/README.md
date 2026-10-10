@@ -367,6 +367,18 @@ va-precopy/
 | api_server `/proc/<pid>/environ` | 含 `HCCL_INTRA_ROCE_ENABLE=1` |
 | `python3 tools/test_keys.py && python3 tools/test_resolve.py` | `PASS` |
 
+## 操作注意事项
+
+复现/操作中**仍现行**的陷阱集中在此（已失效/已修复的历史坑见 [EXPERIMENTS.md](EXPERIMENTS.md)「踩坑记录」）：
+
+- **启动与清理**
+  - 残留实例会「假 READY」：vLLM 进程 `setproctitle` 后名为 `VLLM::EngineCore/Worker_TP/APIServer`，`ps | grep python` 搜不到；旧实例占着端口与显存时，新实例的 `/v1/models` 可能由旧实例应答。
+  - 清理：`pgrep -f "VLLM::[W]"`（括号防 pgrep 匹配自身命令行）+ 显式 kill，再 `npu-smi info -t usages -i <id>` 确认 HBM 释放（<10%）。
+- **跨机操作**
+  - 两机**非共享存储**：各自 clone 本目录并同步（补丁、脚本、配置保持一致）。
+  - 高频 SSH 连接触发对端限速（认证后断连/KEX 卡死）：控制操作合并成批执行，或改控制台人工执行。
+- **判定**：指标会骗人（假命中）、必须全新 prompt 首中、必须等源 client TTL、勿用 netdev 计数器、分 rank 证据需 DEBUG——判定方法与其陷阱是一个整体，见 [REPRODUCE.md](REPRODUCE.md) §3。
+
 ## 边界与已知限制
 
 - **验证覆盖面**

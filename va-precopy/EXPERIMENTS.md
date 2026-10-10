@@ -37,7 +37,7 @@
 - 流程与单机一致：warm A → collect 24 keys（`prefix_keys_xhost_het.txt`）→ `resolve_segments.sh --target-ip 7.242.105.217 --tp 4` → precopy（245 侧容器内跑，`--targets` 平铺 4 seg）→ 打 B。
 - 结果：**24/24 key 存在**，A=TP2 的 sub-key put 跨机生效；**24/24 `replica_copy_success`**（A 侧 `client_service.cpp:2624`，~1 key/s），副本对号：rank0→`217:16471`、rank1→`217:15526`、rank2→`217:16596`、rank3→`217:15742`（每 key 双副本：245 源 seg + 217 目标 seg，`check_exists` 取证）；B 首次请求 `hit_tokens: 768/801`（**95.9%**，与单机正向一致）、零 invalid；B(DEBUG) 分 rank `MooncakeBackend.get enter keys=6` × TP0-3；A/B 同 prompt 贪心 16/64 token 输出逐字一致。
 - **本机读铁证（2026-10-09 深夜，杀源实例法，总表 #12）**：杀 worker-A 并等 client TTL 注销其 segment 副本（`batch_get_replica_desc` 仅剩 217 副本）后，B 用**全新 prompt 首次**命中：外部 get `enter keys=6` ×4 rank 同秒成功、external hit 累计 89.8%、零 invalid、输出与 A 逐字一致 ⇒ **get 读的是 217 本机 seg 副本**。早期用 RoCE 网卡打点取证的方法已撤回（netdev 计数器不统计 RDMA，总表 #9）；同 prompt 第二次命中会被 vLLM 内部 HBM prefix cache 接住（外部 get=0），判定必须用全新 prompt 首中。B 命中时刻 `Connected to segment: 7.242.105.245:*` 是 precopy copy-task 收尾传输（与 get 同秒重叠造成的误读，勿再当读取证据——本机 seg 读不留连接日志）。
-- 坑（跨机新增）：217 容器残留旧 worker 致假 READY、master 日志轮转（已失效）——均见文末「踩坑记录」。
+- 坑（跨机新增）：217 容器残留旧 worker 致假 READY（清理方法现见 [README.md](README.md)「操作注意事项」）；master 日志轮转坑已失效（见文末「踩坑记录」）。
 
 ### 反向：A=TP4 → B=TP2（总表 #6）
 
@@ -72,14 +72,10 @@
 
 **踩坑记录（跨机操作）**：
 
-- **残留进程与假 READY**
-  - 217 容器残留 10/8 旧 worker：vLLM `setproctitle` 后进程名为 `VLLM::EngineCore/Worker_TP/APIServer`，`ps | grep python|vllm` **大小写躲过**；旧进程占 8002 端口与卡 0-3 显存，新 B 起不来或假 READY（`/v1/models` 由旧实例应答）。
-  - 清理：`pgrep -f "VLLM::[W]"`（括号防 pgrep 匹配自身 ssh 命令行）+ 显式 kill + `npu-smi info -t usages -i <id>` 验 HBM 释放。
-- **取证与日志**
-  - 分 rank `MooncakeBackend.get enter keys=` 证据需 `VLLM_LOGGING_LEVEL=DEBUG` 启动。
+仍现行的操作陷阱已并入操作文档：残留旧 worker 致「假 READY」与清理、跨机 SSH 限速、两机非共享存储 → [README.md](README.md)「操作注意事项」；判定环节的陷阱（假命中、全新 prompt、TTL、netdev、DEBUG 取证）→ [REPRODUCE.md](REPRODUCE.md) §3。以下只留历史记录：
+
+- **证据与记录**
   - `worker_A.log` 被 10/09 深夜两次重启覆盖（`nohup >` 截断）：早期 72 次 `replica_copy_success` 以总表 #8 文字为准；重启 A 后需重 warm。
-  - `precopy.py` 退出偶发 allocator abort（RC=134）/挂起：**已修复**（见「勘误与演进」）；旧环境 READY 已打印即拷贝完成，可忽略。
-- **跨机 SSH**
-  - 非交互 SSH 无 sshpass/密钥，`expect` + 密码可用；高频连接触发对端限速（认证后断连/KEX 卡死），需静置恢复或改控制台人工执行。
-- **已失效（2026-10-10 重构后不再存在，留作历史）**
+- **已修复 / 已失效**
+  - `precopy.py` 退出偶发 allocator abort（RC=134）/挂起：已修复（见「勘误与演进」）。
   - master 日志被轮转后 fd 仍写改名文件（`.bak.27b`）→ `ln -sf` 修复：当时 `resolve_segments.sh` 读 master 日志 mount 行；resolve 改走 admin API + pidfile/ss 后此坑消失。
