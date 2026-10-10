@@ -52,7 +52,7 @@ B2：请求前把前缀 KV 放到目标实例本机 DRAM。先把三个对象讲
 
 | 项 | 现状 |
 |----|------|
-| **Key 集合** | `collect_prefix_keys.py --tp-size N` 展开 `head_or_tp_rank:0..N/put_step-1` × 满块（`keys.py::expand_store_keys`） |
+| **Key 集合** | `precopy.py` prompt 模式内嵌 `collect_keys()` 展开 `head_or_tp_rank:0..N/put_step-1` × 满块（`keys.py::expand_store_keys`；key 全程内存） |
 | **多 seg** | `precopy.py --targets seg0,seg1,...`：**rank i 的 key 只 copy 到 `targets[i]`**（不再 key×N 广播） |
 | **调度** | 仍 **按 key 串行** `create_copy_and_wait`；映射已对号入座 |
 | **解析 seg** | `resolve_segments.sh --role B --tp N` → `TARGET_SEGMENTS`（master admin API 名单 ∩ pidfile 进程树 `ss` 端口；rank 取自 `VLLM::Worker_TP<N>` 进程名，对不上即 fail loud，**不读日志**） |
@@ -134,7 +134,7 @@ sequenceDiagram
 
 日志只剩**人工取证**角色，不参与任何控制流：分 rank `MooncakeBackend.get enter keys=`（0.3.11 无等效 API，vLLM `/metrics` 只有聚合 external hit）、源侧 `replica_copy_success` 计数——这些是版本限制下的取证手段，REPRODUCE §3 的三层判据靠人读，脚本不读。
 
-**key 格式与 hash 一律 import 上游权威实现，不自己搬**：block hash 链 import vllm `kv_cache_utils`（`collect_prefix_keys.py`）；PoolKey 字符串格式 import vllm-ascend `PoolKey`/`KeyMetadata`（`keys.py`，rc1=`config_data.py` / main=`metadata.py` 自适应，按字段名构造——rc1 有 `pcp_rank`、main 已删，位置参数构造会漂移）。上游改格式时 import 自动跟随；两道哨兵兜底：`collect --check-master`（key 对不上即 exit 2）与 `test_keys.py::test_upstream_parity`（容器内镜像 vs 上游逐字节比对）。`keys.py` 内置的 rc1 纯 Python 镜像只作离线 fallback（打印 WARN）。
+**key 格式与 hash 一律 import 上游权威实现，不自己搬**：block hash 链 import vllm `kv_cache_utils`（`collect_prefix_keys.py`）；PoolKey 字符串格式 import vllm-ascend `PoolKey`/`KeyMetadata`（`keys.py`，rc1=`config_data.py` / main=`metadata.py` 自适应，按字段名构造——rc1 有 `pcp_rank`、main 已删，位置参数构造会漂移）。上游改格式时 import 自动跟随；两道哨兵兜底：`batch_is_exist` 存在性核对（precopy prompt 模式内置，缺 key 即 exit 2）与 `test_keys.py::test_upstream_parity`（容器内镜像 vs 上游逐字节比对）。`keys.py` 内置的 rc1 纯 Python 镜像只作离线 fallback（打印 WARN）。
 
 ## 目录
 
@@ -145,8 +145,8 @@ sequenceDiagram
 | `EXPERIMENTS.md` | 实验总表 12 条 + 踩坑记录（含撤回历史） |
 | `env_ascend_a2.sh` | A2 RoCE 环境（`HCCL_INTRA_ROCE_ENABLE` 等），供 source |
 | `common.py` | Mooncake store 封装 |
-| `precopy.py` | 控制面：`--targets` 时 rank→seg 映射后 `create_copy_task` |
-| `collect_prefix_keys.py` | warm prompt → import vllm hash 链 → 全 rank PoolKey → `prefix_keys.txt`（`--check-master` 漂移哨兵） |
+| `precopy.py` | **单入口控制面**：warm prompt → 进程内算 key → `batch_is_exist` 核对 → `create_copy_task` → READY（key 走内存；`--keys-file` 仅调试） |
+| `collect_prefix_keys.py` | `collect_keys()` 库函数 + CLI（被 precopy 内嵌调用；单跑 = 调试/核对） |
 | `resolve_segments.sh` | master admin API + pidfile/ss 对号 seg（**不解析日志**）；`--role`/`--tp`/`--ssh` → `TARGET_SEGMENTS` |
 | `stop_cluster.sh` | 停 worker（可选停 master） |
 | `store_demo.py` | Store 半程（无 vLLM） |
@@ -227,27 +227,25 @@ prefix = "va-precopy shared prefix for store warmup. " * 80
 print(json.dumps({"model":"qwen","prompt":prefix,"max_tokens":1,"temperature":0}))
 PY
 
-PYTHONHASHSEED=0 python3 collect_prefix_keys.py \
-  --model /data/models/Qwen3-VL-8B-w8a8c16 \
-  --model-name Qwen3-VL-8B-w8a8c16 \
-  --tp-size "${TP:-1}" \
-  --prefix-repeat 80 \
-  --out prefix_keys.txt \
-  --check-master 127.0.0.1:50088
-
 # resolve：admin API + pidfile/ss（不读日志）；TP=N 加 --tp N
 eval "$(bash resolve_segments.sh --export --role B --tp "${TP:-1}")"
 # 跨机：B 侧探测走 ssh，pidfile 是 B 机上的克隆路径
 # eval "$(bash resolve_segments.sh --export --role B --tp "$TP" \
 #   --ssh 'ssh root@B_IP' --pidfile /root/va-precopy/logs/worker_B.pid)"
 
+# 单入口：warm prompt → 进程内算 key → batch_is_exist 核对 → copy → READY
 python3 precopy.py \
   --master 127.0.0.1:50088 \
   --protocol ascend \
   --targets "${TARGET_SEGMENTS:-$TARGET_SEGMENT}" \
-  --keys-file prefix_keys.txt \
+  --model /data/models/Qwen3-VL-8B-w8a8c16 \
+  --model-name Qwen3-VL-8B-w8a8c16 \
+  --prefix "va-precopy shared prefix for store warmup. " \
+  --prefix-repeat 80 \
+  --tp-size "${TP:-1}" \
+  --dump-keys prefix_keys.txt \
   --dry-show-before
-# 成功：READY（rank i → targets[i]）
+# 成功：READY（rank i → targets[i]）；key 全程内存，--dump-keys 只是调试留档
 ```
 
 ## A2 环境变量（硬依赖）
@@ -319,13 +317,12 @@ python3 precopy.py \
 
 ```bash
 # 机 A：master + worker-A；机 B：worker-B（同 MC_MASTER；LOCAL_IP=B_IP）
-PYTHONHASHSEED=0 python3 collect_prefix_keys.py \
-  --model ... --model-name ... --tp-size 4 --block-size 1536 \
-  --out prefix_keys.txt --check-master A_IP:50088
 eval "$(bash resolve_segments.sh --export --role B --tp 4 --master A_IP:50088 \
   --ssh 'ssh root@B_IP' --pidfile /root/va-precopy/logs/worker_B.pid)"
 python3 precopy.py --master A_IP:50088 --protocol ascend \
-  --targets "$TARGET_SEGMENTS" --keys-file prefix_keys.txt --dry-show-before
+  --targets "$TARGET_SEGMENTS" \
+  --model ... --model-name ... --tp-size 4 --block-size 1536 \
+  --prefix-repeat 80 --dry-show-before
 # 再打 B:8002；看 external_prefix_cache_*
 ```
 

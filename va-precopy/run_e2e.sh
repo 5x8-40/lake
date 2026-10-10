@@ -4,8 +4,9 @@
 #   DRY_RUN=1 bash run_e2e.sh
 #   LOCAL_IP=... NIC_NAME=... MODEL=... bash run_e2e.sh
 #
-# Auto path (after workers ready): warm → collect_prefix_keys → resolve_segments → precopy → hit B.
-# Homogeneous TP>1: collect expands all head_or_tp_rank; precopy maps rank i → B segs[i].
+# Auto path (after workers ready): warm → resolve_segments → precopy → hit B.
+# precopy prompt mode computes keys in-process (import vllm/vllm-ascend), checks
+# batch_is_exist, then copies: rank i keys → B segs[i]. No intermediate key file.
 set -euo pipefail
 
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -129,36 +130,19 @@ PY
   echo
 fi
 
-step "5. collect keys + resolve target segment + create_copy_task"
+step "5. resolve target segments + precopy (compute keys → check → copy)"
 if [[ "$DRY_RUN" == "1" ]]; then
-  echo "DRY_RUN: collect_prefix_keys.py + resolve_segments.sh + precopy.py"
+  echo "DRY_RUN: resolve_segments.sh + precopy.py (prompt mode: keys computed in-process)"
   exit 0
 fi
 
 if [[ "$AUTO_PRECOPY" != "1" ]]; then
-  echo "AUTO_PRECOPY=0 — skip precopy. Set TARGET_SEGMENT + KEYS_FILE and re-run precopy manually."
+  echo "AUTO_PRECOPY=0 — skip precopy. Set TARGET_SEGMENTS and run precopy.py manually (--prefix or --keys-file)."
   exit 0
 fi
 
 export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
 export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
-if ! python3 "$SCRIPT_DIR/collect_prefix_keys.py" \
-  --model "$MODEL" \
-  --model-name "$MODEL_NAME" \
-  --prefix "$PREFIX" \
-  --prefix-repeat "$PREFIX_REPEAT" \
-  --block-size "$BLOCK_SIZE" \
-  --tp-size "$TP_B" \
-  --peer-tp-size "$TP_A" \
-  --put-step "$PUT_STEP" \
-  --out "$KEYS_FILE" \
-  --check-master "$MC_MASTER" \
-  --protocol "$PROTOCOL" \
-  --device "${DEVICES_A%%,*}"; then
-  echo "[e2e] WARN: collect_prefix_keys reported missing keys; precopy would be partial." >&2
-  echo "[e2e] HINT: heterogeneous TP needs patch_tp_mismatch_worker.patch applied in the container (upstream tp_mismatch put is dead code otherwise)." >&2
-  exit 1
-fi
 
 if [[ -z "$TARGET_SEGMENTS" ]]; then
   # resolve_segments.sh: master admin API + pidfile/ss cross-check (no log parsing).
@@ -170,12 +154,26 @@ if [[ -z "$TARGET_SEGMENTS" ]]; then
   echo "[e2e] auto TARGET_SEGMENTS=$TARGET_SEGMENTS (SEG_A=$SEG_A)"
 fi
 
-python3 "$SCRIPT_DIR/precopy.py" \
+# Single-entry precopy: warm prompt → in-process keys → exist check → copy.
+if ! python3 "$SCRIPT_DIR/precopy.py" \
   --master "$MC_MASTER" \
   --protocol "$PROTOCOL" \
   --targets "$TARGET_SEGMENTS" \
-  --keys-file "$KEYS_FILE" \
-  --dry-show-before
+  --model "$MODEL" \
+  --model-name "$MODEL_NAME" \
+  --prefix "$PREFIX" \
+  --prefix-repeat "$PREFIX_REPEAT" \
+  --block-size "$BLOCK_SIZE" \
+  --tp-size "$TP_B" \
+  --peer-tp-size "$TP_A" \
+  --put-step "$PUT_STEP" \
+  --device "${DEVICES_A%%,*}" \
+  --dump-keys "$KEYS_FILE" \
+  --dry-show-before; then
+  echo "[e2e] ERROR: precopy failed (keys missing = warm 未覆盖, or hash/key drift)." >&2
+  echo "[e2e] HINT: heterogeneous TP needs patch_tp_mismatch_worker.patch applied in the container (upstream tp_mismatch put is dead code otherwise)." >&2
+  exit 1
+fi
 
 if [[ "$HIT_B" != "1" ]]; then
   echo "HIT_B=0 — skip request to worker-B"

@@ -66,6 +66,52 @@ def _hash_prompt(
     return [block_hash_to_str(h) for h in hashes], len(ids)
 
 
+def collect_keys(
+    *,
+    model_path: str,
+    prefix: str,
+    model_name: str = "",
+    block_size: int = 128,
+    tp_size: int = 1,
+    peer_tp_size: int | None = None,
+    put_step: int = 1,
+    hash_algo: str = "sha256",
+) -> tuple[list[str], dict]:
+    """prompt -> expanded PoolKey list (in-process API; precopy.py calls this).
+
+    Returns (keys, info). Hash chain and PoolKey format are imported from
+    vllm / vllm-ascend — nothing reimplemented. Container-only (needs
+    transformers + vllm + vllm_ascend).
+    """
+    model_name = model_name or os.path.basename(model_path.rstrip("/"))
+    hexes, n_tokens = _hash_prompt(model_path, prefix, block_size, hash_algo)
+    effective_tp = tp_size
+    if peer_tp_size and peer_tp_size != tp_size:
+        effective_tp = max(tp_size, peer_tp_size)
+    keys = expand_store_keys(
+        model_name=model_name,
+        chunk_hashes=hexes,
+        tp_size=effective_tp,
+        put_step=put_step,
+    )
+    info = {
+        "n_tokens": n_tokens,
+        "n_full_blocks": len(hexes),
+        "tp_size": tp_size,
+        "peer_tp_size": peer_tp_size,
+        "effective_tp": effective_tp,
+        "put_step": put_step,
+        "model_name": model_name,
+        "hash_algo": hash_algo,
+        "key_format": (
+            "upstream(vllm_ascend.PoolKey)"
+            if keys_mod.upstream_key_classes() is not None
+            else "builtin-mirror(OFFLINE, drift risk!)"
+        ),
+    }
+    return keys, info
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description="Collect Mooncake prefix keys after warm")
     p.add_argument("--model", required=True, help="HF model path (tokenizer)")
@@ -129,30 +175,21 @@ def main() -> int:
             file=sys.stderr,
         )
 
-    model_name = args.model_name or os.path.basename(args.model.rstrip("/"))
-    prefix = args.prefix * args.prefix_repeat
-    hexes, n_tokens = _hash_prompt(args.model, prefix, args.block_size, args.hash_algo)
-    effective_tp = args.tp_size
-    if args.peer_tp_size and args.peer_tp_size != args.tp_size:
-        effective_tp = max(args.tp_size, args.peer_tp_size)
-    keys = expand_store_keys(
-        model_name=model_name,
-        chunk_hashes=hexes,
-        tp_size=effective_tp,
+    keys, info = collect_keys(
+        model_path=args.model,
+        model_name=args.model_name,
+        prefix=args.prefix * args.prefix_repeat,
+        block_size=args.block_size,
+        tp_size=args.tp_size,
+        peer_tp_size=args.peer_tp_size,
         put_step=args.put_step,
+        hash_algo=args.hash_algo,
     )
+    model_name = info["model_name"]
     by_rank = group_keys_by_rank(keys)
-    key_src = (
-        "upstream(vllm_ascend.PoolKey)"
-        if keys_mod.upstream_key_classes() is not None
-        else "builtin-mirror(OFFLINE, drift risk!)"
-    )
     print(
-        f"n_tokens={n_tokens} n_full_blocks={len(hexes)} "
-        f"tp_size={args.tp_size} peer_tp_size={args.peer_tp_size} "
-        f"effective_tp={effective_tp} put_step={args.put_step} "
-        f"ranks={sorted(by_rank)} keys={len(keys)} model_name={model_name} "
-        f"hash_algo={args.hash_algo} key_format={key_src}"
+        " ".join(f"{k}={v}" for k, v in info.items())
+        + f" ranks={sorted(by_rank)} keys={len(keys)}"
     )
 
     out_path = args.out

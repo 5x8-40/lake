@@ -12,6 +12,18 @@ to targets[i] (not the same key broadcast to every seg).
 Finish copy BEFORE the target worker opens a get session for the real
 request. After READY, send traffic to that worker.
 
+Single entry (prompt mode): hand it the warm prompt — key computation
+(import vllm/vllm-ascend), batch_is_exist check, copy and READY all happen
+in-process; keys never touch a file unless --dump-keys is given:
+
+  python3 precopy.py --master 127.0.0.1:50088 --protocol ascend \\
+      --targets "B:p0,B:p1" \\
+      --model /data/models/Qwen3-VL-8B-w8a8c16 \\
+      --prefix "shared prefix. " --prefix-repeat 80 --tp-size 2
+
+Debug paths (keys from outside): --keys / --keys-file, or standalone
+collect_prefix_keys.py + test_keys.py.
+
 Examples:
   # TP=1
   python3 precopy.py --master 127.0.0.1:50088 --protocol ascend \\
@@ -32,13 +44,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from common import (
-    assert_targets_have_replicas,
-    create_copy_and_wait,
-    memory_replica_endpoints,
-    setup_store,
-)
 from keys import group_keys_by_rank, parse_head_or_tp_rank
+
+# NOTE: common (mooncake client) is imported lazily in main() AFTER arg
+# validation and key computation, so --dump-keys and usage errors work
+# without a mooncake install.
 
 
 def _load_keys(args: argparse.Namespace) -> list[str]:
@@ -94,8 +104,29 @@ def main() -> int:
         default=os.environ.get("TARGET_SEGMENTS", ""),
         help="comma-separated B local_seg list; key rank i → targets[i]",
     )
-    p.add_argument("--keys", default="", help="comma-separated object keys")
-    p.add_argument("--keys-file", default="", help="file with one key per line")
+    p.add_argument("--keys", default="", help="comma-separated object keys (debug)")
+    p.add_argument("--keys-file", default="", help="file with one key per line (debug)")
+    # Prompt mode: compute keys in-process from the warm prompt (product path).
+    p.add_argument("--prefix", default=os.environ.get("PREFIX", ""),
+                   help="base warm prompt string (needs --model)")
+    p.add_argument("--prefix-repeat", type=int, default=int(os.environ.get("PREFIX_REPEAT", "1")))
+    p.add_argument("--model", default=os.environ.get("MODEL", ""),
+                   help="HF model path for tokenizer (prompt mode)")
+    p.add_argument("--model-name", default=os.environ.get("MODEL_NAME", ""),
+                   help="PoolKey model_name (default: basename of --model)")
+    p.add_argument("--block-size", type=int, default=int(os.environ.get("BLOCK_SIZE", "128")))
+    p.add_argument("--tp-size", type=int, default=int(os.environ.get("TP_SIZE", os.environ.get("TP", "1"))),
+                   help="target (B) TP size for rank expansion")
+    p.add_argument("--peer-tp-size", type=int,
+                   default=int(os.environ.get("PEER_TP_SIZE", "0")) or None,
+                   help="source (A) TP size for tp_mismatch; effective_tp=max(local,peer)")
+    p.add_argument("--put-step", type=int, default=int(os.environ.get("PUT_STEP", "1")))
+    p.add_argument("--hash-algo", default=os.environ.get("PREFIX_CACHING_HASH_ALGO", "sha256"),
+                   help="must match engine prefix_caching_hash_algo")
+    p.add_argument("--dump-keys", default="",
+                   help="optional: write computed keys to this file (debug artifact)")
+    p.add_argument("--skip-exist-check", action="store_true",
+                   help="prompt mode: skip batch_is_exist before copy")
     p.add_argument(
         "--coord-hostname",
         default="",
@@ -119,9 +150,39 @@ def main() -> int:
     if master.count(":") == 0:
         master = f"{master}:50088"
 
-    keys = _load_keys(args)
+    computed = bool(args.prefix and args.model)
+    if computed and (args.keys or args.keys_file):
+        print(
+            "ERROR: --prefix/--model (compute) and --keys/--keys-file (debug) "
+            "are mutually exclusive",
+            file=sys.stderr,
+        )
+        return 2
+    if computed:
+        from collect_prefix_keys import collect_keys
+
+        keys, info = collect_keys(
+            model_path=args.model,
+            model_name=args.model_name,
+            prefix=args.prefix * args.prefix_repeat,
+            block_size=args.block_size,
+            tp_size=args.tp_size,
+            peer_tp_size=args.peer_tp_size,
+            put_step=args.put_step,
+            hash_algo=args.hash_algo,
+        )
+        print("[precopy] collect: " + " ".join(f"{k}={v}" for k, v in info.items()))
+        if args.dump_keys:
+            with open(args.dump_keys, "w", encoding="utf-8") as f:
+                f.write("\n".join(keys) + "\n")
+            print(f"[precopy] dumped {len(keys)} keys -> {args.dump_keys}")
+    else:
+        keys = _load_keys(args)
     if not keys:
-        print("ERROR: provide --keys and/or --keys-file", file=sys.stderr)
+        print(
+            "ERROR: provide --keys/--keys-file (debug) or --prefix + --model (compute)",
+            file=sys.stderr,
+        )
         return 2
 
     targets = _parse_targets(args)
@@ -171,6 +232,13 @@ def main() -> int:
         torch.npu.set_device(args.device)
         print(f"[precopy] torch.npu.set_device({args.device})")
 
+    from common import (
+        assert_targets_have_replicas,
+        create_copy_and_wait,
+        memory_replica_endpoints,
+        setup_store,
+    )
+
     store = setup_store(
         local_hostname=coord,
         master_server_address=master,
@@ -181,6 +249,21 @@ def main() -> int:
     )
 
     try:
+        if computed and not args.skip_exist_check:
+            # Same batch_is_exist semantics as collect --check-master: computed
+            # keys must ALL be in the pool (warm covered the full prefix, hash
+            # algo matches engine, key format not drifted) or copying is moot.
+            ex = store.batch_is_exist(keys)
+            n_ok = sum(1 for e in ex if e == 1 or e is True or (isinstance(e, int) and e > 0))
+            print(f"[precopy] exist check: {n_ok}/{len(keys)}")
+            if n_ok != len(keys):
+                print(
+                    "[precopy] ERROR: keys missing in pool — warm 未覆盖该前缀，"
+                    "或 hash-algo/key 格式与引擎漂移",
+                    file=sys.stderr,
+                )
+                return 2
+
         if args.dry_show_before:
             for key in keys:
                 print(

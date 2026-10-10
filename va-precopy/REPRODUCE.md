@@ -46,12 +46,13 @@ A/B 同 `tp_size`，同机不同卡组。**无需补丁**。
 ```bash
 # 一键（TP=1）：
 bash run_e2e.sh
-# 多 TP 分步：
-PYTHONHASHSEED=0 python3 collect_prefix_keys.py --tp-size 2 --prefix-repeat 80 \
-  --out prefix_keys.txt --check-master 127.0.0.1:50088
+# 多 TP 分步（单入口：prompt→key→核对→copy 进程内完成）：
 eval "$(bash resolve_segments.sh --export --role B --tp 2)"
 python3 precopy.py --master 127.0.0.1:50088 --protocol ascend \
-  --targets "$TARGET_SEGMENTS" --keys-file prefix_keys.txt
+  --targets "$TARGET_SEGMENTS" \
+  --model /data/models/Qwen3-VL-8B-w8a8c16 \
+  --prefix "va-precopy shared prefix for store warmup. " \
+  --prefix-repeat 80 --tp-size 2
 ```
 
 注意：`--targets` 按 rank 序传（rank i 的 key 只 copy 到 `targets[i]`）；rank↔seg 对号由 `resolve_segments.sh` 自动完成（admin API + pidfile/ss 求交，不读日志，对不上即 fail loud）。
