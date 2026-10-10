@@ -15,7 +15,9 @@
 # Optional:
 #   APPLY_HUGEPAGES=1  # write /proc/sys/vm/nr_hugepages (default: off; avoid DRY_RUN/host surprises)
 #   NR_HUGEPAGES=200000
-set -euo pipefail
+#
+# NOTE: this file is SOURCED — do NOT `set -e/-u` here (they would leak into
+# the calling shell, incl. interactive sessions). Guard variables explicitly.
 
 _guess_ip_iface() {
   # Prefer a routable NIC with an IPv4 address (skip lo / docker0 / virbr*).
@@ -73,6 +75,6 @@ fi
 
 echo "[env_ascend_a2] HCCL_INTRA_ROCE_ENABLE=$HCCL_INTRA_ROCE_ENABLE"
 echo "[env_ascend_a2] HCCL_IF_IP=$HCCL_IF_IP"
-echo "[env_ascend_a2] HCCL_SOCKET_IFNAME=${HCCL_SOCKET_IFNAME:-<unset>} GLOO=$GLOO_SOCKET_IFNAME TP=$TP_SOCKET_IFNAME"
+echo "[env_ascend_a2] HCCL_SOCKET_IFNAME=${HCCL_SOCKET_IFNAME:-<unset>} GLOO=${GLOO_SOCKET_IFNAME:-<unset>} TP=${TP_SOCKET_IFNAME:-<unset>}"
 echo "[env_ascend_a2] PYTHONHASHSEED=$PYTHONHASHSEED"
 echo "[env_ascend_a2] nr_hugepages=$(cat /proc/sys/vm/nr_hugepages 2>/dev/null || echo n/a)"

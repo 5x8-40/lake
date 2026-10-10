@@ -102,10 +102,6 @@ else
   export HCCL_NPU_SOCKET_PORT_RANGE=${HCCL_NPU_SOCKET_PORT_RANGE_B:-26100-26199}
 fi
 
-if [[ "${TP}" != "1" ]]; then
-  echo "[worker-$ROLE] WARN: TP=$TP not validated; TP>1 saw TRANSFER_FAIL / HcclBatchPut=4 on A2. Prefer TP=1." >&2
-fi
-
 CMD=(
   python3 -m vllm.entrypoints.openai.api_server
   --model "$MODEL"

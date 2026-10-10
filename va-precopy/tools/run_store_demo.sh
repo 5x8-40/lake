@@ -65,5 +65,5 @@ if [[ "$PROTOCOL" == "ascend" ]]; then
   echo "[run] ascend mode HOST_IP=$HOST_IP devices=$SOURCE_DEVICE/$TARGET_DEVICE/$COORD_DEVICE"
 fi
 
-export PYTHONPATH="$ROOT/precopy:${PYTHONPATH:-}"
+# store_demo.py inserts ../precopy into sys.path itself.
 exec python3 "$SCRIPT_DIR/store_demo.py" --master "$MC_MASTER" --protocol "$PROTOCOL"
