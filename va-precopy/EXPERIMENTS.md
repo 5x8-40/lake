@@ -19,6 +19,43 @@
 | 11 | 10/09 晚 | 217 容器 wheel 升级 `0.3.13.post1` | 尝试升级 mooncake（上游 1fc27b6 已有 `SelectCompleteMemoryReplica` 本机优先） | **失败**：mount 4 seg 后 EngineCore 挂起 15+ 分钟（APIServer `Waiting for 1 local core engine proc`），疑与旧 master 兼容性；回退 `0.3.11.post1` 后恢复正常（#8/#9 即回退后所测） | master 日志、`worker_B.log`（17:03-17:18） |
 | 12 | 10/09 深夜 | 跨机 245→217 异构重验（全新 prompt ×2：961/801 tok）+ **杀源实例终极判定** | **通过**：28/24 keys 全对号入池（master 独立复核）；杀 A + client TTL 注销（`batch_get_replica_desc` 仅剩 217 副本）后 **B 首中**：外部 get `enter keys=6` ×4 rank、`get returned token_len=768` 同秒成功、external hit 累计 89.8%（与 768/897 增量精确自洽）、零 invalid、输出与 A 逐字一致 ⇒ **get 读本机 seg 副本铁证**。两个新认知：① 同 prompt 第二次命中被 vLLM 内部 HBM prefix cache 整体接住（外部 get=0；内部累计 24.9%=896/3620 精确自洽）——本机读判定必须用**全新 prompt 首中**；② netdev 计数器不计 RDMA（见 #9 撤回）。开放问题：双副本并存时 replica 选择策略（0.3.11 无显式本机优先，实测首中未新建远端连接） | `logs/worker_B.log`（get 11829-11841、metrics 12203 行）；`prefix_keys_reverify.txt`/`prefix_keys_final.txt` |
 
+## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
+
+总表 #5-#8/#12 的操作细节与输出原文（2026-10-10 自 README 迁入；文中裸文件名按文末勘误的二次重组映射）。
+
+### 单机正向：A=TP2 → B=TP4（总表 #5）
+
+- 配置：A=TP2（卡 0,1，:8001）、B=TP4（卡 2,3,4,5，:8002），均 `prefill_tp_size=2, decode_tp_size=4`；模型 VL-8B（GQA，8 KV head；`effective_tp=4`，`num_sub_keys=2`）。
+- 流程：warm A → `collect_prefix_keys.py --tp-size 4 --peer-tp-size 2`（展开 eff rank 0-3，6 满块 × 4 = **24 keys**）→ 解析 B 的 4 seg（`worker_B.log` 的 `listening on`，pid 对号 rank）→ `precopy.py --targets seg0,seg1,seg2,seg3`（eff rank i → B seg i）→ 打 B。
+- 结果：**24/24 key 存在**且副本对号（eff0/1 → A TP0 seg，eff2/3 → A TP1 seg）；precopy 后每个 eff-rank key 在 B 对应 seg 有本地副本；B 侧 `kvpool hit tokens: 768/801`（**95.9%**），TP0-3 各自 `backend get keys=6` 成功、零 invalid block；A(TP2)/B(TP4) 同 prompt 贪心 16 token 输出逐字一致。
+- 证据：`logs/worker_A.log`（`tp_mismatch put keys=12` × 2 rank）、`logs/worker_B.log`（分 rank get）、`logs/e2e_hetero_2_4.log`（首次跑，死于 collect exit 2；补丁后手工复测通过）。
+
+### 跨机：245(A=TP2) → 217(B=TP4)（总表 #8/#12）
+
+配置：A=TP2（245，卡 0,1，:8001）、B=TP4（217，卡 0-3，:8002），master 在 245 宿主机 `:50088`；两端容器同镜像，217 容器需先打 `patch_tp_mismatch_worker.patch`。跨机操作用 `ssh root@7.242.105.217`（密码，expect 包装；sshpass 未装）。
+
+- 流程与单机一致：warm A → collect 24 keys（`prefix_keys_xhost_het.txt`）→ `resolve_segments.sh --target-ip 7.242.105.217 --tp 4` → precopy（245 侧容器内跑，`--targets` 平铺 4 seg）→ 打 B。
+- 结果：**24/24 key 存在**，A=TP2 的 sub-key put 跨机生效；**24/24 `replica_copy_success`**（A 侧 `client_service.cpp:2624`，~1 key/s），副本对号：rank0→`217:16471`、rank1→`217:15526`、rank2→`217:16596`、rank3→`217:15742`（每 key 双副本：245 源 seg + 217 目标 seg，`check_exists` 取证）；B 首次请求 `hit_tokens: 768/801`（**95.9%**，与单机正向一致）、零 invalid；B(DEBUG) 分 rank `MooncakeBackend.get enter keys=6` × TP0-3；A/B 同 prompt 贪心 16/64 token 输出逐字一致。
+- **本机读铁证（2026-10-09 深夜，杀源实例法，总表 #12）**：杀 worker-A 并等 client TTL 注销其 segment 副本（`batch_get_replica_desc` 仅剩 217 副本）后，B 用**全新 prompt 首次**命中：外部 get `enter keys=6` ×4 rank 同秒成功、external hit 累计 89.8%、零 invalid、输出与 A 逐字一致 ⇒ **get 读的是 217 本机 seg 副本**。早期用 RoCE 网卡打点取证的方法已撤回（netdev 计数器不统计 RDMA，总表 #9）；同 prompt 第二次命中会被 vLLM 内部 HBM prefix cache 接住（外部 get=0），判定必须用全新 prompt 首中。B 命中时刻 `Connected to segment: 7.242.105.245:*` 是 precopy copy-task 收尾传输（与 get 同秒重叠造成的误读，勿再当读取证据——本机 seg 读不留连接日志）。
+- 坑（跨机新增）：217 容器残留 10/8 的旧 worker-B —— vLLM `setproctitle` 后进程名是 `VLLM::EngineCore/Worker_TP/APIServer`，`ps | grep python|vllm` **搜不到**（大小写躲过），旧进程占着 8002 端口与卡 0-3 显存，新 B 起不来或假 READY（`/v1/models` 由旧实例应答）。清理用 `pgrep -f "VLLM::"` + `npu-smi info -t usages -i <id>` 核对 HBM 释放（注意 pgrep 模式含 "VLLM::" 时会匹配自身 ssh 命令行，用 `VLLM::[W]` 括号技巧）。
+- master 日志（历史坑，已失效）：当时 `resolve_segments.sh` 读 `logs/mooncake_master.log` 的 mount 行，日志轮转后 fd 仍写在改名文件上（`.bak.27b`）导致读不到——`ln -sf` 修复。2026-10-10 起 resolve 改走 admin API + pidfile/ss，此坑不存在了。
+
+### 反向：A=TP4 → B=TP2（总表 #6）
+
+反向暴露两个新约束，均已解决并验证：
+
+1. **配置语义（易错）**：`infer_tp_mismatch_info`（`config_data.py:48`）对 kv_producer/**kv_both** 读 **`decode_tp_size`** 作为 peer（kv_consumer 才读 `prefill_tp_size`）。反向必须配 `decode_tp_size=4`（对端 TP，不是本机 TP）——配成 2 时 B(TP2) 判「无不匹配」而退化为普通 TP2 行为。
+2. **get 侧只有异步路径感知 tp_mismatch**：同步 load（`start_load_kv` 内联 get）按本机 rank 名取**一个** key、全本地切片尺寸，对 B=TP2 会请求 4 头尺寸而 eff 对象只有 2 头 → get 失败 → invalid block → 全部回退重算（external hit 指标照样 ~95%，**假命中**）。小 TP 消费者必须 `load_async=1`（`start_worker.sh` 已支持 `LOAD_ASYNC` env 注入），走 `KVCacheStoreRecvingThread → _load_kv_tp_mismatch` sub-key strided get。
+
+实测：A=TP4（卡 0-3，`decode_tp_size=4`→plain put 即 eff 命名）、B=TP2（卡 4,5，`LOAD_ASYNC=1`）。
+
+- A 四 rank 各普通 put 6 key（24/24，命名=eff 0-3，内容=2 头/eff shard）；
+- precopy 映射：eff rank i → B seg[i//2]，现有 `--targets` 传**重复列表** `seg0,seg0,seg1,seg1` 即可（无需改代码）；
+- B：`External prefix cache hit rate: 95.9%`、零 invalid；TP0/TP1 各 `tp_mismatch get keys=12`（6 块 × 2 sub-key）成功；
+- A(TP4)/B(TP2) 同 prompt 贪心 16 token 输出逐字一致。
+
+**方向差异小结**：eff=4 时，A=TP2 生产者靠补丁后的 sub-key **put**；B=TP4 消费者同步 load 即可；A=TP4 生产者 plain put 即可；B=TP2 消费者**必须** `load_async=1`。即：**小 TP 端需要 sub-key 读写（put 已由补丁修通，get 需异步路径）**；大 TP（=effective_tp）端两条路径都退化为普通行为。（B=TP2 实测走异步路径 `load_async=1`；补丁已升级为 #15835 完整版、同步 load 已恢复 mismatch 分发，`load_async=1` 从硬约束降为推荐项，同步路径未单独复测。）
+
 **勘误（2026-10-10）**：#12 行「0.3.11 无显式本机优先」判断有误——0.3.11.post1 的 `SelectBestReplica` 已实现「prefer local MEMORY」（`real_client.cpp:283-286`）；0.3.12+ 新增的 `SelectCompleteMemoryReplica` 只用于 session API 路径。结论以 [REPRODUCE.md](REPRODUCE.md) §3 为准。另：#5/#7 行的 `patch_tp_mismatch_worker.py`（python 打补丁脚本，#15835 子集）已替换为 `patch_tp_mismatch_worker.patch`（标准 unified diff，#15835 完整版 backport，含同步 load 分发）。另：`precopy.py` 退出偶发 allocator abort 已定位——退出期 teardown 竞态（GC/atexit 乱序析构与在途收尾操作竞争；0.3.11.post1 缺上游 #3943 teardown drain，check_exists/collect/store_demo 均有 close、precopy 是唯一漏的），已修复为 READY 后显式 `store.close()`。另（2026-10-10 重构）：`resolve_segments.sh` 已重写为 master admin API（`:9003/get_all_segments`）+ pidfile/进程树 `ss` 对号，**不再解析任何日志**——下方「master 日志轮转」「旧 master 无 mount 行」两条踩坑随之失效（保留作历史记录）；同批 `keys.py`/`collect_prefix_keys.py` 改为 import 上游权威实现（vllm-ascend `PoolKey` / vllm `kv_cache_utils`），内置 key 镜像降为离线 fallback，`--check-master` 与 `test_keys.py::test_upstream_parity` 为格式漂移哨兵；`precopy.py` 随后合并为单入口（warm prompt → 进程内算 key → `batch_is_exist` 核对 → copy → READY，key 全程内存），`prefix_keys.txt` 降为 `--dump-keys` 调试留档，`collect_prefix_keys.py` 保留为库 + 独立 CLI。另（2026-10-10 目录重组）：产品控制面 py 归 `precopy/`（`collect_prefix_keys.py` 更名 `precopy/collect.py`）、集群脚本归 `cluster/`、调试工具归 `tools/`，`run_e2e.sh` 留根；本文及 README/REPRODUCE 历史章节中的裸文件名按此映射。另（2026-10-10 二次重组·按调用链归位）：`precopy/collect.py` 并入 `precopy/keys.py`（「key 计算」一个模块：prompt→hash 链→PoolKey 枚举，CLI 双模式 `--model`/`--chunk-hashes` + `--check-master`）；`cluster/resolve_segments.sh` Python 化为 `precopy/resolve.py` 并由 `precopy.py` 缺省内嵌调用（`--targets` 显式给定才跳过；跨机把自身源码 pipe 到 B 机 `python3 -` 执行），bash 版与 `run_e2e.sh` 的 `eval "$(...)"` 胶水一并删除；新增 `tools/test_resolve.py`（纯逻辑 + 真实 socket/pidfile/HTTP 集成 11 用例）；`tools/check_exists.py` 并入 `keys.py`（`--keys-file` 输入 + `--check-master` 全量逐 key 端点），下方 #8/#12 的 `check_exists` 取证按此映射。
 
 **踩坑记录（跨机操作）**：

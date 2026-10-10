@@ -49,7 +49,7 @@ step() { echo; echo "==== $* ===="; }
 if [[ "$TP_A" != "$TP_B" ]]; then
   echo "[e2e] heterogeneous TP: A=$TP_A -> B=$TP_B (prefill_tp_size=$TP_A decode_tp_size=$TP_B; needs patch_tp_mismatch_worker.patch in container; see README 异构 TP)." >&2
 elif [[ "$TP_B" != "1" ]]; then
-  echo "[e2e] TP=$TP_B homogeneous: rank i keys → B local_seg[i] (see README 实现现状)." >&2
+  echo "[e2e] TP=$TP_B homogeneous: rank i keys → B local_seg[i] (see README 怎么运作)." >&2
 fi
 
 if [[ "$ENABLE_ASCEND_A2" == "1" && "$PROTOCOL" == "ascend" && "$DRY_RUN" != "1" ]]; then
