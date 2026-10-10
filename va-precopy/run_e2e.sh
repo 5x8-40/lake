@@ -46,7 +46,7 @@ DECODE_TP_SIZE=${DECODE_TP_SIZE:-$TP_B}
 step() { echo; echo "==== $* ===="; }
 
 if [[ "$TP_A" != "$TP_B" ]]; then
-  echo "[e2e] heterogeneous TP: A=$TP_A -> B=$TP_B (prefill_tp_size=$TP_A decode_tp_size=$TP_B; needs patch_tp_mismatch_worker.py in container; see README 异构 TP)." >&2
+  echo "[e2e] heterogeneous TP: A=$TP_A -> B=$TP_B (prefill_tp_size=$TP_A decode_tp_size=$TP_B; needs patch_tp_mismatch_worker.patch in container; see README 异构 TP)." >&2
 elif [[ "$TP_B" != "1" ]]; then
   echo "[e2e] TP=$TP_B homogeneous: rank i keys → B local_seg[i] (see README 实现现状)." >&2
 fi
@@ -156,7 +156,7 @@ if ! python3 "$SCRIPT_DIR/collect_prefix_keys.py" \
   --protocol "$PROTOCOL" \
   --device "${DEVICES_A%%,*}"; then
   echo "[e2e] WARN: collect_prefix_keys reported missing keys; precopy would be partial." >&2
-  echo "[e2e] HINT: heterogeneous TP needs patch_tp_mismatch_worker.py applied in the container (upstream tp_mismatch put is dead code otherwise)." >&2
+  echo "[e2e] HINT: heterogeneous TP needs patch_tp_mismatch_worker.patch applied in the container (upstream tp_mismatch put is dead code otherwise)." >&2
   exit 1
 fi
 

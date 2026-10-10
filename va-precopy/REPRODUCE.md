@@ -16,7 +16,7 @@
 | 同机多 worker | `preferred_segment: true` | 否则写路径可能把 KV 分到同机另一 worker 的 segment，预复制场景退化 |
 | 取证日志 | `VLLM_LOGGING_LEVEL=DEBUG` | 非 DEBUG 无分 rank `MooncakeBackend.get enter keys=` 证据 |
 
-**已知上游 bug（异构 TP 场景必打补丁）**：v0.26.0rc1 的 `pool_worker.py::_start_kv_transfer_threads` 构造发送/接收线程时漏传 `worker=self`，导致 tp_mismatch 的 put/get 分支是**死代码**。必须先打 `patch_tp_mismatch_worker.py`（幂等、自动备份，容器内执行）。同构场景不受影响，无需补丁。上游已在 main 修复（[#15835](https://github.com/vllm-project/vllm-ascend/pull/15835)，2026-09-09 合入，`9f8773ea`），但 **rc1 / rc2 均不含**，0.26 rc 镜像仍须打本补丁；本补丁为 #15835 完整版的 rc1 backport（含同步 load 分发，自动升级旧子集补丁）。
+**已知上游 bug（异构 TP 场景必打补丁）**：v0.26.0rc1 的 `pool_worker.py::_start_kv_transfer_threads` 构造发送/接收线程时漏传 `worker=self`，导致 tp_mismatch 的 put/get 分支是**死代码**。必须先打 `patch_tp_mismatch_worker.patch`（容器内 `cd /vllm-workspace/vllm-ascend && git apply --check <补丁> && git apply -v <补丁>`，或 `patch -p1`；`git apply -R --check` 探测是否已打）。同构场景不受影响，无需补丁。上游已在 main 修复（[#15835](https://github.com/vllm-project/vllm-ascend/pull/15835)，2026-09-09 合入，`9f8773ea`），但 **rc1 / rc2 均不含**，0.26 rc 镜像仍须打本补丁；本补丁为 #15835 完整版的 rc1 backport（含同步 load 分发）。若容器已打过旧 `.py` 子集补丁，先恢复其 `.bak.<时间戳>` 备份（或重建容器）再打，否则上下文不匹配。
 
 **操作要点**：
 
@@ -65,7 +65,7 @@ master 在源机 `0.0.0.0:50088`；B 机 worker 配 `MC_MASTER`/`LOCAL_IP`/`HCCL
 
 ### ③ 异构同机（双向）
 
-A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`decode_tp_size=<B_TP>`。**两端容器都必须打 `patch_tp_mismatch_worker.py`**。
+A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`decode_tp_size=<B_TP>`。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
 
 方向规则（`effective_tp = max(A_TP, B_TP)`）：
 

@@ -346,7 +346,7 @@ flowchart LR
 
 **上游已修**：[vllm-ascend #15835](https://github.com/vllm-project/vllm-ascend/pull/15835)（fix #15842，2026-09-09 合入 main，merge commit `9f8773ea`；根因 = #11444 重构丢了 #11582 引入的接线）。除两处线程构造补 `worker=self if self.tp_mismatch else None`，还恢复了 `start_load_kv` 同步 load 的 mismatch 分发。**rc1 / rc2 均不含，仅 main 有**。
 
-补丁：`patch_tp_mismatch_worker.py`（幂等，自动备份）——**#15835 完整版 backport 到 rc1**：两处线程构造补 `worker=self if self.tp_mismatch else None`（同 TP 传 None、不碰普通路径）+ `start_load_kv` 恢复同步 load 的 mismatch 分发；已打过旧子集补丁（仅 `worker=self`）的容器会被自动升级。打上后小 TP 消费者同步 load 亦可走 `_load_kv_tp_mismatch`，**`LOAD_ASYNC=1` 由硬约束降为推荐项**（异步仍是 overlap 更优路径）。注意：本目录全部异构实测在旧子集补丁 + 异步路径下完成（[EXPERIMENTS.md](EXPERIMENTS.md) #5/#6/#8/#12），同步 mismatch 路径按上游修复恢复、未在本测试床单独复测；0.26 rc 镜像必须打本补丁（rc1/rc2 均不含上游修复）。
+补丁：`patch_tp_mismatch_worker.patch`（标准 unified diff，三处 hunk 锚定 rc1 唯一上下文）——**#15835 完整版 backport 到 rc1**：两处线程构造补 `worker=self if self.tp_mismatch else None`（同 TP 传 None、不碰普通路径）+ `start_load_kv` 恢复同步 load 的 mismatch 分发。容器内应用：`cd /vllm-workspace/vllm-ascend && git apply --check patch_tp_mismatch_worker.patch && git apply -v patch_tp_mismatch_worker.patch`（或 `patch -p1`）；`git apply -R --check` 探测是否已打。打上后小 TP 消费者同步 load 亦可走 `_load_kv_tp_mismatch`，**`LOAD_ASYNC=1` 由硬约束降为推荐项**（异步仍是 overlap 更优路径）。注意：本目录全部异构实测在旧 python 子集补丁 + 异步路径下完成（[EXPERIMENTS.md](EXPERIMENTS.md) #5/#6/#8/#12），同步 mismatch 路径按上游修复恢复、未在本测试床单独复测；0.26 rc 镜像必须打本补丁（rc1/rc2 均不含上游修复）。
 
 ### 异构 e2e 实测（2026-10-09，单机 245，A2 RoCE）
 
@@ -358,7 +358,7 @@ flowchart LR
 
 ### 跨机异构实测（2026-10-09，245 → 217，A=TP2 → B=TP4）
 
-配置：A=TP2（245，卡 0,1，:8001）、B=TP4（217，卡 0-3，:8002），master 在 245 宿主机 `:50088`；两端容器同镜像，217 容器需先打 `patch_tp_mismatch_worker.py`。跨机操作用 `ssh root@7.242.105.217`（密码，expect 包装；sshpass 未装）。
+配置：A=TP2（245，卡 0,1，:8001）、B=TP4（217，卡 0-3，:8002），master 在 245 宿主机 `:50088`；两端容器同镜像，217 容器需先打 `patch_tp_mismatch_worker.patch`。跨机操作用 `ssh root@7.242.105.217`（密码，expect 包装；sshpass 未装）。
 
 - 流程与单机一致：warm A → collect 24 keys（`prefix_keys_xhost_het.txt`）→ `resolve_segments.sh --target-ip 7.242.105.217 --tp 4` → precopy（245 侧容器内跑，`--targets` 平铺 4 seg）→ 打 B。
 - 结果：**24/24 key 存在**，A=TP2 的 sub-key put 跨机生效；**24/24 `replica_copy_success`**（A 侧 `client_service.cpp:2624`，~1 key/s），副本对号：rank0→`217:16471`、rank1→`217:15526`、rank2→`217:16596`、rank3→`217:15742`（每 key 双副本：245 源 seg + 217 目标 seg，`check_exists` 取证）；B 首次请求 `hit_tokens: 768/801`（**95.9%**，与单机正向一致）、零 invalid；B(DEBUG) 分 rank `MooncakeBackend.get enter keys=6` × TP0-3；A/B 同 prompt 贪心 16/64 token 输出逐字一致。
