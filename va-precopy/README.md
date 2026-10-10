@@ -384,6 +384,7 @@ va-precopy/
 - **验证覆盖面**
   - 只验证 **非 layerwise** + **本机 DRAM** 目标；layerwise / 落盘 / 编排集成见「开放问题」。
   - 新路径（rank↔seg 对号）只重跑过同构同机 TP=2，同构跨机与 TP=4 仍是 10/08 旧 key×N 路径结果（见「验证状态」表注）。
+  - 全部实测为 GQA（`put_step=1`）；`put_step>1`（MLA 塌缩，key 全在 rank 0）时 plan 全落 `targets[0]`——功能正确但其余 rank 读远端副本，该映射未验证。
 - **复制与副本**
   - copy 按 key **串行**；未做并行 / 本机扩散 / 带宽限速（与在线读共享带宽）。
   - 副本 **无 pin**：READY 后可能被池驱逐；源属主客户端（worker-A）必须在线，掉线则 copy 失败。

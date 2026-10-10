@@ -24,7 +24,7 @@ in-process; keys never touch a file unless --dump-keys is given:
 
 Debug paths: --targets/--target to skip resolution (segments known);
 --keys / --keys-file to skip key computation; standalone keys.py /
-resolve.py CLIs + ../tools/test_keys.py.
+resolve.py CLIs + ../tools/test_keys.py / test_resolve.py.
 
 Examples:
   # TP=1

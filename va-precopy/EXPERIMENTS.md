@@ -73,6 +73,7 @@
   - `precopy.py` 对反向（peer>local）自动按 `i // num_sub_keys` 展开 targets——此前须手工传重复列表（见实录反向），run_e2e 反向会报「need targets[0..3]」走不通。
   - `run_e2e.sh` `DECODE_TP_SIZE` 默认从 `$TP_B` 改为 `max(TP_A,TP_B)`：kv_both 的 decode_tp_size 是 **peer** size，两个方向都必须恒为 effective_tp；原默认在反向让 B 判「无不匹配」→ 普通 get → 假命中。
   - `run_e2e.sh` worker 就绪轮询后 fail-fast（此前未就绪也继续 warm，且正好撞上假 READY 坑）。
+  - `run_e2e.sh` 反向（TP_A>TP_B）自动给 B 注入 `LOAD_ASYNC=1`（走 #6 已验证的异步 sub-key get；同步 mismatch 路径补丁恢复后仍未复测，避免一键落在未验证路径）。
 
 **踩坑记录（跨机操作）**：
 

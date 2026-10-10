@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end va-precopy on vllm-ascend + Mooncake (validated: TP=1, A2 RoCE).
+# End-to-end va-precopy on vllm-ascend + Mooncake (validated: 同构 TP=1/2、异构双向、跨机；A2 RoCE).
 #
 #   DRY_RUN=1 bash run_e2e.sh
 #   LOCAL_IP=... NIC_NAME=... MODEL=... bash run_e2e.sh
@@ -51,6 +51,7 @@ step() { echo; echo "==== $* ===="; }
 
 if [[ "$TP_A" != "$TP_B" ]]; then
   echo "[e2e] heterogeneous TP: A=$TP_A -> B=$TP_B (prefill_tp_size=$PREFILL_TP_SIZE decode_tp_size=$DECODE_TP_SIZE; needs patch_tp_mismatch_worker.patch in container; see README 异构 TP)." >&2
+  [[ "$TP_A" -gt "$TP_B" ]] && echo "[e2e] reverse: worker-B gets LOAD_ASYNC=1 (sub-key get via the validated async path)." >&2
 elif [[ "$TP_B" != "1" ]]; then
   echo "[e2e] TP=$TP_B homogeneous: rank i keys → B local_seg[i] (see README 怎么运作)." >&2
 fi
@@ -74,7 +75,7 @@ cat <<EOF
   protocol:   $PROTOCOL  ENABLE_ASCEND_A2=$ENABLE_ASCEND_A2
   model:      $MODEL (served=$SERVED_NAME pool_model_name=$MODEL_NAME)
   prefix:     len=${#WARM_PROMPT} (base*${PREFIX_REPEAT})
-  precopy:    rank i keys → B segs[i] (segments resolved in-process unless given)
+  precopy:    rank i keys → B segs[i] (reverse hetero auto-expands i//num_sub_keys; segs resolved in-process unless given)
   AUTO_PRECOPY=$AUTO_PRECOPY KEYS_FILE=$KEYS_FILE
   TARGET_SEGMENTS=${TARGET_SEGMENTS:-<auto>}
 EOF
@@ -89,12 +90,19 @@ fi
 step "2. worker-A (source)"
 _start_worker() {
   local role=$1 port=$2 lookup=$3 devices=$4 tp=$5
+  # Reverse hetero (TP_A>TP_B): B is the small-TP consumer — route its sub-key
+  # get through the ASYNC path (the one validated in EXPERIMENTS #6); the
+  # patch restores sync mismatch load, but that path is not re-tested here.
+  local load_async_env=""
+  if [[ "$role" == "B" && "$TP_A" -gt "$TP_B" ]]; then
+    load_async_env="LOAD_ASYNC=1"
+  fi
   ROLE=$role PORT=$port LOOKUP_ID=$lookup ASCEND_RT_VISIBLE_DEVICES=$devices \
     MODEL=$MODEL SERVED_NAME=$SERVED_NAME MC_MASTER=$MC_MASTER \
     MOONCAKE_PROTOCOL=$PROTOCOL TP=$tp MAX_MODEL_LEN=$MAX_MODEL_LEN \
     PREFILL_TP_SIZE=$PREFILL_TP_SIZE DECODE_TP_SIZE=$DECODE_TP_SIZE \
     ENABLE_ASCEND_A2=$ENABLE_ASCEND_A2 DRY_RUN=$DRY_RUN \
-    bash "$SCRIPT_DIR/cluster/start_worker.sh"
+    env $load_async_env bash "$SCRIPT_DIR/cluster/start_worker.sh"
 }
 _start_worker A "$PORT_A" 0 "$DEVICES_A" "$TP_A"
 
