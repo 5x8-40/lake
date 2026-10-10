@@ -136,4 +136,4 @@ fi
 nohup "${CMD[@]}" >"$LOGDIR/worker_${ROLE}.log" 2>&1 &
 echo $! >"$LOGDIR/worker_${ROLE}.pid"
 echo "[worker-$ROLE] pid=$(cat "$LOGDIR/worker_${ROLE}.pid") log=$LOGDIR/worker_${ROLE}.log"
-echo "[worker-$ROLE] tip: find local_seg in Mooncake setup logs for precopy.py --target"
+echo "[worker-$ROLE] tip: rank<->seg 由 resolve_segments.sh 解析（master admin :9003 + pidfile/ss，不读日志）"

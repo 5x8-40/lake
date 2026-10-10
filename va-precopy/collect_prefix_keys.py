@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Build prefix_keys.txt from a warm prompt (vllm-ascend container).
 
-Recomputes engine block hashes with PYTHONHASHSEED-aligned NONE_HASH, then
-expands PoolKeys for all head_or_tp_rank (homogeneous TP), optionally checks
-Mooncake batch_is_exist.
+Recomputes engine block hashes by IMPORTING vllm's own hash chain
+(``kv_cache_utils.hash_block_tokens`` + ``get_hash_fn_by_name``), then expands
+PoolKeys for all head_or_tp_rank via keys.py (which imports vllm-ascend
+``PoolKey`` when available). Nothing about the key format or hash algorithm
+is reimplemented here — only the enumeration loop is ours.
 
 Requires: transformers + vllm + vllm_ascend (inside vllm-ascend image).
 For offline key formatting from known hexes, use keys.py instead.
@@ -28,18 +30,27 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
+import keys as keys_mod
 from keys import expand_store_keys, group_keys_by_rank
 
 
-def _hash_prompt(model_path: str, prefix: str, block_size: int) -> tuple[list[str], int]:
+def _hash_prompt(
+    model_path: str, prefix: str, block_size: int, hash_algo: str
+) -> tuple[list[str], int]:
     from transformers import AutoTokenizer
     from vllm.utils.hashing import get_hash_fn_by_name
     from vllm.v1.core import kv_cache_utils as ku
-    from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
-        block_hash_to_str,
-    )
 
-    hash_fn = get_hash_fn_by_name("sha256")
+    try:  # v0.26 rc1/rc2 layout
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+            block_hash_to_str,
+        )
+    except ImportError:  # main layout (config_data.py renamed metadata.py)
+        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+            block_hash_to_str,
+        )
+
+    hash_fn = get_hash_fn_by_name(hash_algo)
     ku.init_none_hash(hash_fn)
 
     tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -70,6 +81,11 @@ def main() -> int:
     )
     p.add_argument("--prefix-repeat", type=int, default=80)
     p.add_argument("--block-size", type=int, default=128)
+    p.add_argument(
+        "--hash-algo",
+        default=os.environ.get("PREFIX_CACHING_HASH_ALGO", "sha256"),
+        help="must match engine prefix_caching_hash_algo (vllm default: sha256)",
+    )
     p.add_argument(
         "--tp-size",
         type=int,
@@ -106,16 +122,16 @@ def main() -> int:
     p.add_argument("--device", type=int, default=0, help="NPU for ascend setup_store")
     args = p.parse_args()
 
-    if os.environ.get("PYTHONHASHSEED") is None:
+    if args.hash_algo == "builtin" and os.environ.get("PYTHONHASHSEED") is None:
         print(
-            "[collect_prefix_keys] WARN: PYTHONHASHSEED unset; "
+            "[collect_prefix_keys] WARN: hash-algo=builtin but PYTHONHASHSEED unset; "
             "engine used PYTHONHASHSEED=0 — set the same or hashes will miss",
             file=sys.stderr,
         )
 
     model_name = args.model_name or os.path.basename(args.model.rstrip("/"))
     prefix = args.prefix * args.prefix_repeat
-    hexes, n_tokens = _hash_prompt(args.model, prefix, args.block_size)
+    hexes, n_tokens = _hash_prompt(args.model, prefix, args.block_size, args.hash_algo)
     effective_tp = args.tp_size
     if args.peer_tp_size and args.peer_tp_size != args.tp_size:
         effective_tp = max(args.tp_size, args.peer_tp_size)
@@ -126,11 +142,17 @@ def main() -> int:
         put_step=args.put_step,
     )
     by_rank = group_keys_by_rank(keys)
+    key_src = (
+        "upstream(vllm_ascend.PoolKey)"
+        if keys_mod.upstream_key_classes() is not None
+        else "builtin-mirror(OFFLINE, drift risk!)"
+    )
     print(
         f"n_tokens={n_tokens} n_full_blocks={len(hexes)} "
         f"tp_size={args.tp_size} peer_tp_size={args.peer_tp_size} "
         f"effective_tp={effective_tp} put_step={args.put_step} "
-        f"ranks={sorted(by_rank)} keys={len(keys)} model_name={model_name}"
+        f"ranks={sorted(by_rank)} keys={len(keys)} model_name={model_name} "
+        f"hash_algo={args.hash_algo} key_format={key_src}"
     )
 
     out_path = args.out

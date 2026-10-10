@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """Build Mooncake object keys matching vllm-ascend AscendStoreConnector.
 
-Key string format is owned by vllm-ascend ``PoolKey.to_string()`` /
-``LayerPoolKey.to_string()`` in ``config_data.py`` (0.26). This module
-reimplements that format in pure Python so the prefetcher does not
-import torch / vllm.
+Key string format is OWNED by vllm-ascend ``PoolKey.to_string()``
+(rc1: ``.../ascend_store/config_data.py``; main: ``.../ascend_store/metadata.py``).
+Inside a vllm-ascend container this module IMPORTS the upstream classes and
+constructs keys **by field name** (``dataclasses.fields``), so upstream format
+changes — e.g. rc1 ``KeyMetadata.pcp_rank`` / ``@pcp:`` in to_string, both
+removed on main — are followed automatically instead of silently drifting.
 
-Prefer importing the real helpers when running inside a vllm-ascend
-container (``--prefer-upstream``). Offline / no-NPU: use this builder
-with known block-hash hex strings.
+Offline (vllm_ascend not importable): falls back to the built-in rc1 mirror
+``KeySpec`` with a loud stderr warning. Drift sentinel in-container:
+``collect_prefix_keys.py --check-master`` (batch_is_exist must be 100%),
+plus ``test_keys.py::test_upstream_parity``.
 """
 
 from __future__ import annotations
@@ -39,8 +42,85 @@ def group_keys_by_rank(keys: list[str]) -> dict[int, list[str]]:
     return dict(sorted(out.items()))
 
 
+# ---------------------------------------------------------------------------
+# Upstream import (preferred path)
+# ---------------------------------------------------------------------------
+
+_UPSTREAM: tuple | bool | None = None  # (KeyMetadata, PoolKey) | False
+
+
+def upstream_key_classes() -> tuple | None:
+    """Lazy-import vllm-ascend (KeyMetadata, PoolKey); None when unavailable."""
+    global _UPSTREAM
+    if _UPSTREAM is not None:
+        return _UPSTREAM or None
+    try:
+        try:  # v0.26 rc1/rc2 layout
+            from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
+                KeyMetadata,
+                PoolKey,
+            )
+        except ImportError:  # main layout (config_data.py renamed metadata.py)
+            from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.metadata import (
+                KeyMetadata,
+                PoolKey,
+            )
+        _UPSTREAM = (KeyMetadata, PoolKey)
+    except Exception:
+        _UPSTREAM = False
+    return _UPSTREAM or None
+
+
+def _make_keys_upstream(
+    model_name: str,
+    chunk_hash: str,
+    *,
+    head_or_tp_rank: int = 0,
+    pcp_rank: int = 0,
+    dcp_rank: int = 0,
+    pp_rank: int = 0,
+    kv_cache_group_id: int = 0,
+    cache_role: str = "kv",
+    cache_family: str = "default",
+    num_layers: int = 0,
+) -> list[str]:
+    """Construct via upstream PoolKey, passing only fields this version has.
+
+    rc1 KeyMetadata has ``pcp_rank`` (and ``@pcp:`` in to_string); main does
+    not. Filtering by ``dataclasses.fields`` keeps both working.
+    """
+    from dataclasses import fields
+
+    KeyMetadata, PoolKey = upstream_key_classes()  # type: ignore[misc]
+    known = {f.name for f in fields(KeyMetadata)}
+    wanted = {
+        "model_name": model_name,
+        "head_or_tp_rank": head_or_tp_rank,
+        "pcp_rank": pcp_rank,
+        "dcp_rank": dcp_rank,
+        "pp_rank": pp_rank,
+        "kv_cache_group_id": kv_cache_group_id,
+        "cache_role": cache_role,
+        "cache_family": cache_family,
+    }
+    km = KeyMetadata(**{k: v for k, v in wanted.items() if k in known})
+    pk = PoolKey(km, chunk_hash)
+    if num_layers > 0:
+        return [lk.to_string() for lk in pk.split_layers(num_layers)]
+    return [pk.to_string()]
+
+
+# ---------------------------------------------------------------------------
+# Offline mirror (fallback only; rc1 format)
+# ---------------------------------------------------------------------------
+
+
 @dataclass(frozen=True)
 class KeySpec:
+    """Pure-python rc1-format mirror. OFFLINE FALLBACK ONLY — the container
+    path imports upstream PoolKey instead. If upstream changes the format,
+    this mirror drifts; test_keys.py::test_upstream_parity goes red."""
+
     model_name: str
     chunk_hash: str
     head_or_tp_rank: int = 0
@@ -53,7 +133,7 @@ class KeySpec:
     layer_id: int | None = None
 
     def to_string(self) -> str:
-        # Mirror vllm_ascend...config_data.PoolKey / LayerPoolKey.to_string
+        # Mirror of rc1 config_data.PoolKey / LayerPoolKey.to_string
         if self.layer_id is None:
             return (
                 f"{self.model_name}"
@@ -77,6 +157,9 @@ class KeySpec:
         )
 
 
+_WARNED_MIRROR = False
+
+
 def expand_store_keys(
     *,
     model_name: str,
@@ -90,8 +173,24 @@ def expand_store_keys(
     num_layers: int = 0,
     kv_cache_group_id: int = 0,
     cache_family: str = "default",
+    prefer_upstream: bool = True,
 ) -> list[str]:
-    """Same enumeration as ``PoolScheduler._generate_store_query_keys``."""
+    """Same enumeration as ``PoolScheduler._generate_store_query_keys``.
+
+    Key strings come from upstream PoolKey when importable (default);
+    the built-in rc1 mirror is only an offline fallback.
+    """
+    global _WARNED_MIRROR
+    if include_layers and num_layers <= 0:
+        raise ValueError("include_layers requires num_layers > 0")
+    use_upstream = prefer_upstream and upstream_key_classes() is not None
+    if prefer_upstream and not use_upstream and not _WARNED_MIRROR:
+        print(
+            "WARN: vllm_ascend not importable; using built-in rc1 key mirror "
+            "(OFFLINE fallback — format may drift from engine)",
+            file=sys.stderr,
+        )
+        _WARNED_MIRROR = True
     head_or_tp_ranks = max(tp_size // max(put_step, 1), 1)
     keys: list[str] = []
     for chunk_hash in chunk_hashes:
@@ -99,21 +198,21 @@ def expand_store_keys(
             for dcp_rank in range(dcp_size):
                 for head_or_tp_rank in range(head_or_tp_ranks):
                     for pp_rank in range(pp_size):
-                        base = KeySpec(
-                            model_name=model_name,
-                            chunk_hash=chunk_hash,
-                            head_or_tp_rank=head_or_tp_rank,
-                            pcp_rank=pcp_rank,
-                            dcp_rank=dcp_rank,
-                            pp_rank=pp_rank,
-                            kv_cache_group_id=kv_cache_group_id,
-                            cache_family=cache_family,
-                        )
-                        if include_layers:
-                            if num_layers <= 0:
-                                raise ValueError(
-                                    "include_layers requires num_layers > 0"
+                        if use_upstream:
+                            keys.extend(
+                                _make_keys_upstream(
+                                    model_name,
+                                    chunk_hash,
+                                    head_or_tp_rank=head_or_tp_rank,
+                                    pcp_rank=pcp_rank,
+                                    dcp_rank=dcp_rank,
+                                    pp_rank=pp_rank,
+                                    kv_cache_group_id=kv_cache_group_id,
+                                    cache_family=cache_family,
+                                    num_layers=num_layers if include_layers else 0,
                                 )
+                            )
+                        elif include_layers:
                             for layer_id in range(num_layers):
                                 # LayerPoolKey.to_string omits pp_rank
                                 keys.append(
@@ -130,46 +229,18 @@ def expand_store_keys(
                                     ).to_string()
                                 )
                         else:
-                            keys.append(base.to_string())
-    return keys
-
-
-def try_upstream_expand(args: argparse.Namespace) -> list[str] | None:
-    """Optional: call real vllm-ascend helpers when installed."""
-    try:
-        from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (  # type: ignore
-            KeyMetadata,
-            PoolKey,
-        )
-    except Exception:
-        return None
-
-    head_or_tp_ranks = max(args.tp_size // max(args.put_step, 1), 1)
-    keys: list[str] = []
-    for chunk_hash in args.chunk_hashes:
-        for pcp_rank in range(args.pcp_size):
-            for dcp_rank in range(args.dcp_size):
-                for head_or_tp_rank in range(head_or_tp_ranks):
-                    for pp_rank in range(args.pp_size):
-                        pk = PoolKey(
-                            KeyMetadata(
-                                args.model_name,
-                                head_or_tp_rank,
-                                pcp_rank,
-                                dcp_rank,
-                                pp_rank,
-                                kv_cache_group_id=args.group_id,
-                                cache_family=args.cache_family,
-                            ),
-                            chunk_hash,
-                        )
-                        if args.include_layers:
-                            keys.extend(
-                                lk.to_string()
-                                for lk in pk.split_layers(args.num_layers)
+                            keys.append(
+                                KeySpec(
+                                    model_name=model_name,
+                                    chunk_hash=chunk_hash,
+                                    head_or_tp_rank=head_or_tp_rank,
+                                    pcp_rank=pcp_rank,
+                                    dcp_rank=dcp_rank,
+                                    pp_rank=pp_rank,
+                                    kv_cache_group_id=kv_cache_group_id,
+                                    cache_family=cache_family,
+                                ).to_string()
                             )
-                        else:
-                            keys.append(pk.to_string())
     return keys
 
 
@@ -190,34 +261,31 @@ def main() -> int:
     p.add_argument("--cache-family", default="default")
     p.add_argument("--include-layers", action="store_true")
     p.add_argument("--num-layers", type=int, default=0)
-    p.add_argument("--prefer-upstream", action="store_true")
+    p.add_argument(
+        "--prefer-upstream",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="import vllm-ascend PoolKey (default; --no-prefer-upstream forces mirror)",
+    )
     p.add_argument("--out", default="", help="write keys one per line; default stdout")
     p.add_argument("--json", action="store_true", help="print JSON array")
     args = p.parse_args()
     args.chunk_hashes = [h.strip() for h in args.chunk_hashes.split(",") if h.strip()]
 
-    keys: list[str] | None = None
-    if args.prefer_upstream:
-        keys = try_upstream_expand(args)
-        if keys is None:
-            print(
-                "WARN: vllm_ascend not importable; using local PoolKey mirror",
-                file=sys.stderr,
-            )
-    if keys is None:
-        keys = expand_store_keys(
-            model_name=args.model_name,
-            chunk_hashes=args.chunk_hashes,
-            tp_size=args.tp_size,
-            put_step=args.put_step,
-            pcp_size=args.pcp_size,
-            dcp_size=args.dcp_size,
-            pp_size=args.pp_size,
-            include_layers=args.include_layers,
-            num_layers=args.num_layers,
-            kv_cache_group_id=args.group_id,
-            cache_family=args.cache_family,
-        )
+    keys = expand_store_keys(
+        model_name=args.model_name,
+        chunk_hashes=args.chunk_hashes,
+        tp_size=args.tp_size,
+        put_step=args.put_step,
+        pcp_size=args.pcp_size,
+        dcp_size=args.dcp_size,
+        pp_size=args.pp_size,
+        include_layers=args.include_layers,
+        num_layers=args.num_layers,
+        kv_cache_group_id=args.group_id,
+        cache_family=args.cache_family,
+        prefer_upstream=args.prefer_upstream,
+    )
 
     if args.json:
         text = json.dumps(keys, ensure_ascii=False, indent=2)

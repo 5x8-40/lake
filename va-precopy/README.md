@@ -22,7 +22,7 @@
 |------|------|
 | **同机 TP=2**（VL-8B，`DEVICES_A=0,1` / `B=2,3`） | **通过**：12 keys（rank0/1×6 满块）；rank0→B:`15466`、rank1→B:`15594` READY；打 B 后 `hits=768` / `queries=801` ≈ **95.9%** |
 
-说明：旧 master 日志无 `mount_segment` 时 `resolve_segments.sh` 会失败——可从 `worker_B.log` 的 `Transfer Engine RPC ... listening on IP:port` 取两段作 `--targets`（按 rank 序）。`precopy` 退出偶发 allocator abort，**已打印 READY 即可忽略**。
+说明：`resolve_segments.sh` **不读任何日志**——seg 名单取自 master admin API（`GET :9003/get_all_segments`），rank↔seg 对号用 `start_worker.sh` 写的 pidfile + 进程树 `ss -ltnp` 端口与名单求交，对不上即 fail loud（见「Key 与 segment」）。`precopy` 退出偶发 allocator abort 已修复（READY 后显式 `store.close()`）。
 
 ### 历史（2026-10-08，旧 key×N 广播路径）
 
@@ -55,7 +55,7 @@ B2：请求前把前缀 KV 放到目标实例本机 DRAM。先把三个对象讲
 | **Key 集合** | `collect_prefix_keys.py --tp-size N` 展开 `head_or_tp_rank:0..N/put_step-1` × 满块（`keys.py::expand_store_keys`） |
 | **多 seg** | `precopy.py --targets seg0,seg1,...`：**rank i 的 key 只 copy 到 `targets[i]`**（不再 key×N 广播） |
 | **调度** | 仍 **按 key 串行** `create_copy_and_wait`；映射已对号入座 |
-| **解析 seg** | `resolve_segments.sh --target-ip B_IP --tp N` → `TARGET_SEGMENTS`（按 mount 时间序 ≈ rank 0..N-1） |
+| **解析 seg** | `resolve_segments.sh --role B --tp N` → `TARGET_SEGMENTS`（master admin API 名单 ∩ pidfile 进程树 `ss` 端口；rank 取自 `VLLM::Worker_TP<N>` 进程名，对不上即 fail loud，**不读日志**） |
 | **未做** | 多 key/多 seg **并行**；跨机一份 + 同机扩散；异构 TP 见下节（已验证，需容器补丁） |
 
 注意 `4×K` 把 key ≠ 4 倍数据：每把 key 只是**某个 rank 的切片**，合起来才是一份完整 KV（总字节 ≈ 一份逻辑 KV）——不是每把 key 都在 4 个 seg 上各留全量副本。
@@ -87,15 +87,21 @@ precopy.py / run_e2e.sh    独立进程：create_copy_task → READY
 ```mermaid
 sequenceDiagram
     autonumber
-    participant CP as 控制面（va-precopy 独立进程）
-    participant M as mooncake_master<br/>key→副本→seg 权威
-    participant A as Worker A（源，N rank）
-    participant B as Worker B（目标，N rank）
     participant G as gateway/router
+    participant A as Worker A（源，N rank）
+    participant M as mooncake_master<br/>key→副本→seg 权威 + admin :9003
+    participant CP as 控制面（va-precopy 独立进程）【脚手架】
+    participant B as Worker B（目标，N rank）
 
-    Note over A: warm：rank i put 自己的 KV 分片<br/>key@rank:i 落 A seg_i（preferred_segment 钉住）
-    CP->>CP: collect：重算 block hash<br/>展开全 rank key（rank 0..N-1）
-    CP->>CP: resolve：得 B 的 N 个 seg<br/>（rank→seg 对号）
+    Note over G,M: 阶段 1 · 暖场：前缀 KV 进池（普通请求路径）
+    G->>A: warm 请求（共享前缀）
+    A->>M: rank i put 自己的 KV 分片<br/>key@rank:i 落 A seg_i（preferred_segment 钉住）
+
+    Note over CP,B: 阶段 2 · 控制面预复制（B2，引擎不参与）
+    CP->>CP: collect：import vllm hash 链 +<br/>vllm-ascend PoolKey 展开全 rank key<br/>【脚手架特有：生产由调度侧给 key】
+    CP->>M: batch_is_exist 核对（格式漂移哨兵）
+    CP->>M: GET :9003/get_all_segments（seg 名单）
+    CP->>B: pidfile+进程树+ss 对号 rank→seg<br/>与名单求交，不符即 fail loud<br/>【脚手架特有：生产由编排层掌握拓扑】
     loop 每个 key（当前串行，可并行化）
         CP->>M: create_copy_task(key@rank:i, [B seg_i])
         M-->>A: 给源属主派 REPLICA_COPY 后台任务
@@ -104,13 +110,31 @@ sequenceDiagram
     end
     CP->>M: batch_get_replica_desc 逐 key 核验本机副本
     CP->>G: READY → 放行
+
+    Note over G,B: 阶段 3 · 真实请求：local-first 读本机副本
     G->>B: 真实请求
-    B->>M: 每 rank get 自己 rank 的 key（BatchQuery）
+    B->>M: 每 rank BatchQuery 自己 rank 的 key
     M-->>B: 副本列表（含 B 本机副本）
     Note over B: 客户端 local-first（SelectBestReplica）<br/>选本机 seg → 本机 DRAM 读，零跨机 RDMA
 ```
 
 注：图中「READY → 放行」目前由 `run_e2e.sh` / 手工顺序保证，接 gateway/router 的编排集成见「开放问题 #2」；「哪个 key 在哪个 seg」无需通知任何人——master 是放置权威，get 时 `BatchQuery` 现查；副本无 pin，READY 后受池驱逐策略管理。
+
+## 数据来源与日志边界
+
+**设计约束：任何脚本不得解析任何日志来做控制决策。** 控制流每个输入都有 API / OS 级来源：
+
+| 控制面需要 | 来源 | 性质 |
+|-----------|------|------|
+| B 的 seg 名单 | `GET :9003/get_all_segments`（master admin，纯文本逐行） | master API（`start_master.sh` 默认开 9003） |
+| rank↔seg 对号 | `logs/worker_<ROLE>.pid` → 进程树 → `ss -ltnp` 端口 ∩ 名单；rank 取 `VLLM::Worker_TP<N>` 进程名 | OS 级（跨机经 `--ssh`） |
+| key 名单核对 | `batch_is_exist` / `batch_get_replica_desc` | 客户端 API |
+| READY 判定 | `query_task` + `batch_get_replica_desc` | 客户端 API |
+| worker 就绪 | 轮询 HTTP `/v1/models` | HTTP API |
+
+日志只剩**人工取证**角色，不参与任何控制流：分 rank `MooncakeBackend.get enter keys=`（0.3.11 无等效 API，vLLM `/metrics` 只有聚合 external hit）、源侧 `replica_copy_success` 计数——这些是版本限制下的取证手段，REPRODUCE §3 的三层判据靠人读，脚本不读。
+
+**key 格式与 hash 一律 import 上游权威实现，不自己搬**：block hash 链 import vllm `kv_cache_utils`（`collect_prefix_keys.py`）；PoolKey 字符串格式 import vllm-ascend `PoolKey`/`KeyMetadata`（`keys.py`，rc1=`config_data.py` / main=`metadata.py` 自适应，按字段名构造——rc1 有 `pcp_rank`、main 已删，位置参数构造会漂移）。上游改格式时 import 自动跟随；两道哨兵兜底：`collect --check-master`（key 对不上即 exit 2）与 `test_keys.py::test_upstream_parity`（容器内镜像 vs 上游逐字节比对）。`keys.py` 内置的 rc1 纯 Python 镜像只作离线 fallback（打印 WARN）。
 
 ## 目录
 
@@ -122,17 +146,17 @@ sequenceDiagram
 | `env_ascend_a2.sh` | A2 RoCE 环境（`HCCL_INTRA_ROCE_ENABLE` 等），供 source |
 | `common.py` | Mooncake store 封装 |
 | `precopy.py` | 控制面：`--targets` 时 rank→seg 映射后 `create_copy_task` |
-| `collect_prefix_keys.py` | warm prompt → block hash → 全 rank PoolKey → `prefix_keys.txt` |
-| `resolve_segments.sh` | master 日志解析 seg；`--target-ip`+`--tp` → `TARGET_SEGMENTS` |
+| `collect_prefix_keys.py` | warm prompt → import vllm hash 链 → 全 rank PoolKey → `prefix_keys.txt`（`--check-master` 漂移哨兵） |
+| `resolve_segments.sh` | master admin API + pidfile/ss 对号 seg（**不解析日志**）；`--role`/`--tp`/`--ssh` → `TARGET_SEGMENTS` |
 | `stop_cluster.sh` | 停 worker（可选停 master） |
 | `store_demo.py` | Store 半程（无 vLLM） |
-| `keys.py` | 按 AscendStore `PoolKey` 格式枚举 object key（已知 hex） |
+| `keys.py` | 枚举 object key：容器内 import vllm-ascend `PoolKey`（权威），内置 rc1 镜像仅离线 fallback |
 | `start_master.sh` | 拉起 `mooncake_master` |
 | `start_worker.sh` | 拉起单实例 vllm-ascend + AscendStoreConnector |
 | `run_store_demo.sh` | 跑 store 半程 |
 | `run_e2e.sh` | 双 worker 编排 + 自动 warm/precopy/hit B |
 | `conf/mooncake.json.example` | Mooncake 配置样例 |
-| `test_keys.py` | `keys.py` 纯单测 |
+| `test_keys.py` | `keys.py` 单测 + 容器内 upstream 一致性哨兵 |
 
 ## 快速开始
 
@@ -211,9 +235,11 @@ PYTHONHASHSEED=0 python3 collect_prefix_keys.py \
   --out prefix_keys.txt \
   --check-master 127.0.0.1:50088
 
-# TP=1: resolve 最近两次 mount；TP>1: --target-ip + --tp
-eval "$(bash resolve_segments.sh --export)"
-# eval "$(bash resolve_segments.sh --export --target-ip "$LOCAL_IP" --tp "$TP")"
+# resolve：admin API + pidfile/ss（不读日志）；TP=N 加 --tp N
+eval "$(bash resolve_segments.sh --export --role B --tp "${TP:-1}")"
+# 跨机：B 侧探测走 ssh，pidfile 是 B 机上的克隆路径
+# eval "$(bash resolve_segments.sh --export --role B --tp "$TP" \
+#   --ssh 'ssh root@B_IP' --pidfile /root/va-precopy/logs/worker_B.pid)"
 
 python3 precopy.py \
   --master 127.0.0.1:50088 \
@@ -233,7 +259,7 @@ python3 precopy.py \
 | `HCCL_INTRA_ROCE_ENABLE=1` | 卡间 RoCE 单边通信（缺则 `HcclBatchPut=4`） |
 | `HCCL_IF_IP` | 主机业务 IP（与 segment 名中的 IP 一致） |
 | `HCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` / `TP_SOCKET_IFNAME` | 业务网卡名 |
-| `PYTHONHASHSEED=0` | 与控制面重算 block hash 对齐 |
+| `PYTHONHASHSEED=0` | legacy 防御；仅 block hash algo=builtin 时影响与控制面对齐（默认 sha256 不需要） |
 | `HCCL_NPU_SOCKET_PORT_RANGE` | 同机多 worker 分端口段（脚本按 ROLE 默认 26000/26100） |
 
 非 A2（如 A3 HCCS）设 `ENABLE_ASCEND_A2=0` 并按官方文档导出对应变量。
@@ -264,9 +290,9 @@ python3 precopy.py \
 
 概念见「实现现状 · 三个对象」，这里是操作指针：
 
-- **key 枚举**：`collect_prefix_keys.py --tp-size N`（在线核对 + 展开全 rank）；离线纯枚举用 `keys.py`。
-- **seg 解析**：TP=1 时 `resolve_segments.sh` 取最近两次 mount；TP>1 时 `--target-ip B_IP --tp N`（按 mount 序 ≈ rank 序）。
-- **chunk hash**：`PYTHONHASHSEED` 与引擎一致（worker 默认 0），否则重算的 block hash 对不上、key 全 miss。
+- **key 枚举**：`collect_prefix_keys.py --tp-size N`——hash 链与 PoolKey 格式都 **import 上游权威实现**（见「数据来源与日志边界」）；`keys.py` 内置镜像仅离线 fallback。
+- **seg 解析**：`resolve_segments.sh --role B --tp N`（**不读日志**）：名单 = `GET :9003/get_all_segments`；对号 = `logs/worker_B.pid` → 进程树 → `ss -ltnp` 端口 ∩ 名单；rank 号取进程名 `VLLM::Worker_TP<N>`（TP=1 不需要）。任何一步对不上即 fail loud。跨机：`--ssh 'ssh root@B_IP' --pidfile <B 机路径>`。
+- **chunk hash**：`--hash-algo`（默认 sha256）与引擎 `prefix_caching_hash_algo` 一致即可；`PYTHONHASHSEED=0` 只在 algo=builtin 时才需要（legacy 防御）。
 
 ## 验收
 
@@ -275,6 +301,7 @@ python3 precopy.py \
 | `DRY_RUN=1 bash run_e2e.sh` | 打印 master / A / B / precopy 步骤 |
 | `run_e2e.sh`（TP=1 + A2 env） | `[precopy] READY`；B 侧 External prefix hit |
 | `precopy.py --targets` | 各 key AFTER 仅含其 mapped seg |
+| `bash resolve_segments.sh --role B --tp N` | 输出 rank↔seg 映射（admin API + pidfile/ss，无日志）；任一源不符即 fail loud |
 | api_server `/proc/<pid>/environ` | 含 `HCCL_INTRA_ROCE_ENABLE=1` |
 | `python3 test_keys.py` | `PASS` |
 
@@ -282,7 +309,7 @@ python3 precopy.py \
 
 - 同构 **TP=2 rank↔seg** 已通过（见上）；TP=4 新路径未重跑。旧 key×N 历史结果仍有效作对照。
 - copy 仍按 key **串行**；未做并行 / 本机扩散。
-- `resolve_segments.sh` 依赖本目录 `mooncake_master.log` 的 `mount_segment`；master 若为旧进程/日志不在此文件则失败——改从 `worker_*.log` 取 `listening on IP:port` 填 `--targets`。
+- `resolve_segments.sh` 的新依赖：master admin `:9003` 在线（`start_master.sh` 默认开）；`start_worker.sh` 写的 pidfile（跨机经 `--ssh` 在 B 机读）；TP>1 时 rank 号依赖 vLLM 进程名 `VLLM::Worker_TP<N>`——vLLM 改命名会 **fail loud**（不会静默错配），届时按 `pgrep -af 'VLLM::'` 实际输出更新脚本模式。
 - `precopy.py` 退出期偶发 allocator abort / 挂起：**已修复**（READY 后显式 `store.close()`，与 check_exists / collect / store_demo 对齐；此前 precopy 是唯一不 close 的脚本）。根因 = 客户端退出期 teardown 竞态：GC/atexit 触发的乱序析构与在途收尾操作（copy-task 收尾连接、重连协程）竞争，0.3.11.post1 缺上游 #3943（teardown drain）等修复；旧日志中出现时 READY 已打印即可忽略。
 - 源属主客户端（worker-A）必须在线；副本 **无 pin**；与读共享带宽。
 - 生成物已 `.gitignore`；本目录只验证 **非 layerwise** + **本机 DRAM**。
@@ -295,7 +322,8 @@ python3 precopy.py \
 PYTHONHASHSEED=0 python3 collect_prefix_keys.py \
   --model ... --model-name ... --tp-size 4 --block-size 1536 \
   --out prefix_keys.txt --check-master A_IP:50088
-eval "$(bash resolve_segments.sh --export --target-ip B_IP --tp 4)"
+eval "$(bash resolve_segments.sh --export --role B --tp 4 --master A_IP:50088 \
+  --ssh 'ssh root@B_IP' --pidfile /root/va-precopy/logs/worker_B.pid)"
 python3 precopy.py --master A_IP:50088 --protocol ascend \
   --targets "$TARGET_SEGMENTS" --keys-file prefix_keys.txt --dry-show-before
 # 再打 B:8002；看 external_prefix_cache_*
@@ -365,7 +393,7 @@ flowchart LR
 - 流程与单机一致：warm A → collect 24 keys（`prefix_keys_xhost_het.txt`）→ `resolve_segments.sh --target-ip 7.242.105.217 --tp 4` → precopy（245 侧容器内跑，`--targets` 平铺 4 seg）→ 打 B。
 - 结果：**24/24 key 存在**，A=TP2 的 sub-key put 跨机生效；**24/24 `replica_copy_success`**（A 侧 `client_service.cpp:2624`，~1 key/s），副本对号：rank0→`217:16471`、rank1→`217:15526`、rank2→`217:16596`、rank3→`217:15742`（每 key 双副本：245 源 seg + 217 目标 seg，`check_exists` 取证）；B 首次请求 `hit_tokens: 768/801`（**95.9%**，与单机正向一致）、零 invalid；B(DEBUG) 分 rank `MooncakeBackend.get enter keys=6` × TP0-3；A/B 同 prompt 贪心 16/64 token 输出逐字一致。
 - 坑（跨机新增）：217 容器残留 10/8 的旧 worker-B —— vLLM `setproctitle` 后进程名是 `VLLM::EngineCore/Worker_TP/AAPIServer`，`ps | grep python|vllm` **搜不到**（大小写躲过），旧进程占着 8002 端口与卡 0-3 显存，新 B 起不来或假 READY（`/v1/models` 由旧实例应答）。清理用 `pgrep -f "VLLM::"` + `npu-smi info -t usages -i <id>` 核对 HBM 释放（注意 pgrep 模式含 "VLLM::" 时会匹配自身 ssh 命令行，用 `VLLM::[W]` 括号技巧）。
-- master 日志：`logs/mooncake_master.log` 被轮转后 master 的 fd 仍写在改名文件上（`.bak.27b`），`resolve_segments.sh` 读不到 mount_segment 行 —— `ln -sf mooncake_master.log.bak.27b logs/mooncake_master.log` 即可。
+- master 日志（历史坑，已失效）：当时 `resolve_segments.sh` 读 `logs/mooncake_master.log` 的 mount 行，日志轮转后 fd 仍写在改名文件上（`.bak.27b`）导致读不到——`ln -sf` 修复。2026-10-10 起 resolve 改走 admin API + pidfile/ss，此坑不存在了。
 
 ### 反向 A=TP4 → B=TP2 实测（2026-10-09，单机 245）
 

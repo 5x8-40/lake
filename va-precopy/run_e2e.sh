@@ -161,15 +161,12 @@ if ! python3 "$SCRIPT_DIR/collect_prefix_keys.py" \
 fi
 
 if [[ -z "$TARGET_SEGMENTS" ]]; then
-  if [[ "$TP_B" -gt 1 ]]; then
-    if [[ -z "$RESOLVE_TARGET_IP" ]]; then
-      echo "[e2e] ERROR: TP_B=$TP_B needs TARGET_SEGMENTS or RESOLVE_TARGET_IP/LOCAL_IP" >&2
-      exit 1
-    fi
-    eval "$(bash "$SCRIPT_DIR/resolve_segments.sh" --export --target-ip "$RESOLVE_TARGET_IP" --tp "$TP_B")"
-  else
-    eval "$(bash "$SCRIPT_DIR/resolve_segments.sh" --export)"
-  fi
+  # resolve_segments.sh: master admin API + pidfile/ss cross-check (no log parsing).
+  RESOLVE_ARGS=(--export --role B --tp "$TP_B")
+  [[ -n "$RESOLVE_TARGET_IP" ]] && RESOLVE_ARGS+=(--target-ip "$RESOLVE_TARGET_IP")
+  [[ -n "${RESOLVE_SSH:-}" ]] && RESOLVE_ARGS+=(--ssh "$RESOLVE_SSH")
+  [[ -n "${RESOLVE_PIDFILE:-}" ]] && RESOLVE_ARGS+=(--pidfile "$RESOLVE_PIDFILE")
+  eval "$(bash "$SCRIPT_DIR/resolve_segments.sh" "${RESOLVE_ARGS[@]}")"
   echo "[e2e] auto TARGET_SEGMENTS=$TARGET_SEGMENTS (SEG_A=$SEG_A)"
 fi
 
@@ -200,4 +197,4 @@ curl -s "http://127.0.0.1:${PORT_B}/v1/completions" \
   -H 'Content-Type: application/json' \
   -d "$BODY"
 echo
-echo "DONE - expect External prefix cache hit on worker-B (see logs/worker_B.log)"
+echo "DONE - expect External prefix cache hit on worker-B (人工取证: logs/worker_B.log；脚本不解析日志)"
