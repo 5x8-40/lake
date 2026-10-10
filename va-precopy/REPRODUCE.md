@@ -2,7 +2,7 @@
 
 在 **vllm-ascend** 上做 Mooncake KV **预复制（pre-copy）**：真实请求打到目标实例之前，用 Mooncake `create_copy_task` 把已有前缀 KV 复制到该实例的本机 DRAM segment，使读路径 local-first、避免跨机拉 KV。
 
-本文是**复现参考**：只保留已跑通的结论、必配项与必须注意的 bug/陷阱。完整的设计说明、踩坑过程、历史实验见 [README.md](README.md)。
+本文是**复现参考**：只保留已跑通的结论、必配项与必须注意的 bug/陷阱。完整设计说明见 [README.md](README.md)，实验史与踩坑记录见 [EXPERIMENTS.md](EXPERIMENTS.md)。
 
 ## 0. 通用环境与硬配置（所有场景必读）
 
@@ -16,7 +16,7 @@
 | 同机多 worker | `preferred_segment: true` | 否则写路径可能把 KV 分到同机另一 worker 的 segment，预复制场景退化 |
 | 取证日志 | `VLLM_LOGGING_LEVEL=DEBUG` | 非 DEBUG 无分 rank `MooncakeBackend.get enter keys=` 证据 |
 
-**已知上游 bug（异构 TP 场景必打补丁）**：v0.26.0rc1 的 `pool_worker.py::_start_kv_transfer_threads` 构造发送/接收线程时漏传 `worker=self`，导致 tp_mismatch 的 put/get 分支是**死代码**。必须先打 `patch_tp_mismatch_worker.py`（幂等、自动备份，容器内执行）。同构场景不受影响，无需补丁。
+**已知上游 bug（异构 TP 场景必打补丁）**：v0.26.0rc1 的 `pool_worker.py::_start_kv_transfer_threads` 构造发送/接收线程时漏传 `worker=self`，导致 tp_mismatch 的 put/get 分支是**死代码**。必须先打 `patch_tp_mismatch_worker.py`（幂等、自动备份，容器内执行）。同构场景不受影响，无需补丁。上游已在 main 修复（[#15835](https://github.com/vllm-project/vllm-ascend/pull/15835)，2026-09-09 合入，`9f8773ea`），但 **rc1 / rc2 均不含**，0.26 rc 镜像仍须打本补丁；本补丁是 #15835 的子集（缺同步 load 分发，即下文 `LOAD_ASYNC=1` 约束的根因），后续可整体替换为上游完整版。
 
 **操作要点**：
 
@@ -74,6 +74,8 @@ A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`dec
 | TP = effective_tp 的大 TP 端 | plain put（无需 sub-key） | 同步 load 即可 |
 | TP < effective_tp 的小 TP 端 | 需补丁后 sub-key put | **必须 `LOAD_ASYNC=1`**（同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算） |
 
+注：`LOAD_ASYNC=1` 约束源于本目录补丁是上游 #15835 的子集（缺同步 load 的 mismatch 分发）；换用上游完整修复后同步 load 可用，该要求取消。
+
 **配置陷阱（反向方向最易错）**：`infer_tp_mismatch_info` 对 `kv_producer`/`kv_both` 读的是 **`decode_tp_size`** 作为 peer size（`kv_consumer` 才读 `prefill_tp_size`）。反向（A=TP4→B=TP2）时 B 侧必须配 `decode_tp_size=4`（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
 
 precopy 映射：eff rank i → B seg `i // num_sub_keys`。B=TP2（num_sub_keys=2）时传重复列表 `seg0,seg0,seg1,seg1`；B=TP4（=eff）时平铺 `seg0,seg1,seg2,seg3`。collect 用 `--tp-size <eff> --peer-tp-size <小 TP>`（24 keys = 6 满块 × 4 eff rank）。
@@ -105,7 +107,7 @@ precopy 映射：eff rank i → B seg `i // num_sub_keys`。B=TP2（num_sub_keys
 
 **各场景现状**：场景④已按第 3 层铁证确认 local-first（2026-10-09 晚：杀源 A 后 B 首中 768 token 全部外部 get 成功、零 invalid、输出与 A 逐字一致）；场景①③同机无跨机流量问题；场景②验证当时未做本机读判定，复现时建议按本节自证一次。
 
-**开放问题**：双副本并存时 get 的副本选择策略。本机优先选择（`SelectCompleteMemoryReplica`）为 mooncake 0.3.13+/upstream 1fc27b6 引入，本验证用 0.3.11.post1；实测双副本首中未新建远端连接（`Connected to segment` 仅出现在 precopy copy-task 执行线程），倾向于读本机，但未从源码确证选择逻辑。
+**副本选择策略（已从源码确证）**：双副本并存时 get 的 local-first 在本验证所用 0.3.11.post1 即已生效——`SelectBestReplica` 实现「prefer local MEMORY」（`real_client.cpp:283-286`，调用点 `:2527` / `:2834`）；0.3.12+ / upstream `78726c5c` 新增的 `SelectCompleteMemoryReplica` 只用于 session API 路径，与本文 get 路径无关。与实测一致：双副本首中未新建远端连接（`Connected to segment` 仅出现在 precopy copy-task 执行线程）。
 
 ## 4. 已知问题与边界
 
