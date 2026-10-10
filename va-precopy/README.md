@@ -42,13 +42,13 @@
 
 ## 实现现状（同构多 TP / 多 key）
 
-B2：请求前把前缀 KV 放到目标实例本机 DRAM。同构 TP（A/B 同 `tp_size`）下对齐 AscendStore 命名空间：
+B2：请求前把前缀 KV 放到目标实例本机 DRAM。先把三个对象讲清楚（以 VL-8B、TP=2、801 token 前缀为例），再说每样做到了什么。
 
-术语：
+### 三个对象
 
-- **seg**：`IP:rpc_port`，一 rank 一个 `local_seg`。
-- **key**：一个满 KV block 的 object key；**一请求多 key**（按 `block_size` 切满块；尾巴不满块一般不进列表 → hit ≈ 满块 tokens/总 prefix）。
-- **head_or_tp_rank**：PoolKey 里的 shard 下标（通常 = `tp_rank`；`kv_heads < tp` 时有 `put_step` 折叠）。
+- **key —— KV 在池里的存取单位**。KV 不是作为一个整体进池的：引擎把它按 block 切开（本模型一块 = 128 token），**每个满块、每个 rank 的切片，各是池里一个独立对象，各配一把 key**。801 token 前缀 = 6 个满块 × 2 个 rank = **12 把 key**；余下 33 个 token 不满一块不进池——所以命中只有 768/801 ≈ 95.9%，尾巴由引擎重算补齐。预取的本质：把这 12 把 key 对应的对象逐个复制到目标侧。
+- **seg —— KV 的物理落点**。worker 每个 rank 起机时在本机 DRAM 划一块区域注册进池，这块区域叫一个 segment（seg），名字就是它的地址 `IP:rpc_port`。**一个 rank 一个 seg**（TP=2 的实例有 2 个 seg）。master 记录「每把 key 的副本落在哪些 seg 上」，get 时按这个视图选副本。所谓 local-first：key 在**本 rank 自己的 seg** 上有副本 → 读本机 DRAM，不走网络。
+- **head_or_tp_rank —— key 尾部的切片编号**。TP 下每个 rank 只持有 KV head 的一部分（8 KV head ÷ TP=2 → 每 rank 4 个 head 的 KV）。同一 block 在不同 rank 上的切片内容不同，key 尾部带编号区分「这是哪个 rank 的切片」，避免撞名——这就是 `head_or_tp_rank`，通常等于 `tp_rank`（rank0 的块 → `…@head_or_tp_rank:0@…`，rank1 → `:1@…`）。例外：KV head 数比 TP 还小时（如 MLA 只 1 个 KV head，各 rank 内容相同），多个 rank 共用一个编号（`put_step` 折叠，全 rank 都写 `:0@`）——所以枚举 key 的编号范围是 `0 .. N/put_step-1`，不一定是 `0..N-1`。
 
 | 项 | 现状 |
 |----|------|
@@ -58,7 +58,7 @@ B2：请求前把前缀 KV 放到目标实例本机 DRAM。同构 TP（A/B 同 `
 | **解析 seg** | `resolve_segments.sh --target-ip B_IP --tp N` → `TARGET_SEGMENTS`（按 mount 时间序 ≈ rank 0..N-1） |
 | **未做** | 多 key/多 seg **并行**；跨机一份 + 同机扩散；异构 TP 见下节（已验证，需容器补丁） |
 
-TP=4、K 个满块 → `4×K` 次 copy，但是 **各 rank 各一份 shard**（总字节 ≈ 一份逻辑 KV），不是同一 key 在 4 个 seg 上各留全量副本。
+注意 `4×K` 把 key ≠ 4 倍数据：每把 key 只是**某个 rank 的切片**，合起来才是一份完整 KV（总字节 ≈ 一份逻辑 KV）——不是每把 key 都在 4 个 seg 上各留全量副本。
 
 ## 拓扑
 
@@ -262,9 +262,11 @@ python3 precopy.py \
 
 ## Key 与 segment
 
-- **Object key**：AscendStore 命名空间；**一请求多 key**（每满块 × 每 `head_or_tp_rank`）。`collect_prefix_keys.py --tp-size N`；离线用 `keys.py`。
-- **Segment 名**：`local_seg` = `get_ip():rpc_port`。TP=1：`resolve_segments.sh` 取最近两次 mount；TP>1：`--target-ip B_IP --tp N`。
-- **chunk hash**：`PYTHONHASHSEED` 与引擎一致（worker 默认 0）。
+概念见「实现现状 · 三个对象」，这里是操作指针：
+
+- **key 枚举**：`collect_prefix_keys.py --tp-size N`（在线核对 + 展开全 rank）；离线纯枚举用 `keys.py`。
+- **seg 解析**：TP=1 时 `resolve_segments.sh` 取最近两次 mount；TP>1 时 `--target-ip B_IP --tp N`（按 mount 序 ≈ rank 序）。
+- **chunk hash**：`PYTHONHASHSEED` 与引擎一致（worker 默认 0），否则重算的 block hash 对不上、key 全 miss。
 
 ## 验收
 
