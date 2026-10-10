@@ -44,11 +44,11 @@ A/B 同 `tp_size`，同机不同卡组。**无需补丁**。流程见 [README.md
 master 在源机 `0.0.0.0:50088`；B 机 worker 配 `MC_MASTER`/`LOCAL_IP`/`HCCL_IF_IP` 指向本机。
 
 - TP=1/2 与 TP=4 均已通过；27B Mamba 需 `--block-size 1536`（Mamba 状态按 align 块入池）。
-- **须知**：本场景验证于 2026-10-08 的旧 key×N 广播路径；当前代码的新 rank↔seg 映射路径已在其子集（同构同机 TP=2）复测通过，同构跨机新路径未单独重跑。复现时请按 §3 方法验证读本机副本。
+- **须知**：本场景验证于 2026-10-08 的旧 key×N 广播路径；新 rank↔seg 映射路径已在其子集（同构同机 TP=2，10/09，重构前控制面）复测通过，同构跨机新路径未单独重跑；2026-10-10 控制面重构（单入口 `precopy.py` 内嵌 resolve 等）未真机回归，待办见 [README.md](README.md)「边界与已知限制 · 验证覆盖面」。复现时请按 §3 方法验证读本机副本。
 
 ### ③ 异构同机（双向）
 
-A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`decode_tp_size=<B_TP>`。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
+A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`decode_tp_size=<max(A_TP,B_TP)>`（**两端同值**，即 `run_e2e.sh` 的默认值）。kv_both 把 `decode_tp_size` 当 **peer** size 读，只有恒配 effective_tp=max 两个方向才都对——配成 `<B_TP>` 在正向恰好等于 max 能对，反向（B 为小 TP）即踩下方「配置陷阱」的假命中；`prefill_tp_size` 仅 kv_consumer 读，kv_both 场景不影响。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
 
 方向规则（`effective_tp = max(A_TP, B_TP)`）：
 

@@ -36,6 +36,8 @@ finally:
 PY
 }
 
+# Same default-fill as precopy.py/store_demo.py: bare host means :50088.
+[[ "$MC_MASTER" == *:* ]] || MC_MASTER="$MC_MASTER:50088"
 host=${MC_MASTER%:*}
 port=${MC_MASTER##*:}
 

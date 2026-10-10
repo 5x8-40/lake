@@ -229,7 +229,7 @@ sequenceDiagram
 
 | 控制面需要 | 来源 | 性质 |
 |-----------|------|------|
-| B 的 seg 名单 | `GET :9003/get_all_segments`（master admin，纯文本逐行） | master API（`cluster/start_master.sh` 默认开 9003） |
+| B 的 seg 名单 | `GET :9003/get_all_segments`（master admin，纯文本逐行） | master API（:9003 为 mooncake_master 内置默认，`start_master.sh` 无需 flag，见脚本注释） |
 | rank↔seg 对号 | `logs/worker_<ROLE>.pid` → 进程树 → `ss -ltnp` 端口 ∩ 名单；rank 取 `VLLM::Worker_TP<N>` 进程名 | OS 级（跨机经 `--ssh`） |
 | key 名单核对 | `batch_is_exist` / `batch_get_replica_desc` | 客户端 API |
 | READY 判定 | `query_task` + `batch_get_replica_desc` | 客户端 API |
@@ -384,13 +384,14 @@ va-precopy/
 - **验证覆盖面**
   - 只验证 **非 layerwise** + **本机 DRAM** 目标；layerwise / 落盘 / 编排集成见「开放问题」。
   - 新路径（rank↔seg 对号）只重跑过同构同机 TP=2，同构跨机与 TP=4 仍是 10/08 旧 key×N 路径结果（见「验证状态」表注）。
+  - 2026-10-10 控制面重构（单入口 `precopy.py` 内嵌 resolve、反向 targets 自动展开、`run_e2e.sh` 异构默认值/LOAD_ASYNC 自动注入）仅离线验证（`bash -n` / DRY_RUN / 单测 / patch 对 rc1 tag 的 apply check），**真机回归待做**：同构 TP=2 e2e、反向异构 e2e、正向异构回归。「验证状态」表各条均为重构前控制面结果。
   - 全部实测为 GQA（`put_step=1`）；`put_step>1`（MLA 塌缩，key 全在 rank 0）时 plan 全落 `targets[0]`——功能正确但其余 rank 读远端副本，该映射未验证。
 - **复制与副本**
   - copy 按 key **串行**；未做并行 / 本机扩散 / 带宽限速（与在线读共享带宽）。
   - 副本 **无 pin**：READY 后可能被池驱逐；源属主客户端（worker-A）必须在线，掉线则 copy 失败。
 - **控制面依赖**
   - `protocol` 须与 `mooncake.json` 一致（store 半程可 `tcp`，NPU 集群用 `ascend`）。
-  - `resolve.py`：master admin `:9003` 在线（`start_master.sh` 默认开）；`start_worker.sh` 写的 pidfile（跨机经 `--ssh` 读 B 机）；TP>1 时 rank 号依赖进程名 `VLLM::Worker_TP<N>`——vLLM 改命名会 **fail loud**（不静默错配），届时按 `pgrep -af 'VLLM::'` 实际输出更新模块内模式。
+  - `resolve.py`：master admin `:9003` 在线（mooncake_master 内置默认，见 `start_master.sh` 注释）；`start_worker.sh` 写的 pidfile（跨机经 `--ssh` 读 B 机）；TP>1 时 rank 号依赖进程名 `VLLM::Worker_TP<N>`——vLLM 改命名会 **fail loud**（不静默错配），届时按 `pgrep -af 'VLLM::'` 实际输出更新模块内模式。
 - **异构 TP**：0.26 rc 镜像（rc1/rc2）必打 `patch_tp_mismatch_worker.patch`；tp_mismatch 不支持 MLA / layerwise / sparse / hybrid（机制与补丁见「怎么运作 · 异构 TP」）。
 
 ## 开放问题（待讨论）
