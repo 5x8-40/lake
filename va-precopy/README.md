@@ -281,7 +281,7 @@ python3 precopy.py \
 - 同构 **TP=2 rank↔seg** 已通过（见上）；TP=4 新路径未重跑。旧 key×N 历史结果仍有效作对照。
 - copy 仍按 key **串行**；未做并行 / 本机扩散。
 - `resolve_segments.sh` 依赖本目录 `mooncake_master.log` 的 `mount_segment`；master 若为旧进程/日志不在此文件则失败——改从 `worker_*.log` 取 `listening on IP:port` 填 `--targets`。
-- `precopy.py` 退出时偶发 allocator abort；若已打印 `READY` 可忽略。
+- `precopy.py` 退出期偶发 allocator abort / 挂起：**已修复**（READY 后显式 `store.close()`，与 check_exists / collect / store_demo 对齐；此前 precopy 是唯一不 close 的脚本）。根因 = 客户端退出期 teardown 竞态：GC/atexit 触发的乱序析构与在途收尾操作（copy-task 收尾连接、重连协程）竞争，0.3.11.post1 缺上游 #3943（teardown drain）等修复；旧日志中出现时 READY 已打印即可忽略。
 - 源属主客户端（worker-A）必须在线；副本 **无 pin**；与读共享带宽。
 - 生成物已 `.gitignore`；本目录只验证 **非 layerwise** + **本机 DRAM**。
 - **异构 TP（A/B 不同 tp_size）**：AscendStore **原生支持**（`prefill_tp_size`/`decode_tp_size` → tp_mismatch sub-key），但 v0.26.0rc1 put 路径有 bug 需补丁，见下节。

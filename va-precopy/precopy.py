@@ -180,30 +180,38 @@ def main() -> int:
         device_name=args.device_name,
     )
 
-    if args.dry_show_before:
-        for key in keys:
+    try:
+        if args.dry_show_before:
+            for key in keys:
+                print(
+                    f"[precopy] BEFORE {key}: "
+                    f"{sorted(memory_replica_endpoints(store, key))}"
+                )
+
+        # Still serial key-by-key (parallelism TBD); mapping is per-rank.
+        for key, target in plan:
+            print(f"[precopy] create_copy_task({key!r}, [{target!r}])")
+            create_copy_and_wait(store, key, [target], timeout_s=args.timeout_s)
+
+        # Verify each key only on its mapped target (not every seg).
+        for key, target in plan:
+            assert_targets_have_replicas(store, [key], [target])
             print(
-                f"[precopy] BEFORE {key}: "
+                f"[precopy] AFTER  {key}: "
                 f"{sorted(memory_replica_endpoints(store, key))}"
             )
 
-    # Still serial key-by-key (parallelism TBD); mapping is per-rank.
-    for key, target in plan:
-        print(f"[precopy] create_copy_task({key!r}, [{target!r}])")
-        create_copy_and_wait(store, key, [target], timeout_s=args.timeout_s)
-
-    # Verify each key only on its mapped target (not every seg).
-    for key, target in plan:
-        assert_targets_have_replicas(store, [key], [target])
         print(
-            f"[precopy] AFTER  {key}: "
-            f"{sorted(memory_replica_endpoints(store, key))}"
+            "[precopy] READY - each rank's keys on its B local_seg; "
+            "send traffic to target worker",
+            flush=True,
         )
-
-    print(
-        "[precopy] READY - each rank's keys on its B local_seg; "
-        "send traffic to target worker"
-    )
+    finally:
+        # Orderly teardown while the interpreter is healthy. Without close(),
+        # cleanup is deferred to exit-time GC/atexit, which intermittently
+        # aborts (RC=134) or hangs on mooncake <0.3.12 (teardown races with
+        # in-flight RPC/transfer threads; cf. upstream #3909/#3943).
+        store.close()
     return 0
 
 

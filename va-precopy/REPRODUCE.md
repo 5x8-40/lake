@@ -21,7 +21,7 @@
 **操作要点**：
 
 - 残留 worker 清理：vLLM 进程经 `setproctitle` 后名为 `VLLM::EngineCore/Worker_TP/APIServer`，`ps | grep python` 搜不到；用 `pgrep -f "VLLM::[W]"`（括号防自匹配）+ 显式 kill，再用 `npu-smi info -t usages -i <id>` 确认 HBM 释放（<10%）。旧实例残留在目标端口会让新实例「假 READY」。
-- `precopy.py` 客户端退出偶发 allocator abort（RC=134）或挂起：**拷贝工作已完成，以源侧 `replica_copy_success` 计数 / READY 打印为准**，可忽略。
+- `precopy.py` 客户端退出偶发 allocator abort（RC=134）或挂起：**已通过显式 `store.close()` 修复**（2026-10-10，根因 = 退出期 teardown 竞态，0.3.11.post1 缺上游 #3943）。旧环境若仍出现：READY 已打印即拷贝完成，可忽略。
 - master 日志被轮转后 fd 仍在改名文件上：`ln -sf mooncake_master.log.bak.27b logs/mooncake_master.log` 修复 `resolve_segments.sh`。
 - 两机**非共享存储**：各自 clone 本目录并同步。
 - 跨机 ssh 高频连接触发对端限速（认证后断连/KEX 卡死）：控制操作合并成批执行，或改控制台人工执行。
