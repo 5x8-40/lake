@@ -22,6 +22,7 @@ if _PRECOPY not in sys.path:
     sys.path.insert(0, _PRECOPY)
 
 from resolve import (  # noqa: E402
+    ProbeError,
     ResolveError,
     _intersect,
     probe_local,
@@ -29,13 +30,13 @@ from resolve import (  # noqa: E402
 )
 
 
-def _expect_err(fn, needle: str) -> None:
+def _expect_err(fn, needle: str, exc=ResolveError) -> None:
     try:
         fn()
-    except ResolveError as e:
+    except exc as e:
         assert needle in str(e), f"want {needle!r} in error: {e}"
         return
-    raise AssertionError(f"expected ResolveError containing {needle!r}")
+    raise AssertionError(f"expected {exc.__name__} containing {needle!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +208,24 @@ def test_missing_pidfile_fails() -> None:
         srv.shutdown()
 
 
+def test_ssh_requires_explicit_pidfile() -> None:
+    # Default pidfile is derived from THIS checkout — meaningless remotely.
+    _expect_err(
+        lambda: resolve_segments(tp=1, admin="http://127.0.0.1:1", ssh="ssh x"),
+        "requires --pidfile",
+    )
+
+
+def test_garbage_pidfile_fails() -> None:
+    with tempfile.NamedTemporaryFile("w", delete=False) as f:
+        f.write("not-a-pid")
+        pidfile = f.name
+    try:
+        _expect_err(lambda: probe_local(pidfile), "not a pid", exc=ProbeError)
+    finally:
+        os.unlink(pidfile)
+
+
 TESTS = [
     test_tp1_happy,
     test_tp2_rank_order,
@@ -219,6 +238,8 @@ TESTS = [
     test_end_to_end_tp1,
     test_stale_pidfile_fails,
     test_missing_pidfile_fails,
+    test_ssh_requires_explicit_pidfile,
+    test_garbage_pidfile_fails,
 ]
 
 if __name__ == "__main__":

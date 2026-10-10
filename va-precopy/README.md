@@ -90,7 +90,7 @@ sequenceDiagram
     participant G as gateway/router
     participant A as Worker A（源，N rank）
     participant M as mooncake_master<br/>key→副本→seg 权威 + admin :9003
-    participant CP as 控制面（va-precopy 独立进程）【脚手架】
+    participant CP as 控制面（va-precopy 原型）
     participant B as Worker B（目标，N rank）
 
     Note over G,M: 阶段 1 · 暖场：前缀 KV 进池（普通请求路径）
@@ -98,10 +98,10 @@ sequenceDiagram
     A->>M: rank i put 自己的 KV 分片<br/>key@rank:i 落 A seg_i（preferred_segment 钉住）
 
     Note over CP,B: 阶段 2 · 控制面预复制（B2，引擎不参与）
-    CP->>CP: collect：import vllm hash 链 +<br/>vllm-ascend PoolKey 展开全 rank key<br/>【重算=外部控制面标准做法（同 Dynamo router）；<br/>生产化=逻辑搬进控制面或引擎 KV 事件流】
-    CP->>M: batch_is_exist 核对（格式漂移哨兵）
     CP->>M: GET :9003/get_all_segments（seg 名单）
-    CP->>B: pidfile+进程树+ss 对号 rank→seg<br/>与名单求交，不符即 fail loud<br/>【脚手架特有：生产由编排层掌握拓扑】
+    CP->>B: pidfile+进程树+ss 对号 rank→seg<br/>与名单求交，不符即 fail loud<br/>【测试床特有：生产由编排层掌握拓扑】
+    CP->>CP: 算 key（keys.py）：import vllm hash 链 +<br/>vllm-ascend PoolKey 展开全 rank key<br/>【重算=外部控制面标准做法（同 Dynamo router）】
+    CP->>M: batch_is_exist 核对（格式漂移哨兵）
     loop 每个 key（当前串行，可并行化）
         CP->>M: create_copy_task(key@rank:i, [B seg_i])
         M-->>A: 给源属主派 REPLICA_COPY 后台任务

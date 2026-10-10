@@ -93,7 +93,7 @@ python3 precopy/precopy.py --master A_IP:50088 --protocol ascend \
   --model ... --prefix ... --prefix-repeat 80
 ```
 
-已验证配置：245(A=TP2，卡0,1，:8001) → 217(B=TP4，卡0-3，:8002)，三轮 precopy 各 24/24 `replica_copy_success`（A 侧 ~1 key/s），副本对号落 217 四个 seg（每 key 双副本：源 seg + 目标 seg，`check_exists` 逐 key 取证）。
+已验证配置：245(A=TP2，卡0,1，:8001) → 217(B=TP4，卡0-3，:8002)，三轮 precopy 各 24/24 `replica_copy_success`（A 侧 ~1 key/s），副本对号落 217 四个 seg（每 key 双副本：源 seg + 目标 seg，逐 key 取证——当时用 `check_exists`，现并入 `keys.py --keys-file <留档> --check-master`）。
 
 ## 3. 「读本机副本」判定方法（重点）
 

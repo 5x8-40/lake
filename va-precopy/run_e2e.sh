@@ -141,7 +141,8 @@ if [[ "$AUTO_PRECOPY" != "1" ]]; then
   exit 0
 fi
 
-export PYTHONPATH="$SCRIPT_DIR/precopy:${PYTHONPATH:-}"
+# precopy.py inserts its own dir into sys.path; PYTHONHASHSEED is a legacy
+# guard (only matters when engine prefix_caching_hash_algo=builtin).
 export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
 
 # Single-entry precopy: warm prompt → in-process seg resolution + keys → check → copy.

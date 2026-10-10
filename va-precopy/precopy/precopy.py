@@ -13,9 +13,9 @@ Finish copy BEFORE the target worker opens a get session for the real
 request. After READY, send traffic to that worker.
 
 Single entry (prompt mode): hand it the warm prompt and the target worker —
-key computation (import vllm/vllm-ascend), segment resolution (admin API +
-pidfile/ss), batch_is_exist check, copy and READY all happen in-process;
-keys never touch a file unless --dump-keys is given:
+segment resolution (admin API + pidfile/ss), key computation (import
+vllm/vllm-ascend), batch_is_exist check, copy and READY all happen
+in-process; keys never touch a file unless --dump-keys is given:
 
   python3 precopy.py --master 127.0.0.1:50088 --protocol ascend \\
       --role B --tp-size 2 \\
@@ -46,7 +46,7 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
     sys.path.insert(0, _HERE)
 
-from keys import group_keys_by_rank, parse_head_or_tp_rank
+from keys import _load_keys_file, group_keys_by_rank, parse_head_or_tp_rank
 
 # NOTE: common (mooncake client) is imported lazily in main() AFTER arg
 # validation and key computation, so --dump-keys and usage errors work
@@ -58,12 +58,7 @@ def _load_keys(args: argparse.Namespace) -> list[str]:
     if args.keys:
         keys.extend(k.strip() for k in args.keys.split(",") if k.strip())
     if args.keys_file:
-        with open(args.keys_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                keys.append(line)
+        keys.extend(_load_keys_file(args.keys_file))
     seen: set[str] = set()
     out: list[str] = []
     for k in keys:
@@ -194,6 +189,11 @@ def main() -> int:
             file=sys.stderr,
         )
         return 2
+
+    # Resolve BEFORE key computation: the probe is ~100ms (admin GET + ps/ss)
+    # while the tokenizer load is seconds — a stale worker must fail fast.
+    targets = _parse_targets(args, master)
+
     if computed:
         from keys import collect_keys
 
@@ -207,7 +207,7 @@ def main() -> int:
             put_step=args.put_step,
             hash_algo=args.hash_algo,
         )
-        print("[precopy] collect: " + " ".join(f"{k}={v}" for k, v in info.items()))
+        print("[precopy] keys: " + " ".join(f"{k}={v}" for k, v in info.items()))
         if args.dump_keys:
             with open(args.dump_keys, "w", encoding="utf-8") as f:
                 f.write("\n".join(keys) + "\n")
@@ -221,7 +221,6 @@ def main() -> int:
         )
         return 2
 
-    targets = _parse_targets(args, master)
     by_rank = group_keys_by_rank(keys)
     max_rank = max(by_rank) if by_rank else -1
     if len(targets) == 1 and max_rank <= 0:

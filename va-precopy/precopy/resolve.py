@@ -166,7 +166,10 @@ def probe_local(pidfile: str) -> list[tuple[int, int | None, list[int]]]:
         raise ProbeError(_PROBE_MISSING, f"pidfile {pidfile} unreadable ({e})") from e
     if not root:
         raise ProbeError(_PROBE_MISSING, f"pidfile {pidfile} empty")
-    root_pid = int(root)
+    try:
+        root_pid = int(root)
+    except ValueError as e:
+        raise ProbeError(_PROBE_MISSING, f"pidfile {pidfile} not a pid: {root!r}") from e
     if not _pid_alive(root_pid):
         raise ProbeError(_PROBE_STALE, f"pidfile {pidfile} stale: pid {root_pid} dead")
     tree = _process_tree(root_pid)
@@ -302,6 +305,13 @@ def resolve_segments(
         host = master.rsplit(":", 1)[0] if ":" in master else master
         admin = f"http://{host}:{admin_port}"
     if not pidfile:
+        if ssh:
+            # The default pidfile path is derived from THIS checkout — it is
+            # meaningless on the remote host. Fail loud instead of probing a
+            # silently wrong path.
+            raise ResolveError(
+                "cross-machine probe requires --pidfile (path ON the target host)"
+            )
         if not logdir:
             logdir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "logs")
         pidfile = os.path.join(logdir, f"worker_{role}.pid")
