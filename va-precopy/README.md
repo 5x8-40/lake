@@ -156,7 +156,7 @@ B2：请求前把前缀 KV 放到目标实例本机 DRAM。先把三个对象讲
 | 项 | 现状 |
 |----|------|
 | **Key 集合** | `precopy.py` prompt 模式内嵌 `collect_keys()` 展开 `head_or_tp_rank:0..N/put_step-1` × 满块（`precopy/keys.py`；key 全程内存） |
-| **多 seg** | `precopy.py --targets seg0,seg1,...`：**rank i 的 key 只 copy 到 `targets[i]`**（不再 key×N 广播） |
+| **多 seg** | `precopy.py --targets seg0,seg1,...`：**rank i 的 key 只 copy 到 `targets[i]`**（不再 key×N 广播）；反向异构（eff>N）自动展开为 `targets[i // num_sub_keys]` |
 | **调度** | 仍 **按 key 串行** `create_copy_and_wait`；映射已对号入座 |
 | **解析 seg** | `precopy.py` 缺省即内嵌 `resolve.resolve_segments()`（`precopy/resolve.py`）：master admin API 名单 ∩ pidfile 进程树 `ss` 端口；rank 取自 `VLLM::Worker_TP<N>` 进程名，对不上即 fail loud，**不读日志**；显式 `--targets` 可跳过 |
 | **未做** | 多 key/多 seg **并行**；跨机一份 + 同机扩散；异构 TP 见下节（已验证，需容器补丁） |
@@ -185,7 +185,7 @@ precopy.py / run_e2e.sh    独立进程：create_copy_task → READY
 
 复制晚于 get session 则本次请求仍可能读远端；下一个请求会重新选副本。
 
-全流程（同构 TP=N；异构只是 key 命名空间换成 eff rank、映射换成 `targets[i // num_sub_keys]`）：
+全流程（同构 TP=N；异构 key 命名空间换成 eff rank；反向（B 为小 TP）时 precopy 把 B 的 seg 列表按 `i // num_sub_keys` 自动展开）：
 
 ```mermaid
 sequenceDiagram

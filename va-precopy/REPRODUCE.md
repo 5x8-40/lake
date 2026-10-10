@@ -61,7 +61,7 @@ A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`dec
 
 **配置陷阱（反向方向最易错）**：`infer_tp_mismatch_info` 对 `kv_producer`/`kv_both` 读的是 **`decode_tp_size`** 作为 peer size（`kv_consumer` 才读 `prefill_tp_size`）。反向（A=TP4→B=TP2）时 B 侧必须配 `decode_tp_size=4`（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
 
-precopy 映射：eff rank i → B seg `i // num_sub_keys`。B=TP2（num_sub_keys=2）时传重复列表 `seg0,seg0,seg1,seg1`；B=TP4（=eff）时平铺 `seg0,seg1,seg2,seg3`。key 计算用 `--tp-size <eff> --peer-tp-size <小 TP>`（24 keys = 6 满块 × 4 eff rank）。
+precopy 映射：eff rank i → B seg `i // num_sub_keys`，**由 precopy 自动展开**（`--tp-size <B 的 TP> --peer-tp-size <A 的 TP>`；反向 B=TP2 时 resolve 出的 2 个 seg 自动展开成 `seg0,seg0,seg1,seg1`，无需手工重复列表）；显式 `--targets` 时按 eff rank 序平铺给出。key 计算：eff = max(TP_A, TP_B)（24 keys = 6 满块 × 4 eff rank）。
 
 限制：tp_mismatch 不支持 MLA、layerwise、sparse、hybrid（**Mamba/线性注意力结构被代码 gate 显式排除，异构不支持**；Mamba 同构可用）。
 

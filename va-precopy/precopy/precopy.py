@@ -228,12 +228,31 @@ def main() -> int:
         plan: list[tuple[str, str]] = [(k, targets[0]) for k in keys]
     else:
         if max_rank >= len(targets):
-            print(
-                f"ERROR: key head_or_tp_rank max={max_rank} but only "
-                f"{len(targets)} --targets (need targets[0..{max_rank}])",
-                file=sys.stderr,
-            )
-            return 2
+            # Reverse hetero (B has fewer ranks than effective_tp): eff rank i
+            # belongs to B segment i // num_sub_keys — expand the seg list.
+            eff = max(args.tp_size, args.peer_tp_size or 0)
+            n_sub = eff // args.tp_size if args.tp_size else 1
+            if (
+                args.peer_tp_size
+                and args.peer_tp_size > args.tp_size
+                and args.tp_size > 0
+                and eff % args.tp_size == 0
+                and len(targets) == args.tp_size
+                and max_rank == eff - 1
+            ):
+                targets = [targets[i // n_sub] for i in range(eff)]
+                print(
+                    f"[precopy] hetero reverse (peer {args.peer_tp_size} > local "
+                    f"{args.tp_size}): eff rank i → targets[i//{n_sub}] "
+                    f"({args.tp_size} segs auto-expanded to {eff})"
+                )
+            else:
+                print(
+                    f"ERROR: key head_or_tp_rank max={max_rank} but only "
+                    f"{len(targets)} --targets (need targets[0..{max_rank}])",
+                    file=sys.stderr,
+                )
+                return 2
         unknown = [r for r in by_rank if r < 0 or r >= len(targets)]
         if unknown:
             print(f"ERROR: ranks out of range for --targets: {unknown}", file=sys.stderr)

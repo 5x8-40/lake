@@ -42,12 +42,15 @@ HIT_B=${HIT_B:-1}
 TP_A=${TP_A:-$TP}
 TP_B=${TP_B:-$TP}
 PREFILL_TP_SIZE=${PREFILL_TP_SIZE:-$TP_A}
-DECODE_TP_SIZE=${DECODE_TP_SIZE:-$TP_B}
+# kv_both reads decode_tp_size as PEER size; it must be effective_tp=max(A,B)
+# in BOTH directions (forward: A does sub-key put; reverse: B does sub-key get).
+# Defaulting to TP_B breaks reverse (B sees peer==local → plain get → fake hit).
+DECODE_TP_SIZE=${DECODE_TP_SIZE:-$(( TP_A > TP_B ? TP_A : TP_B ))}
 
 step() { echo; echo "==== $* ===="; }
 
 if [[ "$TP_A" != "$TP_B" ]]; then
-  echo "[e2e] heterogeneous TP: A=$TP_A -> B=$TP_B (prefill_tp_size=$TP_A decode_tp_size=$TP_B; needs patch_tp_mismatch_worker.patch in container; see README 异构 TP)." >&2
+  echo "[e2e] heterogeneous TP: A=$TP_A -> B=$TP_B (prefill_tp_size=$PREFILL_TP_SIZE decode_tp_size=$DECODE_TP_SIZE; needs patch_tp_mismatch_worker.patch in container; see README 异构 TP)." >&2
 elif [[ "$TP_B" != "1" ]]; then
   echo "[e2e] TP=$TP_B homogeneous: rank i keys → B local_seg[i] (see README 怎么运作)." >&2
 fi
@@ -102,18 +105,19 @@ step "4. Warm prefix on worker-A"
 if [[ "$DRY_RUN" == "1" ]]; then
   echo "DRY_RUN: curl worker-A /v1/completions max_tokens=$WARM_MAX_TOKENS prompt_len=${#WARM_PROMPT}"
 else
-  for i in $(seq 1 120); do
-    if curl -sf "http://127.0.0.1:${PORT_A}/v1/models" | grep -q "$SERVED_NAME"; then
-      break
-    fi
-    sleep 5
-  done
-  for i in $(seq 1 120); do
-    if curl -sf "http://127.0.0.1:${PORT_B}/v1/models" | grep -q "$SERVED_NAME"; then
-      break
-    fi
-    sleep 5
-  done
+  wait_ready() {
+    local role=$1 port=$2
+    for _ in $(seq 1 120); do
+      if curl -sf "http://127.0.0.1:${port}/v1/models" | grep -q "$SERVED_NAME"; then
+        return 0
+      fi
+      sleep 5
+    done
+    echo "[e2e] ERROR: worker-$role (:$port) not ready after 600s — check for stale instances (fake READY: pgrep -af 'VLLM::'; see README 操作注意事项)" >&2
+    return 1
+  }
+  wait_ready A "$PORT_A"
+  wait_ready B "$PORT_B"
   BODY=$(WARM_PROMPT="$WARM_PROMPT" SERVED_NAME="$SERVED_NAME" WARM_MAX_TOKENS="$WARM_MAX_TOKENS" python3 - <<'PY'
 import json, os
 print(json.dumps({

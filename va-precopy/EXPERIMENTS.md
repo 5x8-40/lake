@@ -49,7 +49,7 @@
 实测：A=TP4（卡 0-3，`decode_tp_size=4`→plain put 即 eff 命名）、B=TP2（卡 4,5，`LOAD_ASYNC=1`）。
 
 - A 四 rank 各普通 put 6 key（24/24，命名=eff 0-3，内容=2 头/eff shard）；
-- precopy 映射：eff rank i → B seg[i//2]，现有 `--targets` 传**重复列表** `seg0,seg0,seg1,seg1` 即可（无需改代码）；
+- precopy 映射：eff rank i → B seg[i//2]，当时 `--targets` 传**重复列表** `seg0,seg0,seg1,seg1`（2026-10-10 起由 precopy 自动展开，见「勘误与演进」）；
 - B：`External prefix cache hit rate: 95.9%`、零 invalid；TP0/TP1 各 `tp_mismatch get keys=12`（6 块 × 2 sub-key）成功；
 - A(TP4)/B(TP2) 同 prompt 贪心 16 token 输出逐字一致。
 
@@ -69,6 +69,10 @@
   - 单入口合并：`precopy.py` = warm prompt → 进程内 resolve → 算 key → `batch_is_exist` 核对 → copy → READY，key 全程内存（`--dump-keys` 仅调试留档）。
   - 目录归位：产品控制面 → `precopy/`（precopy/keys/resolve/common），集群脚本 → `cluster/`，调试 → `tools/`；`resolve_segments.sh` Python 化为 `precopy/resolve.py`（admin API + pidfile/ss，**不再读日志**——「master 日志轮转」「旧 master 无 mount 行」两坑随之失效，保留下方作历史）；`check_exists.py` 并入 `keys.py --keys-file --check-master`；新增 `tools/test_resolve.py`。
   - 历史裸文件名映射：`collect_prefix_keys.py`→`precopy/keys.py`；`resolve_segments.sh`→`precopy/resolve.py`；`check_exists`→`keys.py --keys-file --check-master`。本文及 README/REPRODUCE 历史章节按此映射。
+- **反向异构一键化（2026-10-10，外部 review 修正）**
+  - `precopy.py` 对反向（peer>local）自动按 `i // num_sub_keys` 展开 targets——此前须手工传重复列表（见实录反向），run_e2e 反向会报「need targets[0..3]」走不通。
+  - `run_e2e.sh` `DECODE_TP_SIZE` 默认从 `$TP_B` 改为 `max(TP_A,TP_B)`：kv_both 的 decode_tp_size 是 **peer** size，两个方向都必须恒为 effective_tp；原默认在反向让 B 判「无不匹配」→ 普通 get → 假命中。
+  - `run_e2e.sh` worker 就绪轮询后 fail-fast（此前未就绪也继续 warm，且正好撞上假 READY 坑）。
 
 **踩坑记录（跨机操作）**：
 
