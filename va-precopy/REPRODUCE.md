@@ -27,7 +27,7 @@
 | ① 同构同机 | 245 单机，A=TP2(卡0,1)→B=TP2(卡2,3)，VL-8B | ✅ 通过 | **95.9%**（768/801），零 invalid | 同机场景：目标实例本机 seg，天然 local |
 | ② 同构跨机 | 245→217，TP=1/2；TP=4（27B Mamba） | ✅ 通过 | ~95%+（27B ≈92.1%，满块） | 当时未单独取证；建议按 §3 自证（见下） |
 | ③ 异构同机 | 245 单机，双向 TP2→TP4 / TP4→TP2 | ✅ 双向通过 | **95.9%**，零 invalid | 同机场景：天然 local |
-| ④ 异构跨机 | 245(A=TP2)→217(B=TP4)，三轮 precopy | ✅ 通过 | **95.9%**（768/801），零 invalid | ✅ **杀源实例法铁证**（2026-10-09 晚，见 §3）：仅剩本机副本时外部 get 成功 |
+| ④ 异构跨机 | 245(A=TP2)→217(B=TP4)，三轮 precopy | ✅ 通过 | **95.9%**（768/801），零 invalid | ✅ **杀源实例法确证**（2026-10-09 晚，见 §3）：仅剩本机副本时外部 get 成功 |
 
 命中数字均为 `kvpool hit tokens 768/801` 量级（前缀 801 token、768 满块 token；尾巴不满块不进 key 列表，属预期）。各场景 A/B 同 prompt 贪心输出**逐字一致**（16/64 token 均验过）。
 
@@ -48,7 +48,7 @@ master 在源机 `0.0.0.0:50088`；B 机 worker 配 `MC_MASTER`/`LOCAL_IP`/`HCCL
 
 ### ③ 异构同机（双向）
 
-A/B 不同 `tp_size`，两端 env 均配 **`PEER_TP_SIZE=<max(A_TP,B_TP)>`**（**两端同值**，即 `run_e2e.sh` 的默认值；`start_worker.sh` 把它写进引擎字段 `decode_tp_size`，规则推导见 [README.md](README.md)「env 处方」）。引擎把该字段当 **peer** size 读，只有恒配 effective_tp=max 两个方向才都对——配成 `<B_TP>` 在正向恰好等于 max 能对，反向（B 为小 TP）即踩下方「配置陷阱」的假命中；`prefill_tp_size` 是引擎 consumer 角色字段，本测试床用不到（脚本不生成）。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
+A/B 不同 `tp_size`，两端 env 均配 **`PEER_TP_SIZE=<max(A_TP,B_TP)>`**（**两端同值**，即 `run_e2e.sh` 的默认值；`start_worker.sh` 把它写进引擎字段 `decode_tp_size`，规则推导见 [README.md](README.md)「env 配置」）。引擎把该字段当 **peer** size 读，只有恒配 effective_tp=max 两个方向才都对——配成 `<B_TP>` 在正向恰好等于 max 能对，反向（B 为小 TP）即踩下方「配置陷阱」的假命中；`prefill_tp_size` 是引擎 consumer 角色字段，本测试床用不到（脚本不生成）。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
 
 方向规则（`effective_tp = max(A_TP, B_TP)`）：
 
@@ -79,7 +79,7 @@ precopy 映射：eff rank i → B seg `i // num_sub_keys`，**由 precopy 自动
 |------|------|------|
 | 1. 指标 | B 侧 log / metrics | `External prefix cache hit rate` ~90%+，且**零 invalid block** |
 | 2. 分 rank get | `VLLM_LOGGING_LEVEL=DEBUG` 启动 | 每个 TP rank 各打印 `MooncakeBackend.get enter keys=<每 rank key 数>`，get 成功 |
-| 3. 杀源实例终极判定（金标准） | 确认外部 get 真实发生（`get enter` 行在该时刻存在）且输出与源实例逐字一致 | 源实例已死、其 segment 副本已从池注销（`batch_get_replica_desc` 仅剩目标机副本）后，目标实例**首次**命中该 prompt 仍成功 ⇒ 数据物理上只能来自本机副本 |
+| 3. 杀源实例法（终判） | 确认外部 get 真实发生（`get enter` 行在该时刻存在）且输出与源实例逐字一致 | 源实例已死、其 segment 副本已从池注销（`batch_get_replica_desc` 仅剩目标机副本）后，目标实例**首次**命中该 prompt 仍成功 ⇒ 数据物理上只能来自本机副本 |
 
 **杀源实例法的两个关键陷阱**：
 
@@ -88,7 +88,7 @@ precopy 映射：eff rank i → B seg `i // num_sub_keys`，**由 precopy 自动
 
 **勿用 netdev 网卡计数器判定**：本环境（昇腾 A2 RoCE）的 `ip -s link` / sysfs 计数器**不统计 RDMA KV 流量**——阳性对照：24 keys（~43 MB）真实跨机传输期间，源/目标两侧计数器增量均 <2 MB。任何「传输了却看不到字节」或「没看到字节=读本机」的推断在此 NIC 上均不成立。
 
-**各场景现状**：场景④已按第 3 层铁证确认 local-first（2026-10-09 晚：杀源 A 后 B 首中 768 token 全部外部 get 成功、零 invalid、输出与 A 逐字一致）；场景①③同机无跨机流量问题；场景②验证当时未做本机读判定，复现时建议按本节自证一次。
+**各场景现状**：场景④已按第 3 层确证 local-first（2026-10-09 晚：杀源 A 后 B 首中 768 token 全部外部 get 成功、零 invalid、输出与 A 逐字一致）；场景①③同机无跨机流量问题；场景②验证当时未做本机读判定，复现时建议按本节自证一次。
 
 **副本选择策略（已从源码确证）**：双副本并存时 get 的 local-first 在本验证所用 0.3.11.post1 即已生效——`SelectBestReplica` 实现「prefer local MEMORY」（`real_client.cpp:283-286`，调用点 `:2527` / `:2834`）；0.3.12+ / upstream `78726c5c` 新增的 `SelectCompleteMemoryReplica` 只用于 session API 路径，与本文 get 路径无关。与实测一致：双副本首中未新建远端连接（`Connected to segment` 仅出现在 precopy copy-task 执行线程）。
 

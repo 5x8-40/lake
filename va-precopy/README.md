@@ -19,11 +19,11 @@
 | 同构同机 TP=2（rank↔seg 新路径，2026-10-09） | **通过**：12 keys 对号入 B 两 seg；hit 768/801 ≈ **95.9%** |
 | 同构跨机 TP=1/2、TP=4 27B Mamba（旧 key×N 广播路径，2026-10-08） | 通过：~95%+（Mamba ≈92.1% 满块，`--block-size 1536`）；新路径未单独重跑 |
 | 异构同机 双向 TP2↔TP4（2026-10-09，需容器补丁） | **通过**：24/24 key 对号，95.9%，零 invalid，A/B 输出逐字一致 |
-| 异构跨机 245(TP2)→217(TP4)（2026-10-09，需容器补丁） | **通过** + **杀源实例法铁证读本机副本**（仅剩 217 副本时 B 首中 768 token 全部外部 get 成功） |
+| 异构跨机 245(TP2)→217(TP4)（2026-10-09，需容器补丁） | **通过** + **杀源实例法确证读本机副本**（仅剩 217 副本时 B 首中 768 token 全部外部 get 成功） |
 | 异构跨机正向 245(TP2)→217(TP4) 回归（2026-10-12，bc6b5be 单入口 + #15835 补丁） | **通过**：32 keys READY、8/8 token 逐字一致、零 invalid、external hit 88.2%（滚动累计口径，非单请求） |
 | 异构跨机反向 217(TP4)→245(TP2) **同步 load**（2026-10-12，bc6b5be + #15835 补丁） | **通过**：36/36 key 对号、每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 分发生效、8/8 token 逐字一致、74.6→79.7% hit、零 invalid |
 
-完整实验史（总表 14 条 + 异构实录 + 撤回记录）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定金标准见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」「开放问题」。
+完整实验史（总表 14 条 + 异构实录 + 撤回记录）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」「开放问题」。
 
 ## 快速开始
 
@@ -232,18 +232,36 @@ sequenceDiagram
 | 控制面需要 | 来源 | 性质 |
 |-----------|------|------|
 | B 的 seg 名单 | `GET :9003/get_all_segments`（master admin，纯文本逐行） | master API（:9003 为 mooncake_master 内置默认，`start_master.sh` 无需 flag，见脚本注释） |
-| rank↔seg 对号 | `logs/worker_<ROLE>.pid` → 进程树（`/proc/*/stat`，ps 兜底）→ `ss -ltnp` 端口（缺 `ss` 回退 `/proc/net/tcp`）∩ 名单；rank 取 `VLLM::Worker_TP<N>` 进程名；TP=1 探测基建缺失时降级为 admin 单 seg 匹配（loud WARN） | OS 级（跨机经 `--ssh`） |
+| rank↔seg 对号 | `logs/worker_<ROLE>.pid` → 进程树（`/proc/*/stat`，ps 兜底）→ `ss -ltnp` 端口（缺 `ss` 回退 `/proc/net/tcp`）∩ 名单；rank 取 `VLLM::Worker_TP<N>` 进程名；TP=1 探测基建缺失时降级为 admin 单 seg 匹配（loud WARN）；匹配链与 fail loud 边界见下「rank↔seg 匹配链」 | OS 级（跨机经 `--ssh`） |
 | key 名单核对 | `batch_is_exist` / `batch_get_replica_desc` | 客户端 API |
 | READY 判定 | `query_task` + `batch_get_replica_desc` | 客户端 API |
 | worker 就绪 | 轮询 HTTP `/v1/models` | HTTP API |
 
 日志只剩**人工取证**角色，不参与任何控制流：分 rank `MooncakeBackend.get enter keys=`（0.3.11 无等效 API，vLLM `/metrics` 只有聚合 external hit）、源侧 `replica_copy_success` 计数——这些是版本限制下的取证手段，REPRODUCE §3 的三层判据靠人读，脚本不读。
 
+### rank↔seg 匹配链（resolve.py）
+
+目标：`targets[i] = rank i 的 seg`。四跳，全部 OS/API 级来源，不读日志：
+
+1. **pidfile → 进程树**：`start_worker.sh` 写 `logs/worker_<ROLE>.pid`（api_server pid）→ 按 `/proc/*/stat` 的 ppid 链展开整棵进程树（`ps` 兜底）。
+2. **进程 → 监听端口**：`ss -ltnp`；容器无 `ss` 回退 `/proc/net/tcp{,6}`（LISTEN 行得 inode→port）× `/proc/<pid>/fd`（`socket:[inode]` 反查属主进程）。
+3. **进程 → rank**：读 `/proc/<pid>/cmdline` 的 proctitle `VLLM::Worker_TP<N>`，N 即 rank。rank 是 vLLM 拉起 worker 时赋的**逻辑编号，与物理卡号无关**——实例只用 4-7 卡时进程名仍是 `Worker_TP0..3`，照常匹配；用哪几张卡由启动参数 `ASCEND_RT_VISIBLE_DEVICES` 决定，不进匹配链（`npu-smi 卡→pid` 仅为人工核对手段）。
+4. **端口 ∩ master 名单 → seg**：进程监听端口与 admin `get_all_segments` 名单（seg 名 = `IP:rpc_port`）求交，即得 rank→seg。
+
+fail loud 边界（宁错杀不静默错配——拷错 seg 就失去 local-first 的意义）：
+
+- 一个端口命中多个 seg（同机多实例）→ 必须给 `--target-ip`；
+- 同一 rank 被两个 seg 认领、TP>1 出现无 rank 信息的 seg → 报错（旧 worker 残留，或 vLLM 改了 proctitle 命名）；
+- rank 0..N-1 缺一 → 报错；
+- TP=1 特例：唯一候选 seg 即 rank 0（构造上无歧义）；探测基建全挂时降级为 admin 名单单 seg 匹配（loud WARN），但 pidfile stale（worker 已死）**不降级**——防止把 KV 拷进 TTL 到期即注销的 seg。
+
+跨机：把 resolve.py 源码经 ssh pipe 到目标机 `python3 - --local-probe` 执行（不假设远端路径），探测错误码经 ssh 透传。
+
 **key 格式与 hash 一律 import 上游权威实现，不自己搬**：block hash 链 import vllm `kv_cache_utils`，PoolKey 字符串格式 import vllm-ascend `PoolKey`/`KeyMetadata`（都在 `precopy/keys.py`；rc1=`config_data.py` / main=`metadata.py` 自适应，按字段名构造——rc1 有 `pcp_rank`、main 已删，位置参数构造会漂移）。上游改格式时 import 自动跟随；两道哨兵兜底：`batch_is_exist` 存在性核对（precopy prompt 模式内置，缺 key 即 exit 2）与 `tools/test_keys.py::test_upstream_parity`（容器内镜像 vs 上游逐字节比对）。`precopy/keys.py` 内置的 rc1 纯 Python 镜像只作离线 fallback（打印 WARN）。
 
 ### 异构 TP（A/B 不同 tp_size）
 
-问题：A=TP2、B=TP4 能否像「原生 Mooncake/connector」一样共享同一套 shard？结论：**能——AscendStore 原生支持；单机双向（TP2→TP4 / TP4→TP2）与跨机（245→217）均已实测通过**（external hit 95.9%、零 invalid、A/B 输出逐字一致；跨机读本机副本经杀源实例法铁证），**但 v0.26.0rc1 必须打补丁**（见下）。实测实录见 [EXPERIMENTS.md](EXPERIMENTS.md)「实验实录」节（总表 #5/#6/#8/#12 + 10-12 回归 #13/#14）。
+问题：A=TP2、B=TP4 能否像「原生 Mooncake/connector」一样共享同一套 shard？结论：**能——AscendStore 原生支持；单机双向（TP2→TP4 / TP4→TP2）与跨机（245→217）均已实测通过**（external hit 95.9%、零 invalid、A/B 输出逐字一致；跨机读本机副本经杀源实例法确证），**但 v0.26.0rc1 必须打补丁**（见下）。实测实录见 [EXPERIMENTS.md](EXPERIMENTS.md)「实验实录」节（总表 #5/#6/#8/#12 + 10-12 回归 #13/#14）。
 
 | 层 | 结论 |
 |----|------|
@@ -282,7 +300,7 @@ flowchart LR
 - **反向（TP4→TP2）**：A 是大 TP 端 → plain put；B 是小 TP 端 → sub-key get（`_load_kv_tp_mismatch` 读多个 eff key、按 head 切片拼回本地）。
 - 数学关系：`num_sub_keys = local_heads_per_rank ÷ effective_heads_per_rank`（`config_data.py::infer_tp_mismatch_info`，main 已改名 `metadata.py`）；eff key 命名 `effective_rank = tp_rank × num_sub_keys + sub_idx`。
 
-#### env 处方（2026-10-12 实测固化）
+#### env 配置
 
 引擎从 `decode_tp_size` 字段读对端 TP（`config_data.py:48`，只在 worker init 算一次；`prefill_tp_size` 是 consumer 角色字段，本测试床用不到、脚本不生成）；算出的 `(enabled, eff, num_sub_keys)` 同时固定用于该实例的 put 与 get 两侧——**mismatch 信息与实验方向无关**，方向只决定谁 put 谁 get。因此：
 
@@ -331,7 +349,7 @@ va-precopy/
 | 文档 | 作用 |
 |------|------|
 | `README.md` | 本文：端到端说明 |
-| `REPRODUCE.md` | 客户复现参考：结论 + 必配项 + 「读本机副本」判定金标准 |
+| `REPRODUCE.md` | 客户复现参考：结论 + 必配项 + 「读本机副本」判定方法 |
 | `EXPERIMENTS.md` | 实验总表 14 条 + 异构实录 + 踩坑记录（含撤回历史） |
 
 ## 操作参考
@@ -436,7 +454,7 @@ B2 目标是 worker 挂载的 **DRAM segment**。Mooncake 可有 DRAM→SSD 分�
 ### 4. 其它生产缺口（短清单）
 
 - **B 侧重复请求偶发 1-token 贪心翻转**：仅 10/09 旧非 DEBUG 实例出现，新 DEBUG 实例未复现；疑外部加载与 local 路径交替的数值扰动，非字节错乱——复现条件与根因待查，**生产化前必须闭环**（实验记录见 [EXPERIMENTS.md](EXPERIMENTS.md) #10）
-- **副本/GC 生命周期（2026-10-12 观察，待确认）**：key 属主实例死亡后，master 将 key **连同远端副本一起移除**——正向实验 keys 在属主 A 重启后消失（exist 0/32，尽管 B seg 副本仍在）；与 #12「杀源实例法」短窗口内可读并存。预复制副本在属主下线后的长期语义（保留/驱逐/迁移归属）需单独闭环，直接影响故障恢复时已预热前缀的可用性。
+- **副本/GC 生命周期（2026-10-12 观察，待确认）**：key 属主实例死亡后，master 将 key **连同远端副本一起移除**——正向实验 keys 在属主 A 重启后消失（exist 0/32；B seg 字节原地残留，但元数据已删、不可寻址）；与 #12「杀源实例法」短窗口内可读并存。预复制副本在属主下线后的长期语义（保留/驱逐/迁移归属）需单独闭环，直接影响故障恢复时已预热前缀的可用性。
 - EP：持 KV 的 rank/多机拓扑尚未测
 - master HA、监控（READY 延迟、copy 失败率、external hit）
 - 源 worker 掉线则 copy 失败，与故障重路由如何衔接

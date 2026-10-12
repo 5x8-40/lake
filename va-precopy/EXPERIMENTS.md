@@ -14,12 +14,12 @@
 | 6 | 10/09 午 | 单机 245：A=TP4(卡0-3)→B=TP2(卡4,5)，B `LOAD_ASYNC=1` | 异构反向 e2e | 通过：24/24、**95.9%**、零 invalid、输出一致；踩坑：`decode_tp_size` 对 kv_both 是 **peer** size | 见「实验实录 · 反向」 |
 | 7 | 10/09 | 容器内 `vllm_ascend` 源码 | 上游 bug 修复实验：`pool_worker.py::_start_kv_transfer_threads` 构造 `KVCacheStore{Sending,Recving}Thread` 漏传 `worker=self` → `kv_transfer.py` tp_mismatch put/get 分支双双死代码 | `patch_tp_mismatch_worker.py` 幂等补丁，put 通路打通（#5 的 24/24 即补丁效果）；get 通路靠 #6 异步路径 | `patch_tp_mismatch_worker.py`、`config_data.py::infer_tp_mismatch_info` |
 | 8 | 10/09 晚 | 跨机 245→217：A=TP2(卡0,1)→B=TP4(卡0-3) | 异构跨机 e2e（三轮 precopy 验证稳定性） | **通过**：24/24 跨机 sub-key put、24/24 `replica_copy_success`、副本对号落 217 四 seg、B 首中 **95.9%** 零 invalid、输出逐字一致 | 见「实验实录 · 跨机」 |
-| 9 | 10/09 晚 | 245 宿主机 RoCE 网卡打点（`ip -s link enp67s0f5` 前后差值） | **读本机副本判定**（单次 B 命中 16 token） | ~~TX **+0.47 MB** / RX +0.13 MB；若读远端应 ~44 MB ⇒ get 读的是 217 本机 seg 副本~~ **10/09 深夜撤回：阳性对照实测 netdev 计数器不统计昇腾 RoCE RDMA 流量（24 keys ~43 MB 真实跨机传输，两侧计数器增量均 <2 MB），本行证据方法论作废**。读本机副本改由 #12 杀源实例法铁证。注：worker 日志里的 `Connected to segment: 245` 是 precopy copy-task 收尾连接（与 get 同秒重叠），非读取证据 | 本次会话打点记录；`/tmp/nic_before.txt`/`after.txt`（245） |
+| 9 | 10/09 晚 | 245 宿主机 RoCE 网卡打点（`ip -s link enp67s0f5` 前后差值） | **读本机副本判定**（单次 B 命中 16 token） | ~~TX **+0.47 MB** / RX +0.13 MB；若读远端应 ~44 MB ⇒ get 读的是 217 本机 seg 副本~~ **10/09 深夜撤回：阳性对照实测 netdev 计数器不统计昇腾 RoCE RDMA 流量（24 keys ~43 MB 真实跨机传输，两侧计数器增量均 <2 MB），本行证据方法论作废**。读本机副本改由 #12 杀源实例法确证。注：worker 日志里的 `Connected to segment: 245` 是 precopy copy-task 收尾连接（与 get 同秒重叠），非读取证据 | 本次会话打点记录；`/tmp/nic_before.txt`/`after.txt`（245） |
 | 10 | 10/09 | B(217) 重复请求确定性观察 | 同 prompt 反复打 B（16/64 token × 多次）+ 冷 prompt 对照 | 旧非 DEBUG 实例：**奇数次输出与 A 一致、偶数次近平局 token 处 1-token 翻转**（"warmup. va" → "warmup.  va"）；A 3×64 token 稳定；B 冷 prompt 3× 稳定；0.3.11+DEBUG 新实例 3 连跑未复现。疑外部加载路径交替的数值扰动，非字节错乱（纯外部读首请求与 A 逐字一致） | 本会话输出记录；根因待复现 |
 | 11 | 10/09 晚 | 217 容器 wheel 升级 `0.3.13.post1` | 尝试升级 mooncake（上游 1fc27b6 已有 `SelectCompleteMemoryReplica` 本机优先） | **失败**：mount 4 seg 后 EngineCore 挂起 15+ 分钟（APIServer `Waiting for 1 local core engine proc`），疑与旧 master 兼容性；回退 `0.3.11.post1` 后恢复正常（#8/#9 即回退后所测） | master 日志、`worker_B.log`（17:03-17:18） |
-| 12 | 10/09 深夜 | 跨机 245→217 异构重验（全新 prompt ×2：961/801 tok）+ **杀源实例终极判定** | **通过** + **杀源实例法铁证读本机副本**（仅剩 217 副本时 B 首中全部外部 get 成功、零 invalid、输出与 A 逐字一致）。两认知：判定须用**全新 prompt 首中**（第二次被内部 HBM cache 接住，外部 get=0）；netdev 不计 RDMA（#9 撤回依据） | 见「实验实录 · 跨机」；判定方法 [REPRODUCE.md](REPRODUCE.md) §3 |
-| 13 | 10/12 上午 | 跨机 245→217 异构，**bc6b5be 单入口控制面 + 两端 #15835 完整补丁** | 正向回归（升级后首测）：warm A → 单入口 precopy（32 keys=8 满块×4 eff）READY → B 首中 external **88.2%**（滚动累计口径，非单请求）、零 invalid、16-tok ×6 + 64-tok ×2 **8/8 逐字一致**（1-token 翻转未复现）。绕法：B 机容器无 `ss`，用 admin `:9003/get_all_segments` + 显式 `--targets` | 本次会话记录；见「实验实录 · 10-12 回归 · 正向」 |
-| 14 | 10/12 下午 | 跨机 **反向 217(TP4)→245(TP2)，A 同步 load（无 LOAD_ASYNC）** | **通过**：36/36 key 对号入 A 两 seg（18+18）；每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 证 hunk3 同步分发生效；8/8 token 与 B(TP4) 参考逐字一致；external hit 74.6→79.7%、零 invalid。踩坑：A env 误翻 `DECODE_TP_SIZE=2` → mismatch 静默禁用 → `-800`（指纹=`Failed to get 9 keys`=每块 1 key）；改回原 env（两台同配 `PREFILL=2/DECODE=4`）即通 | 见「实验实录 · 10-12 回归 · 反向（同步 load）」 |
+| 12 | 10/09 深夜 | 跨机 245→217 异构重验（全新 prompt ×2：961/801 tok）+ **杀源实例终判** | **通过** + **杀源实例法确证读本机副本**（仅剩 217 副本时 B 首中全部外部 get 成功、零 invalid、输出与 A 逐字一致）。两认知：判定须用**全新 prompt 首中**（第二次被内部 HBM cache 接住，外部 get=0）；netdev 不计 RDMA（#9 撤回依据） | 见「实验实录 · 跨机」；判定方法 [REPRODUCE.md](REPRODUCE.md) §3 |
+| 13 | 10/12 上午 | 跨机 245→217 异构，**bc6b5be 单入口控制面 + 两端 #15835 完整补丁** | 正向回归（升级后首测）：warm A → 单入口 precopy（32 keys=8 满块×4 eff）READY → B 首中 external **88.2%**（滚动累计口径，非单请求）、零 invalid、16-tok ×6 + 64-tok ×2 **8/8 逐字一致**（1-token 翻转未复现）。B 机容器无 `ss`：用 admin `:9003/get_all_segments` + 显式 `--targets` | 本次会话记录；见「实验实录 · 10-12 回归 · 正向」 |
+| 14 | 10/12 下午 | 跨机 **反向 217(TP4)→245(TP2)，A 同步 load（无 LOAD_ASYNC）** | **通过**：36/36 key 对号入 A 两 seg（18+18）；每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 证 hunk3 同步分发生效；8/8 token 与 B(TP4) 参考逐字一致；external hit 74.6→79.7%、零 invalid。踩坑：首跑 A 侧 peer 误配成 2（=自身 TP）→ mismatch 静默禁用 → `-800`（指纹 `Failed to get 9 keys`=每块 1 key）；改回 `PEER=4` 即通——同步 load mismatch 由此闭环 | 见「实验实录 · 10-12 回归 · 反向（同步 load）」 |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
 
@@ -38,7 +38,7 @@
 
 - 流程与单机一致：warm A → collect 24 keys（`prefix_keys_xhost_het.txt`）→ `resolve_segments.sh --target-ip 7.242.105.217 --tp 4` → precopy（245 侧容器内跑，`--targets` 平铺 4 seg）→ 打 B。
 - 结果：**24/24 key 存在**，A=TP2 的 sub-key put 跨机生效；**24/24 `replica_copy_success`**（A 侧 `client_service.cpp:2624`，~1 key/s），副本对号：rank0→`217:16471`、rank1→`217:15526`、rank2→`217:16596`、rank3→`217:15742`（每 key 双副本：245 源 seg + 217 目标 seg，`check_exists` 取证）；B 首次请求 `hit_tokens: 768/801`（**95.9%**，与单机正向一致）、零 invalid；B(DEBUG) 分 rank `MooncakeBackend.get enter keys=6` × TP0-3；A/B 同 prompt 贪心 16/64 token 输出逐字一致。
-- **本机读铁证（2026-10-09 深夜，杀源实例法，总表 #12）**：杀 worker-A 并等 client TTL 注销其 segment 副本（`batch_get_replica_desc` 仅剩 217 副本）后，B 用**全新 prompt 首次**命中：外部 get `enter keys=6` ×4 rank 同秒成功、external hit 累计 89.8%、零 invalid、输出与 A 逐字一致 ⇒ **get 读的是 217 本机 seg 副本**。早期用 RoCE 网卡打点取证的方法已撤回（netdev 计数器不统计 RDMA，总表 #9）；同 prompt 第二次命中会被 vLLM 内部 HBM prefix cache 接住（外部 get=0），判定必须用全新 prompt 首中。B 命中时刻 `Connected to segment: 7.242.105.245:*` 是 precopy copy-task 收尾传输（与 get 同秒重叠造成的误读，勿再当读取证据——本机 seg 读不留连接日志）。
+- **本机读确证（2026-10-09 深夜，杀源实例法，总表 #12）**：杀 worker-A 并等 client TTL 注销其 segment 副本（`batch_get_replica_desc` 仅剩 217 副本）后，B 用**全新 prompt 首次**命中：外部 get `enter keys=6` ×4 rank 同秒成功、external hit 累计 89.8%、零 invalid、输出与 A 逐字一致 ⇒ **get 读的是 217 本机 seg 副本**。早期用 RoCE 网卡打点取证的方法已撤回（netdev 计数器不统计 RDMA，总表 #9）；同 prompt 第二次命中会被 vLLM 内部 HBM prefix cache 接住（外部 get=0），判定必须用全新 prompt 首中。B 命中时刻 `Connected to segment: 7.242.105.245:*` 是 precopy copy-task 收尾传输（与 get 同秒重叠造成的误读，勿再当读取证据——本机 seg 读不留连接日志）。
 - 坑（跨机新增）：217 容器残留旧 worker 致假 READY（清理方法现见 [README.md](README.md)「操作注意事项」）；master 日志轮转坑已失效（见文末「踩坑记录」）。
 
 ### 反向：A=TP4 → B=TP2（总表 #6）
@@ -61,7 +61,7 @@
 
 - **判定方法勘误**
   - #12「0.3.11 无显式本机优先」有误：0.3.11.post1 `SelectBestReplica` 已实现 prefer local MEMORY（`real_client.cpp:283-286`）；0.3.12+ `SelectCompleteMemoryReplica` 仅 session API 路径。结论以 [REPRODUCE.md](REPRODUCE.md) §3 为准。
-  - #9 netdev 打点法撤回：计数器不统计昇腾 RoCE RDMA；本机读判定金标准改为杀源实例法（REPRODUCE §3）。
+  - #9 netdev 打点法撤回：计数器不统计昇腾 RoCE RDMA；本机读判定的终判改为杀源实例法（REPRODUCE §3）。
 - **补丁演进**
   - `patch_tp_mismatch_worker.py`（python 子集补丁，仅 `worker=self`，#5/#7 行）→ `patch_tp_mismatch_worker.patch`（#15835 完整版 rc1 backport，含同步 load 分发）；`LOAD_ASYNC=1` 由硬约束降为推荐（同步 mismatch 路径 2026-10-12 真机复测通过，总表 #14）。
 - **问题修复**
@@ -89,17 +89,17 @@
 
 ## 实验实录（2026-10-12 回归：bc6b5be 单入口控制面 + #15835 完整补丁）
 
-环境：两端容器均 #15835 完整版补丁（`patch_tp_mismatch_worker.patch`）；A=245 TP2（卡 0,1，:8001）、B=217 TP4（卡 0-3，:8002）；master 245 宿主机 `:50088`；env 两台同配 `PREFILL_TP_SIZE=2 DECODE_TP_SIZE=4`（当日变量名——2026-10-12 晚起脚本删 `PREFILL_TP_SIZE`（consumer 角色字段，用不到）、`DECODE_TP_SIZE` 正名 `PEER_TP_SIZE`，语义不变；现行处方见 README「env 处方」）；`VLLM_LOGGING_LEVEL=DEBUG`。
+环境：两端容器均 #15835 完整版补丁（`patch_tp_mismatch_worker.patch`）；A=245 TP2（卡 0,1，:8001）、B=217 TP4（卡 0-3，:8002）；master 245 宿主机 `:50088`；env 两台同 `DECODE_TP_SIZE=4`（**对端 TP 字段**，=max(2,4)，两台同值——不是本机 TP；当日另有 `PREFILL_TP_SIZE=2`，kv_both 不读、无作用。2026-10-12 晚起脚本删 `PREFILL_TP_SIZE`、`DECODE_TP_SIZE` 正名 `PEER_TP_SIZE`，语义不变；现行配置见 [README.md](README.md)「env 配置」）；`VLLM_LOGGING_LEVEL=DEBUG`（仅取证：分 rank `get enter` 日志非 DEBUG 不打印）。
 
 ### 正向：245(TP2)→217(TP4)（总表 #13）
 
 - 流程：warm A（`"va-precopy v53 regression hetero cross-machine prompt. "×80` = 1041 tok，8 满块）→ 单入口 `precopy.py --role B --tp-size 4 --peer-tp-size 2`（32 keys READY；eff0→16051, 1→16258, 2→16276, 3→16787）→ 打 B。
 - 结果：B 首中外部 get ×4 rank 成功（复命中走 vLLM 内部 HBM cache，预期）、external hit **88.2%**（滚动累计口径：实例启动以来所有请求，非本请求单值；故低于 95.9% 单请求口径）、零 invalid；16-tok ×6 + 64-tok ×2 **8/8 与 A 逐字一致，1-token 翻转未复现**（与 #10「新 DEBUG 实例未复现」一致）。
-- 绕法：B 机容器无 `ss`、pidfile 亦 stale——改用 master admin API `GET :9003/get_all_segments`（TTL 已自动注销旧 seg，名单干净）+ 显式 `--targets`。
+- B 机探测路径：容器无 `ss`、pidfile 亦 stale——改用 master admin API `GET :9003/get_all_segments`（TTL 已自动注销旧 seg，名单干净）+ 显式 `--targets`。
 
 ### 反向：217(TP4)→245(TP2)，同步 load（总表 #14）
 
-- 首跑失败（配置坑）：把 A env 按方向误翻成 `PREFILL_TP_SIZE=4 DECODE_TP_SIZE=2` → kv_both 读 peer=`decode_tp_size`=2=自身 → mismatch **静默禁用** → plain get 按本地 4-head 尺寸读 2-head eff key → `mooncake -800`，日志形状 `Failed to get 9 keys out of 9`（=9 块×1 key/rank，即「每块 1 key」指纹；正确 mismatch 应为每 rank 18 keys）→ 500。**#6 的坑 1 在新单入口下复踩**，处方固化为：两台同配 `PREFILL=2/DECODE=4`（README env 处方节 + `start_worker.sh` 整除校验）。
+- 首跑失败（配置坑）：把 A env 按方向误翻成 `PREFILL_TP_SIZE=4 DECODE_TP_SIZE=2` → kv_both 读 peer=`decode_tp_size`=2=自身 → mismatch **静默禁用** → plain get 按本地 4-head 尺寸读 2-head eff key → `mooncake -800`，日志形状 `Failed to get 9 keys out of 9`（=9 块×1 key/rank，即「每块 1 key」指纹；正确 mismatch 应为每 rank 18 keys）→ 500。**#6 的坑 1 在新单入口下复踩**，规则固化为：两台同配（README「env 配置」+ `start_worker.sh` 整除校验）。
 - 修正后：A 重启（无 `LOAD_ASYNC`）；B 不动（plain put 名字与字节恒等于 eff key）→ warm B 全新前缀（`"...reverse sync prompt. "×80` = 1201 tok，9 满块）→ 单入口 `precopy.py --role A --tp-size 2 --peer-tp-size 4 --targets <A 两 seg>`（36/36 exist；反向自动展开 eff i → targets[i//2]；rank↔seg 经 `ss` 端口→pid + `npu-smi` 卡→pid 对号）→ 打 A。
 - 结果：**每 rank `MooncakeBackend.get enter keys=18`**（TP0 读 @0…、TP1 读 @3…，9 块 × 2 sub-key 拼回本地）、`prepare get ... load_async=False` ×2 rank（hunk3 同步分发生效）、external hit 74.6→79.7%、零 invalid、16×6 + 64×2 **8/8 与 B(TP4) 参考逐字一致** → **`_load_kv_tp_mismatch` 拼回 + 同步分发两条空白路径首次真机闭环**。
 
@@ -107,7 +107,7 @@
 
 1. **PYTHONHASHSEED 未设 → 控制面 key 全体漂移**：vllm `kv_cache_utils.init_none_hash`（rc1 容器版 `kv_cache_utils.py:111-114`；main 已重构为 `resolve_none_hash_seed`）在 seed 未设时 `NONE_HASH = os.urandom(32)` 折入**每个** block hash，且 sha256 不在 `_CBOR_HASH_FUNCTIONS` 警告名单——**静默**。实测同一 prompt 两次算出 `dc9fdff8…`/`948bbe7a…` 两个 key 集，`batch_is_exist` 0/N 假失败（引擎其实已 put）。引擎侧 `start_worker.sh` 已带 seed；控制面（keys.py/precopy/手工探测脚本）此前没带。已修：`keys.py::_hash_prompt` fail loud；顺带勘误 README 前置表「默认 sha256 不需要」的说法。
 2. **孤儿 EngineCore 占卡**：重启 A 时只 kill 了 api_server（按 pid 段过滤漏掉 EngineCore/Worker——其 pid 与 api_server 相差悬殊），HBM 被孤儿占住，新实例 worker 起不来；segs 还是旧实例的。清理须按 `npu-smi`（卡→pid）+ `ss`（端口→pid）对号出的实际 pid 杀。
-3. **副本随属主消失**：属主 A 重启后，正向 keys 从 master 连同 B 侧副本一起移除（exist 0/32）——预复制副本的存活性疑似绑定属主 client，影响故障恢复语义，已列 README「开放问题」。
+3. **副本随属主消失（元数据级）**：属主 A 重启 → client TTL 过期 → master 把 key 记录连同全部副本记录（含 B seg 上的）一起移除，`batch_is_exist` 0/32。B 侧 DRAM 字节并未被擦除，但失去元数据即不可寻址，等同消失（原地残留至 seg 空间复用）。副本存活性疑似绑定属主 client，影响故障恢复语义，已列 README「开放问题」。
 4. **ssh 限速下 expect 的正确姿势**：`timeout` 杀掉 expect 后孤儿 ssh 仍握住管道写端，`| tail` 等 EOF 会把整个外层命令拖挂（实测被拖 300s+）。姿势：输出重定向落文件 + expect timeout 分支显式 `close`。
 
 ### 10-12 对既有结论的影响
