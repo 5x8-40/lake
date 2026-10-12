@@ -115,4 +115,4 @@
 - 同步 load mismatch：**已闭环**（#14，A 同步 load 36/36）。
 - key 一致性：**已闭环**（#13/#14 单入口 `batch_is_exist` 32/32、36/36 全中）。
 - 多卡 rank↔seg 对号：**已闭环**（`--targets` + admin API/`npu-smi` 手工对号）。
-- 仍待：`run_e2e.sh` 一键真机重跑（同构 TP=2 + 异构双向；10-12 回归走单入口手工分步，一键编排本身未跑）、1-token 翻转根因、MLA（明确不支持）、CI 冒烟 job；`tools/test_keys.py` 容器内单跑；resolve.py proctitle 自动匹配的多卡真机验证。
+- 仍待：`run_e2e.sh` 一键真机重跑（同构 TP=2 + 异构双向；10-12 回归走单入口手工分步，一键编排本身未跑）、1-token 翻转根因、MLA（明确不支持）；`tools/test_keys.py` 容器内单跑；resolve.py proctitle 自动匹配的多卡真机验证。

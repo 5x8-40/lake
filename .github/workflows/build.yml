@@ -15,6 +15,7 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       cmx: ${{ steps.filter.outputs.cmx }}
+      precopy: ${{ steps.filter.outputs.precopy }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -31,6 +32,7 @@ jobs:
             if [ -z "$BEFORE" ] || [[ "$BEFORE" =~ ^0+$ ]]; then
               echo "code=true" >> "$GITHUB_OUTPUT"
               echo "cmx=true" >> "$GITHUB_OUTPUT"
+              echo "precopy=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             RANGE="${BEFORE}...HEAD"
@@ -39,14 +41,19 @@ jobs:
           echo "$files"
           code=false
           cmx=false
+          precopy=false
           if echo "$files" | grep -qE '^(rust|go|python|proto|scripts|deploy|bench)/|^\.github/workflows/build\.yml'; then
             code=true
           fi
           if echo "$files" | grep -qE '^tools/cmx-sim/'; then
             cmx=true
           fi
+          if echo "$files" | grep -qE '^va-precopy/|^\.github/workflows/build\.yml'; then
+            precopy=true
+          fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "cmx=$cmx" >> "$GITHUB_OUTPUT"
+          echo "precopy=$precopy" >> "$GITHUB_OUTPUT"
 
   # 文档门禁:每条流水线都跑——纯文档 PR 的唯一必跑任务。
   docs-check:
@@ -59,6 +66,31 @@ jobs:
         with:
           python-version: "3.12"
       - run: python scripts/check_doc_links.py
+
+  # va-precopy 冒烟(PR #53 review §四.B):无 NPU 依赖的离线检查——语法/编译/单测/干跑三向。
+  # 补丁对 rc1 源码的应用检查与上游逐字节比对需容器源码,留在本地,此处只做可解析性。
+  va-precopy:
+    needs: filter
+    if: needs.filter.outputs.precopy == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: va-precopy
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: bash -n run_e2e.sh cluster/*.sh
+      - run: python -m py_compile precopy/*.py tools/*.py
+      - run: python tools/test_keys.py
+      - run: python tools/test_resolve.py
+      - run: DRY_RUN=1 bash run_e2e.sh
+      - run: DRY_RUN=1 TP_A=2 TP_B=4 bash run_e2e.sh
+      - run: DRY_RUN=1 TP_A=4 TP_B=2 bash run_e2e.sh
+      - run: git apply --numstat patch_tp_mismatch_worker.patch | grep -q .
 
   cmx-sim-check:
     needs: filter
