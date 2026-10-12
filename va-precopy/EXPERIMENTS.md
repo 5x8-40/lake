@@ -105,7 +105,7 @@
 
 ### 10-12 踩坑（新）
 
-1. **PYTHONHASHSEED 未设 → 控制面 key 全体漂移**：vllm `kv_cache_utils.init_none_hash`（`kv_cache_utils.py:111-114`）在 seed 未设时 `NONE_HASH = os.urandom(32)` 折入**每个** block hash，且 sha256 不在 `_CBOR_HASH_FUNCTIONS` 警告名单——**静默**。实测同一 prompt 两次算出 `dc9fdff8…`/`948bbe7a…` 两个 key 集，`batch_is_exist` 0/N 假失败（引擎其实已 put）。引擎侧 `start_worker.sh` 已带 seed；控制面（keys.py/precopy/手工探测脚本）此前没带。已修：`keys.py::_hash_prompt` fail loud；顺带勘误 README 前置表「默认 sha256 不需要」的说法。
+1. **PYTHONHASHSEED 未设 → 控制面 key 全体漂移**：vllm `kv_cache_utils.init_none_hash`（rc1 容器版 `kv_cache_utils.py:111-114`；main 已重构为 `resolve_none_hash_seed`）在 seed 未设时 `NONE_HASH = os.urandom(32)` 折入**每个** block hash，且 sha256 不在 `_CBOR_HASH_FUNCTIONS` 警告名单——**静默**。实测同一 prompt 两次算出 `dc9fdff8…`/`948bbe7a…` 两个 key 集，`batch_is_exist` 0/N 假失败（引擎其实已 put）。引擎侧 `start_worker.sh` 已带 seed；控制面（keys.py/precopy/手工探测脚本）此前没带。已修：`keys.py::_hash_prompt` fail loud；顺带勘误 README 前置表「默认 sha256 不需要」的说法。
 2. **孤儿 EngineCore 占卡**：重启 A 时只 kill 了 api_server（按 pid 段过滤漏掉 EngineCore/Worker——其 pid 与 api_server 相差悬殊），HBM 被孤儿占住，新实例 worker 起不来；segs 还是旧实例的。清理须按 `npu-smi`（卡→pid）+ `ss`（端口→pid）对号出的实际 pid 杀。
 3. **副本随属主消失**：属主 A 重启后，正向 keys 从 master 连同 B 侧副本一起移除（exist 0/32）——预复制副本的存活性疑似绑定属主 client，影响故障恢复语义，已列 README「开放问题」。
 4. **ssh 限速下 expect 的正确姿势**：`timeout` 杀掉 expect 后孤儿 ssh 仍握住管道写端，`| tail` 等 EOF 会把整个外层命令拖挂（实测被拖 300s+）。姿势：输出重定向落文件 + expect timeout 分支显式 `close`。

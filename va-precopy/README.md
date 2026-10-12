@@ -36,7 +36,7 @@
 | `HCCL_INTRA_ROCE_ENABLE=1` | 卡间 RoCE 单边通信（缺则 `HcclBatchPut=4`） |
 | `HCCL_IF_IP` | 主机业务 IP（与 segment 名中的 IP 一致） |
 | `HCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME` / `TP_SOCKET_IFNAME` | 业务网卡名 |
-| `PYTHONHASHSEED=0` | **控制面对齐硬依赖**（非 legacy）：上游 `kv_cache_utils.init_none_hash` 在 seed 未设时用 `os.urandom(32)` 作 `NONE_HASH` 折入每个 block hash（sha256 不在 cbor 警告名单，静默漂移）——引擎带 seed 而控制面不带时，keys.py 每次算出不同 key（exist check 0/N 假失败）。`keys.py::_hash_prompt` 已 fail loud |
+| `PYTHONHASHSEED=0` | **控制面对齐硬依赖**（非 legacy）：rc1 上游 `kv_cache_utils.init_none_hash` 在 seed 未设时用 `os.urandom(32)` 作 `NONE_HASH` 折入每个 block hash（sha256 不在 cbor 警告名单，静默漂移）——引擎带 seed 而控制面不带时，keys.py 每次算出不同 key（exist check 0/N 假失败）。`keys.py::_hash_prompt` 已 fail loud |
 | `HCCL_NPU_SOCKET_PORT_RANGE` | 同机多 worker 分端口段（脚本按 ROLE 默认 26000/26100） |
 
 非 A2（如 A3 HCCS）设 `ENABLE_ASCEND_A2=0` 并按官方文档导出对应变量。
