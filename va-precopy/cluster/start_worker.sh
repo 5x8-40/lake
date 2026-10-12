@@ -31,9 +31,9 @@ LOCAL_BUFFER_SIZE=${LOCAL_BUFFER_SIZE:-1GB}
 DRY_RUN=${DRY_RUN:-0}
 USE_LAYERWISE=${USE_LAYERWISE:-false}
 # Heterogeneous TP (AscendStore): PEER_TP_SIZE = the OTHER instance's TP, written
-# to engine field decode_tp_size — a PD-era name; rc1 config_data.py:48 reads the
-# peer from decode_tp_size for kv_producer/kv_both (prefill_tp_size is read only
-# by kv_consumer => dead config on this all-kv_both testbed, not emitted).
+# to engine field decode_tp_size — a PD-era name; rc1 config_data.py:48 reads
+# the peer TP from it (prefill_tp_size is a consumer-role field => dead config
+# on this testbed, not emitted).
 PEER_TP_SIZE=${PEER_TP_SIZE:-}
 
 cat >"$MOONCAKE_CONFIG_PATH" <<EOF
@@ -79,9 +79,9 @@ PY
 )
 fi
 
-# tp_mismatch sanity (kv_both): PEER_TP_SIZE goes to engine field decode_tp_size,
-# which infer_tp_mismatch_info (rc1 config_data.py:48) reads as the PEER TP for
-# kv_producer/kv_both. A wrong value does NOT error at startup — if
+# tp_mismatch sanity: PEER_TP_SIZE goes to engine field decode_tp_size, which
+# infer_tp_mismatch_info (rc1 config_data.py:48) reads as the peer TP.
+# A wrong value does NOT error at startup — if
 # num_kv_heads % eff != 0 (eff = max(local, peer)) the connector silently
 # disables mismatch and the first hetero get dies with mooncake -800
 # ("Failed to get <blocks> keys": plain-path reads eff keys at local size).

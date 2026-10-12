@@ -89,7 +89,7 @@
 
 ## 实验实录（2026-10-12 回归：bc6b5be 单入口控制面 + #15835 完整补丁）
 
-环境：两端容器均 #15835 完整版补丁（`patch_tp_mismatch_worker.patch`）；A=245 TP2（卡 0,1，:8001）、B=217 TP4（卡 0-3，:8002）；master 245 宿主机 `:50088`；env 两台同配 `PREFILL_TP_SIZE=2 DECODE_TP_SIZE=4`（当日变量名——2026-10-12 晚起脚本删 `PREFILL_TP_SIZE`（kv_both 死配置）、`DECODE_TP_SIZE` 正名 `PEER_TP_SIZE`，语义不变；现行处方见 README「kv_both 的 env 处方」）；`VLLM_LOGGING_LEVEL=DEBUG`。
+环境：两端容器均 #15835 完整版补丁（`patch_tp_mismatch_worker.patch`）；A=245 TP2（卡 0,1，:8001）、B=217 TP4（卡 0-3，:8002）；master 245 宿主机 `:50088`；env 两台同配 `PREFILL_TP_SIZE=2 DECODE_TP_SIZE=4`（当日变量名——2026-10-12 晚起脚本删 `PREFILL_TP_SIZE`（consumer 角色字段，用不到）、`DECODE_TP_SIZE` 正名 `PEER_TP_SIZE`，语义不变；现行处方见 README「env 处方」）；`VLLM_LOGGING_LEVEL=DEBUG`。
 
 ### 正向：245(TP2)→217(TP4)（总表 #13）
 

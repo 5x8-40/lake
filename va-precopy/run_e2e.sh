@@ -41,13 +41,13 @@ HIT_B=${HIT_B:-1}
 # Heterogeneous TP: A=TP_A (prefill/source), B=TP_B (decode/target). Same TP: leave unset.
 TP_A=${TP_A:-$TP}
 TP_B=${TP_B:-$TP}
-# PEER_TP_SIZE = the OTHER instance's TP. kv_both reads the peer only from the
-# decode_tp_size config field (rc1 config_data.py:48) — a PD-era name that for
-# kv_both simply means "peer TP". Same value max(A,B) on both ends is correct
-# in BOTH directions (forward: A sub-key put; reverse: B sub-key get);
-# defaulting to the smaller TP silently disables mismatch on the small end
-# (→ mooncake -800 on sync load / fake hit on async). prefill_tp_size is read
-# only by kv_consumer — dead config for this all-kv_both testbed, not set.
+# PEER_TP_SIZE = the OTHER instance's TP. The engine reads the peer TP only
+# from the decode_tp_size config field (rc1 config_data.py:48) — a PD-era
+# name that simply means "peer TP" here. Same value max(A,B) on both ends is
+# correct in BOTH directions (forward: A sub-key put; reverse: B sub-key
+# get); defaulting to the smaller TP silently disables mismatch on the small
+# end (→ mooncake -800 on sync load / fake hit on async). prefill_tp_size is
+# a consumer-role field — dead config on this testbed, not set.
 PEER_TP_SIZE=${PEER_TP_SIZE:-$(( TP_A > TP_B ? TP_A : TP_B ))}
 
 step() { echo; echo "==== $* ===="; }

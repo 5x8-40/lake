@@ -48,7 +48,7 @@ master 在源机 `0.0.0.0:50088`；B 机 worker 配 `MC_MASTER`/`LOCAL_IP`/`HCCL
 
 ### ③ 异构同机（双向）
 
-A/B 不同 `tp_size`，两端 env 均配 **`PEER_TP_SIZE=<max(A_TP,B_TP)>`**（**两端同值**，即 `run_e2e.sh` 的默认值；`start_worker.sh` 把它写进引擎字段 `decode_tp_size`，规则推导见 [README.md](README.md)「kv_both 的 env 处方」）。引擎把该字段当 **peer** size 读，只有恒配 effective_tp=max 两个方向才都对——配成 `<B_TP>` 在正向恰好等于 max 能对，反向（B 为小 TP）即踩下方「配置陷阱」的假命中；`prefill_tp_size` 仅引擎 consumer 角色读，本测试床（全 kv_both）是死配置（脚本不生成）。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
+A/B 不同 `tp_size`，两端 env 均配 **`PEER_TP_SIZE=<max(A_TP,B_TP)>`**（**两端同值**，即 `run_e2e.sh` 的默认值；`start_worker.sh` 把它写进引擎字段 `decode_tp_size`，规则推导见 [README.md](README.md)「env 处方」）。引擎把该字段当 **peer** size 读，只有恒配 effective_tp=max 两个方向才都对——配成 `<B_TP>` 在正向恰好等于 max 能对，反向（B 为小 TP）即踩下方「配置陷阱」的假命中；`prefill_tp_size` 是引擎 consumer 角色字段，本测试床用不到（脚本不生成）。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
 
 方向规则（`effective_tp = max(A_TP, B_TP)`）：
 
@@ -59,7 +59,7 @@ A/B 不同 `tp_size`，两端 env 均配 **`PEER_TP_SIZE=<max(A_TP,B_TP)>`**（*
 
 注：小 TP 消费者走异步的原因——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中，见 §3）；异步路径才走 `_load_kv_tp_mismatch`。当前补丁（#15835 完整版 backport）已恢复同步 load 的 mismatch 分发，且**同步 mismatch 已于 2026-10-12 真机回归通过**（反向 217(TP4)→245(TP2)、`load_async=False`，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #14）——硬约束解除，`LOAD_ASYNC=1` 为推荐（异步 overlap 更优），`run_e2e.sh` 反向（TP_A>TP_B）仍默认给 B 注入；手动分步（README 快速开始 C）需自行 export。
 
-**配置陷阱（反向方向最易错）**：`infer_tp_mismatch_info` 对 `kv_producer`/`kv_both` 读的是 **`decode_tp_size`** 作为 peer size（`kv_consumer` 才读 `prefill_tp_size`；脚本侧变量 `PEER_TP_SIZE`，2026-10-12 前名 `DECODE_TP_SIZE`）。反向（A=TP4→B=TP2）时 B 侧必须配 peer=4（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
+**配置陷阱（反向方向最易错）**：引擎从 **`decode_tp_size`** 读 peer size（`config_data.py:48`；脚本侧变量 `PEER_TP_SIZE`，2026-10-12 前名 `DECODE_TP_SIZE`）。反向（A=TP4→B=TP2）时 B 侧必须配 peer=4（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
 
 precopy 映射：eff rank i → B seg `i // num_sub_keys`，**由 precopy 自动展开**（`--tp-size <B 的 TP> --peer-tp-size <A 的 TP>`；反向 B=TP2 时 resolve 出的 2 个 seg 自动展开成 `seg0,seg0,seg1,seg1`，无需手工重复列表）；显式 `--targets` 时按 eff rank 序平铺给出。key 计算：eff = max(TP_A, TP_B)（24 keys = 6 满块 × 4 eff rank）。
 

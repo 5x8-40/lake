@@ -282,11 +282,11 @@ flowchart LR
 - **反向（TP4→TP2）**：A 是大 TP 端 → plain put；B 是小 TP 端 → sub-key get（`_load_kv_tp_mismatch` 读多个 eff key、按 head 切片拼回本地）。
 - 数学关系：`num_sub_keys = local_heads_per_rank ÷ effective_heads_per_rank`（`config_data.py::infer_tp_mismatch_info`，main 已改名 `metadata.py`）；eff key 命名 `effective_rank = tp_rank × num_sub_keys + sub_idx`。
 
-#### kv_both 的 env 处方（2026-10-12 实测固化）
+#### env 处方（2026-10-12 实测固化）
 
-`kv_role` 是引擎 connector 字段（本测试床恒为 `kv_both`；precopy 控制面绕过引擎直操作 master，**不感知 role**）——但它决定引擎从哪个字段读对端 TP，处方由此推：`infer_tp_mismatch_info`（`config_data.py:48`）只在 worker init 算一次，且 **kv_both 的 peer 永远读 `decode_tp_size`**（`prefill_tp_size` 仅纯 kv_consumer 读——本测试床全 kv_both，是死配置，脚本不生成）；算出的 `(enabled, eff, num_sub_keys)` 同时固定用于该实例的 put 与 get 两侧——**mismatch 信息与实验方向无关**，方向只决定谁 put 谁 get。因此：
+引擎从 `decode_tp_size` 字段读对端 TP（`config_data.py:48`，只在 worker init 算一次；`prefill_tp_size` 是 consumer 角色字段，本测试床用不到、脚本不生成）；算出的 `(enabled, eff, num_sub_keys)` 同时固定用于该实例的 put 与 get 两侧——**mismatch 信息与实验方向无关**，方向只决定谁 put 谁 get。因此：
 
-- **规则：每台 kv_both 实例 `PEER_TP_SIZE = max(本机 TP, 对端 TP)`**——`run_e2e.sh` 默认即 `max(TP_A,TP_B)`，`start_worker.sh` 把它写进引擎字段 `decode_tp_size`（PD 时代命名，对 kv_both 就是「对端 TP」；2026-10-12 前脚本变量名 `DECODE_TP_SIZE`，同义）。同构填自身 TP（disabled=正确）。两方向同一组值，**不要按方向翻转**（10-12 曾把 A 的 peer 误翻成 2=自身 → mismatch 静默禁用，[EXPERIMENTS.md](EXPERIMENTS.md) #14）。
+- **规则：每台实例 `PEER_TP_SIZE = max(本机 TP, 对端 TP)`**——`run_e2e.sh` 默认即 `max(TP_A,TP_B)`，`start_worker.sh` 把它写进引擎字段 `decode_tp_size`（PD 时代命名，即「对端 TP」；2026-10-12 前脚本变量名 `DECODE_TP_SIZE`，同义）。同构填自身 TP（disabled=正确）。两方向同一组值，**不要按方向翻转**（10-12 曾把 A 的 peer 误翻成 2=自身 → mismatch 静默禁用，[EXPERIMENTS.md](EXPERIMENTS.md) #14）。
 - **错误配置的运行期指纹**：小 TP 端禁用后走 plain get，按本地 head 尺寸读 eff key → 尺寸不符 → `mooncake -800`，日志形状 `Failed to get <块数> keys`（每块 1 key；正确 mismatch 应为 `块数 × num_sub_keys`）。填了对 `eff=max(本机,对端)` 不整除的值同样静默禁用——`start_worker.sh` 已加整除校验 fail loud。
 - 大 TP 端 disabled 即正确：其 plain key（`@tp_rank`、全本地切片）名字与字节恒等于 eff key。
 
