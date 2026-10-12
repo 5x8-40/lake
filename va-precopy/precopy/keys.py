@@ -265,6 +265,22 @@ def expand_store_keys(
 def _hash_prompt(
     model_path: str, prefix: str, block_size: int, hash_algo: str
 ) -> tuple[list[str], int]:
+    # Guard BEFORE computing: upstream kv_cache_utils.init_none_hash salts the
+    # whole block-hash chain with NONE_HASH = os.urandom(32) when
+    # PYTHONHASHSEED is unset (vllm/v1/core/kv_cache_utils.py:111-114; sha256
+    # is not in _CBOR_HASH_FUNCTIONS, so there is no warning either). The
+    # engine sets PYTHONHASHSEED=0 (start_worker.sh) and folds
+    # NONE_HASH=hash_fn("0") into every block; a control plane without the
+    # seed computes a different chain per run and batch_is_exist fails 0/N
+    # even though the engine put the KV. Observed 2026-10-12: same prompt,
+    # two runs -> two different key sets. Fail loud here.
+    if os.environ.get("PYTHONHASHSEED") != "0":
+        raise SystemExit(
+            "ERROR: PYTHONHASHSEED must be '0' to reproduce the engine's "
+            "block-hash chain (kv_cache_utils.init_none_hash salts with "
+            "os.urandom when unset). Export PYTHONHASHSEED=0 and rerun."
+        )
+
     from transformers import AutoTokenizer
     from vllm.utils.hashing import get_hash_fn_by_name
     from vllm.v1.core import kv_cache_utils as ku

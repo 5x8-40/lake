@@ -18,6 +18,8 @@
 | 10 | 10/09 | B(217) 重复请求确定性观察 | 同 prompt 反复打 B（16/64 token × 多次）+ 冷 prompt 对照 | 旧非 DEBUG 实例：**奇数次输出与 A 一致、偶数次近平局 token 处 1-token 翻转**（"warmup. va" → "warmup.  va"）；A 3×64 token 稳定；B 冷 prompt 3× 稳定；0.3.11+DEBUG 新实例 3 连跑未复现。疑外部加载路径交替的数值扰动，非字节错乱（纯外部读首请求与 A 逐字一致） | 本会话输出记录；根因待复现 |
 | 11 | 10/09 晚 | 217 容器 wheel 升级 `0.3.13.post1` | 尝试升级 mooncake（上游 1fc27b6 已有 `SelectCompleteMemoryReplica` 本机优先） | **失败**：mount 4 seg 后 EngineCore 挂起 15+ 分钟（APIServer `Waiting for 1 local core engine proc`），疑与旧 master 兼容性；回退 `0.3.11.post1` 后恢复正常（#8/#9 即回退后所测） | master 日志、`worker_B.log`（17:03-17:18） |
 | 12 | 10/09 深夜 | 跨机 245→217 异构重验（全新 prompt ×2：961/801 tok）+ **杀源实例终极判定** | **通过** + **杀源实例法铁证读本机副本**（仅剩 217 副本时 B 首中全部外部 get 成功、零 invalid、输出与 A 逐字一致）。两认知：判定须用**全新 prompt 首中**（第二次被内部 HBM cache 接住，外部 get=0）；netdev 不计 RDMA（#9 撤回依据） | 见「实验实录 · 跨机」；判定方法 [REPRODUCE.md](REPRODUCE.md) §3 |
+| 13 | 10/12 上午 | 跨机 245→217 异构，**bc6b5be 单入口控制面 + 两端 #15835 完整补丁** | 正向回归（升级后首测）：warm A → 单入口 precopy（32 keys=8 满块×4 eff）READY → B 首中 external **88.2%**、零 invalid、16-tok ×6 + 64-tok ×2 **8/8 逐字一致**（1-token 翻转未复现）。绕法：B 机容器无 `ss`，用 admin `:9003/get_all_segments` + 显式 `--targets` | 本次会话记录；见「实验实录 · 10-12 回归 · 正向」 |
+| 14 | 10/12 下午 | 跨机 **反向 217(TP4)→245(TP2)，A 同步 load（无 LOAD_ASYNC）** | **通过**：36/36 key 对号入 A 两 seg（18+18）；每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 证 hunk3 同步分发生效；8/8 token 与 B(TP4) 参考逐字一致；external hit 74.6→79.7%、零 invalid。踩坑：A env 误翻 `DECODE_TP_SIZE=2` → mismatch 静默禁用 → `-800`（指纹=`Failed to get 9 keys`=每块 1 key）；改回原 env（两台同配 `PREFILL=2/DECODE=4`）即通 | 见「实验实录 · 10-12 回归 · 反向（同步 load）」 |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
 
@@ -61,7 +63,7 @@
   - #12「0.3.11 无显式本机优先」有误：0.3.11.post1 `SelectBestReplica` 已实现 prefer local MEMORY（`real_client.cpp:283-286`）；0.3.12+ `SelectCompleteMemoryReplica` 仅 session API 路径。结论以 [REPRODUCE.md](REPRODUCE.md) §3 为准。
   - #9 netdev 打点法撤回：计数器不统计昇腾 RoCE RDMA；本机读判定金标准改为杀源实例法（REPRODUCE §3）。
 - **补丁演进**
-  - `patch_tp_mismatch_worker.py`（python 子集补丁，仅 `worker=self`，#5/#7 行）→ `patch_tp_mismatch_worker.patch`（#15835 完整版 rc1 backport，含同步 load 分发）；`LOAD_ASYNC=1` 由硬约束降为推荐（同步路径未复测）。
+  - `patch_tp_mismatch_worker.py`（python 子集补丁，仅 `worker=self`，#5/#7 行）→ `patch_tp_mismatch_worker.patch`（#15835 完整版 rc1 backport，含同步 load 分发）；`LOAD_ASYNC=1` 由硬约束降为推荐（同步 mismatch 路径 2026-10-12 真机复测通过，总表 #14）。
 - **问题修复**
   - `precopy.py` 退出偶发 allocator abort/挂起：根因 = 退出期 teardown 竞态（GC/atexit 乱序析构 × 在途收尾；0.3.11.post1 缺上游 #3943 drain，precopy 是唯一不 close 的脚本）——已修复为 READY 后显式 `store.close()`；旧日志中出现时 READY 已打印即可忽略。
 - **控制面重构（按调用链三次归位）**
@@ -84,3 +86,32 @@
 - **已修复 / 已失效**
   - `precopy.py` 退出偶发 allocator abort（RC=134）/挂起：已修复（见「勘误与演进」）。
   - master 日志被轮转后 fd 仍写改名文件（`.bak.27b`）→ `ln -sf` 修复：当时 `resolve_segments.sh` 读 master 日志 mount 行；resolve 改走 admin API + pidfile/ss 后此坑消失。
+
+## 实验实录（2026-10-12 回归：bc6b5be 单入口控制面 + #15835 完整补丁）
+
+环境：两端容器均 #15835 完整版补丁（`patch_tp_mismatch_worker.patch`）；A=245 TP2（卡 0,1，:8001）、B=217 TP4（卡 0-3，:8002）；master 245 宿主机 `:50088`；env 两台同配 `PREFILL_TP_SIZE=2 DECODE_TP_SIZE=4`（kv_both 处方，见 README「异构 TP · env 处方」）；`VLLM_LOGGING_LEVEL=DEBUG`。
+
+### 正向：245(TP2)→217(TP4)（总表 #13）
+
+- 流程：warm A（`"va-precopy v53 regression hetero cross-machine prompt. "×80` = 1041 tok，8 满块）→ 单入口 `precopy.py --role B --tp-size 4 --peer-tp-size 2`（32 keys READY；eff0→16051, 1→16258, 2→16276, 3→16787）→ 打 B。
+- 结果：B 首中外部 get ×4 rank 成功（复命中走 vLLM 内部 HBM cache，预期）、external hit **88.2%**、零 invalid；16-tok ×6 + 64-tok ×2 **8/8 与 A 逐字一致，1-token 翻转未复现**（与 #10「新 DEBUG 实例未复现」一致）。
+- 绕法：B 机容器无 `ss`、pidfile 亦 stale——改用 master admin API `GET :9003/get_all_segments`（TTL 已自动注销旧 seg，名单干净）+ 显式 `--targets`。
+
+### 反向：217(TP4)→245(TP2)，同步 load（总表 #14）
+
+- 首跑失败（配置坑）：把 A env 按方向误翻成 `PREFILL_TP_SIZE=4 DECODE_TP_SIZE=2` → kv_both 读 peer=`decode_tp_size`=2=自身 → mismatch **静默禁用** → plain get 按本地 4-head 尺寸读 2-head eff key → `mooncake -800`，日志形状 `Failed to get 9 keys out of 9`（=9 块×1 key/rank，即「每块 1 key」指纹；正确 mismatch 应为每 rank 18 keys）→ 500。**#6 的坑 1 在新单入口下复踩**，处方固化为：两台同配 `PREFILL=2/DECODE=4`（README env 处方节 + `start_worker.sh` 整除校验）。
+- 修正后：A 重启（无 `LOAD_ASYNC`）；B 不动（plain put 名字与字节恒等于 eff key）→ warm B 全新前缀（`"...reverse sync prompt. "×80` = 1201 tok，9 满块）→ 单入口 `precopy.py --role A --tp-size 2 --peer-tp-size 4 --targets <A 两 seg>`（36/36 exist；反向自动展开 eff i → targets[i//2]；rank↔seg 经 `ss` 端口→pid + `npu-smi` 卡→pid 对号）→ 打 A。
+- 结果：**每 rank `MooncakeBackend.get enter keys=18`**（TP0 读 @0…、TP1 读 @3…，9 块 × 2 sub-key 拼回本地）、`prepare get ... load_async=False` ×2 rank（hunk3 同步分发生效）、external hit 74.6→79.7%、零 invalid、16×6 + 64×2 **8/8 与 B(TP4) 参考逐字一致** → **`_load_kv_tp_mismatch` 拼回 + 同步分发两条空白路径首次真机闭环**。
+
+### 10-12 踩坑（新）
+
+1. **PYTHONHASHSEED 未设 → 控制面 key 全体漂移**：vllm `kv_cache_utils.init_none_hash`（`kv_cache_utils.py:111-114`）在 seed 未设时 `NONE_HASH = os.urandom(32)` 折入**每个** block hash，且 sha256 不在 `_CBOR_HASH_FUNCTIONS` 警告名单——**静默**。实测同一 prompt 两次算出 `dc9fdff8…`/`948bbe7a…` 两个 key 集，`batch_is_exist` 0/N 假失败（引擎其实已 put）。引擎侧 `start_worker.sh` 已带 seed；控制面（keys.py/precopy/手工探测脚本）此前没带。已修：`keys.py::_hash_prompt` fail loud；顺带勘误 README 前置表「默认 sha256 不需要」的说法。
+2. **孤儿 EngineCore 占卡**：重启 A 时只 kill 了 api_server（按 pid 段过滤漏掉 EngineCore/Worker——其 pid 与 api_server 相差悬殊），HBM 被孤儿占住，新实例 worker 起不来；segs 还是旧实例的。清理须按 `npu-smi`（卡→pid）+ `ss`（端口→pid）对号出的实际 pid 杀。
+3. **副本随属主消失**：属主 A 重启后，正向 keys 从 master 连同 B 侧副本一起移除（exist 0/32）——预复制副本的存活性疑似绑定属主 client，影响故障恢复语义，已列 README「开放问题」。
+4. **ssh 限速下 expect 的正确姿势**：`timeout` 杀掉 expect 后孤儿 ssh 仍握住管道写端，`| tail` 等 EOF 会把整个外层命令拖挂（实测被拖 300s+）。姿势：输出重定向落文件 + expect timeout 分支显式 `close`。
+
+### 10-12 对既有结论的影响
+
+- 「同步 mismatch 未单独复测」（10-10 重构披露）→ **已闭环**（#14）。
+- reviewer 挂账的真机回归三项：同步 load mismatch ✓（#14）、key 一致性哨兵 ✓（#13：8/8 token + 零 invalid）、多卡 Worker_TP 进程名确认 ✓（#14 rank↔seg 对号走通）。
+- 仍待：同构 TP=2 e2e 重跑（新控制面）、1-token 翻转根因、MLA（明确不支持）、CI 冒烟 job。

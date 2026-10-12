@@ -80,6 +80,37 @@ PY
 )
 fi
 
+# tp_mismatch sanity (kv_both): decode_tp_size is the PEER TP (config_data.py:
+# infer_tp_mismatch_info reads prefill_tp_size only for kv_consumer). A wrong
+# value does NOT error at startup — if num_kv_heads % eff != 0 the connector
+# silently disables mismatch and the first hetero get dies with mooncake -800
+# ("Failed to get <blocks> keys": plain-path reads eff keys at local size).
+# Fail loud here instead. Rule: set DECODE_TP_SIZE = max(own TP, peer TP).
+if [[ -n "$DECODE_TP_SIZE" && "$DECODE_TP_SIZE" != "$TP" ]]; then
+  KVH=$(python3 - "$MODEL" <<'PY' 2>/dev/null || echo 0
+import json, sys
+try:
+    c = json.load(open(sys.argv[1] + "/config.json"))
+except Exception:
+    print(0)
+else:
+    t = c.get("text_config") or {}
+    print(c.get("num_key_value_heads") or c.get("num_kv_heads")
+          or t.get("num_key_value_heads") or t.get("num_kv_heads") or 0)
+PY
+)
+  if [[ "$KVH" != 0 ]]; then
+    if [[ $((KVH % DECODE_TP_SIZE)) -ne 0 ]]; then
+      echo "[worker-$ROLE] ERROR: num_kv_heads=$KVH not divisible by DECODE_TP_SIZE=$DECODE_TP_SIZE — tp_mismatch silently falls back to plain path; set DECODE_TP_SIZE to the peer (larger) TP." >&2
+      exit 2
+    fi
+    EFF=$DECODE_TP_SIZE; [[ "$TP" -gt "$EFF" ]] && EFF=$TP
+    echo "[worker-$ROLE] tp_mismatch: local TP=$TP peer(decode_tp_size)=$DECODE_TP_SIZE num_kv_heads=$KVH -> eff=$EFF num_sub_keys=$((EFF / TP))"
+  else
+    echo "[worker-$ROLE] WARN: cannot read num_kv_heads from $MODEL/config.json — skip tp_mismatch divisibility check"
+  fi
+fi
+
 # A2 RoCE: required for cross-card create_copy_task (HcclBatchPut). See env_ascend_a2.sh.
 ENABLE_ASCEND_A2=${ENABLE_ASCEND_A2:-1}
 if [[ "$ENABLE_ASCEND_A2" == "1" && "$PROTOCOL" == "ascend" ]]; then
