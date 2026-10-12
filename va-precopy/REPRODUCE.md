@@ -48,7 +48,7 @@ master 在源机 `0.0.0.0:50088`；B 机 worker 配 `MC_MASTER`/`LOCAL_IP`/`HCCL
 
 ### ③ 异构同机（双向）
 
-A/B 不同 `tp_size`，两端 env 均配 **`PEER_TP_SIZE=<max(A_TP,B_TP)>`**（**两端同值**，即 `run_e2e.sh` 的默认值；`start_worker.sh` 把它写进引擎字段 `decode_tp_size`，规则推导见 [README.md](README.md)「kv_both 的 env 处方」）。kv_both 把该字段当 **peer** size 读，只有恒配 effective_tp=max 两个方向才都对——配成 `<B_TP>` 在正向恰好等于 max 能对，反向（B 为小 TP）即踩下方「配置陷阱」的假命中；`prefill_tp_size` 仅 kv_consumer 读，kv_both 是死配置（脚本不生成）。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
+A/B 不同 `tp_size`，两端 env 均配 **`PEER_TP_SIZE=<max(A_TP,B_TP)>`**（**两端同值**，即 `run_e2e.sh` 的默认值；`start_worker.sh` 把它写进引擎字段 `decode_tp_size`，规则推导见 [README.md](README.md)「kv_both 的 env 处方」）。引擎把该字段当 **peer** size 读，只有恒配 effective_tp=max 两个方向才都对——配成 `<B_TP>` 在正向恰好等于 max 能对，反向（B 为小 TP）即踩下方「配置陷阱」的假命中；`prefill_tp_size` 仅引擎 consumer 角色读，本测试床（全 kv_both）是死配置（脚本不生成）。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
 
 方向规则（`effective_tp = max(A_TP, B_TP)`）：
 

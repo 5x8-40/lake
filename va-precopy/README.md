@@ -160,7 +160,7 @@ B2：请求前把前缀 KV 放到目标实例本机 DRAM。先把三个对象讲
 | **Key 集合** | `precopy.py` prompt 模式内嵌 `collect_keys()` 展开 `head_or_tp_rank:0..N/put_step-1` × 满块（`precopy/keys.py`；key 全程内存） |
 | **多 seg** | `precopy.py --targets seg0,seg1,...`：**rank i 的 key 只 copy 到 `targets[i]`**（不再 key×N 广播）；反向异构（eff>N）自动展开为 `targets[i // num_sub_keys]` |
 | **调度** | 仍 **按 key 串行** `create_copy_and_wait`；映射已对号入座 |
-| **解析 seg** | `precopy.py` 缺省即内嵌 `resolve.resolve_segments()`（`precopy/resolve.py`）：master admin API 名单 ∩ pidfile 进程树 `ss` 端口（缺 `ss` 回退 `/proc`）；rank 取自 `VLLM::Worker_TP<N>` 进程名，对不上即 fail loud，**不读日志**；显式 `--targets` 可跳过 |
+| **解析 seg** | `precopy.py` 缺省即内嵌 `resolve.resolve_segments()`（`precopy/resolve.py`）：master admin API 名单 ∩ pidfile 进程树（`/proc`，ps 兜底）`ss` 端口（缺 `ss` 回退 `/proc`）；rank 取自 `VLLM::Worker_TP<N>` 进程名，对不上即 fail loud，**不读日志**；TP=1 可降级 admin 单 seg 匹配；显式 `--targets` 可跳过 |
 | **未做** | 多 key/多 seg **并行**；跨机一份 + 同机扩散；异构 TP 见下节（已验证，需容器补丁） |
 
 注意 `4×K` 把 key ≠ 4 倍数据：每把 key 只是**某个 rank 的切片**，合起来才是一份完整 KV（总字节 ≈ 一份逻辑 KV）——不是每把 key 都在 4 个 seg 上各留全量副本。
@@ -232,7 +232,7 @@ sequenceDiagram
 | 控制面需要 | 来源 | 性质 |
 |-----------|------|------|
 | B 的 seg 名单 | `GET :9003/get_all_segments`（master admin，纯文本逐行） | master API（:9003 为 mooncake_master 内置默认，`start_master.sh` 无需 flag，见脚本注释） |
-| rank↔seg 对号 | `logs/worker_<ROLE>.pid` → 进程树 → `ss -ltnp` 端口（缺 `ss` 回退 `/proc/net/tcp`）∩ 名单；rank 取 `VLLM::Worker_TP<N>` 进程名 | OS 级（跨机经 `--ssh`） |
+| rank↔seg 对号 | `logs/worker_<ROLE>.pid` → 进程树（`/proc/*/stat`，ps 兜底）→ `ss -ltnp` 端口（缺 `ss` 回退 `/proc/net/tcp`）∩ 名单；rank 取 `VLLM::Worker_TP<N>` 进程名；TP=1 探测基建缺失时降级为 admin 单 seg 匹配（loud WARN） | OS 级（跨机经 `--ssh`） |
 | key 名单核对 | `batch_is_exist` / `batch_get_replica_desc` | 客户端 API |
 | READY 判定 | `query_task` + `batch_get_replica_desc` | 客户端 API |
 | worker 就绪 | 轮询 HTTP `/v1/models` | HTTP API |
@@ -284,7 +284,7 @@ flowchart LR
 
 #### kv_both 的 env 处方（2026-10-12 实测固化）
 
-`infer_tp_mismatch_info`（`config_data.py:48`）只在 worker init 算一次，且 **kv_both 的 peer 永远读 `decode_tp_size`**（`prefill_tp_size` 仅纯 kv_consumer 读——本测试床全 kv_both，是死配置，脚本不生成）；算出的 `(enabled, eff, num_sub_keys)` 同时固定用于该实例的 put 与 get 两侧——**mismatch 信息与实验方向无关**，方向只决定谁 put 谁 get。因此：
+`kv_role` 是引擎 connector 字段（本测试床恒为 `kv_both`；precopy 控制面绕过引擎直操作 master，**不感知 role**）——但它决定引擎从哪个字段读对端 TP，处方由此推：`infer_tp_mismatch_info`（`config_data.py:48`）只在 worker init 算一次，且 **kv_both 的 peer 永远读 `decode_tp_size`**（`prefill_tp_size` 仅纯 kv_consumer 读——本测试床全 kv_both，是死配置，脚本不生成）；算出的 `(enabled, eff, num_sub_keys)` 同时固定用于该实例的 put 与 get 两侧——**mismatch 信息与实验方向无关**，方向只决定谁 put 谁 get。因此：
 
 - **规则：每台 kv_both 实例 `PEER_TP_SIZE = max(本机 TP, 对端 TP)`**——`run_e2e.sh` 默认即 `max(TP_A,TP_B)`，`start_worker.sh` 把它写进引擎字段 `decode_tp_size`（PD 时代命名，对 kv_both 就是「对端 TP」；2026-10-12 前脚本变量名 `DECODE_TP_SIZE`，同义）。同构填自身 TP（disabled=正确）。两方向同一组值，**不要按方向翻转**（10-12 曾把 A 的 peer 误翻成 2=自身 → mismatch 静默禁用，[EXPERIMENTS.md](EXPERIMENTS.md) #14）。
 - **错误配置的运行期指纹**：小 TP 端禁用后走 plain get，按本地 head 尺寸读 eff key → 尺寸不符 → `mooncake -800`，日志形状 `Failed to get <块数> keys`（每块 1 key；正确 mismatch 应为 `块数 × num_sub_keys`）。填了对 `eff=max(本机,对端)` 不整除的值同样静默禁用——`start_worker.sh` 已加整除校验 fail loud。
@@ -388,7 +388,7 @@ va-precopy/
 - **跨机操作**
   - 两机**非共享存储**：各自 clone 本目录并同步（补丁、脚本、配置保持一致）。
   - 高频 SSH 连接触发对端限速（认证后断连/KEX 卡死）：控制操作合并成批执行，或改控制台人工执行；expect 包装要「输出落文件 + timeout 分支 close」，否则孤儿 ssh 握住管道会把外层 timeout 也拖挂。
-  - **容器无 `ss` 不再是死路**：resolve 缺 `ss` 自动回退 `/proc/net/tcp × /proc/*/fd`（stdlib，需能读其他进程 fd——root 或同 uid；hidepid 则 fail loud 并在报错里列出替代路径）。仍走不通时：master admin API 拿权威名单（`GET :9003/get_all_segments`，TTL 过期自动注销；`/get_all_keys` 可取证全量 key）+ 显式 `--targets` 跳过自动解析；手工 rank↔seg 对号用 `ss -ltnp`（宿主机）端口→pid + `npu-smi` 卡→pid（卡号=rank 号）。
+  - **容器无 `ss`/`ps` 不再是死路**：resolve 进程树走 `/proc/*/stat`（`ps` 兜底）、端口缺 `ss` 回退 `/proc/net/tcp × /proc/*/fd`（stdlib，需能读其他进程 fd——root 或同 uid；hidepid 则 fail loud 并在报错里列出替代路径）；**TP=1 且探测基建全挂时自动降级**为 admin 名单单 seg 匹配（复用 master :9003，loud WARN、无交叉核对；pidfile stale=worker 已死**不降级**，防拷进将注销 seg）。TP>1 仍走不通时：master admin API 拿权威名单（`GET :9003/get_all_segments`，TTL 过期自动注销；`/get_all_keys` 可取证全量 key）+ 显式 `--targets` 跳过自动解析；手工 rank↔seg 对号用 `ss -ltnp`（宿主机）端口→pid + `npu-smi` 卡→pid（卡号=rank 号）。
 - **判定**：指标会骗人（假命中）、必须全新 prompt 首中、必须等源 client TTL、勿用 netdev 计数器、分 rank 证据需 DEBUG——判定方法与其陷阱是一个整体，见 [REPRODUCE.md](REPRODUCE.md) §3。
 
 ## 边界与已知限制

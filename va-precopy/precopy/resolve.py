@@ -8,18 +8,22 @@ standalone (debug) and as its own remote probe (see below).
 Data sources (no log involved):
   seg names : mooncake master admin API  GET :<admin_port>/get_all_segments
               (plain text, one "ip:port" per line; rpc_service.cpp)
-  rank->pid : pidfile written by cluster/start_worker.sh -> full process
-              tree -> /proc/<pid>/cmdline proctitle "VLLM::Worker_TP<N>"
+  rank->pid : pidfile written by cluster/start_worker.sh -> process tree
+              (/proc/*/stat ppid links; `ps` fallback) -> /proc/<pid>/cmdline
+              proctitle "VLLM::Worker_TP<N>"
   pid->seg  : listening TCP ports INTERSECT admin segment list; ports from
               `ss -ltnp`, falling back to /proc/net/tcp{,6} x /proc/*/fd
               (stdlib-only, for minimal containers without ss)
+  TP=1 degraded: probe infra gap (no pidfile / no ss+/proc) -> admin-only
+              single-seg match (loud WARN, no cross-check; stale pidfile =
+              dead worker stays fail loud)
 
 Any source disagreement fails loud — a silently wrong rank<->seg map means
 copying to the wrong DRAM segment (local-first is the whole point).
 
-Cross-machine: B-side probes (pidfile/ps/ss) run over ssh by piping THIS
-FILE's source to `python3 - --local-probe <pidfile>` on the target host —
-no remote checkout path is assumed. That is why this module is stdlib-only.
+Cross-machine: B-side probes (pidfile + /proc; ps/ss only as fallbacks) run
+over ssh by piping THIS FILE's source to `python3 - --local-probe <pidfile>`
+on the target host — no remote checkout path is assumed.
 
 Usage:
   python3 resolve.py --role B --tp 4                      # standalone debug
@@ -93,17 +97,49 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
-def _process_tree(root_pid: int) -> set[int]:
+def _pid_children_map() -> dict[int, list[int]]:
+    """ppid -> pids map. Primary: /proc/*/stat ppid links (stdlib — minimal
+    containers may lack ps). Fallback: `ps -eo pid=,ppid=` (e.g. hidepid)."""
+    children: dict[int, list[int]] = {}
+    n_stat = 0
+    try:
+        pid_names = os.listdir("/proc")
+    except OSError:
+        pid_names = []
+    for pid_s in pid_names:
+        if not pid_s.isdigit():
+            continue
+        try:
+            with open(f"/proc/{pid_s}/stat", "rb") as f:
+                stat = f.read().decode(errors="replace")
+        except OSError:
+            continue
+        # comm (field 2) may contain spaces/parens — parse fields AFTER the
+        # last ')': state ppid pgrp ...
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            continue
+        fields = stat[rparen + 1 :].split()
+        if len(fields) < 2:
+            continue
+        children.setdefault(int(fields[1]), []).append(int(pid_s))
+        n_stat += 1
+    if n_stat:
+        return children
     out = subprocess.run(
         ["ps", "-eo", "pid=,ppid="], capture_output=True, text=True, check=True
     ).stdout
-    children: dict[int, list[int]] = {}
     for ln in out.splitlines():
         parts = ln.split()
         if len(parts) != 2:
             continue
         pid, ppid = int(parts[0]), int(parts[1])
         children.setdefault(ppid, []).append(pid)
+    return children
+
+
+def _process_tree(root_pid: int) -> set[int]:
+    children = _pid_children_map()
     seen: set[int] = set()
     stack = [root_pid]
     while stack:
@@ -381,6 +417,26 @@ def resolve_segments(
         rows = probe_ssh(ssh, pidfile) if ssh else probe_local(pidfile)
     except ProbeError as e:
         where = ssh or "this host"
+        # TP=1 last resort (reuses the mooncake admin port we already query):
+        # exactly one seg on target-ip + TP=1 => rank 0 by construction.
+        # Infrastructure gaps only (no pidfile / no port-listing source) — a
+        # STALE pidfile means the worker DIED; degrading then would copy into
+        # a soon-to-vanish seg, so that stays fail loud. Loud WARN either
+        # way, and any ambiguity stays fail loud.
+        if tp == 1 and e.code != _PROBE_STALE:
+            solo = [s for s in segs if not target_ip or s.startswith(f"{target_ip}:")]
+            if len(solo) == 1:
+                print(
+                    f"[resolve] WARN: probe on {where} failed ({e}); TP=1 degraded "
+                    f"to admin-only single-seg match {solo[0]} (no pid cross-check)",
+                    file=sys.stderr,
+                )
+                return solo, {
+                    "admin": admin,
+                    "pidfile": pidfile,
+                    "probe": f"admin-only degraded (probe failed: {e})",
+                    "rank_seg": {0: solo[0]},
+                }
         if e.code == _PROBE_MISSING:
             raise ResolveError(
                 f"pidfile {pidfile} missing/empty (worker-{role} not started via "

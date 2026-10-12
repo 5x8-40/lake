@@ -27,6 +27,7 @@ from resolve import (  # noqa: E402
     _intersect,
     _listen_ports_by_pid,
     _listen_ports_by_pid_proc,
+    _process_tree,
     probe_local,
     resolve_segments,
 )
@@ -196,7 +197,7 @@ def test_stale_pidfile_fails() -> None:
 
 
 def test_missing_pidfile_fails() -> None:
-    srv = _start_admin("127.0.0.1:5001\n")
+    srv = _start_admin("127.0.0.1:5001\n127.0.0.1:5002\n")  # ambiguous: no TP=1 degrade
     try:
         _expect_err(
             lambda: resolve_segments(
@@ -276,6 +277,79 @@ def test_dispatch_falls_back_without_ss() -> None:
         proc.wait()
 
 
+# ---------------------------------------------------------------------------
+# Process tree (/proc primary, ps fallback) + TP=1 admin-only degrade
+# ---------------------------------------------------------------------------
+
+
+def test_process_tree_contains_child() -> None:
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _LISTENER], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        proc.stdout.readline()  # wait until listening
+        assert proc.pid in _process_tree(os.getpid())
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_process_tree_ps_fallback() -> None:
+    if not os.path.exists("/proc"):
+        return
+    import resolve as r
+
+    orig_listdir = r.os.listdir
+
+    def no_proc(path, *a, **kw):
+        if path == "/proc":
+            raise OSError("hidepid")
+        return orig_listdir(path, *a, **kw)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _LISTENER], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        proc.stdout.readline()
+        r.os.listdir = no_proc
+        try:
+            assert proc.pid in _process_tree(os.getpid())  # via ps
+        finally:
+            r.os.listdir = orig_listdir
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_tp1_admin_only_degrade() -> None:
+    srv = _start_admin("127.0.0.1:5001\n")  # exactly one seg
+    try:
+        targets, info = resolve_segments(
+            tp=1,
+            admin=f"http://127.0.0.1:{srv.server_port}",
+            pidfile="/nonexistent/worker_B.pid",  # probe must fail
+        )
+        assert targets == ["127.0.0.1:5001"], targets
+        assert info["probe"].startswith("admin-only degraded"), info
+    finally:
+        srv.shutdown()
+
+
+def test_tp1_admin_only_ambiguous_fails() -> None:
+    srv = _start_admin("127.0.0.1:5001\n127.0.0.1:5002\n")  # two segs, same ip
+    try:
+        _expect_err(
+            lambda: resolve_segments(
+                tp=1,
+                admin=f"http://127.0.0.1:{srv.server_port}",
+                pidfile="/nonexistent/worker_B.pid",
+            ),
+            "missing/empty",  # degraded path refuses ambiguity, original error
+        )
+    finally:
+        srv.shutdown()
+
+
 TESTS = [
     test_tp1_happy,
     test_tp2_rank_order,
@@ -292,6 +366,10 @@ TESTS = [
     test_garbage_pidfile_fails,
     test_proc_fallback_finds_listener,
     test_dispatch_falls_back_without_ss,
+    test_process_tree_contains_child,
+    test_process_tree_ps_fallback,
+    test_tp1_admin_only_degrade,
+    test_tp1_admin_only_ambiguous_fails,
 ]
 
 if __name__ == "__main__":
