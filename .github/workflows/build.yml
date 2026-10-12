@@ -90,7 +90,10 @@ jobs:
       - run: DRY_RUN=1 bash run_e2e.sh
       - run: DRY_RUN=1 TP_A=2 TP_B=4 bash run_e2e.sh
       - run: DRY_RUN=1 TP_A=4 TP_B=2 bash run_e2e.sh
-      - run: git apply --numstat patch_tp_mismatch_worker.patch | grep -q .
+      # 补丁结构断言:unified diff 头 + 三处 hunk(与 README「三处 hunk 锚定 rc1 唯一上下文」一致)。
+      - run: |
+          grep -q '^diff --git' patch_tp_mismatch_worker.patch
+          test "$(grep -c '^@@ ' patch_tp_mismatch_worker.patch)" -eq 3
 
   cmx-sim-check:
     needs: filter
