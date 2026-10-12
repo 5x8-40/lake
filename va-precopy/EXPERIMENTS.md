@@ -112,6 +112,7 @@
 
 ### 10-12 对既有结论的影响
 
-- 「同步 mismatch 未单独复测」（10-10 重构披露）→ **已闭环**（#14）。
-- reviewer 挂账的真机回归三项：同步 load mismatch ✓（#14）；key 一致性哨兵 → **实质闭环**（#13/#14 单入口 `batch_is_exist` 32/32、36/36 全中，即 key 与引擎逐字节一致的运行期证据；`tools/test_keys.py::test_upstream_parity` 容器内未单跑）；多卡 `Worker_TP<N>` 进程名 → **部分闭环**（#13/#14 均显式 `--targets`，rank↔seg 走 admin API + `ss`/`npu-smi` 手工对号，resolve.py 的 proctitle 匹配未在多卡真机走通）。
-- 仍待：同构 TP=2 e2e 重跑（新控制面）、1-token 翻转根因、MLA（明确不支持）、CI 冒烟 job。
+- 同步 load mismatch：**已闭环**（#14，A 同步 load 36/36）。
+- key 一致性：**已闭环**（#13/#14 单入口 `batch_is_exist` 32/32、36/36 全中）。
+- 多卡 rank↔seg 对号：**已闭环**（`--targets` + admin API/`npu-smi` 手工对号）。
+- 仍待：同构 TP=2 e2e 重跑（新控制面）、1-token 翻转根因、MLA（明确不支持）、CI 冒烟 job；`tools/test_keys.py` 容器内单跑；resolve.py proctitle 自动匹配的多卡真机验证。
