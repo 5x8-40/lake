@@ -55,7 +55,7 @@ A/B 不同 `tp_size`，两端 env 均配 **`PEER_TP_SIZE=<max(A_TP,B_TP)>`**（*
 | 角色 | put（生产） | get（消费） |
 |------|-------------|-------------|
 | TP = effective_tp 的大 TP 端 | plain put（无需 sub-key） | 同步 load 即可 |
-| TP < effective_tp 的小 TP 端 | 需补丁后 sub-key put | sub-key get（`LOAD_ASYNC=1` 异步路径） |
+| TP < effective_tp 的小 TP 端 | 需补丁后 sub-key put | sub-key get（同步/异步均可，推荐 `LOAD_ASYNC=1`） |
 
 注：无补丁时小 TP 消费者必须走异步——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中，见 §3）；异步路径才走 `_load_kv_tp_mismatch`。补丁（#15835 backport）含同步 load 的 mismatch 分发，同步/异步均可（同步已验证，见 [EXPERIMENTS.md](EXPERIMENTS.md) #14）；`LOAD_ASYNC=1` 为推荐（异步 overlap 更优），`run_e2e.sh` 反向（TP_A>TP_B）默认给 B 注入；手动分步（README 快速开始 C）需自行 export。
 
