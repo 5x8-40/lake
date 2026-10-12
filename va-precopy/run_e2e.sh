@@ -41,16 +41,19 @@ HIT_B=${HIT_B:-1}
 # Heterogeneous TP: A=TP_A (prefill/source), B=TP_B (decode/target). Same TP: leave unset.
 TP_A=${TP_A:-$TP}
 TP_B=${TP_B:-$TP}
-PREFILL_TP_SIZE=${PREFILL_TP_SIZE:-$TP_A}
-# kv_both reads decode_tp_size as PEER size; it must be effective_tp=max(A,B)
-# in BOTH directions (forward: A does sub-key put; reverse: B does sub-key get).
-# Defaulting to TP_B breaks reverse (B sees peer==local → plain get → fake hit).
-DECODE_TP_SIZE=${DECODE_TP_SIZE:-$(( TP_A > TP_B ? TP_A : TP_B ))}
+# PEER_TP_SIZE = the OTHER instance's TP. kv_both reads the peer only from the
+# decode_tp_size config field (rc1 config_data.py:48) — a PD-era name that for
+# kv_both simply means "peer TP". Same value max(A,B) on both ends is correct
+# in BOTH directions (forward: A sub-key put; reverse: B sub-key get);
+# defaulting to the smaller TP silently disables mismatch on the small end
+# (→ mooncake -800 on sync load / fake hit on async). prefill_tp_size is read
+# only by kv_consumer — dead config for this all-kv_both testbed, not set.
+PEER_TP_SIZE=${PEER_TP_SIZE:-$(( TP_A > TP_B ? TP_A : TP_B ))}
 
 step() { echo; echo "==== $* ===="; }
 
 if [[ "$TP_A" != "$TP_B" ]]; then
-  echo "[e2e] heterogeneous TP: A=$TP_A -> B=$TP_B (prefill_tp_size=$PREFILL_TP_SIZE decode_tp_size=$DECODE_TP_SIZE; needs patch_tp_mismatch_worker.patch in container; see README 异构 TP)." >&2
+  echo "[e2e] heterogeneous TP: A=$TP_A -> B=$TP_B (peer decode_tp_size=$PEER_TP_SIZE on both; needs patch_tp_mismatch_worker.patch in container; see README 异构 TP)." >&2
   [[ "$TP_A" -gt "$TP_B" ]] && echo "[e2e] reverse: worker-B gets LOAD_ASYNC=1 (sub-key get via the validated async path)." >&2
 elif [[ "$TP_B" != "1" ]]; then
   echo "[e2e] TP=$TP_B homogeneous: rank i keys → B local_seg[i] (see README 怎么运作)." >&2
@@ -100,7 +103,7 @@ _start_worker() {
   ROLE=$role PORT=$port LOOKUP_ID=$lookup ASCEND_RT_VISIBLE_DEVICES=$devices \
     MODEL=$MODEL SERVED_NAME=$SERVED_NAME MC_MASTER=$MC_MASTER \
     MOONCAKE_PROTOCOL=$PROTOCOL TP=$tp MAX_MODEL_LEN=$MAX_MODEL_LEN \
-    PREFILL_TP_SIZE=$PREFILL_TP_SIZE DECODE_TP_SIZE=$DECODE_TP_SIZE \
+    PEER_TP_SIZE=$PEER_TP_SIZE \
     ENABLE_ASCEND_A2=$ENABLE_ASCEND_A2 DRY_RUN=$DRY_RUN \
     env $load_async_env bash "$SCRIPT_DIR/cluster/start_worker.sh"
 }

@@ -12,7 +12,7 @@
 | mooncake wheel | `mooncake_transfer_engine_npu-0.3.11.post1` | **勿升级 0.3.13.post1**：mount segment 后 EngineCore 挂起 15+ 分钟（疑与旧 master 兼容性），实测失败已回退 |
 | master | 245 宿主机 `mooncake_master 0.0.0.0:50088` | 跨机时 B 侧配 `MC_MASTER=A_IP:50088`、`LOCAL_IP=B_IP`、`HCCL_IF_IP=B_IP` |
 | A2 RoCE | `HCCL_INTRA_ROCE_ENABLE=1` + `env_ascend_a2.sh` 全套 | **缺则跨卡 copy 直接失败（`HcclBatchPut=4`）**。业务网卡 `NIC_NAME=enp67s0f5`（两台同名） |
-| hash 对齐 | precopy/keys `--hash-algo sha256`（默认） | 与引擎 `prefix_caching_hash_algo` 一致即可；`PYTHONHASHSEED=0` 仅 algo=builtin 时需要（legacy 防御） |
+| hash 对齐 | precopy/keys `--hash-algo sha256`（默认）+ **`PYTHONHASHSEED=0`** | algo 与引擎 `prefix_caching_hash_algo` 一致；**seed 是控制面硬依赖**：rc1 引擎在 seed 未设时用 `os.urandom(32)` 作 `NONE_HASH` 折入每个 block hash（sha256 静默无警告），控制面不带 seed 算出的 key 全体漂移（`keys.py::_hash_prompt` 已 fail loud；2026-10-12 实测踩坑，见 [EXPERIMENTS.md](EXPERIMENTS.md)「10-12 踩坑」） |
 | 同机多 worker | `preferred_segment: true` | 否则写路径可能把 KV 分到同机另一 worker 的 segment，预复制场景退化 |
 | 取证日志 | `VLLM_LOGGING_LEVEL=DEBUG` | 非 DEBUG 无分 rank `MooncakeBackend.get enter keys=` 证据 |
 
@@ -48,7 +48,7 @@ master 在源机 `0.0.0.0:50088`；B 机 worker 配 `MC_MASTER`/`LOCAL_IP`/`HCCL
 
 ### ③ 异构同机（双向）
 
-A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`decode_tp_size=<max(A_TP,B_TP)>`（**两端同值**，即 `run_e2e.sh` 的默认值）。kv_both 把 `decode_tp_size` 当 **peer** size 读，只有恒配 effective_tp=max 两个方向才都对——配成 `<B_TP>` 在正向恰好等于 max 能对，反向（B 为小 TP）即踩下方「配置陷阱」的假命中；`prefill_tp_size` 仅 kv_consumer 读，kv_both 场景不影响。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
+A/B 不同 `tp_size`，两端 env 均配 **`PEER_TP_SIZE=<max(A_TP,B_TP)>`**（**两端同值**，即 `run_e2e.sh` 的默认值；`start_worker.sh` 把它写进引擎字段 `decode_tp_size`，规则推导见 [README.md](README.md)「kv_both 的 env 处方」）。kv_both 把该字段当 **peer** size 读，只有恒配 effective_tp=max 两个方向才都对——配成 `<B_TP>` 在正向恰好等于 max 能对，反向（B 为小 TP）即踩下方「配置陷阱」的假命中；`prefill_tp_size` 仅 kv_consumer 读，kv_both 是死配置（脚本不生成）。**两端容器都必须打 `patch_tp_mismatch_worker.patch`**。
 
 方向规则（`effective_tp = max(A_TP, B_TP)`）：
 
@@ -57,9 +57,9 @@ A/B 不同 `tp_size`，extra_config 两端均配 `prefill_tp_size=<A_TP>`、`dec
 | TP = effective_tp 的大 TP 端 | plain put（无需 sub-key） | 同步 load 即可 |
 | TP < effective_tp 的小 TP 端 | 需补丁后 sub-key put | sub-key get（`LOAD_ASYNC=1` 异步路径） |
 
-注：小 TP 消费者走异步的原因——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中，见 §3）；异步路径才走 `_load_kv_tp_mismatch`。当前补丁（#15835 完整版 backport）已恢复同步 load 的 mismatch 分发，硬约束解除，`LOAD_ASYNC=1` 降为推荐；本测试床异构实测均走异步，同步 mismatch 未单独复测。`run_e2e.sh` 反向（TP_A>TP_B）已自动给 B 注入 `LOAD_ASYNC=1`；手动分步（README 快速开始 C）需自行 export。
+注：小 TP 消费者走异步的原因——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中，见 §3）；异步路径才走 `_load_kv_tp_mismatch`。当前补丁（#15835 完整版 backport）已恢复同步 load 的 mismatch 分发，且**同步 mismatch 已于 2026-10-12 真机回归通过**（反向 217(TP4)→245(TP2)、`load_async=False`，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #14）——硬约束解除，`LOAD_ASYNC=1` 为推荐（异步 overlap 更优），`run_e2e.sh` 反向（TP_A>TP_B）仍默认给 B 注入；手动分步（README 快速开始 C）需自行 export。
 
-**配置陷阱（反向方向最易错）**：`infer_tp_mismatch_info` 对 `kv_producer`/`kv_both` 读的是 **`decode_tp_size`** 作为 peer size（`kv_consumer` 才读 `prefill_tp_size`）。反向（A=TP4→B=TP2）时 B 侧必须配 `decode_tp_size=4`（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
+**配置陷阱（反向方向最易错）**：`infer_tp_mismatch_info` 对 `kv_producer`/`kv_both` 读的是 **`decode_tp_size`** 作为 peer size（`kv_consumer` 才读 `prefill_tp_size`；脚本侧变量 `PEER_TP_SIZE`，2026-10-12 前名 `DECODE_TP_SIZE`）。反向（A=TP4→B=TP2）时 B 侧必须配 peer=4（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
 
 precopy 映射：eff rank i → B seg `i // num_sub_keys`，**由 precopy 自动展开**（`--tp-size <B 的 TP> --peer-tp-size <A 的 TP>`；反向 B=TP2 时 resolve 出的 2 个 seg 自动展开成 `seg0,seg0,seg1,seg1`，无需手工重复列表）；显式 `--targets` 时按 eff rank 序平铺给出。key 计算：eff = max(TP_A, TP_B)（24 keys = 6 满块 × 4 eff rank）。
 

@@ -30,10 +30,11 @@ GLOBAL_SEGMENT_SIZE=${GLOBAL_SEGMENT_SIZE:-1GB}
 LOCAL_BUFFER_SIZE=${LOCAL_BUFFER_SIZE:-1GB}
 DRY_RUN=${DRY_RUN:-0}
 USE_LAYERWISE=${USE_LAYERWISE:-false}
-# Heterogeneous TP (AscendStore): peer side TP for tp_mismatch (non-MLA, non-layerwise).
-# kv_consumer reads peer prefill_tp_size; kv_producer/both reads decode_tp_size.
-PREFILL_TP_SIZE=${PREFILL_TP_SIZE:-}
-DECODE_TP_SIZE=${DECODE_TP_SIZE:-}
+# Heterogeneous TP (AscendStore): PEER_TP_SIZE = the OTHER instance's TP, written
+# to engine field decode_tp_size — a PD-era name; rc1 config_data.py:48 reads the
+# peer from decode_tp_size for kv_producer/kv_both (prefill_tp_size is read only
+# by kv_consumer => dead config on this all-kv_both testbed, not emitted).
+PEER_TP_SIZE=${PEER_TP_SIZE:-}
 
 cat >"$MOONCAKE_CONFIG_PATH" <<EOF
 {
@@ -64,15 +65,13 @@ EOF
 # Optional hetero TP: peer TP size so both sides address pool at effective_tp=max(local,peer).
 # LOAD_ASYNC is honored here too — it must NOT be gated on the hetero vars alone,
 # or a same-TP LOAD_ASYNC=1 would be silently dropped.
-if [[ -n "$PREFILL_TP_SIZE" || -n "$DECODE_TP_SIZE" || -n "${LOAD_ASYNC:-}" ]]; then
-  KV_CONFIG=$(KV_CONFIG="$KV_CONFIG" PREFILL_TP_SIZE="$PREFILL_TP_SIZE" DECODE_TP_SIZE="$DECODE_TP_SIZE" python3 - <<'PY'
+if [[ -n "$PEER_TP_SIZE" || -n "${LOAD_ASYNC:-}" ]]; then
+  KV_CONFIG=$(KV_CONFIG="$KV_CONFIG" PEER_TP_SIZE="$PEER_TP_SIZE" python3 - <<'PY'
 import json, os
 cfg = json.loads(os.environ["KV_CONFIG"])
 extra = cfg["kv_connector_extra_config"]
-if os.environ.get("PREFILL_TP_SIZE"):
-    extra["prefill_tp_size"] = int(os.environ["PREFILL_TP_SIZE"])
-if os.environ.get("DECODE_TP_SIZE"):
-    extra["decode_tp_size"] = int(os.environ["DECODE_TP_SIZE"])
+if os.environ.get("PEER_TP_SIZE"):
+    extra["decode_tp_size"] = int(os.environ["PEER_TP_SIZE"])
 if os.environ.get("LOAD_ASYNC"):
     extra["load_async"] = True
 print(json.dumps(cfg))
@@ -80,13 +79,14 @@ PY
 )
 fi
 
-# tp_mismatch sanity (kv_both): decode_tp_size is the PEER TP (config_data.py:
-# infer_tp_mismatch_info reads prefill_tp_size only for kv_consumer). A wrong
-# value does NOT error at startup — if num_kv_heads % eff != 0 the connector
-# silently disables mismatch and the first hetero get dies with mooncake -800
+# tp_mismatch sanity (kv_both): PEER_TP_SIZE goes to engine field decode_tp_size,
+# which infer_tp_mismatch_info (rc1 config_data.py:48) reads as the PEER TP for
+# kv_producer/kv_both. A wrong value does NOT error at startup — if
+# num_kv_heads % eff != 0 (eff = max(local, peer)) the connector silently
+# disables mismatch and the first hetero get dies with mooncake -800
 # ("Failed to get <blocks> keys": plain-path reads eff keys at local size).
-# Fail loud here instead. Rule: set DECODE_TP_SIZE = max(own TP, peer TP).
-if [[ -n "$DECODE_TP_SIZE" && "$DECODE_TP_SIZE" != "$TP" ]]; then
+# Fail loud here instead. Rule: PEER_TP_SIZE = max(own TP, peer TP).
+if [[ -n "$PEER_TP_SIZE" && "$PEER_TP_SIZE" != "$TP" ]]; then
   KVH=$(python3 - "$MODEL" <<'PY' 2>/dev/null || echo 0
 import json, sys
 try:
@@ -100,12 +100,12 @@ else:
 PY
 )
   if [[ "$KVH" != 0 ]]; then
-    if [[ $((KVH % DECODE_TP_SIZE)) -ne 0 ]]; then
-      echo "[worker-$ROLE] ERROR: num_kv_heads=$KVH not divisible by DECODE_TP_SIZE=$DECODE_TP_SIZE — tp_mismatch silently falls back to plain path; set DECODE_TP_SIZE to the peer (larger) TP." >&2
+    EFF=$PEER_TP_SIZE; [[ "$TP" -gt "$EFF" ]] && EFF=$TP
+    if [[ $((KVH % EFF)) -ne 0 ]]; then
+      echo "[worker-$ROLE] ERROR: num_kv_heads=$KVH not divisible by eff=$EFF (max of local TP=$TP, PEER_TP_SIZE=$PEER_TP_SIZE) — tp_mismatch silently falls back to plain path; set PEER_TP_SIZE to the peer (larger) TP." >&2
       exit 2
     fi
-    EFF=$DECODE_TP_SIZE; [[ "$TP" -gt "$EFF" ]] && EFF=$TP
-    echo "[worker-$ROLE] tp_mismatch: local TP=$TP peer(decode_tp_size)=$DECODE_TP_SIZE num_kv_heads=$KVH -> eff=$EFF num_sub_keys=$((EFF / TP))"
+    echo "[worker-$ROLE] tp_mismatch: local TP=$TP peer=$PEER_TP_SIZE (engine field decode_tp_size) num_kv_heads=$KVH -> eff=$EFF num_sub_keys=$((EFF / TP))"
   else
     echo "[worker-$ROLE] WARN: cannot read num_kv_heads from $MODEL/config.json — skip tp_mismatch divisibility check"
   fi

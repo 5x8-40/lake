@@ -25,6 +25,8 @@ from resolve import (  # noqa: E402
     ProbeError,
     ResolveError,
     _intersect,
+    _listen_ports_by_pid,
+    _listen_ports_by_pid_proc,
     probe_local,
     resolve_segments,
 )
@@ -226,6 +228,54 @@ def test_garbage_pidfile_fails() -> None:
         os.unlink(pidfile)
 
 
+# ---------------------------------------------------------------------------
+# /proc fallback (hosts without ss — minimal containers)
+# ---------------------------------------------------------------------------
+
+
+def test_proc_fallback_finds_listener() -> None:
+    if not os.path.exists("/proc/net/tcp"):
+        return  # no /proc on this host (e.g. macOS) — fallback untestable here
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _LISTENER], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        port = int(proc.stdout.readline().strip())
+        ports = _listen_ports_by_pid_proc()
+        assert port in ports.get(proc.pid, []), (proc.pid, port, ports.get(proc.pid))
+    finally:
+        proc.kill()
+        proc.wait()
+
+
+def test_dispatch_falls_back_without_ss() -> None:
+    if not os.path.exists("/proc/net/tcp"):
+        return
+    import resolve as r
+
+    orig_run = r.subprocess.run
+
+    def no_ss(cmd, **kw):
+        if list(cmd)[:2] == ["ss", "-ltnp"]:
+            raise FileNotFoundError("ss")
+        return orig_run(cmd, **kw)
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", _LISTENER], stdout=subprocess.PIPE, text=True
+    )
+    try:
+        port = int(proc.stdout.readline().strip())
+        r.subprocess.run = no_ss
+        try:
+            ports = _listen_ports_by_pid()  # must NOT raise _PROBE_NO_SS
+        finally:
+            r.subprocess.run = orig_run
+        assert port in ports.get(proc.pid, []), (proc.pid, port)
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 TESTS = [
     test_tp1_happy,
     test_tp2_rank_order,
@@ -240,6 +290,8 @@ TESTS = [
     test_missing_pidfile_fails,
     test_ssh_requires_explicit_pidfile,
     test_garbage_pidfile_fails,
+    test_proc_fallback_finds_listener,
+    test_dispatch_falls_back_without_ss,
 ]
 
 if __name__ == "__main__":

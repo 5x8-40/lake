@@ -10,7 +10,9 @@ Data sources (no log involved):
               (plain text, one "ip:port" per line; rpc_service.cpp)
   rank->pid : pidfile written by cluster/start_worker.sh -> full process
               tree -> /proc/<pid>/cmdline proctitle "VLLM::Worker_TP<N>"
-  pid->seg  : ss -ltnp listening ports INTERSECT admin segment list
+  pid->seg  : listening TCP ports INTERSECT admin segment list; ports from
+              `ss -ltnp`, falling back to /proc/net/tcp{,6} x /proc/*/fd
+              (stdlib-only, for minimal containers without ss)
 
 Any source disagreement fails loud — a silently wrong rank<->seg map means
 copying to the wrong DRAM segment (local-first is the whole point).
@@ -37,11 +39,12 @@ import sys
 import urllib.request
 
 _WORKER_RANK_RE = re.compile(r"Worker_TP(\d+)")
+_SOCKET_RE = re.compile(r"socket:\[(\d+)\]")
 
 # Probe exit codes (propagated through ssh; keep stable).
 _PROBE_MISSING = 3  # pidfile missing/empty
 _PROBE_STALE = 4  # pidfile root process dead
-_PROBE_NO_SS = 5  # ss -ltnp unavailable
+_PROBE_NO_SS = 5  # no port-listing source (ss missing AND /proc fallback failed)
 
 
 class ResolveError(RuntimeError):
@@ -118,11 +121,13 @@ def _listen_ports_by_pid() -> dict[int, list[int]]:
     Row layout: [netid?] state recv-q send-q LOCAL PEER process. The process
     field is always last (users:(("name",pid=N,fd=M))), so LOCAL is taken
     relative to it — robust to the optional netid column.
+
+    `ss` missing (minimal containers) falls back to /proc parsing.
     """
     try:
         proc = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True)
-    except FileNotFoundError as e:
-        raise ProbeError(_PROBE_NO_SS, "ss -ltnp unavailable (ss not found)") from e
+    except FileNotFoundError:
+        return _listen_ports_by_pid_proc()
     out: dict[int, set[int]] = {}
     for ln in proc.stdout.splitlines():
         m = re.search(r"pid=(\d+)", ln)
@@ -142,6 +147,61 @@ def _listen_ports_by_pid() -> dict[int, list[int]]:
         except (ValueError, IndexError):
             continue
         out.setdefault(pid, set()).add(port)
+    return {pid: sorted(ports) for pid, ports in out.items()}
+
+
+def _listen_ports_by_pid_proc() -> dict[int, list[int]]:
+    """Fallback for hosts without `ss`: LISTEN ports from /proc/net/tcp{,6}
+    (socket inode -> port) mapped to pids via /proc/<pid>/fd socket links.
+
+    stdlib-only. Needs read access to other processes' fd dirs (root or same
+    uid; a hidepid-mounted /proc breaks it -> fail loud). Cross-machine this
+    runs on the target host over ssh, where the host /proc sees container
+    processes (shared pid namespace view from the host side).
+    """
+    inode_port: dict[int, int] = {}
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(table, encoding="ascii") as f:
+                lines = f.read().splitlines()
+        except OSError:
+            continue
+        for ln in lines[1:]:
+            fields = ln.split()
+            # sl local rem st tx:rx tr:tm retrnsmt uid timeout inode ...
+            if len(fields) < 10 or fields[3] != "0A":  # 0A = LISTEN
+                continue
+            try:
+                port = int(fields[1].rsplit(":", 1)[1], 16)
+                inode = int(fields[9])
+            except ValueError:
+                continue
+            inode_port[inode] = port
+    if not inode_port:
+        raise ProbeError(
+            _PROBE_NO_SS,
+            "ss missing and /proc/net/tcp{,6} unreadable or has no LISTEN rows",
+        )
+    out: dict[int, set[int]] = {}
+    for pid_s in os.listdir("/proc"):
+        if not pid_s.isdigit():
+            continue
+        fd_dir = f"/proc/{pid_s}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(f"{fd_dir}/{fd}")
+            except OSError:
+                continue
+            m = _SOCKET_RE.fullmatch(target)
+            if not m:
+                continue
+            port = inode_port.get(int(m.group(1)))
+            if port is not None:
+                out.setdefault(int(pid_s), set()).add(port)
     return {pid: sorted(ports) for pid, ports in out.items()}
 
 
@@ -332,7 +392,13 @@ def resolve_segments(
                 "re-run start_worker.sh)"
             ) from e
         if e.code == _PROBE_NO_SS:
-            raise ResolveError(f"ss -ltnp unavailable on {where}") from e
+            raise ResolveError(
+                f"no port-listing source on {where} (ss missing and /proc "
+                "fallback failed — hidepid / no read access to other pids' fd?) — "
+                "alternatives: pass --targets explicitly (segment list from master "
+                "admin GET :9003/get_all_segments), or resolve rank<->seg by hand "
+                "(npu-smi card->pid)"
+            ) from e
         raise ResolveError(f"probe failed on {where}: {e}") from e
     if not rows:
         raise ResolveError(f"no listening TCP port found under pidfile tree {pidfile}")

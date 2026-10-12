@@ -265,10 +265,13 @@ def expand_store_keys(
 def _hash_prompt(
     model_path: str, prefix: str, block_size: int, hash_algo: str
 ) -> tuple[list[str], int]:
-    # Guard BEFORE computing: upstream kv_cache_utils.init_none_hash salts the
-    # whole block-hash chain with NONE_HASH = os.urandom(32) when
-    # PYTHONHASHSEED is unset (vllm/v1/core/kv_cache_utils.py:111-114; sha256
-    # is not in _CBOR_HASH_FUNCTIONS, so there is no warning either). The
+    # Guard BEFORE computing: upstream folds NONE_HASH into the whole
+    # block-hash chain, and when PYTHONHASHSEED is unset the rc1 container's
+    # vllm makes it os.urandom(32) — for ALL algos (vllm/v1/core/
+    # kv_cache_utils.py:111-114, rc1 tree layout; vllm main moved this to
+    # resolve_none_hash_seed :132-145, where sha256 gets a fixed
+    # DEFAULT_NONE_HASH_SEED instead — line anchors here are rc1). sha256 is
+    # not in _CBOR_HASH_FUNCTIONS, so there is no warning either. The
     # engine sets PYTHONHASHSEED=0 (start_worker.sh) and folds
     # NONE_HASH=hash_fn("0") into every block; a control plane without the
     # seed computes a different chain per run and batch_is_exist fails 0/N
@@ -493,13 +496,6 @@ def main() -> int:
     if not file_mode and not args.model_name:
         print("ERROR: --model-name required in --chunk-hashes mode", file=sys.stderr)
         return 2
-    if args.hash_algo == "builtin" and os.environ.get("PYTHONHASHSEED") is None:
-        print(
-            "[keys] WARN: hash-algo=builtin but PYTHONHASHSEED unset; "
-            "engine used PYTHONHASHSEED=0 — set the same or hashes will miss",
-            file=sys.stderr,
-        )
-
     if prompt_mode:
         keys, info = collect_keys(
             model_path=args.model,

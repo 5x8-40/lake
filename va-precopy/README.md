@@ -20,9 +20,10 @@
 | 同构跨机 TP=1/2、TP=4 27B Mamba（旧 key×N 广播路径，2026-10-08） | 通过：~95%+（Mamba ≈92.1% 满块，`--block-size 1536`）；新路径未单独重跑 |
 | 异构同机 双向 TP2↔TP4（2026-10-09，需容器补丁） | **通过**：24/24 key 对号，95.9%，零 invalid，A/B 输出逐字一致 |
 | 异构跨机 245(TP2)→217(TP4)（2026-10-09，需容器补丁） | **通过** + **杀源实例法铁证读本机副本**（仅剩 217 副本时 B 首中 768 token 全部外部 get 成功） |
+| 异构跨机正向 245(TP2)→217(TP4) 回归（2026-10-12，bc6b5be 单入口 + #15835 补丁） | **通过**：32 keys READY、8/8 token 逐字一致、零 invalid、external hit 88.2%（滚动累计口径，非单请求） |
 | 异构跨机反向 217(TP4)→245(TP2) **同步 load**（2026-10-12，bc6b5be + #15835 补丁） | **通过**：36/36 key 对号、每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 分发生效、8/8 token 逐字一致、74.6→79.7% hit、零 invalid |
 
-完整实验史（总表 12 条 + 异构实录 + 撤回记录）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定金标准见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」「开放问题」。
+完整实验史（总表 14 条 + 异构实录 + 撤回记录）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定金标准见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」「开放问题」。
 
 ## 快速开始
 
@@ -159,7 +160,7 @@ B2：请求前把前缀 KV 放到目标实例本机 DRAM。先把三个对象讲
 | **Key 集合** | `precopy.py` prompt 模式内嵌 `collect_keys()` 展开 `head_or_tp_rank:0..N/put_step-1` × 满块（`precopy/keys.py`；key 全程内存） |
 | **多 seg** | `precopy.py --targets seg0,seg1,...`：**rank i 的 key 只 copy 到 `targets[i]`**（不再 key×N 广播）；反向异构（eff>N）自动展开为 `targets[i // num_sub_keys]` |
 | **调度** | 仍 **按 key 串行** `create_copy_and_wait`；映射已对号入座 |
-| **解析 seg** | `precopy.py` 缺省即内嵌 `resolve.resolve_segments()`（`precopy/resolve.py`）：master admin API 名单 ∩ pidfile 进程树 `ss` 端口；rank 取自 `VLLM::Worker_TP<N>` 进程名，对不上即 fail loud，**不读日志**；显式 `--targets` 可跳过 |
+| **解析 seg** | `precopy.py` 缺省即内嵌 `resolve.resolve_segments()`（`precopy/resolve.py`）：master admin API 名单 ∩ pidfile 进程树 `ss` 端口（缺 `ss` 回退 `/proc`）；rank 取自 `VLLM::Worker_TP<N>` 进程名，对不上即 fail loud，**不读日志**；显式 `--targets` 可跳过 |
 | **未做** | 多 key/多 seg **并行**；跨机一份 + 同机扩散；异构 TP 见下节（已验证，需容器补丁） |
 
 注意 `4×K` 把 key ≠ 4 倍数据：每把 key 只是**某个 rank 的切片**，合起来才是一份完整 KV（总字节 ≈ 一份逻辑 KV）——不是每把 key 都在 4 个 seg 上各留全量副本。
@@ -231,7 +232,7 @@ sequenceDiagram
 | 控制面需要 | 来源 | 性质 |
 |-----------|------|------|
 | B 的 seg 名单 | `GET :9003/get_all_segments`（master admin，纯文本逐行） | master API（:9003 为 mooncake_master 内置默认，`start_master.sh` 无需 flag，见脚本注释） |
-| rank↔seg 对号 | `logs/worker_<ROLE>.pid` → 进程树 → `ss -ltnp` 端口 ∩ 名单；rank 取 `VLLM::Worker_TP<N>` 进程名 | OS 级（跨机经 `--ssh`） |
+| rank↔seg 对号 | `logs/worker_<ROLE>.pid` → 进程树 → `ss -ltnp` 端口（缺 `ss` 回退 `/proc/net/tcp`）∩ 名单；rank 取 `VLLM::Worker_TP<N>` 进程名 | OS 级（跨机经 `--ssh`） |
 | key 名单核对 | `batch_is_exist` / `batch_get_replica_desc` | 客户端 API |
 | READY 判定 | `query_task` + `batch_get_replica_desc` | 客户端 API |
 | worker 就绪 | 轮询 HTTP `/v1/models` | HTTP API |
@@ -242,7 +243,7 @@ sequenceDiagram
 
 ### 异构 TP（A/B 不同 tp_size）
 
-问题：A=TP2、B=TP4 能否像「原生 Mooncake/connector」一样共享同一套 shard？结论：**能——AscendStore 原生支持；单机双向（TP2→TP4 / TP4→TP2）与跨机（245→217）均已实测通过**（external hit 95.9%、零 invalid、A/B 输出逐字一致；跨机读本机副本经杀源实例法铁证），**但 v0.26.0rc1 必须打补丁**（见下）。实测实录见 [EXPERIMENTS.md](EXPERIMENTS.md)「实验实录」节（总表 #5/#6/#8/#12）。
+问题：A=TP2、B=TP4 能否像「原生 Mooncake/connector」一样共享同一套 shard？结论：**能——AscendStore 原生支持；单机双向（TP2→TP4 / TP4→TP2）与跨机（245→217）均已实测通过**（external hit 95.9%、零 invalid、A/B 输出逐字一致；跨机读本机副本经杀源实例法铁证），**但 v0.26.0rc1 必须打补丁**（见下）。实测实录见 [EXPERIMENTS.md](EXPERIMENTS.md)「实验实录」节（总表 #5/#6/#8/#12 + 10-12 回归 #13/#14）。
 
 | 层 | 结论 |
 |----|------|
@@ -283,10 +284,10 @@ flowchart LR
 
 #### kv_both 的 env 处方（2026-10-12 实测固化）
 
-`infer_tp_mismatch_info`（`config_data.py:48`）只在 worker init 算一次，且 **kv_both 的 peer 永远读 `decode_tp_size`**（`prefill_tp_size` 仅纯 kv_consumer 读）；算出的 `(enabled, eff, num_sub_keys)` 同时固定用于该实例的 put 与 get 两侧——**mismatch 信息与实验方向无关**，方向只决定谁 put 谁 get。因此：
+`infer_tp_mismatch_info`（`config_data.py:48`）只在 worker init 算一次，且 **kv_both 的 peer 永远读 `decode_tp_size`**（`prefill_tp_size` 仅纯 kv_consumer 读——本测试床全 kv_both，是死配置，脚本不生成）；算出的 `(enabled, eff, num_sub_keys)` 同时固定用于该实例的 put 与 get 两侧——**mismatch 信息与实验方向无关**，方向只决定谁 put 谁 get。因此：
 
-- **规则：每台 kv_both 实例 `DECODE_TP_SIZE = max(本机 TP, 对端 TP)`**；`PREFILL_TP_SIZE` 对 kv_both 不参与。同构集群填自身 TP（disabled=正确）。两方向用同一组 env，**不要按方向翻转**（10-12 曾误翻 A 为 `PREFILL=4/DECODE=2` → peer=2=自身 → mismatch 静默禁用）。
-- **错误配置的运行期指纹**：小 TP 端禁用后走 plain get，按本地 head 尺寸读 eff key → 尺寸不符 → `mooncake -800`，日志形状 `Failed to get <块数> keys`（每块 1 key；正确 mismatch 应为 `块数 × num_sub_keys`）。填了不整除的值同样静默禁用——`start_worker.sh` 已加整除校验 fail loud。
+- **规则：每台 kv_both 实例 `PEER_TP_SIZE = max(本机 TP, 对端 TP)`**——`run_e2e.sh` 默认即 `max(TP_A,TP_B)`，`start_worker.sh` 把它写进引擎字段 `decode_tp_size`（PD 时代命名，对 kv_both 就是「对端 TP」；2026-10-12 前脚本变量名 `DECODE_TP_SIZE`，同义）。同构填自身 TP（disabled=正确）。两方向同一组值，**不要按方向翻转**（10-12 曾把 A 的 peer 误翻成 2=自身 → mismatch 静默禁用，[EXPERIMENTS.md](EXPERIMENTS.md) #14）。
+- **错误配置的运行期指纹**：小 TP 端禁用后走 plain get，按本地 head 尺寸读 eff key → 尺寸不符 → `mooncake -800`，日志形状 `Failed to get <块数> keys`（每块 1 key；正确 mismatch 应为 `块数 × num_sub_keys`）。填了对 `eff=max(本机,对端)` 不整除的值同样静默禁用——`start_worker.sh` 已加整除校验 fail loud。
 - 大 TP 端 disabled 即正确：其 plain key（`@tp_rank`、全本地切片）名字与字节恒等于 eff key。
 
 #### 上游 bug（v0.26.0rc1）：tp_mismatch put/get 是死代码
@@ -331,7 +332,7 @@ va-precopy/
 |------|------|
 | `README.md` | 本文：端到端说明 |
 | `REPRODUCE.md` | 客户复现参考：结论 + 必配项 + 「读本机副本」判定金标准 |
-| `EXPERIMENTS.md` | 实验总表 12 条 + 异构实录 + 踩坑记录（含撤回历史） |
+| `EXPERIMENTS.md` | 实验总表 14 条 + 异构实录 + 踩坑记录（含撤回历史） |
 
 ## 操作参考
 
@@ -387,7 +388,7 @@ va-precopy/
 - **跨机操作**
   - 两机**非共享存储**：各自 clone 本目录并同步（补丁、脚本、配置保持一致）。
   - 高频 SSH 连接触发对端限速（认证后断连/KEX 卡死）：控制操作合并成批执行，或改控制台人工执行；expect 包装要「输出落文件 + timeout 分支 close」，否则孤儿 ssh 握住管道会把外层 timeout 也拖挂。
-  - **B 机容器无 `ss` 时 resolve 走不通**：用 master admin API 拿权威名单（`GET :9003/get_all_segments`，TTL 过期自动注销；`/get_all_keys` 可取证全量 key）+ 显式 `--targets` 跳过自动解析；rank↔seg 对号用 `ss -ltnp`（宿主机）端口→pid + `npu-smi` 卡→pid（卡号=rank 号）。
+  - **容器无 `ss` 不再是死路**：resolve 缺 `ss` 自动回退 `/proc/net/tcp × /proc/*/fd`（stdlib，需能读其他进程 fd——root 或同 uid；hidepid 则 fail loud 并在报错里列出替代路径）。仍走不通时：master admin API 拿权威名单（`GET :9003/get_all_segments`，TTL 过期自动注销；`/get_all_keys` 可取证全量 key）+ 显式 `--targets` 跳过自动解析；手工 rank↔seg 对号用 `ss -ltnp`（宿主机）端口→pid + `npu-smi` 卡→pid（卡号=rank 号）。
 - **判定**：指标会骗人（假命中）、必须全新 prompt 首中、必须等源 client TTL、勿用 netdev 计数器、分 rank 证据需 DEBUG——判定方法与其陷阱是一个整体，见 [REPRODUCE.md](REPRODUCE.md) §3。
 
 ## 边界与已知限制

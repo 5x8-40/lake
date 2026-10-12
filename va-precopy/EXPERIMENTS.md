@@ -1,6 +1,6 @@
 # va-precopy 实验总表与踩坑记录
 
-2026-10-08 ~ 10-09 全量实验史（含已撤回证据），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。
+2026-10-08 ~ 10-12 全量实验史（含已撤回证据），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。
 
 模型除注明外均为 `/data/models/Qwen3-VL-8B-w8a8c16`（GQA 8 KV head，block_size 128，`PYTHONHASHSEED=0`）；主机 245=7.242.105.245，217=7.242.105.217；容器镜像 `quay.io/ascend/vllm-ascend:v0.26.0rc1`；mooncake wheel `mooncake_transfer_engine_npu-0.3.11.post1`（除注明外）；master 在 245 宿主机 `:50088`。
 
@@ -18,7 +18,7 @@
 | 10 | 10/09 | B(217) 重复请求确定性观察 | 同 prompt 反复打 B（16/64 token × 多次）+ 冷 prompt 对照 | 旧非 DEBUG 实例：**奇数次输出与 A 一致、偶数次近平局 token 处 1-token 翻转**（"warmup. va" → "warmup.  va"）；A 3×64 token 稳定；B 冷 prompt 3× 稳定；0.3.11+DEBUG 新实例 3 连跑未复现。疑外部加载路径交替的数值扰动，非字节错乱（纯外部读首请求与 A 逐字一致） | 本会话输出记录；根因待复现 |
 | 11 | 10/09 晚 | 217 容器 wheel 升级 `0.3.13.post1` | 尝试升级 mooncake（上游 1fc27b6 已有 `SelectCompleteMemoryReplica` 本机优先） | **失败**：mount 4 seg 后 EngineCore 挂起 15+ 分钟（APIServer `Waiting for 1 local core engine proc`），疑与旧 master 兼容性；回退 `0.3.11.post1` 后恢复正常（#8/#9 即回退后所测） | master 日志、`worker_B.log`（17:03-17:18） |
 | 12 | 10/09 深夜 | 跨机 245→217 异构重验（全新 prompt ×2：961/801 tok）+ **杀源实例终极判定** | **通过** + **杀源实例法铁证读本机副本**（仅剩 217 副本时 B 首中全部外部 get 成功、零 invalid、输出与 A 逐字一致）。两认知：判定须用**全新 prompt 首中**（第二次被内部 HBM cache 接住，外部 get=0）；netdev 不计 RDMA（#9 撤回依据） | 见「实验实录 · 跨机」；判定方法 [REPRODUCE.md](REPRODUCE.md) §3 |
-| 13 | 10/12 上午 | 跨机 245→217 异构，**bc6b5be 单入口控制面 + 两端 #15835 完整补丁** | 正向回归（升级后首测）：warm A → 单入口 precopy（32 keys=8 满块×4 eff）READY → B 首中 external **88.2%**、零 invalid、16-tok ×6 + 64-tok ×2 **8/8 逐字一致**（1-token 翻转未复现）。绕法：B 机容器无 `ss`，用 admin `:9003/get_all_segments` + 显式 `--targets` | 本次会话记录；见「实验实录 · 10-12 回归 · 正向」 |
+| 13 | 10/12 上午 | 跨机 245→217 异构，**bc6b5be 单入口控制面 + 两端 #15835 完整补丁** | 正向回归（升级后首测）：warm A → 单入口 precopy（32 keys=8 满块×4 eff）READY → B 首中 external **88.2%**（滚动累计口径，非单请求）、零 invalid、16-tok ×6 + 64-tok ×2 **8/8 逐字一致**（1-token 翻转未复现）。绕法：B 机容器无 `ss`，用 admin `:9003/get_all_segments` + 显式 `--targets` | 本次会话记录；见「实验实录 · 10-12 回归 · 正向」 |
 | 14 | 10/12 下午 | 跨机 **反向 217(TP4)→245(TP2)，A 同步 load（无 LOAD_ASYNC）** | **通过**：36/36 key 对号入 A 两 seg（18+18）；每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 证 hunk3 同步分发生效；8/8 token 与 B(TP4) 参考逐字一致；external hit 74.6→79.7%、零 invalid。踩坑：A env 误翻 `DECODE_TP_SIZE=2` → mismatch 静默禁用 → `-800`（指纹=`Failed to get 9 keys`=每块 1 key）；改回原 env（两台同配 `PREFILL=2/DECODE=4`）即通 | 见「实验实录 · 10-12 回归 · 反向（同步 load）」 |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
@@ -89,12 +89,12 @@
 
 ## 实验实录（2026-10-12 回归：bc6b5be 单入口控制面 + #15835 完整补丁）
 
-环境：两端容器均 #15835 完整版补丁（`patch_tp_mismatch_worker.patch`）；A=245 TP2（卡 0,1，:8001）、B=217 TP4（卡 0-3，:8002）；master 245 宿主机 `:50088`；env 两台同配 `PREFILL_TP_SIZE=2 DECODE_TP_SIZE=4`（kv_both 处方，见 README「异构 TP · env 处方」）；`VLLM_LOGGING_LEVEL=DEBUG`。
+环境：两端容器均 #15835 完整版补丁（`patch_tp_mismatch_worker.patch`）；A=245 TP2（卡 0,1，:8001）、B=217 TP4（卡 0-3，:8002）；master 245 宿主机 `:50088`；env 两台同配 `PREFILL_TP_SIZE=2 DECODE_TP_SIZE=4`（当日变量名——2026-10-12 晚起脚本删 `PREFILL_TP_SIZE`（kv_both 死配置）、`DECODE_TP_SIZE` 正名 `PEER_TP_SIZE`，语义不变；现行处方见 README「kv_both 的 env 处方」）；`VLLM_LOGGING_LEVEL=DEBUG`。
 
 ### 正向：245(TP2)→217(TP4)（总表 #13）
 
 - 流程：warm A（`"va-precopy v53 regression hetero cross-machine prompt. "×80` = 1041 tok，8 满块）→ 单入口 `precopy.py --role B --tp-size 4 --peer-tp-size 2`（32 keys READY；eff0→16051, 1→16258, 2→16276, 3→16787）→ 打 B。
-- 结果：B 首中外部 get ×4 rank 成功（复命中走 vLLM 内部 HBM cache，预期）、external hit **88.2%**、零 invalid；16-tok ×6 + 64-tok ×2 **8/8 与 A 逐字一致，1-token 翻转未复现**（与 #10「新 DEBUG 实例未复现」一致）。
+- 结果：B 首中外部 get ×4 rank 成功（复命中走 vLLM 内部 HBM cache，预期）、external hit **88.2%**（滚动累计口径：实例启动以来所有请求，非本请求单值；故低于 95.9% 单请求口径）、零 invalid；16-tok ×6 + 64-tok ×2 **8/8 与 A 逐字一致，1-token 翻转未复现**（与 #10「新 DEBUG 实例未复现」一致）。
 - 绕法：B 机容器无 `ss`、pidfile 亦 stale——改用 master admin API `GET :9003/get_all_segments`（TTL 已自动注销旧 seg，名单干净）+ 显式 `--targets`。
 
 ### 反向：217(TP4)→245(TP2)，同步 load（总表 #14）
@@ -113,5 +113,5 @@
 ### 10-12 对既有结论的影响
 
 - 「同步 mismatch 未单独复测」（10-10 重构披露）→ **已闭环**（#14）。
-- reviewer 挂账的真机回归三项：同步 load mismatch ✓（#14）、key 一致性哨兵 ✓（#13：8/8 token + 零 invalid）、多卡 Worker_TP 进程名确认 ✓（#14 rank↔seg 对号走通）。
+- reviewer 挂账的真机回归三项：同步 load mismatch ✓（#14）；key 一致性哨兵 → **实质闭环**（#13/#14 单入口 `batch_is_exist` 32/32、36/36 全中，即 key 与引擎逐字节一致的运行期证据；`tools/test_keys.py::test_upstream_parity` 容器内未单跑）；多卡 `Worker_TP<N>` 进程名 → **部分闭环**（#13/#14 均显式 `--targets`，rank↔seg 走 admin API + `ss`/`npu-smi` 手工对号，resolve.py 的 proctitle 匹配未在多卡真机走通）。
 - 仍待：同构 TP=2 e2e 重跑（新控制面）、1-token 翻转根因、MLA（明确不支持）、CI 冒烟 job。
