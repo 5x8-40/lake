@@ -9,10 +9,10 @@
 | 项 | 必配值 | 说明 |
 |----|--------|------|
 | 容器镜像 | `quay.io/ascend/vllm-ascend:v0.26.0rc1` | 两端一致 |
-| mooncake wheel | `mooncake_transfer_engine_npu-0.3.11.post1` | **勿升级 0.3.13.post1**：mount segment 后 EngineCore 挂起 15+ 分钟（疑与旧 master 兼容性），实测失败已回退 |
+| mooncake wheel | `mooncake_transfer_engine_npu-0.3.11.post1` | **勿升级 0.3.13.post1**：mount segment 后 EngineCore 挂起 15+ 分钟（疑与旧 master 兼容性） |
 | master | 245 宿主机 `mooncake_master 0.0.0.0:50088` | 跨机时 B 侧配 `MC_MASTER=A_IP:50088`、`LOCAL_IP=B_IP`、`HCCL_IF_IP=B_IP` |
 | A2 RoCE | `HCCL_INTRA_ROCE_ENABLE=1` + `env_ascend_a2.sh` 全套 | **缺则跨卡 copy 直接失败（`HcclBatchPut=4`）**。业务网卡 `NIC_NAME=enp67s0f5`（两台同名） |
-| hash 对齐 | precopy/keys `--hash-algo sha256`（默认）+ **`PYTHONHASHSEED=0`** | algo 与引擎 `prefix_caching_hash_algo` 一致；**seed 是控制面硬依赖**：rc1 引擎在 seed 未设时用 `os.urandom(32)` 作 `NONE_HASH` 折入每个 block hash（sha256 静默无警告），控制面不带 seed 算出的 key 全体漂移（`keys.py::_hash_prompt` 已 fail loud；2026-10-12 实测踩坑，见 [EXPERIMENTS.md](EXPERIMENTS.md)「10-12 踩坑」） |
+| hash 对齐 | precopy/keys `--hash-algo sha256`（默认）+ **`PYTHONHASHSEED=0`** | algo 与引擎 `prefix_caching_hash_algo` 一致；**seed 是控制面硬依赖**：rc1 引擎在 seed 未设时用 `os.urandom(32)` 作 `NONE_HASH` 折入每个 block hash（sha256 静默无警告），控制面不带 seed 算出的 key 全体漂移（`keys.py::_hash_prompt` 缺 seed 即 fail loud） |
 | 同机多 worker | `preferred_segment: true` | 否则写路径可能把 KV 分到同机另一 worker 的 segment，预复制场景退化 |
 | 取证日志 | `VLLM_LOGGING_LEVEL=DEBUG` | 非 DEBUG 无分 rank `MooncakeBackend.get enter keys=` 证据 |
 
@@ -44,7 +44,7 @@ A/B 同 `tp_size`，同机不同卡组。**无需补丁**。流程见 [README.md
 master 在源机 `0.0.0.0:50088`；B 机 worker 配 `MC_MASTER`/`LOCAL_IP`/`HCCL_IF_IP` 指向本机。
 
 - TP=1/2 与 TP=4 均已通过；27B Mamba 需 `--block-size 1536`（Mamba 状态按 align 块入池）。
-- **须知**：本场景验证于 2026-10-08 的旧 key×N 广播路径；新 rank↔seg 映射路径已在其子集（同构同机 TP=2，10/09，重构前控制面）复测通过，同构跨机新路径未单独重跑；2026-10-10 控制面重构（单入口 `precopy.py` 内嵌 resolve 等）未真机回归，待办见 [README.md](README.md)「边界与已知限制 · 验证覆盖面」。复现时请按 §3 方法验证读本机副本。
+- **须知**：本场景验证于 2026-10-08 的旧 key×N 广播路径；rank↔seg 新路径已验证同构同机 TP=2（10/09）与异构跨机双向（10/12，#13/#14），同构跨机新路径未重跑（覆盖面见 [README.md](README.md)「边界与已知限制」）。复现时请按 §3 方法验证读本机副本。
 
 ### ③ 异构同机（双向）
 
@@ -57,9 +57,9 @@ A/B 不同 `tp_size`，两端 env 均配 **`PEER_TP_SIZE=<max(A_TP,B_TP)>`**（*
 | TP = effective_tp 的大 TP 端 | plain put（无需 sub-key） | 同步 load 即可 |
 | TP < effective_tp 的小 TP 端 | 需补丁后 sub-key put | sub-key get（`LOAD_ASYNC=1` 异步路径） |
 
-注：小 TP 消费者走异步的原因——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中，见 §3）；异步路径才走 `_load_kv_tp_mismatch`。当前补丁（#15835 完整版 backport）已恢复同步 load 的 mismatch 分发，且**同步 mismatch 已于 2026-10-12 真机回归通过**（反向 217(TP4)→245(TP2)、`load_async=False`，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #14）——硬约束解除，`LOAD_ASYNC=1` 为推荐（异步 overlap 更优），`run_e2e.sh` 反向（TP_A>TP_B）仍默认给 B 注入；手动分步（README 快速开始 C）需自行 export。
+注：无补丁时小 TP 消费者必须走异步——同步 load 只按本机 rank 名取全本地切片 → 尺寸不匹配 → invalid → 全重算（假命中，见 §3）；异步路径才走 `_load_kv_tp_mismatch`。补丁（#15835 backport）含同步 load 的 mismatch 分发，同步/异步均可（同步已验证，见 [EXPERIMENTS.md](EXPERIMENTS.md) #14）；`LOAD_ASYNC=1` 为推荐（异步 overlap 更优），`run_e2e.sh` 反向（TP_A>TP_B）默认给 B 注入；手动分步（README 快速开始 C）需自行 export。
 
-**配置陷阱（反向方向最易错）**：引擎从 **`decode_tp_size`** 读 peer size（`config_data.py:48`；脚本侧变量 `PEER_TP_SIZE`，2026-10-12 前名 `DECODE_TP_SIZE`）。反向（A=TP4→B=TP2）时 B 侧必须配 peer=4（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
+**配置陷阱（反向方向最易错）**：引擎从 **`decode_tp_size`** 读 peer size（`config_data.py:48`；脚本侧变量 `PEER_TP_SIZE`）。反向（A=TP4→B=TP2）时 B 侧必须配 peer=4（对端 TP）；配成本机 TP=2 会被判「无不匹配」而退化为普通路径——**指标照样显示 ~95% hit，但实际是假命中**（见 §3）。
 
 precopy 映射：eff rank i → B seg `i // num_sub_keys`，**由 precopy 自动展开**（`--tp-size <B 的 TP> --peer-tp-size <A 的 TP>`；反向 B=TP2 时 resolve 出的 2 个 seg 自动展开成 `seg0,seg0,seg1,seg1`，无需手工重复列表）；显式 `--targets` 时按 eff rank 序平铺给出。key 计算：eff = max(TP_A, TP_B)（24 keys = 6 满块 × 4 eff rank）。
 
@@ -83,7 +83,7 @@ precopy 映射：eff rank i → B seg `i // num_sub_keys`，**由 precopy 自动
 
 **杀源实例法的两个关键陷阱**：
 
-- **必须用全新 prompt 且只打一次**。同一 prompt 第二次打目标实例时，vLLM 内部 prefix cache（HBM radix）会整体接住（外部 get 次数为 0，`Prefix cache hit rate` 上升）——此时命中与 pool 无关，实验作废。实测曾因此误判，靠 `MooncakeBackend.get enter` 行数为 0 揭穿。
+- **必须用全新 prompt 且只打一次**。同一 prompt 第二次打目标实例时，vLLM 内部 prefix cache（HBM radix）会整体接住（外部 get 次数为 0，`Prefix cache hit rate` 上升）——此时命中与 pool 无关，实验作废（外部 get 行数为 0 即此情形）。
 - **必须等源实例 client TTL 过期**（master `client_ttl`，默认 120s），确认 `batch_get_replica_desc` 对全部 key 只剩目标机副本后再打。
 
 **勿用 netdev 网卡计数器判定**：本环境（昇腾 A2 RoCE）的 `ip -s link` / sysfs 计数器**不统计 RDMA KV 流量**——阳性对照：24 keys（~43 MB）真实跨机传输期间，源/目标两侧计数器增量均 <2 MB。任何「传输了却看不到字节」或「没看到字节=读本机」的推断在此 NIC 上均不成立。

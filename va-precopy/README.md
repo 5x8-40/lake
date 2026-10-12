@@ -158,7 +158,7 @@ B2：请求前把前缀 KV 放到目标实例本机 DRAM。先把三个对象讲
 | 项 | 现状 |
 |----|------|
 | **Key 集合** | `precopy.py` prompt 模式内嵌 `collect_keys()` 展开 `head_or_tp_rank:0..N/put_step-1` × 满块（`precopy/keys.py`；key 全程内存） |
-| **多 seg** | `precopy.py --targets seg0,seg1,...`：**rank i 的 key 只 copy 到 `targets[i]`**（不再 key×N 广播）；反向异构（eff>N）自动展开为 `targets[i // num_sub_keys]` |
+| **多 seg** | `precopy.py --targets seg0,seg1,...`：**rank i 的 key 只 copy 到 `targets[i]`**；反向异构（eff>N）自动展开为 `targets[i // num_sub_keys]` |
 | **调度** | 仍 **按 key 串行** `create_copy_and_wait`；映射已对号入座 |
 | **解析 seg** | `precopy.py` 缺省即内嵌 `resolve.resolve_segments()`（`precopy/resolve.py`）：master admin API 名单 ∩ pidfile 进程树（`/proc`，ps 兜底）`ss` 端口（缺 `ss` 回退 `/proc`）；rank 取自 `VLLM::Worker_TP<N>` 进程名，对不上即 fail loud，**不读日志**；TP=1 可降级 admin 单 seg 匹配；显式 `--targets` 可跳过 |
 | **未做** | 多 key/多 seg **并行**；跨机一份 + 同机扩散；异构 TP 见下节（已验证，需容器补丁） |
@@ -286,23 +286,23 @@ flowchart LR
 
 引擎从 `decode_tp_size` 字段读对端 TP（`config_data.py:48`，只在 worker init 算一次；`prefill_tp_size` 是 consumer 角色字段，本测试床用不到、脚本不生成）；算出的 `(enabled, eff, num_sub_keys)` 同时固定用于该实例的 put 与 get 两侧——**mismatch 信息与实验方向无关**，方向只决定谁 put 谁 get。因此：
 
-- **规则：每台实例 `PEER_TP_SIZE = max(本机 TP, 对端 TP)`**——`run_e2e.sh` 默认即 `max(TP_A,TP_B)`，`start_worker.sh` 把它写进引擎字段 `decode_tp_size`（PD 时代命名，即「对端 TP」；2026-10-12 前脚本变量名 `DECODE_TP_SIZE`，同义）。同构填自身 TP（disabled=正确）。两方向同一组值，**不要按方向翻转**（10-12 曾把 A 的 peer 误翻成 2=自身 → mismatch 静默禁用，[EXPERIMENTS.md](EXPERIMENTS.md) #14）。
-- **错误配置的运行期指纹**：小 TP 端禁用后走 plain get，按本地 head 尺寸读 eff key → 尺寸不符 → `mooncake -800`，日志形状 `Failed to get <块数> keys`（每块 1 key；正确 mismatch 应为 `块数 × num_sub_keys`）。填了对 `eff=max(本机,对端)` 不整除的值同样静默禁用——`start_worker.sh` 已加整除校验 fail loud。
+- **规则：每台实例 `PEER_TP_SIZE = max(本机 TP, 对端 TP)`**——`run_e2e.sh` 默认即 `max(TP_A,TP_B)`，`start_worker.sh` 把它写进引擎字段 `decode_tp_size`（PD 时代命名，即「对端 TP」）。同构填自身 TP（disabled=正确）。两方向同一组值，**不要按方向翻转**（翻转成 peer=自身 → mismatch 静默禁用，实例见 [EXPERIMENTS.md](EXPERIMENTS.md) #14）。
+- **错误配置的运行期指纹**：小 TP 端禁用后走 plain get，按本地 head 尺寸读 eff key → 尺寸不符 → `mooncake -800`，日志形状 `Failed to get <块数> keys`（每块 1 key；正确 mismatch 应为 `块数 × num_sub_keys`）。填了对 `eff=max(本机,对端)` 不整除的值同样静默禁用——`start_worker.sh` 带整除校验 fail loud。
 - 大 TP 端 disabled 即正确：其 plain key（`@tp_rank`、全本地切片）名字与字节恒等于 eff key。
 
 #### 上游 bug（v0.26.0rc1）：tp_mismatch put/get 是死代码
 
 `pool_worker.py::_start_kv_transfer_threads` 构造 `KVCacheStoreSendingThread` / `KVCacheStoreRecvingThread` 时**漏传 `worker=self`**，而 `kv_transfer.py` 的 tp_mismatch put/get 分支都 gate 在 `self.worker is not None`（`:681` / `:934`）。后果：put 走普通路径，key 用**本地 rank 名**、值是**全本地 head 切片**——消费方（更大 TP）按 eff-rank 名找 key，部分「同名碰撞」会读到错误字节，其余直接 miss。
 
-**上游已修**：[vllm-ascend #15835](https://github.com/vllm-project/vllm-ascend/pull/15835)（fix #15842，2026-09-09 合入 main，merge commit `9f8773ea`；根因 = #11444 重构丢了 #11582 引入的接线）。除两处线程构造补 `worker=self if self.tp_mismatch else None`，还恢复了 `start_load_kv` 同步 load 的 mismatch 分发。**rc1 / rc2 均不含，仅 main 有**。
+**上游已修**：[vllm-ascend #15835](https://github.com/vllm-project/vllm-ascend/pull/15835)（fix #15842，2026-09-09 合入 main，merge commit `9f8773ea`）。除两处线程构造补 `worker=self if self.tp_mismatch else None`，还恢复了 `start_load_kv` 同步 load 的 mismatch 分发。**rc1 / rc2 均不含，仅 main 有**。
 
-补丁：`patch_tp_mismatch_worker.patch` = **#15835 完整版的 rc1 backport**（标准 unified diff，三处 hunk 锚定 rc1 唯一上下文；同 TP 传 None、不碰普通路径）。容器内应用：`cd /vllm-workspace/vllm-ascend && git apply --check patch_tp_mismatch_worker.patch && git apply -v patch_tp_mismatch_worker.patch`（或 `patch -p1`）；`git apply -R --check` 探测是否已打。打上后小 TP 消费者同步 load 亦可走 `_load_kv_tp_mismatch`，**`LOAD_ASYNC=1` 由硬约束降为推荐项**（异步仍是 overlap 更优路径；同步 mismatch 路径已于 2026-10-12 真机回归通过——反向 217(TP4)→245(TP2)、`load_async=False` 分发 + sub-key get 拼回 + 8/8 token 一致，见 [EXPERIMENTS.md](EXPERIMENTS.md) 总表 #14；此前异步实测见 #5/#6/#8/#12）。
+补丁：`patch_tp_mismatch_worker.patch` = **#15835 完整版的 rc1 backport**（标准 unified diff，三处 hunk 锚定 rc1 唯一上下文；同 TP 传 None、不碰普通路径）。容器内应用：`cd /vllm-workspace/vllm-ascend && git apply --check patch_tp_mismatch_worker.patch && git apply -v patch_tp_mismatch_worker.patch`（或 `patch -p1`）；`git apply -R --check` 探测是否已打。打上后小 TP 消费者同步 load 亦可走 `_load_kv_tp_mismatch`；**`LOAD_ASYNC=1` 为推荐项**（异步 overlap 更优；同步 mismatch 路径已验证，见 [EXPERIMENTS.md](EXPERIMENTS.md) #14）。
 
 参考：`pool_worker.py`（`put_step`/`head_or_tp_rank`/`_build_tp_mismatch_keys_and_addrs`）；`docs/research/sglang/storage-backends.md`。
 
 ## 目录结构
 
-按调用链归位（2026-10-10 二次重组）：控制面 = `precopy/` 一个 Python 包，三个能力各一模块（keys/resolve/common），编排 = `precopy.py`；`cluster/` 只剩集群生命周期；历史章节中的 `collect_prefix_keys.py`（→`precopy/keys.py`）、`cluster/resolve_segments.sh`（→`precopy/resolve.py`）与 `tools/check_exists.py`（→`keys.py --keys-file --check-master`）按此映射。
+控制面 = `precopy/` 一个 Python 包（keys/resolve/common 三个能力模块）+ `precopy.py` 编排；`cluster/` 为集群生命周期脚本；`tools/` 为调试/测试。历史章节裸文件名映射见 [EXPERIMENTS.md](EXPERIMENTS.md)「勘误与演进」。
 
 ```text
 va-precopy/
@@ -383,12 +383,12 @@ va-precopy/
 
 - **启动与清理**
   - 残留实例会「假 READY」：vLLM 进程 `setproctitle` 后名为 `VLLM::EngineCore/Worker_TP/APIServer`，`ps | grep python` 搜不到；旧实例占着端口与显存时，新实例的 `/v1/models` 可能由旧实例应答。
-  - 清理：`pgrep -f "VLLM::[W]"`（括号防 pgrep 匹配自身命令行）+ 显式 kill，再 `npu-smi info -t usages -i <id>` 确认 HBM 释放（<10%）。**kill 须按 `npu-smi`/`ss` 对号出的实际 pid**，不能按 api_server pid 段猜——EngineCore/Worker 的 pid 可能与 api_server 相差很远（2026-10-12 踩坑：只杀 api_server 留下孤儿 EngineCore 占卡，新实例 worker 起不来）。
-  - **控制面进程也要 `PYTHONHASHSEED=0`**：keys.py/precopy 计算 hash 链必须与引擎同 seed（上游 `init_none_hash` 未设 seed 时用 `os.urandom` 折入每块 hash，且 sha256 无警告）——`keys.py::_hash_prompt` 已 fail loud，但手工 `python3 -`/docker exec 跑探测脚本时记得带。
+  - 清理：`pgrep -f "VLLM::[W]"`（括号防 pgrep 匹配自身命令行）+ 显式 kill，再 `npu-smi info -t usages -i <id>` 确认 HBM 释放（<10%）。**kill 须按 `npu-smi`/`ss` 对号出的实际 pid**，不能按 api_server pid 段猜——EngineCore/Worker 的 pid 可能与 api_server 相差很远；只杀 api_server 会留下孤儿 EngineCore 占卡，新 worker 起不来。
+  - **控制面进程也要 `PYTHONHASHSEED=0`**：keys.py/precopy 计算 hash 链必须与引擎同 seed（上游 `init_none_hash` 未设 seed 时用 `os.urandom` 折入每块 hash，且 sha256 无警告）——`keys.py::_hash_prompt` 缺 seed 即 fail loud；手工 `python3 -`/docker exec 跑探测脚本时记得带。
 - **跨机操作**
   - 两机**非共享存储**：各自 clone 本目录并同步（补丁、脚本、配置保持一致）。
   - 高频 SSH 连接触发对端限速（认证后断连/KEX 卡死）：控制操作合并成批执行，或改控制台人工执行；expect 包装要「输出落文件 + timeout 分支 close」，否则孤儿 ssh 握住管道会把外层 timeout 也拖挂。
-  - **容器无 `ss`/`ps` 不再是死路**：resolve 进程树走 `/proc/*/stat`（`ps` 兜底）、端口缺 `ss` 回退 `/proc/net/tcp × /proc/*/fd`（stdlib，需能读其他进程 fd——root 或同 uid；hidepid 则 fail loud 并在报错里列出替代路径）；**TP=1 且探测基建全挂时自动降级**为 admin 名单单 seg 匹配（复用 master :9003，loud WARN、无交叉核对；pidfile stale=worker 已死**不降级**，防拷进将注销 seg）。TP>1 仍走不通时：master admin API 拿权威名单（`GET :9003/get_all_segments`，TTL 过期自动注销；`/get_all_keys` 可取证全量 key）+ 显式 `--targets` 跳过自动解析；手工 rank↔seg 对号用 `ss -ltnp`（宿主机）端口→pid + `npu-smi` 卡→pid（卡号=rank 号）。
+  - **容器无 `ss`/`ps`**：resolve 进程树走 `/proc/*/stat`（`ps` 兜底）、端口缺 `ss` 回退 `/proc/net/tcp × /proc/*/fd`（stdlib，需能读其他进程 fd——root 或同 uid；hidepid 则 fail loud 并在报错里列出替代路径）；**TP=1 且探测基建全挂时自动降级**为 admin 名单单 seg 匹配（复用 master :9003，loud WARN、无交叉核对；pidfile stale=worker 已死**不降级**，防拷进将注销 seg）。TP>1 仍走不通时：master admin API 拿权威名单（`GET :9003/get_all_segments`，TTL 过期自动注销；`/get_all_keys` 可取证全量 key）+ 显式 `--targets` 跳过自动解析；手工 rank↔seg 对号用 `ss -ltnp`（宿主机）端口→pid + `npu-smi` 卡→pid（卡号=rank 号）。
 - **判定**：指标会骗人（假命中）、必须全新 prompt 首中、必须等源 client TTL、勿用 netdev 计数器、分 rank 证据需 DEBUG——判定方法与其陷阱是一个整体，见 [REPRODUCE.md](REPRODUCE.md) §3。
 
 ## 边界与已知限制
@@ -396,7 +396,7 @@ va-precopy/
 - **验证覆盖面**
   - 只验证 **非 layerwise** + **本机 DRAM** 目标；layerwise / 落盘 / 编排集成见「开放问题」。
   - 新路径（rank↔seg 对号）只重跑过同构同机 TP=2，同构跨机与 TP=4 仍是 10/08 旧 key×N 路径结果（见「验证状态」表注）。
-  - 2026-10-10 控制面重构（单入口 `precopy.py` 内嵌 resolve、反向 targets 自动展开、`run_e2e.sh` 异构默认值/LOAD_ASYNC 自动注入）已于 2026-10-12 真机回归：**正向异构 e2e（bc6b5be 单入口路径，总表 #13）与反向异构 e2e 含同步 load（总表 #14）均通过**；同构 TP=2 e2e 仍未重跑。「验证状态」表中 10/08-09 各条均为重构前控制面结果。
+  - 「验证状态」表 10/08-09 各条为重构前控制面结果；现行控制面（bc6b5be 单入口）已验证异构跨机双向（#13/#14，含同步 load），同构 TP=2 e2e 未重跑。
   - 全部实测为 GQA（`put_step=1`）；`put_step>1`（MLA 塌缩，key 全在 rank 0）时 plan 全落 `targets[0]`——功能正确但其余 rank 读远端副本，该映射未验证。
 - **复制与副本**
   - copy 按 key **串行**；未做并行 / 本机扩散 / 带宽限速（与在线读共享带宽）。
