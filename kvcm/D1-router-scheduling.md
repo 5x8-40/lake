@@ -29,6 +29,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源属主客户端必须在线；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
 - **F5 副本无 pin**：READY 后受池驱逐策略管理；属主实例下线，key 连同远端副本被 master 移除（实测观察，机制与时机待确认 → E5；记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
 - **F6 引擎 APC 私有**：HBM 侧前缀缓存是引擎私有 LRU——无 pin、无池元数据、外部不可见（kv-prefetch.md 方案 A 注意节）。
+- **F15 lease 是 key 粒度：读续租、复制不续租、删 key 释放全部副本**：lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本无独立 TTL。读路径续租（`GrantReadLease(default_kv_lease_ttl_)`：`GetReplicaList:3299` / `BatchQuery:4337` / `:4566`）；`CopyStart` 不触碰 lease（`:6444` 起）。TTL 到期 / 驱逐一律走 `EraseMetadata`——删 key 元数据并释放**全部**副本（`:2308-2313` 注释、`:2374-2375`；驱逐候选必须 lease 过期，`:8117` / `:8299` / `:12434`）。推论：「原副本 TTL 到、复制的副本没到」的状态不存在；removed 是 key 全局事件，无需位置。
 
 **引擎 kv event**
 
@@ -39,7 +40,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   - 范围：本部署只挂 AscendStoreConnector；`preempt_offload` connector 另有事件路径（`preempt_offload/manager.py:732`，cpu_block_pool 事件），不在本部署范围。
 - **F9 盲区一：预复制无事件**：事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码）；`create_copy_task` 不经任何引擎代码 → 预复制副本**结构上无事件**，任何引擎事件消费者都看不到。
 - **F10 盲区二：引擎事件通道上池侧无 Removed**：vllm-ascend 仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / F5 连坐）对引擎事件消费者不可见。GPU 侧有 Removed（F8-1，上游既有）；池原生 publisher 有 removed（F14），三条通道别混淆。
-- **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`），ZMQ 传输；事件 = `{kStored/kRemoved/kCleared, key, medium, tenant, group}`——**不含 seg/机器位置**。
+- **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`），ZMQ 传输，RFC #1527 schema。字段名兼容 vLLM（legacy `type:"BlockStored"` / `block_hashes` / `parent_block_hash`）但**内容全空/nil**（`kv_event_publisher.cpp:440-462`；config 注释「parent_hash and token_ids are not interpreted by the storage publisher」）——有效载荷 = `object_key`（PoolKey 字符串）+ `medium` + tenant/group + 固定上下文（`model_name` / `backend_id` / `block_size` / `dp_rank`），**不含 seg/机器位置**；`backend_id` 标识池级流（一 master 一端点，非实例级）。stored 事件对 router 无可用 hash 内容。
   - 发布点（精确到宿主函数）：
 
     | 事件 | 发布点 |
@@ -117,7 +118,7 @@ flowchart TB
 候选与裁决：
 
 - **a. 控制面补发事件（选定，管放置）**：copy 完成后控制面按引擎格式补发 `BlockStored`，router 零改动。放置归属任何版本都只能靠它（池事件无位置、复制路径零发布，F14）。实现见下方「方案 a 落地」。
-- **b. 池侧事件流（管删除，升级后接管）**：mooncake main 的原生 publisher（F14）对 put / 删除 / **驱逐**都发事件——正是删除面需要的（删除不需要位置：key 没了，所有实例的条目都该删）。管不了放置：载荷只有 key+medium、**不含机器位置**（位置恰是放置的核心），且**复制路径零发布**。「升级后让它顺便管放置」不成立：复制路径加发布点 + 载荷加位置 = fork mooncake（submodule 只读，改动须 fork 长期维护），事件仍是池 schema（PoolKey 字符串、per-rank 切片、无链序与 parent），router 消费它就变池感知组件（同 c 的排除理由），放置反被绑上升级节奏——方案 a 在 0.3.11 即可跑。**0.3.11.post1 不含此机制（E8 已核），要用须升级 mooncake 版本**——删除问题随之解决，不另做机制。
+- **b. 池侧事件流（管删除，升级后接管）**：mooncake main 的原生 publisher（F14）对 put / 删除 / **驱逐**都发事件——正是删除面需要的（删除不需要位置：删除是 key 粒度，全部副本连坐释放，F15）。管不了放置：载荷只有 key+medium、**不含机器位置**（位置恰是放置的核心），且**复制路径零发布**。「升级后让它顺便管放置」不成立：复制路径加发布点 + 载荷加位置 = fork mooncake（submodule 只读，改动须 fork 长期维护），事件仍是池 schema（PoolKey 字符串、per-rank 切片、无链序与 parent），router 消费它就变池感知组件（同 c 的排除理由），放置反被绑上升级节奏——方案 a 在 0.3.11 即可跑。**0.3.11.post1 不含此机制（E8 已核），要用须升级 mooncake 版本**——删除问题随之解决，不另做机制。
 - **c. router 直读 master（排除）**：放置删除都能解决（现查现准），但要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件，脱离经典事件驱动架构，且是全新增机制。
 - **kvcm 轮询对账（不做）**：唯一价值在删除面（周期拉 master 快照 diff 能发现副本没了）；只为删除做一个对账器得不偿失，删除由升级解决。
 - **router 条目 TTL（当前不做）**：纯删除兜底，与预复制放置无关（它不携带「B 有了」的任何信息）；router 侧独立机制，不需要任何新通道。升级前若删除面要兜底可再议。
