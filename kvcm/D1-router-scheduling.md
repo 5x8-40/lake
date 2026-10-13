@@ -39,7 +39,18 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   - 范围：本部署只挂 AscendStoreConnector；`preempt_offload` connector 另有事件路径（`preempt_offload/manager.py:732`，cpu_block_pool 事件），不在本部署范围。
 - **F9 盲区一：预复制无事件**：事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码）；`create_copy_task` 不经任何引擎代码 → 预复制副本**结构上无事件**，任何引擎事件消费者都看不到。
 - **F10 盲区二：引擎事件通道上池侧无 Removed**：vllm-ascend 仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / F5 连坐）对引擎事件消费者不可见。GPU 侧有 Removed（F8-1，上游既有）；池原生 publisher 有 removed（F14），三条通道别混淆。
-- **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`）：put commit 发 stored、删除发 removed、**驱逐发 removed**（`PublishKvRemovedAfterEvict`）、介质增减发 delta；事件 = `{kStored/kRemoved/kCleared, key, medium, tenant, group}`——**不含 seg/机器位置**；ZMQ 传输；编译开关 `ENABLE_KV_EVENTS`（CMake 默认 OFF，官方 wheel 构建显式 ON）+ 运行开关 `enable_kv_events`（`master_config.h:220`，默认 false）。发布点只挂在四处：`PutEnd`（stored，`:5372`）、`EraseMetadata`（removed，`:2338`）、驱逐四路径（removed，`:8161`/`:8314`/`:11366`/`:12549`）、`RemoveAll`（cleared）——**复制路径（`CopyStart:6444`/`CopyEnd:6666`）零发布：预复制副本落位不会自动产生池事件**。**版本口径：publisher 代码在 v0.3.11 之后才进仓（v0.3.11 tag 无 `kv_event/` 目录、CMake 与 wheel 构建均无此开关）→ 0.3.11.post1 不含此机制，要用须升级 mooncake**。vllm-ascend 不消费它。
+- **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`），ZMQ 传输；事件 = `{kStored/kRemoved/kCleared, key, medium, tenant, group}`——**不含 seg/机器位置**。
+  - 发布点（精确到宿主函数）：
+
+    | 事件 | 发布点 |
+    |------|--------|
+    | stored | `PutEnd:5372`（引擎 put 提交，唯一） |
+    | removed | `EraseMetadata:2338`（删除/属主连坐）+ 驱逐四路径（`:8161`/`:8314`/`:11366`/`:12549`） |
+    | cleared | `RemoveAll` |
+    | 复制路径（`CopyStart:6444` / `CopyEnd:6666`） | **零发布——预复制副本落位不会自动产生池事件** |
+
+  - 开关：编译 `ENABLE_KV_EVENTS`（CMake 默认 OFF，官方 wheel 构建显式 ON）+ 运行 `enable_kv_events`（`master_config.h:220`，默认 false）。
+  - **版本口径：publisher 代码在 v0.3.11 之后才进仓（v0.3.11 tag 无 `kv_event/` 目录、CMake 与 wheel 构建均无此开关）→ 0.3.11.post1 不含此机制，要用须升级 mooncake**。vllm-ascend 不消费它。
 
 **复制幂等性（重复发 copy 的后果）**
 
