@@ -17,13 +17,13 @@
 六个待定问题：
 
 1. **选路输入**——router 需要「前缀 × 实例」全局视图，数据从哪来。经典做法：router 消费引擎 kv event 维护「block hash → 实例」索引，不碰池 key（池位置是控制面平面的事）。
-2. **可见性**——预复制绕开引擎、不产生引擎事件（F9），router 索引怎么知道预复制放置。候选：a 控制面补发引擎格式事件 / b 池侧事件流（依赖 E8）/ c router 直读 master（脱离经典架构，已排除）。倾向 a。
+2. **可见性**——预复制绕开引擎、不产生引擎事件（F9），router 索引怎么知道预复制放置。候选：a 控制面补发引擎格式事件 / b 池侧事件流（mooncake 有原生 publisher 含驱逐 removed，F14；载荷无机器位置、默认关、0.3.11 是否编入未核 → E8）/ c router 直读 master（脱离经典架构，已排除）。倾向 a 为主、b 可用则补删除面。
 3. **「哪个实例拥有前缀」怎么定义**——副本在 B 的 seg ≠ B 引擎 radix 里有该前缀。
 4. **时序**——先选路再预热（等 READY 增加 TTFT）vs 预测性预热（请求没来就浪费，P7）；预热中请求到达的兜底（读路径自动远端读，F3）。
 5. **选路目标函数**——命中率 / 实例负载 / 传输成本的权衡；多实例选一。
 6. **release 归谁**——释放决策是 router / 控制面 / 池策略。
 
-已知现状：池侧无 Removed 事件（F10）→ 索引中池副本条目只增不减，陈旧只损性能（F3）；GPU 侧有 Removed（F8）。选路方进程形态与 D4 耦合；工程实现 E11-E14 依赖设计定型，E10/E11 骨架可先行。
+已知现状：引擎事件通道上池侧无 Removed（F10）→ 索引中池副本条目只增不减，陈旧只损性能（F3）；GPU 侧有 Removed（F8）；池原生 publisher 有 removed 但默认关、无位置、0.3.11 是否编入未核（F14 → E8）。选路方进程形态与 D4 耦合；工程实现 E11-E14 依赖设计定型，E10/E11 骨架可先行。
 
 **D2. KV 调度操作集（pin / demote / prefetch / retain / release）**
 
@@ -88,7 +88,7 @@
 - **E5. 副本消失机制核实**——属主下线后 key+副本移除的时机与条件（TTL、GC 扫描窗口）对照实验 → D3 事实输入。
 - **E6. 0.3.11 API 子集核对**——D2 引用的 lease/offload/promotion 是 mooncake main 的符号，测试床 wheel 是 0.3.11.post1，逐个核对可用子集，缺的即池侧扩展工作量 → D2/P5 输入。
 - **E7. MLA 实测**——`put_step>1` 时 plan 全落 `targets[0]`、其余 rank 读远端，功能推断正确未实测；hybrid/sparse 被上游 gate 排除（异构不支持，同构可用）。
-- **E8. mooncake kv_event schema 核对**——🟡 不再阻塞 D1（倾向路径 a 控制面补发事件，路径 b 池事件流未选用）；publisher 存在性佐证：`master_config.h:220` 有 `enable_kv_events` 开关；载荷字段、是否含副本/seg 位置、0.3.11 是否带，仅在重新启用池事件时需要核对。
+- **E8. mooncake kv_event schema 核对**——🟡 机制已核实（落 D1 F14）：publisher 含 stored/removed/cleared，**驱逐发 removed**（`PublishKvRemovedAfterEvict`）；载荷 = key+medium+tenant+group，**无 seg/机器位置**；ZMQ 传输；编译开关 `MOONCAKE_ENABLE_KV_EVENTS`（需 libzmq）+ 运行开关 `enable_kv_events` 默认关。剩一项：0.3.11.post1 wheel 是否编入（容器内起 master 带开关实测）。若编入，b 可为 D1 第 2 问补删除面。
 - **E9. vLLM 事件载荷核对**——✅ 已闭环（结论落 D1 事实基线 F7-F10）：`BlockStored` 含 `medium` 字段；两个发布源——引擎核发 GPU 块事件（含 Removed，上游既有）、连接器发池 put 事件（无 Removed）；预复制绕引擎结构性无事件。
 
 ### B. 服务化重构（骨架可直接开工，接口依赖设计）

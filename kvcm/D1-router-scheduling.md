@@ -37,7 +37,8 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   1. **引擎核（GPU/APC 块）**：上游 `BlockPool` 在块进 HBM 缓存时发 `BlockStored(medium="gpu")`、驱逐时发 `BlockRemoved(medium="gpu")`（上游 `vllm/v1/core/block_pool.py:362` / `:548` / `:621`）；vllm-ascend 的 coordinator patch 原样建 `BlockPool` 并透传门控（`patch_kv_cache_coordinator.py:150-154`）。
   2. **连接器（池 put）**：worker 侧在引擎自己 put 成功后生成 `BlockStored(medium="cpu")`（`kv_transfer.py:1162`、`pool_worker.py:3111`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py:213`）；门控 `enable_kv_cache_events`（`pool_scheduler.py:108`）。池侧无对应 Removed。
 - **F9 盲区一：预复制无事件**：事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码）；`create_copy_task` 不经任何引擎代码 → 预复制副本**结构上无事件**，任何引擎事件消费者都看不到。
-- **F10 盲区二：池侧无 Removed**：vllm-ascend 仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / F5 连坐）对事件消费者不可见。GPU 侧有 Removed（F8-1，上游既有），两层别混淆。
+- **F10 盲区二：引擎事件通道上池侧无 Removed**：vllm-ascend 仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / F5 连坐）对引擎事件消费者不可见。GPU 侧有 Removed（F8-1，上游既有）；池原生 publisher 有 removed（F14），三条通道别混淆。
+- **F14 池原生事件流（默认关）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`）：put commit 发 stored、删除发 removed、**驱逐发 removed**（`PublishKvRemovedAfterEvict`）、介质增减发 delta；事件 = `{kStored/kRemoved/kCleared, key, medium, tenant, group}`——**不含 seg/机器位置**；ZMQ 传输；编译开关 `MOONCAKE_ENABLE_KV_EVENTS`（需 libzmq）+ 运行开关 `enable_kv_events`（`master_config.h:220`，默认 false）；0.3.11.post1 wheel 是否编入未核（E8）。vllm-ascend 不消费它。
 
 **复制幂等性（重复发 copy 的后果）**
 
@@ -47,6 +48,44 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   3. **部分重叠按 seg 粒度**：targets 中部分 seg 已有副本 → 只给缺失的 seg 建副本，非全有或全无。
 - **F12 提交层无去重**：`CreateCopyTask`（`master_service.cpp:13677`）只校验 key 存在 + 目标 seg 可分配，不查目标已有副本、不查在途任务——两个 `create_copy_task` 都会拿到任务 ID；去重发生在源属主执行 `Copy→CopyStart` 时（F11），时序：先执行者赢，后者按 F11-2 失败。
 - **F13 同机不同 seg 的重复是设计内**：防护是 per-(key, seg)；同机多实例各有 seg，同 key 在同机不同 seg 各一份是异构同机的正常工作形态（README 异构 TP 节）。key 不同的内容重复（不同模型/hash 命名空间）不在防护范围。
+
+## 基线：无 kvcm 时怎么运作
+
+```mermaid
+flowchart LR
+    subgraph RT["Router（经典事件驱动）"]
+        IDX["索引 block hash → 实例<br/>分层 gpu=HBM / cpu=池"]
+    end
+    subgraph A["实例 A"]
+        EA["引擎 + APC（HBM 私有）"]
+        SA["本机 DRAM seg"]
+    end
+    subgraph B["实例 B"]
+        EB["引擎 + APC"]
+        SB["本机 DRAM seg"]
+    end
+    M["mooncake_master<br/>key → 副本 → seg 权威"]
+    PB["池事件 publisher<br/>默认关，0.3.11 未核（F14）"]
+
+    Q["请求"] --> RT
+    RT -->|"① 前缀亲和：发给算过该前缀的实例"| EA
+    EA -->|"② put 满块，钉本机 seg（preferred_segment）"| SA
+    EA -.->|"③ BlockStored gpu/cpu；BlockRemoved 仅 gpu（F8）"| IDX
+    SA <-->|"注册/心跳"| M
+    SB <-->|"注册/心跳"| M
+    EA -->|"④ 读：BatchQuery 现查（F1）"| M
+    EB -->|"④ 读：BatchQuery 现查"| M
+    EA -->|"local-first 本机读（F3）"| SA
+    EB -->|"⑤ 副本在 A：跨机 RDMA 读"| SA
+    M -.->|"stored/removed/cleared，key+medium 无位置"| PB
+    PB -.->|"ZMQ"| IDX
+```
+
+要点：
+
+- **事件来源实例 = 物理位置**：写被 `preferred_segment` 钉在本机 seg → router 做前缀亲和即拿到本机读。这是「router 知道 KV 在哪台机器」的机制——不是事件带位置，而是 put 者即位置。
+- **引擎是唯一写者** → 引擎事件的并集 ≈ 池内容；缺口是池侧删除面（引擎通道无 Removed，F10；池原生 publisher 有但默认关，F14）。
+- **任何实例都能读任何前缀**：`BatchQuery` 现查 master，副本在哪都能读（跨机 RDMA）；位置只影响快慢，不影响正确性（F3）。
 
 ## 待定问题
 
@@ -65,12 +104,14 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 三条候选：
 
 - **a. 控制面补发事件**：copy 完成后，控制面按引擎格式补发 `BlockStored`（「B 存了这些 block」）。hash 链控制面已重算（keys.py 的中间产物即引擎 block hash），router 零改动。
-- **b. 池侧事件流**：依赖 E8 核对（载荷是否含副本位置、0.3.11 是否带）；自研则与「不改池」冲突。
+- **b. 池侧事件流**：mooncake main 有原生 publisher（F14）：put / 删除 / **驱逐**都发事件。两个缺口：载荷只有 key+medium、**不含机器位置**——能告诉 router「key 没了」，告诉不了「谁本机有」；默认关 + 编译开关，0.3.11.post1 是否编入未核（E8）。
 - **c. router 直读 master**：要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件——脱离经典事件驱动架构，已排除。
 
-陈旧：池侧无 Removed（F10）→ 索引中池副本条目只增不减；副本被驱逐 / 属主连坐删除（F5）router 都收不到通知。GPU 侧条目有 Removed（F8-1），能正常过期。选错不致命：请求打到实例后 get miss，引擎自动远端读 / 重算（F3），只损性能不损正确性。缓解候选：router 侧索引条目过期，或定期对账（后者又涉及 router 碰 master，随 a 定型后再定）。
+a 与 b 互补：a 给放置归属（「B 有了」），b 给删除面（「key 没了」，含驱逐）——a 单独留下的陈旧问题正好由 b 补上。b 可用则组合完备；b 不可用则 a + router 侧条目过期兜底。
 
-倾向（待讨论）：a。
+陈旧：引擎事件通道上池侧无 Removed（F10）→ 池副本条目只增不减；副本被驱逐 / 属主连坐删除（F5）router 收不到通知。GPU 侧条目有 Removed（F8-1），能正常过期。选错不致命：请求打到实例后 get miss，引擎自动远端读 / 重算（F3），只损性能不损正确性。
+
+倾向（待讨论）：a 为主；b 若 0.3.11 编入则补删除面（E8 先核 wheel）。
 
 ### 3. 「哪个实例拥有前缀」怎么定义
 
