@@ -114,7 +114,7 @@ flowchart TB
 
 三条候选：
 
-- **a. 控制面补发事件**：copy 完成后，控制面按引擎格式补发 `BlockStored`（「B 存了这些 block」）。hash 链控制面已重算（keys.py 的中间产物即引擎 block hash），router 零改动。
+- **a. 控制面补发事件**：copy 完成后，控制面按引擎格式补发 `BlockStored`（「B 存了这些 block」）。hash 链控制面已重算（keys.py 的中间产物即引擎 block hash），router 零改动。接线注意：事件体无实例字段（仅 `data_parallel_rank`，上游 `kv_events.py:39`），经典机制按**发布端点**归实例（每引擎一个端点，router 按来源记账）——补发必须以目标实例的身份到达 router（每实例一个发布端点或伴生发布者），实现归 E14。
 - **b. 池侧事件流**：mooncake main 有原生 publisher（F14）：put / 删除 / **驱逐**都发事件。三个缺口：载荷只有 key+medium、**不含机器位置**；**复制路径零发布**——预复制落位不会自动发事件，升级后 a 依然必要；**0.3.11.post1 不含此机制（E8 已核），要用须升级 mooncake 版本**。
 - **c. router 直读 master**：要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件——脱离经典事件驱动架构，已排除。
 
