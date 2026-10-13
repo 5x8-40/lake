@@ -156,6 +156,8 @@ intent 去重与重试安全：控制面以（前缀 × 目标实例）为幂等
 
 ## 留给后续
 
+编号登记处（含 P/E 系列、状态与依赖）：[backlog.md](backlog.md)。
+
 - **D2**：KV 调度操作集（pin/demote/prefetch/retain/release；master 无显式 pin → `SubmitReplicaActionProposal` lease 机制；释放有 `Remove`/`BatchRemove` 现成）
 - **D3**：副本生命周期与 READY 语义（F5 连坐移除、TTL、属主下线后的副本归属）
 - **D4**：编排进程形态（预复制控制面独立进程或并入 Router；READY 栅栏接 gateway；seg→实例注册通道；**router 框架若消费引擎 kv event，预复制视图带外注入**，§2 集成约束）
