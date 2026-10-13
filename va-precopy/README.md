@@ -353,7 +353,7 @@ va-precopy/
 | `README.md` | 本文：端到端说明 |
 | `REPRODUCE.md` | 客户复现参考：结论 + 必配项 + 「读本机副本」判定方法 |
 | `EXPERIMENTS.md` | 实验总表 14 条 + 异构实录 + 踩坑记录（含撤回历史） |
-| `D003-kv-prefetch.md` | 预取方案设计（自 dynamo-ascend decisions 移入，非 dynamo-ascend 文档） |
+| `D003-kv-prefetch.md` | 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测） |
 | `D1-router-scheduling.md` | 生产化设计 D1：Router 集成与请求调度 |
 
 ## 操作参考

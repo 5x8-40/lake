@@ -22,5 +22,3 @@
   - [bringup.md](bringup.md) — 容器内安装 + 聚合拉起
   - [pd-mooncake.md](pd-mooncake.md) — PD / Store / 卸载 / KV router / 跨机
   - 脚本：[`../../scripts/dynamo-ascend/`](../../scripts/dynamo-ascend/)
-
-> KV 预取（原 D003）不属于本计划，已移至 [`../../va-precopy/`](../../va-precopy/)；三个「layerwise」辨析是一般知识文档，已移至 [`../research/vllm-ascend/layerwise-taxonomy.md`](../research/vllm-ascend/layerwise-taxonomy.md)。
