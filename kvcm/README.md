@@ -223,7 +223,7 @@ sequenceDiagram
     Note over B: 客户端 local-first（SelectBestReplica）<br/>选本机 seg → 本机 DRAM 读，零跨机 RDMA
 ```
 
-注：图中「READY → 放行」目前由 `run_e2e.sh` / 手工顺序保证，接 gateway/router 的编排集成见 [backlog.md](backlog.md) D4；「哪个 key 在哪个 seg」无需通知任何人——master 是放置权威，get 时 `BatchQuery` 现查；副本无 pin，READY 后受池驱逐策略管理。
+注：图中「READY → 放行」目前由 `run_e2e.sh` / 手工顺序保证，接 gateway/router 的编排集成见 [backlog.md](backlog.md) D4；「哪个 key 在哪个 seg」无需通知任何人——mooncake_master 是放置权威，get 时 `BatchQuery` 现查；副本无 pin，READY 后受池驱逐策略管理。
 
 ### 数据来源与日志边界
 

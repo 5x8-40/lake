@@ -16,14 +16,14 @@
 
 六个问题（全部闭环）：
 
-1. **选路输入**——✅ 已闭环（落 D1 §1）：router 消费引擎 kv event 维护「block hash → 实例」索引（经典事件驱动），不碰池 key（池位置是控制面平面的事）；事件门控与通道接线归 D4。
-2. **可见性**——✅ 已闭环（落 D1 §2）。拆两问：**放置** = 方案 a 控制面补发 `BlockStored`（池事件无位置、复制路径零发布，任何版本只能靠它，F14）；**删除** = 升级 mooncake 用池 publisher（0.3.11 不含，E8 已核）。轮询对账（只为删除得不偿失）与 router 条目 TTL（与放置无关的独立兜底）不做；直读 master 排除。方案 a 复用要点：事件字段全是 keys.py 中间产物，发布直接 import 上游 `ZmqEventPublisher`；身份 = 端点（每目标实例一个补发端点，「端点 → 实例」注册归 D4/E13）。
+1. **选路输入**——✅ 已闭环（落 D1 §1）：router 维护「block hash → 实例」索引，只消费引擎格式事件；来源两个——引擎原生事件 + kvcm 补发/翻译（预复制放置、池删除），kvcm 负责补齐引擎看不到的部分；不碰池 key（池位置是控制面平面的事）。事件开关与传输接线归 D4。
+2. **可见性**——✅ 已闭环（落 D1 §2）。拆两问：**放置** = 方案 a 控制面补发 `BlockStored`（池事件不带机器位置、复制路径零发布，任何版本只能靠它，F14）；**删除** = 升级 mooncake 开 master publisher，由 kvcm 订阅并翻译成引擎格式重发（PoolKey 解析 block hash + rank 去重，router 不碰池格式；0.3.11 不含，E8 已核）。轮询对账（只为删除得不偿失）与 router 条目 TTL（与放置无关的独立兜底）不做；直读 master 排除。方案 a 复用要点：事件字段全是 keys.py 中间产物，发布直接 import 上游 `ZmqEventPublisher`；身份 = 端点（每目标实例一个补发端点，「端点 → 实例」注册归 D4/E13）。
 3. **「哪个实例拥有前缀」怎么定义**——✅ 已闭环（落 D1 §3）：实例 X 拥有前缀 P = P 的连续满块链 KV 在 X 本机——HBM（gpu 事件）与本机池 seg（cpu 事件 / kvcm 补发）都算；命中长度 = 连续满块数 × block_size；HBM 与 DRAM 差异留 §5 打分；rank 维度由事件语义吃掉（全 rank 才发），router 无需 per-rank 索引。
-4. **时序**——✅ 已闭环（落 D1 §4）：请求不等 READY（照常走 F3 兜底链，复制后台追）；复制三时机并存（顺手补 / 提前备——最终形态前端 agent/coder 钩子预发送喂 intent，归 D4 / 挑现成的 = router 前缀亲和本职）；intent 以（前缀 × 目标实例）为幂等键去重。边界：kvcm 不决策选路，router 不指挥复制。
+4. **时序**——✅ 已闭环（落 D1 §4）：请求不等 READY（照常走 F3 兜底链，复制后台追）；复制三时机并存（顺手补 / 提前备——最终形态前端 agent/coder 钩子在请求发出前先把信号给控制面，归 D4 / 挑现成的 = router 前缀亲和本职）；intent 以（前缀 × 目标实例）为幂等键去重。边界：kvcm 不决策选路，router 不直接下复制命令，经 intent 表达意图（router → kvcm 上行），事件下行（kvcm → router）。
 5. **选路目标函数**——✅ 已闭环（落 D1 §5）：归 router 内部实现，kvcm 无决策（§1-§3 后 router 输入已齐）；候选在案——分级兜底 / 打分制（Dynamo 分层计价借初值）/ 传输成本两档；权重待真机校准（P7）。
-6. **release 归谁**——✅ 已闭环（落 D1 §6）：router 出会话生命周期 hint，控制面决策执行，池驱逐兜底；主路径 = 停保活软释放（读续租作安全垫，误伤不了热数据），主动 Remove 仅限「确认没人用」（key 全局，A 原本连坐）。
+6. **release 归谁**——✅ 已闭环（落 D1 §6）：router 提供会话生命周期线索，控制面决策执行，池驱逐兜底；手段三个——主路径停保活软释放（有读自动续租，动不了在用的数据）、中间档 demote 降层（DRAM→SSD 不删，归 D2）、例外主动 Remove（key 全局，A 的原本一起删）仅限「确认没人用」。
 
-已知现状：引擎事件通道上池侧无 Removed（F10）→ 索引中池副本条目只增不减，陈旧只损性能（F3）；GPU 侧有 Removed（F8）；池原生 publisher 有 removed 但 0.3.11 不含、载荷无位置（F14，E8 已核）。选路方进程形态与 D4 耦合；工程实现 E11-E14 依赖设计定型，E10/E11 骨架可先行。
+已知现状：引擎事件通道上看不到池副本删除（F10）→ 索引中池副本条目只增不减，条目过时只损性能（F3）；GPU 侧有 Removed（F8）；池原生 publisher 有 removed 但 0.3.11 不含、载荷只说 key 怎么了不说在哪台机器（F14，E8 已核）——升级后由 kvcm 订阅、翻译成引擎格式重发（D1 §2 方案 b）。选路方进程形态与 D4 耦合；工程实现 E11-E14 依赖设计定型，E10/E11 骨架可先行。
 
 **D2. KV 调度操作集（pin / demote / prefetch / retain / release）**
 
@@ -33,7 +33,7 @@
 - pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无显式 pin API——靠 lease 机制（`SubmitReplicaActionProposal` → `ReplicaActionLease`）或池侧扩展。main 另有 **soft pin**（默认 30min / 上限 24h，`types.h:86-89`），挂在 `ReplicateConfig` 路径（put/replicate 时指定，非「给已有 key 加 pin」的独立 API），`allow_evict_soft_pinned_objects` 默认 true = 软保护。lake 文档有同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）可参考。
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
 - demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（以 disk 为 READY 会吃掉预热收益）。
-- release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 出 hint，控制面决策，池兜底）。
+- release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 提供会话生命周期线索，控制面决策，池兜底；含中间档 demote）。
 - 事实输入：E6。
 
 **D3. 副本生命周期与 READY 语义**
@@ -47,7 +47,7 @@
 **D4. 编排集成**
 
 - 待定：READY 信号如何接 gateway/router：谁发起预取、何时放行、失败重试。过载/准入仍归 gateway，推理侧只管执行。
-- 待定：Prefetch Orchestrator 形态（旁路进程或并入 Router）：收 intent → 调 B2 → READY 栅栏 → 放行。
+- 待定：Prefetch Orchestrator 形态（旁路进程或并入 Router）：收 intent → 调 B2 → READY 确认 → 放行。
 - 边界（随 D1 §2 方案 a，已闭环）：router 消费引擎 kv event，预复制放置由控制面补发事件注入（D1 §2）；控制面侧 seg→实例拓扑由编排层提供（测试床 resolve.py 探测链是取证手段，不是生产路径）。
 - 是 D1 时序问题的执行面。骨架先行：E12/E13。
 
@@ -98,7 +98,7 @@
 - **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。
 - **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC 候选，与仓内跨语言 RPC 选型一致）。协议字段依赖 D4 定型；通道骨架可先行。
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例拉起 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3/D5 耦合）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
-- **E14. KV event 通信**——随 D1 §2 方案 a（已闭环）：控制面自产事件 pub 端——直接 import 上游 `ZmqEventPublisher`（`kv_events.py:305`），事件字段取自 keys.py 中间产物（hash 链 / token ids），READY 核验后按目标实例各发一条 `BlockStored`；每目标实例一个发布端点，「端点 → 实例」注册归 D4/E13；引擎事件 sub 端归 router 侧。pub 骨架可直接开工。
+- **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自产引擎格式事件。**pub 端**：直接 import 上游 `ZmqEventPublisher`（`kv_events.py:305`），事件字段取自 keys.py 中间产物（hash 链 / token ids），READY 核验后按目标实例各发一条 `BlockStored`；每目标实例一个发布端点，「端点 → 实例」注册归 D4/E13。**升级 mooncake 后加 sub 端 + 翻译**：订阅 master publisher（F14），PoolKey 解析 block hash、rank 去重，重发 `BlockRemoved` / `AllBlocksCleared`；引擎事件 sub 端归 router 侧。pub 骨架可直接开工。
 
 ### C. 性能与生产化
 

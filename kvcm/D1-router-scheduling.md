@@ -19,34 +19,40 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 ## 事实基线（代码核实）
 
-以下事实已核实，作为讨论输入。Mooncake 锚点 @ `1fc27b62`（submodule）；vllm-ascend 锚点 @ 0.26（rc1）；上游 vLLM 锚点 @ submodule `027b6f3a2`。
+以下事实已核实，作为讨论输入。Mooncake 锚点 @ `1fc27b62`（submodule）；vllm-ascend 锚点 @ 0.26（rc1）；上游 vLLM 锚点 @ submodule `027b6f3a2`。编号按核实先后（F15 后补，主题属副本生命周期，列于「池与副本」），小节按主题归类。
 
 **池与副本**
 
-- **F1 master 是放置权威**：key → 副本 → seg 由 master 记录；读路径 get 时 `BatchQuery` 现查（`real_client.cpp` 8 处调用点，客户端无位置缓存）；没有其他位置通知通道（池 publisher 不带位置，F14）。
-- **F2 key = 满块 × rank 切片**：每个满块 × 每个 rank 的切片 = 一把 key，尾带 `head_or_tp_rank`；801 token 前缀 × TP=2 → 12 把 key（README「三个对象」）。
-- **F3 副本选择 local-first**：非 layerwise 读时 `SelectBestReplica` 本机内存副本优先（`replica_selection.h:122`）；layerwise get session 建立时 `SelectCompleteMemoryReplica` 选一次副本（`real_client.cpp:471`），且 session 要求恰好一个副本（`:6470` 附近，`replicas.size() != 1 → INVALID_REPLICA`）→ 复制必须先于 session 完成，错过只影响当前请求（[kv-prefetch.md](kv-prefetch.md) 时序节）。
+- **F1 mooncake_master 是放置权威**：key → 副本 → seg 由 mooncake_master 记录；读路径 get 时 `BatchQuery` 现查（`real_client.cpp` 8 处调用点，客户端无位置缓存）；没有其他位置通知通道（池 publisher 不带位置，F14）。
+- **F2 一把 key = 一个满块在一个 rank 上的切片**：KV 按 block 切开（本模型 128 token 一块）；TP 下每个 rank 只持有块的一部分，同一块在不同 rank 内容不同——「满块 × rank」的每一片是池里一个独立对象 = 一把 key，尾部带 rank 编号（`head_or_tp_rank`）。例：801 token 前缀 = 6 个满块（768 token，余 33 不满一块不进池），TP=2 → 6 × 2 = **12 把 key**（详见 README「三个对象」）。
+- **F3 读路径：先查后选，本机优先**：引擎读池分两步——先向 master 查副本列表（`BatchQuery`，F1），再开读会话搬数据。非 layerwise 读时 `SelectBestReplica` 本机内存副本优先（`replica_selection.h:122`）。layerwise 的读会话（get session）建立时从列表里选定一个副本（本机优先，`SelectCompleteMemoryReplica`，`real_client.cpp:470`），整个会话只从它读（读时校验锁定的必须恰好一个，否则报 `INVALID_REPLICA`，`:6470`）；会话本身带租约，建立后一个 TTL 窗口内有效（`:6464`）。推论：复制必须在会话建立前落位，本次才用得上；赶不上，选择器自动挑远端副本，跨机读，只影响当前这一次请求（[kv-prefetch.md](kv-prefetch.md) 时序节）。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源属主客户端必须在线；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
-- **F5 副本无 pin**：复制路径不加 pin / lease（F15）→ READY 后受池驱逐策略管理；属主实例下线，key 连同远端副本被 master 移除（实测观察，机制与时机待确认 → E5；记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。注：mooncake main 有 soft pin 机制（挂 `ReplicateConfig`），属 D2 pin 候选（见 [backlog.md](backlog.md) D2），与本条「预复制副本默认无保护」不矛盾。
+- **F5 副本无 pin：READY 后随时可能被池驱逐**：复制路径不加 pin / lease（F15），副本落位后不受保护，池驱逐策略说收就收。属主实例（最初写入 key 的引擎）下线后，master 把它写入的 key 连同这些 key 在**所有机器**上的副本一起删除——**我们预热到 B 的副本也在其中，一起没**（实测：属主下线后 exist 0/32，机制与时机待确认 → E5；记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。注：mooncake main 有 soft pin 机制（挂 `ReplicateConfig`），属 D2 pin 候选（见 [backlog.md](backlog.md) D2），与本条「预复制副本默认无保护」不矛盾。
 - **F6 引擎 APC 私有**：HBM 侧前缀缓存是引擎私有 LRU——无 pin、无池元数据、外部不可见（kv-prefetch.md 方案 A 注意节）。
-- **F15 lease 是 key 粒度：读续租、复制不续租、删 key 释放全部副本**：lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本无独立 TTL。读路径续租（`GrantReadLease(default_kv_lease_ttl_)`：`ExistKeyImpl:3299` / `GetReplicaList:4401` / `BatchGetReplicaList:4566`）；`CopyStart` 不触碰 lease（`:6444` 起）。TTL 到期 / 驱逐一律走 `EraseMetadata`——删 key 元数据并释放**全部**副本（`:2308-2313` 注释、`:2374-2375`；驱逐候选必须 lease 过期，`:8117` / `:8299` / `:12434`）。续租 API：`ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`，`:3271` / `:3307`），`ProbeKey` / `BatchProbeKey` 不续租（`:3276` / `:3312`）；默认 `default_kv_lease_ttl=10s`（`types.h:84`，部署以 master 配置为准）。推论一：「原副本 TTL 到、复制的副本没到」的状态不存在；removed 是 key 全局事件，无需位置。推论二：预复制不续租，READY 后一个 TTL 窗口内无流量即进入可驱逐状态——控制面需有界保活（周期 `batch_is_exist`，kvcm 现成调用；无限续租 = 变相 pin，违背 F5），保活策略归 D3。
+- **F15 lease 是 key 粒度：读续租、复制不续租、删 key 释放全部副本**：
+  - lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本没有独立 TTL。
+  - 读路径续租：`GrantReadLease(default_kv_lease_ttl_)`（`ExistKeyImpl:3299` / `GetReplicaList:4401` / `BatchGetReplicaList:4566`）；`CopyStart` 不触碰 lease（`:6444` 起）。
+  - 删除与驱逐：TTL 到期 / 驱逐一律走 `EraseMetadata`——删 key 元数据并释放**全部**副本（`:2308-2313` 注释、`:2374-2375`）；驱逐候选必须 lease 已过期（`:8117` / `:8299` / `:12434`）。
+  - 续租 API：`ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`，`:3271` / `:3307`）；`ProbeKey` / `BatchProbeKey` 不续租（`:3276` / `:3312`）；默认 `default_kv_lease_ttl=10s`（`types.h:84`，部署以 master 配置为准）。
+  - 推论一：lease 在 key 上，不存在「原副本 TTL 到、复制的副本没到」的状态；removed 是 key 全局事件，无需位置。
+  - 推论二：复制不续租，READY 后一个 TTL 窗口内无流量即进入可驱逐状态——控制面需有界保活（周期 `batch_is_exist`，kvcm 现成调用；无限续租 = 变相 pin，违背 F5），保活策略归 D3。
 
 **引擎 kv event**
 
-- **F7 事件 schema 带介质字段**：`MEDIUM_GPU` / `MEDIUM_CPU`（上游 `vllm/distributed/kv_events.py:51-52`）；`BlockStored{block_hashes, parent_block_hash, token_ids, block_size, medium}`（`:56-68`）。
+- **F7 事件 schema 带介质字段**：`MEDIUM_GPU` / `MEDIUM_CPU`（上游 `vllm/distributed/kv_events.py:51-52`）；`BlockStored{block_hashes, parent_block_hash, token_ids, block_size, medium}`（`:56-68`）。medium 标记 KV 在哪种介质上——gpu = HBM 显存、cpu = DRAM 内存池；router 据此区分命中层级（§5 计价）。
 - **F8 事件有两个发布源**：
   1. **引擎核（GPU/APC 块）**：上游 `BlockPool` 在块进 HBM 缓存时发 `BlockStored(medium="gpu")`、驱逐时发 `BlockRemoved(medium="gpu")`（上游 `vllm/v1/core/block_pool.py:362` / `:548` / `:621`）；vllm-ascend 的 coordinator patch 原样建 `BlockPool` 并透传门控（`patch_kv_cache_coordinator.py:150-154`）。
-  2. **连接器（池 put）**：worker 侧在引擎自己 put 成功后生成 `BlockStored(medium="cpu")`（`kv_transfer.py:1162`、`pool_worker.py:3111`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py:213`）；门控 `enable_kv_cache_events`（`pool_scheduler.py:108`）。池侧无对应 Removed。
+  2. **连接器（池 put）**：worker 侧在引擎自己 put 成功后生成 `BlockStored(medium="cpu")`（`kv_transfer.py:1162`、`pool_worker.py:3111`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py:213`）；门控 `enable_kv_cache_events`（`pool_scheduler.py:108`）。池副本的删除/驱逐不在这条引擎通道上发——那是 master publisher 的事（另一条通道，F14，0.3.11 不含）。
   - 范围：本部署只挂 AscendStoreConnector；`preempt_offload` connector 另有事件路径（`preempt_offload/manager.py:732`，cpu_block_pool 事件），不在本部署范围。
-- **F9 盲区一：预复制无事件**：事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码）；`create_copy_task` 不经任何引擎代码 → 预复制副本**结构上无事件**，任何引擎事件消费者都看不到。
-- **F10 盲区二：引擎事件通道上池侧无 Removed**：vllm-ascend 仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / F5 连坐）对引擎事件消费者不可见。GPU 侧有 Removed（F8-1，上游既有）；池原生 publisher 有 removed（F14），三条通道别混淆。
-- **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`），ZMQ 传输，RFC #1527 schema。字段名兼容 vLLM（legacy `type:"BlockStored"` / `block_hashes` / `parent_block_hash`）但**内容全空/nil**（`kv_event_publisher.cpp:440-462`；config 注释「parent_hash and token_ids are not interpreted by the storage publisher」）——有效载荷 = `object_key`（PoolKey 字符串）+ `medium` + tenant/group + 固定上下文（`model_name` / `backend_id` / `block_size` / `dp_rank`），**不含 seg/机器位置**；`backend_id` 标识池级流（一 master 一端点，非实例级）。stored 事件对 router 无可用 hash 内容。
+- **F9 盲区一：预复制在两条通道上都不会自动产生事件**：引擎事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码），`create_copy_task` 完全在引擎之外 → 引擎通道**结构上**不会有预复制事件；master publisher（F14，0.3.12 起）是另一条通道，其复制路径同样零发布——所以预复制落位只能由 kvcm 补发（§2 方案 a）。
+- **F10 盲区二：引擎事件通道上看不到池副本的删除**：vllm-ascend 全仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / 属主下线删除，F5）对引擎事件消费者不可见。注意三条通道别混淆：HBM 淘汰有 Removed（引擎通道，F8-1）；池删除有 removed（master publisher 通道，F14，0.3.11 不含）；引擎通道的池 put 只有 Stored 没有 Removed。
+- **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`），ZMQ 传输，RFC #1527 schema——**用途是池级缓存失效广播**：面向外部索引器报告「某把 key 存了 / 删了 / 清了」；对我们的价值只在 removed/cleared（删除面），stored 无 hash 内容且引擎自己发得更全。字段名兼容 vLLM（legacy `type:"BlockStored"` / `block_hashes` / `parent_block_hash`）但**内容全空/nil**（`kv_event_publisher.cpp:440-462`；config 注释「parent_hash and token_ids are not interpreted by the storage publisher」）——有效载荷 = `object_key`（PoolKey 字符串）+ `medium` + tenant/group + 固定上下文（`model_name` / `backend_id` / `block_size` / `dp_rank`），**不含 seg/机器位置**（事件只说哪把 key 怎么了，不说 key 在哪台机器上）；`backend_id` 标识池级流（一 master 一端点，非实例级）。stored 事件对 router 无可用 hash 内容。
   - 发布点（精确到宿主函数）：
 
     | 事件 | 发布点 |
     |------|--------|
     | stored | `PutEnd:5372`（引擎 put 提交，唯一） |
-    | removed | `EraseMetadata:2338`（删除/属主连坐）+ 驱逐四路径（`:8161`/`:8314`/`:11366`/`:12549`） |
+    | removed | `EraseMetadata:2338`（删除 / 属主下线）+ 驱逐四路径（`:8161`/`:8314`/`:11366`/`:12549`） |
     | cleared | `RemoveAll` |
     | 复制路径（`CopyStart:6444` / `CopyEnd:6666`） | **零发布——预复制副本落位不会自动产生池事件** |
 
@@ -88,7 +94,7 @@ flowchart TB
     SA <-->|"注册/心跳"| M
     SB <-->|"注册/心跳"| M
     M["mooncake_master<br/>key → 副本 → seg 权威"]
-    M -.->|"stored/removed/cleared，key+medium 无位置"| PB
+    M -.->|"stored/removed/cleared，只说 key 怎么了，不说在哪台机器（F14）"| PB
     PB["池事件 publisher<br/>0.3.11 不含，main 才有（F14）"]
     PB -.->|"ZMQ"| IDX
 ```
@@ -103,27 +109,32 @@ flowchart TB
 
 ### 1. 选路方需要哪些输入
 
-经典做法：router 消费引擎 kv event，维护「block hash → 实例」索引；新请求按同一 hash 链算前缀 block hash，查最长匹配（Dynamo/llm-d 同构）。事件由引擎发出，来源实例天然可知，不需要额外的 seg→实例映射表。
+决策：router 维护「block hash → 实例」索引，新请求按同一 hash 链算前缀 block hash、查最长匹配（Dynamo/llm-d 同构）。索引的事件来源两个，**kvcm 负责补齐引擎看不到的部分**：
 
-事实约束：引擎 kv event 只覆盖引擎自己的 put（F8），载荷是引擎 block hash + token ids + medium（F7），不含池位置（seg/副本）。池位置是控制面平面的事（keys.py 算 PoolKey、master 记副本），不进 router。
+1. **引擎原生事件**：引擎自己的动作——HBM 块的存入与淘汰（medium=gpu）、池 put 的存入（medium=cpu）（F7/F8）。
+2. **kvcm 补发/翻译的事件**：预复制落位（放置，§2 方案 a）；升级 mooncake 后，池里的删除/驱逐由 kvcm 订阅 master publisher、翻译成引擎格式重发（删除，§2 方案 b）。
 
-留待 D4：事件门控与通道（`enable_kv_cache_events`，F8）在部署形态下怎么接。
+router 自始至终只消费引擎格式（`BlockStored` / `BlockRemoved` / `AllBlocksCleared`），不碰池 key、不读 master（§2 方案 c 排除理由）。事件由引擎发出，来源实例天然可知，不需要额外的 seg→实例映射表；kvcm 补发按目标实例端点发，归属同样天然（§2「方案 a 落地」）。
+
+事实约束：引擎事件只覆盖引擎自己的动作（F8）——HBM 淘汰有 Removed，但池侧删除/驱逐/预复制都不产生引擎事件（F9/F10），这些正是 kvcm 要补的部分。事件里的 medium 字段标记 KV 在哪种介质上（gpu=HBM / cpu=DRAM 池），供 §5 分层计价。
+
+留待 D4：事件开关与传输接线（`enable_kv_cache_events` 默认关，需打开才有事件，F8；ZMQ 端点配置、router 订阅方式）在部署形态下怎么接。
 
 ### 2. 可见性：router 的索引怎么知道预复制放置
 
 预复制绕开引擎、不产生引擎事件（F9）→ router 的事件索引永远只知道「前缀在 A」，不知道拷完后「B 也有了」。这里有两个问题：**放置**（router 不知道 B 有了）与**删除**（副本没了，router 还当它存在）。
 
-结论：**放置靠控制面补发事件（方案 a），删除靠升级 mooncake 用池 publisher（方案 b）**；对账与 TTL 不做，直读 master 排除。
+结论：**放置靠控制面补发事件（方案 a）；删除靠升级 mooncake 后由 kvcm 订阅池 publisher、翻译成引擎格式重发（方案 b）**。router 自始至终只消费引擎格式，不碰池格式。对账与 TTL 不做，直读 master 排除。
 
 候选与裁决：
 
 - **a. 控制面补发事件（选定，管放置）**：copy 完成后控制面按引擎格式补发 `BlockStored`，router 零改动。放置归属任何版本都只能靠它（池事件无位置、复制路径零发布，F14）。实现见下方「方案 a 落地」。
-- **b. 池侧事件流（管删除，升级后接管）**：mooncake main 的原生 publisher（F14）对 put / 删除 / **驱逐**都发事件——正是删除面需要的（删除不需要位置：删除是 key 粒度，全部副本连坐释放，F15）。管不了放置：载荷只有 key+medium、**不含机器位置**（位置恰是放置的核心），且**复制路径零发布**。「升级后让它顺便管放置」不成立：复制路径加发布点 + 载荷加位置 = fork mooncake（submodule 只读，改动须 fork 长期维护），事件仍是池 schema（PoolKey 字符串、per-rank 切片、无链序与 parent），router 消费它就变池感知组件（同 c 的排除理由），放置反被绑上升级节奏——方案 a 在 0.3.11 即可跑。**0.3.11.post1 不含此机制（E8 已核），要用须升级 mooncake 版本**——删除问题随之解决，不另做机制。
+- **b. 池侧事件流（管删除，升级后由 kvcm 翻译接管）**：升级后打开 master publisher（F14），removed/cleared 正是删除面需要的（删除是 key 全局事件、全部副本一起删，无需位置，F15）。**消费方是 kvcm，不是 router**：kvcm 订阅 master 的 ZMQ 端点，把事件里的 PoolKey 解析出 block hash（keys.py 已知格式），按引擎格式重发 `BlockRemoved` / `AllBlocksCleared`；同一逻辑块的多个 rank key 由 kvcm 去重成一条。router 不碰池格式，不会变成池感知组件。stored 事件不取（无 hash 内容，且引擎自己发得更全，F14）。管不了放置：复制路径零发布 + 载荷无位置；「升级后让它顺便管放置」不成立——加发布点加位置 = fork mooncake（submodule 只读，fork 长期背维护），事件仍是池 schema，放置反被绑上升级节奏，而方案 a 在 0.3.11 即可跑。**0.3.11.post1 不含 publisher（E8 已核），要用须升级 mooncake 版本**——删除问题随之解决，不另做机制。
 - **c. router 直读 master（排除）**：放置删除都能解决（现查现准），但要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件，脱离经典事件驱动架构，且是全新增机制。
 - **kvcm 轮询对账（不做）**：唯一价值在删除面（周期拉 master 快照 diff 能发现副本没了）；只为删除做一个对账器得不偿失，删除由升级解决。
 - **router 条目 TTL（当前不做）**：纯删除兜底，与预复制放置无关（它不携带「B 有了」的任何信息）；router 侧独立机制，不需要任何新通道。升级前若删除面要兜底可再议。
 
-陈旧：引擎事件通道上池侧无 Removed（F10）→ 池副本条目只增不减；副本被驱逐 / 属主连坐删除（F5）router 收不到通知。GPU 侧条目有 Removed（F8-1），能正常过期。选错不致命：请求打到实例后 get miss，引擎自动远端读 / 重算（F3），只损性能不损正确性。
+**索引条目过时的后果**：删除面接通前，池副本被删（驱逐 / TTL / 属主下线，F5/F10）router 收不到通知 → 索引里 cpu 条目只增不减，会把请求导向其实已经没有副本的实例。后果只是变慢：请求打过去 get miss，引擎自动跨机读或重算（F3），不出错。HBM 条目有淘汰事件（F8-1），不过时。
 
 **方案 a 落地（复用与身份）**
 
@@ -138,7 +149,7 @@ flowchart TB
 | `medium` | 与引擎池 put 事件对齐（F8；上游常量 `MEDIUM_CPU`，`kv_events.py:51`） |
 
 - **发布组件**：直接 import 上游 `ZmqEventPublisher`（`kv_events.py:305`）——构造给 `endpoint`/`topic`，`publish(EventBatch)` 一次调用；wire 格式（topic + seq + msgpack 三帧）与 replay buffer 内置。kvcm 容器路径本就已 import vllm / vllm_ascend（keys.py），零新增依赖；沿用 keys.py/common.py 的 lazy import 形态，debug 路径不背 vllm。
-- **身份（哪台机器）**：事件体无实例字段（仅 `data_parallel_rank`，`kv_events.py:39`），上游机制是**身份 = 端点**——router 按订阅端点把事件归入实例；一个实例多个端点有现成先例（DP rank 端口偏移 `offset_endpoint_port`，`kv_events.py:528`）。因此 kvcm **每个目标实例开一个发布端点**，由编排把「端点 → 实例」注册给 router（与引擎端点同一注册通道，归 D4/E13）；router 把补发端点并入该实例的端点集合，零新概念。topic 只是订阅过滤（默认空），不是身份机制。
+- **身份（哪台机器）**：事件体无实例字段（仅 `data_parallel_rank`，`kv_events.py:39`），上游机制是**身份 = 端点**——router 按订阅端点把事件归入实例；一个实例多个端点有现成先例（DP rank 端口偏移 `offset_endpoint_port`，`kv_events.py:528`）。因此 kvcm **每个目标实例开一个发布端点**，由编排把「端点 → 实例」注册给 router（与引擎端点同一注册通道，归 D4/E13）；router 把补发端点并入该实例的端点集合，零新概念。ZMQ topic 是消息分拣标签（订阅端按它过滤消息），多个发布者可共用同一个 topic——它标不出「来自哪台机器」，所以身份只能走端点。
 - **发布时机**：READY 核验通过（`precopy.py::assert_targets_have_replicas`）后，一次预复制发一条 `BlockStored`（block_hashes = 前缀连续满块链；引擎侧经 `KVEventAggregator` 跨 rank 聚合后同语义）。
 - **幂等**：router 索引是集合语义，补发与引擎自发重复无害；重复预热重复补发亦无害（池层幂等 F11）。
 
@@ -146,7 +157,7 @@ flowchart TB
 
 问题：副本在 B 的 seg ≠ B 引擎 radix 里有该前缀——master 视图 / 引擎 kv event / 控制面 copy 记录三来源覆盖范围不同，§2 闭环后统一为索引声称一个口径。
 
-定义：**实例 X 拥有前缀 P = P 的连续满块链的 KV 在 X 本机**——HBM（APC，gpu 事件）或本机池 seg（cpu 事件 / kvcm 补发）都算；命中长度 = 连续满块数 × block_size，尾巴由引擎重算（801 token 按 768，README「三个对象」）。HBM 与本机 DRAM 的差异不在定义层区分，留 §5 打分。
+定义：**实例 X 拥有前缀 P = P 的连续满块链的 KV 在 X 本机**——HBM（APC，gpu 事件）或本机池 seg（cpu 事件 / kvcm 补发）都算；命中长度 = 连续满块数 × block_size，不满一块的尾巴由引擎重算（801 token 命中前 768）。HBM 与本机 DRAM 的差异不在定义层区分，留 §5 打分。
 
 成立条件（已核事实）：
 
@@ -160,15 +171,15 @@ flowchart TB
 
 结论：
 
-- **请求不等 READY**：等待式选路不设——请求按本机有 / 池远端有 / 重算照常走（F3 兜底链），复制在后台追，本条赶不上不错只损；READY 栅栏是测试床验证手段（[kv-prefetch.md](kv-prefetch.md)「与请求调度联动」），不进请求热路径。
+- **请求不等 READY**：不做「hold 住请求等复制完成」——请求按本机有 / 池远端有 / 重算照常走（F3 兜底链），复制在后台追，本条赶不上不错只慢。测试床里「READY 后才放行请求」只是实验操作顺序（[kv-prefetch.md](kv-prefetch.md)「与请求调度联动」），生产不设这种等待。
 - **复制三个时机并存**：
   1. **顺手补**：请求打到无本地副本的实例，本次跨机读，控制面观测后异步补复制，后续请求受益；
-  2. **提前备**：多轮会话首轮选定实例后异步预热，第二轮起本地命中；最终形态由前端 agent / coder 钩子预发送喂情报（intent 来源与通道归 D4）；
+  2. **提前备**：多轮会话首轮选定实例后异步预热，第二轮起本地命中；提前量的最终来源是前端 agent/coder——它的钩子在请求发出前先把信号给控制面（信号形态与通道归 D4）；
   3. **挑现成的**：索引里已有的实例优先选——这是 router 消费事件后的本职（前缀亲和），不是第三种复制时机，也不是 kvcm 决策。
-- **预热中到达照常下发**：get session 选不到本机副本自动选远端（F3），session 锁副本 per-request，错过只影响当前请求。
+- **预热中到达照常下发**：引擎读池时先查副本列表选一个——本机没有就选远端，跨机读，慢一些不出错；选择只管当前这一次请求（F3），复制完成后，之后的请求自然用上本机副本。
 - **intent 去重**：控制面以（前缀 × 目标实例）为幂等键，在途不重复发、完成不重复发；重发由池层幂等兜底（F11）。
 
-职责边界：kvcm 管复制 / 保活 / 补发事件（让 KV 到位、告诉世界 KV 在哪），不决策选路；router 管索引与选路，不指挥复制。单向耦合。
+职责边界：kvcm 管复制 / 保活 / 补发事件（让 KV 到位、告诉 router KV 在哪），不决策选路；router 管索引与选路，不直接下复制命令——它不懂池（容量 / 在途任务 / 副本现状），只向 kvcm 表达意图（intent：某前缀接下来在实例 B 上用，通道归 E12），复制与否、何时、去重由 kvcm 决策（它懂池）。两条单向通道：intent 上行（router → kvcm），事件下行（kvcm → router）。
 
 ### 5. 目标函数（归 router 内部实现）
 
@@ -182,25 +193,26 @@ flowchart TB
 
 ### 6. release 与放置的边界
 
-分工：router 出情报（会话结束 / 迁移 / 超时 hint），控制面（kvcm）决策执行，池策略兜底。router 不指挥释放——与 §4 不指挥复制同一条边界。依据：router 知道「谁还会用」，池知道「谁还在」，释放决策需要两者。
+分工：router 提供线索（会话结束 / 迁移 / 超时），控制面（kvcm）决策执行，池策略兜底。router 不直接下释放命令——与 §4 不直接下复制命令同一条边界。依据：router 知道「谁还会用」，池知道「谁还在」，释放决策需要两者。
 
-前提事实：删除与 lease 都是 key 粒度（F15）——「只删 B 的副本、保留 A 的」不存在也不需要：B 的副本占 B 自己的内存，该让位时由池驱逐处理，不归释放决策。于是 release 只剩「整个前缀（所有副本）什么时候删」。
+前提事实：删除与 lease 都是 key 粒度（F15）——「只删 B 的副本、保留 A 的」不存在也不需要：B 的副本占 B 自己的内存，该让位时由池驱逐处理，不归释放决策。于是 release 只剩「整个前缀（所有副本）怎么处理」。
 
-手段两个 + 兜底一个：
+手段三个 + 兜底一个：
 
-- **主路径·停保活（软释放）**：副本活着是因为有人续租（控制面保活 / 引擎读）——释放不需要新动作，停止动作就行：控制面停掉某前缀的保活，租约到期池自然收走。安全垫：任何实例还在读，租约照续（F15），停保活只收回控制面自己的兴趣，误伤不了热数据。
+- **主路径·停保活（软释放）**：副本活着是因为有读在续租、或控制面在保活（F15）——释放不需要新动作，停止动作就行：控制面停掉某前缀的保活，租约到期池自然收走。保护机制：任何实例还在读这个前缀，读路径会自动续租，key 不受影响——停保活只是控制面不再续租，动不了仍在使用的数据。
+- **中间档·demote（降层）**：不删除，DRAM → SSD，前缀还在池里可读（更慢）；适合「近期不用、但可能还会用」。操作集归 D2（`enable_ssd_offload` / `EvictDiskReplica`）。
 - **例外通道·主动 Remove（硬释放）**：等不了自然过期、要立即腾地方时用；key 全局删除（A 的原本一起没），门槛 = 确认前缀谁都不再用（会话明确结束、前缀一次性）。`Remove` / `BatchRemove` 现成（D2）。
-- **兜底·池驱逐（非手段）**：控制面挂了 / 漏了 / 决策错了，TTL + 驱逐照样收，副本永不泄漏；两个手段只让回收更快更准，不承担正确性。
+- **兜底·池驱逐（非手段）**：即使控制面出错（没停保活、没发 Remove），池的 TTL 与驱逐也会最终回收——不会出现没人记得、永远占着内存的孤儿副本。三个手段只让回收更快更准，正确性不靠它们。
 
-已知缺口（登记，不归 D1）：master 无显式 pin API（lease 机制 → D2）；属主下线副本连坐移除（F5 → D3/D5）。
+已知缺口（登记，不归 D1）：master 无显式 pin API（lease 机制 → D2）；属主下线副本一并移除（F5 → D3/D5）。
 
 ## 留给后续
 
 编号登记处（含 P/E 系列、状态与依赖）：[backlog.md](backlog.md)。
 
 - **D2**：KV 调度操作集（pin/demote/prefetch/retain/release；master 无显式 pin → `SubmitReplicaActionProposal` lease 机制；释放有 `Remove`/`BatchRemove` 现成）
-- **D3**：副本生命周期与 READY 语义（F5 连坐移除、TTL、属主下线后的副本归属）
-- **D4**：编排进程形态（预复制控制面独立进程或并入选路方；READY 栅栏接 gateway；seg→实例与「端点→实例」注册通道；预复制视图由控制面补发事件注入，§2）
+- **D3**：副本生命周期与 READY 语义（F5 属主下线移除、TTL、属主下线后的副本归属）
+- **D4**：编排进程形态（预复制控制面独立进程或并入选路方；READY 确认接 gateway；seg→实例与「端点→实例」注册通道；预复制视图由控制面补发事件注入，§2）
 - **D5**：故障衔接（源属主掉线 copy 失败（F4）、与重路由的先后）
 - **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../docs/research/vllm-ascend/layerwise-taxonomy.md)）
 - **D7**：方案 A（壳请求进 HBM）去留与叠加顺序
