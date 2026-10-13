@@ -23,7 +23,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 **池与副本**
 
-- **F1 master 是放置权威**：key → 副本 → seg 由 master 记录；读路径 get 时 `BatchQuery` 现查，没有其他位置通知通道（[README.md](README.md) 时序节）。
+- **F1 master 是放置权威**：key → 副本 → seg 由 master 记录；读路径 get 时 `BatchQuery` 现查（`real_client.cpp` 8 处调用点，客户端无位置缓存）；没有其他位置通知通道（池 publisher 不带位置，F14）。
 - **F2 key = 满块 × rank 切片**：每个满块 × 每个 rank 的切片 = 一把 key，尾带 `head_or_tp_rank`；801 token 前缀 × TP=2 → 12 把 key（README「三个对象」）。
 - **F3 副本选择 local-first**：非 layerwise 读时 `SelectBestReplica` 本机内存副本优先（`replica_selection.h:122`）；layerwise get session 建立时 `SelectCompleteMemoryReplica` 选一次副本（`real_client.cpp:471`），且 session 要求恰好一个副本（`:6470` 附近，`replicas.size() != 1 → INVALID_REPLICA`）→ 复制必须先于 session 完成，错过只影响当前请求（[kv-prefetch.md](kv-prefetch.md) 时序节）。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源属主客户端必须在线；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
@@ -36,6 +36,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F8 事件有两个发布源**：
   1. **引擎核（GPU/APC 块）**：上游 `BlockPool` 在块进 HBM 缓存时发 `BlockStored(medium="gpu")`、驱逐时发 `BlockRemoved(medium="gpu")`（上游 `vllm/v1/core/block_pool.py:362` / `:548` / `:621`）；vllm-ascend 的 coordinator patch 原样建 `BlockPool` 并透传门控（`patch_kv_cache_coordinator.py:150-154`）。
   2. **连接器（池 put）**：worker 侧在引擎自己 put 成功后生成 `BlockStored(medium="cpu")`（`kv_transfer.py:1162`、`pool_worker.py:3111`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py:213`）；门控 `enable_kv_cache_events`（`pool_scheduler.py:108`）。池侧无对应 Removed。
+  - 范围：本部署只挂 AscendStoreConnector；`preempt_offload` connector 另有事件路径（`preempt_offload/manager.py:732`，cpu_block_pool 事件），不在本部署范围。
 - **F9 盲区一：预复制无事件**：事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码）；`create_copy_task` 不经任何引擎代码 → 预复制副本**结构上无事件**，任何引擎事件消费者都看不到。
 - **F10 盲区二：引擎事件通道上池侧无 Removed**：vllm-ascend 仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / F5 连坐）对引擎事件消费者不可见。GPU 侧有 Removed（F8-1，上游既有）；池原生 publisher 有 removed（F14），三条通道别混淆。
 - **F14 池原生事件流（默认关）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`）：put commit 发 stored、删除发 removed、**驱逐发 removed**（`PublishKvRemovedAfterEvict`）、介质增减发 delta；事件 = `{kStored/kRemoved/kCleared, key, medium, tenant, group}`——**不含 seg/机器位置**；ZMQ 传输；编译开关 `MOONCAKE_ENABLE_KV_EVENTS`（需 libzmq）+ 运行开关 `enable_kv_events`（`master_config.h:220`，默认 false）；0.3.11.post1 wheel 是否编入未核（E8）。vllm-ascend 不消费它。
@@ -52,10 +53,12 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 ## 基线：无 kvcm 时怎么运作
 
 ```mermaid
-flowchart LR
+flowchart TB
+    Q["请求"] --> RT
     subgraph RT["Router（经典事件驱动）"]
         IDX["索引 block hash → 实例<br/>分层 gpu=HBM / cpu=池"]
     end
+    RT -->|"① 前缀亲和：发给算过该前缀的实例"| EA
     subgraph A["实例 A"]
         EA["引擎 + APC（HBM 私有）"]
         SA["本机 DRAM seg"]
@@ -64,20 +67,17 @@ flowchart LR
         EB["引擎 + APC"]
         SB["本机 DRAM seg"]
     end
-    M["mooncake_master<br/>key → 副本 → seg 权威"]
-    PB["池事件 publisher<br/>默认关，0.3.11 未核（F14）"]
-
-    Q["请求"] --> RT
-    RT -->|"① 前缀亲和：发给算过该前缀的实例"| EA
     EA -->|"② put 满块，钉本机 seg（preferred_segment）"| SA
     EA -.->|"③ BlockStored gpu/cpu；BlockRemoved 仅 gpu（F8）"| IDX
-    SA <-->|"注册/心跳"| M
-    SB <-->|"注册/心跳"| M
-    EA -->|"④ 读：BatchQuery 现查（F1）"| M
-    EB -->|"④ 读：BatchQuery 现查"| M
     EA -->|"local-first 本机读（F3）"| SA
     EB -->|"⑤ 副本在 A：跨机 RDMA 读"| SA
+    EA -->|"④ 读：BatchQuery 现查（F1）"| M
+    EB -->|"④ 读：BatchQuery 现查"| M
+    SA <-->|"注册/心跳"| M
+    SB <-->|"注册/心跳"| M
+    M["mooncake_master<br/>key → 副本 → seg 权威"]
     M -.->|"stored/removed/cleared，key+medium 无位置"| PB
+    PB["池事件 publisher<br/>默认关，0.3.11 未核（F14）"]
     PB -.->|"ZMQ"| IDX
 ```
 
@@ -120,7 +120,7 @@ a 与 b 互补：a 给放置归属（「B 有了」），b 给删除面（「key
 三个来源覆盖范围不同：
 
 - master 视图（key → 副本 → seg，F1）：预复制副本唯一完备的信息源。
-- 引擎 kv event：只覆盖引擎自己的 put（F8），无 Removed（F10），APC 命中不进任何事件（F6）。
+- 引擎 kv event：只覆盖引擎自己的 put（F8），池侧无 Removed（F10），APC 命中不进任何事件（F6）。
 - 控制面 copy 记录：只覆盖预复制动作。
 
 建议定义（待确认）：**本地命中 = 前缀连续满块集合中，目标实例每个 rank 的 key 都在本机 seg 上有 DRAM 副本**（master 视图口径）。全 rank 齐备 = 零跨机；部分 rank 本地按块比例计入（F3：get session 每 rank 独立选副本）。命中 token 数 = 连续满块数 × block_size，尾巴由引擎重算（801 token 命中 768 口径，README「三个对象」）。MLA（`put_step>1`）key 折叠到 rank 0，判定退化为单 rank，该映射未实测（README 边界节）。
