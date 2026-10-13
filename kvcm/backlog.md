@@ -8,18 +8,19 @@
 
 ## 一、设计决策
 
-**D1. Router 集成与请求调度** — ✅ 已定稿（2026-10-13）
+**D1. Router 集成与请求调度** — 讨论中
 
-- 设计全文：[D1-router-scheduling.md](D1-router-scheduling.md)——选路输入三表、可见性 = 直读 master + Router 只读镜像、事件身份三种不混、预测式时序、目标函数、release 归池 hint 单向。
-- 复制幂等性：重发 copy 不产生同 seg 重复副本（D1 F11-F13，CopyStart 三层防护）。
-- 剩余为工程实现：E11-E14。
+- 工作文档：[D1-router-scheduling.md](D1-router-scheduling.md)——事实基线 F1-F13 已核实（含复制幂等性：重发 copy 不产生同 seg 重复副本）。
+- 待定：可见性路径选型（控制面自产事件 / 池侧事件流 / 直读 master）、「哪个实例拥有前缀」定义、预热与选路时序、目标函数权重、release 边界。
+- 选路方身份未定（kvcm 现无 router 组件），进程形态与 D4 耦合。
+- 工程实现 E11-E14 依赖设计定型；E10/E11 骨架可先行。
 
 **D2. KV 调度操作集（pin / demote / prefetch / retain / release）**
 
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无显式 pin API——靠 lease 机制（`SubmitReplicaActionProposal` → `ReplicaActionLease`）或池侧扩展。lake 主设计「引用数 >0 冻结」正是 pin 语义，要接上。
+- pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无显式 pin API——靠 lease 机制（`SubmitReplicaActionProposal` → `ReplicaActionLease`）或池侧扩展。lake 文档有同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）可参考。
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
 - demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（以 disk 为 READY 会吃掉预热收益）。
 - release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；边界已定（D1 ⑥：归池策略，Router 只给 hint）。
@@ -42,7 +43,7 @@
 **D5. 故障衔接**
 
 - 事实：copy 期间源实例掉线即失败（master 给源属主派任务，D1 F4）。
-- 事实（2026-10-13）：源属主挂死后，在途任务标记由 master reaper 清理（`master_service.cpp:10654` 附近）；清理窗口内重发同一 copy 吃 `OBJECT_HAS_REPLICATION_TASK`（幂等语义见 D1 F11-F12）；staged 副本是否随 reaper 一并清除未核实。
+- 事实：源属主挂死后，在途任务标记由 master reaper 清理（`master_service.cpp:10654` 附近）；清理窗口内重发同一 copy 吃 `OBJECT_HAS_REPLICATION_TASK`（幂等语义见 D1 F11-F12）；staged 副本是否随 reaper 一并清除未核实。
 - 待定：与故障重路由如何衔接——重新预热还是容忍本次远端读。
 
 **D6. layerwise 选型**
@@ -78,7 +79,7 @@
 - **E6. 0.3.11 API 子集核对**——D2 引用的 lease/offload/promotion 是 mooncake main 的符号，测试床 wheel 是 0.3.11.post1，逐个核对可用子集，缺的即池侧扩展工作量 → D2/P5 输入。
 - **E7. MLA 实测**——`put_step>1` 时 plan 全落 `targets[0]`、其余 rank 读远端，功能推断正确未实测；hybrid/sparse 被上游 gate 排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——🟡 不再阻塞 D1（已选定路径 c 直读 master，路径 b 池事件流弃用）；publisher 载荷字段、是否含副本/seg 位置、0.3.11 是否带 `enable_kv_events`，仅在重新启用池事件时需要。
-- **E9. vLLM 事件载荷核对**——✅ 已闭环（2026-10-13，落 D1 事实基线 F7-F10）：`BlockStored` 含 `medium` 字段；引擎自己 put 成功才发（`medium="cpu"`）；预复制绕引擎结构性无事件；vllm-ascend 0.26 全仓零 `BlockRemoved`。
+- **E9. vLLM 事件载荷核对**——✅ 已闭环（结论落 D1 事实基线 F7-F10）：`BlockStored` 含 `medium` 字段；引擎自己 put 成功才发（`medium="cpu"`）；预复制绕引擎结构性无事件；vllm-ascend 0.26 全仓零 `BlockRemoved`。
 
 ### B. 服务化重构（骨架可直接开工，接口依赖设计）
 
@@ -99,4 +100,4 @@
 - llm-d EPP 推测索引（TTL 2s 补窗手法）：[../docs/research/llm-d/](../docs/research/llm-d/)
 - AIBrix ZMQ 事件同步：[../docs/research/aibrix/](../docs/research/aibrix/)
 - mooncake master API（submodule 源码，符号锚点）：`master_service.h`（`CreateCopyTask` / `SubmitReplicaActionProposal` / `Remove` / `BatchEvict`）、`master_service.cpp`（`CopyStart:6444` 幂等三层防护；`CreateCopyTask:13677` 提交层无去重；reaper `10654` 附近）
-- 关键差异：现有系统的事件都是单源（引擎侧或池侧），我们是双源（引擎事件 + 池放置事实），权威归属与合并规则要自己定——D1 已定 master 视图权威。
+- 关键差异：现有系统的事件都是单源（引擎侧或池侧），我们是双源（引擎事件 + 池放置事实），权威归属与合并规则要自己定（D1 待定问题 §2/§3）。
