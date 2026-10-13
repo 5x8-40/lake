@@ -1,5 +1,7 @@
 # KVCM backlog：遗留问题与下一步计划
 
+来源：[issue #54](https://github.com/5x8-40/lake/issues/54)（KV-CM 遗留问题总清单）；本文是活文档，条目状态随讨论与实验更新。
+
 编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环即从本文删除，结论落对应正式文档（D 系文档 / `kv-prefetch.md` / README）。
 
 依赖主线：D1/D2 是设计主线（E5/E6/E8/E9 是其事实输入）；E10→E11→E12/E13/E14 是服务化主线（重构先行、协议随后）；P1-P8 大多随 D1/D2 定型一并回答。
@@ -31,7 +33,7 @@
 - pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无显式 pin API——靠 lease 机制（`SubmitReplicaActionProposal` → `ReplicaActionLease`）或池侧扩展。lake 文档有同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）可参考。
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
 - demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（以 disk 为 READY 会吃掉预热收益）。
-- release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；边界已定（D1 ⑥：归池策略，Router 只给 hint）。
+- release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策见 D1 第 6 问（讨论中）。
 - 事实输入：E6。
 
 **D3. 副本生命周期与 READY 语义**
@@ -72,7 +74,7 @@
 - **P4. 读与驱逐竞态**——get 选中副本后到读完之间被驱逐的防护（mooncake 侧应有 lease/refcount，语义待确认，与 D2 retain 耦合）。
 - **P5. 多租户与配额**——多模型共池的隔离（mooncake main 有 tenant quota，0.3.11 是否具备待核对 → E6）。
 - **P6. 鉴权边界**——现状能连 master 就能 `create_copy_task`/`Remove`。生产需要接入控制；控制面权限应大于引擎（引擎只需读写自己 seg）。
-- **P7. 预热成本核算**——预热后请求没来或去了别实例的浪费；READY 延迟（带宽×块数）vs 请求到达时间的窗口预测。框架已定（D1 ④⑤），成本参数待实测。
+- **P7. 预热成本核算**——预热后请求没来或去了别实例的浪费；READY 延迟（带宽×块数）vs 请求到达时间的窗口预测。与 D1 第 4/5 问耦合（讨论中）。
 - **P8. 指标归因**——命中率要拆「预热贡献 vs 引擎内部 HBM cache」。测试床已遇到第二次命中被内部 cache 接住（外部 get=0），生产监控同样会混淆。
 
 ## 三、工程项
@@ -86,7 +88,7 @@
 - **E5. 副本消失机制核实**——属主下线后 key+副本移除的时机与条件（TTL、GC 扫描窗口）对照实验 → D3 事实输入。
 - **E6. 0.3.11 API 子集核对**——D2 引用的 lease/offload/promotion 是 mooncake main 的符号，测试床 wheel 是 0.3.11.post1，逐个核对可用子集，缺的即池侧扩展工作量 → D2/P5 输入。
 - **E7. MLA 实测**——`put_step>1` 时 plan 全落 `targets[0]`、其余 rank 读远端，功能推断正确未实测；hybrid/sparse 被上游 gate 排除（异构不支持，同构可用）。
-- **E8. mooncake kv_event schema 核对**——🟡 不再阻塞 D1（已选定路径 c 直读 master，路径 b 池事件流弃用）；publisher 载荷字段、是否含副本/seg 位置、0.3.11 是否带 `enable_kv_events`，仅在重新启用池事件时需要。
+- **E8. mooncake kv_event schema 核对**——🟡 不再阻塞 D1（倾向路径 a 控制面补发事件，路径 b 池事件流未选用）；publisher 存在性佐证：`master_config.h:220` 有 `enable_kv_events` 开关；载荷字段、是否含副本/seg 位置、0.3.11 是否带，仅在重新启用池事件时需要核对。
 - **E9. vLLM 事件载荷核对**——✅ 已闭环（结论落 D1 事实基线 F7-F10）：`BlockStored` 含 `medium` 字段；引擎自己 put 成功才发（`medium="cpu"`）；预复制绕引擎结构性无事件；vllm-ascend 0.26 全仓零 `BlockRemoved`。
 
 ### B. 服务化重构（骨架可直接开工，接口依赖设计）
@@ -107,5 +109,5 @@
 - Dynamo KV-aware router 外部重算 hash 链：[../docs/research/dynamo/overview.md](../docs/research/dynamo/overview.md)
 - llm-d EPP 推测索引（TTL 2s 补窗手法）：[../docs/research/llm-d/](../docs/research/llm-d/)
 - AIBrix ZMQ 事件同步：[../docs/research/aibrix/](../docs/research/aibrix/)
-- mooncake master API（submodule 源码，符号锚点）：`master_service.h`（`CreateCopyTask` / `SubmitReplicaActionProposal` / `Remove` / `BatchEvict`）、`master_service.cpp`（`CopyStart:6444` 幂等三层防护；`CreateCopyTask:13677` 提交层无去重；reaper `10654` 附近）
+- mooncake master API（submodule 源码，符号锚点）：`master_service.h`（`CreateCopyTask` / `SubmitReplicaActionProposal` / `Remove` / `BatchEvict`）、`master_config.h`（`enable_kv_events` 开关，E8）、`master_service.cpp`（`CopyStart:6444` 幂等三层防护；`CreateCopyTask:13677` 提交层无去重；reaper `10654` 附近）
 - 关键差异：现有系统的事件都是单源（引擎侧或池侧），我们是双源（引擎事件 + 池放置事实），权威归属与合并规则要自己定（D1 待定问题 §2/§3）。
