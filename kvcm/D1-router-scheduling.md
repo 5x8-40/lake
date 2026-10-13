@@ -35,6 +35,15 @@
 - **F9 盲区一：预复制无事件**：事件只在连接器 worker 代码路径生成（F8）；`create_copy_task` 不经任何引擎代码 → 预复制副本**结构上无事件**，任何引擎事件消费者都看不到。
 - **F10 盲区二：无 Removed**：vllm-ascend 0.26 全仓零 `BlockRemoved` → 副本消失（驱逐 / TTL / F5 连坐）对事件消费者同样不可见。
 
+**复制幂等性（重复发 copy 的后果）**
+
+- **F11 重发安全，三层防护都在 CopyStart（`master_service.cpp:6444`），不依赖任何事件**：
+  1. **目标 seg 已有副本 → 跳过**：按 seg 粒度去重——`GetReplicaBySegmentName(tgt) == nullptr` 才计数（`:6498`）、才分配（`:6595`）；全部目标已有副本 → 返回空 targets → 客户端 `replica_copy_skipped / target_replicas_already_exist`，按**成功** no-op（`client_service.cpp:4363`）。同 seg 不会产生第二份同 key 副本。
+  2. **同 key 有在途任务 → 拒绝**：`HasReplicationTask()` → 第二个 `CopyStart` 失败 `OBJECT_HAS_REPLICATION_TASK`（`:6488`）——并发重发不会建两个任务；但这是**任务失败**（`query_task` 可见）不是静默成功，控制面重发时要把该错误码按「已在途」处理，不当失败。
+  3. **部分重叠按 seg 粒度**：targets 中部分 seg 已有副本 → 只给缺失的 seg 建副本，非全有或全无。
+- **F12 提交层无去重**：`CreateCopyTask`（`master_service.cpp:13677`）只校验 key 存在 + 目标 seg 可分配，不查目标已有副本、不查在途任务——两个 `create_copy_task` 都会拿到任务 ID；去重发生在源属主执行 `Copy→CopyStart` 时（F11），时序：先执行者赢，后者按 F11-2 失败。
+- **F13 同机不同 seg 的重复是设计内**：防护是 per-(key, seg)；同机多实例各有 seg，同 key 在同机不同 seg 各一份是异构同机的正常工作形态（README 异构 TP 节）。key 不同的内容重复（不同模型/hash 命名空间）不在防护范围。
+
 ## 设计决策
 
 ### 1. 选路输入：三张表
@@ -98,6 +107,8 @@ Router 可见的「本地命中」只按 master 视图定义：**目标实例本
 2. 控制面算 key → `create_copy_task` → `query_task` → `batch_get_replica_desc` 核验 → READY（F4）
 3. Router 镜像刷新——该前缀对目标实例本地可见
 4. 后续同前缀请求：镜像查中 → 直接选该实例
+
+intent 去重与重试安全：控制面以（前缀 × 目标实例）为幂等键，在途不重复发、完成不重复发；即便重发也由 F11 兜底（同 seg 跳过 / 在途报 `OBJECT_HAS_REPLICATION_TASK`）——重发安全，不产生重复副本。
 
 反应式兜底：选了实例但副本未就绪（未预取 / 在途 / 镜像正向陈旧）：
 
