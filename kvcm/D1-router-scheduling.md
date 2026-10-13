@@ -39,7 +39,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   - 范围：本部署只挂 AscendStoreConnector；`preempt_offload` connector 另有事件路径（`preempt_offload/manager.py:732`，cpu_block_pool 事件），不在本部署范围。
 - **F9 盲区一：预复制无事件**：事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码）；`create_copy_task` 不经任何引擎代码 → 预复制副本**结构上无事件**，任何引擎事件消费者都看不到。
 - **F10 盲区二：引擎事件通道上池侧无 Removed**：vllm-ascend 仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / F5 连坐）对引擎事件消费者不可见。GPU 侧有 Removed（F8-1，上游既有）；池原生 publisher 有 removed（F14），三条通道别混淆。
-- **F14 池原生事件流（默认关）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`）：put commit 发 stored、删除发 removed、**驱逐发 removed**（`PublishKvRemovedAfterEvict`）、介质增减发 delta；事件 = `{kStored/kRemoved/kCleared, key, medium, tenant, group}`——**不含 seg/机器位置**；ZMQ 传输；编译开关 `MOONCAKE_ENABLE_KV_EVENTS`（需 libzmq）+ 运行开关 `enable_kv_events`（`master_config.h:220`，默认 false）；0.3.11.post1 wheel 是否编入未核（E8）。vllm-ascend 不消费它。
+- **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`）：put commit 发 stored、删除发 removed、**驱逐发 removed**（`PublishKvRemovedAfterEvict`）、介质增减发 delta；事件 = `{kStored/kRemoved/kCleared, key, medium, tenant, group}`——**不含 seg/机器位置**；ZMQ 传输；编译开关 `ENABLE_KV_EVENTS`（CMake 默认 OFF，官方 wheel 构建显式 ON）+ 运行开关 `enable_kv_events`（`master_config.h:220`，默认 false）。**版本口径：publisher 代码在 v0.3.11 之后才进仓（v0.3.11 tag 无 `kv_event/` 目录、CMake 与 wheel 构建均无此开关）→ 0.3.11.post1 不含此机制，要用须升级 mooncake**。vllm-ascend 不消费它。
 
 **复制幂等性（重复发 copy 的后果）**
 
@@ -77,7 +77,7 @@ flowchart TB
     SB <-->|"注册/心跳"| M
     M["mooncake_master<br/>key → 副本 → seg 权威"]
     M -.->|"stored/removed/cleared，key+medium 无位置"| PB
-    PB["池事件 publisher<br/>默认关，0.3.11 未核（F14）"]
+    PB["池事件 publisher<br/>0.3.11 不含，main 才有（F14）"]
     PB -.->|"ZMQ"| IDX
 ```
 
@@ -104,14 +104,14 @@ flowchart TB
 三条候选：
 
 - **a. 控制面补发事件**：copy 完成后，控制面按引擎格式补发 `BlockStored`（「B 存了这些 block」）。hash 链控制面已重算（keys.py 的中间产物即引擎 block hash），router 零改动。
-- **b. 池侧事件流**：mooncake main 有原生 publisher（F14）：put / 删除 / **驱逐**都发事件。两个缺口：载荷只有 key+medium、**不含机器位置**——能告诉 router「key 没了」，告诉不了「谁本机有」；默认关 + 编译开关，0.3.11.post1 是否编入未核（E8）。
+- **b. 池侧事件流**：mooncake main 有原生 publisher（F14）：put / 删除 / **驱逐**都发事件。两个缺口：载荷只有 key+medium、**不含机器位置**——能告诉 router「key 没了」，告诉不了「谁本机有」；**0.3.11.post1 不含此机制（E8 已核），要用须升级 mooncake 版本**。
 - **c. router 直读 master**：要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件——脱离经典事件驱动架构，已排除。
 
-a 与 b 互补：a 给放置归属（「B 有了」），b 给删除面（「key 没了」，含驱逐）——a 单独留下的陈旧问题正好由 b 补上。b 可用则组合完备；b 不可用则 a + router 侧条目过期兜底。
+a 与 b 互补：a 给放置归属（「B 有了」），b 给删除面（「key 没了」，含驱逐）——a 单独留下的陈旧问题正好由 b 补上。0.3.11 不含 b（F14）→ 当前版本下现实解是 a + router 侧条目过期兜底；b 作升级 mooncake 后的增强项保留。
 
 陈旧：引擎事件通道上池侧无 Removed（F10）→ 池副本条目只增不减；副本被驱逐 / 属主连坐删除（F5）router 收不到通知。GPU 侧条目有 Removed（F8-1），能正常过期。选错不致命：请求打到实例后 get miss，引擎自动远端读 / 重算（F3），只损性能不损正确性。
 
-倾向（待讨论）：a 为主；b 若 0.3.11 编入则补删除面（E8 先核 wheel）。
+倾向（待讨论）：a + router 条目过期；b 留作升级增强。
 
 ### 3. 「哪个实例拥有前缀」怎么定义
 
