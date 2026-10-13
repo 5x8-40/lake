@@ -48,7 +48,7 @@ jobs:
           if echo "$files" | grep -qE '^tools/cmx-sim/'; then
             cmx=true
           fi
-          if echo "$files" | grep -qE '^va-precopy/|^\.github/workflows/build\.yml'; then
+          if echo "$files" | grep -qE '^kvcm/|^\.github/workflows/build\.yml'; then
             precopy=true
           fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
@@ -67,15 +67,15 @@ jobs:
           python-version: "3.12"
       - run: python scripts/check_doc_links.py
 
-  # va-precopy 冒烟(PR #53 review §四.B):无 NPU 依赖的离线检查——语法/编译/单测/干跑三向。
+  # kvcm 冒烟(PR #53 review §四.B):无 NPU 依赖的离线检查——语法/编译/单测/干跑三向。
   # 补丁对 rc1 源码的应用检查与上游逐字节比对需容器源码,留在本地,此处只做可解析性。
-  va-precopy:
+  kvcm:
     needs: filter
     if: needs.filter.outputs.precopy == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: va-precopy
+        working-directory: kvcm
     steps:
       - uses: actions/checkout@v4
         with:

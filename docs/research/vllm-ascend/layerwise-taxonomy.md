@@ -48,7 +48,7 @@ sequenceDiagram
 
 ## ② 池 layerwise（block_key）：`AscendStoreConnector` + Mooncake Store
 
-**D003 预取方案的目标路径。** 池是中介，P↔D 无直连；PD 场景 = P 逐层写池 + D 逐层读池：
+**KV 预取方案的目标路径。** 池是中介，P↔D 无直连；PD 场景 = P 逐层写池 + D 逐层读池：
 
 ```mermaid
 flowchart LR
@@ -89,7 +89,7 @@ sequenceDiagram
 - HBM 全层驻留：`extract_layout_config` 返回 None（`mooncake_layerwise.py:77-80`，docstring 原文 "Block-key transfer does not opt into GVA-backed physical reuse"）→ worker 不建共享 buffer（`worker.py:635-636`）
 - 读落点 = 请求自己的 block：`pool_worker.py:2263`（`request.block_ids[block_index]`）
 - 本地 APC 命中的块不重读：`start_block = vllm_cached_tokens // block_size`（`pool_worker.py:2229`；hybrid 路径 `mooncake_layerwise.py:345`）
-- → **HBM 预热成立**（见 [D003-kv-prefetch.md](../../../va-precopy/D003-kv-prefetch.md) 方案 A）
+- → **HBM 预热成立**（见 [kv-prefetch.md](../../../kvcm/kv-prefetch.md) 方案 A）
 
 ## ③ 池 layerwise（gva 层复用）：`AscendStoreConnector` + Memcache
 
@@ -119,7 +119,7 @@ flowchart LR
 - 官方设计文档 §8「`MooncakeLayerwiseConnector` 不提供逐缓冲区传输完成门」的含义：①（P2P 直推）只负责把层推给 D，没有按 buffer 回报「内容已被消费、可以覆盖」的同步机制，所以层复用挂不上它
 - APC「命中」的块不真持有 KV → `layerwise_offload=True` 强制整前缀从池重读（`pool_worker.py:1795`；赋值点 L585/L601，门控 `use_layerwise_transfer` L224）
 - 官方设计文档 §8：逐层共享缓冲区卸载**需要 Memcache 后端**和 eager 模式
-- → 这条路径上 **HBM 预热不成立**，只能暖本机 DRAM（D003 方案 B2）
+- → 这条路径上 **HBM 预热不成立**，只能暖本机 DRAM（KV 预取方案 B2）
 
 ## ② 的逐层流水线 vs 异步整体加载
 
@@ -142,8 +142,8 @@ flowchart LR
 - vllm-ascend 对 layerwise **强制** `load_async=false`（`pool_scheduler.py:747`）——layerwise 模式下该形态不可用，这是它的真实短板
 - 因此是部署时的模式选择：追 TTFT、前缀长、网络好 → layerwise；保吞吐、求稳、网络不可控 → 非 layerwise + `load_async=true`
 
-对 D003 预取的含义：壳请求在 layerwise 下同步占槽，批量预热会与真实流量竞争——这正是方案 B2（带外复制、零引擎侵入）的成本优势场景；若部署形态主要为预取服务，非 layerwise + `load_async=true` 是更干净的壳请求路径。
+对 KV 预取的含义：壳请求在 layerwise 下同步占槽，批量预热会与真实流量竞争——这正是方案 B2（带外复制、零引擎侵入）的成本优势场景；若部署形态主要为预取服务，非 layerwise + `load_async=true` 是更干净的壳请求路径。
 
-## 与 D003 的关系
+## 与 KV 预取的关系
 
-一句话：D003 的目标场景是 **②**（`backend=mooncake`）。① 是 PD 直连传输（无池、无「预取进池/进 HBM」概念）；③ 是 Memcache 卸载（HBM 减量，预取只能到本机 DRAM）。讨论「layerwise」时先对齐三件套：连接器名、`backend`、`use_layerwise`。
+一句话：KV 预取的目标场景是 **②**（`backend=mooncake`）。① 是 PD 直连传输（无池、无「预取进池/进 HBM」概念）；③ 是 Memcache 卸载（HBM 减量，预取只能到本机 DRAM）。讨论「layerwise」时先对齐三件套：连接器名、`backend`、`use_layerwise`。

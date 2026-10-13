@@ -1,4 +1,4 @@
-# va-precopy
+# KVCM（KV Centric Manager）
 
 在 **vllm-ascend** 上做 Mooncake KV **预复制（pre-copy）**：真实请求打到目标实例之前，用 Mooncake `create_copy_task` 把已有前缀 KV 复制到该实例的本机 DRAM segment，让读路径 local-first，避免跨机拉 KV。引擎不参与复制；不引入额外控制面框架。
 
@@ -44,7 +44,7 @@
 ### A. 无 NPU：看计划 / 跑 store 半程
 
 ```bash
-cd va-precopy
+cd kvcm
 
 DRY_RUN=1 bash run_e2e.sh
 
@@ -61,7 +61,7 @@ PROTOCOL=ascend SOURCE_DEVICE=4 TARGET_DEVICE=5 COORD_DEVICE=6 \
 在 **vllm-ascend** 容器内：
 
 ```bash
-cd va-precopy
+cd kvcm
 
 # 显式指定主机 IP + 业务网卡（官方 A2 要求；也可让 env_ascend_a2.sh 猜测）
 export LOCAL_IP=7.242.105.245
@@ -104,7 +104,7 @@ ROLE=B PORT=8002 LOOKUP_ID=1 ASCEND_RT_VISIBLE_DEVICES=1 TP=1 \
 python3 - <<'PY' | curl -s http://127.0.0.1:8001/v1/completions \
   -H 'Content-Type: application/json' -d @-
 import json
-prefix = "va-precopy shared prefix for store warmup. " * 80
+prefix = "kvcm shared prefix for store warmup. " * 80
 print(json.dumps({"model":"qwen","prompt":prefix,"max_tokens":1,"temperature":0}))
 PY
 
@@ -115,7 +115,7 @@ python3 precopy/precopy.py \
   --role B --tp-size "${TP:-1}" \
   --model /data/models/Qwen3-VL-8B-w8a8c16 \
   --model-name Qwen3-VL-8B-w8a8c16 \
-  --prefix "va-precopy shared prefix for store warmup. " \
+  --prefix "kvcm shared prefix for store warmup. " \
   --prefix-repeat 80 \
   --dump-keys prefix_keys.txt \
   --dry-show-before
@@ -131,7 +131,7 @@ master 在源机 `0.0.0.0:50088`；B 机 worker 配 `MC_MASTER=A_IP:50088`、`LO
 # 机 A：master + worker-A；机 B：worker-B
 python3 precopy/precopy.py --master A_IP:50088 --protocol ascend \
   --role B --tp-size 4 \
-  --ssh 'ssh root@B_IP' --pidfile /root/va-precopy/logs/worker_B.pid \
+  --ssh 'ssh root@B_IP' --pidfile /root/kvcm/logs/worker_B.pid \
   --model ... --model-name ... --block-size 1536 \
   --prefix-repeat 80 --dry-show-before
 # 再打 B:8002；看 external_prefix_cache_*
@@ -195,7 +195,7 @@ sequenceDiagram
     participant G as gateway/router
     participant A as Worker A（源，N rank）
     participant M as mooncake_master<br/>key→副本→seg 权威 + admin :9003
-    participant CP as 控制面（va-precopy 原型）
+    participant CP as 控制面（KVCM 原型）
     participant B as Worker B（目标，N rank）
 
     Note over G,M: 阶段 1 · 暖场：前缀 KV 进池（普通请求路径）
@@ -323,7 +323,7 @@ flowchart LR
 控制面 = `precopy/` 一个 Python 包（keys/resolve/common 三个能力模块）+ `precopy.py` 编排；`cluster/` 为集群生命周期脚本；`tools/` 为调试/测试。历史章节裸文件名映射见 [EXPERIMENTS.md](EXPERIMENTS.md)「勘误与演进」。
 
 ```text
-va-precopy/
+kvcm/
 ├── run_e2e.sh            # 一键入口：双 worker 编排 + 自动 warm/precopy/hit B
 ├── precopy/              # 产品控制面（Python 包，三个能力 + 编排）
 │   ├── precopy.py        #   单入口：warm prompt → resolve segs → 算 key → 核对 → copy → READY
@@ -344,7 +344,7 @@ va-precopy/
 ├── logs/                 # pidfile / 日志（gitignore）
 ├── patch_tp_mismatch_worker.patch  # 异构 TP 必打（#15835 rc1 backport）
 ├── README.md / REPRODUCE.md / EXPERIMENTS.md
-├── D003-kv-prefetch.md      # 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测）
+├── kv-prefetch.md           # 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测）
 └── D1-router-scheduling.md  # 生产化设计 D1：Router 集成与请求调度
 ```
 
@@ -353,7 +353,7 @@ va-precopy/
 | `README.md` | 本文：端到端说明 |
 | `REPRODUCE.md` | 客户复现参考：结论 + 必配项 + 「读本机副本」判定方法 |
 | `EXPERIMENTS.md` | 实验总表 14 条 + 异构实录 + 踩坑记录（含撤回历史） |
-| `D003-kv-prefetch.md` | 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测） |
+| `kv-prefetch.md` | 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测） |
 | `D1-router-scheduling.md` | 生产化设计 D1：Router 集成与请求调度 |
 
 ## 操作参考

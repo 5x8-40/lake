@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end va-precopy on vllm-ascend + Mooncake (validated: 同构 TP=1/2、异构双向、跨机；A2 RoCE).
+# End-to-end KVCM on vllm-ascend + Mooncake (validated: 同构 TP=1/2、异构双向、跨机；A2 RoCE).
 #
 #   DRY_RUN=1 bash run_e2e.sh
 #   LOCAL_IP=... NIC_NAME=... MODEL=... bash run_e2e.sh
@@ -30,7 +30,7 @@ MAX_MODEL_LEN=${MAX_MODEL_LEN:-4096}
 TARGET_SEGMENTS=${TARGET_SEGMENTS:-}
 RESOLVE_TARGET_IP=${RESOLVE_TARGET_IP:-${LOCAL_IP:-}}
 KEYS_FILE=${KEYS_FILE:-$SCRIPT_DIR/prefix_keys.txt}
-PREFIX=${PREFIX:-"va-precopy shared prefix for store warmup. "}
+PREFIX=${PREFIX:-"kvcm shared prefix for store warmup. "}
 PREFIX_REPEAT=${PREFIX_REPEAT:-80}
 BLOCK_SIZE=${BLOCK_SIZE:-128}
 PUT_STEP=${PUT_STEP:-1}

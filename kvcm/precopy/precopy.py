@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""va-precopy control plane against a live Mooncake + vllm-ascend cluster.
+"""KVCM control plane against a live Mooncake + vllm-ascend cluster.
 
 Workers already contribute segments via AscendStoreConnector. This process
 does NOT put KV; it only:
@@ -102,7 +102,7 @@ def _parse_targets(args: argparse.Namespace, master: str) -> list[str]:
 
 
 def main() -> int:
-    p = argparse.ArgumentParser(description="va-precopy: Mooncake create_copy_task")
+    p = argparse.ArgumentParser(description="kvcm: Mooncake create_copy_task")
     p.add_argument(
         "--master",
         default=os.environ.get("MC_MASTER_ADDRESS", "127.0.0.1:50088"),
@@ -265,7 +265,7 @@ def main() -> int:
         or ""
     )
     coord = args.coord_hostname or (
-        f"{local_ip}:13021" if local_ip else "va-precopy:0"
+        f"{local_ip}:13021" if local_ip else "kvcm:0"
     )
 
     print(f"[precopy] master={master} protocol={args.protocol}")

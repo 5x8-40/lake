@@ -1,4 +1,4 @@
-"""Mooncake create_copy_task helpers for va-precopy.
+"""Mooncake create_copy_task helpers for KVCM.
 
 The vLLM engine does not participate: copy is a store-client background
 transfer coordinated by mooncake_master.
@@ -137,5 +137,5 @@ def assert_targets_have_replicas(
             if t not in have:
                 missing.append(f"{key} missing on {t} (have={sorted(have)})")
     if missing:
-        raise AssertionError("va-precopy verify failed:\n  " + "\n  ".join(missing))
+        raise AssertionError("kvcm verify failed:\n  " + "\n  ".join(missing))
     return placement

@@ -28,7 +28,7 @@ on the target host — no remote checkout path is assumed.
 Usage:
   python3 resolve.py --role B --tp 4                      # standalone debug
   python3 resolve.py --role B --tp 4 --ssh 'ssh root@B' \
-      --pidfile /root/va-precopy/logs/worker_B.pid        # cross-machine
+      --pidfile /root/kvcm/logs/worker_B.pid        # cross-machine
   python3 resolve.py --local-probe logs/worker_B.pid      # probe only (ssh target)
 """
 

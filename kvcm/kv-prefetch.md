@@ -1,4 +1,4 @@
-# D003: KV 预取——预取请求 + 显式副本复制
+# KV 预取——预取请求 + 显式副本复制
 
 - 日期: 2026-09-28
 - 状态: B2 已实测（本目录测试床，见 [README.md](README.md)「验证状态」与 [EXPERIMENTS.md](EXPERIMENTS.md)）；生产化选路设计见 [D1-router-scheduling.md](D1-router-scheduling.md)
