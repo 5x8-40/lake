@@ -449,7 +449,7 @@ kvcm/
 
 待定：独立 **Prefetch Orchestrator**（旁路进程或并入 Router）：收 intent → 调 B2 → READY 栅栏 → gateway/router 放行。过载/准入仍归 gateway；引擎不参与策略。
 
-选路侧设计见 [D1-router-scheduling.md](D1-router-scheduling.md)（占位，下个 PR 起写）；编排进程形态（D4）仍待定。
+选路侧设计见 [D1-router-scheduling.md](D1-router-scheduling.md)；编排进程形态（D4）仍待定。
 
 ### 3. 落盘（SSD / disk）
 
