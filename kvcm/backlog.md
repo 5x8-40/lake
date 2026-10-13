@@ -10,8 +10,8 @@
 
 **D1. Router 集成与请求调度** — ✅ 已定稿（2026-10-13）
 
-- 六问已决：选路输入三表、可见性 = 直读 master + Router 只读镜像、事件身份三种不混、预测式时序、目标函数、release 归池 hint 单向。全文：[D1-router-scheduling.md](D1-router-scheduling.md)。
-- 复制幂等性已坐实：重发 copy 不产生同 seg 重复副本（F11-F13，CopyStart 三层防护）。
+- 设计全文：[D1-router-scheduling.md](D1-router-scheduling.md)——选路输入三表、可见性 = 直读 master + Router 只读镜像、事件身份三种不混、预测式时序、目标函数、release 归池 hint 单向。
+- 复制幂等性：重发 copy 不产生同 seg 重复副本（D1 F11-F13，CopyStart 三层防护）。
 - 剩余为工程实现：E11-E14。
 
 **D2. KV 调度操作集（pin / demote / prefetch / retain / release）**
@@ -58,7 +58,7 @@
 ## 二、潜在问题
 
 - **P1. KV 与模型版本绑定**——vLLM block hash 不含权重 revision，权重更新后旧 KV 会误命中且输出静默错误。key 命名空间必须含 model_id/revision。随 D1 key 表定型一并回答。
-- **P2. 并发预热去重**——🟡 池层幂等已坐实（D1 F11-F13：重发不产生重复副本，在途报 `OBJECT_HAS_REPLICATION_TASK`）；仍待做：控制面（前缀 × 目标实例）幂等键合并，避免多请求/多 router 实例并发触发时重复占带宽。
+- **P2. 并发预热去重**——🟡 池层幂等已核实（D1 F11-F13：重发不产生重复副本，在途报 `OBJECT_HAS_REPLICATION_TASK`）；仍待做：控制面（前缀 × 目标实例）幂等键合并，避免多请求/多 router 实例并发触发时重复占带宽。
 - **P3. 快照语义**——copy 期间源前缀还在增长（在途请求继续产生 block），precopy 是快照，快照点之后的新 block 谁补。
 - **P4. 读与驱逐竞态**——get 选中副本后到读完之间被驱逐的防护（mooncake 侧应有 lease/refcount，语义待确认，与 D2 retain 耦合）。
 - **P5. 多租户与配额**——多模型共池的隔离（mooncake main 有 tenant quota，0.3.11 是否具备待核对 → E6）。
@@ -74,7 +74,7 @@
 - **E2. key 哨兵容器单跑**——`test_keys.py` 在容器内跑通（运行期 `batch_is_exist` 32/32、36/36 证据已齐）。
 - **E3. 多卡自动匹配验证**——resolve 的 `VLLM::Worker_TP<N>` proctitle 匹配在多卡真机走通（现为 `--targets` + 手工对号；失效时明确报错而非静默错配）。
 - **E4. 1-token 翻转根因**——旧非 DEBUG 实例偶发，新实例未复现；首次外部读输出逐字一致，疑路径交替数值扰动。生产化前必须查清（[EXPERIMENTS.md](EXPERIMENTS.md) #10）。
-- **E5. 副本消失机制坐实**——属主下线后 key+副本移除的时机与条件（TTL、GC 扫描窗口）对照实验 → D3 事实输入。
+- **E5. 副本消失机制核实**——属主下线后 key+副本移除的时机与条件（TTL、GC 扫描窗口）对照实验 → D3 事实输入。
 - **E6. 0.3.11 API 子集核对**——D2 引用的 lease/offload/promotion 是 mooncake main 的符号，测试床 wheel 是 0.3.11.post1，逐个核对可用子集，缺的即池侧扩展工作量 → D2/P5 输入。
 - **E7. MLA 实测**——`put_step>1` 时 plan 全落 `targets[0]`、其余 rank 读远端，功能推断正确未实测；hybrid/sparse 被上游 gate 排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——🟡 不再阻塞 D1（已选定路径 c 直读 master，路径 b 池事件流弃用）；publisher 载荷字段、是否含副本/seg 位置、0.3.11 是否带 `enable_kv_events`，仅在重新启用池事件时需要。
