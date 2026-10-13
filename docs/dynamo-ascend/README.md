@@ -23,4 +23,4 @@
   - [pd-mooncake.md](pd-mooncake.md) — PD / Store / 卸载 / KV router / 跨机
   - 脚本：[`../../scripts/dynamo-ascend/`](../../scripts/dynamo-ascend/)
 
-> KV 预取（原 D003）与三个「layerwise」辨析不属于本计划，已移至 [`../../va-precopy/`](../../va-precopy/)（vllm-ascend + Mooncake 预复制测试床）。
+> KV 预取（原 D003）不属于本计划，已移至 [`../../va-precopy/`](../../va-precopy/)；三个「layerwise」辨析是一般知识文档，已移至 [`../research/vllm-ascend/layerwise-taxonomy.md`](../research/vllm-ascend/layerwise-taxonomy.md)。

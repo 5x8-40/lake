@@ -345,7 +345,6 @@ va-precopy/
 ├── patch_tp_mismatch_worker.patch  # 异构 TP 必打（#15835 rc1 backport）
 ├── README.md / REPRODUCE.md / EXPERIMENTS.md
 ├── D003-kv-prefetch.md      # 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测）
-├── layerwise-taxonomy.md    # 三个「layerwise」辨析（PD P2P / 池 block_key / 池 gva）
 └── D1-router-scheduling.md  # 生产化设计 D1：Router 集成与请求调度
 ```
 
@@ -355,7 +354,6 @@ va-precopy/
 | `REPRODUCE.md` | 客户复现参考：结论 + 必配项 + 「读本机副本」判定方法 |
 | `EXPERIMENTS.md` | 实验总表 14 条 + 异构实录 + 踩坑记录（含撤回历史） |
 | `D003-kv-prefetch.md` | 预取方案设计（自 dynamo-ascend decisions 移入，非 dynamo-ascend 文档） |
-| `layerwise-taxonomy.md` | 三个「layerwise」辨析（同上移入） |
 | `D1-router-scheduling.md` | 生产化设计 D1：Router 集成与请求调度 |
 
 ## 操作参考
@@ -443,7 +441,7 @@ va-precopy/
 | Mooncake block_key | `backend=mooncake` + `use_layerwise=true` | 逐层 range 读；HBM 仍全层；壳请求同步占槽 |
 | MemCache gva | `backend=memcache` + `use_layerwise=true` | HBM 可减量；预热落点更偏本机 DRAM |
 
-待定：生产默认走 MemCache，还是留 Mooncake 并补测 layerwise + B2（get session 是否仍选本机 DRAM）。不建议自研 Mooncake GVA。三个「layerwise」机制的完整辨析见 [layerwise-taxonomy.md](layerwise-taxonomy.md)。
+待定：生产默认走 MemCache，还是留 Mooncake 并补测 layerwise + B2（get session 是否仍选本机 DRAM）。不建议自研 Mooncake GVA。三个「layerwise」机制的完整辨析见 [../docs/research/vllm-ascend/layerwise-taxonomy.md](../docs/research/vllm-ascend/layerwise-taxonomy.md)。
 
 ### 2. 上层编排（现只有底层）
 
