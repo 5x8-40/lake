@@ -432,6 +432,6 @@ kvcm/
 
 ## 开放问题（待讨论）
 
-底层 B2 已实测；开放问题统一登记在 [backlog.md](backlog.md)：设计决策 D1-D7（D1 讨论中，事实基线已核实：[D1-router-scheduling.md](D1-router-scheduling.md)）、潜在问题 P1-P8、工程项 E1-E16，含状态与依赖关系。
+底层 B2 已实测；开放问题统一登记在 [backlog.md](backlog.md)：设计决策 D1-D7（D1 已闭环：[D1-router-scheduling.md](D1-router-scheduling.md)）、潜在问题 P1-P8、工程项 E1-E16，含状态与依赖关系。
 
 

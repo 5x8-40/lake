@@ -11,7 +11,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 | 参考 | 锚点 | 借什么 | 关键差异 |
 |------|------|--------|----------|
 | lake 选路面 | `../go/router/modeselect.go::SelectExecMode` + `prefixHint`；[`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「权威、镜像与本地 overlay」 | 反向陈旧不查（只损性能）、miss 回退权威的经验 | lake router 是池感知组件（持位置视图镜像）；kvcm router 走经典事件驱动，不碰池位置 |
-| lake 命中定义 | [`../docs/features/features.md`](../docs/features/features.md)「Pool 命中 vs 本地命中」 | 术语：Pool 命中（省重算需传输）≠ 本地命中（省传输） | lake 本地命中指 L0/HBM 池放置；kvcm 场景选路方可观测的是本机 DRAM 副本（F6） |
+| lake 命中定义 | [`../docs/features/features.md`](../docs/features/features.md)「Pool 命中 vs 本地命中」 | 术语：Pool 命中（省重算需传输）≠ 本地命中（省传输） | lake 本地命中指 L0/HBM 池放置；kvcm 的「本机」含 HBM 与本机 DRAM 两层，经 gpu/cpu 事件均可观测（§3） |
 | lake 单向边界 | [`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「池放置·调度读视图」 | 调度读视图、不反向指挥放置的边界形态 | lake 的池有自主放置能力；Mooncake 池没有，放置智能只能在外置控制面 |
 | llm-d Router | [`../docs/research/llm-d/overview.md`](../docs/research/llm-d/overview.md)「核心结论」；[`../docs/research/llm-d/architecture.md`](../docs/research/llm-d/architecture.md) §4 | 推测索引（TTL 2s）是派生索引系统补决策-确认窗口的手法 | llm-d 索引是事件流派生的副本视图（引擎才是真相）；master 直读没有该窗口 |
 | Dynamo router | [`../docs/research/dynamo/overview.md`](../docs/research/dynamo/overview.md)「Router(KV-aware)」 | 成本模型（分层命中×权重 + decode 占用 + 在途请求）；分层计价 device 1.0 / host 0.75 / disk 0.25；在途负载无权威、router 本地记账 | Dynamo 缓存状态权威在 worker 本地索引，router 靠事件逼近（丢事件需 gap→快照重放）；直读 master 无此失效模式。外部重算 block hash 链 Dynamo 已为先例（keys.py 同款） |
@@ -27,9 +27,9 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F2 key = 满块 × rank 切片**：每个满块 × 每个 rank 的切片 = 一把 key，尾带 `head_or_tp_rank`；801 token 前缀 × TP=2 → 12 把 key（README「三个对象」）。
 - **F3 副本选择 local-first**：非 layerwise 读时 `SelectBestReplica` 本机内存副本优先（`replica_selection.h:122`）；layerwise get session 建立时 `SelectCompleteMemoryReplica` 选一次副本（`real_client.cpp:471`），且 session 要求恰好一个副本（`:6470` 附近，`replicas.size() != 1 → INVALID_REPLICA`）→ 复制必须先于 session 完成，错过只影响当前请求（[kv-prefetch.md](kv-prefetch.md) 时序节）。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源属主客户端必须在线；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
-- **F5 副本无 pin**：READY 后受池驱逐策略管理；属主实例下线，key 连同远端副本被 master 移除（实测观察，机制与时机待确认 → E5；记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
+- **F5 副本无 pin**：复制路径不加 pin / lease（F15）→ READY 后受池驱逐策略管理；属主实例下线，key 连同远端副本被 master 移除（实测观察，机制与时机待确认 → E5；记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。注：mooncake main 有 soft pin 机制（挂 `ReplicateConfig`），属 D2 pin 候选（见 [backlog.md](backlog.md) D2），与本条「预复制副本默认无保护」不矛盾。
 - **F6 引擎 APC 私有**：HBM 侧前缀缓存是引擎私有 LRU——无 pin、无池元数据、外部不可见（kv-prefetch.md 方案 A 注意节）。
-- **F15 lease 是 key 粒度：读续租、复制不续租、删 key 释放全部副本**：lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本无独立 TTL。读路径续租（`GrantReadLease(default_kv_lease_ttl_)`：`GetReplicaList:3299` / `BatchQuery:4337` / `:4566`）；`CopyStart` 不触碰 lease（`:6444` 起）。TTL 到期 / 驱逐一律走 `EraseMetadata`——删 key 元数据并释放**全部**副本（`:2308-2313` 注释、`:2374-2375`；驱逐候选必须 lease 过期，`:8117` / `:8299` / `:12434`）。续租 API：`ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`，`:3271` / `:3307`），`ProbeKey` / `BatchProbeKey` 不续租（`:3276` / `:3312`）；默认 `default_kv_lease_ttl=10s`（`types.h:84`，部署以 master 配置为准）。推论一：「原副本 TTL 到、复制的副本没到」的状态不存在；removed 是 key 全局事件，无需位置。推论二：预复制不续租，READY 后一个 TTL 窗口内无流量即进入可驱逐状态——控制面需有界保活（周期 `batch_is_exist`，kvcm 现成调用；无限续租 = 变相 pin，违背 F5），保活策略归 D3。
+- **F15 lease 是 key 粒度：读续租、复制不续租、删 key 释放全部副本**：lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本无独立 TTL。读路径续租（`GrantReadLease(default_kv_lease_ttl_)`：`ExistKeyImpl:3299` / `GetReplicaList:4401` / `BatchGetReplicaList:4566`）；`CopyStart` 不触碰 lease（`:6444` 起）。TTL 到期 / 驱逐一律走 `EraseMetadata`——删 key 元数据并释放**全部**副本（`:2308-2313` 注释、`:2374-2375`；驱逐候选必须 lease 过期，`:8117` / `:8299` / `:12434`）。续租 API：`ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`，`:3271` / `:3307`），`ProbeKey` / `BatchProbeKey` 不续租（`:3276` / `:3312`）；默认 `default_kv_lease_ttl=10s`（`types.h:84`，部署以 master 配置为准）。推论一：「原副本 TTL 到、复制的副本没到」的状态不存在；removed 是 key 全局事件，无需位置。推论二：预复制不续租，READY 后一个 TTL 窗口内无流量即进入可驱逐状态——控制面需有界保活（周期 `batch_is_exist`，kvcm 现成调用；无限续租 = 变相 pin，违背 F5），保活策略归 D3。
 
 **引擎 kv event**
 
@@ -107,7 +107,7 @@ flowchart TB
 
 事实约束：引擎 kv event 只覆盖引擎自己的 put（F8），载荷是引擎 block hash + token ids + medium（F7），不含池位置（seg/副本）。池位置是控制面平面的事（keys.py 算 PoolKey、master 记副本），不进 router。
 
-待定：事件门控与通道（`enable_kv_cache_events`，F8）在部署形态下怎么接 → 归 D4。
+留待 D4：事件门控与通道（`enable_kv_cache_events`，F8）在部署形态下怎么接。
 
 ### 2. 可见性：router 的索引怎么知道预复制放置
 
@@ -200,7 +200,7 @@ flowchart TB
 
 - **D2**：KV 调度操作集（pin/demote/prefetch/retain/release；master 无显式 pin → `SubmitReplicaActionProposal` lease 机制；释放有 `Remove`/`BatchRemove` 现成）
 - **D3**：副本生命周期与 READY 语义（F5 连坐移除、TTL、属主下线后的副本归属）
-- **D4**：编排进程形态（预复制控制面独立进程或并入选路方；READY 栅栏接 gateway；seg→实例注册通道；若最终部署的 router 框架消费引擎 kv event，预复制视图需带外注入，见 §2）
+- **D4**：编排进程形态（预复制控制面独立进程或并入选路方；READY 栅栏接 gateway；seg→实例与「端点→实例」注册通道；预复制视图由控制面补发事件注入，§2）
 - **D5**：故障衔接（源属主掉线 copy 失败（F4）、与重路由的先后）
 - **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../docs/research/vllm-ascend/layerwise-taxonomy.md)）
 - **D7**：方案 A（壳请求进 HBM）去留与叠加顺序

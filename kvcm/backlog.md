@@ -33,7 +33,7 @@
 - pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无显式 pin API——靠 lease 机制（`SubmitReplicaActionProposal` → `ReplicaActionLease`）或池侧扩展。main 另有 **soft pin**（默认 30min / 上限 24h，`types.h:86-89`），挂在 `ReplicateConfig` 路径（put/replicate 时指定，非「给已有 key 加 pin」的独立 API），`allow_evict_soft_pinned_objects` 默认 true = 软保护。lake 文档有同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）可参考。
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
 - demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（以 disk 为 READY 会吃掉预热收益）。
-- release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策见 D1 第 6 问（讨论中）。
+- release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 出 hint，控制面决策，池兜底）。
 - 事实输入：E6。
 
 **D3. 副本生命周期与 READY 语义**
@@ -72,10 +72,10 @@
 - **P1. KV 与模型版本绑定**——vLLM block hash 不含权重 revision，权重更新后旧 KV 会误命中且输出静默错误。key 命名空间必须含 model_id/revision。随 D1 key 表定型一并回答。
 - **P2. 并发预热去重**——🟡 池层幂等已核实（D1 F11-F13：重发不产生重复副本，在途报 `OBJECT_HAS_REPLICATION_TASK`）；仍待做：控制面（前缀 × 目标实例）幂等键合并，避免多请求/多 router 实例并发触发时重复占带宽。
 - **P3. 快照语义**——copy 期间源前缀还在增长（在途请求继续产生 block），precopy 是快照，快照点之后的新 block 谁补。
-- **P4. 读与驱逐竞态**——get 选中副本后到读完之间被驱逐的防护（mooncake 侧应有 lease/refcount，语义待确认，与 D2 retain 耦合）。
+- **P4. 读与驱逐竞态**——🟡 部分已由 D1 F15 回答：读路径（`BatchGetReplicaList:4566` / `GetReplicaList:4401`）即授 lease（默认 10s），查询到读完的窗口受 lease 保护（驱逐候选必须 lease 过期）；副本级 refcount 与长读请求的语义仍待确认（与 D2 retain 耦合）。
 - **P5. 多租户与配额**——多模型共池的隔离（mooncake main 有 tenant quota，0.3.11 是否具备待核对 → E6）。
 - **P6. 鉴权边界**——现状能连 master 就能 `create_copy_task`/`Remove`。生产需要接入控制；控制面权限应大于引擎（引擎只需读写自己 seg）。
-- **P7. 预热成本核算**——预热后请求没来或去了别实例的浪费；READY 延迟（带宽×块数）vs 请求到达时间的窗口预测。与 D1 第 4/5 问耦合（讨论中）。
+- **P7. 预热成本核算**——预热后请求没来或去了别实例的浪费；READY 延迟（带宽×块数）vs 请求到达时间的窗口预测。与 D1 §4/§5 耦合（已闭环，口径见 D1）。
 - **P8. 指标归因**——命中率要拆「预热贡献 vs 引擎内部 HBM cache」。测试床已遇到第二次命中被内部 cache 接住（外部 get=0），生产监控同样会混淆。
 
 ## 三、工程项
@@ -111,4 +111,4 @@
 - llm-d EPP 推测索引（TTL 2s 补窗手法）：[../docs/research/llm-d/](../docs/research/llm-d/)
 - AIBrix ZMQ 事件同步：[../docs/research/aibrix/](../docs/research/aibrix/)
 - mooncake master API（submodule 源码，符号锚点）：`master_service.h`（`CreateCopyTask` / `SubmitReplicaActionProposal` / `Remove` / `BatchEvict`）、`master_config.h`（`enable_kv_events` 开关，E8）、`master_service.cpp`（`CopyStart:6444` 幂等三层防护；`CreateCopyTask:13677` 提交层无去重；reaper `10654` 附近）
-- 关键差异：现有系统的事件都是单源（引擎侧或池侧），我们是双源（引擎事件 + 池放置事实），权威归属与合并规则要自己定（D1 待定问题 §2/§3）。
+- 关键差异：现有系统的事件都是单源（引擎侧或池侧），我们是双源（引擎事件 + 池放置事实），权威归属与合并规则要自己定（D1 §2/§3）。
