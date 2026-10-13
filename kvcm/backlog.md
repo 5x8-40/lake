@@ -23,7 +23,7 @@
 5. **选路目标函数**——命中率 / 实例负载 / 传输成本的权衡；多实例选一。
 6. **release 归谁**——释放决策是 router / 控制面 / 池策略。
 
-已知现状：vllm-ascend 0.26 无 Removed 事件（F10）→ 事件索引只增不减，陈旧只损性能（F3）。选路方进程形态与 D4 耦合；工程实现 E11-E14 依赖设计定型，E10/E11 骨架可先行。
+已知现状：池侧无 Removed 事件（F10）→ 索引中池副本条目只增不减，陈旧只损性能（F3）；GPU 侧有 Removed（F8）。选路方进程形态与 D4 耦合；工程实现 E11-E14 依赖设计定型，E10/E11 骨架可先行。
 
 **D2. KV 调度操作集（pin / demote / prefetch / retain / release）**
 
@@ -89,7 +89,7 @@
 - **E6. 0.3.11 API 子集核对**——D2 引用的 lease/offload/promotion 是 mooncake main 的符号，测试床 wheel 是 0.3.11.post1，逐个核对可用子集，缺的即池侧扩展工作量 → D2/P5 输入。
 - **E7. MLA 实测**——`put_step>1` 时 plan 全落 `targets[0]`、其余 rank 读远端，功能推断正确未实测；hybrid/sparse 被上游 gate 排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——🟡 不再阻塞 D1（倾向路径 a 控制面补发事件，路径 b 池事件流未选用）；publisher 存在性佐证：`master_config.h:220` 有 `enable_kv_events` 开关；载荷字段、是否含副本/seg 位置、0.3.11 是否带，仅在重新启用池事件时需要核对。
-- **E9. vLLM 事件载荷核对**——✅ 已闭环（结论落 D1 事实基线 F7-F10）：`BlockStored` 含 `medium` 字段；引擎自己 put 成功才发（`medium="cpu"`）；预复制绕引擎结构性无事件；vllm-ascend 0.26 全仓零 `BlockRemoved`。
+- **E9. vLLM 事件载荷核对**——✅ 已闭环（结论落 D1 事实基线 F7-F10）：`BlockStored` 含 `medium` 字段；两个发布源——引擎核发 GPU 块事件（含 Removed，上游既有）、连接器发池 put 事件（无 Removed）；预复制绕引擎结构性无事件。
 
 ### B. 服务化重构（骨架可直接开工，接口依赖设计）
 

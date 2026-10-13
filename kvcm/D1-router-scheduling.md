@@ -19,7 +19,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 ## 事实基线（代码核实）
 
-以下事实已核实，作为讨论输入。Mooncake 锚点 @ `1fc27b62`（submodule）；vllm-ascend 锚点 @ 0.26（rc1）。
+以下事实已核实，作为讨论输入。Mooncake 锚点 @ `1fc27b62`（submodule）；vllm-ascend 锚点 @ 0.26（rc1）；上游 vLLM 锚点 @ submodule `027b6f3a2`。
 
 **池与副本**
 
@@ -33,9 +33,11 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 **引擎 kv event**
 
 - **F7 事件 schema 带介质字段**：`MEDIUM_GPU` / `MEDIUM_CPU`（上游 `vllm/distributed/kv_events.py:51-52`）；`BlockStored{block_hashes, parent_block_hash, token_ids, block_size, medium}`（`:56-68`）。
-- **F8 引擎 put 成功才发事件**：AscendStoreConnector 的 worker 侧在引擎自己 put 成功后生成 `BlockStored(medium="cpu")`（`kv_transfer.py:1162`、`pool_worker.py:3111`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py:213`）；门控 `enable_kv_cache_events`（`pool_scheduler.py:108`）。
-- **F9 盲区一：预复制无事件**：事件只在连接器 worker 代码路径生成（F8）；`create_copy_task` 不经任何引擎代码 → 预复制副本**结构上无事件**，任何引擎事件消费者都看不到。
-- **F10 盲区二：无 Removed**：vllm-ascend 0.26 全仓零 `BlockRemoved` → 副本消失（驱逐 / TTL / F5 连坐）对事件消费者同样不可见。
+- **F8 事件有两个发布源**：
+  1. **引擎核（GPU/APC 块）**：上游 `BlockPool` 在块进 HBM 缓存时发 `BlockStored(medium="gpu")`、驱逐时发 `BlockRemoved(medium="gpu")`（上游 `vllm/v1/core/block_pool.py:362` / `:548` / `:621`）；vllm-ascend 的 coordinator patch 原样建 `BlockPool` 并透传门控（`patch_kv_cache_coordinator.py:150-154`）。
+  2. **连接器（池 put）**：worker 侧在引擎自己 put 成功后生成 `BlockStored(medium="cpu")`（`kv_transfer.py:1162`、`pool_worker.py:3111`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py:213`）；门控 `enable_kv_cache_events`（`pool_scheduler.py:108`）。池侧无对应 Removed。
+- **F9 盲区一：预复制无事件**：事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码）；`create_copy_task` 不经任何引擎代码 → 预复制副本**结构上无事件**，任何引擎事件消费者都看不到。
+- **F10 盲区二：池侧无 Removed**：vllm-ascend 仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / F5 连坐）对事件消费者不可见。GPU 侧有 Removed（F8-1，上游既有），两层别混淆。
 
 **复制幂等性（重复发 copy 的后果）**
 
@@ -66,7 +68,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **b. 池侧事件流**：依赖 E8 核对（载荷是否含副本位置、0.3.11 是否带）；自研则与「不改池」冲突。
 - **c. router 直读 master**：要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件——脱离经典事件驱动架构，已排除。
 
-陈旧（与选哪条无关的现状）：vllm-ascend 0.26 无任何 Removed 事件（F10）→ 索引只增不减；副本被驱逐 / 属主连坐删除（F5）router 都收不到通知。错了不致命：请求打到实例后 get miss，引擎自动远端读 / 重算（F3），只损性能不损正确性。缓解候选：router 侧索引条目过期，或定期对账（后者又涉及 router 碰 master，随 a 定型后再定）。
+陈旧：池侧无 Removed（F10）→ 索引中池副本条目只增不减；副本被驱逐 / 属主连坐删除（F5）router 都收不到通知。GPU 侧条目有 Removed（F8-1），能正常过期。选错不致命：请求打到实例后 get miss，引擎自动远端读 / 重算（F3），只损性能不损正确性。缓解候选：router 侧索引条目过期，或定期对账（后者又涉及 router 碰 master，随 a 定型后再定）。
 
 倾向（待讨论）：a。
 
