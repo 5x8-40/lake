@@ -1,6 +1,6 @@
 # D1: Router 集成与请求调度（预复制的选路侧）
 
-- 状态: **讨论中**——事实基线（F1-F13）已核实；「待定问题」各节未拍板
+- 状态: **讨论中**——事实基线（F1-F14）已核实；待定问题 §1/§2 已闭环，§3-§6 未拍板
 - 上游问题: [backlog.md](backlog.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
 - 角色约定: kvcm 目前没有 router 组件。本文「选路方 / router」指未来消费引擎 kv event、决定请求发往哪个实例的组件（gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能），进程形态归 D4
 
@@ -100,7 +100,7 @@ flowchart TB
 
 ## 待定问题
 
-### 1. 选路方需要哪些输入
+### 1. 选路方需要哪些输入（已闭环）
 
 经典做法：router 消费引擎 kv event，维护「block hash → 实例」索引；新请求按同一 hash 链算前缀 block hash，查最长匹配（Dynamo/llm-d 同构）。事件由引擎发出，来源实例天然可知，不需要额外的 seg→实例映射表。
 
@@ -108,21 +108,38 @@ flowchart TB
 
 待定：事件门控与通道（`enable_kv_cache_events`，F8）在部署形态下怎么接 → 归 D4。
 
-### 2. 可见性：router 的索引怎么知道预复制放置
+### 2. 可见性：router 的索引怎么知道预复制放置（已闭环）
 
-预复制绕开引擎、不产生引擎事件（F9）→ router 的事件索引永远只知道「前缀在 A」，不知道拷完后「B 也有了」。
+预复制绕开引擎、不产生引擎事件（F9）→ router 的事件索引永远只知道「前缀在 A」，不知道拷完后「B 也有了」。这里有两个问题：**放置**（router 不知道 B 有了）与**删除**（副本没了，router 还当它存在）。
 
-三条候选：
+结论：**放置靠控制面补发事件（方案 a），删除靠升级 mooncake 用池 publisher（方案 b）**；对账与 TTL 不做，直读 master 排除。
 
-- **a. 控制面补发事件**：copy 完成后，控制面按引擎格式补发 `BlockStored`（「B 存了这些 block」）。hash 链控制面已重算（keys.py 的中间产物即引擎 block hash），router 零改动。接线注意：事件体无实例字段（仅 `data_parallel_rank`，上游 `kv_events.py:39`），经典机制按**发布端点**归实例（每引擎一个端点，router 按来源记账）——补发必须以目标实例的身份到达 router（每实例一个发布端点或伴生发布者），实现归 E14。
-- **b. 池侧事件流**：mooncake main 有原生 publisher（F14）：put / 删除 / **驱逐**都发事件。三个缺口：载荷只有 key+medium、**不含机器位置**；**复制路径零发布**——预复制落位不会自动发事件，升级后 a 依然必要；**0.3.11.post1 不含此机制（E8 已核），要用须升级 mooncake 版本**。
-- **c. router 直读 master**：要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件——脱离经典事件驱动架构，已排除。
+候选与裁决：
 
-a 与 b 的分工：a 给放置归属（「B 有了」）——任何版本都只能靠 a（池事件无位置、复制路径零发布，F14）；b 给删除面（「key 没了」，含驱逐）。0.3.11 不含 b（F14）→ 当前版本下删除面靠 **kvcm 轮询对账**（周期拉 master 快照 diff，补发失效信号；kvcm 本就是池感知组件，router 不碰池）或 **router 条目过期**（零新通道，接受陈旧窗口，选错由读路径兜底 F3）；升级 mooncake 后删除面由 b 接管。
+- **a. 控制面补发事件（选定，管放置）**：copy 完成后控制面按引擎格式补发 `BlockStored`，router 零改动。放置归属任何版本都只能靠它（池事件无位置、复制路径零发布，F14）。实现见下方「方案 a 落地」。
+- **b. 池侧事件流（管删除，升级后接管）**：mooncake main 的原生 publisher（F14）对 put / 删除 / **驱逐**都发事件——正是删除面需要的；但载荷只有 key+medium、**不含机器位置**，且**复制路径零发布**，所以它管不了放置。**0.3.11.post1 不含此机制（E8 已核），要用须升级 mooncake 版本**——删除问题随之解决，不另做机制。
+- **c. router 直读 master（排除）**：放置删除都能解决（现查现准），但要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件，脱离经典事件驱动架构，且是全新增机制。
+- **kvcm 轮询对账（不做）**：唯一价值在删除面（周期拉 master 快照 diff 能发现副本没了）；只为删除做一个对账器得不偿失，删除由升级解决。
+- **router 条目 TTL（当前不做）**：纯删除兜底，与预复制放置无关（它不携带「B 有了」的任何信息）；router 侧独立机制，不需要任何新通道。升级前若删除面要兜底可再议。
 
 陈旧：引擎事件通道上池侧无 Removed（F10）→ 池副本条目只增不减；副本被驱逐 / 属主连坐删除（F5）router 收不到通知。GPU 侧条目有 Removed（F8-1），能正常过期。选错不致命：请求打到实例后 get miss，引擎自动远端读 / 重算（F3），只损性能不损正确性。
 
-倾向（待讨论）：a（放置）+ kvcm 对账（删除面）；router 条目过期作简化版；b 留作升级增强。
+**方案 a 落地（复用与身份）**
+
+事件体每个字段都是 keys.py 的现成中间产物，发布类直接 import 上游，新增代码只有一个薄模块（拼事件 + 管理 publisher 实例）：
+
+| 事件字段 | 来源 |
+|----------|------|
+| `block_hashes` | keys.py `_hash_prompt` 的 hash 链（`hash_block_tokens` 逐块结果，转 hex 前的原值） |
+| `parent_block_hash` | 同上，链首块的 parent |
+| `token_ids` | `_hash_prompt` 的 tokenizer 输出 |
+| `block_size` | 参数 |
+| `medium` | 与引擎池 put 事件对齐（F8；上游常量 `MEDIUM_CPU`，`kv_events.py:51`） |
+
+- **发布组件**：直接 import 上游 `ZmqEventPublisher`（`kv_events.py:305`）——构造给 `endpoint`/`topic`，`publish(EventBatch)` 一次调用；wire 格式（topic + seq + msgpack 三帧）与 replay buffer 内置。kvcm 容器路径本就已 import vllm / vllm_ascend（keys.py），零新增依赖；沿用 keys.py/common.py 的 lazy import 形态，debug 路径不背 vllm。
+- **身份（哪台机器）**：事件体无实例字段（仅 `data_parallel_rank`，`kv_events.py:39`），上游机制是**身份 = 端点**——router 按订阅端点把事件归入实例；一个实例多个端点有现成先例（DP rank 端口偏移 `offset_endpoint_port`，`kv_events.py:528`）。因此 kvcm **每个目标实例开一个发布端点**，由编排把「端点 → 实例」注册给 router（与引擎端点同一注册通道，归 D4/E13）；router 把补发端点并入该实例的端点集合，零新概念。topic 只是订阅过滤（默认空），不是身份机制。
+- **发布时机**：READY 核验通过（`precopy.py::assert_targets_have_replicas`）后，一次预复制发一条 `BlockStored`（block_hashes = 前缀连续满块链；引擎侧经 `KVEventAggregator` 跨 rank 聚合后同语义）。
+- **幂等**：router 索引是集合语义，补发与引擎自发重复无害；重复预热重复补发亦无害（池层幂等 F11）。
 
 ### 3. 「哪个实例拥有前缀」怎么定义
 
