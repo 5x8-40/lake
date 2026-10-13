@@ -200,7 +200,7 @@ sequenceDiagram
 
     Note over G,M: 阶段 1 · 暖场：前缀 KV 进池（普通请求路径）
     G->>A: warm 请求（共享前缀）
-    A->>M: rank i put 自己的 KV 分片<br/>key@rank:i 落 A seg_i（preferred_segment 钉住）
+    A->>M: rank i put 自己的 KV 分片<br/>key@rank:i 落 A seg_i（preferred_segment 固定）
 
     Note over CP,B: 阶段 2 · 控制面预复制（B2，引擎不参与）
     CP->>M: GET :9003/get_all_segments（seg 名单）
