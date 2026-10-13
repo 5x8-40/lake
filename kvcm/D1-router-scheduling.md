@@ -2,7 +2,7 @@
 
 - 状态: **讨论中**——事实基线（F1-F13）已核实；「待定问题」各节未拍板
 - 上游问题: [backlog.md](backlog.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
-- 角色约定: kvcm 目前没有 router 组件。本文「选路方」指未来消费位置视图、决定请求发往哪个实例的组件（gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能），进程形态归 D4
+- 角色约定: kvcm 目前没有 router 组件。本文「选路方 / router」指未来消费引擎 kv event、决定请求发往哪个实例的组件（gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能），进程形态归 D4
 
 ## 参考实现
 
@@ -10,7 +10,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 | 参考 | 锚点 | 借什么 | 关键差异 |
 |------|------|--------|----------|
-| lake 选路面 | `../go/router/modeselect.go::SelectExecMode` + `prefixHint`；[`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「权威、镜像与本地 overlay」 | 选路方持位置视图镜像、选路零 RPC 的形态；miss 回退权威；反向陈旧不查（只损性能） | lake 镜像由存储控制面 gRPC stream 推送；kvcm 若走直读 master 路线需自行 reconcile |
+| lake 选路面 | `../go/router/modeselect.go::SelectExecMode` + `prefixHint`；[`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「权威、镜像与本地 overlay」 | 反向陈旧不查（只损性能）、miss 回退权威的经验 | lake router 是池感知组件（持位置视图镜像）；kvcm router 走经典事件驱动，不碰池位置 |
 | lake 命中定义 | [`../docs/features/features.md`](../docs/features/features.md)「Pool 命中 vs 本地命中」 | 术语：Pool 命中（省重算需传输）≠ 本地命中（省传输） | lake 本地命中指 L0/HBM 池放置；kvcm 场景选路方可观测的是本机 DRAM 副本（F6） |
 | lake 单向边界 | [`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「池放置·调度读视图」 | 调度读视图、不反向指挥放置的边界形态 | lake 的池有自主放置能力；Mooncake 池没有，放置智能只能在外置控制面 |
 | llm-d Router | [`../docs/research/llm-d/overview.md`](../docs/research/llm-d/overview.md)「核心结论」；[`../docs/research/llm-d/architecture.md`](../docs/research/llm-d/architecture.md) §4 | 推测索引（TTL 2s）是派生索引系统补决策-确认窗口的手法 | llm-d 索引是事件流派生的副本视图（引擎才是真相）；master 直读没有该窗口 |
@@ -50,32 +50,25 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 ### 1. 选路方需要哪些输入
 
-问题：选路方需要「前缀 × 实例」全局视图，数据来源未定；引擎 KV event 只含 block hash/token ids，描述引擎本地 radix，不含池位置（F7/F8）。
+经典做法：router 消费引擎 kv event，维护「block hash → 实例」索引；新请求按同一 hash 链算前缀 block hash，查最长匹配（Dynamo/llm-d 同构）。事件由引擎发出，来源实例天然可知，不需要额外的 seg→实例映射表。
 
-若按「前缀 → keys → 副本位置 → 实例」分解，需要三张表：
+事实约束：引擎 kv event 只覆盖引擎自己的 put（F8），载荷是引擎 block hash + token ids + medium（F7），不含池位置（seg/副本）。池位置是控制面平面的事（keys.py 算 PoolKey、master 记副本），不进 router。
 
-| 输入 | 内容 | 来源 | 状态 |
-|------|------|------|------|
-| 前缀 → keys | block hash 链 × PoolKey 全 rank 展开 | `precopy/keys.py` 口径（import 上游权威 hash 链；`PYTHONHASHSEED` 对齐） | 现成（F2） |
-| key → 副本位置 | 每把 key 的副本落在哪些 seg | master（F1） | 现成 |
-| seg → 实例 | seg 名（`IP:rpc_port`）↔ 实例 ↔ rank | 生产来源未定——测试床 `resolve.py` 探测链是取证手段，不是生产路径 | 归 D4 |
+待定：事件门控与通道（`enable_kv_cache_events`，F8）在部署形态下怎么接 → 归 D4。
 
-### 2. 可见性：选路方怎么拿到副本位置（核心待定）
+### 2. 可见性：router 的索引怎么知道预复制放置
+
+预复制绕开引擎、不产生引擎事件（F9）→ router 的事件索引永远只知道「前缀在 A」，不知道拷完后「B 也有了」。
 
 三条候选：
 
-- **a. 控制面自产事件**：预复制控制面在复制完成/失效时向选路方发事件（keys.py 已重算同一 hash 链，格式可对齐引擎 `BlockStored`）
-- **b. 池侧事件流**：mooncake main 有 `enable_kv_events` publisher，载荷是否含副本位置、0.3.11 是否带均未核对（E8）；若需自研事件流则与「不改池」冲突
-- **c. 直读 master**：选路方直接查 / 周期 reconcile master 的 key→replicas 视图（F1）
+- **a. 控制面补发事件**：copy 完成后，控制面按引擎格式补发 `BlockStored`（「B 存了这些 block」）。hash 链控制面已重算（keys.py 的中间产物即引擎 block hash），router 零改动。
+- **b. 池侧事件流**：依赖 E8 核对（载荷是否含副本位置、0.3.11 是否带）；自研则与「不改池」冲突。
+- **c. router 直读 master**：要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件——脱离经典事件驱动架构，已排除。
 
-事实约束：
+陈旧（与选哪条无关的现状）：vllm-ascend 0.26 无任何 Removed 事件（F10）→ 索引只增不减；副本被驱逐 / 属主连坐删除（F5）router 都收不到通知。错了不致命：请求打到实例后 get miss，引擎自动远端读 / 重算（F3），只损性能不损正确性。缓解候选：router 侧索引条目过期，或定期对账（后者又涉及 router 碰 master，随 a 定型后再定）。
 
-- 纯引擎 kv event 流不可能覆盖预复制：预复制无事件（F9）、副本消失无事件（F10）。
-- a 单独不完备：控制面知道自己的 copy 结果，但不知道驱逐 / TTL / 属主连坐（F5）——纯事件流索引会陈旧，仍需对账手段。
-- c 没有事件流的丢失/乱序/gap 问题（Dynamo 为此配了序号 + 快照重放整套兜底，参考实现）；代价是查询压力在 master，规模大时需要缓存层。
-- 可组合：c 作权威 + a 作刷新触发。
-
-倾向（待讨论）：c 为主 + a 触发。
+倾向（待讨论）：a。
 
 ### 3. 「哪个实例拥有前缀」怎么定义
 

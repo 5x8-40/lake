@@ -10,10 +10,18 @@
 
 **D1. Router 集成与请求调度** — 讨论中
 
-- 工作文档：[D1-router-scheduling.md](D1-router-scheduling.md)——事实基线 F1-F13 已核实（含复制幂等性：重发 copy 不产生同 seg 重复副本）。
-- 待定：可见性路径选型（控制面自产事件 / 池侧事件流 / 直读 master）、「哪个实例拥有前缀」定义、预热与选路时序、目标函数权重、release 边界。
-- 选路方身份未定（kvcm 现无 router 组件），进程形态与 D4 耦合。
-- 工程实现 E11-E14 依赖设计定型；E10/E11 骨架可先行。
+最终形态：router 决策请求发哪个实例 → precopy 预热该实例 → 并决定哪些 KV 释放。工作文档：[D1-router-scheduling.md](D1-router-scheduling.md)（事实基线 F1-F13 已核实，含复制幂等性：重发 copy 不产生同 seg 重复副本）。
+
+六个待定问题：
+
+1. **选路输入**——router 需要「前缀 × 实例」全局视图，数据从哪来。经典做法：router 消费引擎 kv event 维护「block hash → 实例」索引，不碰池 key（池位置是控制面平面的事）。
+2. **可见性**——预复制绕开引擎、不产生引擎事件（F9），router 索引怎么知道预复制放置。候选：a 控制面补发引擎格式事件 / b 池侧事件流（依赖 E8）/ c router 直读 master（脱离经典架构，已排除）。倾向 a。
+3. **「哪个实例拥有前缀」怎么定义**——副本在 B 的 seg ≠ B 引擎 radix 里有该前缀。
+4. **时序**——先选路再预热（等 READY 增加 TTFT）vs 预测性预热（请求没来就浪费，P7）；预热中请求到达的兜底（读路径自动远端读，F3）。
+5. **选路目标函数**——命中率 / 实例负载 / 传输成本的权衡；多实例选一。
+6. **release 归谁**——释放决策是 router / 控制面 / 池策略。
+
+已知现状：vllm-ascend 0.26 无 Removed 事件（F10）→ 事件索引只增不减，陈旧只损性能（F3）。选路方进程形态与 D4 耦合；工程实现 E11-E14 依赖设计定型，E10/E11 骨架可先行。
 
 **D2. KV 调度操作集（pin / demote / prefetch / retain / release）**
 
@@ -37,7 +45,7 @@
 
 - 待定：READY 信号如何接 gateway/router：谁发起预取、何时放行、失败重试。过载/准入仍归 gateway，推理侧只管执行。
 - 待定：Prefetch Orchestrator 形态（旁路进程或并入 Router）：收 intent → 调 B2 → READY 栅栏 → 放行。
-- 已定边界：Router 框架若消费引擎 kv event，预复制视图带外注入（D1 §2）；seg→实例注册通道（D1 ①第三表）。
+- 已定边界：router 消费引擎 kv event，预复制放置由控制面补发事件注入（D1 §2）；控制面侧 seg→实例拓扑由编排层提供（测试床 resolve.py 探测链是取证手段，不是生产路径）。
 - 是 D1 时序问题的执行面。骨架先行：E12/E13。
 
 **D5. 故障衔接**
