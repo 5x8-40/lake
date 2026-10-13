@@ -15,7 +15,7 @@ vllm-ascend 0.26 里有**三个**同名「layerwise」的机制。都是 KV 传�
 | 元数据 | metaserver（httpx）+ zmq side channel | Store master（对象元数据） | Memcache MetaService |
 | HBM 布局 | 标准全层 KV cache | 标准全层 KV cache，**驻留** | **共享 buffer 轮转**（I+min(B,R) 个物理 buffer，HBM 减量） |
 | 「逐层」语义 | P 算完一层推一层；D 按层接收 | 池读/写在层粒度**流水线化**（计算-传输重叠） | 逐层换入换出（真卸载） |
-| dynamo 视角 | 第三种线格式（`do_remote_prefill` + metaserver，见 [pd-mooncake.md](pd-mooncake.md)「为什么协议挂到 Nixl」） | 池连接器，不产生 PD `kv_transfer_params` | 同左 |
+| dynamo 视角 | 第三种线格式（`do_remote_prefill` + metaserver，见 [pd-mooncake.md](../docs/dynamo-ascend/pd-mooncake.md)「为什么协议挂到 Nixl」） | 池连接器，不产生 PD `kv_transfer_params` | 同左 |
 | 官方文档 | — | [Mooncake 分层适配与优化](https://docs.vllm.ai/projects/ascend/zh-cn/latest/user_guide/feature_guide/mooncake_layerwise_adaptation_and_optimization.html) | [分层与稀疏KV缓存卸载设计](https://docs.vllm.ai/projects/ascend/zh-cn/latest/developer_guide/Design_Documents/layerwise_and_sparse_kv_cache_offloading.html) |
 
 快速判别：看连接器名 + `backend` + `use_layerwise` 三件套，对照上表首两行。
@@ -89,13 +89,13 @@ sequenceDiagram
 - HBM 全层驻留：`extract_layout_config` 返回 None（`mooncake_layerwise.py:77-80`，docstring 原文 "Block-key transfer does not opt into GVA-backed physical reuse"）→ worker 不建共享 buffer（`worker.py:635-636`）
 - 读落点 = 请求自己的 block：`pool_worker.py:2263`（`request.block_ids[block_index]`）
 - 本地 APC 命中的块不重读：`start_block = vllm_cached_tokens // block_size`（`pool_worker.py:2229`；hybrid 路径 `mooncake_layerwise.py:345`）
-- → **HBM 预热成立**（见 [decisions/D003-kv-prefetch.md](decisions/D003-kv-prefetch.md) 方案 A）
+- → **HBM 预热成立**（见 [D003-kv-prefetch.md](D003-kv-prefetch.md) 方案 A）
 
 ## ③ 池 layerwise（gva 层复用）：`AscendStoreConnector` + Memcache
 
 先拆词：「gva 层复用」= **gva 数据面** + **层复用**两件事，没有「gva 层」这个东西：
 
-- **GVA** = Global Virtual Address，MemFabric 的全局虚拟编址：把集群各节点的 HBM/DRAM 编进统一地址空间，传输按 GVA 地址跨机跨介质直接读写（OneCopy：RH2D/D2RH 等）；memcache 元数据里 key → 副本位置 + 介质 + GVA（见 [`../research/memcache/architecture.md`](../research/memcache/architecture.md)）
+- **GVA** = Global Virtual Address，MemFabric 的全局虚拟编址：把集群各节点的 HBM/DRAM 编进统一地址空间，传输按 GVA 地址跨机跨介质直接读写（OneCopy：RH2D/D2RH 等）；memcache 元数据里 key → 副本位置 + 介质 + GVA（见 [`../docs/research/memcache/architecture.md`](../docs/research/memcache/architecture.md)）
 - **层复用** = 物理 HBM buffer 跨层轮转复用（下述）
 
 「逐层计算、加载下一层、卸载上一层」描述的是这条路径——**真卸载，HBM 减量**：

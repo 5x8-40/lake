@@ -343,7 +343,10 @@ va-precopy/
 ├── conf/                 # mooncake 配置（样例 + 生成的 mooncake.<ROLE>.json）
 ├── logs/                 # pidfile / 日志（gitignore）
 ├── patch_tp_mismatch_worker.patch  # 异构 TP 必打（#15835 rc1 backport）
-└── README.md / REPRODUCE.md / EXPERIMENTS.md
+├── README.md / REPRODUCE.md / EXPERIMENTS.md
+├── D003-kv-prefetch.md      # 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测）
+├── layerwise-taxonomy.md    # 三个「layerwise」辨析（PD P2P / 池 block_key / 池 gva）
+└── D1-router-scheduling.md  # 生产化设计 D1：Router 集成与请求调度
 ```
 
 | 文档 | 作用 |
@@ -351,6 +354,9 @@ va-precopy/
 | `README.md` | 本文：端到端说明 |
 | `REPRODUCE.md` | 客户复现参考：结论 + 必配项 + 「读本机副本」判定方法 |
 | `EXPERIMENTS.md` | 实验总表 14 条 + 异构实录 + 踩坑记录（含撤回历史） |
+| `D003-kv-prefetch.md` | 预取方案设计（自 dynamo-ascend decisions 移入，非 dynamo-ascend 文档） |
+| `layerwise-taxonomy.md` | 三个「layerwise」辨析（同上移入） |
+| `D1-router-scheduling.md` | 生产化设计 D1：Router 集成与请求调度 |
 
 ## 操作参考
 
@@ -437,13 +443,15 @@ va-precopy/
 | Mooncake block_key | `backend=mooncake` + `use_layerwise=true` | 逐层 range 读；HBM 仍全层；壳请求同步占槽 |
 | MemCache gva | `backend=memcache` + `use_layerwise=true` | HBM 可减量；预热落点更偏本机 DRAM |
 
-待定：生产默认走 MemCache，还是留 Mooncake 并补测 layerwise + B2（get session 是否仍选本机 DRAM）。不建议自研 Mooncake GVA。
+待定：生产默认走 MemCache，还是留 Mooncake 并补测 layerwise + B2（get session 是否仍选本机 DRAM）。不建议自研 Mooncake GVA。三个「layerwise」机制的完整辨析见 [layerwise-taxonomy.md](layerwise-taxonomy.md)。
 
 ### 2. 上层编排（现只有底层）
 
 现状：手工 / `run_e2e.sh`：warm → keys → `create_copy_task` → READY → **再**打目标。缺「谁预取、何时放行、失败重试」。
 
 待定：独立 **Prefetch Orchestrator**（旁路进程或并入 Router）：收 intent → 调 B2 → READY 栅栏 → gateway/router 放行。过载/准入仍归 gateway；引擎不参与策略。
+
+选路侧设计已立：[D1-router-scheduling.md](D1-router-scheduling.md)（选路输入/可见性/时序/目标函数/release 边界）；编排进程形态（D4）仍待定。
 
 ### 3. 落盘（SSD / disk）
 
