@@ -1,12 +1,12 @@
-# D003: KV 预取——预取请求 + 显式副本复制
+# KV 预取——预取请求 + 显式副本复制
 
 - 日期: 2026-09-28
-- 状态: 提议（方案定型；落地前需完成文末实测清单）
+- 状态: B2 已实测（本目录测试床，见 [README.md](README.md)「验证状态」与 [EXPERIMENTS.md](EXPERIMENTS.md)）；生产化选路设计见 [D1-router-scheduling.md](D1-router-scheduling.md)
 
 ## 背景
 
 - 目标场景：vllm-ascend 0.26 + Mooncake Store 做 KV 卸载（`AscendStoreConnector`，`backend=mooncake`）。前缀 KV 已在池中（远端节点 DRAM 副本），真实请求到达前把 KV 预取到目标节点，消除首个请求的远端读延迟。
-- 需求形态：SGLang [#27574](https://github.com/sgl-project/sglang/issues/27574)（Programmatic KV）式的控制面可编程预取——外部控制面决定"何时、把哪个前缀、放到哪个节点"，引擎只执行。参考 [`../../research/vllm_vs_sglang/agent-kv-cache.md`](../../research/vllm_vs_sglang/agent-kv-cache.md)、[`../../research/vllm/kv-session-roadmap.md`](../../research/vllm/kv-session-roadmap.md)。
+- 需求形态：SGLang [#27574](https://github.com/sgl-project/sglang/issues/27574)（Programmatic KV）式的控制面可编程预取——外部控制面决定"何时、把哪个前缀、放到哪个节点"，引擎只执行。参考 [`../docs/research/vllm_vs_sglang/agent-kv-cache.md`](../docs/research/vllm_vs_sglang/agent-kv-cache.md)、[`../docs/research/vllm/kv-session-roadmap.md`](../docs/research/vllm/kv-session-roadmap.md)。
 - 形态约束：**预取请求 + 加载完就释放**。预取请求 = prompt 与目标前缀 token 级一致（block hash 才一致）、`max_tokens=1` 的合成请求，唯一目的是触发 connector 的池加载。不加新的带外传输通道，复用现有请求路径与池机制。
 
 代码核实基线：vllm-ascend 源码 `~/vllm-ascend-0.26`；Mooncake submodule `3rdparty/mooncake` @ **1fc27b62**（2026-09-28，含 range 读 API 的 PR [#2881](https://github.com/kvcache-ai/Mooncake/pull/2881) `78726c5c`）；上游 vLLM `3rdparty/vllm` @ 027b6f3a2（2026-09-28）。
@@ -15,7 +15,7 @@
 
 ## 两种模式的分野
 
-> 「layerwise」在 vllm-ascend 0.26 里有三个同名机制（PD P2P 直推 / 池 block_key / 池 gva 层复用），本文只涉及 `AscendStoreConnector` 的池 layerwise。完整辨析（含 mermaid 图）见 [`../layerwise-taxonomy.md`](../layerwise-taxonomy.md)。
+> 「layerwise」在 vllm-ascend 0.26 里有三个同名机制（PD P2P 直推 / 池 block_key / 池 gva 层复用），本文只涉及 `AscendStoreConnector` 的池 layerwise。完整辨析（含 mermaid 图）见 [`../docs/research/vllm-ascend/layerwise-taxonomy.md`](../docs/research/vllm-ascend/layerwise-taxonomy.md)。
 
 `AscendStoreConnector` 两种用法，读路径与本地命中处理不同；**预取目标介质相同——HBM（APC）与本机 DRAM 两层皆有效**：
 
@@ -187,7 +187,7 @@ sequenceDiagram
 
 - **与方案 A 的联动**：layerwise 下壳请求自己也会建 get session——壳请求若先于复制完成到达，session 锁定远端副本，本次复制对它无效。正确顺序：先 B2 复制完成，再发壳请求（壳请求读本机副本进 HBM，传输也更快）
 - **错过时序的缓解**：session 随请求结束释放，下一个请求重新选副本——错过只影响当前请求，不自毁
-- **职责边界**：确认就绪再放行是 gateway/router 侧编排，推理引擎无改动
+- **职责边界**：确认就绪再放行是 gateway/router 侧编排，推理引擎无改动；生产化选路设计（选路输入/可见性/时序/目标函数）见 [D1-router-scheduling.md](D1-router-scheduling.md)
 
 ## 决策
 

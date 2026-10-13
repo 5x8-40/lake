@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Key computation for va-precopy: prompt -> block hashes -> PoolKey strings.
+"""Key computation for KVCM: prompt -> block hashes -> PoolKey strings.
 
 Everything about the key format or hash algorithm is IMPORTED from upstream,
 nothing reimplemented:
@@ -429,7 +429,7 @@ def main() -> int:
     )
     p.add_argument(
         "--prefix",
-        default="va-precopy shared prefix for store warmup. ",
+        default="kvcm shared prefix for store warmup. ",
         help="prompt mode: base prefix string before repeat",
     )
     p.add_argument("--prefix-repeat", type=int, default=80)

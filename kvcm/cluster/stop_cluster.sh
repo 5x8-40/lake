@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Stop va-precopy workers (and optionally mooncake_master).
+# Stop KVCM workers (and optionally mooncake_master).
 #
 #   bash stop_cluster.sh              # workers only
 #   STOP_MASTER=1 bash stop_cluster.sh

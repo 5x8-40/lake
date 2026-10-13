@@ -15,7 +15,7 @@ vllm-ascend 0.26 里有**三个**同名「layerwise」的机制。都是 KV 传�
 | 元数据 | metaserver（httpx）+ zmq side channel | Store master（对象元数据） | Memcache MetaService |
 | HBM 布局 | 标准全层 KV cache | 标准全层 KV cache，**驻留** | **共享 buffer 轮转**（I+min(B,R) 个物理 buffer，HBM 减量） |
 | 「逐层」语义 | P 算完一层推一层；D 按层接收 | 池读/写在层粒度**流水线化**（计算-传输重叠） | 逐层换入换出（真卸载） |
-| dynamo 视角 | 第三种线格式（`do_remote_prefill` + metaserver，见 [pd-mooncake.md](pd-mooncake.md)「为什么协议挂到 Nixl」） | 池连接器，不产生 PD `kv_transfer_params` | 同左 |
+| dynamo 视角 | 第三种线格式（`do_remote_prefill` + metaserver，见 [pd-mooncake.md](../../dynamo-ascend/pd-mooncake.md)「为什么协议挂到 Nixl」） | 池连接器，不产生 PD `kv_transfer_params` | 同左 |
 | 官方文档 | — | [Mooncake 分层适配与优化](https://docs.vllm.ai/projects/ascend/zh-cn/latest/user_guide/feature_guide/mooncake_layerwise_adaptation_and_optimization.html) | [分层与稀疏KV缓存卸载设计](https://docs.vllm.ai/projects/ascend/zh-cn/latest/developer_guide/Design_Documents/layerwise_and_sparse_kv_cache_offloading.html) |
 
 快速判别：看连接器名 + `backend` + `use_layerwise` 三件套，对照上表首两行。
@@ -48,7 +48,7 @@ sequenceDiagram
 
 ## ② 池 layerwise（block_key）：`AscendStoreConnector` + Mooncake Store
 
-**D003 预取方案的目标路径。** 池是中介，P↔D 无直连；PD 场景 = P 逐层写池 + D 逐层读池：
+**KV 预取方案的目标路径。** 池是中介，P↔D 无直连；PD 场景 = P 逐层写池 + D 逐层读池：
 
 ```mermaid
 flowchart LR
@@ -89,13 +89,13 @@ sequenceDiagram
 - HBM 全层驻留：`extract_layout_config` 返回 None（`mooncake_layerwise.py:77-80`，docstring 原文 "Block-key transfer does not opt into GVA-backed physical reuse"）→ worker 不建共享 buffer（`worker.py:635-636`）
 - 读落点 = 请求自己的 block：`pool_worker.py:2263`（`request.block_ids[block_index]`）
 - 本地 APC 命中的块不重读：`start_block = vllm_cached_tokens // block_size`（`pool_worker.py:2229`；hybrid 路径 `mooncake_layerwise.py:345`）
-- → **HBM 预热成立**（见 [decisions/D003-kv-prefetch.md](decisions/D003-kv-prefetch.md) 方案 A）
+- → **HBM 预热成立**（见 [kv-prefetch.md](../../../kvcm/kv-prefetch.md) 方案 A）
 
 ## ③ 池 layerwise（gva 层复用）：`AscendStoreConnector` + Memcache
 
 先拆词：「gva 层复用」= **gva 数据面** + **层复用**两件事，没有「gva 层」这个东西：
 
-- **GVA** = Global Virtual Address，MemFabric 的全局虚拟编址：把集群各节点的 HBM/DRAM 编进统一地址空间，传输按 GVA 地址跨机跨介质直接读写（OneCopy：RH2D/D2RH 等）；memcache 元数据里 key → 副本位置 + 介质 + GVA（见 [`../research/memcache/architecture.md`](../research/memcache/architecture.md)）
+- **GVA** = Global Virtual Address，MemFabric 的全局虚拟编址：把集群各节点的 HBM/DRAM 编进统一地址空间，传输按 GVA 地址跨机跨介质直接读写（OneCopy：RH2D/D2RH 等）；memcache 元数据里 key → 副本位置 + 介质 + GVA（见 [`../memcache/architecture.md`](../memcache/architecture.md)）
 - **层复用** = 物理 HBM buffer 跨层轮转复用（下述）
 
 「逐层计算、加载下一层、卸载上一层」描述的是这条路径——**真卸载，HBM 减量**：
@@ -119,7 +119,7 @@ flowchart LR
 - 官方设计文档 §8「`MooncakeLayerwiseConnector` 不提供逐缓冲区传输完成门」的含义：①（P2P 直推）只负责把层推给 D，没有按 buffer 回报「内容已被消费、可以覆盖」的同步机制，所以层复用挂不上它
 - APC「命中」的块不真持有 KV → `layerwise_offload=True` 强制整前缀从池重读（`pool_worker.py:1795`；赋值点 L585/L601，门控 `use_layerwise_transfer` L224）
 - 官方设计文档 §8：逐层共享缓冲区卸载**需要 Memcache 后端**和 eager 模式
-- → 这条路径上 **HBM 预热不成立**，只能暖本机 DRAM（D003 方案 B2）
+- → 这条路径上 **HBM 预热不成立**，只能暖本机 DRAM（KV 预取方案 B2）
 
 ## ② 的逐层流水线 vs 异步整体加载
 
@@ -142,8 +142,8 @@ flowchart LR
 - vllm-ascend 对 layerwise **强制** `load_async=false`（`pool_scheduler.py:747`）——layerwise 模式下该形态不可用，这是它的真实短板
 - 因此是部署时的模式选择：追 TTFT、前缀长、网络好 → layerwise；保吞吐、求稳、网络不可控 → 非 layerwise + `load_async=true`
 
-对 D003 预取的含义：壳请求在 layerwise 下同步占槽，批量预热会与真实流量竞争——这正是方案 B2（带外复制、零引擎侵入）的成本优势场景；若部署形态主要为预取服务，非 layerwise + `load_async=true` 是更干净的壳请求路径。
+对 KV 预取的含义：壳请求在 layerwise 下同步占槽，批量预热会与真实流量竞争——这正是方案 B2（带外复制、零引擎侵入）的成本优势场景；若部署形态主要为预取服务，非 layerwise + `load_async=true` 是更干净的壳请求路径。
 
-## 与 D003 的关系
+## 与 KV 预取的关系
 
-一句话：D003 的目标场景是 **②**（`backend=mooncake`）。① 是 PD 直连传输（无池、无「预取进池/进 HBM」概念）；③ 是 Memcache 卸载（HBM 减量，预取只能到本机 DRAM）。讨论「layerwise」时先对齐三件套：连接器名、`backend`、`use_layerwise`。
+一句话：KV 预取的目标场景是 **②**（`backend=mooncake`）。① 是 PD 直连传输（无池、无「预取进池/进 HBM」概念）；③ 是 Memcache 卸载（HBM 减量，预取只能到本机 DRAM）。讨论「layerwise」时先对齐三件套：连接器名、`backend`、`use_layerwise`。

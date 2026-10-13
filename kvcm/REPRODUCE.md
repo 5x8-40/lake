@@ -1,4 +1,4 @@
-# va-precopy 复现参考（客户版）
+# KVCM 复现参考（客户版）
 
 在 **vllm-ascend** 上做 Mooncake KV **预复制（pre-copy）**：真实请求打到目标实例之前，用 Mooncake `create_copy_task` 把已有前缀 KV 复制到该实例的本机 DRAM segment，使读路径 local-first、避免跨机拉 KV。
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""va-precopy store-only demo (no vLLM).
+"""KVCM store-only demo (no vLLM).
 
 On stock Mooncake, ``protocol=tcp`` can run without NPU.
 On vllm-ascend's Ascend-built Mooncake, AscendDirectTransport is always
@@ -123,7 +123,7 @@ def _client_main(
 
 def main() -> int:
     ip = _host_ip()
-    p = argparse.ArgumentParser(description="va-precopy store-only demo")
+    p = argparse.ArgumentParser(description="kvcm store-only demo")
     p.add_argument(
         "--master",
         default=os.environ.get("MC_MASTER_ADDRESS", "127.0.0.1:50088"),
@@ -171,7 +171,7 @@ def main() -> int:
     if master.count(":") == 0:
         master = f"{master}:50088"
 
-    key = args.key or f"va-precopy-{uuid.uuid4().hex[:12]}"
+    key = args.key or f"kvcm-{uuid.uuid4().hex[:12]}"
     source = args.source_segment
     target = args.target_segment
     if source == target:
