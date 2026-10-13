@@ -47,7 +47,7 @@
 
 - 待定：READY 信号如何接 gateway/router：谁发起预取、何时放行、失败重试。过载/准入仍归 gateway，推理侧只管执行。
 - 待定：Prefetch Orchestrator 形态（旁路进程或并入 Router）：收 intent → 调 B2 → READY 栅栏 → 放行。
-- 已定边界：router 消费引擎 kv event，预复制放置由控制面补发事件注入（D1 §2）；控制面侧 seg→实例拓扑由编排层提供（测试床 resolve.py 探测链是取证手段，不是生产路径）。
+- 边界（随 D1 倾向 a，讨论中）：router 消费引擎 kv event，预复制放置由控制面补发事件注入（D1 §2）；控制面侧 seg→实例拓扑由编排层提供（测试床 resolve.py 探测链是取证手段，不是生产路径）。
 - 是 D1 时序问题的执行面。骨架先行：E12/E13。
 
 **D5. 故障衔接**
@@ -97,7 +97,7 @@
 - **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。
 - **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC 候选，与仓内跨语言 RPC 选型一致）。协议字段依赖 D4 定型；通道骨架可先行。
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例拉起 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3/D5 耦合）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
-- **E14. KV event 通信**——🟡 主路径已降级：D1 已定直读 master 为主，自产事件非必要路径；仅当 Router 框架消费引擎 kv event 时需做 pub 端（格式对齐引擎 `BlockStored`，keys.py hash 链天然一致）+ 视图带外注入。通道选型（ZMQ / NATS / gRPC stream）依赖 D4。
+- **E14. KV event 通信**——随 D1 倾向 a（讨论中）：控制面自产事件 pub 端（格式对齐引擎 `BlockStored`，keys.py hash 链天然一致）成为主需求；引擎事件 sub 端归 router 侧。通道选型（ZMQ / NATS / gRPC stream）依赖 D4；pub 骨架与格式对齐可先行。
 
 ### C. 性能与生产化
 
