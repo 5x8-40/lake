@@ -1,6 +1,6 @@
 # D1: Router 集成与请求调度（预复制的选路侧）
 
-- 状态: **讨论中**——事实基线（F1-F14）已核实；待定问题 §1/§2 已闭环，§3-§6 未拍板
+- 状态: **讨论中**——事实基线（F1-F15）已核实；待定问题 §1-§3 已闭环，§4-§6 未拍板
 - 上游问题: [backlog.md](backlog.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
 - 角色约定: kvcm 目前没有 router 组件。本文「选路方 / router」指未来消费引擎 kv event、决定请求发往哪个实例的组件（gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能），进程形态归 D4
 
@@ -142,17 +142,17 @@ flowchart TB
 - **发布时机**：READY 核验通过（`precopy.py::assert_targets_have_replicas`）后，一次预复制发一条 `BlockStored`（block_hashes = 前缀连续满块链；引擎侧经 `KVEventAggregator` 跨 rank 聚合后同语义）。
 - **幂等**：router 索引是集合语义，补发与引擎自发重复无害；重复预热重复补发亦无害（池层幂等 F11）。
 
-### 3. 「哪个实例拥有前缀」怎么定义
+### 3. 「哪个实例拥有前缀」怎么定义（已闭环）
 
-问题：副本在 B 的 seg ≠ B 引擎 radix 里有该前缀。
+问题：副本在 B 的 seg ≠ B 引擎 radix 里有该前缀——master 视图 / 引擎 kv event / 控制面 copy 记录三来源覆盖范围不同，§2 闭环后统一为索引声称一个口径。
 
-三个来源覆盖范围不同：
+定义：**实例 X 拥有前缀 P = P 的连续满块链的 KV 在 X 本机**——HBM（APC，gpu 事件）或本机池 seg（cpu 事件 / kvcm 补发）都算；命中长度 = 连续满块数 × block_size，尾巴由引擎重算（801 token 按 768，README「三个对象」）。HBM 与本机 DRAM 的差异不在定义层区分，留 §5 打分。
 
-- master 视图（key → 副本 → seg，F1）：预复制副本唯一完备的信息源。
-- 引擎 kv event：只覆盖引擎自己的 put（F8），池侧无 Removed（F10），APC 命中不进任何事件（F6）。
-- 控制面 copy 记录：只覆盖预复制动作。
+成立条件（已核事实）：
 
-建议定义（待确认）：**本地命中 = 前缀连续满块集合中，目标实例每个 rank 的 key 都在本机 seg 上有 DRAM 副本**（master 视图口径）。全 rank 齐备 = 零跨机；部分 rank 本地按块比例计入（F3：get session 每 rank 独立选副本）。命中 token 数 = 连续满块数 × block_size，尾巴由引擎重算（801 token 命中 768 口径，README「三个对象」）。MLA（`put_step>1`）key 折叠到 rank 0，判定退化为单 rank，该映射未实测（README 边界节）。
+- **router 口径即索引声称**：router 不读 master（§2），「拥有」= 索引中 P 的连续满块链每个 block hash 都有 X 的条目。条目可能陈旧（cpu 侧只增不减，F10），选错由读路径兜底（F3），只损性能。
+- **rank 维度由事件语义吃掉**：引擎侧全 rank put 才发（`KVEventAggregator`，F8-2）；kvcm 侧全 rank READY 核验才补发（`assert_targets_have_replicas`）。一条事件 = 该实例全 rank 齐备，router 无需 per-rank 索引。MLA（`put_step>1`）key 折叠 rank 0，判定退化单 rank，未实测（E7）。
+- **本机 = 事件归属实例**：cpu 条目的物理位置 = 发布端点归属的实例（引擎 put 钉本机 seg；kvcm 按目标实例端点补发，§2）。同机多实例各持 seg 的细分（本机他实例 seg 算不算「本机」）当前部署不出现，出现时按 seg→实例注册细化，归 D4/E13。
 
 ### 4. 时序：预热与选路的先后
 
