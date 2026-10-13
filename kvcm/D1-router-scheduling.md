@@ -29,7 +29,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源属主客户端必须在线；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
 - **F5 副本无 pin**：READY 后受池驱逐策略管理；属主实例下线，key 连同远端副本被 master 移除（实测观察，机制与时机待确认 → E5；记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
 - **F6 引擎 APC 私有**：HBM 侧前缀缓存是引擎私有 LRU——无 pin、无池元数据、外部不可见（kv-prefetch.md 方案 A 注意节）。
-- **F15 lease 是 key 粒度：读续租、复制不续租、删 key 释放全部副本**：lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本无独立 TTL。读路径续租（`GrantReadLease(default_kv_lease_ttl_)`：`GetReplicaList:3299` / `BatchQuery:4337` / `:4566`）；`CopyStart` 不触碰 lease（`:6444` 起）。TTL 到期 / 驱逐一律走 `EraseMetadata`——删 key 元数据并释放**全部**副本（`:2308-2313` 注释、`:2374-2375`；驱逐候选必须 lease 过期，`:8117` / `:8299` / `:12434`）。推论：「原副本 TTL 到、复制的副本没到」的状态不存在；removed 是 key 全局事件，无需位置。
+- **F15 lease 是 key 粒度：读续租、复制不续租、删 key 释放全部副本**：lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本无独立 TTL。读路径续租（`GrantReadLease(default_kv_lease_ttl_)`：`GetReplicaList:3299` / `BatchQuery:4337` / `:4566`）；`CopyStart` 不触碰 lease（`:6444` 起）。TTL 到期 / 驱逐一律走 `EraseMetadata`——删 key 元数据并释放**全部**副本（`:2308-2313` 注释、`:2374-2375`；驱逐候选必须 lease 过期，`:8117` / `:8299` / `:12434`）。续租 API：`ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`，`:3271` / `:3307`），`ProbeKey` / `BatchProbeKey` 不续租（`:3276` / `:3312`）；默认 `default_kv_lease_ttl=10s`（`types.h:84`，部署以 master 配置为准）。推论一：「原副本 TTL 到、复制的副本没到」的状态不存在；removed 是 key 全局事件，无需位置。推论二：预复制不续租，READY 后一个 TTL 窗口内无流量即进入可驱逐状态——控制面需有界保活（周期 `batch_is_exist`，kvcm 现成调用；无限续租 = 变相 pin，违背 F5），保活策略归 D3。
 
 **引擎 kv event**
 

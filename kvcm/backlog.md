@@ -30,7 +30,7 @@
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无显式 pin API——靠 lease 机制（`SubmitReplicaActionProposal` → `ReplicaActionLease`）或池侧扩展。lake 文档有同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）可参考。
+- pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无显式 pin API——靠 lease 机制（`SubmitReplicaActionProposal` → `ReplicaActionLease`）或池侧扩展。main 另有 **soft pin**（默认 30min / 上限 24h，`types.h:86-89`），挂在 `ReplicateConfig` 路径（put/replicate 时指定，非「给已有 key 加 pin」的独立 API），`allow_evict_soft_pinned_objects` 默认 true = 软保护。lake 文档有同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）可参考。
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
 - demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（以 disk 为 READY 会吃掉预热收益）。
 - release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策见 D1 第 6 问（讨论中）。
@@ -40,6 +40,7 @@
 
 - 事实：副本无 pin，READY 后池可驱逐；属主实例下线后 key 连同远端副本被 master 元数据级移除（字节成无索引残留；exist 0/32 实测见 [EXPERIMENTS.md](EXPERIMENTS.md)）——D1 F5。lease 为 key 粒度：读续租、`CopyStart` 不续租、TTL/驱逐删 key 释放全部副本——D1 F15。
 - 待定：READY 是否 =「本机 DRAM 必达」；保活策略；属主下线后副本归属（保留/驱逐/迁移）。
+- 保活机制事实（D1 F15）：`batch_is_exist` 顺带续租（`ProbeKey` 不续），默认 TTL 10s——预复制不续租则一个 TTL 窗口内无流量即可驱逐；保活循环必须有界（会话期 / 固定窗口 / 首流量后停租），无限续租 = 变相 pin。策略（续多久、何时停）本节定型。
 - 落盘子项：Mooncake DRAM→SSD（`enable_ssd_offload`，本目录默认 `false`）是池内冷热，不是「预复制直指定 disk」；SSD 仅作容量/恢复异步 demote。
 - 直接影响故障恢复时已预热前缀的可用性（D5）。事实输入：E5。
 
@@ -86,7 +87,7 @@
 - **E3. 多卡自动匹配验证**——resolve 的 `VLLM::Worker_TP<N>` proctitle 匹配在多卡真机走通（现为 `--targets` + 手工对号；失效时明确报错而非静默错配）。
 - **E4. 1-token 翻转根因**——旧非 DEBUG 实例偶发，新实例未复现；首次外部读输出逐字一致，疑路径交替数值扰动。生产化前必须查清（[EXPERIMENTS.md](EXPERIMENTS.md) #10）。
 - **E5. 副本消失机制核实**——属主下线后 key+副本移除的时机与条件（TTL、GC 扫描窗口）对照实验 → D3 事实输入。
-- **E6. 0.3.11 API 子集核对**——D2 引用的 lease/offload/promotion 是 mooncake main 的符号，测试床 wheel 是 0.3.11.post1，逐个核对可用子集，缺的即池侧扩展工作量 → D2/P5 输入。
+- **E6. 0.3.11 API 子集核对**——D2 引用的 lease/offload/promotion 是 mooncake main 的符号，测试床 wheel 是 0.3.11.post1，逐个核对可用子集，缺的即池侧扩展工作量 → D2/P5 输入。新增核对：`BatchExistKey` 的 `grant_lease` 续租语义与 `BatchProbeKey`（D1 F15）、soft pin（D2 pin 候选）、`default_kv_lease_ttl` 实际配置值。
 - **E7. MLA 实测**——`put_step>1` 时 plan 全落 `targets[0]`、其余 rank 读远端，功能推断正确未实测；hybrid/sparse 被上游 gate 排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——✅ 已闭环（落 D1 F14）：publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medium+tenant+group，**无 seg/机器位置**；ZMQ 传输；CMake 默认 OFF、官方 wheel 构建 ON。**0.3.11.post1 不含此机制**（publisher 代码在 v0.3.11 之后进仓，tag 上无 `kv_event/` 目录、无构建开关）——D1 路径 b 要用须升级 mooncake 版本。
 - **E9. vLLM 事件载荷核对**——✅ 已闭环（结论落 D1 事实基线 F7-F10）：`BlockStored` 含 `medium` 字段；两个发布源——引擎核发 GPU 块事件（含 Removed，上游既有）、连接器发池 put 事件（无 Removed）；预复制绕引擎结构性无事件。
