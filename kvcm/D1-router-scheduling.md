@@ -125,69 +125,17 @@ flowchart TB
 
 ## 目标形态：kvcm 就位后的全链路
 
-```mermaid
-flowchart TB
-    subgraph MAIN["主流程（控制面 + 数据面）"]
-        AG["前端 agent / coder 钩子"]
-        RT["Router<br/>算 hash · 打分 · 选路"]
-        KV["kvcm 控制面<br/>复制 + 有界保活 + 补发事件"]
-        M["mooncake_master<br/>key → 副本 → seg 权威"]
-        subgraph A["实例 A（源）"]
-            direction TB
-            EA["引擎 + APC（HBM 私有）"]
-            SA["本机 DRAM seg"]
-        end
-        subgraph B["实例 B（目标）"]
-            direction TB
-            EB["引擎 + APC"]
-            SB["本机 DRAM seg"]
-        end
-        AG -->|"① 预告 + 请求"| RT
-        RT -->|"② intent 下行：前缀 × 目标实例（E12）"| KV
-        KV -->|"③ 复制 / 核验 / 保活 / 释放（F4/F15/§6）"| M
-        M -->|"④ 派 copy 任务给源属主（F4）"| EA
-        M ~~~ EB
-        EA -->|"put/get（preferred_segment 固定本机）"| SA
-        EB -->|"put/get"| SB
-        SA -->|"⑤ RDMA 复制（源属主执行）"| SB
-        RT -->|"⑩ 选路下发"| EB
-        EB -->|"⑪ BatchQuery 现查（F1）"| M
-        EB -->|"⑫ 本机没有选远端：跨机 RDMA 读（F3）"| SA
-    end
-    subgraph FORMS["事件流与索引：两种部署形态（二选一）"]
-        direction LR
-        subgraph NOW["形态一：0.3.11 现状（无 publisher、无 Conductor）"]
-            direction TB
-            E1["引擎原生事件<br/>gpu/cpu（F8）"]
-            K1["kvcm 补发 BlockStored<br/>（§2 方案 a）"]
-            R1["Router<br/>（进程内建索引）"]
-            N1["池删除不可见（F10）：<br/>索引条目过时只损性能（§2）"]
-            E1 -.->|"⑦"| R1
-            K1 -.->|"⑥"| R1
-        end
-        subgraph NEW["形态二：升级 mooncake 后（有 publisher、有 Conductor）"]
-            direction TB
-            E2["引擎原生事件 gpu/cpu"]
-            K2["kvcm 补发 BlockStored"]
-            P2["池 publisher<br/>stored / removed / cleared（F14）"]
-            C2["Conductor<br/>RFC #1403"]
-            R2["Router"]
-            E2 -.->|"⑦"| C2
-            K2 -.->|"⑥"| C2
-            P2 -.->|"⑨ 解析 object_key 出 hash（§2 方案 b）"| C2
-            R2 -->|"查询：token_ids 或 hash"| C2
-        end
-    end
-    MAIN ~~~ FORMS
-```
+![kvcm 就位后的全链路](kvcm-arch.svg)
+
+图源：[Excalidraw 可编辑版](https://excalidraw.com/#json=cPeGPZYWCAnFHGbByq4up,EhiF60uCucmnmiz21HERxw)。当前为结构示意，①-⑫ 编号与事件/读路径细节以下文读图为准，图面补齐中。
 
 读图：
 
-- 图分两个区域：**主流程**（控制面 + 数据面，①②③④⑤⑩⑪⑫）在上；**事件流与索引**（⑥⑦⑨）在下，两种部署形态二选一，kvcm 补发端点与格式相同。
-- 布局：主流程从上到下（①② → ③④⑤ → ⑩⑪⑫）；实例 A‖B 横向并排、⑤ RDMA 横边相连。`~~~` 是不可见边，仅用于布局对齐。
+- 图为左右两栏：**左列**主流程竖链（控制面 + 数据面）；**右列**事件 / 索引两种部署形态（二选一），kvcm 补发端点与格式相同。
+- 布局：左列主流程从上到下（①② → ③④⑤）；实例 A/B 竖排、⑤ RDMA 竖边相连；右列形态一（上）/ 形态二（下），kvcm 与 master 横边右进。
 - **两条单向通道（§4）**：intent 下行 ②（Router → kvcm），事件上行 ⑥（kvcm → 索引）。
 - **选路面逻辑分层（§1）**：Router 不订阅事件流——索引订阅事件建索引，Router 自算请求的 hash 链查索引（token_ids 或 hash 两种入参，不依赖原始 token 文本），拿命中分数选路（⑩）。
-- **索引部署两种形态**（图下方区域）：0.3.11 现状没有池 publisher、没有 Conductor，事件只有引擎 ⑦ 与 kvcm 补发 ⑥ 两条源，由 Router 进程内索引消费——池删除不可见，索引条目过时只损性能（F3/§2）；升级 mooncake 后 publisher 与 Conductor 就位，Conductor 消费三条源（⑥⑦⑨），Router 走 HTTP 查询。kvcm 补发在两种形态下走同一套端点、同一套引擎格式（§2 方案 a 形态无关性），差异只在编排层注册动作。
+- **索引部署两种形态**（图右列）：0.3.11 现状没有池 publisher、没有 Conductor，事件只有引擎 ⑦ 与 kvcm 补发 ⑥ 两条源，由 Router 进程内索引消费——kvcm 视野外的池删除不可见（引擎 put 的 KV 被驱逐/TTL），索引条目过时只损性能（F3/§2）；升级 mooncake 后 publisher 与 Conductor 就位，Conductor 消费三条源（⑥⑦⑨），Router 走 HTTP 查询。kvcm 补发在两种形态下走同一套端点、同一套引擎格式（§2 方案 a 形态无关性），差异只在编排层注册动作。
 - **kvcm 只碰控制面**：复制 / 核验 / 保活 / 释放走 master RPC（③，含 §6 停保活 / demote / Remove 三手段）；数据面复制（⑤ RDMA）由 master 派单（④）、源属主执行。池驱逐兜底不在图上（master 内部行为）。
 - ① 是「提前备」的提前量来源（§4）：前端钩子比请求早到，Router 拿到预告后按 ② 表达意图，复制与否由 kvcm 决策。
 - 请求不等复制完成（⑩ 直接下发）；读路径先查后选（⑪ BatchQuery → ⑫ 跨机读兜底，F1/F3）——预复制只是提高本地命中概率，不是读路径前提。
