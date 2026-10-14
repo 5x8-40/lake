@@ -17,6 +17,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 | Dynamo router | [`../docs/research/dynamo/overview.md`](../docs/research/dynamo/overview.md)「Router(KV-aware)」 | 成本模型（分层命中×权重 + decode 占用 + 在途请求）；分层计价 device 1.0 / host 0.75 / disk 0.25；在途负载无权威、router 本地记账 | Dynamo 缓存状态权威在 worker 本地索引，router 靠事件逼近（丢事件需 gap→快照重放）；直读 master 无此失效模式。外部重算 block hash 链 Dynamo 已为先例（keys.py 同款） |
 | Mooncake Conductor | mooncake 仓内 `mooncake-conductor/`：`object_key_parser.cpp::ParseVllmObjectKey`；HTTP 契约 RFC #1403（F14） | 现成外挂索引组件：订阅引擎/池事件建全局前缀索引，Router 走 HTTP 查询；object_key 解析已覆盖 vLLM-Ascend key 布局（keys.py 一族） | Conductor 是只读索引，不管复制/保活/补发——与 kvcm 职责互补；组件级替代评估归 backlog D4 |
 | Dynamo standalone indexer | dynamo 仓内 `lib/kv-router/src/services/indexer/`；`standalone-indexer.md` | RFC #1403 契约参照实现：`/register`（含 replay_endpoint）/ `/query` / **`/query_by_hash`**；gap 检测 + replay；P2P recovery（`--peers` 外挂索引 HA 答案）；`/query` 按 gpu/cpu/disk 分层返回 | 它只订引擎事件不订池——「事件源单一时外挂无聚合价值」的实例；Dynamo 主流 kv-router 仍内置索引 + shared_cache 直订 master |
+| Dynamo router 形态谱系 | dynamo 仓内 `router-operations.md`「Dynamo-Native Remote Indexer」；`configuration-and-tuning.md`「KV Indexer / Approx KV Indexer」 | 形态三条先例：内置（kv-router 本地索引）/ 外挂（standalone indexer）/ 内置但暴露服务（`--serve-indexer` 暴露 `kv_indexer_query`，consumer `--use-remote-indexer` 查远端而不建本地全量）；predict-on-route side indexer（路由决策写短 TTL 辅助树、打分取两树 max，解兄弟请求批内竞态；侧树分立根因 = router 自算 hash 与引擎口径不同，写入主树会污染） | 辅助树约束我们有反向答案：kvcm 补发与引擎同口径（keys.py），可入主树（§2 方案 a）；兄弟请求竞态是否需辅助树归 D4 |
 | Mooncake 界限 | [`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「为何池必须自长 radix」 | Mooncake store 只存不透明字节块（无内容寻址、无前缀匹配）——预复制控制面是外置的「懂前缀 + 懂位置」层 | 不照搬 lake 的池内 radix：keys.py 按 key 逐把算，不建树；前缀匹配退化为「连续满块命中长度」 |
 
 ## 事实基线（代码核实）
@@ -185,7 +186,7 @@ flowchart TB
 
 ### 1. 选路方需要哪些输入
 
-决策：选路输入是一张「block hash → 实例」索引，逻辑上分两层——**索引**（订阅事件流、维护索引）与**查询**（Router 自算请求的 hash 链查索引、拿命中分数选实例）。逻辑分层是社区共识形态（Conductor / Dynamo standalone indexer / MindIE 同构），查询契约已标准化（RFC #1403：`/query` 支持 token_ids 或 block hash key 两种入参——Router 查 hash 接口即可，不依赖原始 token 文本）。**进程形态留 D4**：索引内置 Router 进程（llm-d EPP / Dynamo kv-router 形态）还是外挂独立组件（Conductor 形态）——两种形态索引内容完全相同（「block hash → 实例 × 介质」），差别只在组件归属、请求路径是否多一跳、HA 与消费者数量，权衡见本节末「留待 D4」。索引的事件来源两个，**kvcm 负责补齐引擎看不到的部分**：
+决策：选路输入是一张「block hash → 实例」索引，逻辑上分两层——**索引**（订阅事件流、维护索引）与**查询**（Router 自算请求的 hash 链查索引、拿命中分数选实例）。逻辑分层是社区共识形态（Conductor / Dynamo standalone indexer / MindIE 同构），查询契约已标准化（RFC #1403：`/query` 支持 token_ids 或 block hash key 两种入参——Router 查 hash 接口即可，不依赖原始 token 文本）。**进程形态留 D4**：全量索引只建一份，形态三条——内置 Router 进程（llm-d EPP / Dynamo kv-router 式）、外挂独立组件（Conductor 式）、内置但暴露查询服务（Dynamo remote indexer 式：`--serve-indexer` 的 router 保持本地事件摄入并暴露 `kv_indexer_query`，consumer 查远端而不建本地全量）；三种形态全量索引内容完全相同（「block hash → 实例 × 介质」），差别在组件归属、请求路径是否多一跳、HA 与消费者数量，权衡见本节末「留待 D4」。全量索引之外还可叠加**本地辅助预测树**（Dynamo predict-on-route side indexer：路由决策写进短 TTL 侧树、打分取两树 max，解决兄弟请求批内竞态；与 llm-d 推测索引 TTL 2s 同构）——辅助树与主树分离是因为 router 自算 hash 与引擎 hash 口径不同、写入主树会污染（Dynamo 原话：同一物理块会挂在两个 key 下）；kvcm 补发与引擎同口径（keys.py），无此约束（§2 方案 a）。索引的事件来源两个，**kvcm 负责补齐引擎看不到的部分**：
 
 1. **引擎原生事件**：引擎自己的动作——HBM 块的存入与淘汰（medium=gpu）、池 put 的存入（medium=cpu）（F7/F8）。
 2. **kvcm 补发的事件**：预复制落位（放置，§2 方案 a）。删除面升级 mooncake 后由**索引侧直接订阅池 publisher、解析 object_key 出 hash**（首选，Conductor/Dynamo 已为先例，§2 方案 b）；kvcm 订阅翻译重发降级为备选。
@@ -194,7 +195,7 @@ flowchart TB
 
 事实约束：引擎事件只覆盖引擎自己的动作（F8）——HBM 淘汰有 Removed，但池侧删除/驱逐/预复制都不产生引擎事件（F9/F10），这些正是 kvcm 要补的部分。事件里的 medium 字段标记 KV 在哪种介质上（gpu=HBM / cpu=DRAM 池），供 §5 分层计价（Dynamo 计价 device 1.0 / host 0.75 / disk 0.25，standalone indexer `/query` 按 gpu/cpu/disk 分层返回）。
 
-留待 D4：事件开关与传输接线（`enable_kv_cache_events` 默认关，需打开才有事件，F8；ZMQ 端点配置、索引订阅方式）在部署形态下怎么接。**索引进程形态（内置 vs 外挂）**：内置三理由——索引是打分用的摘要、与 scorer 紧耦合（llm-d 架构 §2 原话「是给打分用的摘要，不是存储元数据」；推测索引与 scorer 联动）；请求路径少一跳（EPP 同步选路是内存操作）；事件源单一时外挂无聚合价值（llm-d/Dynamo kv-router 内置的根因）。外挂三理由——事件源多条需聚合（本场景三条：引擎 + kvcm 补发 + 池删除）；消费者多个（Router + 扩缩容/观测控制面）；索引独立 HA（standalone indexer 的 P2P recovery 即外挂形态的答案）。外挂一跳 HTTP 与 D-direct <5ms 模式选择预算的权衡（[`../docs/features/slo.md`](../docs/features/slo.md)；缓解：提前查询、异步化）。Conductor 组件级替代评估见 backlog D4。
+留待 D4：事件开关与传输接线（`enable_kv_cache_events` 默认关，需打开才有事件，F8；ZMQ 端点配置、索引订阅方式）在部署形态下怎么接。**索引进程形态**：全量索引一份，三条形态——内置（llm-d EPP / Dynamo kv-router：索引是打分用的摘要、与 scorer 紧耦合，llm-d 架构 §2 原话「是给打分用的摘要，不是存储元数据」；请求路径少一跳；事件源单一时外挂无聚合价值——单源外挂等于把同一份信息搬远一跳）、外挂（Conductor：多事件源聚合、多消费者、索引独立 HA，standalone indexer 的 P2P recovery 即外挂 HA 答案）、内置但暴露查询服务（Dynamo remote indexer：索引留在 router 进程、HTTP 暴露给多 consumer，HA 跟随 router 副本，介于前两者之间）。本场景事件源三条（引擎 + kvcm 补发 + 池删除），外挂/暴露服务有聚合价值；核心拍板项 = 那一跳 HTTP 是否进同步选路路径（D-direct <5ms 模式选择预算，[`../docs/features/slo.md`](../docs/features/slo.md)；缓解：提前查询、异步化）。**辅助预测树**（兄弟请求批内竞态：一批同前缀请求同时到达、引擎尚未发 stored——Dynamo side indexer / llm-d 推测索引先例）与形态无关，独立决策。Conductor 组件级替代评估见 backlog D4。
 
 ### 2. 可见性：router 的索引怎么知道预复制放置
 
@@ -204,7 +205,7 @@ flowchart TB
 
 候选与裁决：
 
-- **a. 控制面补发事件（选定，管放置）**：copy 完成后控制面按引擎格式补发 `BlockStored`，索引与 Router 零改动。放置归属任何版本都只能靠它（池事件无位置、复制路径零发布，F14）。补发还有一层 master 给不了的语义：kvcm 在 READY 核验全 rank 落位后才发，事件语义是「该实例全 rank 齐备、可路由」；master 即使肯发 `CopyEnd` 也只是单 key 粒度的「字节落位」——「几个 rank 算齐」的聚合语义只有控制面能给（引擎侧同构：全 rank put 齐才由 `KVEventAggregator` 聚合发出，F8-2）。实现见下方「方案 a 落地」。
+- **a. 控制面补发事件（选定，管放置）**：copy 完成后控制面按引擎格式补发 `BlockStored`，索引与 Router 零改动。放置归属任何版本都只能靠它（池事件无位置、复制路径零发布，F14）。补发还有两层 master 给不了的语义：一是 kvcm 在 READY 核验全 rank 落位后才发，事件语义是「该实例全 rank 齐备、可路由」；master 即使肯发 `CopyEnd` 也只是单 key 粒度的「字节落位」——「几个 rank 算齐」的聚合语义只有控制面能给（引擎侧同构：全 rank put 齐才由 `KVEventAggregator` 聚合发出，F8-2）。二是补发的 hash 与引擎**同口径**（keys.py 复算同一 hash 链），补发条目直接进**主索引树**、与引擎自发条目同树合并——对照 Dynamo predict-on-route 侧树：它分立的根因正是 router 自算 hash 与引擎口径不同、写入主树会污染（§1），我们不背这个约束。实现见下方「方案 a 落地」。
 - **b. 池侧事件流（管删除，升级后索引侧直订为首选）**：升级后打开 master publisher（F14），removed/cleared 正是删除面需要的（删除是 key 全局事件、全部副本一起删，无需位置，F15）。**首选：索引侧直接订阅 master 的 ZMQ 端点，把事件里的 PoolKey 解析出 block hash 入索引**——Conductor 的 `ParseVllmObjectKey` 是现成实现（已覆盖 vLLM-Ascend key 布局，F14），Dynamo kv-router 自持 hash↔key 映射同构（`shared_cache.rs`，F14）；同一逻辑块的多个 rank key 由索引侧去重成一条。**备选：kvcm 订阅后翻译成引擎格式 `BlockRemoved` / `AllBlocksCleared` 重发**——仅当索引侧坚持只消费引擎格式时（keys.py 已知格式，翻译逻辑现成）。两条路 Router 都不碰池格式。stored 事件不取（hash 全空，且引擎自己发得更全，F14）。管不了放置：复制路径零发布 + 载荷无位置；「升级后让它顺便管放置」不成立——加发布点加位置 = fork mooncake（submodule 只读，fork 后长期自己维护），事件仍是池 schema，放置反被绑上升级节奏，而方案 a 在 0.3.11 即可跑。**0.3.11.post1 不含 publisher（E8 已核），要用须升级 mooncake 版本**——删除问题随之解决，不另做机制。
 - **c. router 直读 master（排除）**：放置删除都能解决（现查现准），但要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件，脱离经典事件驱动架构，且是全新增机制。
 - **kvcm 轮询对账（不做）**：周期拉 master 全量快照、与自己的记录 diff——唯一价值在删除面（能发现副本没了）；只为删除做一个对账器得不偿失，删除由升级解决。
