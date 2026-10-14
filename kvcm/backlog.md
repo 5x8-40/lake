@@ -30,7 +30,7 @@
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无独立 pin API。main 的 pin 机制都挂在写路径（`PutStart` / `UpsertStart` 收 `ReplicateConfig`，`master_service.h:452` / `:515`）：**soft pin**（`soft_pin_action`，key 粒度限时驱逐保护，默认 30min / 上限 24h，`types.h:85-89`，到期自动失效；驱逐两轮制排最后，`allow_evict_soft_pinned_objects` 默认 true = 极端情况仍可驱逐，`master_service.h:987-995`）与 **hard pin**（`with_hard_pin`，不可驱逐，`replica.h:113`）。**`CreateCopyTask` 无 config 参数（`master_service.h:844-846`），预复制路径带不了 pin**——预热副本只能靠 lease 机制（`SubmitReplicaActionProposal` → `ReplicaActionLease`）或池侧扩展。lake 文档有同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）可参考。
+- pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无独立 pin API。main 的 pin 机制都挂在写路径（`PutStart` / `UpsertStart` 收 `ReplicateConfig`，`master_service.h:452` / `:515`）：**soft pin**（`soft_pin_action`，key 粒度限时驱逐保护，默认 30min / 上限 24h，`types.h:85-89`，到期自动失效；驱逐两轮制排最后，`allow_evict_soft_pinned_objects` 默认 true = 极端情况仍可驱逐，`master_service.h:987-995`）与 **hard pin**（`with_hard_pin`，不可驱逐，`replica.h:113`）。**`CreateCopyTask` 无 config 参数（`master_service.h:844-846`），预复制路径带不了 pin**；hard pin 写入时固化进对象元数据（`master_service.cpp:6068`）、全驱逐路径检查 `IsHardPinned`（`:8117` 等）。无给已有 key 事后加/解 pin 的独立 RPC——`SubmitReplicaActionProposal` 不是 pin（action 只有 ADD，`rpc_types.h:17-19`）。预热副本要保护只能池侧扩展。lake 文档有同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）可参考。
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
 - demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（若以落盘为 READY，等待落盘的时间会把预热收益抵消）。用途二：实例计划下线前降层保存 KV，避免属主下线整批删除（D1 F5；下线删除是否覆盖 disk 副本未核实 → E5/D3）。
 - release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 提供会话生命周期线索，控制面决策，池兜底；含中间档 demote）。
@@ -40,7 +40,8 @@
 
 - 事实：副本无 pin，READY 后池可驱逐；属主实例下线后 key 连同远端副本被 master 元数据级移除（字节成无索引残留；exist 0/32 实测见 [EXPERIMENTS.md](EXPERIMENTS.md)）——D1 F5。lease 为 key 粒度：读续租、`CopyStart` 不续租、TTL/驱逐删 key 释放全部副本——D1 F15。
 - 待定：READY 是否 =「本机 DRAM 必达」；保活策略；属主下线后副本归属（保留/驱逐/迁移）。
-- 保活机制事实（D1 F15）：`batch_is_exist` 顺带续租（`ProbeKey` 不续），默认 TTL 10s——预复制不续租则一个 TTL 窗口内无流量即可驱逐；保活循环必须有界（会话期 / 固定窗口 / 首流量后停租），无限续租 = 变相 pin。策略（续多久、何时停）本节定型。
+- 保活机制事实（D1 F15）：`batch_is_exist` 顺带续租（`ProbeKey` 不续），默认 TTL 10s——预复制不续租则一个 TTL 窗口内无流量即可驱逐；保活循环必须有界（会话期 / 固定窗口 / 首流量后停租），无限续租事实上等于 pin。策略（续多久、何时停）本节定型。
+- 下线迁移事实：main 有 `CreateDrainJob`（`master_service.h:872`，把指定 seg 优雅排空到目标 seg，带并发上限）——实例计划下线前的迁移路径，归本节评估。
 - 落盘子项：Mooncake DRAM→SSD（`enable_ssd_offload`，本目录默认 `false`）是池内冷热，不是「预复制直指定 disk」；SSD 仅作容量/恢复异步 demote。
 - 直接影响故障恢复时已预热前缀的可用性（D5）。事实输入：E5。
 

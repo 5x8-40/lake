@@ -32,8 +32,8 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   - 属主实例（最初写入 key 的引擎）下线后，master 把它写入的 key 连同这些 key 在**所有机器**上的副本一起删除——**我们预热到 B 的副本也在其中，一起没**（实测：属主下线后 exist 0/32，机制与时机待确认 → E5；记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
   - mooncake main 有 pin 机制，但都挂在写路径上（`PutStart` / `UpsertStart` 收 `ReplicateConfig`，`master_service.h:452` / `:515`）：
     - **soft pin**（`soft_pin_action`，`replica.h:64-68`）：key 粒度的**限时**驱逐保护——默认 30min、上限 24h（`types.h:85-89`），到期自动失效（`CleanupExpiredSoftPins`，`master_service.h:1468`）；驱逐两轮制把它排最后——第一轮只驱逐无 soft pin 的对象，第一轮凑不够且 `allow_evict_soft_pinned_objects`（默认 true，`types.h:90`）时软 pin 也可被驱逐（`master_service.h:987-995`），所以叫「软」。
-    - **hard pin**（`with_hard_pin`，`replica.h:113`）：不可驱逐。
-  - **`CreateCopyTask` 没有 config 参数（`master_service.h:844-846`），预复制路径带不了 pin**——预热副本要保护只能另找机制（lease 等，归 D2）。
+    - **hard pin**（`with_hard_pin`，`replica.h:113`）：显式 pin，不可驱逐——写入时设置并固化进对象元数据（`master_service.cpp:6068`），全驱逐路径检查 `IsHardPinned`（`:8117` / `:11918` / `:12213` / `:12434`）。
+  - **`CreateCopyTask` 没有 config 参数（`master_service.h:844-846`），预复制路径带不了 pin**；也没有给已有 key 事后加/解 pin 的独立 RPC——`SubmitReplicaActionProposal` 不是 pin（action 只有 ADD，`rpc_types.h:17-19`）。预热副本要保护只能池侧扩展，归 D2。
 - **F6 引擎 APC（HBM 前缀缓存）私有**：APC 是引擎私有 LRU——无 pin、无池元数据、外部不可见（kv-prefetch.md 方案 A 注意节）。
 - **F15 lease 是 key 粒度：读续租、复制不续租、删 key 释放全部副本**：
   - lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本没有独立 TTL。
@@ -113,6 +113,54 @@ flowchart TB
 - **事件来源实例 = 物理位置**：写被 `preferred_segment` 固定在本机 seg → router 做前缀亲和即拿到本机读。「router 怎么知道 KV 在哪台机器」：不是靠事件带位置——谁 put 的，KV 就在谁本机。
 - **引擎是唯一写者** → 引擎事件的并集 ≈ 池内容；缺口是池侧删除面（引擎通道无 Removed，F10；池原生 publisher 有但默认关，F14）。
 - **任何实例都能读任何前缀**：`BatchQuery` 现查 master，副本在哪都能读（跨机 RDMA）；位置只影响快慢，不影响正确性（F3）。
+
+## 目标形态：kvcm 就位后的全链路
+
+```mermaid
+flowchart TB
+    subgraph FE["前端"]
+        AG["agent / coder 钩子"]
+    end
+    subgraph RT["Router（只消费引擎格式事件）"]
+        IDX["索引 block hash → 实例<br/>gpu=HBM / cpu=本机 DRAM 池"]
+    end
+    KV["kvcm 控制面<br/>复制 + 有界保活 + 补发/翻译事件"]
+    subgraph A["实例 A（源）"]
+        EA["引擎 + APC（HBM 私有）"]
+        SA["本机 DRAM seg"]
+    end
+    subgraph B["实例 B（目标）"]
+        EB["引擎 + APC"]
+        SB["本机 DRAM seg"]
+    end
+    M["mooncake_master<br/>key → 副本 → seg 权威"]
+    PB["池事件 publisher<br/>0.3.11 不含，升级后（F14）"]
+
+    AG -->|"① 请求发出前先给预告（前缀，形态归 D4）"| RT
+    AG -->|"请求"| RT
+    RT -->|"② intent 上行：前缀 × 目标实例（E12）"| KV
+    KV -->|"③ create_copy_task / 核验 / 保活（F4/F15）"| M
+    M -->|"④ 派 copy 任务给源属主（F4）"| EA
+    SA -->|"⑤ RDMA 复制（源属主执行）"| SB
+    KV -.->|"⑥ 事件下行：补发 BlockStored（方案 a）<br/>重发翻译后的 BlockRemoved（方案 b）"| IDX
+    EA -.->|"⑦ 引擎原生事件 gpu/cpu（F8）"| IDX
+    EB -.->|"⑦"| IDX
+    M -->|"⑧ stored / removed / cleared（F14）"| PB
+    PB -.->|"⑨ 订阅，PoolKey → hash 翻译（升级后）"| KV
+    RT -->|"⑩ 选路下发"| EB
+    EB -->|"⑪ BatchQuery 现查（F1）"| M
+    EB -->|"⑫ 本机没有选远端：跨机 RDMA 读（F3）"| SA
+    KV -->|"⑬ 停保活 / demote / Remove（§6）"| M
+    SA <-->|"注册/心跳"| M
+    SB <-->|"注册/心跳"| M
+```
+
+读图：
+
+- **两条单向通道（§4）**：intent 上行 ②，事件下行 ⑥；虚线 = 事件流，实线 = 控制/数据流。
+- ① 是「提前备」的提前量来源（§4）：前端钩子比请求早到，router 拿到预告后按 ② 表达意图，复制与否由 kvcm 决策。
+- ⑧⑨ 升级 mooncake 后才存在（F14）；升级前删除面无事件，索引条目过时只损性能（§2）。
+- ⑬ 是 §6 的三个手段：停保活主路径、demote 中间档、Remove 例外；池驱逐兜底不在图上（master 内部行为）。
 
 ## 设计决策
 
@@ -213,7 +261,7 @@ router 自始至终只消费引擎格式（`BlockStored` / `BlockRemoved` / `All
 - **例外通道·主动 Remove（硬释放）**：等不了自然过期、要立即腾地方时用；key 全局删除（A 的原本一起删），门槛 = 确认前缀谁都不再用（会话明确结束、前缀一次性）。`Remove` / `BatchRemove` 现成（D2）。
 - **兜底·池驱逐（非手段）**：即使控制面出错（没停保活、没发 Remove），池的 TTL 与驱逐也会最终回收——不会出现没人记得、永远占着内存的孤儿副本。三个手段只让回收更快更准，正确性不靠它们。
 
-已知缺口（登记，不归 D1）：master 无显式 pin API（lease 机制 → D2）；属主下线副本一并移除（F5 → D3/D5）。
+已知缺口（登记，不归 D1）：显式 pin（hard pin）只在写路径可设，无事后加/解 pin 的独立 RPC，预复制带不了（F5 → D2）；属主下线副本一并移除（F5 → D3/D5）。
 
 ## 留给后续
 
