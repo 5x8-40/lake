@@ -27,7 +27,13 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F2 一把 key = 一个满块在一个 rank 上的切片**：KV 按 block 切开（本模型 128 token 一块）；TP 下每个 rank 只持有块的一部分，同一块在不同 rank 内容不同——「满块 × rank」的每一片是池里一个独立对象 = 一把 key，尾部带 rank 编号（`head_or_tp_rank`）。例：801 token 前缀 = 6 个满块（768 token，余 33 不满一块不进池），TP=2 → 6 × 2 = **12 把 key**（详见 README「三个对象」）。
 - **F3 读路径：先查后选，本机优先**：引擎读池分两步——先向 master 查副本列表（`BatchQuery`，F1），再开读会话搬数据。非 layerwise 读时 `SelectBestReplica` 本机内存副本优先（`replica_selection.h:122`）。layerwise 的读会话（get session）建立时从列表里选定一个副本（本机优先，`SelectCompleteMemoryReplica`，`real_client.cpp:470`），整个会话只从它读（读时校验锁定的必须恰好一个，否则报 `INVALID_REPLICA`，`:6470`）；会话本身带租约，建立后一个 TTL 窗口内有效（`:6464`）。推论：复制必须在会话建立前落位，本次才用得上；赶不上，选择器自动挑远端副本，跨机读，只影响当前这一次请求（[kv-prefetch.md](kv-prefetch.md) 时序节）。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源属主客户端（写入该 key 的引擎）必须在线；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
-- **F5 副本无 pin：READY 后随时可能被池驱逐**：复制路径不加 pin / lease（F15），副本落位后不受保护，池驱逐策略说收就收。属主实例（最初写入 key 的引擎）下线后，master 把它写入的 key 连同这些 key 在**所有机器**上的副本一起删除——**我们预热到 B 的副本也在其中，一起没**（实测：属主下线后 exist 0/32，机制与时机待确认 → E5；记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。注：mooncake main 有 soft pin 机制（挂 `ReplicateConfig`），属 D2 pin 候选（见 [backlog.md](backlog.md) D2），与本条「预复制副本默认无保护」不矛盾。
+- **F5 副本无 pin：READY 后随时可能被池驱逐**：
+  - 复制路径不加 pin / lease（F15），副本落位后不受保护，池驱逐策略说收就收。
+  - 属主实例（最初写入 key 的引擎）下线后，master 把它写入的 key 连同这些 key 在**所有机器**上的副本一起删除——**我们预热到 B 的副本也在其中，一起没**（实测：属主下线后 exist 0/32，机制与时机待确认 → E5；记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
+  - mooncake main 有 pin 机制，但都挂在写路径上（`PutStart` / `UpsertStart` 收 `ReplicateConfig`，`master_service.h:452` / `:515`）：
+    - **soft pin**（`soft_pin_action`，`replica.h:64-68`）：key 粒度的**限时**驱逐保护——默认 30min、上限 24h（`types.h:85-89`），到期自动失效（`CleanupExpiredSoftPins`，`master_service.h:1468`）；驱逐两轮制把它排最后——第一轮只驱逐无 soft pin 的对象，第一轮凑不够且 `allow_evict_soft_pinned_objects`（默认 true，`types.h:90`）时软 pin 也可被驱逐（`master_service.h:987-995`），所以叫「软」。
+    - **hard pin**（`with_hard_pin`，`replica.h:113`）：不可驱逐。
+  - **`CreateCopyTask` 没有 config 参数（`master_service.h:844-846`），预复制路径带不了 pin**——预热副本要保护只能另找机制（lease 等，归 D2）。
 - **F6 引擎 APC（HBM 前缀缓存）私有**：APC 是引擎私有 LRU——无 pin、无池元数据、外部不可见（kv-prefetch.md 方案 A 注意节）。
 - **F15 lease 是 key 粒度：读续租、复制不续租、删 key 释放全部副本**：
   - lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本没有独立 TTL。
@@ -35,7 +41,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   - 删除与驱逐：TTL 到期 / 驱逐一律走 `EraseMetadata`——删 key 元数据并释放**全部**副本（`:2308-2313` 注释、`:2374-2375`）；驱逐候选必须 lease 已过期（`:8117` / `:8299` / `:12434`）。
   - 续租 API：`ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`，`:3271` / `:3307`）；`ProbeKey` / `BatchProbeKey` 不续租（`:3276` / `:3312`）；默认 `default_kv_lease_ttl=10s`（`types.h:84`，部署以 master 配置为准）。
   - 推论一：lease 在 key 上，不存在「原副本 TTL 到、复制的副本没到」的状态；removed 是 key 全局事件，无需位置。
-  - 推论二：复制不续租，READY 后一个 TTL 窗口内无流量即进入可驱逐状态——控制面需有界保活（周期 `batch_is_exist`，kvcm 现成调用；无限续租 = 变相 pin，违背 F5），保活策略归 D3。
+  - 推论二：复制不续租，READY 后一个 TTL 窗口内无流量即进入可驱逐状态——控制面需有界保活（周期 `batch_is_exist`，kvcm 现成调用）；保活必须有界，无限续租事实上等于 pin，池永远收不走这些 key。保活策略归 D3。
 
 **引擎 kv event**
 
@@ -46,7 +52,10 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   - 范围：本部署只挂 AscendStoreConnector；`preempt_offload` connector 另有事件路径（`preempt_offload/manager.py:732`，cpu_block_pool 事件），不在本部署范围。
 - **F9 盲区一：预复制在两条通道上都不会自动产生事件**：引擎事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码），`create_copy_task` 完全在引擎之外 → 引擎通道**结构上**不会有预复制事件；master publisher（F14，0.3.12 起）是另一条通道，其复制路径同样零发布——所以预复制落位只能由 kvcm 补发（§2 方案 a）。
 - **F10 盲区二：引擎事件通道上看不到池副本的删除**：vllm-ascend 全仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / 属主下线删除，F5）对引擎事件消费者不可见。注意三条通道别混淆：HBM 淘汰有 Removed（引擎通道，F8-1）；池删除有 removed（master publisher 通道，F14，0.3.11 不含）；引擎通道的池 put 只有 Stored 没有 Removed。
-- **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`），ZMQ 传输，RFC #1527 schema——**用途是池级缓存失效广播**：面向外部索引器报告「某把 key 存了 / 删了 / 清了」；对我们的价值只在 removed/cleared（删除面），stored 无 hash 内容且引擎自己发得更全。字段名兼容 vLLM（legacy `type:"BlockStored"` / `block_hashes` / `parent_block_hash`）但**内容全空/nil**（`kv_event_publisher.cpp:440-462`；config 注释「parent_hash and token_ids are not interpreted by the storage publisher」）——有效载荷 = `object_key`（PoolKey 字符串）+ `medium` + tenant/group + 固定上下文（`model_name` / `backend_id` / `block_size` / `dp_rank`），**不含 seg/机器位置**（事件只说哪把 key 怎么了，不说 key 在哪台机器上）；`backend_id` 标识池级流（一 master 一端点，非实例级）。stored 事件对 router 无可用 hash 内容。
+- **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`），ZMQ 传输，schema 套用 RFC #1527。
+  - **schema 从哪来、为谁设计**：RFC #1527 是「推理引擎 → KV 感知 router/indexer」的事件线格式（原文：事件告知 router 每个 worker 上哪些块被存/删，供缓存感知调度），hash 是核心字段。mooncake 存储侧套用了这个 schema，但**池是内容无关的字节块存储——只认识 PoolKey 字符串，不知道 token 与 hash 链（hash 只有写入方知道）**，所以字段名兼容 vLLM（legacy `type:"BlockStored"` / `block_hashes` / `parent_block_hash`）但**内容全空/nil**（`kv_event_publisher.cpp:440-462`；config 注释「parent_hash and token_ids are not interpreted by the storage publisher」）。
+  - **有效载荷** = `object_key`（PoolKey 字符串）+ `medium` + tenant/group + 固定上下文（`model_name` / `backend_id` / `block_size` / `dp_rank`），**不含 seg/机器位置**（事件只说哪把 key 怎么了，不说 key 在哪台机器上）；`backend_id` 标识池级流（一 master 一端点，非实例级）。
+  - **这套事件现在能服务谁**：没有 hash，通用 router 对不上自己的索引，直接用不了；能用的是**讲 PoolKey 命名空间的消费者**——写入方自己，或拥有 PoolKey ↔ hash 映射的控制面。对我们来说这个控制面就是 kvcm（keys.py 就是 PoolKey ↔ block hash 映射的拥有者）：kvcm 订阅池事件、从 PoolKey 解析出 hash、翻译成引擎格式重发给 router（§2 方案 b）。对我们的价值只在 removed/cleared（删除面）；stored 不取（无 hash 内容，且引擎自己发得更全）。
   - 发布点（精确到宿主函数）：
 
     | 事件 | 发布点 |
@@ -200,7 +209,7 @@ router 自始至终只消费引擎格式（`BlockStored` / `BlockRemoved` / `All
 手段三个 + 兜底一个：
 
 - **主路径·停保活（软释放）**：副本活着是因为有读在续租、或控制面在保活（F15）——释放不需要新动作，停止动作就行：控制面停掉某前缀的保活，租约到期池自然收走。保护机制：任何实例还在读这个前缀，读路径会自动续租，key 不受影响——停保活只是控制面不再续租，动不了仍在使用的数据。
-- **中间档·demote（降层）**：不删除，DRAM → SSD，前缀还在池里可读（更慢）；适合「近期不用、但可能还会用」。操作集归 D2（`enable_ssd_offload` / `EvictDiskReplica`）。
+- **中间档·demote（降层）**：不删除，DRAM → SSD，前缀还在池里可读（更慢）。两个用途：「近期不用、但可能还会用」的前缀降层省 DRAM；**实例计划下线前把它的 KV 降层保存，避免属主下线 key 被整批删除（F5）**——下线删除是否连 disk 副本一起清未核实（归 E5/D3），核实前此用途按候选记账。操作集归 D2（`enable_ssd_offload` / `EvictDiskReplica`）。
 - **例外通道·主动 Remove（硬释放）**：等不了自然过期、要立即腾地方时用；key 全局删除（A 的原本一起删），门槛 = 确认前缀谁都不再用（会话明确结束、前缀一次性）。`Remove` / `BatchRemove` 现成（D2）。
 - **兜底·池驱逐（非手段）**：即使控制面出错（没停保活、没发 Remove），池的 TTL 与驱逐也会最终回收——不会出现没人记得、永远占着内存的孤儿副本。三个手段只让回收更快更准，正确性不靠它们。
 

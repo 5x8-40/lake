@@ -30,9 +30,9 @@
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无显式 pin API——靠 lease 机制（`SubmitReplicaActionProposal` → `ReplicaActionLease`）或池侧扩展。main 另有 **soft pin**（默认 30min / 上限 24h，`types.h:86-89`），挂在 `ReplicateConfig` 路径（put/replicate 时指定，非「给已有 key 加 pin」的独立 API），`allow_evict_soft_pinned_objects` 默认 true = 软保护。lake 文档有同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）可参考。
+- pin：READY 后防驱逐。master 只有全局驱逐（`BatchEvict`、tenant watermark），无独立 pin API。main 的 pin 机制都挂在写路径（`PutStart` / `UpsertStart` 收 `ReplicateConfig`，`master_service.h:452` / `:515`）：**soft pin**（`soft_pin_action`，key 粒度限时驱逐保护，默认 30min / 上限 24h，`types.h:85-89`，到期自动失效；驱逐两轮制排最后，`allow_evict_soft_pinned_objects` 默认 true = 极端情况仍可驱逐，`master_service.h:987-995`）与 **hard pin**（`with_hard_pin`，不可驱逐，`replica.h:113`）。**`CreateCopyTask` 无 config 参数（`master_service.h:844-846`），预复制路径带不了 pin**——预热副本只能靠 lease 机制（`SubmitReplicaActionProposal` → `ReplicaActionLease`）或池侧扩展。lake 文档有同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）可参考。
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
-- demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（若以落盘为 READY，等待落盘的时间会把预热收益抵消）。
+- demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（若以落盘为 READY，等待落盘的时间会把预热收益抵消）。用途二：实例计划下线前降层保存 KV，避免属主下线整批删除（D1 F5；下线删除是否覆盖 disk 副本未核实 → E5/D3）。
 - release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 提供会话生命周期线索，控制面决策，池兜底；含中间档 demote）。
 - 事实输入：E6。
 
