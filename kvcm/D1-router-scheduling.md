@@ -3,7 +3,7 @@
 - 状态: **已闭环**——事实基线（F1-F15）已核实；六个设计问题全部闭环
 - 上游问题: [backlog.md](backlog.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
 - 角色约定: kvcm 目前没有 router 组件。本文选路面逻辑上分两层（§1）：**索引**（订阅事件流建索引）与 **Router**（查索引、决定请求发往哪个实例；gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能）。索引进程形态（内置 Router / 外挂组件）归 D4
-- 图: mermaid 源在 [figures/](figures/)（一张图一个 `.mmd`），改后重新渲染：`cd kvcm/figures && npx --yes @mermaid-js/mermaid-cli -i <name>.mmd -o <name>.svg -b white`
+- 图: 主流程图源在 [figures/kvcm-main.mmd](figures/kvcm-main.mmd)，改后重新渲染：`cd kvcm/figures && npx --yes @mermaid-js/mermaid-cli -i kvcm-main.mmd -o kvcm-main.svg -b white`；其余图内联于本文
 
 ## 参考实现
 
@@ -91,7 +91,32 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 ## 基线：无 kvcm 时怎么运作
 
-![无 kvcm 基线](figures/kvcm-baseline.svg)
+```mermaid
+flowchart TB
+    Q["请求"] --> RT
+    subgraph RT["Router（经典事件驱动）"]
+        IDX["索引 block hash → 实例<br/>分层 gpu=HBM / cpu=池"]
+    end
+    RT -->|"① 前缀亲和：发给算过该前缀的实例"| EA
+    subgraph A["实例 A"]
+        EA["引擎 + APC（HBM 私有）"]
+        SA["本机 DRAM seg"]
+    end
+    subgraph B["实例 B"]
+        EB["引擎 + APC"]
+        SB["本机 DRAM seg"]
+    end
+    EA -->|"② put 满块，固定写本机 seg（preferred_segment）"| SA
+    EA -.->|"③ BlockStored gpu/cpu；BlockRemoved 仅 gpu（F8）"| IDX
+    EA -->|"local-first 本机读（F3）"| SA
+    EB -->|"⑤ 副本在 A：跨机 RDMA 读"| SA
+    EA -->|"④ 读：BatchQuery 现查（F1）"| M
+    EB -->|"④ 读：BatchQuery 现查"| M
+    M["mooncake_master<br/>key → 副本 → seg 权威"]
+    M -.->|"stored/removed/cleared，只说 key 怎么了，不说在哪台机器（F14）"| PB
+    PB["池事件 publisher<br/>0.3.11 不含，main 才有（F14）"]
+    PB -.->|"ZMQ"| IDX
+```
 
 要点：
 
@@ -107,7 +132,30 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 事件流与索引：两种部署形态（二选一，kvcm 补发端点与格式相同）：
 
-![事件流与索引：两种部署形态](figures/kvcm-deploy-forms.svg)
+```mermaid
+flowchart LR
+    subgraph NOW["形态一：mooncake 0.3.11 现状（无 publisher、无 Conductor）"]
+        direction TB
+        E1["引擎原生事件<br/>gpu/cpu（F8）"]
+        K1["kvcm 补发 BlockStored<br/>（§2 方案 a）"]
+        R1["Router<br/>（进程内建索引）"]
+        N1["池删除不可见（F10）：<br/>索引条目过时只损性能（§2）"]
+        E1 -.->|"⑦"| R1
+        K1 -.->|"⑥"| R1
+    end
+    subgraph NEW["形态二：升级 mooncake 后（有 publisher、有 Conductor）"]
+        direction TB
+        E2["引擎原生事件 gpu/cpu"]
+        K2["kvcm 补发 BlockStored"]
+        P2["池 publisher<br/>stored / removed / cleared（F14）"]
+        C2["Conductor<br/>RFC #1403"]
+        R2["Router"]
+        E2 -.->|"⑦"| C2
+        K2 -.->|"⑥"| C2
+        P2 -.->|"⑨ 解析 object_key 出 hash（§2 方案 b）"| C2
+        R2 -->|"查询：token_ids 或 hash"| C2
+    end
+```
 
 读图：
 
@@ -137,7 +185,23 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 三种索引形态对比（三种摆法索引内容相同，区别只在谁建索引、查询是否跨进程；kvcm 补发端点三形态相同，零适配）：
 
-![三种索引形态对比](figures/kvcm-index-forms.svg)
+```mermaid
+flowchart LR
+    subgraph F1["形态一：Router 内置索引"]
+        direction TB
+        SRC1["引擎事件 + kvcm 补发"] --> R1["Router<br/>（进程内建索引）"]
+    end
+    subgraph F2["形态二：外挂 Conductor"]
+        direction TB
+        SRC2["引擎事件 + kvcm 补发 + 池 publisher"] --> C2["Conductor"]
+        R2["Router"] -->|"HTTP 查询"| C2
+    end
+    subgraph F3["形态三：内置 + 暴露查询服务"]
+        direction TB
+        SRC3["引擎事件 + kvcm 补发"] --> R3["Router-1<br/>（进程内建索引 + 开查询服务）"]
+        R4["Router-2 …"] -->|"HTTP 查询"| R3
+    end
+```
 
 ### 2. 可见性：router 的索引怎么知道预复制放置
 
