@@ -50,6 +50,7 @@
 - 待定：READY 信号如何接 gateway/router：谁发起预取、何时放行、失败重试。过载/准入仍归 gateway，推理侧只管执行。
 - 待定：Prefetch Orchestrator 形态（旁路进程或并入 Router）：收 intent → 调 B2 → READY 确认 → 放行。
 - 边界（随 D1 §2 方案 a，已闭环）：router 消费引擎 kv event，预复制放置由控制面补发事件注入（D1 §2）；控制面侧 seg→实例拓扑由编排层提供（测试床 resolve.py 探测链是取证手段，不是生产路径）。
+- 登记：mooncake 自家 Conductor（`mooncake-conductor/`，C++）是现成索引器组件，与 kvcm **职责互补不重叠**——Conductor = router 侧索引（订阅引擎/池事件建全局前缀表，HTTP `/query` 出「前缀 × 实例 × 介质」命中；含 object_key→hash parser），不复制、不保活、不释放；kvcm = 池控制面（复制 / 保活 / 补发事件 / 释放），Conductor 都没有。重叠仅一点：object_key→hash 解析（它自用建索引，我们方案 b 翻译重发）。复用路径两条：组件级——router 索引直接用 Conductor（方案 b 翻译层随之消失，方案 a 补发仍需要、接收方变 Conductor）；代码级——自研索引则对照 `object_key_parser.cpp`。待评估：成熟度（文档写 Go、仓内实现为 C++；0.3.11 不含、随升级获得）、在线路径 HTTP 查询延迟 vs 进程内索引、HA、与 §5 打分逻辑的结合（D1 F14 消费者现状节）。
 - 是 D1 时序问题的执行面。骨架先行：E12/E13。
 
 **D5. 故障衔接**
@@ -99,7 +100,7 @@
 - **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。
 - **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC 候选，与仓内跨语言 RPC 选型一致）。协议字段依赖 D4 定型；通道骨架可先行。
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例拉起 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3/D5 耦合）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
-- **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自产引擎格式事件。**pub 端**：直接 import 上游 `ZmqEventPublisher`（`kv_events.py:305`），事件字段取自 keys.py 中间产物（hash 链 / token ids），READY 核验后按目标实例各发一条 `BlockStored`；每目标实例一个发布端点，「端点 → 实例」注册归 D4/E13。**升级 mooncake 后加 sub 端 + 翻译**：订阅 master publisher（F14），PoolKey 解析 block hash、rank 去重，重发 `BlockRemoved` / `AllBlocksCleared`；引擎事件 sub 端归 router 侧。pub 骨架可直接开工。
+- **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自产引擎格式事件。**pub 端**：直接 import 上游 `ZmqEventPublisher`（`kv_events.py:305`），事件字段取自 keys.py 中间产物（hash 链 / token ids），READY 核验后按目标实例各发一条 `BlockStored`；每目标实例一个发布端点，「端点 → 实例」注册归 D4/E13。**升级 mooncake 后加 sub 端 + 翻译**：订阅 master publisher（F14），PoolKey 解析 block hash、rank 去重，重发 `BlockRemoved` / `AllBlocksCleared`；解析可直接对照 mooncake-conductor `object_key_parser.cpp:160-276`（`ParseVllmObjectKey`，已覆盖 vLLM-Ascend key 布局）；引擎事件 sub 端归 router 侧。pub 骨架可直接开工。
 
 ### C. 性能与生产化
 
@@ -111,5 +112,6 @@
 - Dynamo KV-aware router 外部重算 hash 链：[../docs/research/dynamo/overview.md](../docs/research/dynamo/overview.md)
 - llm-d EPP 推测索引（事件确认前先用推测条目，TTL 2s 自动过期）：[../docs/research/llm-d/](../docs/research/llm-d/)
 - AIBrix ZMQ 事件同步：[../docs/research/aibrix/](../docs/research/aibrix/)
-- mooncake master API（submodule 源码，符号锚点）：`master_service.h`（`CreateCopyTask` / `SubmitReplicaActionProposal` / `Remove` / `BatchEvict`）、`master_config.h`（`enable_kv_events` 开关，E8）、`master_service.cpp`（`CopyStart:6444` 幂等三层防护；`CreateCopyTask:13677` 提交层无去重；reaper `10654` 附近）
+- mooncake master API（submodule 源码，符号锚点）：`master_service.h`（`CreateCopyTask` / `SubmitReplicaActionProposal` / `Remove` / `BatchEvict` / `CreateDrainJob`）、`master_config.h`（`enable_kv_events` 开关，E8）、`master_service.cpp`（`CopyStart:6444` 幂等三层防护；`CreateCopyTask:13677` 提交层无去重；reaper `10654` 附近）
+- mooncake Conductor（池事件的自家消费者）：`mooncake-conductor/src/kvevent/object_key_parser.cpp`（`ParseVllmObjectKey:160` / `ParseSglangObjectKey:99`）、`docs/source/design/conductor/conductor-architecture-design.md`
 - 关键差异：现有系统的事件都是单源（引擎侧或池侧），我们是双源（引擎原生事件 + kvcm 补发/翻译的池事件），权威归属与合并规则要自己定（D1 §2/§3）。
