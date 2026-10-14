@@ -2,7 +2,7 @@
 
 - 状态: **已闭环**——事实基线（F1-F15）已核实；六个设计问题全部闭环
 - 上游问题: [backlog.md](backlog.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
-- 角色约定: kvcm 目前没有 router 组件。本文「选路方 / router」指未来消费引擎 kv event、决定请求发往哪个实例的组件（gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能），进程形态归 D4
+- 角色约定: kvcm 目前没有 router 组件。本文选路面逻辑上分两层（§1）：**索引**（订阅事件流建索引）与 **Router**（查索引、决定请求发往哪个实例；gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能）。索引进程形态（内置 Router / 外挂组件）归 D4
 
 ## 参考实现
 
@@ -15,6 +15,8 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 | lake 单向边界 | [`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「池放置·调度读视图」 | 调度读视图、不反向指挥放置的边界形态 | lake 的池有自主放置能力；Mooncake 池没有，放置智能只能在外置控制面 |
 | llm-d Router | [`../docs/research/llm-d/overview.md`](../docs/research/llm-d/overview.md)「核心结论」；[`../docs/research/llm-d/architecture.md`](../docs/research/llm-d/architecture.md) §4 | 推测索引（事件确认前先用推测条目顶上，TTL 2s 自动过期） | llm-d 索引是事件流派生的副本视图（引擎才是真相）；master 直读没有该窗口 |
 | Dynamo router | [`../docs/research/dynamo/overview.md`](../docs/research/dynamo/overview.md)「Router(KV-aware)」 | 成本模型（分层命中×权重 + decode 占用 + 在途请求）；分层计价 device 1.0 / host 0.75 / disk 0.25；在途负载无权威、router 本地记账 | Dynamo 缓存状态权威在 worker 本地索引，router 靠事件逼近（丢事件需 gap→快照重放）；直读 master 无此失效模式。外部重算 block hash 链 Dynamo 已为先例（keys.py 同款） |
+| Mooncake Conductor | mooncake 仓内 `mooncake-conductor/`：`object_key_parser.cpp::ParseVllmObjectKey`；HTTP 契约 RFC #1403（F14） | 现成外挂索引组件：订阅引擎/池事件建全局前缀索引，Router 走 HTTP 查询；object_key 解析已覆盖 vLLM-Ascend key 布局（keys.py 一族） | Conductor 是只读索引，不管复制/保活/补发——与 kvcm 职责互补；组件级替代评估归 backlog D4 |
+| Dynamo standalone indexer | dynamo 仓内 `lib/kv-router/src/services/indexer/`；`standalone-indexer.md` | RFC #1403 契约参照实现：`/register`（含 replay_endpoint）/ `/query` / **`/query_by_hash`**；gap 检测 + replay；P2P recovery（`--peers` 外挂索引 HA 答案）；`/query` 按 gpu/cpu/disk 分层返回 | 它只订引擎事件不订池——「事件源单一时外挂无聚合价值」的实例；Dynamo 主流 kv-router 仍内置索引 + shared_cache 直订 master |
 | Mooncake 界限 | [`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「为何池必须自长 radix」 | Mooncake store 只存不透明字节块（无内容寻址、无前缀匹配）——预复制控制面是外置的「懂前缀 + 懂位置」层 | 不照搬 lake 的池内 radix：keys.py 按 key 逐把算，不建树；前缀匹配退化为「连续满块命中长度」 |
 
 ## 事实基线（代码核实）
@@ -54,13 +56,17 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F10 盲区二：引擎事件通道上看不到池副本的删除**：vllm-ascend 全仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / 属主下线删除，F5）对引擎事件消费者不可见。注意三条通道别混淆：HBM 淘汰有 Removed（引擎通道，F8-1）；池删除有 removed（master publisher 通道，F14，0.3.11 不含）；引擎通道的池 put 只有 Stored 没有 Removed。
 - **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`），ZMQ 传输，schema 套用 RFC #1527。
   - **schema 从哪来、为谁设计**：RFC #1527 是「推理引擎 → KV 感知 router/indexer」的事件线格式（原文：事件告知 router 每个 worker 上哪些块被存/删，供缓存感知调度），hash 是核心字段。mooncake 存储侧套用了这个 schema，但**池是内容无关的字节块存储——只认识 PoolKey 字符串，不知道 token 与 hash 链（hash 只有写入方知道）**，所以字段名兼容 vLLM（legacy `type:"BlockStored"` / `block_hashes` / `parent_block_hash`）但**内容全空/nil**（`kv_event_publisher.cpp:440-462`；config 注释「parent_hash and token_ids are not interpreted by the storage publisher」）。
+  - **配套的索引契约（RFC #1403，KV-Store Indexer API）**：消费侧的标准形态是**逻辑分层**——索引组件订阅事件流建索引，Router 查索引而不订阅流。事件源（引擎或池）向索引组件 `/register` 注册端点（`type` 支持 vLLM / Mooncake / SGLang，附 `endpoint` 与 `replay_endpoint`）；Router 侧 `/query` 查询，**支持 token_ids 或 block hash key 两种入参**（`/query_by_hash`）——Router 自算请求的 hash 链查 hash 接口即可，不依赖原始 token 文本。Conductor 与 Dynamo standalone indexer 是该契约的两个实现。
   - **有效载荷** = `object_key`（PoolKey 字符串）+ `medium` + tenant/group + 固定上下文（`model_name` / `backend_id` / `block_size` / `dp_rank`），**不含 seg/机器位置**（事件只说哪把 key 怎么了，不说 key 在哪台机器上）；`backend_id` 标识池级流（一 master 一端点，非实例级）。
   - **消费者现状（多方核实）**：
-    - **Mooncake Conductor（自家索引器，设计上的消费者）**：仓内 `mooncake-conductor/`（C++），订阅引擎或存储后端的 KV 事件建全局前缀索引，供 router HTTP 查询（`docs/source/design/conductor/conductor-architecture-design.md`）。对「只有 object_key」的池事件，它用 **`object_key_parser`** 解析出 hash 入索引——`ParseSglangObjectKey`（SGLang 的 SHA-256 key）与 `ParseVllmObjectKey`（注释原话：为「Mooncake publisher 只转发 raw key」场景准备的 vLLM/vLLM-Ascend 连接器 key 兼容解析器，`object_key_parser.h:28-30`），支持 `model@hash@head_or_tp_rank`、`@pcp@dcp@head_or_tp_rank:` 等 vLLM-Ascend 布局（`object_key_parser.cpp:160-276`）——正是 keys.py 的 PoolKey 一族。
-    - **vLLM / SGLang**：不消费——各自只有自己的引擎事件体系（vLLM `kv_events.py`、SGLang `disaggregation/kv_events`），仓内无订阅池事件的代码。
-    - **Dynamo**：不消费——同名 `KvEventPublisher` 是它自己的组件（订阅引擎 ZMQ 转 NATS）；schema 与 RFC #1527 同源，但 mooncake 事件 hash 为空，它的索引器拿到也建不了树。
-    - **GitHub 全仓搜 `KvEventPublisher`**：除 mooncake 本体与上述各家自有组件外无任何订阅方实现；mooncake 仓内订阅代码只有测试（`kv_event_publisher_test.cpp` 的 ScopedSubscriber）。
-    - 结论：真实消费者目前只有 Conductor 一家（自家、在演进中）。**事件不带 hash 是共识现状，消费方的标准做法就是解析 object_key 拿回 hash**——kvcm 方案 b 与之同构，区别只在 Conductor 自己当索引，kvcm 翻译成引擎格式重发（router 保持单一口径）。对我们的价值只在 removed/cleared（删除面）；stored 不取（无 hash 内容，且引擎自己发得更全）。
+    - **Mooncake Conductor（自家索引器，真实消费方）**：仓内 `mooncake-conductor/`（C++），订阅引擎或存储后端的 KV 事件建全局前缀索引，对外提供 RFC #1403 的 HTTP 查询契约（`docs/source/design/conductor/conductor-architecture-design.md`）。对「只有 object_key」的池事件，它用 **`object_key_parser`** 解析出 hash 入索引——`ParseSglangObjectKey`（SGLang 的 SHA-256 key）与 `ParseVllmObjectKey`（注释原话：为「Mooncake publisher 只转发 raw key」场景准备的 vLLM/vLLM-Ascend 连接器 key 兼容解析器，`object_key_parser.h:28-30`），支持 `model@hash@head_or_tp_rank`、`@pcp@dcp@head_or_tp_rank:` 等 vLLM-Ascend 布局（`object_key_parser.cpp:160-276`）——正是 keys.py 的 PoolKey 一族。
+    - **Dynamo kv-router（真实消费方）**：`lib/llm/src/kv_router/shared_cache.rs` 的 `HicacheSharedKvCache`——SGLang HiCache + Mooncake L3 场景，文件头注释原话 "Tracks those object keys from the Mooncake master's KV event stream"（`:4-12`）：从 SGLang worker runtime config 读 master 事件端点（`:164-210`），ZMQ SUB 直连（`:316-323`），解析 `MooncakeEventBatch = (timestamp_ms, events, dp_rank)`（`:86-88`）与 `MooncakeObjectEvent{event_type, object_key, tenant_id, group_id}`（`:76`），自己按 SGLang page hash 规则把前缀展开成 object key、跟踪 `present_keys`；sequence gap → 清空状态重建（`:228`）。消费方自持「hash ↔ key」映射，与解析 object_key 同构。（本条纠正此前「Dynamo 不消费」的错误记录。）
+    - **Dynamo Standalone KV Indexer（另一组件，订引擎不订池）**：`python -m dynamo.indexer`（`lib/kv-router/src/services/indexer/`），文档原话 "subscribes to ZMQ KV event streams directly from workers"（`standalone-indexer.md`）——订的是引擎（bare vLLM/SGLang）事件；HTTP API follow RFC #1403，含 `/query_by_hash`（pre-computed block_hashes 入参，Router 不依赖原始 token）。
+    - **华为 MindIE Motor（真实消费方，经 Conductor）**：官方文档「KV Cache 亲和性调度」——P 实例 `kv-events-config`（zmq）发引擎事件 → Conductor 建全局位置表 → Coordinator 查 Conductor 做亲和调度；`kvevent_instance` 支持注册 `type: "Mooncake"` 事件源（即 master publisher 一路）。对接经 Conductor 完成，网关不自订事件流。
+    - **vLLM / SGLang**：不消费池事件——各自只有自己的引擎事件体系（vLLM `kv_events.py`、SGLang `disaggregation/kv_events`）。vLLM 仓内 `examples/features/kv_events/kv_events_subscriber.py` 订的是 **vLLM 引擎自己**的事件，与 master publisher 无关。
+    - **LMCache**：不消费——Mooncake 对接是纯数据面 connector（`mooncakestore_connector.py`），全文无任何事件订阅代码。
+    - **GitHub 全仓搜 `KvEventPublisher`**：除上述外无其他第三方订阅方实现；mooncake 仓内订阅代码只有测试（`kv_event_publisher_test.cpp` 的 ScopedSubscriber）。
+    - 结论：**事件不带 hash 是共识现状，消费方的标准做法是自己解析 object_key（Conductor 路径）或自持 hash↔key 映射（Dynamo 路径）拿回 hash**。对我们的价值只在 removed/cleared（删除面）；stored 不取（hash 全空，且引擎自己发得更全）。
   - 发布点（精确到宿主函数）：
 
     | 事件 | 发布点 |
@@ -124,10 +130,12 @@ flowchart TB
 ```mermaid
 flowchart TB
     AG["前端 agent / coder 钩子"]
-    subgraph RT["Router（只消费引擎格式事件）"]
-        IDX["索引 block hash → 实例<br/>gpu=HBM / cpu=本机 DRAM 池"]
+    subgraph ROUTE["选路面（逻辑分层；索引进程形态归 D4）"]
+        direction LR
+        RT["Router<br/>算 hash · 打分 · 选路"]
+        IDX["索引（内置或外挂组件）<br/>block hash → 实例"]
     end
-    KV["kvcm 控制面<br/>复制 + 有界保活 + 补发/翻译事件"]
+    KV["kvcm 控制面<br/>复制 + 有界保活 + 补发事件"]
     subgraph POOL["Mooncake"]
         direction LR
         M["mooncake_master<br/>key → 副本 → seg 权威"]
@@ -144,60 +152,60 @@ flowchart TB
         SB["本机 DRAM seg"]
     end
 
-    AG -->|"① 预告 + 请求"| IDX
-    IDX -->|"② intent 上行：前缀 × 目标实例（E12）"| KV
-    KV -->|"③ create_copy_task / 核验 / 保活（F4/F15）"| M
+    AG -->|"① 预告 + 请求"| RT
+    RT -->|"查询：token_ids 或 hash（RFC #1403）"| IDX
+    RT -->|"② intent 上行：前缀 × 目标实例（E12）"| KV
+    KV -->|"③ 复制 / 核验 / 保活 / 释放（F4/F15/§6）"| M
     M -->|"⑧ stored / removed / cleared（F14）"| PB
-    PB -.->|"⑨ 订阅，PoolKey → hash 翻译（升级后）"| KV
-    KV -.->|"⑥ 事件下行：补发 BlockStored（方案 a）<br/>重发翻译后的 BlockRemoved（方案 b）"| IDX
+    PB -.->|"⑨ 订阅，解析 object_key 出 hash（升级后）"| IDX
+    KV -.->|"⑥ 补发 BlockStored（方案 a，告知放置）"| IDX
+    EA -.->|"⑦ 引擎原生事件 gpu/cpu（F8）"| IDX
+    EB -.->|"⑦"| IDX
     M -->|"④ 派 copy 任务给源属主（F4）"| EA
     M ~~~ EB
     EA -->|"put/get（preferred_segment 固定本机）"| SA
     EB -->|"put/get"| SB
     SA -->|"⑤ RDMA 复制（源属主执行）"| SB
-    EA -.->|"⑦ 引擎原生事件 gpu/cpu（F8）"| IDX
-    EB -.->|"⑦"| IDX
-    IDX -->|"⑩ 选路下发"| EB
+    RT -->|"⑩ 选路下发"| EB
     EB -->|"⑪ BatchQuery 现查（F1）"| M
     EB -->|"⑫ 本机没有选远端：跨机 RDMA 读（F3）"| SA
-    KV -->|"⑬ 停保活 / demote / Remove（§6）"| M
-    SA <-->|"注册/心跳"| M
-    SB <-->|"注册/心跳"| M
 ```
 
 读图：
 
-- 主流程从上到下：前端 → Router → kvcm → Mooncake → 引擎层 → seg 层；并列模块横向并排、横边连接——master 与 publisher（⑧）、实例 A 与 B、RDMA 复制（⑤）。事件流（虚线）沿两侧汇回 Router 索引。`~~~` 是不可见边，仅用于布局对齐。
-- **两条单向通道（§4）**：intent 上行 ②，事件下行 ⑥。
-- ① 是「提前备」的提前量来源（§4）：前端钩子比请求早到，router 拿到预告后按 ② 表达意图，复制与否由 kvcm 决策。
-- ⑧⑨ 升级 mooncake 后才存在（F14）；升级前删除面无事件，索引条目过时只损性能（§2）。
-- ⑬ 是 §6 的三个手段：停保活主路径、demote 中间档、Remove 例外；池驱逐兜底不在图上（master 内部行为）。
+- 布局：主流程从上到下（①② → ③④⑤ → ⑩⑪⑫）；同一层的组件横向并排、横边相连——Router‖索引（查询）、master‖publisher（⑧）、实例 A‖B、两侧 seg（⑤ RDMA）。`~~~` 是不可见边，仅用于布局对齐；实例 → master 的注册/心跳边省略（F1，与 kvcm 职责无关）。
+- **选路面逻辑分层（§1）**：索引订阅三类事件（⑥⑦⑨）建索引；Router 不订阅事件流——自算请求的 hash 链查索引（RFC #1403，token_ids 或 hash 两种入参，不依赖原始 token 文本），拿命中分数选路（⑩）。图中 Router‖索引是**逻辑**分层；索引进程形态（内置 Router 进程 / 外挂独立组件）归 D4，两种形态索引内容相同。
+- **两条单向通道（§4）**：intent 上行 ②（Router → kvcm），事件下行 ⑥（kvcm → 索引）。
+- **kvcm 只碰控制面**：复制 / 核验 / 保活 / 释放走 master RPC（③，含 §6 停保活 / demote / Remove 三手段）；数据面复制（⑤ RDMA）由 master 派单（④）、源属主执行。池驱逐兜底不在图上（master 内部行为）。
+- ① 是「提前备」的提前量来源（§4）：前端钩子比请求早到，Router 拿到预告后按 ② 表达意图，复制与否由 kvcm 决策。
+- 请求不等复制完成（⑩ 直接下发）；读路径先查后选（⑪ BatchQuery → ⑫ 跨机读兜底，F1/F3）——预复制只是提高本地命中概率，不是读路径前提。
+- ⑧⑨ 升级 mooncake 后才存在（F14）；⑨ 的首选消费者是索引侧直订（§2 方案 b，kvcm 翻译重发为备选）；升级前删除面无事件，索引条目过时只损性能（§2）。
 
 ## 设计决策
 
 ### 1. 选路方需要哪些输入
 
-决策：router 维护「block hash → 实例」索引，新请求按同一 hash 链算前缀 block hash、查最长匹配（Dynamo/llm-d 同构）。索引的事件来源两个，**kvcm 负责补齐引擎看不到的部分**：
+决策：选路输入是一张「block hash → 实例」索引，逻辑上分两层——**索引**（订阅事件流、维护索引）与**查询**（Router 自算请求的 hash 链查索引、拿命中分数选实例）。逻辑分层是社区共识形态（Conductor / Dynamo standalone indexer / MindIE 同构），查询契约已标准化（RFC #1403：`/query` 支持 token_ids 或 block hash key 两种入参——Router 查 hash 接口即可，不依赖原始 token 文本）。**进程形态留 D4**：索引内置 Router 进程（llm-d EPP / Dynamo kv-router 形态）还是外挂独立组件（Conductor 形态）——两种形态索引内容完全相同（「block hash → 实例 × 介质」），差别只在组件归属、请求路径是否多一跳、HA 与消费者数量，权衡见本节末「留待 D4」。索引的事件来源两个，**kvcm 负责补齐引擎看不到的部分**：
 
 1. **引擎原生事件**：引擎自己的动作——HBM 块的存入与淘汰（medium=gpu）、池 put 的存入（medium=cpu）（F7/F8）。
-2. **kvcm 补发/翻译的事件**：预复制落位（放置，§2 方案 a）；升级 mooncake 后，池里的删除/驱逐由 kvcm 订阅 master publisher、翻译成引擎格式重发（删除，§2 方案 b）。
+2. **kvcm 补发的事件**：预复制落位（放置，§2 方案 a）。删除面升级 mooncake 后由**索引侧直接订阅池 publisher、解析 object_key 出 hash**（首选，Conductor/Dynamo 已为先例，§2 方案 b）；kvcm 订阅翻译重发降级为备选。
 
-router 自始至终只消费引擎格式（`BlockStored` / `BlockRemoved` / `AllBlocksCleared`），不碰池 key、不读 master（§2 方案 c 排除理由）。事件由引擎发出，来源实例直接可知，不需要额外的 seg→实例映射表；kvcm 补发按目标实例端点发，归属同样直接（§2「方案 a 落地」）。
+索引消费引擎格式（`BlockStored` / `BlockRemoved` / `AllBlocksCleared`）为主，不读 master（§2 方案 c 排除理由）；删除面接通后另订阅池 publisher 一条流（解析 object_key，Conductor 现成实现，§2 方案 b）。Router 全程不碰池格式——它只查索引。事件由引擎发出，来源实例直接可知，不需要额外的 seg→实例映射表；kvcm 补发按目标实例端点发，归属同样直接（§2「方案 a 落地」）。
 
-事实约束：引擎事件只覆盖引擎自己的动作（F8）——HBM 淘汰有 Removed，但池侧删除/驱逐/预复制都不产生引擎事件（F9/F10），这些正是 kvcm 要补的部分。事件里的 medium 字段标记 KV 在哪种介质上（gpu=HBM / cpu=DRAM 池），供 §5 分层计价。
+事实约束：引擎事件只覆盖引擎自己的动作（F8）——HBM 淘汰有 Removed，但池侧删除/驱逐/预复制都不产生引擎事件（F9/F10），这些正是 kvcm 要补的部分。事件里的 medium 字段标记 KV 在哪种介质上（gpu=HBM / cpu=DRAM 池），供 §5 分层计价（Dynamo 计价 device 1.0 / host 0.75 / disk 0.25，standalone indexer `/query` 按 gpu/cpu/disk 分层返回）。
 
-留待 D4：事件开关与传输接线（`enable_kv_cache_events` 默认关，需打开才有事件，F8；ZMQ 端点配置、router 订阅方式）在部署形态下怎么接。
+留待 D4：事件开关与传输接线（`enable_kv_cache_events` 默认关，需打开才有事件，F8；ZMQ 端点配置、索引订阅方式）在部署形态下怎么接。**索引进程形态（内置 vs 外挂）**：内置三理由——索引是打分用的摘要、与 scorer 紧耦合（llm-d 架构 §2 原话「是给打分用的摘要，不是存储元数据」；推测索引与 scorer 联动）；请求路径少一跳（EPP 同步选路是内存操作）；事件源单一时外挂无聚合价值（llm-d/Dynamo kv-router 内置的根因）。外挂三理由——事件源多条需聚合（本场景三条：引擎 + kvcm 补发 + 池删除）；消费者多个（Router + 扩缩容/观测控制面）；索引独立 HA（standalone indexer 的 P2P recovery 即外挂形态的答案）。外挂一跳 HTTP 与 D-direct <5ms 模式选择预算的权衡（[`../docs/features/slo.md`](../docs/features/slo.md)；缓解：提前查询、异步化）。Conductor 组件级替代评估见 backlog D4。
 
 ### 2. 可见性：router 的索引怎么知道预复制放置
 
 预复制绕开引擎、不产生引擎事件（F9）→ router 的事件索引永远只知道「前缀在 A」，不知道拷完后「B 也有了」。这里有两个问题：**放置**（router 不知道 B 有了）与**删除**（副本没了，router 还当它存在）。
 
-结论：**放置靠控制面补发事件（方案 a）；删除靠升级 mooncake 后由 kvcm 订阅池 publisher、翻译成引擎格式重发（方案 b）**。router 自始至终只消费引擎格式，不碰池格式。对账与 TTL 不做，直读 master 排除。
+结论：**放置靠控制面补发事件（方案 a）；删除靠升级 mooncake 后打开池 publisher，首选索引侧直接订阅、解析 object_key 出 hash（方案 b；kvcm 订阅翻译重发降级为备选）**。Router 自始至终不碰池格式——它只查索引。对账与 TTL 不做，直读 master 排除。
 
 候选与裁决：
 
-- **a. 控制面补发事件（选定，管放置）**：copy 完成后控制面按引擎格式补发 `BlockStored`，router 零改动。放置归属任何版本都只能靠它（池事件无位置、复制路径零发布，F14）。实现见下方「方案 a 落地」。
-- **b. 池侧事件流（管删除，升级后由 kvcm 翻译接管）**：升级后打开 master publisher（F14），removed/cleared 正是删除面需要的（删除是 key 全局事件、全部副本一起删，无需位置，F15）。**消费方是 kvcm，不是 router**：kvcm 订阅 master 的 ZMQ 端点，把事件里的 PoolKey 解析出 block hash（keys.py 已知格式），按引擎格式重发 `BlockRemoved` / `AllBlocksCleared`；同一逻辑块的多个 rank key 由 kvcm 去重成一条。router 不碰池格式，不会变成池感知组件。生态佐证：mooncake 自家 Conductor 消费同一事件流的做法就是解析 object_key 拿回 hash（`object_key_parser.cpp`，已覆盖 vLLM-Ascend key 布局，F14），与本案同构。stored 事件不取（无 hash 内容，且引擎自己发得更全，F14）。管不了放置：复制路径零发布 + 载荷无位置；「升级后让它顺便管放置」不成立——加发布点加位置 = fork mooncake（submodule 只读，fork 后长期自己维护），事件仍是池 schema，放置反被绑上升级节奏，而方案 a 在 0.3.11 即可跑。**0.3.11.post1 不含 publisher（E8 已核），要用须升级 mooncake 版本**——删除问题随之解决，不另做机制。
+- **a. 控制面补发事件（选定，管放置）**：copy 完成后控制面按引擎格式补发 `BlockStored`，索引与 Router 零改动。放置归属任何版本都只能靠它（池事件无位置、复制路径零发布，F14）。补发还有一层 master 给不了的语义：kvcm 在 READY 核验全 rank 落位后才发，事件语义是「该实例全 rank 齐备、可路由」；master 即使肯发 `CopyEnd` 也只是单 key 粒度的「字节落位」——「几个 rank 算齐」的聚合语义只有控制面能给（引擎侧同构：全 rank put 齐才由 `KVEventAggregator` 聚合发出，F8-2）。实现见下方「方案 a 落地」。
+- **b. 池侧事件流（管删除，升级后索引侧直订为首选）**：升级后打开 master publisher（F14），removed/cleared 正是删除面需要的（删除是 key 全局事件、全部副本一起删，无需位置，F15）。**首选：索引侧直接订阅 master 的 ZMQ 端点，把事件里的 PoolKey 解析出 block hash 入索引**——Conductor 的 `ParseVllmObjectKey` 是现成实现（已覆盖 vLLM-Ascend key 布局，F14），Dynamo kv-router 自持 hash↔key 映射同构（`shared_cache.rs`，F14）；同一逻辑块的多个 rank key 由索引侧去重成一条。**备选：kvcm 订阅后翻译成引擎格式 `BlockRemoved` / `AllBlocksCleared` 重发**——仅当索引侧坚持只消费引擎格式时（keys.py 已知格式，翻译逻辑现成）。两条路 Router 都不碰池格式。stored 事件不取（hash 全空，且引擎自己发得更全，F14）。管不了放置：复制路径零发布 + 载荷无位置；「升级后让它顺便管放置」不成立——加发布点加位置 = fork mooncake（submodule 只读，fork 后长期自己维护），事件仍是池 schema，放置反被绑上升级节奏，而方案 a 在 0.3.11 即可跑。**0.3.11.post1 不含 publisher（E8 已核），要用须升级 mooncake 版本**——删除问题随之解决，不另做机制。
 - **c. router 直读 master（排除）**：放置删除都能解决（现查现准），但要求 router 懂 PoolKey / seg / rank 映射，变成池感知组件，脱离经典事件驱动架构，且是全新增机制。
 - **kvcm 轮询对账（不做）**：周期拉 master 全量快照、与自己的记录 diff——唯一价值在删除面（能发现副本没了）；只为删除做一个对账器得不偿失，删除由升级解决。
 - **router 条目 TTL（当前不做）**：纯删除兜底，与预复制放置无关（它不携带「B 有了」的任何信息）；router 侧独立机制，不需要任何新通道。升级前若删除面要兜底可再议。
@@ -217,9 +225,9 @@ router 自始至终只消费引擎格式（`BlockStored` / `BlockRemoved` / `All
 | `medium` | 与引擎池 put 事件对齐（F8；上游常量 `MEDIUM_CPU`，`kv_events.py:51`） |
 
 - **发布组件**：直接 import 上游 `ZmqEventPublisher`（`kv_events.py:305`）——构造给 `endpoint`/`topic`，`publish(EventBatch)` 一次调用；wire 格式（topic + seq + msgpack 三帧）与 replay buffer 内置。kvcm 容器路径本就已 import vllm / vllm_ascend（keys.py），零新增依赖；沿用 keys.py/common.py 的 lazy import 形态，debug 路径不背 vllm。
-- **身份（哪台机器）**：事件体无实例字段（仅 `data_parallel_rank`，`kv_events.py:39`），上游机制是**身份 = 端点**——router 按订阅端点把事件归入实例；一个实例多个端点有现成先例（DP rank 端口偏移 `offset_endpoint_port`，`kv_events.py:528`）。因此 kvcm **每个目标实例开一个发布端点**，由编排把「端点 → 实例」注册给 router（与引擎端点同一注册通道，归 D4/E13）；router 把补发端点并入该实例的端点集合即可，不需要新概念。ZMQ topic 是消息分拣标签（订阅端按它过滤消息），多个发布者可共用同一个 topic——它标不出「来自哪台机器」，所以身份只能走端点。
+- **身份（哪台机器）**：事件体无实例字段（仅 `data_parallel_rank`，`kv_events.py:39`），上游机制是**身份 = 端点**——索引按订阅端点把事件归入实例；一个实例多个端点有现成先例（DP rank 端口偏移 `offset_endpoint_port`，`kv_events.py:528`）。因此 kvcm **每个目标实例开一个发布端点**，由编排把「端点 → 实例」注册给索引（外挂形态走 RFC #1403 `/register`，与引擎端点同一通道；内置形态同理，归 D4/E13）；索引把补发端点并入该实例的端点集合即可，不需要新概念。ZMQ topic 是消息分拣标签（订阅端按它过滤消息），多个发布者可共用同一个 topic——它标不出「来自哪台机器」，所以身份只能走端点。
 - **发布时机**：READY 核验通过（`precopy.py::assert_targets_have_replicas`）后，一次预复制发一条 `BlockStored`（block_hashes = 前缀连续满块链；引擎侧经 `KVEventAggregator` 跨 rank 聚合后同语义）。
-- **幂等**：router 索引是集合语义，补发与引擎自发重复无害；重复预热重复补发亦无害（池层幂等 F11）。
+- **幂等**：索引是集合语义，补发与引擎自发重复无害；重复预热重复补发亦无害（池层幂等 F11）。
 
 ### 3. 「哪个实例拥有前缀」怎么定义
 
@@ -229,7 +237,7 @@ router 自始至终只消费引擎格式（`BlockStored` / `BlockRemoved` / `All
 
 成立条件（已核事实）：
 
-- **router 口径即索引声称**：router 不读 master（§2），「拥有」= 索引中 P 的连续满块链每个 block hash 都有 X 的条目。条目可能过时（cpu 侧只增不减，F10），选错由读路径兜底（F3），只损性能。
+- **Router 口径即索引声称**：Router 不读 master（§2），「拥有」= 索引中 P 的连续满块链每个 block hash 都有 X 的条目。条目可能过时（cpu 侧只增不减，F10），选错由读路径兜底（F3），只损性能。
 - **rank 维度由事件语义消除**：引擎侧全 rank put 才发（`KVEventAggregator`，F8-2）；kvcm 侧全 rank READY 核验才补发（`assert_targets_have_replicas`）。一条事件 = 该实例全 rank 齐备，router 无需 per-rank 索引。MLA（`put_step>1`）时 KV 只按 rank 0 存（copy plan 全落 targets[0]），判定退化为单 rank，未实测（E7）。
 - **本机 = 事件归属实例**：cpu 条目的物理位置 = 发布端点归属的实例（引擎 put 固定写本机 seg；kvcm 按目标实例端点补发，§2）。同机多实例各持 seg 的细分（本机他实例 seg 算不算「本机」）当前部署不出现，出现时按 seg→实例注册细化，归 D4/E13。
 
@@ -247,7 +255,7 @@ router 自始至终只消费引擎格式（`BlockStored` / `BlockRemoved` / `All
 - **预热中到达照常下发**：引擎读池时先查副本列表选一个——本机没有就选远端，跨机读，慢一些不出错；选择只管当前这一次请求（F3），复制完成后，之后的请求自然用上本机副本。
 - **intent 去重**：控制面以（前缀 × 目标实例）为幂等键，在途不重复发、完成不重复发；重发由池层幂等兜底（F11）。
 
-职责边界：kvcm 管复制 / 保活 / 补发事件（让 KV 到位、告诉 router KV 在哪），不决策选路；router 管索引与选路，不直接下复制命令——它不懂池（容量 / 在途任务 / 副本现状），只向 kvcm 表达意图（intent：某前缀接下来在实例 B 上用，通道归 E12），复制与否、何时、去重由 kvcm 决策（它懂池）。两条单向通道：intent 上行（router → kvcm），事件下行（kvcm → router）。
+职责边界：kvcm 管复制 / 保活 / 补发事件（让 KV 到位、告诉 router KV 在哪），不决策选路；router 管索引与选路，不直接下复制命令——它不懂池（容量 / 在途任务 / 副本现状），只向 kvcm 表达意图（intent：某前缀接下来在实例 B 上用，通道归 E12），复制与否、何时、去重由 kvcm 决策（它懂池）。两条单向通道：intent 上行（Router → kvcm），事件下行（kvcm → 索引）。
 
 ### 5. 目标函数（归 router 内部实现）
 
