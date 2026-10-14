@@ -131,10 +131,14 @@ flowchart TB
 ```mermaid
 flowchart TB
     AG["前端 agent / coder 钩子"]
-    subgraph ROUTE["选路面（逻辑分层；索引进程形态归 D4）"]
+    subgraph ROUTE["选路面（Router 团队域）"]
         direction LR
         RT["Router<br/>算 hash · 打分 · 选路"]
-        IDX["索引（内置或外挂组件）<br/>block hash → 实例"]
+        subgraph IDXOPT["索引：两种方案二选一（kvcm 接口相同）"]
+            direction TB
+            IDX1["A：Router 内置索引<br/>llm-d / Dynamo kv-router 式"]
+            IDX2["B：外挂 Conductor<br/>RFC #1403 现成"]
+        end
     end
     KV["kvcm 控制面<br/>复制 + 有界保活 + 补发事件"]
     subgraph POOL["Mooncake"]
@@ -154,14 +158,14 @@ flowchart TB
     end
 
     AG -->|"① 预告 + 请求"| RT
-    RT -->|"查询：token_ids 或 hash（RFC #1403）"| IDX
+    RT -->|"查询：A 进程内 / B HTTP（RFC #1403，token_ids 或 hash）"| IDXOPT
     RT -->|"② intent 上行：前缀 × 目标实例（E12）"| KV
     KV -->|"③ 复制 / 核验 / 保活 / 释放（F4/F15/§6）"| M
     M -->|"⑧ stored / removed / cleared（F14）"| PB
-    PB -.->|"⑨ 订阅，解析 object_key 出 hash（升级后）"| IDX
-    KV -.->|"⑥ 补发 BlockStored（方案 a，告知放置）"| IDX
-    EA -.->|"⑦ 引擎原生事件 gpu/cpu（F8）"| IDX
-    EB -.->|"⑦"| IDX
+    PB -.->|"⑨ 订阅，解析 object_key 出 hash（升级后）"| IDXOPT
+    KV -.->|"⑥ 补发 BlockStored（方案 a，同一套引擎格式端点）"| IDXOPT
+    EA -.->|"⑦ 引擎原生事件 gpu/cpu（F8）"| IDXOPT
+    EB -.->|"⑦"| IDXOPT
     M -->|"④ 派 copy 任务给源属主（F4）"| EA
     M ~~~ EB
     EA -->|"put/get（preferred_segment 固定本机）"| SA
@@ -175,7 +179,7 @@ flowchart TB
 读图：
 
 - 布局：主流程从上到下（①② → ③④⑤ → ⑩⑪⑫）；同一层的组件横向并排、横边相连——Router‖索引（查询）、master‖publisher（⑧）、实例 A‖B、两侧 seg（⑤ RDMA）。`~~~` 是不可见边，仅用于布局对齐；实例 → master 的注册/心跳边省略（F1，与 kvcm 职责无关）。
-- **选路面逻辑分层（§1）**：索引订阅三类事件（⑥⑦⑨）建索引；Router 不订阅事件流——自算请求的 hash 链查索引（RFC #1403，token_ids 或 hash 两种入参，不依赖原始 token 文本），拿命中分数选路（⑩）。图中 Router‖索引是**逻辑**分层；索引进程形态（内置 Router 进程 / 外挂独立组件）归 D4，两种形态索引内容相同。
+- **选路面逻辑分层（§1）**：索引订阅三类事件（⑥⑦⑨）建索引；Router 不订阅事件流——自算请求的 hash 链查索引（token_ids 或 hash 两种入参，不依赖原始 token 文本），拿命中分数选路（⑩）。**索引两种方案二选一（A 内置 / B 外挂 Conductor）是 Router 团队的选型**——对 kvcm 透明：⑥⑦⑨ 三类事件在两种方案下走的是同一套端点、同一套引擎格式（§2 方案 a 形态无关性），差异只在编排层注册动作与查询方式（A 进程内 / B HTTP）。
 - **两条单向通道（§4）**：intent 上行 ②（Router → kvcm），事件下行 ⑥（kvcm → 索引）。
 - **kvcm 只碰控制面**：复制 / 核验 / 保活 / 释放走 master RPC（③，含 §6 停保活 / demote / Remove 三手段）；数据面复制（⑤ RDMA）由 master 派单（④）、源属主执行。池驱逐兜底不在图上（master 内部行为）。
 - ① 是「提前备」的提前量来源（§4）：前端钩子比请求早到，Router 拿到预告后按 ② 表达意图，复制与否由 kvcm 决策。
@@ -195,7 +199,7 @@ flowchart TB
 
 事实约束：引擎事件只覆盖引擎自己的动作（F8）——HBM 淘汰有 Removed，但池侧删除/驱逐/预复制都不产生引擎事件（F9/F10），这些正是 kvcm 要补的部分。事件里的 medium 字段标记 KV 在哪种介质上（gpu=HBM / cpu=DRAM 池），供 §5 分层计价（Dynamo 计价 device 1.0 / host 0.75 / disk 0.25，standalone indexer `/query` 按 gpu/cpu/disk 分层返回）。
 
-留待 D4：事件开关与传输接线（`enable_kv_cache_events` 默认关，需打开才有事件，F8；ZMQ 端点配置、索引订阅方式）在部署形态下怎么接。**索引进程形态**：全量索引一份，三条形态——内置（llm-d EPP / Dynamo kv-router：索引是打分用的摘要、与 scorer 紧耦合，llm-d 架构 §2 原话「是给打分用的摘要，不是存储元数据」；请求路径少一跳；事件源单一时外挂无聚合价值——单源外挂等于把同一份信息搬远一跳）、外挂（Conductor：多事件源聚合、多消费者、索引独立 HA，standalone indexer 的 P2P recovery 即外挂 HA 答案）、内置但暴露查询服务（Dynamo remote indexer：索引留在 router 进程、HTTP 暴露给多 consumer，HA 跟随 router 副本，介于前两者之间）。本场景事件源三条（引擎 + kvcm 补发 + 池删除），外挂/暴露服务有聚合价值；核心拍板项 = 那一跳 HTTP 是否进同步选路路径（D-direct <5ms 模式选择预算，[`../docs/features/slo.md`](../docs/features/slo.md)；缓解：提前查询、异步化）。**辅助预测树**（兄弟请求批内竞态：一批同前缀请求同时到达、引擎尚未发 stored——Dynamo side indexer / llm-d 推测索引先例）与形态无关，独立决策。Conductor 组件级替代评估见 backlog D4。
+留待 D4：事件开关与传输接线（`enable_kv_cache_events` 默认关，需打开才有事件，F8；ZMQ 端点配置、索引订阅方式）在部署形态下怎么接。**消费侧索引形态（Router 团队选型，kvcm 接口不变——§2 方案 a 形态无关性）**，两种方案：A. Router 内置索引（llm-d EPP / Dynamo kv-router：索引是打分用的摘要、与 scorer 紧耦合，llm-d 架构 §2 原话「是给打分用的摘要，不是存储元数据」；请求路径少一跳；代价是订阅/索引/gap 处理自写；变体：Dynamo remote indexer，内置但暴露查询服务给多 consumer）；B. 外挂 Conductor（现成：object_key parser、RFC #1403、vLLM 格式解码已核实；多事件源聚合、独立 HA；代价是请求路径多一跳 HTTP——D-direct <5ms 模式选择预算，[`../docs/features/slo.md`](../docs/features/slo.md)；缓解：提前查询、异步化）。**辅助预测树**（兄弟请求批内竞态：一批同前缀请求同时到达、引擎尚未发 stored——Dynamo side indexer / llm-d 推测索引先例）与形态无关，独立决策。Conductor 组件级评估见 backlog D4。
 
 ### 2. 可见性：router 的索引怎么知道预复制放置
 
@@ -229,6 +233,7 @@ flowchart TB
 - **身份（哪台机器）**：事件体无实例字段（仅 `data_parallel_rank`，`kv_events.py:39`），上游机制是**身份 = 端点**——索引按订阅端点把事件归入实例；一个实例多个端点有现成先例（DP rank 端口偏移 `offset_endpoint_port`，`kv_events.py:528`）。因此 kvcm **每个目标实例开一个发布端点**，由编排把「端点 → 实例」注册给索引（外挂形态走 RFC #1403 `/register`，与引擎端点同一通道；内置形态同理，归 D4/E13）；索引把补发端点并入该实例的端点集合即可，不需要新概念。ZMQ topic 是消息分拣标签（订阅端按它过滤消息），多个发布者可共用同一个 topic——它标不出「来自哪台机器」，所以身份只能走端点。
 - **发布时机**：READY 核验通过（`precopy.py::assert_targets_have_replicas`）后，一次预复制发一条 `BlockStored`（block_hashes = 前缀连续满块链；引擎侧经 `KVEventAggregator` 跨 rank 聚合后同语义）。
 - **幂等**：索引是集合语义，补发与引擎自发重复无害；重复预热重复补发亦无害（池层幂等 F11）。
+- **形态无关性（设计性质）**：补发接口与消费侧形态无关——**一套端点、一套格式**（引擎格式 + 身份 = 端点），「Router 内置索引」与「外挂 Conductor」两种方案 kvcm 零适配、零分支；差异 100% 在编排层注册动作（端点配置给 Router vs 调 Conductor `/register`）。成立依据是两种消费侧吃的是同一种格式：Conductor 的实现证据 `mooncake-conductor/src/zmq/msg_decoder.cpp::ParseVllmEvent:365`（vLLM 的 `BlockStored` / `BlockRemoved` / `AllBlocksCleared` 全解析，`DecodeVllmEventBatch:886`），Router 内置索引（llm-d/Dynamo 形态）订的同样是该格式。消费侧选型归 Router 团队，不构成 kvcm 的设计变量。
 
 ### 3. 「哪个实例拥有前缀」怎么定义
 
