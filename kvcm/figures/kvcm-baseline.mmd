@@ -1,0 +1,24 @@
+flowchart TB
+    Q["请求"] --> RT
+    subgraph RT["Router（经典事件驱动）"]
+        IDX["索引 block hash → 实例<br/>分层 gpu=HBM / cpu=池"]
+    end
+    RT -->|"① 前缀亲和：发给算过该前缀的实例"| EA
+    subgraph A["实例 A"]
+        EA["引擎 + APC（HBM 私有）"]
+        SA["本机 DRAM seg"]
+    end
+    subgraph B["实例 B"]
+        EB["引擎 + APC"]
+        SB["本机 DRAM seg"]
+    end
+    EA -->|"② put 满块，固定写本机 seg（preferred_segment）"| SA
+    EA -.->|"③ BlockStored gpu/cpu；BlockRemoved 仅 gpu（F8）"| IDX
+    EA -->|"local-first 本机读（F3）"| SA
+    EB -->|"⑤ 副本在 A：跨机 RDMA 读"| SA
+    EA -->|"④ 读：BatchQuery 现查（F1）"| M
+    EB -->|"④ 读：BatchQuery 现查"| M
+    M["mooncake_master<br/>key → 副本 → seg 权威"]
+    M -.->|"stored/removed/cleared，只说 key 怎么了，不说在哪台机器（F14）"| PB
+    PB["池事件 publisher<br/>0.3.11 不含，main 才有（F14）"]
+    PB -.->|"ZMQ"| IDX

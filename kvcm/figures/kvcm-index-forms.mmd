@@ -1,0 +1,15 @@
+flowchart LR
+    subgraph F1["形态一：Router 内置索引"]
+        direction LR
+        SRC1["引擎事件 + kvcm 补发"] --> R1["Router<br/>（进程内建索引）"]
+    end
+    subgraph F2["形态二：外挂 Conductor"]
+        direction LR
+        SRC2["引擎事件 + kvcm 补发 + 池 publisher"] --> C2["Conductor"]
+        R2["Router"] -->|"HTTP 查询"| C2
+    end
+    subgraph F3["形态三：内置 + 暴露查询服务"]
+        direction LR
+        SRC3["引擎事件 + kvcm 补发"] --> R3["Router-1<br/>（进程内建索引 + 开查询服务）"]
+        R4["Router-2 …"] -->|"HTTP 查询"| R3
+    end
