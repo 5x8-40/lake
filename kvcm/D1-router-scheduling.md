@@ -127,15 +127,15 @@ flowchart TB
 
 ![kvcm 就位后的全链路](kvcm-arch.svg)
 
-图源：[Excalidraw 可编辑版](https://excalidraw.com/#json=cPeGPZYWCAnFHGbByq4up,EhiF60uCucmnmiz21HERxw)。当前为结构示意，①-⑫ 编号与事件/读路径细节以下文读图为准，图面补齐中。
+图源：[kvcm-arch.excalidraw](kvcm-arch.excalidraw)（拖入 excalidraw.com 编辑；[在线快照](https://excalidraw.com/#json=cPeGPZYWCAnFHGbByq4up,EhiF60uCucmnmiz21HERxw)为旧版，以仓内源文件为准）。
 
 读图：
 
-- 图为左右两栏：**左列**主流程竖链（控制面 + 数据面）；**右列**事件 / 索引两种部署形态（二选一），kvcm 补发端点与格式相同。
-- 布局：左列主流程从上到下（①② → ③④⑤）；实例 A/B 竖排、⑤ RDMA 竖边相连；右列形态一（上）/ 形态二（下），kvcm 与 master 横边右进。
+- 图分三区：**中列**主流程竖链（控制面 + 数据面，①② → ③④⑤）；**右上**形态一（Router 进程内索引）；**主链左侧**形态二两框（Conductor / 池 publisher）。事件 / 索引两种部署形态二选一，kvcm 补发端点与格式相同。
+- 布局：实例 A（左下）/ B（右下）横排、⑤ RDMA 横边相连；事件上行 ⑥ 由 kvcm 右进形态一、左进 Conductor；master 与池 publisher 虚线相连（publisher 内嵌 master，F14）。
 - **两条单向通道（§4）**：intent 下行 ②（Router → kvcm），事件上行 ⑥（kvcm → 索引）。
 - **选路面逻辑分层（§1）**：Router 不订阅事件流——索引订阅事件建索引，Router 自算请求的 hash 链查索引（token_ids 或 hash 两种入参，不依赖原始 token 文本），拿命中分数选路（⑩）。
-- **索引部署两种形态**（图右列）：0.3.11 现状没有池 publisher、没有 Conductor，事件只有引擎 ⑦ 与 kvcm 补发 ⑥ 两条源，由 Router 进程内索引消费——kvcm 视野外的池删除不可见（引擎 put 的 KV 被驱逐/TTL），索引条目过时只损性能（F3/§2）；升级 mooncake 后 publisher 与 Conductor 就位，Conductor 消费三条源（⑥⑦⑨），Router 走 HTTP 查询。kvcm 补发在两种形态下走同一套端点、同一套引擎格式（§2 方案 a 形态无关性），差异只在编排层注册动作。
+- **索引部署两种形态**（右上形态一 / 主链左侧形态二）：0.3.11 现状没有池 publisher、没有 Conductor，事件只有引擎 ⑦ 与 kvcm 补发 ⑥ 两条源，由 Router 进程内索引消费——kvcm 视野外的池删除不可见（引擎 put 的 KV 被驱逐/TTL），索引条目过时只损性能（F3/§2）；升级 mooncake 后 publisher 与 Conductor 就位，Conductor 消费三条源（⑥⑦⑨），Router 走 HTTP 查询。kvcm 补发在两种形态下走同一套端点、同一套引擎格式（§2 方案 a 形态无关性），差异只在编排层注册动作。
 - **kvcm 只碰控制面**：复制 / 核验 / 保活 / 释放走 master RPC（③，含 §6 停保活 / demote / Remove 三手段）；数据面复制（⑤ RDMA）由 master 派单（④）、源属主执行。池驱逐兜底不在图上（master 内部行为）。
 - ① 是「提前备」的提前量来源（§4）：前端钩子比请求早到，Router 拿到预告后按 ② 表达意图，复制与否由 kvcm 决策。
 - 请求不等复制完成（⑩ 直接下发）；读路径先查后选（⑪ BatchQuery → ⑫ 跨机读兜底，F1/F3）——预复制只是提高本地命中概率，不是读路径前提。
