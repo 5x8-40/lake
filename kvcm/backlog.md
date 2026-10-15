@@ -31,7 +31,21 @@
 
 - 操作集框架：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §1）——七项原子操作 copy/move/keepalive/pin/demote/retain/remove，复合操作原子组合（prefetch = copy+核验+保活注册；软释放 = 停 keepalive；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐——🟡 机制方案已收敛（落 [D2-kv-operations.md](D2-kv-operations.md) §2）：kvcm 自主实现 soft/hard 两种——**soft = upsert 空写**（`UpsertStart` 同 size 授/解 soft pin、不写数据，零数据流，毫秒级不可读窗口）；**hard = 读出→Remove→带 pin 重 put**（kvcm 本地持有数据直到校验成功，失败重试不丢）。**属主处理两方案并列待裁**：改归 kvcm（不改 mooncake、语义改变）vs 借原属主 UUID（语义不变、需 master 加 key→属主查询 RPC，内部数据现成），决策条件 = mooncake 可改性（上游 PR / fork，多人合作项目）+ kvcm 实现语言（E10/E11）。机制事实（main 锚点）：pin 挂写路径（`PutStart` / `UpsertStart` 收 `ReplicateConfig`，`master_service.h:452` / `:515`）——**soft pin**（`soft_pin_action`，默认 30min / 上限 24h，`types.h:85-89`；两轮制排最后，`allow_evict_soft_pinned_objects` 默认 true 极端可逐，`master_service.h:987-995`）与 **hard pin**（`with_hard_pin` 创建固化，`master_service.cpp:6068`）；0.3.11 已有 `with_soft_pin/with_hard_pin`（`replica.h:84-85` @0.3.11）；`CreateCopyTask` 无 config（两版本同）。原结论「无事后 pin 通道、只能池侧扩展」由 upsert 空写路径修正（详见 D2 文档 F2-F4）。lake 同义设计（「引用数 >0 冻结」，`../docs/architecture/kv-cache-pool.md`）。
+- pin：READY 后防驱逐——🟡 机制方案已收敛，落 [D2-kv-operations.md](D2-kv-operations.md) §2
+  - 结论：kvcm 自主实现，soft / hard 都支持
+    - **soft = upsert 空写**：`UpsertStart` 同尺寸带 `with_soft_pin` ±、不写数据 → 零数据流，毫秒级不可读窗口
+    - **hard = 读出→Remove→带 pin 重 put**：kvcm 本地持有数据直到校验成功，失败重试不丢
+  - 待裁：属主处理两方案并列
+    - 改归 kvcm：不改 mooncake，但属主语义变（引擎下线 key 不删；kvcm 成新单点）
+    - 借原属主 UUID：语义不变，但需 master 加「key → 属主 UUID」查询 RPC（内部数据现成）
+    - 决策条件 = mooncake 可改性（上游 PR / fork，多人合作项目）+ kvcm 实现语言（E10/E11）
+  - 机制事实（详细版见 D2 文档 F1-F4）
+    - pin 挂写路径：`PutStart` / `UpsertStart` 收 `ReplicateConfig`（`master_service.h:452` / `:515` @main；0.3.11 同有，`replica.h:84-85` @0.3.11）
+    - soft pin 限时（默认 30min / 上限 24h，`types.h:85-89` @main），驱逐排最后、极端可逐（`allow_evict_soft_pinned_objects` 默认 true，`master_service.h:987-995` @main）
+    - hard pin 创建时固化（`master_service.cpp:6068` @main）
+    - `CreateCopyTask` 无 config（两版本同）→ 复制路径带不了 pin
+  - 修正记录：原结论「无事后 pin 通道、只能池侧扩展」作废——upsert 空写可达（D2 文档 F2-F4）
+  - lake 同义设计参考：「引用数 >0 冻结」（`../docs/architecture/kv-cache-pool.md`）
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
 - demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（若以落盘为 READY，等待落盘的时间会把预热收益抵消）。用途二：实例计划下线前降层保存 KV，避免属主下线整批删除（D1 F5；下线删除是否覆盖 disk 副本未核实 → E5/D3）。
 - release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 提供会话生命周期线索，控制面决策，池兜底；含中间档 demote）。
