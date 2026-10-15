@@ -18,6 +18,13 @@
 | 参考 | 锚点 | 借什么 | 关键差异 |
 |------|------|--------|----------|
 | Mooncake master 写路径 | mooncake 仓内 `master_service.cpp::UpsertStart`（@0.3.11） | 已有 key 事后加/解 soft pin 的唯一现成通道：同尺寸 upsert 会顺带设置/清除 soft pin（F3） | 该路径为「覆盖写」设计；本文的「空写」（声明更新但不写数据，只为触发元数据变更）是复用其副作用，非官方用法 |
+| LMCache 后端接口 + controller | `lmcache/v1/storage_backend/storage_backend_interface.py`（七方法）+ `lmcache/v1/cache_controller`（lookup/pin/move/clear） | 与 kvcm 七操作一一对应——操作集合理性的直接证据；命令面/数据面分离形态 | LMCache 无全局强一致元数据（controller 是协调非权威）；kvcm 有 master 权威视图 |
+| KVCR | `src/kvcr/remote_fw_dram.py`（hint/query/fetch 时序）+ Guard 组件 | 传输窗口 pin（`claim/pin`→`release_pin`）；Guard 旁挂持池（retain 对照） | KVCR 目的地发起 + 派生索引 hint；kvcm 集中式 + master 权威视图。fencing 在 kvcm 不需要（属主管辖只有 Revoke） |
+| TensorCast policy 预设 | `tensorcast/api/_config.py::StorePolicyProfile` | cache/durable/ha/cold/warm/pinned 放置契约命名层；Caller-Leased 所有权二分（kvcm 对引擎 KV 是租借） | TensorCast 声明式 policy；kvcm 命令式操作——API 形态留 E11 参考 |
+| FlexKV 结束卸载 | `vllm_v1_adapter.py::request_finished` | 会话/请求结束触发降层（demote §3）；inclusive 分层语义 | FlexKV 引擎插件层；kvcm 独立控制面 |
+| SGLang 块生命周期 | `hiradix_cache.py::_evict_backuped` 等（见 [../docs/research/sglang/block-lifecycle.md](../docs/research/sglang/block-lifecycle.md)） | 「释放 = 逐层剥离」：降层/摘除/后端自决——kvcm 三档（软释放/demote/remove）的业界对应 | SGLang 有 L3 时引擎永不主动放弃（后端 LRU/TTL）；kvcm remove 是主动彻底删除 |
+
+各操作的逐项对照见 §1 末「参考实现对照」表。
 
 ## 事实基线（代码核实）
 
@@ -157,6 +164,23 @@
 - **部署形态**
   - kvcm 单实例跟随 mooncake master：master 单实例则 kvcm 单实例；master 将来多实例时再议 kvcm 的 HA 与共享存储
   - 状态存 **sqlite**（零新组件；上 HA 时再换 Redis/etcd）
+
+### 参考实现对照（七项操作逐项）
+
+| kvcm 操作 | 业界对应 | 验证与差异 |
+|---|---|---|
+| copy | LMCache `P2PBackend` 跨实例直传 + controller 命令（lookup/**pin/move**/clear，`lmcache/v1/cache_controller`）；KVCR hint 驱动 P2P（**目的地发起**，源侧 `claim/pin` 配合）；llm-d P2P（索引只作 hint、握手兜底）；HiCache `prefetch_from_storage`（L3→L2→L1，三策略终止） | 命令面/数据面分离是通例。kvcm 的 `CreateCopyTask`（master 指派源端执行）同构 LMCache controller 集中式；KVCR/llm-d 的「目的地发起」依赖派生索引 + 握手，kvcm 有 master 权威视图，集中式成立 |
+| move | LMCache controller 命令集含 `move`；KVCR `deliver`（纯搬运层模式） | move 作控制面原语存在即合理；`CreateMoveTask` 指定源、删源，语义一致 |
+| keepalive | LMCache 后端接口 `touch_cache`；FlexKV lease「保证传输期间块有效」；llm-d 推测索引 TTL 2s（`defaultSpeculativeTTL`，注释自承认是经验值） | 周期 touch 续租是通例；llm-d 的「TTL 是经验值」提示 lease_ttl 须真机校准（F12 已记） |
+| pin | LMCache `pin`/`unpin`（后端接口级）；KVCR `claim/pin`/`release_pin`（**传输窗口专用**，`FETCHABLE` 须等 pin 成功才确定）；TensorCast `pinned` policy（必须驻留 + 溢出**拒绝写入**）；HiCache `lock_ref`（`protected_size_` vs `evictable_size_`，dec 到 0 ≠ 释放、仍可命中） | mooncake 三件套（lease/soft/hard）比多数系统细。差异：TensorCast `pinned` 溢出拒绝写入，mooncake hard pin 无此语义（创建时固化、之后改不了，F1）；KVCR 的传输窗口 pin 在 mooncake 由「copy 任务在途拒 upsert」覆盖（F2） |
+| demote | §3 专节（FlexKV/LMCache/UCM/KVBM/MemCache 对照） | —— |
+| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是通例；kvcm 登记 disk 副本（§3）= Guard 模式的 mooncake 版。TensorCast Caller-Leased 框定语义：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。fencing 在 kvcm 不需要——属主管辖只有 Revoke（F5/F6），引擎下线后无人 Revoke |
+| remove | LMCache `remove`/`clear`；SGLang 分层放弃（`block-lifecycle.md`）：无 L3 时 `evict` 删叶 = 彻底；**有 L3 时引擎永不主动放弃**——删除下放 L3 后端独立 LRU/TTL，引擎看不到 | SGLang 的「释放 = 逐层剥离」（L1 摘节点降层 → L2 摘除 → L3 后端自决）正是 kvcm 三档（软释放 / demote / remove）的业界对应。「L3 删除引擎不可见」提醒：kvcm remove 后索引侧条目需同步清（D1 已知：池副本删除事件通道缺失） |
+
+- **总观察**
+  1. **LMCache 后端七方法 + controller 命令集**（`contains/put/get/pin/unpin/remove/touch_cache` + `lookup/pin/move/clear`）与 kvcm 七操作几乎一一对应——操作集合理性的最强单点证据
+  2. **TensorCast policy 预设**（`cache/durable/ha/cold/warm/pinned`，`tensorcast/api/_config.py::StorePolicyProfile`）是「放置契约」声明式命名层——kvcm 的操作可视为给 key 改 policy（demote≈`cold`、pin≈`pinned`、默认≈`cache`）；API 形态（声明式 policy vs 命令式操作）留待 E11 协议设计时参考
+  3. **SGLang「释放是逐层剥离不是单动作」**——kvcm 软释放/demote/remove 三档粒度与业界一致
 
 ## §2 pin（候选已摆平，待裁）
 
