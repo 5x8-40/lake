@@ -6,7 +6,8 @@
 - 状态: **讨论中**
   - 操作集框架已闭环（§1）
   - pin：**设计完成**——soft 三候选、hard 两候选、属主两方案已摆平（§2）；裁决依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞后续议题
-  - demote / retain / release 待议（[backlog.md](backlog.md) D2）
+  - demote：**已闭环**——会话级降层 = 停保活 + 落 SSD 两路径（§3）
+  - retain / release 待议（[backlog.md](backlog.md) D2）
 - 上游问题: backlog D2——独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
   - **0.3.11.post1**：测试床实际部署的 wheel
@@ -212,9 +213,38 @@
 - 属主语义若要变，与 retain 议题（D3 耦合）统一评估，不在 pin 单独定
 - **注意**：若 soft 需求选 ① 或 ③，属主问题只剩读删写（hard 需求）一处触发，权重下降
 
-## §3 demote / retain / release
+## §3 demote（设计完成）
 
-- 待议，现状描述在 [backlog.md](backlog.md) D2
+### 语义与边界
+
+- **触发**：会话结束（或策略层判定 KV 变冷）→ kvcm 把该会话的 KV 从 DRAM 降层到 SSD 保存，**不删**
+- **回来路径**：会话回来时从盘读回；池配 `promotion_on_hit` 可由池自动把热的盘副本提回 DRAM
+- **边界**：demote 保的是「会话间歇」场景（引擎实例还活着）；引擎下线后 key 是否级联删除（含 disk 副本）归 retain / D3，不在本节
+- demote 在操作集中是**复合操作**（停 keepalive + 落 SSD），不是新的原子机制
+
+### 落 SSD 的两条路径
+
+| | 路径 A：主动登记 | 路径 B：池配置委托 |
+|---|---|---|
+| 做法 | kvcm 经 client 库 `MountLocalDiskSegment` 挂本地 SSD；对每把 key：读 DRAM 副本 → 写本地盘 → `AddReplica` 向 master 登记 disk 副本（`master_service.cpp:5386` @main；0.3.11 同接口，F1）→ 停 keepalive | 池开 `enable_offload` + `offload_on_evict`（默认 false，`master_config.h:195` @main；0.3.11 是否含 `offload_on_evict` 待 E6 核对）；kvcm 只停 keepalive |
+| 降层时机 | **立即**——会话一结束 DRAM 即释放 | **驱逐时**——池满选中该 key 时，master 塞进 offload 队列 → 挂盘 client 心跳（`OffloadObjectHeartbeat`，`master_service.cpp:8509` @main）领任务写盘 → `NotifyOffloadSuccess` 报备登记 |
+| mooncake 代码 | 不改 | 不改（纯配置） |
+| 数据搬运 | kvcm 承担（读 + 写盘带宽） | 挂盘 client 承担（kvcm 零搬运） |
+| 池不满时 | DRAM 照样释放（主动路径的代价） | key 留 DRAM——会话回来直接 DRAM 命中，比降层更优（懒降层） |
+| 兜底 | —— | offload 队列超每周期上限（`offloading_queue_limit × offload_cap_ratio`）时，`offload_force_evict` 决定丢弃还是留内存 |
+
+- **默认 B**：零搬运零改动，DRAM 无压力时白赚命中
+- **A 作「立即释放 DRAM」档**：DRAM 金贵 / 会话长期不回时由策略层选用；两条可并存
+- DRAM 副本失保护后随驱逐释放；key 因 disk 副本存活——两路径殊途同归
+
+### READY 与落盘的关系
+
+- **READY 不含落盘**：预热 READY = DRAM 副本就位即上报（D1 口径不变）
+- 落盘是降层/后台路径，与 READY 判定无关——若以落盘为 READY，等待落盘的时间会抵消预热收益
+
+## §4 retain / release（待议）
+
+- 现状描述在 [backlog.md](backlog.md) D2
 - retain 的已有输入
   - 与属主语义（§2 两方案）、D3 副本生命周期直接耦合
-  - `AddReplicaForRetainedClient`（master 为「保留副本的客户端」补登记副本的接口）为 main 独有、0.3.11 不含（E6 已核）→ 候选机制，届时评估
+  - `AddReplicaForRetainedClient`（master 为「保留副本的客户端」补登记副本的接口，`master_service.cpp:5400` @main）为 main 独有、0.3.11 不含（E6 已核）→ 候选机制，届时评估

@@ -43,7 +43,7 @@
     - 决策条件 = mooncake 可改性（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、属主管辖、lease 与驱逐、UUID 与空写通道）
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
-- demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（若以落盘为 READY，等待落盘的时间会把预热收益抵消）。用途二：实例计划下线前降层保存 KV，避免属主下线整批删除（D1 F5；下线删除是否覆盖 disk 副本未核实 → E5/D3）。
+- demote：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §3）——会话级降层（会话结束 → DRAM→SSD 保存不删）= 停 keepalive + 落 SSD 两路径：主动 `AddReplica` 登记（per-key 立即，kvcm 搬运）/ 池 `offload_on_evict` 委托（驱逐时降层，kvcm 零搬运，默认）；READY 不含落盘。实例下线前降层保存归 retain（下线删除是否覆盖 disk 副本未核实 → E5/D3）。
 - release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 提供会话生命周期线索，控制面决策，池兜底；含中间档 demote）。
 - 事实输入：E6。
 
