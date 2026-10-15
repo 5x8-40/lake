@@ -43,7 +43,7 @@
     - 决策条件 = mooncake 可改性（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、属主管辖、lease 与驱逐、UUID 与空写通道）
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
-- demote：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §3）——会话级降层（会话结束 → DRAM→SSD 保存不删）= 停 keepalive + 落 SSD 两路径：主动 `AddReplica` 登记（per-key 立即，kvcm 搬运）/ 池 `offload_on_evict` 委托（驱逐时降层，kvcm 零搬运，默认）；READY 不含落盘。实例下线前降层保存归 retain（下线删除是否覆盖 disk 副本未核实 → E5/D3）。
+- demote：🟡 设计完成（落 [D2-kv-operations.md](D2-kv-operations.md) §3）——会话结束 → 停 keepalive + kvcm 读 DRAM 写自己 SSD + `AddReplica` 登记 + 核验（先到先得，静默无效可检出）。kvcm 管自己，与池 `offload_on_evict`（池冷热，0.3.11 含）独立并存。关键收益：disk 副本随**登记 client** 存活（`CleanupStaleHandles` 副本级清理，无按 key 属主整删）→ kvcm 登记则引擎下线副本仍活，天然覆盖 retain 核心场景；引擎自 offload 的副本随引擎死。参考 FlexKV/LMCache/UCM：会话结束触发 + 组件自搬 + 副本放引擎外。READY 不含落盘。
 - release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 提供会话生命周期线索，控制面决策，池兜底；含中间档 demote）。
 - 事实输入：E6。
 

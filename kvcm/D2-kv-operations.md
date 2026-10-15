@@ -6,8 +6,8 @@
 - 状态: **讨论中**
   - 操作集框架已闭环（§1）
   - pin：**设计完成**——soft 三候选、hard 两候选、属主两方案已摆平（§2）；裁决依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞后续议题
-  - demote：**已闭环**——会话级降层 = 停保活 + 落 SSD 两路径（§3）
-  - retain / release 待议（[backlog.md](backlog.md) D2）
+  - demote：**设计完成**——会话级降层 = 停保活 + kvcm 主动登记自己 SSD 副本（§3）；disk 副本随登记 client 存活，引擎下线仍活（天然覆盖 retain 核心场景）
+  - retain（残余部分）/ release 待议（[backlog.md](backlog.md) D2）
 - 上游问题: backlog D2——独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
   - **0.3.11.post1**：测试床实际部署的 wheel
@@ -215,27 +215,43 @@
 
 ## §3 demote（设计完成）
 
-### 语义与边界
+### 语义
 
-- **触发**：会话结束（或策略层判定 KV 变冷）→ kvcm 把该会话的 KV 从 DRAM 降层到 SSD 保存，**不删**
-- **回来路径**：会话回来时从盘读回；池配 `promotion_on_hit` 可由池自动把热的盘副本提回 DRAM
-- **边界**：demote 保的是「会话间歇」场景（引擎实例还活着）；引擎下线后 key 是否级联删除（含 disk 副本）归 retain / D3，不在本节
+- **触发**：会话结束（或策略层判定 KV 变冷）→ kvcm 把该会话的 KV 从 DRAM 降层到自己的 SSD，**不删**
+- **回来路径**：client 读优先级 MEMORY → LOCAL_DISK → DISK（`real_client.cpp:2523-2553` @0.3.11）；任何 client 经 disk descriptor 的 `transport_endpoint` 走 offload RPC **远程读**——引擎跨机器读 kvcm 盘上的副本是现成能力；`promotion_on_hit`（0.3.11 含）可由池把热的盘副本提回 DRAM
 - demote 在操作集中是**复合操作**（停 keepalive + 落 SSD），不是新的原子机制
 
-### 落 SSD 的两条路径
+### 参考实现（各产品降层对照，详见 [../docs/research/hbm-tier-and-offload.md](../docs/research/hbm-tier-and-offload.md)）
 
-| | 路径 A：主动登记 | 路径 B：池配置委托 |
-|---|---|---|
-| 做法 | kvcm 经 client 库 `MountLocalDiskSegment` 挂本地 SSD；对每把 key：读 DRAM 副本 → 写本地盘 → `AddReplica` 向 master 登记 disk 副本（`master_service.cpp:5386` @main；0.3.11 同接口，F1）→ 停 keepalive | 池开 `enable_offload` + `offload_on_evict`（默认 false，`master_config.h:195` @main；0.3.11 是否含 `offload_on_evict` 待 E6 核对）；kvcm 只停 keepalive |
-| 降层时机 | **立即**——会话一结束 DRAM 即释放 | **驱逐时**——池满选中该 key 时，master 塞进 offload 队列 → 挂盘 client 心跳（`OffloadObjectHeartbeat`，`master_service.cpp:8509` @main）领任务写盘 → `NotifyOffloadSuccess` 报备登记 |
-| mooncake 代码 | 不改 | 不改（纯配置） |
-| 数据搬运 | kvcm 承担（读 + 写盘带宽） | 挂盘 client 承担（kvcm 零搬运） |
-| 池不满时 | DRAM 照样释放（主动路径的代价） | key 留 DRAM——会话回来直接 DRAM 命中，比降层更优（懒降层） |
-| 兜底 | —— | offload 队列超每周期上限（`offloading_queue_limit × offload_cap_ratio`）时，`offload_force_evict` 决定丢弃还是留内存 |
+| 产品 | 触发 | 搬运者 | 引擎死后副本 |
+|---|---|---|---|
+| FlexKV | **请求结束**（`request_finished`→D2H） | 卸载组件自己 | 本机失效；REMOTE（Mooncake store 等）保留 |
+| LMCache | forward 内逐层 `save_kv_layer` | 自己（`from_gpu`） | daemon / 远程后端保留 |
+| UCM | 策略调 `dump` | connector 自己 | store 保留 |
+| Dynamo KVBM | `request_finished` settlement | OffloadEngine | G4 保留，G2/G3 随实例 |
+| MemCache（昇腾） | put 时定介质 | LocalService | 池对象 Meta 保留 |
 
-- **默认 B**：零搬运零改动，DRAM 无压力时白赚命中
-- **A 作「立即释放 DRAM」档**：DRAM 金贵 / 会话长期不回时由策略层选用；两条可并存
-- DRAM 副本失保护后随驱逐释放；key 因 disk 副本存活——两路径殊途同归
+- 一致模式：**触发 = 请求/会话结束**（不是池压力）；**搬运 = 卸载组件自己搬**；**降层副本放引擎之外才活得过引擎**
+- Mooncake `offload_on_evict`（驱逐时源引擎写自己盘、副本挂引擎名下）是**池自己的冷热分层**，不是会话生命周期管理——不作为 demote 的实现路径
+
+### 操作构成（kvcm 管自己）
+
+1. kvcm 经 client 库挂本地 SSD（`MountLocalDiskSegment` / `enable_ssd_offload` 初始化 FileStorage，0.3.11 含）
+2. 会话结束 → 对该会话每把 key：读 DRAM 副本 → 写 kvcm 本地盘 → `AddReplica` 向 master 登记 disk 副本（`master_service.cpp:1426` @0.3.11）→ 停 keepalive
+3. **核验**：`AddReplica` 后 `GetReplicaList` 确认自己的 disk 副本在册——每 key 只有一个 LOCAL_DISK 槽，已有他人 disk 副本时登记**静默无效**（返回成功但什么都不做；0.3.11 与 main 同语义）
+4. DRAM 副本失保护后随驱逐释放；key 因 kvcm 的 disk 副本存活
+
+### 副本归属：demote 顺带覆盖 retain 核心场景
+
+- 级联删除是**副本级**的（`CleanupStaleHandles`，`master_service.cpp:2530` @0.3.11）：内存副本随 seg 属主死清、**disk 副本随登记 client 死清**；全无效副本则 key 删。全库无「按 key 属主整删」逻辑
+- 所以：**kvcm 登记的 disk 副本，引擎下线仍存活**——「属主下线副本存续」（retain 核心诉求）由 demote 天然覆盖，不需要改属主
+- 对偶：引擎自己 offload 的副本（池冷热路径）随引擎死清——池冷热不保障会话存续
+
+### 与池 offload 的关系：独立并存
+
+- 池 `offload_on_evict`（0.3.11 含）是池自己的事：驱逐时 master 把任务推给**源副本 seg 属主 client**（`PushOffloadingQueue`），只有源引擎能领；kvcm 无 DRAM seg 领不到任务，也不参与
+- kvcm 不管、不依赖池该配置；两路同 key 相遇时先到先得——kvcm 的会话信号通常早于池压力，核验兜底（见上）
+- 边界：本节 demote 保「会话间歇 + 引擎下线」；「池整体弃置某 key」仍归 release / 池驱逐
 
 ### READY 与落盘的关系
 
@@ -246,5 +262,7 @@
 
 - 现状描述在 [backlog.md](backlog.md) D2
 - retain 的已有输入
+  - **demote（§3）已覆盖核心场景**：kvcm 登记的 disk 副本，引擎下线仍存活
+  - 剩余问题：DRAM 副本在属主下线后的存续（不转盘直接留内存的场景）、长期未命中副本的存续策略
   - 与属主语义（§2 两方案）、D3 副本生命周期直接耦合
   - `AddReplicaForRetainedClient`（master 为「保留副本的客户端」补登记副本的接口，`master_service.cpp:5400` @main）为 main 独有、0.3.11 不含（E6 已核）→ 候选机制，届时评估
