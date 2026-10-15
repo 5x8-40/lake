@@ -92,6 +92,7 @@
 - **P6. 鉴权边界**——现状能连 master 就能 `create_copy_task`/`Remove`。生产需要接入控制；控制面权限应大于引擎（引擎只需读写自己 seg）。
 - **P7. 预热成本核算**——预热后请求没来或去了别实例的浪费；READY 延迟（带宽×块数）vs 请求到达时间的窗口预测。与 D1 §4/§5 耦合（已闭环，口径见 D1）。
 - **P8. 指标归因**——命中率要拆「预热贡献 vs 引擎内部 HBM cache」。测试床已遇到第二次命中被内部 cache 接住（外部 get=0），生产监控同样会混淆。
+- **P9. prefetch 终止**——请求改道/源消失时在途 copy 白耗带宽。对照 HiCache `can_terminate_prefetch` 三策略；mooncake 0.3.11 只有 `CancelDrainJob`，copy/move 无取消 RPC——补法：池侧扩展（改 mooncake）或 kvcm 弱版（弃置 + 事后清副本）。来源：D2 操作集完备性审计（[D2-kv-operations.md](D2-kv-operations.md) §1）。
 
 ## 三、工程项
 

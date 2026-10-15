@@ -188,6 +188,28 @@
   2. **TensorCast policy 预设**（`cache/durable/ha/cold/warm/pinned`，`tensorcast/api/_config.py::StorePolicyProfile`）是「放置契约」声明式命名层——kvcm 的操作可视为给 key 改 policy（demote≈`cold`、pin≈`pinned`、默认≈`cache`）；API 形态（声明式 policy vs 命令式操作）留待 E11 协议设计时参考
   3. **SGLang「释放是逐层剥离不是单动作」**——kvcm 软释放/demote/remove 三档粒度与业界一致
 
+### 操作集完备性审计（双向对照）
+
+- **别人有、kvcm 没有的**
+
+| 操作 | 出处 | 评估 |
+|---|---|---|
+| **prefetch 终止/取消** | HiCache `can_terminate_prefetch` / `mark_terminate`（三策略：best_effort / wait_complete / timeout） | **真缺口**：请求改道 / 源消失时 copy 白耗带宽只能等自生自灭；且 mooncake 0.3.11 只有 `CancelDrainJob`，**copy/move 任务无取消 RPC**——补法：池侧扩展（改 mooncake）或「弃置 + 事后清副本」（kvcm 侧可做的弱版） |
+| compress（KV 压缩） | LMCache controller 命令集 | 远期能力，当前不补 |
+| health / full_sync（对账） | LMCache controller 命令集 | 半缺口：§1 状态记录③有「全量对账重建台账」概念但未操作化——应列为运维操作 |
+| 在途状态查询 | KVCR `query` 四态（HIT / **FETCHING** / FETCHABLE / MISS） | 半缺口：kvcm 只有 exist（在/不在）；「预热中」状态存于 sqlite 任务状态机，是否暴露给索引归 D4 接口设计 |
+
+- **kvcm 有、别人不做的**
+
+| 操作 | 别人为什么不做 | kvcm 为什么要 |
+|---|---|---|
+| pin 显式标记 | UCM/FlexKV 交给后端 LRU/TTL；SGLang 有 L3 时引擎**永不主动放弃**（删除下放后端容量管理） | 预热副本**没有读者**，「读即续租」保不住——预热场景特有 |
+| keepalive 独立保活 | 多数系统靠读路径被动续租，无控制面保活 | 同上（LMCache `touch_cache` 是同例外） |
+| move 显式搬迁 | FlexKV/UCM/HiCache 层间移动是驱逐/prefetch 的副作用，无显式 move | 下线迁移/副本归拢要确定性搬迁（LMCache controller 有 move，不孤立） |
+| retain 属主下线存续 | 引擎插件层（FlexKV/UCM/HiCache L1L2）引擎死缓存失效拉倒；KVCR-Guard/LMCache daemon 才做 | kvcm 独立控制面定位：预热投入要跨实例存亡保住 |
+
+- **审计结论**：不做 pin/keepalive/retain 的系统，共同点是有读者替它们保活、或引擎死了认栽——kvcm 的预热副本恰好「无读者 + 要跨实例存亡」，三样不是多余，是定位使然。**唯一真缺口 = prefetch 终止**（→ backlog）
+
 ## §2 pin（候选已摆平，待裁）
 
 ### 要解决的问题
