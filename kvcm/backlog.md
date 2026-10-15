@@ -31,19 +31,17 @@
 
 - 操作集框架：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §1）——七项原子操作 copy/move/keepalive/pin/demote/retain/remove，复合操作原子组合（prefetch = copy+核验+保活注册；软释放 = 停 keepalive；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐——🟡 机制方案已收敛，落 [D2-kv-operations.md](D2-kv-operations.md) §2
-  - 结论：kvcm 自主实现，soft / hard 都支持
-    - **soft = upsert 空写**：`UpsertStart` 同尺寸带 `with_soft_pin` ±、不写数据 → 零数据流，毫秒级不可读窗口
-    - **hard = 读出→Remove→带 pin 重 put**：kvcm 本地持有数据直到校验成功，失败重试不丢
-  - 待裁：属主处理两方案并列
-    - 改归 kvcm：不改 mooncake，但属主语义变（引擎下线 key 不删；kvcm 成新单点）
-    - 借原属主 UUID：语义不变，但需 master 加「key → 属主 UUID」查询 RPC（内部数据现成）
-    - 决策条件 = mooncake 可改性（上游 PR / fork，多人合作项目）+ kvcm 实现语言（E10/E11）
-  - 机制事实（详细版见 D2 文档 F1-F4）
-    - pin 挂写路径：`PutStart` / `UpsertStart` 收 `ReplicateConfig`（`master_service.h:452` / `:515` @main；0.3.11 同有，`replica.h:84-85` @0.3.11）
-    - soft pin 限时（默认 30min / 上限 24h，`types.h:85-89` @main），驱逐排最后、极端可逐（`allow_evict_soft_pinned_objects` 默认 true，`master_service.h:987-995` @main）
-    - hard pin 创建时固化（`master_service.cpp:6068` @main）
-    - `CreateCopyTask` 无 config（两版本同）→ 复制路径带不了 pin
+- pin：READY 后防驱逐——🟡 候选已摆平，落 [D2-kv-operations.md](D2-kv-operations.md) §2
+  - soft 需求三候选
+    - ① lease 调大 + keepalive：零 mooncake 改动、零属主问题、lease 期内绝对不可逐；代价 = 全局读租约变长（驱逐候选缩小，调参项）+ 断线窗口 = lease_ttl
+    - ② 空写 upsert：不动全局 lease、断线窗口 30min 级；代价 = 空写通道（Python 绑定无分离接口）+ 属主问题
+    - ③ 读锁：零改动但脆（断线即失效、key 读锁死、永续会话）
+  - hard 需求：读删写（kvcm 本地持有数据可重试）或读锁
+  - 属主两方案并列（空写与读删写共同面对）
+    - 改归 kvcm：不改 mooncake、语义变（引擎下线 key 不删；kvcm 成新单点）
+    - 借原属主 UUID：语义不变、需 master 加「key → 属主 UUID」查询 RPC（内部数据现成）
+    - 决策条件 = mooncake 可改性（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
+  - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、属主管辖、lease 与驱逐、UUID 与空写通道）
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
 - demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（若以落盘为 READY，等待落盘的时间会把预热收益抵消）。用途二：实例计划下线前降层保存 KV，避免属主下线整批删除（D1 F5；下线删除是否覆盖 disk 副本未核实 → E5/D3）。
 - release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 提供会话生命周期线索，控制面决策，池兜底；含中间档 demote）。
