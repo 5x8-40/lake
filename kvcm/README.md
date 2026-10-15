@@ -23,7 +23,7 @@
 | 异构跨机正向 245(TP2)→217(TP4) 回归（2026-10-12，bc6b5be 单入口 + #15835 补丁） | **通过**：32 keys READY、8/8 token 逐字一致、零 invalid、external hit 88.2%（滚动累计口径，非单请求） |
 | 异构跨机反向 217(TP4)→245(TP2) **同步 load**（2026-10-12，bc6b5be + #15835 补丁） | **通过**：36/36 key 对号、每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 分发生效、8/8 token 逐字一致、74.6→79.7% hit、零 invalid |
 
-完整实验史（总表 14 条 + 异构实录 + 撤回记录）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」「开放问题」。
+完整实验史（总表 14 条 + 异构实录 + 撤回记录）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」；遗留问题与下一步计划见 [backlog.md](backlog.md)。
 
 ## 快速开始
 
@@ -200,7 +200,7 @@ sequenceDiagram
 
     Note over G,M: 阶段 1 · 暖场：前缀 KV 进池（普通请求路径）
     G->>A: warm 请求（共享前缀）
-    A->>M: rank i put 自己的 KV 分片<br/>key@rank:i 落 A seg_i（preferred_segment 钉住）
+    A->>M: rank i put 自己的 KV 分片<br/>key@rank:i 落 A seg_i（preferred_segment 固定）
 
     Note over CP,B: 阶段 2 · 控制面预复制（B2，引擎不参与）
     CP->>M: GET :9003/get_all_segments（seg 名单）
@@ -223,7 +223,7 @@ sequenceDiagram
     Note over B: 客户端 local-first（SelectBestReplica）<br/>选本机 seg → 本机 DRAM 读，零跨机 RDMA
 ```
 
-注：图中「READY → 放行」目前由 `run_e2e.sh` / 手工顺序保证，接 gateway/router 的编排集成见「开放问题 #2」；「哪个 key 在哪个 seg」无需通知任何人——master 是放置权威，get 时 `BatchQuery` 现查；副本无 pin，READY 后受池驱逐策略管理。
+注：图中「READY → 放行」目前由 `run_e2e.sh` / 手工顺序保证，接 gateway/router 的编排集成见 [backlog.md](backlog.md) D4；「哪个 key 在哪个 seg」无需通知任何人——mooncake_master 是放置权威，get 时 `BatchQuery` 现查；副本无 pin，READY 后受池驱逐策略管理。
 
 ### 数据来源与日志边界
 
@@ -345,7 +345,8 @@ kvcm/
 ├── patch_tp_mismatch_worker.patch  # 异构 TP 必打（#15835 rc1 backport）
 ├── README.md / REPRODUCE.md / EXPERIMENTS.md
 ├── kv-prefetch.md           # 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测）
-└── D1-router-scheduling.md  # 生产化设计 D1：Router 集成与请求调度
+├── D1-router-scheduling.md  # 生产化设计 D1：Router 集成与请求调度
+└── backlog.md               # 遗留问题与下一步计划（D1-D7 / P1-P8 / E1-E16 登记处）
 ```
 
 | 文档 | 作用 |
@@ -355,6 +356,7 @@ kvcm/
 | `EXPERIMENTS.md` | 实验总表 14 条 + 异构实录 + 踩坑记录（含撤回历史） |
 | `kv-prefetch.md` | 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测） |
 | `D1-router-scheduling.md` | 生产化设计 D1：Router 集成与请求调度 |
+| `backlog.md` | 遗留问题与下一步计划（设计决策 D1-D7 / 潜在问题 P1-P8 / 工程项 E1-E16） |
 
 ## 操作参考
 
@@ -416,7 +418,7 @@ kvcm/
 ## 边界与已知限制
 
 - **验证覆盖面**
-  - 只验证 **非 layerwise** + **本机 DRAM** 目标；layerwise / 落盘 / 编排集成见「开放问题」。
+  - 只验证 **非 layerwise** + **本机 DRAM** 目标；layerwise / 落盘 / 编排集成见 [backlog.md](backlog.md)（D6 / D3 / D4）。
   - 新路径（rank↔seg 对号）只重跑过同构同机 TP=2，同构跨机与 TP=4 仍是 10/08 旧 key×N 路径结果（见「验证状态」表注）。
   - 「验证状态」表 10/08-09 各条为重构前控制面结果；现行控制面（bc6b5be 单入口）已验证异构跨机双向（#13/#14，含同步 load，手工分步）；`run_e2e.sh` 一键编排（同构/异构）未真机重跑。
   - 全部实测为 GQA（`put_step=1`）；`put_step>1`（MLA 塌缩，key 全在 rank 0）时 plan 全落 `targets[0]`——功能正确但其余 rank 读远端副本，该映射未验证。
@@ -430,38 +432,6 @@ kvcm/
 
 ## 开放问题（待讨论）
 
-底层 B2 已实测；下列未在本目录闭环，生产前需选型。
+底层 B2 已实测；开放问题统一登记在 [backlog.md](backlog.md)：设计决策 D1-D7（D1 已闭环：[D1-router-scheduling.md](D1-router-scheduling.md)）、潜在问题 P1-P8、工程项 E1-E16，含状态与依赖关系。
 
-### 1. Layerwise
 
-当前 e2e：`use_layerwise=false`。池侧有两条 layerwise 线（vllm-ascend）：
-
-| 路线 | 大致配置 | 含义 |
-|------|----------|------|
-| Mooncake block_key | `backend=mooncake` + `use_layerwise=true` | 逐层 range 读；HBM 仍全层；壳请求同步占槽 |
-| MemCache gva | `backend=memcache` + `use_layerwise=true` | HBM 可减量；预热落点更偏本机 DRAM |
-
-待定：生产默认走 MemCache，还是留 Mooncake 并补测 layerwise + B2（get session 是否仍选本机 DRAM）。不建议自研 Mooncake GVA。三个「layerwise」机制的完整辨析见 [../docs/research/vllm-ascend/layerwise-taxonomy.md](../docs/research/vllm-ascend/layerwise-taxonomy.md)。
-
-### 2. 上层编排（现只有底层）
-
-现状：手工 / `run_e2e.sh`：warm → keys → `create_copy_task` → READY → **再**打目标。缺「谁预取、何时放行、失败重试」。
-
-待定：独立 **Prefetch Orchestrator**（旁路进程或并入 Router）：收 intent → 调 B2 → READY 栅栏 → gateway/router 放行。过载/准入仍归 gateway；引擎不参与策略。
-
-选路侧设计见 [D1-router-scheduling.md](D1-router-scheduling.md)（占位，下个 PR 起写）；编排进程形态（D4）仍待定。
-
-### 3. 落盘（SSD / disk）
-
-B2 目标是 worker 挂载的 **DRAM segment**。Mooncake 可有 DRAM→SSD 分层（`enable_ssd_offload`，本目录默认 `false`），那是池内冷热，不是「预复制直指定 disk」。
-
-待定：产品语义是否 **READY = 本机 DRAM 必达**；SSD 仅作容量/恢复异步 demote。以 disk 为 READY 会吃掉预热收益。
-
-### 4. 其它生产缺口（短清单）
-
-- **B 侧重复请求偶发 1-token 贪心翻转**：仅 10/09 旧非 DEBUG 实例出现，新 DEBUG 实例未复现；疑外部加载与 local 路径交替的数值扰动，非字节错乱——复现条件与根因待查，**生产化前必须闭环**（实验记录见 [EXPERIMENTS.md](EXPERIMENTS.md) #10）
-- **副本/GC 生命周期（2026-10-12 观察，待确认）**：key 属主实例死亡后，master 将 key **连同远端副本一起移除**——正向实验 keys 在属主 A 重启后消失（exist 0/32；B seg 字节原地残留，但元数据已删、不可寻址）；与 #12「杀源实例法」短窗口内可读并存。预复制副本在属主下线后的长期语义（保留/驱逐/迁移归属）需单独闭环，直接影响故障恢复时已预热前缀的可用性。
-- EP：持 KV 的 rank/多机拓扑尚未测
-- master HA、监控（READY 延迟、copy 失败率、external hit）
-- 源 worker 掉线则 copy 失败，与故障重路由如何衔接
-- 方案 A（壳请求进 HBM）是否还要、与 B2 叠加顺序
