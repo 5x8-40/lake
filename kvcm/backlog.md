@@ -42,9 +42,9 @@
     - 借原属主 UUID：语义不变、需 master 加「key → 属主 UUID」查询 RPC（内部数据现成）
     - 决策条件 = mooncake 可改性（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、属主管辖、lease 与驱逐、UUID 与空写通道）
-- retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
+- retain：🟡 机制定型（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——demote 保底（两口径通吃）+ 改属主 / move 待 E5 口径裁决；计划下线编排有 `GracefulUnmountSegment`（0.3.11）/ `CreateDrainJob`（main）；长期未命中存续归策略层。
 - demote：🟡 设计完成（落 [D2-kv-operations.md](D2-kv-operations.md) §3）——会话结束 → 停 keepalive + kvcm 读 DRAM 写自己 SSD + `AddReplica` 登记 + 核验（先到先得，静默无效可检出）。kvcm 管自己，与池 `offload_on_evict`（池冷热，0.3.11 含）独立并存。关键收益：disk 副本随**登记 client** 存活（`CleanupStaleHandles` 副本级清理，无按 key 属主整删）→ kvcm 登记则引擎下线副本仍活，天然覆盖 retain 核心场景；引擎自 offload 的副本随引擎死。参考 FlexKV/LMCache/UCM：会话结束触发 + 组件自搬 + 副本放引擎外。READY 不含落盘。
-- release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 提供会话生命周期线索，控制面决策，池兜底；含中间档 demote）。
+- release：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——决策归属 D1 §6；Remove 系 API（`Remove`/`BatchRemove`/`RemoveByRegex`/`RemoveAll`/`BatchReplicaClear`）全可用按场景选用，`force` 仅限「确认没人用」；收尾 = 清台账 + 索引同步。
 - 事实输入：E6。
 
 **D3. 副本生命周期与 READY 语义**
@@ -101,7 +101,7 @@
 - **E2. key 哨兵容器单跑**——`test_keys.py` 在容器内跑通（运行期 `batch_is_exist` 32/32、36/36 证据已齐）。
 - **E3. 多卡自动匹配验证**——resolve 的 `VLLM::Worker_TP<N>` proctitle 匹配在多卡真机走通（现为 `--targets` + 手工对号；失效时明确报错而非静默错配）。
 - **E4. 1-token 翻转根因**——旧非 DEBUG 实例偶发，新实例未复现；首次外部读输出逐字一致，疑路径交替数值扰动。生产化前必须查清（[EXPERIMENTS.md](EXPERIMENTS.md) #10）。
-- **E5. 副本消失机制核实**——属主下线后 key+副本移除的时机与条件（TTL、GC 扫描窗口）对照实验 → D3 事实输入。
+- **E5. 副本消失机制核实**——属主下线后 key+副本移除的时机与条件（TTL、GC 扫描窗口）对照实验 → D3 事实输入。**D2 代码核实新增裁决点**（[D2-kv-operations.md](D2-kv-operations.md) F6b）：代码上清理是副本级（活 seg 上他 client 副本不该被清、无按 key 属主删路径），与实测 0/32（B seg 副本也消失）矛盾——实验需裁决两口径：「按 key 属主删」vs「按 seg 清理」（前者则改属主有效、后者则 move 有效；demote 保底两口径通吃）；排查方向：master 是否同机陪葬 / 副本实际状态 / 其他清理路径。
 - **E6. 0.3.11 API 子集核对**——D2 引用的 lease/offload/promotion 是 mooncake main 的符号，测试床 wheel 是 0.3.11.post1，逐个核对可用子集，缺的即池侧扩展工作量 → D2/P5 输入。新增核对：`BatchExistKey` 的 `grant_lease` 续租语义与 `BatchProbeKey`（D1 F15）、soft pin（D2 pin 候选）、`default_kv_lease_ttl` 实际配置值。
 - **E7. MLA 实测**——`put_step>1` 时 plan 全落 `targets[0]`、其余 rank 读远端，功能推断正确未实测；hybrid/sparse 被上游 gate 排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——✅ 已闭环（落 D1 F14）：publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medium+tenant+group，**无 seg/机器位置**；ZMQ 传输；CMake 默认 OFF、官方 wheel 构建 ON。**0.3.11.post1 不含此机制**（publisher 代码在 v0.3.11 之后进仓，tag 上无 `kv_event/` 目录、无构建开关）——D1 路径 b 要用须升级 mooncake 版本。

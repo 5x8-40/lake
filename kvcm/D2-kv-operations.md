@@ -3,11 +3,12 @@
 - 本文解决什么问题
   - kvcm（独立 KV 管理控制面）需要对池里的 KV 做调度操作（复制、防驱逐、降层、保留、释放）
   - 本文定这些操作的语义、实现机制、失败处理
-- 状态: **讨论中**
+- 状态: **设计完成**（待 E5 裁决一处事实矛盾）
   - 操作集框架已闭环（§1）
   - pin：**设计完成**——soft 三候选、hard 两候选、属主两方案已摆平（§2）；裁决依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞后续议题
-  - demote：**设计完成**——会话级降层 = 停保活 + kvcm 主动登记自己 SSD 副本（§3）；disk 副本随登记 client 存活，引擎下线仍活（天然覆盖 retain 核心场景）
-  - retain（残余部分）/ release 待议（[backlog.md](backlog.md) D2）
+  - demote：**设计完成**——会话结束 / 变冷 / 计划下线 → 停保活 + kvcm 主动登记自己 SSD 副本（§3）；disk 副本两口径下均安全
+  - retain：**机制定型**——demote 保底（两口径通吃）+ 改属主 / move 待 E5 口径裁决（§4，事实矛盾见 F6b）
+  - release：**定型**——Remove 系 API 全可用按场景选用（§4）
 - 上游问题: backlog D2——独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
   - **0.3.11.post1**：测试床实际部署的 wheel
@@ -81,12 +82,17 @@
     - 只撤写中副本；副本已就绪则拒绝 → `INVALID_WRITE`
   - 与 kvcm 的关系：空写若在 Start/End 之间崩溃，副本卡写中——恢复时扫描任务记录，补 End 或 Revoke 清理（归 §1 状态记录①的崩溃恢复）
 
-### 属主字段管辖范围
+### 属主字段与级联删除
 
-- **F6 属主管辖两件事，其余一概不管**
-  1. **级联删除**：属主进程心跳超时被 master 判定下线后，它写入的 key 连同所有副本（包括 kvcm 预热到其他机器上的）一起被元数据级删除（D1 F5，实测 exist 0/32）
-  2. **写中止权限**：Revoke 校验属主身份（F5）
-- **不管**：copy / move / get / exist——复制与读取路径完全不读属主字段（F7 代码核实）
+- **F6 属主字段代码上只管两件事**（全库 `metadata.client_id` 仅三处：Revoke 校验 ×2、upsert 改写 ×1）
+  1. **写中止权限**：Revoke 校验属主身份（F5）
+  2. **upsert 改写**：「谁最后写谁是属主」（F3①）
+  - **不管**：copy / move / get / exist——复制与读取路径完全不读属主字段（F7 代码核实）
+- **F6b 级联删除：实测现象与代码核实矛盾（归因归 E5）**
+  - **实测**（D1 F5 / EXPERIMENTS #3）：属主 A 重启 → client TTL 过期 → key 记录连同全部副本记录（**含预热到 B seg 上的**）消失，`batch_is_exist` 0/32；现象疑似「副本存活性绑定属主 client」
+  - **代码核实**（0.3.11.post1）：client 过期处理（`master_service.cpp:4930-5015`）= unmount 该 client 全部 seg + `ClearInvalidHandles` 全量扫——清理是**副本级**的（`CleanupStaleHandles :2530`）：内存副本随死 seg 清、disk 副本随死登记 client 清。**活 seg 上其他 client 的副本按代码不该被清**；全库无「按 key 属主删」路径
+  - **矛盾**：实测时 B 的 seg 活着、B 副本 COMPLETE 可读（B 命中 88.2%），按代码应存活，实测却消失——待 E5 对照实验厘清（master 是否同机陪葬 / 副本实际状态 / 其他清理路径）
+  - **设计含义**：两种口径下 retain 有效手段不同（§4）；**demote 落 kvcm SSD 在两口径下都成立**（数据物理离开死 seg + disk 副本登记 client = kvcm）
 
 ### copy / move 机制
 
@@ -226,7 +232,7 @@
 |---|---|---|
 | 做法 | kvcm 传自己的 UUID（自己就是 client，天然持有；sqlite 持久化，重启同 id 重注册） | kvcm 先查得原属主 UUID，调用时原样传回（F4） |
 | mooncake 代码 | **不改**（前提：空写通道不落 Python，F9） | **要改**：master 加「key → 属主 UUID」查询 RPC（数据内部现成，纯暴露，F8） |
-| 属主语义 | **改变**：引擎下线后 key 不再级联删除（正是 retain 想要的收益）；代价 = kvcm 下线 → 名下 key 全删（新单点；缓解 = UUID 持久化 + 重启快于 master 心跳超时） | **不变**：引擎下线 key 删（维持现状语义） |
+| 属主语义 | **改变**：引擎下线后 key 不再级联删除（retain 收益——**有效性依赖 E5 口径**：若级联按 key 属主删则成立；若按 seg 维度清理则 seg 失效照清副本、与 key 属主无关，见 F6b）；代价 = kvcm 下线 → 名下 key 全删（新单点；缓解 = UUID 持久化 + 重启快于 master 心跳超时） | **不变**：引擎下线 key 删（维持现状语义） |
 | 引擎配合 | 无 | 无（补丁打在 master，引擎零感知） |
 
 - **决策条件（外部依赖，非单方可定）**
@@ -241,7 +247,7 @@
 
 ### 语义
 
-- **触发**：会话结束（或策略层判定 KV 变冷）→ kvcm 把该会话的 KV 从 DRAM 降层到自己的 SSD，**不删**
+- **触发**：会话结束 / 策略层判定 KV 变冷 / **实例计划下线前保存**——凡是「DRAM 里的 KV 需要转到 SSD 保存」的场景 → kvcm 把目标 KV 从 DRAM 降层到自己的 SSD，**不删**
 - **回来路径**：client 读优先级 MEMORY → LOCAL_DISK → DISK（`real_client.cpp:2523-2553` @0.3.11）；任何 client 经 disk descriptor 的 `transport_endpoint` 走 offload RPC **远程读**——引擎跨机器读 kvcm 盘上的副本是现成能力；`promotion_on_hit`（0.3.11 含）可由池把热的盘副本提回 DRAM
 - demote 在操作集中是**复合操作**（停 keepalive + 落 SSD），不是新的原子机制
 
@@ -267,9 +273,10 @@
 
 ### 副本归属：demote 顺带覆盖 retain 核心场景
 
-- 级联删除是**副本级**的（`CleanupStaleHandles`，`master_service.cpp:2530` @0.3.11）：内存副本随 seg 属主死清、**disk 副本随登记 client 死清**；全无效副本则 key 删。全库无「按 key 属主整删」逻辑
-- 所以：**kvcm 登记的 disk 副本，引擎下线仍存活**——「属主下线副本存续」（retain 核心诉求）由 demote 天然覆盖，不需要改属主
-- 对偶：引擎自己 offload 的副本（池冷热路径）随引擎死清——池冷热不保障会话存续
+- 级联删除按代码是**副本级**的（`CleanupStaleHandles`，`master_service.cpp:2530` @0.3.11）：内存副本随 seg 属主死清、**disk 副本随登记 client 死清**；全无效副本则 key 删。全库无「按 key 属主整删」逻辑——但与实测现象（B seg 副本也消失）矛盾，归因归 E5（F6b）
+- **kvcm 登记的 disk 副本在两口径下都安全**：代码口径下登记 client（kvcm）活着副本即活；实测口径（绑定 key 属主）下数据已物理离开死 seg、disk descriptor 里登记的是 kvcm
+- 所以「属主下线副本存续」（retain 核心诉求）由 demote 保底覆盖，不依赖改属主
+- 对偶：引擎自己 offload 的副本（池冷热路径）登记 client = 引擎，随引擎死清——池冷热不保障会话存续
 
 ### 与池 offload 的关系：独立并存
 
@@ -282,11 +289,30 @@
 - **READY 不含落盘**：预热 READY = DRAM 副本就位即上报（D1 口径不变）
 - 落盘是降层/后台路径，与 READY 判定无关——若以落盘为 READY，等待落盘的时间会抵消预热收益
 
-## §4 retain / release（待议）
+## §4 retain / release
 
-- 现状描述在 [backlog.md](backlog.md) D2
-- retain 的已有输入
-  - **demote（§3）已覆盖核心场景**：kvcm 登记的 disk 副本，引擎下线仍存活
-  - 剩余问题：DRAM 副本在属主下线后的存续（不转盘直接留内存的场景）、长期未命中副本的存续策略
-  - 与属主语义（§2 两方案）、D3 副本生命周期直接耦合
-  - `AddReplicaForRetainedClient`（master 为「保留副本的客户端」补登记副本的接口，`master_service.cpp:5400` @main）为 main 独有、0.3.11 不含（E6 已核）→ 候选机制，届时评估
+### retain（属主下线后副本存续）：机制定型
+
+- **目标**：写入引擎（属主）下线后，它写的 KV 副本仍可用
+- **保底 = demote**（两口径通吃，§3）：计划下线前把该实例的 KV 降层到 kvcm SSD——数据物理离开死 seg + disk 副本登记 client = kvcm。意外下线来不及 demote 的，依赖池内他机残存副本（按代码口径应存活——E5 验证）
+- **补充手段（有效性依赖 E5 口径，F6b）**
+  - **改属主**（§2 方案一）：仅当 E5 证实「按 key 属主删」才有效
+  - **move/copy 到其他活 seg**：仅当 E5 证实「按 seg 清理」才有效（副本挪到活 seg 即脱离清理范围）
+  - 两者不互斥，E5 裁决后启用对应手段；demote 保底始终成立
+- **计划下线的编排入口**
+  - `GracefulUnmountSegment`（`master_service.cpp:669` @0.3.11）：引擎自调，宽限期后正式 unmount——宽限期即 demote/move 的执行窗口
+  - `CreateDrainJob`（main 独有）：master 把指定 seg 优雅排空到目标 seg（带并发上限），归 D3 评估
+- **长期未命中副本的存续** = 策略层（保活注册表驱动），机制已齐（keepalive/pin/demote）
+- `AddReplicaForRetainedClient`（main 独有，retaining guard 语义）：E5 后评估
+- 与 D3 的边界：副本生命周期（TTL / READY 语义）归 D3；本节只定「属主下线」场景的机制组合
+
+### release（主动释放）：定型
+
+- **决策归属已闭环**（D1 §6）：router 提供会话生命周期线索 → 控制面决策执行 → 池驱逐兜底；三档 = 软释放（停保活）/ demote（降层）/ 主动 Remove（确认没人用）
+- kvcm 是管理控制面，Remove 系 API **全部可用，按场景选用**（`master_service.h:440-464` @0.3.11）
+  - `Remove(key)` / `BatchRemove(keys)`：按 key 精确删
+  - `RemoveByRegex(pattern)`：模式批量删（前缀族 / 模型版本整体下线）
+  - `RemoveAll()`：全池清空（运维重置）
+  - `BatchReplicaClear(keys, client_id, seg)`：清指定 client 指定 seg 上的副本——实例下线后主动清残（`CleanupStaleHandles` 惰性清理的主动版）
+  - 公共参数 `force`：跳过 lease 与复制任务检查——仅「确认没人用」（D1 §6 例外档）使用；否则等 lease 过期自然释放
+- **收尾责任**：remove 后 kvcm 清自己台账 + 索引条目同步清（池副本删除事件通道缺失，D1 F10/F14；llm-d 幽灵条目同坑）
