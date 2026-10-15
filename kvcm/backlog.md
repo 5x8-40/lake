@@ -44,8 +44,6 @@
     - soft pin 限时（默认 30min / 上限 24h，`types.h:85-89` @main），驱逐排最后、极端可逐（`allow_evict_soft_pinned_objects` 默认 true，`master_service.h:987-995` @main）
     - hard pin 创建时固化（`master_service.cpp:6068` @main）
     - `CreateCopyTask` 无 config（两版本同）→ 复制路径带不了 pin
-  - 修正记录：原结论「无事后 pin 通道、只能池侧扩展」作废——upsert 空写可达（D2 文档 F2-F4）
-  - lake 同义设计参考：「引用数 >0 冻结」（`../docs/architecture/kv-cache-pool.md`）
 - retain：属主下线/长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。
 - demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（若以落盘为 READY，等待落盘的时间会把预热收益抵消）。用途二：实例计划下线前降层保存 KV，避免属主下线整批删除（D1 F5；下线删除是否覆盖 disk 副本未核实 → E5/D3）。
 - release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 提供会话生命周期线索，控制面决策，池兜底；含中间档 demote）。
