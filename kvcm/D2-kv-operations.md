@@ -266,89 +266,147 @@
 
 ### 操作图解
 
-统一布局（各操作图只画涉及的部分）：
+统一布局（各操作图复用这套角色，只画涉及的部分）：
 
+```mermaid
+flowchart TD
+    subgraph EA["引擎 A"]
+        HBM_A["HBM<br/>GPU 工作集（操作不直接碰）"]
+        DRAM_A["DRAM seg（池内）"]
+        SSD_A["SSD 本机盘（池内）"]
+    end
+    subgraph EB["引擎 B"]
+        HBM_B["HBM<br/>GPU 工作集"]
+        DRAM_B["DRAM seg（池内）"]
+        SSD_B["SSD 本机盘（池内）"]
+    end
+    M["mooncake master<br/>元数据权威 · 任务派发"]
+    K["kvcm<br/>KV 调度控制面"]
+    R["Router<br/>请求调度"]
+    DFS[("DFS 共享 3FS<br/>仅 main")]
+
+    M <--> EA
+    M <--> EB
+    K <--> M
+    R <--> K
+    R --> EA
+    R --> EB
+    EA <--> DFS
+    EB <--> DFS
 ```
-┌─────────── 引擎 A ───────────┐   ┌─────────── 引擎 B ───────────┐
-│ HBM（GPU 工作集，操作不直接碰）│   │ HBM（同左）                   │
-│ DRAM seg（注册进池）          │   │ DRAM seg（注册进池）           │
-│ SSD（本机盘，挂引擎 client 下）│   │ SSD（同左）                   │
-└──────────────┬───────────────┘   └───────────────┬──────────────┘
-       ┌───────┴─────────────────────────────────────┴───────┐
-       │        mooncake master（元数据权威、任务派发）         │
-       └───────┬──────────────────────────────────────┬──────┘
-           ┌───┴────┐                             ┌───┴────┐
-           │  kvcm  │                             │ Router │
-           └────────┘                             └────────┘
-       ┌────────────────────────────────────────────────────────┐
-       │ DFS（共享 3FS，仅 main；挂载同一份的机器都可读）          │
-       └────────────────────────────────────────────────────────┘
 
-图例：━━▶ 数据流（KV 本体）   ──▶ 控制指令（RPC）   ⇢ 结果知会
-```
-
+- 连线语义：master↔引擎 = RPC + RDMA（任务派发与数据面）；Router→引擎 = 推理请求；Router↔kvcm = READY/会话线索/摘流；kvcm↔master = 全部 KV 操作指令。**kvcm 与引擎之间没有直连**（F11）
 - HBM 标「不直接碰」：八项操作都作用于**池内副本**（DRAM/SSD/DFS）；HBM 工作集由引擎自己的读写路径加载，不在 kvcm 操作面
+- 图例：`──▶` 控制指令（RPC）；`══▶` 数据流（KV 本体）；`┄┄▶` 结果知会
 
-**① copy（预热核心；move 只差两处）**
+**① copy（预热核心）**
 
+```mermaid
+flowchart LR
+    K["kvcm"] -->|"① CreateCopyTask(key, [B.seg])"| M["master"]
+    M -->|"② 派任务给源 seg 属主"| A["引擎 A（源）"]
+    A ==>|"③ RDMA：A.DRAM → B.DRAM"| B["引擎 B（目标）"]
+    A -->|"④ CopyEnd"| M
+    K -->|"⑤ QueryTask + 副本核验"| M
+    K -.->|"⑥ READY"| R["Router"]
 ```
-kvcm ──❶CreateCopyTask(key, [B.seg])──▶ master
-master ──❷任务派给「源 seg 属主」──▶ 引擎 A
-引擎 A：❸ 读 A.DRAM ━━RDMA━━▶ 写 B.DRAM，❹CopyEnd ──▶ master
-kvcm ──❺QueryTask + 副本核验──▶ master
-kvcm ⇢ ❻READY ⇢ Router（可以把请求调去 B 了）
-```
-- Router：**不介入**操作，只收 ❻ 的结果
-- move 差异：❶换 `CreateMoveTask(key, A.seg, B.seg)`（指定源）；❸完成后删 A 侧副本
+- Router：**不介入**操作，只收 ⑥ 的结果（把请求调去 B）
 
-**② keepalive / pin（纯控制，无数据流）**
+**② move（下线迁移/副本归拢）**
 
+```mermaid
+flowchart LR
+    K["kvcm"] -->|"① CreateMoveTask(key, A.seg→B.seg)"| M["master"]
+    M -->|"② 派任务给源 seg 属主"| A["引擎 A（源）"]
+    A ==>|"③ RDMA：A.DRAM → B.DRAM"| B["引擎 B（目标）"]
+    A -->|"④ MoveEnd（源副本随任务完成删除）"| M
+    K -->|"⑤ QueryTask + 副本核验"| M
 ```
-kvcm ──周期 ExistKey/BatchExistKey──▶ master：续 lease（+soft pin 时钟）
-kvcm ──空写 upsert（with_soft_pin=±）──▶ master：设/清 pin 标记
+- 与 copy 的两处差异：①指定源；④完成后源副本删除。Router：**不介入**
+
+**③ keepalive（周期 touch，无数据流）**
+
+```mermaid
+flowchart LR
+    K["kvcm"] -->|"周期 ExistKey / BatchExistKey"| M["master<br/>续 lease 时钟<br/>（有 soft pin 的一并续）"]
+```
+- Router：**不介入**；kvcm 断线 → lease 过期即失效
+
+**④ pin（元数据标记，无数据流）**
+
+```mermaid
+flowchart LR
+    K["kvcm"] -->|"空写 upsert（with_soft_pin=±）"| M["master<br/>设/清 soft pin 标记"]
+```
+- Router：**不介入**；hard pin 只能创建时带（F1），kvcm 事后加不了
+
+**⑤ demote（DRAM→SSD；数据只在本机内流）**
+
+```mermaid
+flowchart LR
+    K["kvcm"] -->|"① 停 keepalive（写回模式的必要前置）"| M["master"]
+    M -.->|"② offload 任务<br/>写穿 = put 时已落盘<br/>写回 = 驱逐选中时"| A["引擎 A"]
+    A ==>|"③ DRAM → 本机 SSD"| S[("A·SSD")]
+    K -->|"④ 核验盘副本在册"| M
+```
+- Router：**不介入**；写穿模式 kvcm 无 ①② 动作，直接 ④ 核验
+
+**⑥ promote（SSD→DRAM；读命中驱动，kvcm 无主动入口）**
+
+```mermaid
+flowchart LR
+    REQ["读请求"] --> E["引擎"]
+    E -->|"读命中只剩盘副本的 key"| M["master<br/>命中统计达阈值"]
+    M -->|"① 派提升任务"| H["盘副本属主 client"]
+    S[("SSD")] ==>|"② 读盘 → 写 DRAM"| D[("DRAM")]
+    H -->|"③ NotifyPromotionSuccess"| M
+```
+- Router：**不介入**（请求自然驱动；主动 promote 两版本无入口）
+
+**⑦ retain（部署/写路径选择，不是 kvcm 的运行时动作）**
+
+```mermaid
+flowchart TB
+    subgraph S1["形态一：retained client（main）"]
+        E1["引擎"] -->|"以保留身份注册"| M1["master"]
+        E1 -.->|"断线"| M1
+        M1 --> R1["master 保留其数据登记<br/>等回来认领"]
+    end
+    subgraph S2["形态二：DFS 副本（main）"]
+        E2["引擎"] ==>|"put / demote 写 DFS"| DFS[("共享 3FS")]
+        DFS --> R2["引擎全灭副本仍在<br/>挂同一 DFS 的机器可读"]
+    end
 ```
 - Router：**不介入**
 
-**③ demote（DRAM→SSD；数据只在本机内流）**
+**⑧ remove**
 
+```mermaid
+flowchart LR
+    K["kvcm"] -->|"① Remove / BatchRemove / RemoveByRegex"| M["master<br/>② 删 key + 全部副本（DRAM/SSD/DFS）"]
+    K -.->|"③ 清台账 + 索引同步"| R["Router/索引"]
 ```
-写穿模式：引擎 put 时 DRAM ━━▶ 本机 SSD（异步落盘，kvcm 无动作）
-写回模式：kvcm ──❶停 keepalive──▶（等 lease 过期 + 池有驱逐压力）
-         master ──❷offload 任务──▶ 引擎：DRAM ━━▶ 本机 SSD，再释放 DRAM
-kvcm ──❸核验盘副本在册──▶ master
-```
-- Router：**不介入**
+- Router：**不介入**决策；③是收尾同步（池无删除事件通道，需 kvcm 主动推，D4）
 
-**④ promote（SSD→DRAM；读命中驱动，kvcm 无主动入口）**
+**⑨ 复合流程——Router 的三个介入点（全在流程层，不在原子操作层）**
 
-```
-引擎请求读到只剩盘副本的 key → master 统计命中达阈值
-master ──❶提升任务──▶ 盘副本属主 client：❷ 读 SSD ━━▶ 写 DRAM，❸上报 ──▶ master
-```
-- Router：**不介入**（请求自然驱动）
-
-**⑤ retain（部署/写路径选择，不是 kvcm 的运行时动作）**
-
-```
-retained client（main）：引擎以保留身份注册 → 断线后 master 不立即清，等认领
-DFS（main）：put/demote 写 DFS ━━▶ 共享 3FS；引擎全灭副本仍在、他机可读
-```
-- Router：**不介入**
-
-**⑥ remove**
-
-```
-kvcm ──❶Remove/BatchRemove/RemoveByRegex──▶ master ──❷删 key + 全部副本（DRAM/SSD/DFS）
-kvcm ❸清台账 ⇢ 索引/Router 同步清条目（池无删除事件通道，需 kvcm 主动推，D4）
-```
-- Router：**不介入**决策；❸是收尾同步
-
-**⑦ 复合流程——Router 的三个介入点（全部在流程层，不在原子操作层）**
-
-```
-prefetch 预热    kvcm copy → READY ⇢ Router 按新副本位置调度请求    （结果介入）
-会话结束降层     Router ⇢ 会话结束线索 ⇢ kvcm 停保活 + demote        （输入介入，D1 §6）
-计划下线        ❶Router 摘流 → ❷kvcm 迁 KV → ❸引擎宽限期卸载 → ❹缩容 （流程介入）
+```mermaid
+flowchart TB
+    subgraph P1["prefetch 预热（结果介入）"]
+        K1["kvcm"] -->|"copy + 核验"| M1["master"]
+        K1 -.->|"READY"| R1["Router"]
+        R1 -->|"按新副本位置调度请求"| B1["引擎 B"]
+    end
+    subgraph P2["会话结束降层（输入介入，D1 §6）"]
+        R2["Router"] -.->|"会话结束线索"| K2["kvcm"]
+        K2 -->|"停保活 + demote"| M2["master"]
+    end
+    subgraph P3["计划下线（流程介入）"]
+        R3["Router"] -->|"① 摘流"| E3["引擎 A"]
+        K3["kvcm"] -->|"② 迁 KV（copy/move/demote）"| M3["master"]
+        E3 -->|"③ GracefulUnmountSegment 宽限期"| M3
+        C3["控制面"] -->|"④ 缩容停引擎"| E3
+    end
 ```
 
 - 总结：**原子操作 Router 一律不介入**；介入只发生在复合流程的输入（会话线索）、结果（READY）、编排（下线）三处——这正是「kvcm 管 KV、Router 管请求」的职责分界
