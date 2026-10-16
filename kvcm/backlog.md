@@ -29,7 +29,7 @@
 
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
-- 操作集框架：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §1）——七项原子操作 copy/move/keepalive/pin/demote/retain/remove，复合操作原子组合（prefetch = copy+核验+保活注册；软释放 = 停 keepalive；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
+- 操作集框架：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程原子组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
 - pin：READY 后防驱逐——🟡 候选已摆平，落 [D2-kv-operations.md](D2-kv-operations.md) §2
   - soft 需求三候选
@@ -42,8 +42,8 @@
     - 借原属主 UUID：语义不变、需 master 加「key → 属主 UUID」查询 RPC（内部数据现成）
     - 决策条件 = mooncake 可改性（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、属主管辖、lease 与驱逐、UUID 与空写通道）
-- retain：🟡 机制定型（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——正路 = main 的 retained client 机制（断线数据保留，`AddReplicaForRetainedClient`），0.3.11 没有；0.3.11 过渡 = 计划下线 demote + 改属主/move 待 E5 口径裁决；计划下线编排有 `GracefulUnmountSegment`（0.3.11）/ `CreateDrainJob`（main）；长期未命中 → demote SSD，策略归编排。
-- demote / promote：🟡 设计完成（落 [D2-kv-operations.md](D2-kv-operations.md) §3）——原子操作，存储统一归 mooncake（引擎实例挂本机 SSD 多级 tier，kvcm 不持存储）。demote = 池开 `enable_offload`（写穿/写回两模式 ≈ HiCache write_through/write_back）+ 停保护后驱逐落盘；promote = `promotion_on_hit` 被动提回（0.3.11 含；主动 RPC 链限 holder，kvcm 无入口）。触发（会话结束/变冷/DRAM 压力/计划下线）归策略层。缺口：无 per-key 立即降层 RPC、主动 promote 无入口 → 池侧扩展。READY 只看 DRAM 就位不含落盘。
+- retain：🟡 机制定型（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——正路 = main 池机制两条并列：retained client（断线数据保留等认领，`AddReplicaForRetainedClient`，解引擎进程下线）、DFS 副本（写共享 3FS，不随 client 死被清，解整机灭失，前提部署 3FS）；0.3.11 下 demote 解不了 retain（盘副本绑引擎 client，引擎死照样清），过渡 = 改属主/move（待 E5 口径裁决）/ kvcm 自挂 SSD（不依赖 E5 的兜底）；计划下线编排有 `GracefulUnmountSegment`（0.3.11）/ `CreateDrainJob`（main）；长期未命中 → demote SSD，策略归编排。
+- demote / promote：🟡 设计完成（落 [D2-kv-operations.md](D2-kv-operations.md) §3）——语义原子、实现为「池通道+核验」组合，存储统一归 mooncake（引擎实例挂本机 SSD 多级 tier，kvcm 不持存储）。demote = 池开 `enable_offload`（写穿/写回两模式 ≈ HiCache write_through/write_back），写回模式须先停保活等 lease 过期（保活挡驱逐即挡落盘）；promote = `promotion_on_hit` 被动提回（0.3.11 含；主动 RPC 链限 holder，kvcm 无入口）。copy/move 接不了 SSD（disk seg 无 seg 名，两版本同）。触发（会话结束/变冷/DRAM 压力/计划下线）归策略层。缺口：无 per-key 立即降层 RPC（两版本同）、主动 promote 无入口 → 池侧扩展。每操作有完成信号，READY 特指 DRAM 就位可调度。
 - release：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——决策归属 D1 §6；kvcm 可用 `Remove`/`BatchRemove`/`RemoveByRegex`（配 key 命名空间才有意义）/`RemoveAll`；`BatchReplicaClear` 限 key 属主自调（kvcm 调不动别人的 key）；`force` 仅限「确认没人用」；收尾 = 清台账 + 索引同步。
 - 事实输入：E6。
 
@@ -102,7 +102,7 @@
 - **E2. key 哨兵容器单跑**——`test_keys.py` 在容器内跑通（运行期 `batch_is_exist` 32/32、36/36 证据已齐）。
 - **E3. 多卡自动匹配验证**——resolve 的 `VLLM::Worker_TP<N>` proctitle 匹配在多卡真机走通（现为 `--targets` + 手工对号；失效时明确报错而非静默错配）。
 - **E4. 1-token 翻转根因**——旧非 DEBUG 实例偶发，新实例未复现；首次外部读输出逐字一致，疑路径交替数值扰动。生产化前必须查清（[EXPERIMENTS.md](EXPERIMENTS.md) #10）。
-- **E5. 副本消失机制核实**——属主下线后 key+副本移除的时机与条件（TTL、GC 扫描窗口）对照实验 → D3 事实输入。**D2 代码核实新增裁决点**（[D2-kv-operations.md](D2-kv-operations.md) F6b）：代码上清理是副本级（活 seg 上他 client 副本不该被清、无按 key 属主删路径），与实测 0/32（B seg 副本也消失）矛盾——实验需裁决两口径：「按 key 属主删」vs「按 seg 清理」（前者则改属主有效、后者则 move 有效；demote 保底两口径通吃）；排查方向：master 是否同机陪葬 / 副本实际状态 / 其他清理路径。
+- **E5. 副本消失机制核实**——属主下线后 key+副本移除的时机与条件（TTL、GC 扫描窗口）对照实验 → D3 事实输入。**D2 代码核实新增裁决点**（[D2-kv-operations.md](D2-kv-operations.md) F6b）：代码上清理是副本级（活 seg 上他 client 副本不该被清、无按 key 属主删路径），与实测 0/32（B seg 副本也消失）矛盾——实验需裁决两口径：「按 key 属主删」vs「按 seg 清理」（前者则改属主有效、后者则 move 有效；0.3.11 下不依赖口径的兜底 = kvcm 自挂 SSD，main 池机制 retained client / DFS 副本是 E5 之外的独立解）；排查方向：master 是否同机陪葬 / 副本实际状态 / 其他清理路径。
 - **E6. 0.3.11 API 子集核对**——D2 引用的 lease/offload/promotion 是 mooncake main 的符号，测试床 wheel 是 0.3.11.post1，逐个核对可用子集，缺的即池侧扩展工作量 → D2/P5 输入。新增核对：`BatchExistKey` 的 `grant_lease` 续租语义与 `BatchProbeKey`（D1 F15）、soft pin（D2 pin 候选）、`default_kv_lease_ttl` 实际配置值。
 - **E7. MLA 实测**——`put_step>1` 时 plan 全落 `targets[0]`、其余 rank 读远端，功能推断正确未实测；hybrid/sparse 被上游 gate 排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——✅ 已闭环（落 D1 F14）：publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medium+tenant+group，**无 seg/机器位置**；ZMQ 传输；CMake 默认 OFF、官方 wheel 构建 ON。**0.3.11.post1 不含此机制**（publisher 代码在 v0.3.11 之后进仓，tag 上无 `kv_event/` 目录、无构建开关）——D1 路径 b 要用须升级 mooncake 版本。
