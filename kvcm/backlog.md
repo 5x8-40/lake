@@ -42,9 +42,9 @@
     - 借原属主 UUID：语义不变、需 master 加「key → 属主 UUID」查询 RPC（内部数据现成）
     - 决策条件 = mooncake 可改性（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、属主管辖、lease 与驱逐、UUID 与空写通道）
-- retain：🟡 机制定型（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——demote 保底（两口径通吃）+ 改属主 / move 待 E5 口径裁决；计划下线编排有 `GracefulUnmountSegment`（0.3.11）/ `CreateDrainJob`（main）；长期未命中存续归策略层。
-- demote：🟡 设计完成（落 [D2-kv-operations.md](D2-kv-operations.md) §3）——会话结束 → 停 keepalive + kvcm 读 DRAM 写自己 SSD + `AddReplica` 登记 + 核验（先到先得，静默无效可检出）。kvcm 管自己，与池 `offload_on_evict`（池冷热，0.3.11 含）独立并存。关键收益：disk 副本随**登记 client** 存活（`CleanupStaleHandles` 副本级清理，无按 key 属主整删）→ kvcm 登记则引擎下线副本仍活，天然覆盖 retain 核心场景；引擎自 offload 的副本随引擎死。参考 FlexKV/LMCache/UCM：会话结束触发 + 组件自搬 + 副本放引擎外。READY 不含落盘。
-- release：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——决策归属 D1 §6；Remove 系 API（`Remove`/`BatchRemove`/`RemoveByRegex`/`RemoveAll`/`BatchReplicaClear`）全可用按场景选用，`force` 仅限「确认没人用」；收尾 = 清台账 + 索引同步。
+- retain：🟡 机制定型（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——正路 = main 的 retained client 机制（断线数据保留，`AddReplicaForRetainedClient`），0.3.11 没有；0.3.11 过渡 = 计划下线 demote + 改属主/move 待 E5 口径裁决；计划下线编排有 `GracefulUnmountSegment`（0.3.11）/ `CreateDrainJob`（main）；长期未命中 → demote SSD，策略归编排。
+- demote / promote：🟡 设计完成（落 [D2-kv-operations.md](D2-kv-operations.md) §3）——原子操作，存储统一归 mooncake（引擎实例挂本机 SSD 多级 tier，kvcm 不持存储）。demote = 池开 `enable_offload`（写穿/写回两模式 ≈ HiCache write_through/write_back）+ 停保护后驱逐落盘；promote = `promotion_on_hit` 被动提回（0.3.11 含；主动 RPC 链限 holder，kvcm 无入口）。触发（会话结束/变冷/DRAM 压力/计划下线）归策略层。缺口：无 per-key 立即降层 RPC、主动 promote 无入口 → 池侧扩展。READY 只看 DRAM 就位不含落盘。
+- release：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——决策归属 D1 §6；kvcm 可用 `Remove`/`BatchRemove`/`RemoveByRegex`（配 key 命名空间才有意义）/`RemoveAll`；`BatchReplicaClear` 限 key 属主自调（kvcm 调不动别人的 key）；`force` 仅限「确认没人用」；收尾 = 清台账 + 索引同步。
 - 事实输入：E6。
 
 **D3. 副本生命周期与 READY 语义**
