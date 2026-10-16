@@ -311,6 +311,8 @@ flowchart TB
     K -.->|"⑥ READY"| R["Router"]
     N["main 另有入口：SubmitReplicaActionProposal<br/>（仅加副本 ADD，带热度准入 + lease）"]
     M -.-> N
+    N2["缺口：copy 任务无取消 RPC（两版本同，P9）——<br/>请求改道/源消失只能弃置 + 事后清副本（弱版）"]
+    M -.-> N2
 ```
 
 **② move（下线迁移/副本归拢）**
@@ -324,6 +326,8 @@ flowchart TB
     K -->|"⑤ QueryTask + 副本核验"| M
     N["seg 级批量搬迁（main）：CreateDrainJob<br/>把整条 seg 的副本迁走排空（下线场景）"]
     M -.-> N
+    N2["缺口：move 任务无取消 RPC（两版本同，P9）；失败则源副本保留"]
+    M -.-> N2
 ```
 
 **③ keepalive（周期 touch，无数据流）**
@@ -357,7 +361,7 @@ flowchart TB
     K --> H1 & H2
     S2 -.-> OWN
     H1 -.-> OWN
-    N["已否决：引擎写入时源头带 pin（侵入 + 全 pin 无区分度）；<br/>AddReplica 此路不通（只收 LOCAL_DISK、不带 pin）；hard pin 事后改不了（F1）"]
+    N["已否决：不做靠驱逐兜底（pin 与未 pin 的差异正是优先级语义）；<br/>引擎写入时源头带 pin（侵入 + 全 pin 无区分度）；<br/>AddReplica 此路不通（只收 LOCAL_DISK、不带 pin）；hard pin 事后改不了（F1）；<br/>copy 路径带不了 pin——CreateCopyTask 不收写配置，pin 必须事后单独加（F1）"]
     SOFT -.-> N
 ```
 
@@ -369,7 +373,7 @@ flowchart TB
     M -.->|"② offload 任务<br/>写穿 = put 完成时已落盘<br/>写回 = 驱逐选中时才落盘"| A["引擎 A"]
     A ==>|"③ DRAM → 本机 SSD"| S[("A·SSD")]
     K -->|"④ 核验盘副本在册"| M
-    N["缺口：无 per-key 立即降层 RPC（两版本同）→ 池侧扩展；<br/>远期变体：demote 到 kvcm 自挂的 SSD（盘副本绑 kvcm，§4 retain 兜底）"]
+    N["缺口：无 per-key 立即降层 RPC（两版本同）→ 池侧扩展；<br/>「立即清内存副本、只留盘副本」也走不通（BatchReplicaClear 限 key 属主，F6②）；<br/>远期变体：demote 到 kvcm 自挂的 SSD（盘副本绑 kvcm，§4 retain 兜底）"]
     M -.-> N
 ```
 
@@ -437,9 +441,10 @@ flowchart TB
 ```mermaid
 flowchart TB
     subgraph P1["prefetch 预热（结果介入）"]
-        K1["kvcm"] -->|"copy + 核验"| M1["master"]
-        K1 -.->|"READY"| R1["Router"]
+        K1["kvcm"] -->|"① copy + 核验"| M1["master"]
+        K1 -.->|"② READY"| R1["Router"]
         R1 -->|"按新副本位置调度请求"| B1["引擎 B"]
+        K1 -->|"③ 保活注册后接 keepalive"| M1
     end
     subgraph P2["会话结束降层（输入介入，D1 §6）"]
         R2["Router"] -.->|"会话结束线索"| K2["kvcm"]
