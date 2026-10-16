@@ -28,12 +28,13 @@
 
 ### 背景概念
 
-- **key 与副本**：池里一把 key 存一份 KV 数据；同一 key 可有多个副本（replica），落在不同机器的 segment（seg，一段注册进池的 DRAM）上
+- **key 与副本**：池里一把 key 一份元数据，元数据里挂着副本列表；同一 key 可有多个副本（replica），落在不同机器的 segment（seg，一段注册进池的 DRAM）上
+- **副本 = 元数据里的一条记录**：内容是「数据在某 seg 的某块 buffer 上」+ 状态。所以副本天然有**两个关联**——逻辑上属于 key（它是 key 元数据的一部分），物理上位于 seg（buffer 分配在 seg 上，seg 注册在 client 名下）。后文「副本跟 seg 死活」「按 key 删副本」分别对应这两个关联
 - **副本两个状态**：写中（PROCESSING，不可读）与就绪（COMPLETE，可读）
 - **属主（owner）**：每把 key 的元数据里记录 `client_id` = 最后写入它的客户端 UUID。注意三层区分，后文反复用到
-  - 属主是 **key 级**字段：一把 key 一个属主，与它有几个副本无关
-  - **副本自身没有属主字段**：副本挂在 seg 上、随 seg 死活（F7）
-  - 清理类 API 按 **key 属主**鉴权（`BatchReplicaClear`，F6②）：kvcm 从未 Put 过数据、不是任何 key 的属主 → 这类 API kvcm 调不动
+  - 属主是 **key 级**字段：一把 key 一个属主，与它有几个副本无关；用途**只是鉴权**（谁有权中止写、谁有权定点清副本，F6），不是副本的归属声明
+  - **副本自身没有属主字段**：副本的存亡由它**所在的 seg** 决定——client 死 → seg 被摘 → 挂在死 seg 上的副本记录被清，扫描按 seg 走、不看 key 属主（F7）
+  - 清理路径分三种、权限各不同（F6 末尾全图）：整 key 删（Remove 系，**不鉴权**，kvcm 可用）/ 定点清单个副本（`BatchReplicaClear`，**限 key 属主自调**，kvcm 调不动）/ 级联清理（client 死亡自动触发）
 - **lease（读租约）**
   - 读路径（`GetReplicaList` / `ExistKey`）授予，lease 期内该 key **绝对不可逐**（驱逐硬过滤直接跳过，F8）
   - **新 put 的 key 出生无租约**：`PutEnd` 里 `GrantLease(0, ...)` 把 lease_timeout 设为 now——「the object has no lease at beginning」（`master_service.cpp:1422` 注释 @0.3.11）；第一次被读/touch 才获得保护
@@ -88,6 +89,10 @@
   2. **副本清理权限**：`BatchReplicaClear` 校验请求者必须是属主（`:937` @0.3.11）——kvcm 非属主调不动
   3. **upsert 改写**：「谁最后写谁是属主」（F3①）
   - **不管**：copy / move / get / exist——复制与读取路径完全不读属主字段（F7 代码核实）；且 copy 的副本登记走独立 RPC 对 `CopyStart`/`CopyEnd`（不经 Put/Upsert），全程不碰 `client_id`——**copy 后 key 属主不变**，仍是最初写入的引擎（`master_service.cpp:1849` @0.3.11）
+- **清理路径全图**（「清理 API 能不能清到某副本」的完整答案）
+  1. **整 key 删**：`Remove` / `BatchRemove` / `RemoveByRegex` / `RemoveAll`——key 元数据连同全部副本一起删（不管副本在哪个 seg）；**不鉴权**，kvcm 可用（§4 release）
+  2. **定点清单个副本**：`BatchReplicaClear(keys, client_id, seg)`——只清指定 client 指定 seg 上的副本、其他 seg 的保留；**限 key 属主自调**（F6②），kvcm 调不动 → kvcm 做不了「只清 A seg 副本、留着 B seg」的定点手术
+  3. **级联清理**：client 死亡 → 其 seg 全摘 → 挂在死 seg 上的副本记录清掉（disk 副本随死 client 清）——按 seg/client 维度扫，**不看 key 属主**；master 自动触发（F6b 有代码与实测的口径矛盾，归 E5）
 - **F6b 级联删除：实测现象与代码核实不一致（归因归 E5）**
   - **实测**（D1 F5 / EXPERIMENTS #3）：属主 A 重启 → client TTL 过期 → key 记录连同全部副本记录（**含预热到 B seg 上的**）消失，`batch_is_exist` 0/32；现象疑似「副本存活性绑定属主 client」
   - **代码核实**（0.3.11.post1）：client 过期处理（`master_service.cpp:4930-5015`）= unmount 该 client 全部 seg + `ClearInvalidHandles` 全量扫——清理是**副本级**的（`CleanupStaleHandles :2530`）：内存副本随死 seg 清、disk 副本随死登记 client 清。**活 seg 上其他 client 的副本按代码不该被清**；全库无「按 key 属主删」路径
