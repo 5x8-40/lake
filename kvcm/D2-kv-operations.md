@@ -297,98 +297,142 @@ flowchart TD
 
 - 连线语义：master↔引擎 = RPC + RDMA（任务派发与数据面）；Router→引擎 = 推理请求；Router↔kvcm = READY/会话线索/摘流；kvcm↔master = 全部 KV 操作指令。**kvcm 与引擎之间没有直连**（F11）
 - HBM 标「不直接碰」：八项操作都作用于**池内副本**（DRAM/SSD/DFS）；HBM 工作集由引擎自己的读写路径加载，不在 kvcm 操作面
-- 图例：`──▶` 控制指令（RPC）；`══▶` 数据流（KV 本体）；`┄┄▶` 结果知会
+- 图例：`──▶` 控制指令（RPC）；`══▶` 数据流（KV 本体）；`┄┄▶` 结果知会/可选路径标注
 
 **① copy（预热核心）**
 
 ```mermaid
-flowchart LR
+flowchart TB
     K["kvcm"] -->|"① CreateCopyTask(key, [B.seg])"| M["master"]
-    M -->|"② 派任务给源 seg 属主"| A["引擎 A（源）"]
+    M -->|"② 派任务给源 seg 属主（随机选源）"| A["引擎 A（源）"]
     A ==>|"③ RDMA：A.DRAM → B.DRAM"| B["引擎 B（目标）"]
     A -->|"④ CopyEnd"| M
     K -->|"⑤ QueryTask + 副本核验"| M
     K -.->|"⑥ READY"| R["Router"]
+    N["main 另有入口：SubmitReplicaActionProposal<br/>（仅加副本 ADD，带热度准入 + lease）"]
+    M -.-> N
 ```
-- Router：**不介入**操作，只收 ⑥ 的结果（把请求调去 B）
 
 **② move（下线迁移/副本归拢）**
 
 ```mermaid
-flowchart LR
+flowchart TB
     K["kvcm"] -->|"① CreateMoveTask(key, A.seg→B.seg)"| M["master"]
     M -->|"② 派任务给源 seg 属主"| A["引擎 A（源）"]
     A ==>|"③ RDMA：A.DRAM → B.DRAM"| B["引擎 B（目标）"]
     A -->|"④ MoveEnd（源副本随任务完成删除）"| M
     K -->|"⑤ QueryTask + 副本核验"| M
+    N["seg 级批量搬迁（main）：CreateDrainJob<br/>把整条 seg 的副本迁走排空（下线场景）"]
+    M -.-> N
 ```
-- 与 copy 的两处差异：①指定源；④完成后源副本删除。Router：**不介入**
 
 **③ keepalive（周期 touch，无数据流）**
 
 ```mermaid
-flowchart LR
-    K["kvcm"] -->|"周期 ExistKey / BatchExistKey"| M["master<br/>续 lease 时钟<br/>（有 soft pin 的一并续）"]
+flowchart TB
+    K["kvcm"] -->|"周期 ExistKey / BatchExistKey（grant_lease=true）"| M["master<br/>续 lease 时钟（有 soft pin 的一并续）"]
+    N["读路径 GetReplicaList 也授 lease——kvcm 的 touch 不用它（F11b 分工）；<br/>ProbeKey 不续租（纯探测，仅 main）"]
+    M -.-> N
 ```
-- Router：**不介入**；kvcm 断线 → lease 过期即失效
 
-**④ pin（元数据标记，无数据流）**
+**④ pin（方案最多：soft 三候选 × hard 两候选 × 属主两方案，§2）**
 
 ```mermaid
-flowchart LR
-    K["kvcm"] -->|"空写 upsert（with_soft_pin=±）"| M["master<br/>设/清 soft pin 标记"]
+flowchart TB
+    K["kvcm"]
+    subgraph SOFT["soft 需求（防驱逐，可接受极端被逐）"]
+        S1["① lease 调大 + 周期 keepalive<br/>保护=lease 期内绝对不可逐；代价=全局读租约变长"]
+        S2["② 空写 upsert 设 soft pin<br/>UpsertStart(原尺寸, with_soft_pin)→不写数据→UpsertEnd"]
+        S3["③ 读锁：持续持有读引用<br/>refcnt>0 绝对挡驱逐；断线即失效（脆，作保底）"]
+    end
+    subgraph HARD["hard 需求（绝对保护）"]
+        H1["读删写：读出数据 → Remove →<br/>带 hard_pin 重新 put → 校验"]
+        H2["读锁长期持有 = 事实 hard pin（同③的脆）"]
+    end
+    subgraph OWN["属主问题（②与读删写共同面对）"]
+        O1["方案一：属主改归 kvcm<br/>传自己 UUID（F3① 改写即收益）"]
+        O2["方案二：借名<br/>传回原属主 UUID，需 master 加「key→属主」查询 RPC"]
+    end
+    K --> S1 & S2 & S3
+    K --> H1 & H2
+    S2 -.-> OWN
+    H1 -.-> OWN
+    N["已否决：引擎写入时源头带 pin（侵入 + 全 pin 无区分度）；<br/>AddReplica 此路不通（只收 LOCAL_DISK、不带 pin）；hard pin 事后改不了（F1）"]
+    SOFT -.-> N
 ```
-- Router：**不介入**；hard pin 只能创建时带（F1），kvcm 事后加不了
 
 **⑤ demote（DRAM→SSD；数据只在本机内流）**
 
 ```mermaid
-flowchart LR
+flowchart TB
     K["kvcm"] -->|"① 停 keepalive（写回模式的必要前置）"| M["master"]
-    M -.->|"② offload 任务<br/>写穿 = put 时已落盘<br/>写回 = 驱逐选中时"| A["引擎 A"]
+    M -.->|"② offload 任务<br/>写穿 = put 完成时已落盘<br/>写回 = 驱逐选中时才落盘"| A["引擎 A"]
     A ==>|"③ DRAM → 本机 SSD"| S[("A·SSD")]
     K -->|"④ 核验盘副本在册"| M
+    N["缺口：无 per-key 立即降层 RPC（两版本同）→ 池侧扩展；<br/>远期变体：demote 到 kvcm 自挂的 SSD（盘副本绑 kvcm，§4 retain 兜底）"]
+    M -.-> N
 ```
-- Router：**不介入**；写穿模式 kvcm 无 ①② 动作，直接 ④ 核验
 
-**⑥ promote（SSD→DRAM；读命中驱动，kvcm 无主动入口）**
-
-```mermaid
-flowchart LR
-    REQ["读请求"] --> E["引擎"]
-    E -->|"读命中只剩盘副本的 key"| M["master<br/>命中统计达阈值"]
-    M -->|"① 派提升任务"| H["盘副本属主 client"]
-    S[("SSD")] ==>|"② 读盘 → 写 DRAM"| D[("DRAM")]
-    H -->|"③ NotifyPromotionSuccess"| M
-```
-- Router：**不介入**（请求自然驱动；主动 promote 两版本无入口）
-
-**⑦ retain（部署/写路径选择，不是 kvcm 的运行时动作）**
+**⑥ promote（SSD→DRAM）**
 
 ```mermaid
 flowchart TB
-    subgraph S1["形态一：retained client（main）"]
-        E1["引擎"] -->|"以保留身份注册"| M1["master"]
-        E1 -.->|"断线"| M1
-        M1 --> R1["master 保留其数据登记<br/>等回来认领"]
+    subgraph PAS["被动路径（主路径）"]
+        REQ["读请求"] --> E["引擎"]
+        E -->|"读命中只剩盘副本的 key"| M1["master<br/>CountMinSketch 统计达阈值（默认 2 次）"]
+        M1 -->|"① 派提升任务"| H["盘副本属主 client"]
+        S1[("SSD")] ==>|"② 读盘 → 写 DRAM"| D1[("DRAM")]
+        H -->|"③ NotifyPromotionSuccess"| M1
     end
-    subgraph S2["形态二：DFS 副本（main）"]
+    subgraph ACT["主动 RPC 链（存在但 kvcm 用不了）"]
+        A2["PromotionAllocStart"] -->|"搬数据"| C2["NotifyPromotionSuccess"]
+        L2["限制：须 master 准入的在途任务（只由被动路径产生）<br/>+ 只许盘副本属主 client 执行（holder 校验）"]
+        A2 -.-> L2
+    end
+    N["已排除：copy/move 接不了 SSD——disk 无 seg 名，做不了源也做不了目标（F7 介质边界）"]
+    PAS -.-> N
+```
+
+**⑦ retain（属主下线后副本存续；正路两形态 + 0.3.11 过渡三手段，§4）**
+
+```mermaid
+flowchart TB
+    subgraph MAIN["正路：main 池机制（两条并列，不依赖 E5）"]
+        E1["引擎"] -->|"以保留身份注册"| M1["master"]
+        M1 --> R1["断线保留数据登记<br/>等回来认领（停机保号）"]
         E2["引擎"] ==>|"put / demote 写 DFS"| DFS[("共享 3FS")]
         DFS --> R2["引擎全灭副本仍在<br/>挂同一 DFS 的机器可读"]
     end
+    subgraph OLD["0.3.11 过渡（demote 解不了：盘副本绑引擎 client，引擎死照样清）"]
+        T1["改属主：空写 upsert 传 kvcm UUID<br/>有效依赖 E5：「按 key 属主删」成立才行"]
+        T2["move：副本迁到活着的他机 seg<br/>有效依赖 E5：「按 seg 清理」成立才行"]
+        T3["kvcm 自挂 SSD：关键 KV 落到 kvcm 名下盘<br/>不依赖 E5；代价=kvcm 带盘、变有状态"]
+        T4["或接受现状：引擎下线 = 数据失效<br/>预热投入重来（E5 钉死口径后评估）"]
+    end
 ```
-- Router：**不介入**
 
-**⑧ remove**
+**⑧ remove（release 三档 + Remove 系全 API）**
 
 ```mermaid
-flowchart LR
-    K["kvcm"] -->|"① Remove / BatchRemove / RemoveByRegex"| M["master<br/>② 删 key + 全部副本（DRAM/SSD/DFS）"]
-    K -.->|"③ 清台账 + 索引同步"| R["Router/索引"]
+flowchart TB
+    subgraph L3["release 三档（D1 §6 决策链）"]
+        G1["软释放：停 keepalive<br/>lease 过期 → 池驱逐兜底"]
+        G2["demote 降层：留 SSD 不删（⑤）"]
+        G3["主动 Remove：仅「确认没人用」"]
+    end
+    subgraph API["Remove 系 API（kvcm 全部可用）"]
+        A1["Remove / BatchRemove<br/>按 key 精确删"]
+        A2["RemoveByRegex<br/>模式批量删（配命名空间前缀，<br/>如 qwen3:v2:.* 删整个模型版本）"]
+        A3["RemoveAll 全池清<br/>0.3.11 同步；main 异步=<br/>client 轮询 PollRemoveAll 自清"]
+    end
+    F["公共参数 force：跳过两道保险强删<br/>①lease 未过期拒删 ②任务在途拒删"]
+    API --> F
+    N["BatchReplicaClear：定点清单个副本<br/>限 key 属主自调——kvcm 调不动（F6②）"]
+    API -.-> N
+    K["kvcm"] -.->|"收尾：清台账 + 索引同步（D4）"| R["Router/索引"]
 ```
-- Router：**不介入**决策；③是收尾同步（池无删除事件通道，需 kvcm 主动推，D4）
 
-**⑨ 复合流程——Router 的三个介入点（全在流程层，不在原子操作层）**
+**⑨ 复合流程——Router 的介入点（全在流程层，不在原子操作层）**
 
 ```mermaid
 flowchart TB
@@ -409,7 +453,7 @@ flowchart TB
     end
 ```
 
-- 总结：**原子操作 Router 一律不介入**；介入只发生在复合流程的输入（会话线索）、结果（READY）、编排（下线）三处——这正是「kvcm 管 KV、Router 管请求」的职责分界
+- 总结：原子操作由 kvcm 与 master/池完成；Router 只在复合流程的输入（会话线索）、结果（READY）、编排（下线）三处出现——「kvcm 管 KV、Router 管请求」的职责分界
 
 ## §2 pin
 
