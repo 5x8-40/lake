@@ -26,10 +26,44 @@ Mooncake 是 **KVCache-centric 的存算分离架构**:将 prefill/decode 集群
 | `mooncake-common/` | C++ | 共享工具(配置加载、环境变量、ASIO) |
 | `mooncake-integration/` | C++/Python | Python 扩展模块构建 + 脚本安装 |
 | `mooncake-wheel/` | Python | pip 包打包,含 vLLM connector |
+| `mooncake-conductor/` | C++ | 全局前缀索引(HTTP `/query`),供 KV-aware router 查路由 |
+| `mooncake-reshard/` | Python | 权重/KV 的 N-D 放置规划(生成 manifest + runtime binding),面向训练 |
+| `monitoring/` | - | Prometheus + Grafana 监控部署件(docker-compose) |
 
 > 核心类型(`ObjectKey`/`Slice`/`Segment`/`ErrorCode`/`UUID`/`ReplicateConfig`)定义在 `mooncake-store/include/types.h`。`Status` 在 transfer-engine 的 `common/base/status.h`。
 
 详见 [transfer-engine.md](transfer-engine.md) 与 [kv-store.md](kv-store.md)。
+
+## 控制面与管理面
+
+Mooncake 的管理设施分两层:运行时在岗的**控制面**(参与数据路径)和对外暴露的**管理面**(Admin HTTP API + 运维工具)。
+
+- **控制面(运行时在岗)**
+  - **master**:元数据权威 + 任务派发。不主动推任务——offload/promote 等任务放内存队列,client 定期来取(`GetOffloadTasks`/`GetPromotionTasks` 随心跳一起返回)。
+  - **HA 子系统**(`mooncake-store/src/ha/`):
+    - 选主:`leadership/leader_coordinator_factory.cpp`,etcd/redis/k8s 三后端
+    - supervisor:`master_service_supervisor.cpp`,监控 master 健康、触发主备切换(`RestoreFromStandby` 是其内部接口,非公开 RPC)
+    - 备机:`standby_controller.cpp` + `standby_metadata_store.cpp`,热备元数据
+    - 持久化:oplog(操作日志复制)+ snapshot(周期快照)
+  - **conductor**(`mooncake-conductor/`):全局前缀索引。收池/引擎事件,维护「前缀 → 节点」映射,HTTP `/query` 供 KV-aware router 查路由。只管索引,不管 KV 操作。
+  - **client 库分担控制面工作**:定期取任务、上报驱逐结果与 DFS 容量——控制面逻辑的一半在 client 库里,不在独立进程。
+- **管理面**(`MasterAdminServer`,master 进程内独立 HTTP 端口,`mooncake-store/src/master_admin_service.cpp`)
+  - 监控:`/metrics`、`/metrics/summary`、`/health`、`/version`
+  - HA 状态:`/role`、`/ha_status`、`/leader`
+  - 查询:`/query_key`、`/batch_query_keys`、`/get_all_keys`、`/get_all_segments`、`/get_segments_detail`、`/query_segment`
+  - KV 事件流状态:`/kv_events/status`
+  - DFS 分片:`GET/POST /api/v1/dfs/shard_count`
+  - DrainJob(排空 segment):`/api/v1/drain_jobs`(创建)+ `/query` + `/cancel`
+  - segment 状态:`/api/v1/segments/status`
+  - 租户配额:`GET/PUT/DELETE /api/v1/tenant_quotas`
+  - 清空:`/api/v1/remove_all`
+- **运维工具**
+  - 管理 CLI:`scripts/management/mc_meta_cli.py`,消费上述 HTTP API + RPC,支持列 key / 查 key / 删 key / 清空。
+  - 监控部署件:`monitoring/`,Prometheus + Grafana docker-compose。
+- **结论**
+  - 控制面完整:master + HA + conductor 覆盖元数据、高可用、索引三面。
+  - 管理面接口齐全但**全是被动 API**:能查、能删、能建 DrainJob、能改配额,但「何时该预热、哪些 key 该保活、何时降层」要人自己判断、自己触发——接口齐了,没有官方组件持续调用它们做自动化管理。
+  - lake kvcm 填的正是这个空:常驻管理进程,持续调用这些接口,按策略自动执行 KV 操作。
 
 ## 分布式模型
 
@@ -103,6 +137,8 @@ Mooncake 是 **KVCache-centric 的存算分离架构**:将 prefill/decode 集群
 | HA 选主(etcd/redis/k8s) | `include/ha/leadership/leader_coordinator.h`::`LeaderCoordinator` |
 | P2P store(无 master,Go) | `mooncake-p2p-store/src/`(BitTorrent 式,经 cgo 调 Transfer Engine C API) |
 | Conductor(cache-aware router,外部) | `docs/source/design/conductor/` |
+| Admin HTTP API | `src/master_admin_service.cpp`::`MasterAdminServer`(~24 端点:/metrics、/query_key、/api/v1/drain_jobs、/api/v1/tenant_quotas 等) |
+| 管理 CLI | `scripts/management/mc_meta_cli.py`(列/查/删 key,消费 Admin HTTP API + RPC) |
 
 ### 构建与集成
 
@@ -127,13 +163,14 @@ Mooncake 是 **KVCache-centric 的存算分离架构**:将 prefill/decode 集群
 ## 劣势
 
 1. **池化管理弱于传输** — Store 是对象级 KV(非 KVCache 语义感知)。无内置内容寻址/radix/前缀复用——前缀匹配完全依赖外部(SGLang RadixAttention 或 Conductor)。Store 只存 opaque bytes,key 是应用定义的字符串。
-2. **池化 DRAM/SSD,非 HBM 池** — Store 池化的是 Client 贡献的 DRAM/SSD,不是 GPU HBM。HBM 仍属各实例私有。跨实例共享需经 RDMA 读 DRAM 池;真正"HBM 池"靠 PD disaggregation 时 prefill→decode 直传(Transfer Engine),不经 Store。
-3. **无多模型配额/GC/碎片整理** — 配额仅 tenant-level,无 per-model;GC 是近似 LRU + lease + zombie 清理,**无主动碎片整理**(依赖 bin-based allocator 的低碎片特性,无 compaction 线程)。
-4. **Master 中心化元数据** — 默认单 master(单点);HA 需 etcd 集群。元数据全在 leader 内存(1024 shard),规模受单机内存限制。快照周期性,最后一次快照后的变更恢复有窗口。
-5. **C++ 门槛高** — 核心数万行(`master_service.cpp` 单文件 ~8000 行),构建依赖重。Python/Go/Rust 是薄绑定层,深度定制需改 C++。
-6. **一致性模型偏弱** — 对象写后 immutable(强一致),但无跨对象事务。Object group 是 best-effort 生命周期提示,非原子。`Get` 保证读完整数据,但"not necessarily the latest"。
-7. **best-effort 副本** — 副本数不保证满足,空间不足时尽力分配(至少 1 个)。`replica_num=3` 可能只分到 1 个。
-8. **无内置 KVCache 压缩/量化** — 存原始 bytes,压缩由引擎侧负责。
+2. **管理面全是被动 API,没有自动化管理进程** — `MasterAdminServer` 提供查询/删除/DrainJob/配额等 HTTP 接口,但「何时预热、保活什么、何时降层」要人自己判断触发,无官方组件代劳(见「控制面与管理面」)。
+3. **池化 DRAM/SSD,非 HBM 池** — Store 池化的是 Client 贡献的 DRAM/SSD,不是 GPU HBM。HBM 仍属各实例私有。跨实例共享需经 RDMA 读 DRAM 池;真正"HBM 池"靠 PD disaggregation 时 prefill→decode 直传(Transfer Engine),不经 Store。
+4. **无多模型配额/GC/碎片整理** — 配额仅 tenant-level,无 per-model;GC 是近似 LRU + lease + zombie 清理,**无主动碎片整理**(依赖 bin-based allocator 的低碎片特性,无 compaction 线程)。
+5. **Master 中心化元数据** — 默认单 master(单点);HA 需 etcd 集群。元数据全在 leader 内存(1024 shard),规模受单机内存限制。快照周期性,最后一次快照后的变更恢复有窗口。
+6. **C++ 门槛高** — 核心数万行(`master_service.cpp` 单文件 ~8000 行),构建依赖重。Python/Go/Rust 是薄绑定层,深度定制需改 C++。
+7. **一致性模型偏弱** — 对象写后 immutable(强一致),但无跨对象事务。Object group 是 best-effort 生命周期提示,非原子。`Get` 保证读完整数据,但"not necessarily the latest"。
+8. **best-effort 副本** — 副本数不保证满足,空间不足时尽力分配(至少 1 个)。`replica_num=3` 可能只分到 1 个。
+9. **无内置 KVCache 压缩/量化** — 存原始 bytes,压缩由引擎侧负责。
 
 ## 与本系统的关键对比
 
@@ -147,6 +184,7 @@ Mooncake 是 **KVCache-centric 的存算分离架构**:将 prefill/decode 集群
 | PD 分离 KV 搬迁 | Transfer Engine 零拷贝 RDMA 直传 | 直接复用 |
 | 传输层 | 极强(16+ 后端,多 NIC 聚合) | 直接复用 |
 | HA | etcd/redis/k8s + OpLog + 快照 | 参考 |
+| 策略管理面 | Admin HTTP API 齐全但被动,无常驻管理进程 | kvcm 常驻管理进程(按策略自动预热/保活/降层) |
 | KV 语义感知 | 无(opaque bytes) | layer/head/token 感知 |
 
 **关键结论**:Mooncake 核心竞争力在**传输引擎**,其 Store 是"对象级分布式 KV cache"而非"KVCache 语义感知的池"。前缀复用/内容寻址/radix 由引擎侧(SGLang HiCache)或外部 Conductor 负责。若构建"以 KV 为中心的存算分离",Mooncake 传输引擎可直接复用,Store 层需在其上增加 KVCache 语义(radix、layer/head 寻址、per-model 配额、主动 GC)——这正是 SGLang HiCache + Mooncake Store 的分工模式。详见 [3rdparty-reference.md](../3rdparty-reference.md)。
