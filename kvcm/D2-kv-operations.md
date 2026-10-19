@@ -324,38 +324,62 @@ flowchart TD
 
 - 连线语义：master↔引擎 = RPC + RDMA（任务派发与数据面）；Router→引擎 = 推理请求；Router↔kvcm = READY/会话线索/摘流；kvcm↔master = 全部 KV 操作指令。**kvcm 与引擎之间没有直连**（F11）
 - HBM 标「不直接碰」：八项操作都作用于**池内副本**（DRAM/SSD/DFS）；HBM 工作集由引擎自己的读写路径加载，不在 kvcm 操作面
-- 图例：`──▶` 控制指令（RPC）；`══▶` 数据流（KV 本体）；`┄┄▶` 结果知会/可选路径标注
+- 图例：①-⑨ 均为时序图——`->>` 调用/数据流向；`-->>` 响应/知会；`--x` 断线（心跳停）；`loop` 周期循环；`rect` 底色区分并列方案（各图题注明）；消息箭头标签即数据流内容时（如「RDMA：A.DRAM → B.DRAM」）表示 KV 本体流动，其余为控制指令
 
-**① copy（预热核心）**
-
-```mermaid
-flowchart TB
-    K["kvcm"] -->|"① CreateCopyTask(key, [B.seg])"| M["master"]
-    M -->|"② 派任务给源 seg 属主（随机选源）"| A["引擎 A（源）"]
-    A ==>|"③ RDMA：A.DRAM → B.DRAM"| B["引擎 B（目标）"]
-    A -->|"④ CopyEnd"| M
-    K -->|"⑤ QueryTask + 副本核验"| M
-    K -.->|"⑥ READY"| R["Router"]
-    N["main 内部机制（不对外 RPC，F13⑤）：SubmitReplicaActionProposal<br/>master 看热度自动加副本（仅 ADD）+ lease 幂等，<br/>终点同为 REPLICA_COPY 任务——kvcm 用不了"]
-    M -.-> N
-    N2["缺口：copy 任务无取消 RPC（两版本同，P9）——<br/>请求改道/源消失只能弃置 + 事后清副本（弱版）"]
-    M -.-> N2
-```
-
-**② move（下线迁移/副本归拢）**
+**① copy（预热核心；时序）**
 
 ```mermaid
-flowchart TB
-    K["kvcm"] -->|"① CreateMoveTask(key, A.seg→B.seg)"| M["master"]
-    M -->|"② 派任务给源 seg 属主"| A["引擎 A（源）"]
-    A ==>|"③ RDMA：A.DRAM → B.DRAM"| B["引擎 B（目标）"]
-    A -->|"④ MoveEnd（源副本随任务完成删除）"| M
-    K -->|"⑤ QueryTask + 副本核验"| M
-    N["CreateDrainJob（两版本同有，F7）：seg 级批量搬迁<br/>后台 job 循环逐 key 搬走排空；job 可取消、task 无（P9）<br/>——下线场景白得取消能力；proposal 机制不做 move（仅 ADD）"]
-    M -.-> N
-    N2["缺口：move 任务无取消 RPC（两版本同，P9）；失败则源副本保留"]
-    M -.-> N2
+sequenceDiagram
+    participant K as kvcm
+    participant M as master
+    participant A as 引擎 A（源，master 随机选）
+    participant B as 引擎 B（目标）
+    participant R as Router
+
+    K->>M: ① CreateCopyTask(key, [B.seg])
+    M->>A: ② 派任务给源 seg 属主（随机选源，F7）
+    A->>B: ③ RDMA：A.DRAM → B.DRAM
+    A->>M: ④ CopyEnd
+    K->>M: ⑤ QueryTask + GetReplicaList 核验
+    K-->>R: ⑥ READY（上报调度，D1 §4）
 ```
+
+- main 内部机制（不对外 RPC，F13⑤）：`SubmitReplicaActionProposal`——master 看热度自动加副本（动作仅 ADD）+ lease 幂等，终点同为 REPLICA_COPY 任务——kvcm 用不了
+- 缺口：copy 任务无取消 RPC（两版本同，P9）——请求改道/源消失只能弃置 + 事后清副本（弱版）
+
+**② move（下线迁移/副本归拢；两形态时序：绿 = 单 key、蓝 = seg 级批量）**
+
+```mermaid
+sequenceDiagram
+    participant K as kvcm
+    participant M as master
+    participant A as 引擎 A（源）
+    participant B as 引擎 B（目标）
+
+    rect rgb(223, 242, 223)
+    Note over K,B: 单 key 搬迁：CreateMoveTask（唯一能指定源的路径，F7）
+    K->>M: ① CreateMoveTask(key, A.seg→B.seg)
+    M->>A: ② 派任务给源 seg 属主
+    A->>B: ③ RDMA：A.DRAM → B.DRAM
+    A->>M: ④ MoveEnd
+    Note over M: 源副本随任务完成删除（失败则源保留）
+    K->>M: ⑤ QueryTask + GetReplicaList 核验
+    end
+
+    rect rgb(222, 235, 247)
+    Note over K,B: seg 级批量搬迁：CreateDrainJob（两版本同有，F7）
+    K->>M: ① CreateDrainJob(源 seg 列表, 可选目标, 并发上限默认 4)
+    Note over M: 源 seg 置 DRAINING（仍可读、不再接受新分配）
+    loop 后台 job 周期扫描源 seg
+        M->>A: 逐 key 派搬迁任务
+        A->>B: RDMA 搬走
+    end
+    Note over M: 排空 → seg 置 DRAINED，可安全下线
+    K->>M: ② CancelDrainJob / QueryDrainJob（job 级可取消）
+    end
+```
+
+- 缺口：copy/move 的单个任务无取消 RPC（两版本同，P9）——下线场景用 DrainJob 白得 job 级取消；`SubmitReplicaActionProposal` 不做 move（动作仅 ADD，F13⑤）
 
 **③ keepalive（注册表驱动的周期 touch，无数据流）**
 
@@ -394,6 +418,7 @@ sequenceDiagram
     Note over M: 副本标写中，key 不可读（毫秒级，F3④）
     K->>M: S2 UpsertEnd（不写数据）
     Note over M: soft pin 置位 ✓
+    Note over K,M: 取消：空写传 with_soft_pin=false（0.3.11）/ DISABLE（main 三态）<br/>或停止续期等 TTL 到期
     end
 
     rect rgb(223, 242, 223)
@@ -402,6 +427,7 @@ sequenceDiagram
         K->>M: L1 ExistKey / BatchExistKey（grant_lease=true）
         Note over M: lease_timeout 续期（有 soft pin 一并续，F9）
     end
+    Note over K,M: 取消：停 touch，lease 到期自然失效（= §4 软释放；无立即撤销 lease RPC）
     end
 
     rect rgb(255, 235, 214)
@@ -416,11 +442,12 @@ sequenceDiagram
     K->>M: R3 PutEnd
     Note over M: hard pin 固化 ✓
     K->>M: R4 GetReplicaList 校验
+    Note over K,M: 取消：无 unpin（两版本或运算保留，§2）——再读删写一遍（不带 hard_pin 重 put）
     end
 ```
 
 - S2 与 R3 的**发起方身份 = 新属主**（F3①）：传自己 UUID 改归 kvcm / 传原属主 UUID 借名（需 master 加查询 RPC）——两选择的取舍见 §2「属主问题」节
-- 效果与代价（保护语义、断线窗口、持续开销、取消方式）见 §2 对比表与「pin 的取消」节，不进图
+- 效果与代价（保护语义、断线窗口、持续开销）见 §2 对比表；取消方式的机制依据见「pin 的取消」节
 
 **⑤ demote（DRAM→SSD；三形态时序：绿 = 写穿、橙 = 写回、蓝 = 远期 kvcm 自挂 SSD，§3）**
 
@@ -505,64 +532,135 @@ sequenceDiagram
 - 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 连调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本属主引擎在线
 - `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本属主引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
 
-**⑦ retain（属主下线后副本存续；正路两形态 + 0.3.11 过渡三手段，§4）**
+**⑦ retain（属主下线后副本存续；六方案时序：绿 = main 正路两条、橙 = 0.3.11 过渡三手段、灰 = 接受现状，§4）**
 
 ```mermaid
-flowchart TB
-    subgraph MAIN["正路：main 池机制（两条并列，不依赖 E5）"]
-        E1["引擎"] -->|"以保留身份注册"| M1["master"]
-        M1 --> R1["断线保留数据登记<br/>等回来认领（停机保号）"]
-        E2["引擎"] ==>|"put / demote 写 DFS"| DFS[("共享 3FS")]
-        DFS --> R2["引擎全灭副本仍在<br/>挂同一 DFS 的机器可读"]
+sequenceDiagram
+    participant E as 引擎 A
+    participant M as master
+    participant K as kvcm
+    participant B as 其他引擎
+    participant KS as kvcm 本机 SSD
+    participant DFS as 共享 3FS
+
+    rect rgb(223, 242, 223)
+    Note over E,DFS: 正路①（main）：retained client——解引擎进程重启
+    E->>M: 以「保留」身份注册运行
+    E--xM: 断线（心跳停）
+    Note over M: 数据登记保留，等回来认领（停机保号）<br/>不立即清（AddReplicaForRetainedClient，F13②）
+    E->>M: 重启回来认领 → 副本继续可用
     end
-    subgraph OLD["0.3.11 过渡（demote 解不了：盘副本绑引擎 client，引擎死照样清）"]
-        T1["改属主：空写 upsert 传 kvcm UUID<br/>有效依赖 E5：「按 key 属主删」成立才行"]
-        T2["move：副本迁到活着的他机 seg<br/>有效依赖 E5：「按 seg 清理」成立才行"]
-        T3["kvcm 自挂 SSD：关键 KV 落到 kvcm 名下盘<br/>不依赖 E5；代价=kvcm 带盘、变有状态"]
-        T4["或接受现状：引擎下线 = 数据失效<br/>预热投入重来（E5 钉死口径后评估）"]
+
+    rect rgb(223, 242, 223)
+    Note over E,DFS: 正路②（main）：DFS 副本——解整机灭失（前提：部署 3FS）
+    E->>DFS: put / demote 写共享 3FS
+    E--xM: 引擎全灭
+    Note over M: master 清内存+本机盘副本，不清 DFS 副本<br/>（ProcessClientOffboardingJob，F13②）
+    B->>DFS: 挂同一 DFS 的机器可读
+    end
+
+    rect rgb(255, 235, 214)
+    Note over E,DFS: 过渡①（0.3.11）：改属主——有效依赖 E5「按 key 属主删」成立才行
+    K->>M: 空写 upsert 传 kvcm UUID（属主改归 kvcm，F3①）
+    E--xM: 引擎死
+    Note over M: key 属主 = kvcm（活着）→ 若按属主删则 key 存活
+    end
+
+    rect rgb(255, 235, 214)
+    Note over E,DFS: 过渡②（0.3.11）：move 到活 seg——有效依赖 E5「按 seg 清理」成立才行
+    K->>M: CreateMoveTask（副本迁到他机活 seg）
+    E--xM: 源引擎死
+    Note over M: 副本绑活 seg（F7）→ 若按 seg 清则副本存活
+    end
+
+    rect rgb(255, 235, 214)
+    Note over E,DFS: 过渡③（0.3.11）：kvcm 自挂 SSD——不依赖 E5 的兜底
+    K->>E: 读关键 KV
+    E-->>K: 数据
+    K->>KS: 写 kvcm 本机盘
+    K->>M: AddReplica 登记（盘副本绑 kvcm）
+    E--xM: 引擎全灭
+    Note over M: kvcm 名下盘副本存活；代价 = kvcm 带盘、变有状态
+    end
+
+    rect rgb(230, 230, 230)
+    Note over E,DFS: 或接受现状：引擎下线 = 数据失效，预热投入重来（E5 钉死口径后评估）
     end
 ```
 
-**⑧ remove（release 三档 + Remove 系全 API）**
+- 先说清 demote 在 0.3.11 解不了 retain：盘副本绑登记它的引擎 client，引擎死照样清（§3）——所以过渡手段里没有 demote
+
+**⑧ remove（release 四档时序：绿 = 软释放、蓝 = 主动 Remove、灰 = 全池清；决策归 D1 §6，§4）**
 
 ```mermaid
-flowchart TB
-    subgraph L3["release 三档（D1 §6 决策链）"]
-        G1["软释放：停 keepalive<br/>lease 过期 → 池驱逐兜底"]
-        G2["demote 降层：留 SSD 不删（⑤）"]
-        G3["主动 Remove：仅「确认没人用」"]
+sequenceDiagram
+    participant K as kvcm
+    participant T as kvcm 台账（sqlite）
+    participant M as master
+    participant E as 各引擎 client
+    participant R as Router/索引
+
+    rect rgb(223, 242, 223)
+    Note over K,R: 档一：软释放（默认档）
+    K->>K: 停 keepalive（保活注册表摘除，图③）
+    Note over M: lease 到期失效（测试床 11s）→ 池驱逐兜底回收
     end
-    subgraph API["Remove 系 API（kvcm 全部可用）"]
-        A1["Remove / BatchRemove<br/>按 key 精确删"]
-        A2["RemoveByRegex<br/>模式批量删（配命名空间前缀，<br/>如 qwen3:v2:.* 删整个模型版本）"]
-        A3["RemoveAll 全池清<br/>0.3.11 同步；main 异步=<br/>client 轮询 PollRemoveAll 自清"]
+
+    rect rgb(223, 242, 223)
+    Note over K,R: 档二：demote 降层（留 SSD 不删）——完整时序走图⑤
+    K->>M: 停保活（写回模式）→ 等驱逐落盘 → 核验盘副本在册
     end
-    F["公共参数 force：跳过两道保险强删<br/>①lease 未过期拒删 ②任务在途拒删"]
-    API --> F
-    N["BatchReplicaClear：定点清单个副本<br/>限 key 属主自调——kvcm 调不动（F6②）"]
-    API -.-> N
-    K["kvcm"] -.->|"收尾：清台账 + 索引同步（D4）"| R["Router/索引"]
+
+    rect rgb(222, 235, 247)
+    Note over K,R: 档三：主动 Remove（仅「确认没人用」）
+    K->>T: 按台账校验目标 key 的模型归属（防跨模型误删）
+    K->>M: Remove / BatchRemove（按 key 精确删）<br/>或 RemoveByRegex（配命名空间前缀，如 qwen3:v2:.* 删整个模型版本）
+    Note over M: 两道保险：lease 未过期拒删、任务在途拒删<br/>被拒 → 等 lease 过期再删；force=true 跳过保险强删（慎用）
+    K->>T: 清台账
+    K-->>R: 索引条目同步清（池无删除事件通道，D1 F10/F14）
+    end
+
+    rect rgb(230, 230, 230)
+    Note over K,R: 档四：RemoveAll 全池清（运维重置）
+    Note over M: 0.3.11：同步调用，阻塞到清完
+    M->>E: main 异步：master 置标志
+    E->>E: 轮询 PollRemoveAll → 各自清盘（F13③）
+    K->>M: 台账对账确认完成
+    end
 ```
 
-**⑨ 复合流程——Router 的介入点（全在流程层，不在原子操作层）**
+- `BatchReplicaClear`（定点清单个副本）**不进图**：限 key 属主自调（F6②），kvcm 调不动——仅引擎下线前自清理场景归引擎用
+
+**⑨ 复合流程——Router 的介入点（全在流程层，不在原子操作层；三段时序）**
 
 ```mermaid
-flowchart TB
-    subgraph P1["prefetch 预热（结果介入）"]
-        K1["kvcm"] -->|"① copy + 核验"| M1["master"]
-        K1 -.->|"② READY"| R1["Router"]
-        R1 -->|"按新副本位置调度请求"| B1["引擎 B"]
-        K1 -->|"③ 保活注册后接 keepalive"| M1
+sequenceDiagram
+    participant R as Router
+    participant K as kvcm
+    participant M as master
+    participant E as 引擎 A
+    participant C as 控制面
+
+    rect rgb(223, 242, 223)
+    Note over R,C: P1 prefetch 预热（Router 结果介入）
+    K->>M: ① copy + 核验（图①）
+    K-->>R: ② READY（副本就位，可调度）
+    R->>E: ③ 按新副本位置调度请求
+    Note over K: ④ 保活注册（注册表）→ 周期 touch（图③）
     end
-    subgraph P2["会话结束降层（输入介入，D1 §6）"]
-        R2["Router"] -.->|"会话结束线索"| K2["kvcm"]
-        K2 -->|"停保活 + demote"| M2["master"]
+
+    rect rgb(255, 235, 214)
+    Note over R,C: P2 会话结束降层（Router 输入介入，D1 §6）
+    R-->>K: ① 会话结束线索
+    K->>M: ② 停保活 + demote（图⑤）
     end
-    subgraph P3["计划下线（流程介入）"]
-        R3["Router"] -->|"① 摘流"| E3["引擎 A"]
-        K3["kvcm"] -->|"② 迁 KV（copy/move/demote）"| M3["master"]
-        E3 -->|"③ GracefulUnmountSegment 宽限期"| M3
-        C3["控制面"] -->|"④ 缩容停引擎"| E3
+
+    rect rgb(222, 235, 247)
+    Note over R,C: P3 计划下线（Router 流程介入，§4）
+    R->>E: ① 摘流（不接新请求，在途跑完）
+    K->>M: ② 迁 KV（copy/move/demote；或 CreateDrainJob 批量，job 级可取消，图②）
+    E->>M: ③ GracefulUnmountSegment（宽限期 = 迁移的时间窗保障）
+    C->>E: ④ 缩容停引擎
     end
 ```
 
