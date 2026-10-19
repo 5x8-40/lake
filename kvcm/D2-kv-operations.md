@@ -350,32 +350,46 @@ flowchart TB
     M -.-> N
 ```
 
-**④ pin（三方案路径一图，连线颜色区分：蓝 = soft pin 档、绿 = hard 档①、橙 = hard 档②，§2）**
+**④ pin（三方案时序，rect 底色区分：蓝 = soft pin 档、绿 = hard 档①、橙 = hard 档②，§2）**
 
 ```mermaid
-flowchart LR
-    K["kvcm"]
-    M["master<br/>key 元数据：lease / soft pin / hard pin"]
-    D["KV 副本（DRAM seg）"]
+sequenceDiagram
+    participant K as kvcm
+    participant M as master
+    participant D as KV 副本（DRAM seg）
 
-    K -->|"S1 GetReplicaList 查原尺寸"| M
-    K -->|"S2 UpsertStart(原尺寸, with_soft_pin) → UpsertEnd（不写数据）"| M
-    K -->|"L1 周期 ExistKey / BatchExistKey（grant_lease=true）"| M
-    K -->|"R1 GetReplicaList"| M
-    D ==>|"R1 RDMA 读出到 kvcm 本地"| K
-    K -->|"R2 Remove"| M
-    K -->|"R3 PutStart(with_hard_pin) → PutEnd"| M
-    K ==>|"R3 RDMA 写回"| D
-    K -->|"R4 GetReplicaList 校验"| M
+    rect rgb(222, 235, 247)
+    Note over K,M: soft pin 档：空写 upsert（驱逐排最后）
+    K->>M: S1 GetReplicaList（查原尺寸）
+    K->>M: S2 UpsertStart(key, 原尺寸, with_soft_pin)
+    Note over M: 副本标写中，key 不可读（毫秒级，F3④）
+    K->>M: S2 UpsertEnd（不写数据）
+    Note over M: soft pin 置位 ✓
+    end
 
-    OWN["属主问题（S2 与 R3 必改写属主，F3①）：<br/>传自己 UUID = 改归 kvcm；<br/>传原属主 UUID = 借名（需 master 加查询 RPC）"]
-    M -.-> OWN
+    rect rgb(223, 242, 223)
+    Note over K,M: hard ①：lease 调大 + keepalive（期内绝对不可逐）
+    loop 每周期（< lease_ttl）
+        K->>M: L1 ExistKey / BatchExistKey（grant_lease=true）
+        Note over M: lease_timeout 续期（有 soft pin 一并续，F9）
+    end
+    end
 
-    linkStyle 0,1 stroke:#1f77b4,stroke-width:2px
-    linkStyle 2 stroke:#2ca02c,stroke-width:2px
-    linkStyle 3,4,5,6,7,8 stroke:#ff7f0e,stroke-width:2px
+    rect rgb(255, 235, 214)
+    Note over K,D: hard ②：读删写（kvcm 失联也安全）
+    K->>M: R1 GetReplicaList
+    D->>K: R1 RDMA 读出（数据到 kvcm 本地）
+    K->>M: R2 Remove(key)
+    Note over M: key 不存在，不可读（重建窗口）
+    K->>M: R3 PutStart(with_hard_pin)
+    K->>D: R3 RDMA 写回
+    K->>M: R3 PutEnd
+    Note over M: hard pin 固化 ✓
+    K->>M: R4 GetReplicaList 校验
+    end
 ```
 
+- S2 与 R3 的**发起方身份 = 新属主**（F3①）：传自己 UUID 改归 kvcm / 传原属主 UUID 借名（需 master 加查询 RPC）——两选择的取舍见 §2「属主问题」节
 - 效果与代价（保护语义、断线窗口、持续开销、取消方式）见 §2 对比表与「pin 的取消」节，不进图
 
 **⑤ demote（DRAM→SSD；数据只在本机内流）**
