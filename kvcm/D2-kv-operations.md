@@ -198,7 +198,7 @@
 - `GetReplicaListForAdmin`：查副本状态但**零副作用**（不续租、不触发 promote、不计命中统计）——核验专用（F11b）
 - `GetAllKeys` / `GetReplicaListByRegex`：全量/模式列举 key——台账对账重建用
 - `ProbeKey`：纯探测在不在，不续租（F9）；实现确认也不喂命中统计（`ExistKeyImpl(grant_lease=false)` 不触发 promote 计数与动态副本观测）——main 下最轻的存在性核验
-- `BatchQueryIp`（两版本同有）：client_id → IP 列表——`GetReplicaList` 给出副本在哪个 seg 后，用它解析「该 seg 属主在哪台机器」，副本位置 → 引擎地址的补环
+- 副本位置无需补环：`GetReplicaList` 的副本 descriptor 自带 `transport_endpoint_`（内存副本 `AllocatedBuffer::Descriptor`，`allocator.h`；盘副本 `LocalDiskDescriptor` 还外加 `client_id`）——「副本在哪台机器」一跳到位。`BatchQueryIp`（client_id → IP，两版本同有）对 kvcm 仅边角用途：已登记引擎 UUID 重连后查当前地址——注意它答的是「client 在哪」，答不了「key 属主是谁」（属主 = 最初写入引擎，copy 后不变；key→属主无查询接口，F13⑥，台账只能写入时自登）
 - `GetStorageUsageSnapshot`（main）：分层容量快照——demote 触发条件「DRAM 压力」的数据源
 - 台账失效通知增强（main）：KV 事件流（ZMQ，stored/removed/cleared，D1 F14）的 removed/cleared 事件可让台账条目立即失效，不必等下轮全量对账；stored 不含 seg/位置（D1 F14 已析），替不了对账——索引面用途归 D1，kvcm 台账只借失效通知
 
