@@ -8,7 +8,7 @@
   - §2 pin：候选已摆平；落地裁决依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞
   - §3 demote / promote：设计完成
   - §4 retain / release：定型；retain 的池机制正路在 main（retained client 或 DFS 副本，F13），0.3.11 下的过渡手段待 E5 实验裁决（F6b）
-  - 文末「总结：kvcm 能力边界」：哪些功能只能被动等池（真缺口 2 条，归池侧扩展）、哪些功能无专用 RPC 但组合可达（对照表）
+  - §1 尾「kvcm 能力边界」：哪些功能只能被动等池（真缺口 2 条，归池侧扩展）、哪些功能无专用 RPC 但组合可达（对照表）
   - 未决问题（详见 backlog）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）；级联删除「代码 vs 实测」口径不一致（E5）
 - 上游问题：backlog D2（kvcm 对池内 KV 的操作面）
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
@@ -268,6 +268,29 @@
 | retain 属主下线存续 | 引擎插件层（FlexKV/UCM/HiCache L1L2）引擎死缓存失效拉倒；KVCR-Guard/LMCache daemon 才做 | kvcm 是独立控制面：预热投入要跨实例存亡保住 |
 
 - **审计结论**：不做 pin/keepalive/retain 的系统，共同点是有读者替它们保活、或引擎死了认栽——kvcm 的预热副本恰好「无读者 + 要跨实例存亡」，这三样是定位需要，不是冗余。**唯一真缺口 = prefetch 终止**（backlog P9）
+
+### kvcm 能力边界（功能视角分级）
+
+判据是**功能目标能否用现有原语组合达成**，不是有没有专用 RPC。与上节审计的关系：审计对照「别人有、kvcm 没有」，本节按功能视角给 kvcm 自身能力定级——真被动 2 条（含审计识别的 P9，另加 §3 的确定性 demote），组合可达 7 条。
+
+**无法操作，只能被动（真功能缺口，归池侧扩展）**
+
+| 功能 | 卡点 | kvcm 现状手段 |
+|---|---|---|
+| 写回模式确定性 demote（含「只清 DRAM 副本、留盘副本」） | 无 per-key 降层 RPC（两版本同）+ `BatchReplicaClear` 限 key 属主（F6②） | 停保活进驱逐候选，时机不可控；远期：自拟盘 + `AddReplica` 登记（§3） |
+| 在途 copy/move 任务取消（止损） | 无任务取消 RPC（两版本同，P9） | 弃置 + 事后清副本——止不住在途带宽，只清结果 |
+
+**功能对齐，组合实现（mooncake 无直接可用接口）**
+
+| 功能 | 组合路径 | 代价 / 延迟 |
+|---|---|---|
+| promote | `GetReplicaList` 促发（刷命中阈值点火）/ 读删写自搬（§3） | 促发看水位门；自搬数据过本地 |
+| hard pin 取消 | 再读删写一遍（§2） | 数据过本地 |
+| lease 撤销（软释放） | 停 touch 等过期（§4） | 固定延迟 = TTL（分钟级，确定） |
+| 指定源 copy | `CreateMoveTask`（要保源则 move 完再 copy 回，F7） | 绕一步 |
+| 死引擎副本清理 | `Remove` / `RemoveByRegex`（不鉴权，§4） | 比等心跳扫描快 |
+| 给新 put 腾 DRAM | `Remove` 冷 key | —— |
+| 冷热观测 | kvcm 自建台账（sqlite，§3） | 不依赖池的 CountMinSketch（不对外） |
 
 ### 操作图解
 
@@ -672,26 +695,3 @@ flowchart TB
     - 仅「确认没人用」（D1 §6 例外档，如全局废弃前缀）才用 force
     - 常规删除不用 force：被拒就等 lease 过期（测试床 11s）再删
 - **收尾责任**：remove 后 kvcm 清自己台账 + 索引条目同步清（池副本删除事件通道缺失，D1 F10/F14；llm-d 幽灵条目同坑）
-
-## 总结：kvcm 能力边界
-
-按「功能能否用现有原语组合达成」分两类——判据是**功能目标**，不是有没有专用 RPC。
-
-### 无法操作，只能被动（真功能缺口，归池侧扩展）
-
-| 功能 | 卡点 | kvcm 现状手段 |
-|---|---|---|
-| 写回模式确定性 demote（含「只清 DRAM 副本、留盘副本」） | 无 per-key 降层 RPC（两版本同）+ `BatchReplicaClear` 限 key 属主（F6②） | 停保活进驱逐候选，时机不可控；远期：自拟盘 + `AddReplica` 登记（§3） |
-| 在途 copy/move 任务取消（止损） | 无任务取消 RPC（两版本同，P9） | 弃置 + 事后清副本——止不住在途带宽，只清结果 |
-
-### 功能对齐，组合实现（mooncake 无直接可用接口）
-
-| 功能 | 组合路径 | 代价 / 延迟 |
-|---|---|---|
-| promote | `GetReplicaList` 促发（刷命中阈值点火）/ 读删写自搬（§3） | 促发看水位门；自搬数据过本地 |
-| hard pin 取消 | 再读删写一遍（§2） | 数据过本地 |
-| lease 撤销（软释放） | 停 touch 等过期（§4） | 固定延迟 = TTL（分钟级，确定） |
-| 指定源 copy | `CreateMoveTask`（要保源则 move 完再 copy 回，F7） | 绕一步 |
-| 死引擎副本清理 | `Remove` / `RemoveByRegex`（不鉴权，§4） | 比等心跳扫描快 |
-| 给新 put 腾 DRAM | `Remove` 冷 key | —— |
-| 冷热观测 | kvcm 自建台账（sqlite，§3） | 不依赖池的 CountMinSketch（不对外） |
