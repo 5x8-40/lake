@@ -109,6 +109,11 @@
 - **CreateMoveTask**（key, source, target，`:5845`）
   - 唯一能指定源的路径；语义是**移动**——完成后源副本删除
   - 执行模型与 copy 相同：任务派给源 seg 属主执行（`GetClientIdBySegmentName(source)`），同样要求源在线；失败则源保留
+- **CreateDrainJob**（两版本同有：`master_service.cpp:5970` @0.3.11，`ProcessDrainJobs` `:6354` @0.3.11 / `:14434` @main）
+  - seg 级批量搬迁：入参 = 一批源 seg 名 + 可选目标 seg 列表 + 并发上限（默认 4，`CreateDrainJobRequest` 字段两版本一字不差）
+  - 语义：源 seg 置 DRAINING（仍可读、不再接受新分配，`segment.h:24` 注释 @0.3.11）→ master 后台 job 线程（`JobDispatchThreadFunc` → `ProcessDrainJobs`）周期扫源 seg 上的 key、逐个派搬迁任务 → 排空后 seg 置 DRAINED，可安全下线
+  - 与 CreateMoveTask 对比：粒度 = seg 批量 vs key 单发；驱动 = 后台 job 循环调度 vs 即时单任务；**可取消性 = job 有 `CancelDrainJob` / `QueryDrainJob`，task 无取消（P9）**——下线场景白得取消能力
+  - 用途：计划下线（§4）
 - **副本没有属主字段，生死跟随所在 seg**：copy 到 B 的副本属 B 的 seg——源引擎下线不影响它；目标引擎（B）下线它才随 seg 失效（代码口径；与实测的不一致见 F6b）
 - **介质边界：copy/move 只在 DRAM seg 之间，接不了 SSD**（两版本一致）
   - disk seg 不在 seg 名字空间：0.3.11 挂盘单独登记在 client 名下（`segment.cpp:133` `MountLocalDiskSegment`，不进 seg 名注册表）；main 改由 `local_ssd_manager_.RegisterClient` 按 client 登记（`master_service.cpp:8407`），同样没有 seg 名——copy/move 的目标校验只认内存 seg 名，**disk 做不了目标**
@@ -170,7 +175,6 @@
   - 前提：部署 3FS（测试床没有）
 
 **③ 下线与运维**
-- `CreateDrainJob` / `CancelDrainJob`：master 主动把指定 seg 上的副本迁走、排空（§4 下线编排）
 - `UnmountLocalDiskSegment`：引擎死前主动摘掉盘的登记（效果等同死后被清，但更干净可控）
 - `RemoveAll` 改异步：master 置个标志，各 client 轮询到（`PollRemoveAll`）后各自清盘——全池清空不再是同步调用
 
@@ -182,7 +186,7 @@
 **⑤ 任务机制变化**
 - offload 任务改**邮箱投递**：master 把任务镜像推进引擎的盘 mailbox，引擎的 store worker 取活干；可以取消（`CancelQueuedOffloadTask`），但镜像已被取走就取消不了
 - **copy/move 任务仍无取消**（两版本同，P9）
-- `SubmitReplicaActionProposal`：名字像「动态副本动作」入口，但动作类型只有 `ADD`（加副本）——**不是降层按钮**，「无 per-key 立即降层 RPC」的结论两版本成立
+- `SubmitReplicaActionProposal`：master **内部**动态副本机制，**不对外暴露**（`rpc_service.h` 未注册、`master_client` 无此方法；由 master 热度准入线程 `DynamicReplicationAdmissionThreadFunc` 自调，带滑窗热度准入 + lease 幂等 + version_epoch 乐观锁）——动作类型只有 `ADD`（加副本，`rpc_types.h:17-19` @main），**不是降层按钮**，kvcm 也用不了；「无 per-key 立即降层 RPC」的结论两版本成立
 
 **⑥ main 仍没有的**（别去找了）
 - per-key 立即降层 RPC、copy/move 任务取消、Python 绑定的空写通道、key→属主 UUID 查询
@@ -309,7 +313,7 @@ flowchart TB
     A -->|"④ CopyEnd"| M
     K -->|"⑤ QueryTask + 副本核验"| M
     K -.->|"⑥ READY"| R["Router"]
-    N["main 另有入口：SubmitReplicaActionProposal<br/>（仅加副本 ADD，带热度准入 + lease）"]
+    N["main 内部机制（不对外 RPC，F13⑤）：SubmitReplicaActionProposal<br/>master 看热度自动加副本（仅 ADD）+ lease 幂等，<br/>终点同为 REPLICA_COPY 任务——kvcm 用不了"]
     M -.-> N
     N2["缺口：copy 任务无取消 RPC（两版本同，P9）——<br/>请求改道/源消失只能弃置 + 事后清副本（弱版）"]
     M -.-> N2
@@ -324,7 +328,7 @@ flowchart TB
     A ==>|"③ RDMA：A.DRAM → B.DRAM"| B["引擎 B（目标）"]
     A -->|"④ MoveEnd（源副本随任务完成删除）"| M
     K -->|"⑤ QueryTask + 副本核验"| M
-    N["seg 级批量搬迁（main）：CreateDrainJob<br/>把整条 seg 的副本迁走排空（下线场景）"]
+    N["CreateDrainJob（两版本同有，F7）：seg 级批量搬迁<br/>后台 job 循环逐 key 搬走排空；job 可取消、task 无（P9）<br/>——下线场景白得取消能力；proposal 机制不做 move（仅 ADD）"]
     M -.-> N
     N2["缺口：move 任务无取消 RPC（两版本同，P9）；失败则源副本保留"]
     M -.-> N2
@@ -334,7 +338,14 @@ flowchart TB
 
 ```mermaid
 flowchart TB
-    K["kvcm"] -->|"周期 ExistKey / BatchExistKey（grant_lease=true）"| M["master<br/>续 lease 时钟（有 soft pin 的一并续）"]
+    subgraph KVCM["kvcm"]
+        REG[("保活注册表（台账，不可丢）<br/>在保活的 key / 归属会话 / 周期")]
+        LOOP["周期循环：遍历注册表逐 key touch"]
+        REG --> LOOP
+    end
+    E1["prefetch READY（⑨）"] -.->|"注册"| REG
+    E2["会话结束 / 软释放（§4）"] -.->|"摘除"| REG
+    LOOP -->|"ExistKey / BatchExistKey（grant_lease=true）"| M["master<br/>续 lease 时钟（有 soft pin 的一并续）"]
     N["读路径 GetReplicaList 也授 lease——kvcm 的 touch 不用它（F11b 分工）；<br/>ProbeKey 不续租（纯探测，仅 main）"]
     M -.-> N
 ```
@@ -597,7 +608,7 @@ flowchart TB
   2. **kvcm 迁 KV**：这台 seg 上的预热副本 copy/move 到他机，或 demote 落盘
   3. **宽限期卸载**：引擎调 `GracefulUnmountSegment`（`master_service.cpp:669` @0.3.11）告诉 master「给我 N 毫秒宽限再摘 seg」——它是迁移的**时间窗保障**（防搬到一半 seg 被摘、数据随 seg 失效），由编排流程触发；不是引擎自己决定何时下线
   4. **缩容停引擎**
-  - `CreateDrainJob`（main 独有）：master 主动把指定 seg 上的副本迁到别的 seg（带并发上限），排空后安全下线——可替代第 2 步的手动搬迁；0.3.11 没有，升级后归 D3 评估
+  - `CreateDrainJob`（两版本同有，F7）：master 后台 job 把指定 seg 上的副本逐个迁到别的 seg（带并发上限默认 4），排空后 seg 置 DRAINED 安全下线——可替代第 2 步的手动搬迁，且 job 级可取消（`CancelDrainJob`），比裸 copy/move 多一层控制；编排用法归 D3 评估
 - **长期未命中副本**：demote 到 SSD（§3）；何时降、降哪些归策略层编排
 - 与 D3 的边界：副本生命周期（TTL / READY 语义）归 D3；本节只定「属主下线」场景的机制组合
 
