@@ -334,21 +334,27 @@ flowchart TB
     M -.-> N2
 ```
 
-**③ keepalive（周期 touch，无数据流）**
+**③ keepalive（注册表驱动的周期 touch，无数据流）**
 
 ```mermaid
-flowchart TB
-    subgraph KVCM["kvcm"]
-        REG[("保活注册表（台账，不可丢）<br/>在保活的 key / 归属会话 / 周期")]
-        LOOP["周期循环：遍历注册表逐 key touch"]
-        REG --> LOOP
+sequenceDiagram
+    participant K as kvcm
+    participant R as 保活注册表（kvcm 内，不可丢）
+    participant M as master
+
+    Note over K: prefetch READY（⑨）后
+    K->>R: 注册 key（含归属会话、周期）
+    loop 每周期（< lease_ttl，测试床 11s）
+        K->>R: 遍历在保活的 key
+        K->>M: ExistKey / BatchExistKey（grant_lease=true）
+        Note over M: lease_timeout 续期（有 soft pin 的一并续，F9）
     end
-    E1["prefetch READY（⑨）"] -.->|"注册"| REG
-    E2["会话结束 / 软释放（§4）"] -.->|"摘除"| REG
-    LOOP -->|"ExistKey / BatchExistKey（grant_lease=true）"| M["master<br/>续 lease 时钟（有 soft pin 的一并续）"]
-    N["读路径 GetReplicaList 也授 lease——kvcm 的 touch 不用它（F11b 分工）；<br/>ProbeKey 不续租（纯探测，仅 main）"]
-    M -.-> N
+    Note over K: 会话结束 / 软释放（§4，router 线索）
+    K->>R: 摘除 key
+    Note over K,M: 停 touch → lease 到期失效 → 驱逐兜底
 ```
+
+- 读路径 `GetReplicaList` 也授 lease——kvcm 的 touch 不用它（F11b 分工）；`ProbeKey` 不续租（纯探测，仅 main）
 
 **④ pin（三方案时序，rect 底色区分：蓝 = soft pin 档、绿 = hard 档①、橙 = hard 档②，§2）**
 
