@@ -350,29 +350,33 @@ flowchart TB
     M -.-> N
 ```
 
-**④ pin（soft pin 档一方案 × hard pin 档两候选 × 属主两方案，§2）**
+**④ pin（三方案路径一图，连线颜色区分：蓝 = soft pin 档、绿 = hard 档①、橙 = hard 档②，§2）**
 
 ```mermaid
-flowchart TB
+flowchart LR
     K["kvcm"]
-    subgraph SOFT["soft pin 档（驱逐排最后，极端可逐）"]
-        S1["空写 upsert 设 soft pin<br/>UpsertStart(原尺寸, with_soft_pin) → 不写数据 → UpsertEnd<br/>有属主问题；取消 = 空写传 false / DISABLE"]
-    end
-    subgraph HARD["hard pin 档（绝对不可驱逐）"]
-        H1["① lease 调大 + 周期 keepalive<br/>期内绝对不可逐；kvcm 须活着续命<br/>代价 = 全局读租约变长（F10）"]
-        H2["② 读删写：读出 → Remove → 带 hard_pin 重 put<br/>kvcm 失联也安全；有属主问题；取消 = 再读删写一遍"]
-    end
-    subgraph OWN["属主问题（空写与读删写共同面对）"]
-        O1["方案一：属主改归 kvcm<br/>传自己 UUID（F3① 改写即收益）"]
-        O2["方案二：借名<br/>传回原属主 UUID，需 master 加「key→属主」查询 RPC"]
-    end
-    K --> S1
-    K --> H1 & H2
-    S1 -.-> OWN
-    H2 -.-> OWN
-    N["已否决：读锁——机制不存在，refcnt 是任务级保护、两版本无读者引用 API（§2）；<br/>不做靠驱逐兜底（pin 与未 pin 的差异正是优先级语义）；<br/>引擎写入时源头带 pin（侵入 + 全 pin 无区分度）；<br/>AddReplica 此路不通（只收 LOCAL_DISK、不带 pin）；hard pin 事后改不了（F1）；<br/>copy 路径带不了 pin——CreateCopyTask 不收写配置，pin 必须事后单独加（F1）"]
-    SOFT -.-> N
+    M["master<br/>key 元数据：lease / soft pin / hard pin"]
+    D["KV 副本（DRAM seg）"]
+
+    K -->|"S1 GetReplicaList 查原尺寸"| M
+    K -->|"S2 UpsertStart(原尺寸, with_soft_pin) → UpsertEnd（不写数据）"| M
+    K -->|"L1 周期 ExistKey / BatchExistKey（grant_lease=true）"| M
+    K -->|"R1 GetReplicaList"| M
+    D ==>|"R1 RDMA 读出到 kvcm 本地"| K
+    K -->|"R2 Remove"| M
+    K -->|"R3 PutStart(with_hard_pin) → PutEnd"| M
+    K ==>|"R3 RDMA 写回"| D
+    K -->|"R4 GetReplicaList 校验"| M
+
+    OWN["属主问题（S2 与 R3 必改写属主，F3①）：<br/>传自己 UUID = 改归 kvcm；<br/>传原属主 UUID = 借名（需 master 加查询 RPC）"]
+    M -.-> OWN
+
+    linkStyle 0,1 stroke:#1f77b4,stroke-width:2px
+    linkStyle 2 stroke:#2ca02c,stroke-width:2px
+    linkStyle 3,4,5,6,7,8 stroke:#ff7f0e,stroke-width:2px
 ```
+
+- 效果与代价（保护语义、断线窗口、持续开销、取消方式）见 §2 对比表与「pin 的取消」节，不进图
 
 **⑤ demote（DRAM→SSD；数据只在本机内流）**
 
