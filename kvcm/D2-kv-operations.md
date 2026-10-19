@@ -8,6 +8,7 @@
   - §2 pin：候选已摆平；落地裁决依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞
   - §3 demote / promote：设计完成
   - §4 retain / release：定型；retain 的池机制正路在 main（retained client 或 DFS 副本，F13），0.3.11 下的过渡手段待 E5 实验裁决（F6b）
+  - 文末「总结：kvcm 能力边界」：哪些功能只能被动等池（真缺口 2 条，归池侧扩展）、哪些功能无专用 RPC 但组合可达（对照表）
   - 未决问题（详见 backlog）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）；级联删除「代码 vs 实测」口径不一致（E5）
 - 上游问题：backlog D2（kvcm 对池内 KV 的操作面）
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
@@ -195,7 +196,7 @@
 
 - **操作集八项**：copy / move / keepalive / pin / demote / promote / retain / remove
   - 按性质分三类
-    - **原子动作**：copy / move / keepalive / demote / promote / remove——原子指**语义**：一个操作一个效果、无中间态对外。实现上 copy/move/keepalive/remove 各对应单 RPC；demote/promote 是「池通道 + 核验」的组合动作（§3），对外仍呈现单步语义
+    - **原子动作**：copy / move / keepalive / demote / promote / remove——原子指**语义**：一个操作一个效果、无中间态对外。实现上 copy/move/keepalive/remove 各对应单 RPC；demote/promote 是组合动作（池通道 / 促发 / 读删写 + 核验，§3），对外仍呈现单步语义
     - **元数据标记**：pin——设一次长期有效的标记
     - **目的型**：retain——「副本跨实例存亡活着」是目的不是机制，由 demote / move / pin 组合实现（§4）
   - 复合流程由原子操作编排而成（策略层组合），不写成一体状态机
@@ -575,6 +576,7 @@ flowchart TB
   - 实例计划下线：下线前把 KV 降层保存
 - demote/promote 与 keepalive 是**独立操作**，但写回模式下有一处机制依赖：落盘由驱逐触发，而保活中的 key（lease 未过期）被驱逐硬过滤跳过（F8）——所以写回模式下 demote 想生效，须先停保活并等 lease 过期，否则驱逐永远轮不到它。写穿模式（put 时已落盘）和 promote（读盘写 DRAM，不经驱逐）都不受保活影响。「停保活」不等于「降层」，它是策略层的动作，不是 demote 语义的一部分
 - **存储形态：mooncake 统一管理**——引擎实例挂本机 SSD（`MountLocalDiskSegment`），DRAM + SSD 构成多级 tier；**kvcm 不持存储**（主路径），只发控制指令；远期 kvcm 也可挂本机 SSD（与引擎同样的挂法）把空闲资源用满——挂后 kvcm 名下盘副本可作 retain 的兜底（§4）
+- **copy/move 对两个方向都用不上**（F7 介质边界，两版本一致）：disk 不在 seg 名字空间——demote 拿 disk 当不了 copy/move 的**目标**；SSD 副本没有 seg 名——promote 拿它当不了 copy/move 的**源**。跨介质只有三条路：池通道（offload / promotion）、kvcm 读写组合（读删写）、（远期）自拟盘登记
 - **版本说明**：本节的机制结论（介质边界、offload/promotion 通道、无立即降层入口）0.3.11 与 main 一致（main 增量全清单见 F13，均不改变本节主路径）
 
 ### 存储领域的冷热分级对照
@@ -604,15 +606,22 @@ flowchart TB
     - 写穿模式：SSD 副本**写入时已有**——数据早已在盘上，DRAM 副本待自然驱逐释放即可（何时释放无所谓，它只是个缓存副本）
     - 写回模式：key 进驱逐候选后，池驱逐时自动先落 SSD 再释放 DRAM（`BatchEvict` 里 `PushOffloadingQueue`，`master_service.cpp:11622` @0.3.11）——时机不可控：池不满就不驱逐、不落盘
   - **核验**：`GetReplicaList` 确认 disk 副本在册（降层完成的判定）
-- **缺口**
-  - **无 per-key「立即降层」RPC**（两版本同）：offload 任务的入队时机只有 put 完成时（写穿）和驱逐选中时（写回）两处；kvcm 想让指定 key 立刻、确定性地落盘，做不到 → 需要时归池侧扩展
-  - 「立即清掉内存副本、只留盘副本」也走不通：`BatchReplicaClear` 校验请求者必须是 key 属主（F6②），kvcm 非属主调不动
+- **缺口（真功能缺口，归池侧扩展）**
+  - **写回模式下无确定性 demote**：offload 任务的入队时机只有 put 完成时（写穿）和驱逐选中时（写回）两处（两版本同）——kvcm 想让指定 key 立刻、确定性地落盘，做不到；池不满就永不落盘
+  - 「立即清掉内存副本、只留盘副本」同属此缺口：`BatchReplicaClear` 校验请求者必须是 key 属主（F6②），kvcm 非属主调不动
+- **远期可行性方案（与 §4「kvcm 挂 SSD」形态绑定）**：kvcm 读 DRAM 数据 → 写自己本机盘文件 → `AddReplica` 登记盘副本（`master_service.cpp:1426` @0.3.11，只收 LOCAL_DISK、不带 pin）——副本绑 kvcm 的 client 与本机盘，引擎读它走远端盘路径、经 kvcm 转发读数——kvcm 从纯控制面变成数据面一环（带宽、可用性沾上），故不作现役路径
 
 ### promote 实现
 
-- **先排除直觉路径**：不能用 copy/move 把 SSD 副本「拉回/搬回」DRAM——copy/move 只在 DRAM seg 之间，SSD 副本做不了源、disk 也做不了目标（F7 介质边界，两版本一致）。跨介质只能走池自己的 promotion 通道
-- **被动路径（主路径）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本属主 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
-- **主动 RPC 链存在但 kvcm 用不了**：`PromotionAllocStart` → 数据搬运 → `NotifyPromotionSuccess`（`master_service.h:559-590` @0.3.11）——两个限制：必须先有 master 准入的在途任务（任务只由被动路径产生）、只许盘副本属主 client 执行（holder 校验）。kvcm 两者都不满足 → **主动 promote 无入口，归缺口**（两版本同）
+- **被动路径（流量驱动）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本属主 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
+- **kvcm 主动路径一：促发（轻，点火）**——对只剩盘副本的 key 连调 `GetReplicaList` 达阈值（默认 2 次）：准入计数是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 频率门 @0.3.11），kvcm 的调用与真实流量同池计数，刷够即触发上面的被动路径
+  - 前提：`promotion_on_hit` 开启 + DRAM 水位低于驱逐高水位（水位门，高了点不着）+ 盘副本属主引擎在线
+  - 促发必须用 `GetReplicaList`——`ExistKey` 点不着（只授 lease、不进 promote 统计，`master_service.cpp:752-770` @0.3.11）；促发顺带授 lease（F11b 的副作用在此是正作用：提回期间防逐）
+- **kvcm 主动路径二：读删写（重，确定性自搬）**——读盘副本数据 → `Remove` → `PutStart` 新建 DRAM 副本 → 写数据 → `PutEnd` → 校验
+  - 为什么不能更省事：`PutStart` 对已存在 key 报 `OBJECT_ALREADY_EXISTS`（@0.3.11）；`UpsertStart` 对已有 key 是原位更新（Case B 复用现有 buffer 地址，`:1693` @0.3.11）——只剩盘副本时原位写的是盘 buffer，提不回 DRAM。所以必须 Remove 后重 put
+  - 属主问题同 §2 读删写（PutStart 传谁 UUID 谁是属主）；数据过 kvcm 本地（带宽）
+  - 对比促发：不等阈值、不等水位门，**确定性**——「必须提回」的场景用它
+- **池的主动 RPC 链（`PromotionAllocStart` → 搬运 → `NotifyPromotionSuccess`，`master_service.h:559-590` @0.3.11）kvcm 用不了**——必须先有 master 准入的在途任务（只由命中驱动产生）、只许盘副本属主 client 执行（holder 校验）。这只是池通道的内部机制说明，不妨碍上面两条 kvcm 路径成立
 
 ### 副本归属与引擎下线
 
@@ -663,3 +672,26 @@ flowchart TB
     - 仅「确认没人用」（D1 §6 例外档，如全局废弃前缀）才用 force
     - 常规删除不用 force：被拒就等 lease 过期（测试床 11s）再删
 - **收尾责任**：remove 后 kvcm 清自己台账 + 索引条目同步清（池副本删除事件通道缺失，D1 F10/F14；llm-d 幽灵条目同坑）
+
+## 总结：kvcm 能力边界
+
+按「功能能否用现有原语组合达成」分两类——判据是**功能目标**，不是有没有专用 RPC。
+
+### 无法操作，只能被动（真功能缺口，归池侧扩展）
+
+| 功能 | 卡点 | kvcm 现状手段 |
+|---|---|---|
+| 写回模式确定性 demote（含「只清 DRAM 副本、留盘副本」） | 无 per-key 降层 RPC（两版本同）+ `BatchReplicaClear` 限 key 属主（F6②） | 停保活进驱逐候选，时机不可控；远期：自拟盘 + `AddReplica` 登记（§3） |
+| 在途 copy/move 任务取消（止损） | 无任务取消 RPC（两版本同，P9） | 弃置 + 事后清副本——止不住在途带宽，只清结果 |
+
+### 功能对齐，组合实现（mooncake 无直接可用接口）
+
+| 功能 | 组合路径 | 代价 / 延迟 |
+|---|---|---|
+| promote | `GetReplicaList` 促发（刷命中阈值点火）/ 读删写自搬（§3） | 促发看水位门；自搬数据过本地 |
+| hard pin 取消 | 再读删写一遍（§2） | 数据过本地 |
+| lease 撤销（软释放） | 停 touch 等过期（§4） | 固定延迟 = TTL（分钟级，确定） |
+| 指定源 copy | `CreateMoveTask`（要保源则 move 完再 copy 回，F7） | 绕一步 |
+| 死引擎副本清理 | `Remove` / `RemoveByRegex`（不鉴权，§4） | 比等心跳扫描快 |
+| 给新 put 腾 DRAM | `Remove` 冷 key | —— |
+| 冷热观测 | kvcm 自建台账（sqlite，§3） | 不依赖池的 CountMinSketch（不对外） |
