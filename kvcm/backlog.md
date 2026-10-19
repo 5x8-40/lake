@@ -32,18 +32,17 @@
 - 操作集框架：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程原子组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
 - pin：READY 后防驱逐——🟡 候选已摆平，落 [D2-kv-operations.md](D2-kv-operations.md) §2
-  - soft 需求三候选
-    - ① lease 调大 + keepalive：零 mooncake 改动、零属主问题、lease 期内绝对不可逐；代价 = 全局读租约变长（驱逐候选缩小，调参项）+ 断线窗口 = lease_ttl
-    - ② 空写 upsert：不动全局 lease、断线窗口 30min 级；代价 = 空写通道（Python 绑定无分离接口）+ 属主问题
-    - ③ 读锁：零改动但脆（断线即失效、key 读锁死、永续会话）
-  - hard 需求：读删写（kvcm 本地持有数据可重试）或读锁
+  - soft pin 档（驱逐排最后，极端可逐）：空写 upsert 一方案——不动全局 lease、断线窗口 30min 级；代价 = 空写通道（Python 绑定无分离接口）+ 属主问题
+  - hard pin 档（绝对不可逐）两候选：① lease 调大 + keepalive（零改动零属主问题；代价 = 全局读租约变长 + kvcm 须活着续命）；② 读删写（kvcm 失联也安全；数据过本地 + 属主问题）
+  - 取消：①停 touch 等过期 / 空写传 false 或 `SoftPinAction::DISABLE` / hard pin 无 unpin、只能再读删写一遍
+  - 读锁已证伪（被否决）：refcnt 是任务级保护，两版本无读者引用 RPC
   - 属主两方案并列（空写与读删写共同面对）
     - 改归 kvcm：不改 mooncake、语义变（引擎下线 key 不删；kvcm 成新单点）
     - 借原属主 UUID：语义不变、需 master 加「key → 属主 UUID」查询 RPC（内部数据现成）
     - 决策条件 = mooncake 可改性（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、属主管辖、lease 与驱逐、UUID 与空写通道）
-- retain：🟡 机制定型（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——正路 = main 池机制两条并列：retained client（断线数据保留等认领，`AddReplicaForRetainedClient`，解引擎进程下线）、DFS 副本（写共享 3FS，不随 client 死被清，解整机灭失，前提部署 3FS）；0.3.11 下 demote 解不了 retain（盘副本绑引擎 client，引擎死照样清），过渡 = 改属主/move（待 E5 口径裁决）/ kvcm 自挂 SSD（不依赖 E5 的兜底）；计划下线编排有 `GracefulUnmountSegment`（0.3.11）/ `CreateDrainJob`（main）；长期未命中 → demote SSD，策略归编排。
-- demote / promote：🟡 设计完成（落 [D2-kv-operations.md](D2-kv-operations.md) §3）——语义原子、实现为「池通道+核验」组合，存储统一归 mooncake（引擎实例挂本机 SSD 多级 tier，kvcm 不持存储）。demote = 池开 `enable_offload`（写穿/写回两模式 ≈ HiCache write_through/write_back），写回模式须先停保活等 lease 过期（保活挡驱逐即挡落盘）；promote = `promotion_on_hit` 被动提回（0.3.11 含；主动 RPC 链限 holder，kvcm 无入口）。copy/move 接不了 SSD（disk seg 无 seg 名，两版本同）。触发（会话结束/变冷/DRAM 压力/计划下线）归策略层。缺口：无 per-key 立即降层 RPC（两版本同）、主动 promote 无入口 → 池侧扩展。每操作有完成信号，READY 特指 DRAM 就位可调度。
+- retain：🟡 机制定型（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——正路 = main 池机制两条并列：retained client（断线数据保留等认领，`AddReplicaForRetainedClient`，解引擎进程下线）、DFS 副本（写共享 3FS，不随 client 死被清，解整机灭失，前提部署 3FS）；0.3.11 下 demote 解不了 retain（盘副本绑引擎 client，引擎死照样清），过渡 = 改属主/move（待 E5 口径裁决）/ kvcm 自挂 SSD（不依赖 E5 的兜底）；计划下线编排有 `GracefulUnmountSegment`（0.3.11）/ `CreateDrainJob`（两版本同有，job 级可取消）；长期未命中 → demote SSD，策略归编排。
+- demote / promote：🟡 设计完成（落 [D2-kv-operations.md](D2-kv-operations.md) §3）——语义原子、实现为组合动作（池通道 / 促发 / 读删写 + 核验），存储统一归 mooncake（引擎实例挂本机 SSD 多级 tier，kvcm 不持存储）。demote = 池开 `enable_offload`（写穿/写回两模式 ≈ HiCache write_through/write_back），写回模式须先停保活等 lease 过期（保活挡驱逐即挡落盘）；promote = `promotion_on_hit` 被动提回 + kvcm 主动两条（`GetReplicaList` 促发点火 / 读删写自搬）。copy/move 接不了 SSD（disk seg 无 seg 名，两版本同）。触发（会话结束/变冷/DRAM 压力/计划下线）归策略层。真功能缺口：写回模式确定性 demote（无 per-key 降层 RPC + `BatchReplicaClear` 限属主）→ 池侧扩展；远期 = kvcm 自拟盘 + `AddReplica` 登记。每操作有完成信号，READY 特指 DRAM 就位可调度。
 - release：✅ 已闭环（落 [D2-kv-operations.md](D2-kv-operations.md) §4）——决策归属 D1 §6；kvcm 可用 `Remove`/`BatchRemove`/`RemoveByRegex`（配 key 命名空间才有意义）/`RemoveAll`；`BatchReplicaClear` 限 key 属主自调（kvcm 调不动别人的 key）；`force` 仅限「确认没人用」；收尾 = 清台账 + 索引同步。
 - 事实输入：E6。
 

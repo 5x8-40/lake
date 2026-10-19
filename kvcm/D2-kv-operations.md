@@ -237,7 +237,7 @@
 | keepalive | LMCache 后端接口 `touch_cache`；FlexKV lease「保证传输期间块有效」；llm-d 推测索引 TTL 2s（`defaultSpeculativeTTL`，代码注释自承是经验值） | 周期 touch 续租在多家存在；llm-d 的「TTL 是经验值」提示 lease_ttl 须真机校准（F10 已记） |
 | pin | LMCache `pin`/`unpin`（后端接口级）；KVCR `claim/pin`/`release_pin`（**传输窗口专用**，`FETCHABLE` 须等 pin 成功才确定）；TensorCast `pinned` policy（必须驻留 + 溢出**拒绝写入**）；HiCache `lock_ref`（`protected_size_` vs `evictable_size_`，dec 到 0 ≠ 释放、仍可命中） | mooncake 三件套（lease/soft/hard）比多数系统细。差异：TensorCast `pinned` 溢出拒绝写入，mooncake hard pin 无此语义（创建时固化、之后改不了，F1）；KVCR 的传输窗口 pin 在 mooncake 由「copy 任务在途拒 upsert」覆盖（F2） |
 | demote | §3 专节（FlexKV/LMCache/UCM/KVBM/MemCache 对照 + HiCache 写穿/写回） | —— |
-| promote | HiCache `load_back`（L2→L1 提回）；FlexKV SSD→GPU 的 H2D 回填；KVCR `fetch`；mooncake `promotion_on_hit`（命中达阈值自动提回） | 被动提升（读命中驱动）是各家主路径；kvcm 同样以池被动机制为主（§3） |
+| promote | HiCache `load_back`（L2→L1 提回）；FlexKV SSD→GPU 的 H2D 回填；KVCR `fetch`；mooncake `promotion_on_hit`（命中达阈值自动提回） | 被动提升（读命中驱动）是各家主路径；kvcm 另有主动两条：`GetReplicaList` 促发点火（同池计数刷阈值）/ 读删写自搬（§3） |
 | retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择；kvcm 的正路 = main 的 retained client 机制（client 断线数据保留，§4），存储统一在 mooncake。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：属主管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是属主 |
 | remove | LMCache `remove`/`clear`；SGLang 分层放弃（`block-lifecycle.md`）：无 L3 时 `evict` 删叶 = 彻底；**有 L3 时引擎永不主动放弃**——删除下放 L3 后端独立 LRU/TTL，引擎看不到 | SGLang 的「释放 = 逐层剥离」（L1 摘节点降层 → L2 摘除 → L3 后端自决）对应 kvcm 三档（软释放 / demote / remove）。「L3 删除引擎不可见」提醒：kvcm remove 后索引侧条目需同步清（D1 已知：池副本删除事件通道缺失） |
 
@@ -433,23 +433,28 @@ flowchart TB
     M -.-> N
 ```
 
-**⑥ promote（SSD→DRAM）**
+**⑥ promote（SSD→DRAM；被动 + kvcm 主动两条，§3）**
 
 ```mermaid
 flowchart TB
-    subgraph PAS["被动路径（主路径）"]
+    subgraph PAS["被动路径（流量驱动）"]
         REQ["读请求"] --> E["引擎"]
-        E -->|"读命中只剩盘副本的 key"| M1["master<br/>CountMinSketch 统计达阈值（默认 2 次）"]
-        M1 -->|"① 派提升任务"| H["盘副本属主 client"]
-        S1[("SSD")] ==>|"② 读盘 → 写 DRAM"| D1[("DRAM")]
-        H -->|"③ NotifyPromotionSuccess"| M1
+        E -->|"读命中只剩盘副本的 key"| M1["master<br/>CountMinSketch 达阈值（默认 2）+ 水位门"]
+        M1 -->|"派提升任务"| H["盘副本属主 client"]
+        S1[("SSD")] ==>|"读盘 → 写 DRAM"| D1[("DRAM")]
+        H -->|"NotifyPromotionSuccess"| M1
     end
-    subgraph ACT["主动 RPC 链（存在但 kvcm 用不了）"]
-        A2["PromotionAllocStart"] -->|"搬数据"| C2["NotifyPromotionSuccess"]
-        L2["限制：须 master 准入的在途任务（只由被动路径产生）<br/>+ 只许盘副本属主 client 执行（holder 校验）"]
-        A2 -.-> L2
+    subgraph TRIG["kvcm 促发（轻，点火）"]
+        K2["kvcm"] -->|"GetReplicaList 连调达阈值<br/>（每次 +1，与真实流量同池计数）"| M1
     end
-    N["已排除：copy/move 接不了 SSD——disk 无 seg 名，做不了源也做不了目标（F7 介质边界）"]
+    subgraph RWR["kvcm 读删写（重，确定性自搬）"]
+        S2[("SSD")] ==>|"① RDMA 读出"| K3["kvcm"]
+        K3 -->|"② Remove"| M2["master"]
+        K3 -->|"③ PutStart → PutEnd"| M2
+        K3 ==>|"③ RDMA 写回"| D2[("DRAM")]
+        K3 -->|"④ GetReplicaList 校验"| M2
+    end
+    N["ExistKey 点不着（只授 lease、不进 promote 统计）；<br/>池主动链限 holder（内部机制，不妨碍 kvcm 两条）；<br/>copy/move 接不了 SSD（F7 介质边界）"]
     PAS -.-> N
 ```
 
