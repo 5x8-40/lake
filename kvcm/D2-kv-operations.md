@@ -55,7 +55,10 @@
     - 新建 key：写入时两种 pin 都可带
     - 已有 key：只能改 soft pin（经 upsert，F3）；hard pin 创建时固化、之后改不了（`master_service.cpp:1737` 注释 @0.3.11）
   - `CreateCopyTask` 不接受写请求配置（两版本同）→ kvcm 的复制路径带不了 pin，pin 必须事后单独加
-  - 排除项：`AddReplica`（`master_service.cpp:1426` @0.3.11）是磁盘副本登记接口，只收 LOCAL_DISK、不带 pin——对「已有 key 事后加 pin」此路不通。注意它**两版本都不是独立 RPC**，是 `NotifyOffloadSuccess` 的内部步骤（`master_service.cpp:2735` @0.3.11）——「客户端本地盘存了数据后上报 master 登记」的完整通道 = `MountLocalDiskSegment`（挂盘）+ 写盘 + `NotifyOffloadSuccess`（上报登记）
+  - 排除项：`AddReplica`（`master_service.cpp:1426` @0.3.11）
+    - 是磁盘副本登记接口，只收 LOCAL_DISK、不带 pin——对「已有 key 事后加 pin」此路不通
+    - **两版本都不是独立 RPC**：是 `NotifyOffloadSuccess` 的内部步骤（`master_service.cpp:2735` @0.3.11）
+    - 「客户端本地盘存了数据后上报 master 登记」的完整通道 = `MountLocalDiskSegment`（挂盘）+ 写盘 + `NotifyOffloadSuccess`（上报登记）
 - **F2 UpsertStart 的三种情形**（`master_service.cpp:1564` @0.3.11）
   - master 按「key 是否存在、尺寸是否一致」分三条路径
     - Case A（key 不存在）：按新 key 分配 buffer
@@ -162,7 +165,12 @@
 
 ### F13 main 相对 0.3.11 的能力增量（按「对 kvcm 有什么用」分六组；各处引用统一指向本条）
 
-- **消费方四分总纲**（读六组前先立框架）：main 的能力补齐分四个消费方向——**master 内部自治**（动态副本、热度统计：按访问统计自动调节，不对外）；**引擎 client**（任务改为自己来取：master 把任务放内存队列、client 定期取；另有驱逐/容量上报、retained 注册——client 从单纯存取数据变成帮池子干活）；**控制面/管理面**（`GetReplicaListForAdmin`、台账对账查询、DrainJob 三件套、DFS 容量管理——名字带 Admin，直接可用，**kvcm 的位置**）；**master 自身 HA**（`RestoreFromStandby`，supervisor 主备）。前两层与 kvcm 不冲突：自治层按统计自动调节、kvcm 按业务语义指定目标，分工互补
+- **消费方四分总纲**（读六组前先立框架）：main 的能力补齐分四个消费方向
+  - **master 内部自治**：动态副本、热度统计——按访问统计自动调节，不对外
+  - **引擎 client**：任务改为自己来取（master 把任务放内存队列、client 定期取）；另有驱逐/容量上报、retained 注册——client 从单纯存取数据变成帮池子干活
+  - **控制面/管理面**：`GetReplicaListForAdmin`、台账对账查询、DrainJob 三件套、DFS 容量管理——名字带 Admin，直接可用，**kvcm 的位置**
+  - **master 自身 HA**：`RestoreFromStandby`，supervisor 主备
+  - 前两层与 kvcm 不冲突：自治层按统计自动调节、kvcm 按业务语义指定目标，分工互补
 
 **① 多模型隔离**（kvcm 按模型管 KV 的底座）
 - 每把 key 归属一个**租户**（tenant），main 所有 RPC 都要带租户名——同 key 不同租户是两份数据
@@ -179,7 +187,10 @@
 **③ 下线与运维**
 - `UnmountLocalDiskSegment`：引擎死前主动摘掉盘的登记（效果等同死后被清，但更干净可控）
 - `RemoveAll` 改异步：master 置个标志，各 client 轮询到（`PollRemoveAll`）后各自清盘——全池清空不再是同步调用
-- `EvictDiskReplica` / `BatchEvictDiskReplica`（main 新增 RPC）：client 盘副本被逐后向 master **上报**、清元数据（通知型，不是「命令 master 驱逐」）。鉴权分介质：`LOCAL_DISK` 限盘副本属主（descriptor 的 client_id 须匹配，`master_service.cpp:6336-6346` @main）；`DISK`（DFS 副本）不验 client_id——kvcm 调用可清 DFS 副本（机制事实登记；语义是「驱逐上报」，拿它当主动删除属于误用，release 不走这条路，§4）
+- `EvictDiskReplica` / `BatchEvictDiskReplica`（main 新增 RPC）：client 盘副本被逐后向 master **上报**、清元数据（通知型，不是「命令 master 驱逐」）。鉴权分介质：
+  - `LOCAL_DISK`：限盘副本属主（descriptor 的 client_id 须匹配，`master_service.cpp:6336-6346` @main）
+  - `DISK`（DFS 副本）：不验 client_id——kvcm 调用可清 DFS 副本
+    - 机制事实登记；语义是「驱逐上报」，拿它当主动删除属于误用，release 不走这条路（§4）
 
 **④ 查询与核验**（kvcm 的台账/对账工具）
 - `GetReplicaListForAdmin`：查副本状态但**零副作用**（不续租、不触发 promote、不计命中统计）——核验专用（F11b）
@@ -190,8 +201,20 @@
 - offload 任务改**引擎来取**：master 把任务放进引擎的盘任务队列（mailbox），引擎的 store worker 定期来取执行；**promotion 同样改成引擎来取**（`PromotionObjectHeartbeat` 注册，引擎心跳取提升任务——0.3.11 的 `PromotionAllocStart` 是 master 主动派的旧形态）
 - **offload 取消不对外**：`CancelQueuedOffloadTask` 是 master 内部方法（RPC 层未注册；唯一调用点 = `UpsertStart` 接管 key 时清掉还在排队的 offload，`master_service.cpp:5892` @main）——kvcm 没有取消 offload 任务的入口
 - **copy/move 任务仍无取消**（两版本同，P9）
-- `SubmitReplicaActionProposal`：master **内部**动态副本机制（热 key 自动加 DRAM 副本）。全链路：`GetReplicaList` 观测点（与 promote 观测并排，`master_service.cpp:4441` @main——**一次调用同喂两个机制**）→ 滑窗计数（窗口内命中 ≥ `ceil(QPS 阈值 × 窗长)` 踩线入队）→ 三档模式 `kOff`（默认）/`kObserve`（只打日志）/`kEnforce` → 准入线程批量提交 proposal → 校验链（lease 幂等 + 冷却 + version_epoch 乐观锁）→ 落 `REPLICA_COPY` 任务派源 seg 属主。**不对外暴露**（`rpc_service.h` 未注册、`master_client` 无）；动作类型只有 `ADD`（`rpc_types.h:17-19` @main），**不是降层按钮**
-  - **kvcm 能触发、但结果不满足 copy 语义**：连调 `GetReplicaList` 使滑窗计数过线即可让 master 自动加副本（与 promote 同一种触发手法）——但目标 seg 由 master 自选（异机优先 → 最空优先 → 稳定哈希决胜，`SelectDynamicReplicaPlan:9511` @main），kvcm 指定不了（`preferred_target_segment` 字段只是预留，且 proposal RPC 不对外）；预热要的是「放到指定引擎」，这条路只适合「不加区分给热 key 加一份」的池级自动调节场景，且要求 master 配 `kEnforce` + 副本数未达上限
+- `SubmitReplicaActionProposal`：master **内部**动态副本机制（热 key 自动加 DRAM 副本）
+  - 全链路：
+    1. `GetReplicaList` 观测点——与 promote 观测并排（`master_service.cpp:4441` @main），**一次调用同时给两个机制计数**
+    2. 滑窗计数——窗口内命中 ≥ `ceil(QPS 阈值 × 窗长)` 时，恰好到线那次入队
+    3. 三档模式：`kOff`（默认）/ `kObserve`（只打日志）/ `kEnforce`
+    4. 准入线程批量提交 proposal
+    5. 校验链：lease 幂等 + 冷却 + version_epoch 乐观锁
+    6. 落 `REPLICA_COPY` 任务，派源 seg 属主执行
+  - **不对外暴露**：`rpc_service.h` 未注册、`master_client` 无
+  - 动作类型只有 `ADD`（`rpc_types.h:17-19` @main），**不能用来降层**
+  - **kvcm 能触发、但结果不满足 copy 语义**
+    - 能触发：连调 `GetReplicaList` 使滑窗计数过线，master 即自动加副本（与 promote 同一种触发手法）
+    - 不满足语义：目标 seg 由 master 自选（异机优先 → 最空优先 → 稳定哈希决胜，`SelectDynamicReplicaPlan:9511` @main），kvcm 指定不了（`preferred_target_segment` 字段只是预留，且 proposal RPC 不对外）
+    - 结论：预热要的是「放到指定引擎」，这条路只适合「不加区分给热 key 加一份」的池级自动调节场景，且要求 master 配 `kEnforce` + 副本数未达上限
   - 「无 per-key 立即降层 RPC」的结论两版本成立
 
 **⑥ main 仍没有的**（别去找了）
@@ -779,7 +802,7 @@ sequenceDiagram
 ### demote 实现
 
 - **前提（部署时定）**：池开 `enable_offload`，引擎实例挂本机 SSD；两种模式二选一（见上「写穿/写回」）
-- **没有「立即降层」按钮**：master 没有一个接口能对它说「把 key X 现在搬去 SSD」——落盘只在两个时刻发生：写入时（写穿）/ 被驱逐时（写回）。所以 kvcm 的 demote 不是一个 RPC，而是一组动作的组合
+- **没有「立即降层」的单接口**：master 没有一个 RPC 能对它说「把 key X 现在搬去 SSD」——落盘只在两个时刻发生：写入时（写穿）/ 被驱逐时（写回）。所以 kvcm 的 demote 不是一个 RPC，而是一组动作的组合
 - **kvcm 动作**
   - 写回模式下先停 keepalive、等 lease 过期（否则驱逐轮不到它，永不落盘）
   - 落盘时机（kvcm 只能促、不能定）
@@ -789,7 +812,11 @@ sequenceDiagram
 - **缺口（真功能缺口，归池侧扩展）**
   - **写回模式下无确定性 demote**：offload 任务的入队时机只有 put 完成时（写穿）和驱逐选中时（写回）两处（两版本同）——kvcm 想让指定 key 立刻、确定性地落盘，做不到；池不满就永不落盘
   - 「立即清掉内存副本、只留盘副本」同属此缺口：`BatchReplicaClear` 校验请求者必须是 key 属主（F6②），kvcm 非属主调不动
-- **远期可行性方案（与 §4「kvcm 挂 SSD」形态绑定）**：kvcm `MountLocalDiskSegment` 挂盘 → 读 DRAM 数据 → 写自己本机盘文件 → `NotifyOffloadSuccess` 上报登记盘副本（`AddReplica` 两版本均非独立 RPC，是该上报的内部步骤、无在途 offload 任务时同样登记，F1；只收 LOCAL_DISK、不带 pin）——副本绑 kvcm 的 client 与本机盘，引擎读它走远端盘路径、经 kvcm 转发读数——kvcm 从纯控制面变成数据面一环（要承担带宽与可用性责任），故不作现役路径
+- **远期可行性方案（与 §4「kvcm 挂 SSD」形态绑定）**
+  - 流程：kvcm `MountLocalDiskSegment` 挂盘 → 读 DRAM 数据 → 写自己本机盘文件 → `NotifyOffloadSuccess` 上报登记盘副本
+  - 要点：`AddReplica` 两版本均非独立 RPC，是该上报的内部步骤、无在途 offload 任务时同样登记（F1）；只收 LOCAL_DISK、不带 pin
+  - 效果：副本绑 kvcm 的 client 与本机盘，引擎读它走远端盘路径、经 kvcm 转发读数
+  - 代价：kvcm 从纯控制面变成数据面一环（要承担带宽与可用性责任），故不作现役路径
 
 ### promote 实现
 
@@ -820,13 +847,19 @@ sequenceDiagram
   - **DFS 副本不绑任何 client 生死**（main，F13）——清理谓词不覆盖它，释放只走 key 级删除
   - copy 到他机的副本绑他机 seg（F7）——源引擎下线不影响它
 - **正式路径 = main 的池机制，两条并列**（0.3.11 都没有，升级获得；均不依赖 E5 口径）
-  - **retained client**：client 以「保留」身份注册后，即使断线，master 也不立刻清它的数据，留时间让它重连接管——类似「停机保号」。入口：`AddReplicaForRetainedClient`（`master_service.cpp:5400` @main）；注册侧在 client 库（`BufferRegistrationAction::kRetained`，`dummy_client.h:260` @main——引擎与 kvcm 链接同一 client 库，**kvcm 同样能以保留身份注册**）。前提：引擎以此身份运行
+  - **retained client**：client 以「保留」身份注册后，即使断线，master 也不立刻清它的数据，留时间让它重连接管——类似「停机保号」
+    - 入口：`AddReplicaForRetainedClient`（`master_service.cpp:5400` @main）
+    - 注册侧在 client 库：`BufferRegistrationAction::kRetained`（`dummy_client.h:260` @main）——引擎与 kvcm 链接同一 client 库，**kvcm 同样能以保留身份注册**
+    - 前提：引擎以此身份运行
   - **DFS 副本**：demote 的目标层选共享 3FS 而非本机 SSD——副本天然跨 client 存亡存活（F13）。前提：部署 3FS
   - 两条不互斥：retained client 解「引擎进程下线」，DFS 解「整机/整实例灭失 + 跨机可读」
 - **0.3.11 过渡期手段**（正式形态是上面的池机制）
   - **先说清 demote 在 0.3.11 解不了 retain**：盘副本绑登记它的 client，而 client 库活在引擎进程内——引擎进程死 = client 死 = 盘副本清（§3）。demote 落的是引擎自己的盘，引擎一死照样带走
   - **改属主 / move**：有效性依赖 E5 口径（F6b）——E5 证实「按 key 属主删」则改属主有效；证实「按 seg 清理」则 move 到活 seg 有效
-  - **kvcm 自己挂 SSD（0.3.11 下唯一不依赖 E5 的兜底）**：kvcm 以独立 client 身份挂本机盘（`MountLocalDiskSegment`，与引擎同样的挂法），把关键 KV 落一份到自己名下、`NotifyOffloadSuccess` 上报登记（F1）——盘副本绑 kvcm 而非引擎，引擎全灭仍存活。也是远期「资源用满」的形态（§3 存储形态）；代价 = kvcm 机器要带盘、kvcm 自身变有状态。**main 下此方案再强化**：kvcm 以 retained client 身份注册（client 库 `kRetained`，上条）——连 kvcm 自己死亡，名下盘副本也保留，等新 kvcm 接管
+  - **kvcm 自己挂 SSD（0.3.11 下唯一不依赖 E5 的兜底）**：kvcm 以独立 client 身份挂本机盘（`MountLocalDiskSegment`，与引擎同样的挂法），把关键 KV 落一份到自己名下、`NotifyOffloadSuccess` 上报登记（F1）
+    - 效果：盘副本绑 kvcm 而非引擎，引擎全灭仍存活；也是远期「资源用满」的形态（§3 存储形态）
+    - 代价：kvcm 机器要带盘、kvcm 自身变有状态
+    - **main 下此方案再强化**：kvcm 以 retained client 身份注册（client 库 `kRetained`，上条）——连 kvcm 自己死亡，名下盘副本也保留，等新 kvcm 接管
   - 或接受现状：「引擎下线 = 池内数据失效」，预热投入重来——由 E5 钉死口径后评估是否可接受
 - **计划下线的编排**（控制面主导，四步）
   1. **Router 摘流**：该实例不再接新请求，在途请求跑完
@@ -848,7 +881,9 @@ sequenceDiagram
     - 多模型安全性：池是多模型共享的，命名空间前缀就是隔离边界——kvcm 台账登记每把 key 的 (model_id, revision)，发 Remove 系操作前按台账校验目标 key 的模型归属，防跨模型误删；main 可进一步把模型映射为 tenant，获得 RPC 命名空间 + 配额 + 驱逐三重隔离（F13）
   - `RemoveAll()`：全池清空（运维重置）——main 改为异步：master 置标志、各 client 轮询 `PollRemoveAll` 自清 SSD（F13），完成时机以台账对账为准
   - `BatchReplicaClear(keys, client_id, seg)`：清指定 client 指定 seg 上的副本——限 key 属主自调（F6②），引擎下线前自清理用；kvcm 调不动别人的 key
-  - `EvictDiskReplica` / `BatchEvictDiskReplica`（main，F13③）：client 盘副本被逐后的**上报**通道。对 kvcm 有用的地方有两处：`LOCAL_DISK` 限属主——kvcm 自挂 SSD 后是自己盘副本的属主，可主动清（自挂形态的收尾工具）；`DISK`（DFS 副本）不验 client_id——能清 DFS 副本，但语义是「驱逐上报」不是主动删除，误用它清副本是把「上报」当「命令」用，release 正式路径仍走 Remove 系
+  - `EvictDiskReplica` / `BatchEvictDiskReplica`（main，F13③）：client 盘副本被逐后的**上报**通道。对 kvcm 有用的地方有两处：
+    - `LOCAL_DISK` 限属主——kvcm 自挂 SSD 后是自己盘副本的属主，可主动清（自挂形态的收尾工具）
+    - `DISK`（DFS 副本）不验 client_id——能清 DFS 副本；但语义是「驱逐上报」不是主动删除，误用它清副本是把「上报」当「命令」用，release 正式路径仍走 Remove 系
   - 公共参数 `force`：Remove 默认有两道保险——① lease 未过期拒删（最近有人读过，可能还在用）② copy/offload 任务在途拒删（传输中删除会破坏数据）；`force=true` 跳过保险强删
     - 仅「确认没人用」（D1 §6 例外档，如全局废弃前缀）才用 force
     - 常规删除不用 force：被拒就等 lease 过期（测试床 11s）再删
