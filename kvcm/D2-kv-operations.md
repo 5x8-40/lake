@@ -195,7 +195,7 @@
 
 - **操作集八项**：copy / move / keepalive / pin / demote / promote / retain / remove
   - 按性质分三类
-    - **原子动作**：copy / move / keepalive / demote / promote / remove——原子指**语义**：一个操作一个效果、无中间态对外。实现上 copy/move/keepalive/remove 各对应单 RPC；demote/promote 是组合动作（池通道 / kvcm 主动触发 / 读删写 + 核验，§3），对外仍呈现单步语义
+    - **原子动作**：copy / move / keepalive / demote / promote / remove——原子指**语义**：一个操作一个效果、无中间态对外。实现上 copy/move/keepalive/remove 各对应单 RPC；demote/promote 是组合动作（池通道或 kvcm 读写组合 + 核验，§3），对外仍呈现单步语义
     - **元数据标记**：pin——设一次长期有效的标记
     - **目的型**：retain——「副本跨实例存亡活着」是目的不是机制，由 demote / move / pin 组合实现（§4）
   - 复合流程由原子操作编排而成（策略层组合），不写成一体状态机
@@ -385,7 +385,7 @@ sequenceDiagram
 sequenceDiagram
     participant K as kvcm
     participant M as master
-    participant D as KV 副本（DRAM seg）
+    participant A as 引擎 A（副本所在）
 
     rect rgb(222, 235, 247)
     Note over K,M: soft pin 档：空写 upsert（驱逐排最后）
@@ -405,13 +405,14 @@ sequenceDiagram
     end
 
     rect rgb(255, 235, 214)
-    Note over K,D: hard ②：读删写（kvcm 失联也安全）
-    K->>M: R1 GetReplicaList
-    D->>K: R1 RDMA 读出（数据到 kvcm 本地）
+    Note over K,A: hard ②：读删写（kvcm 失联也安全）
+    K->>M: R1 GetReplicaList（查副本位置）
+    K->>A: R1 读副本数据
+    A-->>K: 数据（RDMA）
     K->>M: R2 Remove(key)
     Note over M: key 不存在，不可读（重建窗口）
-    K->>M: R3 PutStart(with_hard_pin)
-    K->>D: R3 RDMA 写回
+    K->>M: R3 PutStart(with_hard_pin，master 重新分配位置)
+    Note over K: R3 数据 RDMA 写入新分配的 DRAM
     K->>M: R3 PutEnd
     Note over M: hard pin 固化 ✓
     K->>M: R4 GetReplicaList 校验
@@ -442,13 +443,16 @@ sequenceDiagram
     K->>M: ① 停 keepalive（保活中的 key 驱逐直接跳过，永不落盘）
     Note over M: ② 等 lease 过期（分钟级）→ key 进驱逐候选
     Note over M,E: ③ 等池内存紧张触发驱逐（时机不可控，池不满就永不落盘）
-    E->>ES: ④ 驱逐选中：数据先落盘、再释放 DRAM
-    K->>M: ⑤ GetReplicaList 核验盘副本在册
+    M->>E: ④ 驱逐选中：派 offload 任务给副本所在引擎
+    E->>ES: ⑤ 数据落盘
+    Note over M: ⑥ 释放 DRAM 副本
+    K->>M: ⑦ GetReplicaList 核验盘副本在册
     end
 
     rect rgb(222, 235, 247)
     Note over K,KS: 远期方案：kvcm 自己挂 SSD（确定性，与 §4 retain 兜底同形态）
-    E->>K: ① RDMA 读出 DRAM 数据
+    K->>E: ① 读 DRAM 数据
+    E-->>K: 数据（RDMA）
     K->>KS: ② 写 kvcm 本机盘文件
     K->>M: ③ AddReplica 登记盘副本
     Note over M: 盘副本绑 kvcm——引擎读它要经 kvcm 转发，<br/>kvcm 从控制面变成数据面一环
@@ -463,35 +467,43 @@ sequenceDiagram
 sequenceDiagram
     participant K as kvcm
     participant M as master
+    participant R as 读请求引擎
     participant H as 盘副本属主引擎
-    participant S as SSD 盘副本
 
     rect rgb(223, 242, 223)
-    Note over K,S: 被动路径（真实读流量驱动）
-    H->>M: GetReplicaList（引擎读命中只剩盘副本的 key；每次调用命中计数 +1）
-    Note over M: 计数达阈值（默认 2）且 DRAM 不紧张<br/>（内存接近满时不批——提回也马上被逐）<br/>→ 派提升任务给属主引擎
-    H->>S: 读盘 → 写 DRAM
+    Note over K,H: 被动路径（真实读流量驱动）
+    R->>M: GetReplicaList（处理读请求查副本位置；key 只剩盘副本；每次调用命中计数 +1）
+    Note over M: 计数达阈值（默认 2）且 DRAM 不紧张<br/>（内存接近满时不批——提回也马上被逐）
+    M->>H: 派提升任务
+    Note over H: 读本机 SSD → 写 DRAM
     H->>M: NotifyPromotionSuccess（完成）
     end
 
     rect rgb(255, 235, 214)
-    Note over K,S: kvcm 主动触发（轻，不等真实流量）
-    K->>M: GetReplicaList 连调达阈值（计数与真实流量同池累计）
-    Note over M: 同样要 DRAM 不紧张才派任务——之后走被动路径同一通道
+    Note over K,H: kvcm 主动触发（轻，不等真实流量）
+    K->>M: GetReplicaList 连调刷满计数（与真实流量同池累计）
+    Note over M: 同样要 DRAM 不紧张才派任务
+    M->>H: 派提升任务
+    Note over H: 读本机 SSD → 写 DRAM
+    H->>M: NotifyPromotionSuccess（完成）
     end
 
     rect rgb(222, 235, 247)
-    Note over K,S: kvcm 读删写（重，确定性自搬，不管 DRAM 紧不紧张）
-    K->>M: ① GetReplicaList
-    S->>K: ② RDMA 读出（数据到 kvcm 本地）
+    Note over K,H: kvcm 读删写（重，确定性自搬，不管 DRAM 紧不紧张）
+    K->>M: ① GetReplicaList（查盘副本在哪台引擎）
+    K->>H: ② 读盘副本数据
+    H-->>K: 数据（H 读本机 SSD 后传出）
     K->>M: ③ Remove
     Note over M: key 短暂不存在（重建窗口）
-    K->>M: ④ PutStart → 写数据到 DRAM → PutEnd
-    K->>M: ⑤ GetReplicaList 校验
+    K->>M: ④ PutStart（master 分配 DRAM 位置）
+    Note over K: ⑤ 数据 RDMA 写入目标 DRAM
+    K->>M: ⑥ PutEnd
+    K->>M: ⑦ GetReplicaList 校验
     end
 ```
 
-- `ExistKey` 触发不了 promote（只授 lease、不计命中计数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本属主引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
+- 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 连调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本属主引擎在线
+- `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本属主引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
 
 **⑦ retain（属主下线后副本存续；正路两形态 + 0.3.11 过渡三手段，§4）**
 
@@ -664,7 +676,7 @@ flowchart TB
 - **没有「立即降层」按钮**：master 没有一个接口能对它说「把 key X 现在搬去 SSD」——落盘只在两个时刻发生：写入时（写穿）/ 被驱逐时（写回）。所以 kvcm 的 demote 不是一个 RPC，而是一组动作的组合
 - **kvcm 动作**
   - 写回模式下先停 keepalive、等 lease 过期（否则驱逐轮不到它，永不落盘）
-  - 促成与等待
+  - 落盘时机（kvcm 只能促、不能定）
     - 写穿模式：SSD 副本**写入时已有**——数据早已在盘上，DRAM 副本待自然驱逐释放即可（何时释放无所谓，它只是个缓存副本）
     - 写回模式：key 进驱逐候选后，池驱逐时自动先落 SSD 再释放 DRAM（`BatchEvict` 里 `PushOffloadingQueue`，`master_service.cpp:11622` @0.3.11）——时机不可控：池不满就不驱逐、不落盘
   - **核验**：`GetReplicaList` 确认 disk 副本在册（降层完成的判定）
