@@ -62,7 +62,7 @@
     - Case B（存在且尺寸一致）：**原位更新**——复用原有 buffer 地址，不重新分配；pin 相关行为都发生在这条路径（F3）
     - Case C（存在但尺寸不同）：丢弃旧副本、按新尺寸重分配；旧 pin 设置保留/合并到新元数据
   - 拒绝条件
-    - 该 key 的副本正被读引用 → `OBJECT_REPLICA_BUSY`（改写中的 buffer 会破坏在途 RDMA 读；检查是 per-key 的，不影响其他 key）
+    - 该 key 的副本正被任务引用（copy/offload 在途，refcnt>0）→ `OBJECT_REPLICA_BUSY`（改写中的 buffer 会破坏在途 RDMA 读；检查是 per-key 的，不影响其他 key）
     - 该 key 有 copy/offload 任务在途 → `OBJECT_HAS_REPLICATION_TASK`
   - 参数校验在分支判断之前：要求副本数等配置合法（`replica_num≥1`）——空写虽不走分配，config 也须填合法值
 - **F3 Case B 的四个行为**（`:1698-1737` @0.3.11）
@@ -126,7 +126,7 @@
   - 硬过滤（两轮通用，满足任一即跳过）
     - hard pin → 永不候选
     - lease 未过期 → 跳过（lease 期内绝对安全）
-    - 副本 refcnt>0（正被读引用）→ 该副本不可逐（per-副本字段 `get_refcnt()`）
+    - 副本 refcnt>0（正被任务引用：copy/move/offload/promotion 在途；无读者引用机制，§2 读锁否决条）→ 该副本不可逐（per-副本字段 `get_refcnt()`）
   - 第一轮：无 soft pin 的候选；不够且 `allow_evict_soft_pinned_objects_` 时进第二轮：soft pin 候选
   - **两轮排序依据都是 `lease_timeout`（租约到期早晚 ≈ 最近被读时间）**，不是 LRU 计数、也不是 soft pin 剩余 TTL
     - soft pin TTL 的作用仅是「pin 还有效吗」——决定进哪一轮，不作排序依据
@@ -350,29 +350,27 @@ flowchart TB
     M -.-> N
 ```
 
-**④ pin（方案最多：soft 三候选 × hard 两候选 × 属主两方案，§2）**
+**④ pin（soft pin 档一方案 × hard pin 档两候选 × 属主两方案，§2）**
 
 ```mermaid
 flowchart TB
     K["kvcm"]
-    subgraph SOFT["soft 需求（防驱逐，可接受极端被逐）"]
-        S1["① lease 调大 + 周期 keepalive<br/>保护=lease 期内绝对不可逐；代价=全局读租约变长"]
-        S2["② 空写 upsert 设 soft pin<br/>UpsertStart(原尺寸, with_soft_pin)→不写数据→UpsertEnd"]
-        S3["③ 读锁：持续持有读引用<br/>refcnt>0 绝对挡驱逐；断线即失效（脆，作保底）"]
+    subgraph SOFT["soft pin 档（驱逐排最后，极端可逐）"]
+        S1["空写 upsert 设 soft pin<br/>UpsertStart(原尺寸, with_soft_pin) → 不写数据 → UpsertEnd<br/>有属主问题；取消 = 空写传 false / DISABLE"]
     end
-    subgraph HARD["hard 需求（绝对保护）"]
-        H1["读删写：读出数据 → Remove →<br/>带 hard_pin 重新 put → 校验"]
-        H2["读锁长期持有 = 事实 hard pin（同③的脆）"]
+    subgraph HARD["hard pin 档（绝对不可驱逐）"]
+        H1["① lease 调大 + 周期 keepalive<br/>期内绝对不可逐；kvcm 须活着续命<br/>代价 = 全局读租约变长（F10）"]
+        H2["② 读删写：读出 → Remove → 带 hard_pin 重 put<br/>kvcm 失联也安全；有属主问题；取消 = 再读删写一遍"]
     end
-    subgraph OWN["属主问题（②与读删写共同面对）"]
+    subgraph OWN["属主问题（空写与读删写共同面对）"]
         O1["方案一：属主改归 kvcm<br/>传自己 UUID（F3① 改写即收益）"]
         O2["方案二：借名<br/>传回原属主 UUID，需 master 加「key→属主」查询 RPC"]
     end
-    K --> S1 & S2 & S3
+    K --> S1
     K --> H1 & H2
-    S2 -.-> OWN
-    H1 -.-> OWN
-    N["已否决：不做靠驱逐兜底（pin 与未 pin 的差异正是优先级语义）；<br/>引擎写入时源头带 pin（侵入 + 全 pin 无区分度）；<br/>AddReplica 此路不通（只收 LOCAL_DISK、不带 pin）；hard pin 事后改不了（F1）；<br/>copy 路径带不了 pin——CreateCopyTask 不收写配置，pin 必须事后单独加（F1）"]
+    S1 -.-> OWN
+    H2 -.-> OWN
+    N["已否决：读锁——机制不存在，refcnt 是任务级保护、两版本无读者引用 API（§2）；<br/>不做靠驱逐兜底（pin 与未 pin 的差异正是优先级语义）；<br/>引擎写入时源头带 pin（侵入 + 全 pin 无区分度）；<br/>AddReplica 此路不通（只收 LOCAL_DISK、不带 pin）；hard pin 事后改不了（F1）；<br/>copy 路径带不了 pin——CreateCopyTask 不收写配置，pin 必须事后单独加（F1）"]
     SOFT -.-> N
 ```
 
@@ -484,28 +482,42 @@ flowchart TB
   - kvcm 只 pin 自己预热的少数 key，pin 与未 pin 的差异正是优先级语义——不能没有
 - **引擎写入时源头带 pin**
   - 侵入改引擎；且引擎不知道哪些该 pin，全 pin 则第一轮驱逐无候选、直接进第二轮——pin 失去区分度 = 没有 pin
+- **读锁（kvcm 持续持有读引用挡驱逐）——机制不存在**
+  - 设想：refcnt>0 的副本被驱逐硬过滤跳过（F8），kvcm 挂住一个读引用即可 pin
+  - 实情：读者的保护是 lease 不是 refcnt——`GetReplicaList` 两版本只授 lease（`master_service.cpp:1112` @0.3.11），不碰 refcnt；refcnt 的增减全在 copy/move/offload/promotion 任务路径（`:1936`/`:2151`/`:2890` @0.3.11），是**任务级**保护、master 内部自用——两版本均无「读者持引用」RPC，kvcm 无锁可持
+  - 想要此形态只能池侧扩展（给 mooncake 加读者引用 RPC），不作现役方案
 
-### soft 需求（防驱逐，可接受极端情况被逐）：三个候选
+### soft pin 档（驱逐排最后，极端情况可逐）：空写 upsert 设 soft pin
 
-| | ① lease 调大 + keepalive | ② 空写 upsert | ③ 读锁 |
-|---|---|---|---|
-| 做法 | master 配置 `default_kv_lease_ttl` 调大（如 5min）+ kvcm 周期 touch（F9） | `UpsertStart`(key, 原尺寸, with_soft_pin=±) → 不写数据 → `UpsertEnd`；原尺寸由 `GetReplicaList` 查 | kvcm 对 key 的一个副本持续持有读引用（refcnt>0 挡驱逐，F8） |
-| mooncake 代码 | **不改** | 不改（前提：空写通道不落 Python，F12） | **不改** |
-| 属主问题 | **无**（不碰写路径） | **有**（F3①，见下） | **无** |
-| 保护强度 | lease 期内**绝对不可逐**（比 soft pin 强） | 驱逐排最后，极端可逐 | 绝对不可逐 |
-| 断线窗口 | = lease_ttl（分钟级） | = soft pin TTL（30min 级） | **零**——断线即失效 |
-| 持续开销 | 每 key 每窗口一次 touch | 同左（频率可更低） | 每 key 一个永续读会话（还要续） |
-| 副作用 | 全局读租约变长（F10：驱逐候选缩小，调参项，需真机观察定值） | 两 RPC 间 key 不可读（毫秒级） | key 被读锁死成只读（写/upsert/Remove 全拒）；只保护被锁的那一个副本，其余被逐需 copy 补齐 |
+- 做法：`UpsertStart`(key, 原尺寸, with_soft_pin) → 不写数据 → `UpsertEnd`；原尺寸由 `GetReplicaList` 查
+- mooncake 代码：不改（前提：空写通道不落 Python，F12）
+- 属主问题：**有**（upsert 必改写属主，F3①——见「属主问题」节）
+- 保护语义：驱逐两轮里只排第二轮（F8），第一轮候选凑不够时仍可逐——这是 mooncake soft pin 的本义，与「防驱逐」有缝，接受才用
+- kvcm 失联：TTL 内保护自持（时钟在池里，main 默认 30min），到期不续才失效
+- 持续开销：每 key 每 TTL 一次空写续期
+- 副作用：两 RPC 之间 key 不可读（毫秒级，F3④）；0.3.11 布尔坑——忘带 true 的 upsert 顺手清 pin（F1）
 
-- ① 是当前最干净的候选：零改动、零属主问题、保护更强；核心代价是全局 lease 影响（F10）
-- ③ 可行但脆，作保底
+### hard pin 档（绝对不可驱逐）：两个候选
 
-### hard 需求（绝对保护，kvcm 长期失联也安全）：两个候选
+| | ① lease 调大 + keepalive | ② 读删写 |
+|---|---|---|
+| 做法 | master 配置 `default_kv_lease_ttl` 调大（如 5min）+ kvcm 周期 touch（F9） | 读出数据 → `Remove` → 带 hard_pin 重新 put → 校验副本 |
+| 保护强度 | lease 期内绝对不可逐 | 绝对不可逐，创建时固化、无到期概念（F1） |
+| mooncake 代码 | **不改** | 不改 |
+| 属主问题 | **无**（不碰写路径） | **有**（Remove 后走 Case A 新建，PutStart 传谁 UUID 谁是属主——见「属主问题」节） |
+| kvcm 失联 | 保护剩 lease_ttl 余量，到期失效 | **失联也安全**——保护存于池内元数据，不依赖任何角色存活 |
+| 持续开销 | 每 key 每窗口一次 touch | 一次重建，零持续开销 |
+| 副作用 | 全局读租约变长（F10：驱逐候选缩小，调参项，需真机观察定值） | 重建窗口 key 短暂不可读；数据过 kvcm 本地（带宽）；kvcm 本地持有数据直到校验成功，只有本地也丢才真丢 |
 
-- **读删写**：读出数据 → `Remove` → 带 hard_pin 重新 put → 校验副本
-  - kvcm 本地持有数据直到校验成功，中途失败可重试；只有 kvcm 本地也丢才真丢
-  - 属主问题：Remove 后重建走 Case A 新建，PutStart 传谁 UUID 谁是属主——与空写共用下方两方案
-- **读锁长期持有** = 事实 hard pin（脆，同 ③ 的断线即失效）
+- 选择：要「kvcm 长期失联也安全」→ 只有读删写；接受「kvcm 活着才保护」→ ①更轻（零属主问题、不动数据、可随时停）
+- ① 的保护来自 lease（F9），与 mooncake 的 hard pin 机制无关——放此档是按驱逐过滤下的实际效果（lease 未过期 = 硬过滤跳过，F8）；两者取消语义不同（见下节）
+
+### pin 的取消
+
+- **①**：停止 touch，lease 到期自然失效（= §4 软释放档）；无「立即撤销 lease」RPC，等待窗口 = TTL（分钟级）
+- **空写 soft pin**：主动取消 = 空写传 `with_soft_pin=false`（0.3.11）/ `SoftPinAction::DISABLE`（main 三态，`replica.h:64-68` @main）；或停止续期等 TTL 到期自动失效。注意 0.3.11 下取消可能**被动发生**（布尔坑，F1）
+- **读删写（hard pin）**：**没有 unpin**——两版本都是或运算保留（`with_hard_pin || IsHardPinned()`，`master_service.cpp:1741-1742` @0.3.11 / `:6068` @main；`hard_pinned is const`，`:1696` @0.3.11）——取消 = 再读删写一遍（读出 → Remove → 不带 hard_pin 重 put）
+- 操作集因此不单列 unpin：取消分别由 停 keepalive（软释放）/ pin 同机制逆操作 / remove 系 覆盖
 
 ### 属主问题：两个并列方案（空写与读删写重建共同面对）
 
@@ -524,7 +536,7 @@ flowchart TB
   2. kvcm 实现语言（backlog E10/E11 未定）
      - 若落 Python，空写通道也需绑定补丁 → 方案一同样改 mooncake
 - 属主语义若要变，与 retain 议题（§4）统一评估，不在 pin 单独定
-- **注意**：若 soft 需求选 ① 或 ③，属主问题只剩读删写（hard 需求）一处触发，权重下降
+- **注意**：若 pin 全走 hard pin 档 ①（lease 调大），属主问题只剩读删写一处触发，权重下降
 
 ## §3 demote / promote（层间迁移）
 
