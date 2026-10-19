@@ -193,6 +193,7 @@
 
 ## §1 操作集框架
 
+- **本节与专节的分工**：本节是八项操作的公共面（语义界定、分工、完成信号、业界对照、能力边界、操作图解）；专节只给需要方案取舍或缺口分析的操作——§2 pin（三方案 + 属主问题）、§3 demote/promote（组合路径 + 真功能缺口）、§4 retain/release（多机制组合）。copy / move / keepalive 不设专节：单 RPC 操作、无候选分歧，机制在事实基线（F7 / F9）、语义分工在本节、缺口在能力边界表——三处合读即全覆盖
 - **操作集八项**：copy / move / keepalive / pin / demote / promote / retain / remove
   - 按性质分三类
     - **原子动作**：copy / move / keepalive / demote / promote / remove——原子指**语义**：一个操作一个效果、无中间态对外。实现上 copy/move/keepalive/remove 各对应单 RPC；demote/promote 是组合动作（池通道或 kvcm 读写组合 + 核验，§3），对外仍呈现单步语义

@@ -244,6 +244,7 @@ flowchart LR
 - **分级兜底（最简）**：全本地 > 池远端 > 重算，字典序定档，档内按负载选。
 - **打分制**：命中收益（连续本地满块数 × 分层计价；Dynamo 计价 device 1.0 / host 0.75 / disk 0.25 可借作初值）− 负载惩罚（队列长 / in-flight；在途负载无权威，router 本地记账，参考实现·Dynamo）。
 - **传输成本两档**：显式比较（跨机字节 / 有效带宽 vs 重算成本，不划算换实例重算）或简化（远端副本固定扣分）。
+- **传输繁忙的测量（「有效带宽」怎么来）**：网卡/链路计数器采样——Linux RDMA 计数器（`/sys/class/infiniband/*/ports/*/counters`）或 ethtool 统计，按 Δbytes / (链路速率 × Δt) 估链路利用率；实例上报或控制面采集，router 打分把「目标实例传输忙」计入负载惩罚，kvcm 预热/搬迁据此避让与限速（E15）。参考实现：vLLM-Ascend AI-QoS（`tools/ai_qos/` + 官方介绍 `docs/source/user_guide/feature_guide/Ai_QoS_introduction_en.md`，vllm-project/vllm-ascend）——它证明 KVCache 传输与集合通信/算子下发在交换机上真实冲突（生产级问题）；它的解法是执行层流量分级（NPU channel 优先级映射 UB 交换机 Virtual Lane，严格优先级调度），与我们互补：它管「冲突时谁先走」（单机/交换机 QoS），本条管「什么时候搬、往哪台调度」（集群层避让）。
 
 权重待真机校准（与 P7 耦合）；layerwise 下逐层远端更贵，远端计价按 D6 选型修正。
 
