@@ -168,13 +168,15 @@
 - **消费方四分总纲**（读六组前先立框架）：main 的能力补齐分四个消费方向
   - **master 内部自治**：动态副本、热度统计——按访问统计自动调节，不对外
   - **引擎 client**：任务改为自己来取（master 把任务放内存队列、client 定期取）；另有驱逐/容量上报、retained 注册——client 从单纯存取数据变成帮池子干活
-  - **控制面/管理面**：`GetReplicaListForAdmin`、台账对账查询、DrainJob 三件套、DFS 容量管理——名字带 Admin，直接可用，**kvcm 的位置**
+  - **控制面/管理面**：Admin 命名查询、DrainJob 三件套两版本同有；main 补齐零副作用查询（`GetReplicaListForAdmin`）、租户配额五件套、DFS 容量管理——**kvcm 的位置**
   - **master 自身 HA**：`RestoreFromStandby`，supervisor 主备
   - 前两层与 kvcm 不冲突：自治层按统计自动调节、kvcm 按业务语义指定目标，分工互补
 
 **① 多模型隔离**（kvcm 按模型管 KV 的底座）
 - 每把 key 归属一个**租户**（tenant），main 所有 RPC 都要带租户名——同 key 不同租户是两份数据
 - 租户有独立**配额**（能写多少字节）和独立的**驱逐账**（池满时按租户各自算账，水位默认 90%）；落盘也有租户级上限，超限的 key 被强逐**不落盘**
+  - 配额管理五件套（main）：`UpsertTenantQuotaPolicy`（设/改）、`DeleteTenantQuotaPolicy`、`GetTenantQuotaSnapshot`、`ListTenantQuotaSnapshots`、`GetTenantQuotaAllocatableCapacityBytes`（池子还剩多少可分配）
+  - tenant 在 `Client::Create` 时绑定（默认 `"default"`）——粒度 = client 级：一个引擎跑一个模型版本时，client 级 tenant 天然就是「一模型版本一租户」；单引擎服务多模型需各起 client 各挂 tenant
 - 多把 key 可绑成一个**生命周期组**（`group_ids`）：驱逐时整组同进退——kvcm 的「前缀族」在 main 可以整体绑组，不再逐 key 各自为政
 - kvcm 用法：一个模型版本 = 一个租户（0.3.11 只能靠 key 名前缀模拟，§4 release）
 
@@ -185,9 +187,9 @@
   - 前提：部署 3FS（测试床没有）
 
 **③ 下线与运维**
-- `UnmountLocalDiskSegment`：引擎死前主动摘掉盘的登记（效果等同死后被清，但更干净可控）
-- `RemoveAll` 改异步：master 置个标志，各 client 轮询到（`PollRemoveAll`）后各自清盘——全池清空不再是同步调用
-- `EvictDiskReplica` / `BatchEvictDiskReplica`（main 新增 RPC）：client 盘副本被逐后向 master **上报**、清元数据（通知型，不是「命令 master 驱逐」）。鉴权分介质：
+- `UnmountLocalDiskSegment`（main 新增——0.3.11 挂了本地盘就摘不掉）：引擎死前主动摘掉盘的登记（效果等同死后被清，但更干净可控）
+- `RemoveAll` 改异步（main）：master 置个标志，各 client 轮询到（`PollRemoveAll`）后各自清盘——全池清空不再是同步调用
+- `EvictDiskReplica` / `BatchEvictDiskReplica`（两版本同有）：client 盘副本被逐后向 master **上报**、清元数据（通知型，不是「命令 master 驱逐」）。鉴权分介质：
   - `LOCAL_DISK`：限盘副本属主（descriptor 的 client_id 须匹配，`master_service.cpp:6336-6346` @main）
   - `DISK`（DFS 副本）：不验 client_id——kvcm 调用可清 DFS 副本
     - 机制事实登记；语义是「驱逐上报」，拿它当主动删除属于误用，release 不走这条路（§4）
@@ -195,10 +197,13 @@
 **④ 查询与核验**（kvcm 的台账/对账工具）
 - `GetReplicaListForAdmin`：查副本状态但**零副作用**（不续租、不触发 promote、不计命中统计）——核验专用（F11b）
 - `GetAllKeys` / `GetReplicaListByRegex`：全量/模式列举 key——台账对账重建用
-- `ProbeKey`：纯探测在不在，不续租（F9）
+- `ProbeKey`：纯探测在不在，不续租（F9）；实现确认也不喂命中统计（`ExistKeyImpl(grant_lease=false)` 不触发 promote 计数与动态副本观测）——main 下最轻的存在性核验
+- `BatchQueryIp`（两版本同有）：client_id → IP 列表——`GetReplicaList` 给出副本在哪个 seg 后，用它解析「该 seg 属主在哪台机器」，副本位置 → 引擎地址的补环
+- `GetStorageUsageSnapshot`（main）：分层容量快照——demote 触发条件「DRAM 压力」的数据源
+- 台账失效通知增强（main）：KV 事件流（ZMQ，stored/removed/cleared，D1 F14）的 removed/cleared 事件可让台账条目立即失效，不必等下轮全量对账；stored 不含 seg/位置（D1 F14 已析），替不了对账——索引面用途归 D1，kvcm 台账只借失效通知
 
 **⑤ 任务机制变化**
-- offload 任务改**引擎来取**：master 把任务放进引擎的盘任务队列（mailbox），引擎的 store worker 定期来取执行；**promotion 同样改成引擎来取**（`PromotionObjectHeartbeat` 注册，引擎心跳取提升任务——0.3.11 的 `PromotionAllocStart` 是 master 主动派的旧形态）
+- offload / promotion 任务两版本都是**引擎来取**：master 把任务放进引擎的盘任务队列（mailbox），引擎的 store worker 心跳来取执行（`OffloadObjectHeartbeat` / `PromotionObjectHeartbeat`，两版本同有——0.3.11 实现确认从 `promotion_objects` 队列取任务，`master_service.cpp:2920` @0.3.11）；`PromotionAllocStart`（引擎主动开口要）两版本同有
 - **offload 取消不对外**：`CancelQueuedOffloadTask` 是 master 内部方法（RPC 层未注册；唯一调用点 = `UpsertStart` 接管 key 时清掉还在排队的 offload，`master_service.cpp:5892` @main）——kvcm 没有取消 offload 任务的入口
 - **copy/move 任务仍无取消**（两版本同，P9）
 - `SubmitReplicaActionProposal`：master **内部**动态副本机制（热 key 自动加 DRAM 副本）
@@ -825,7 +830,7 @@ sequenceDiagram
   - 前提：`promotion_on_hit` 开启 + DRAM 还没满到要驱逐的程度（内存紧张时 master 不批——提回来也马上被逐）+ 盘副本属主引擎在线
   - 触发必须用 `GetReplicaList`——`ExistKey` 触发不了（只授 lease、不计命中次数，`master_service.cpp:752-770` @0.3.11）；触发顺带授 lease（F11b 的副作用在此是正作用：提回期间防逐）
 - **kvcm 主动路径二：读删写（重，确定性自搬）**——读盘副本数据 → `Remove` → `PutStart` 新建 DRAM 副本 → 写数据 → `PutEnd` → 校验
-  - 为什么不能更省事：`PutStart` 对已存在 key 报 `OBJECT_ALREADY_EXISTS`（@0.3.11）；`UpsertStart` 对已有 key 是原位更新（Case B 复用现有 buffer 地址，`:1693` @0.3.11）——只剩盘副本时原位写的是盘 buffer，提不回 DRAM。所以必须 Remove 后重 put
+  - 为什么不能更省事：`PutStart` 对已存在 key 报 `OBJECT_ALREADY_EXISTS`（@0.3.11）；`UpsertStart` 对已有 key 是原位更新（Case B 复用现有 buffer 地址，`:1693` @0.3.11；main 注释同一行为——同 size 复用现有 buffer）——只剩盘副本时原位写的是盘 buffer，提不回 DRAM。所以必须 Remove 后重 put（Upsert 否决结论两版本成立）
   - 属主问题同 §2 读删写（PutStart 传谁 UUID 谁是属主）；数据过 kvcm 本地（带宽）
   - 对比触发路径：不等计数、不管 DRAM 紧不紧张，**确定性**——「必须提回」的场景用它
 - **池的主动 RPC 链（`PromotionAllocStart` → 搬运 → `NotifyPromotionSuccess`，`master_service.h:559-590` @0.3.11）kvcm 用不了**——必须先有 master 准入的在途任务（只由命中驱动产生）、只许盘副本属主 client 执行。这只是池通道的内部机制说明，不妨碍上面两条 kvcm 路径成立
@@ -860,6 +865,8 @@ sequenceDiagram
     - 效果：盘副本绑 kvcm 而非引擎，引擎全灭仍存活；也是远期「资源用满」的形态（§3 存储形态）
     - 代价：kvcm 机器要带盘、kvcm 自身变有状态
     - **main 下此方案再强化**：kvcm 以 retained client 身份注册（client 库 `kRetained`，上条）——连 kvcm 自己死亡，名下盘副本也保留，等新 kvcm 接管
+    - 挂盘另一形态：`MountNoFSegment`（两版本同有）挂 NVMe-oF 远端盘——盘在远端阵列、不绑 kvcm 机器，比挂本地盘更接近「kvcm 死也保留」
+    - 排除项：`ReMountSegment` 是 client 重连后重新申报 seg（幂等），不是死掉副本的复活——retain 走不了这条
   - 或接受现状：「引擎下线 = 池内数据失效」，预热投入重来——由 E5 钉死口径后评估是否可接受
 - **计划下线的编排**（控制面主导，四步）
   1. **Router 摘流**：该实例不再接新请求，在途请求跑完
