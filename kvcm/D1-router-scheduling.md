@@ -36,7 +36,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   - mooncake 有 pin 机制（两版本），但都挂在写路径上（`PutStart` / `UpsertStart` 收 `ReplicateConfig`）：
     - **soft pin**：key 粒度的**限时**驱逐保护——0.3.11 是布尔开关 `with_soft_pin`（`replica.h:84-85` @0.3.11），main 升级为三态 `soft_pin_action`（`replica.h:64-68` @main）；TTL 默认 30min、上限 24h（`types.h:86-89` @main），到期自动失效；驱逐两轮制把它排最后（第一轮只逐无 soft pin 的，凑不够且 `allow_evict_soft_pinned_objects` 时软 pin 也可逐）——机制细节与版本差异以 D2 F1 为准。
     - **hard pin**（`with_hard_pin`）：显式 pin，不可驱逐——写入时设置并固化进对象元数据，之后改不了（D2 F1）。
-  - **`CreateCopyTask` 没有 config 参数，预复制路径带不了 pin**；也没有给已有 key 事后加/解 pin 的独立 RPC——`SubmitReplicaActionProposal` 不是 pin（action 只有 ADD，`rpc_types.h:17-19`）。预热副本怎么保护归 D2 §2。
+  - **`CreateCopyTask` 没有 config 参数，预复制路径带不了 pin**；也没有给已有 key 事后加/解 pin 的独立 RPC——`SubmitReplicaActionProposal` 不是 pin（action 只有 ADD，`rpc_types.h:17-19` @main）。预热副本怎么保护归 D2 §2。
 - **F6 引擎 APC（HBM 前缀缓存）私有**：APC 是引擎私有 LRU——无 pin、无池元数据、外部不可见（kv-prefetch.md 方案 A 注意节）。
 - **F15 lease 是 key 粒度：读续租、复制不续租、删 key 释放全部副本**：
   - lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本没有独立 TTL。

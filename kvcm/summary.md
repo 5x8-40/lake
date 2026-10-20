@@ -192,7 +192,7 @@
 **D5. 故障衔接** — ✅ 已闭环
 
 - 事实：copy 期间源实例掉线即失败（master 把任务派给源属主，D1 F4）。
-- 事实：源属主宕机后，在途任务标记由 master 的定期清理线程（reaper）清掉（`master_service.cpp:10654` 附近）；清理完成前重发同一 copy 会收到 `OBJECT_HAS_REPLICATION_TASK` 报错（幂等语义见 D1 F11-F12）。
+- 事实：源属主宕机后，在途任务标记由 master 的定期清理线程（reaper）清掉（`master_service.cpp:10653-10700` @main）；清理完成前重发同一 copy 会收到 `OBJECT_HAS_REPLICATION_TASK` 报错（幂等语义见 D1 F11-F12）。
 - 半成品副本的清理：✅ 已核实（两版本同行为）
   - 半成品副本 = copy/move 已把数据写到目标、但还没标完成的副本
   - master 的定期清理线程（reaper）发现任务超时（TTL = `put_start_release_timeout_sec_`）后，按任务记录的 `replica_ids` 精确丢弃这些半成品：
@@ -246,7 +246,7 @@
   - 做法：三个版本的 RPC 注册表 diff（v0.3.11 与 v0.3.11.post1 完全相同）
   - 0.3.11 已有：lease / offload / promotion 心跳取任务、Admin 查询三件套、`EvictDiskReplica`、`BatchExistKey` 续租（D1 F15）、soft pin（D2 F9）
   - main 才有：`ProbeKey`/`BatchProbeKey`、零副作用 Admin 查询（`GetReplicaListForAdmin`）、租户配额五件套、KV 事件、容量快照、`UnmountLocalDiskSegment`
-  - `default_kv_lease_ttl` 测试床实测 11s（D2 F9）
+  - `default_kv_lease_ttl` 测试床配置 11s（D2 F9）
   - 缺口清单 = D2 F13⑥（per-key 降层 RPC、copy/move 取消、key→属主查询）——这些就是要改 mooncake 池侧的工作量
 - **E7. MLA 实测**——`put_step>1` 时传输计划全部分配到 `targets[0]`、其余 rank 读远端：功能上推断正确但还没实测；hybrid/sparse 被上游的开关检查排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——✅ 已闭环（结论写在 D1 F14）
@@ -290,7 +290,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 - Dynamo KV-aware router 外部重算 hash 链：[../docs/research/dynamo/overview.md](../docs/research/dynamo/overview.md)
 - llm-d EPP 推测索引（事件确认前先用推测条目，TTL 2s 自动过期）：[../docs/research/llm-d/](../docs/research/llm-d/)
 - AIBrix ZMQ 事件同步：[../docs/research/aibrix/](../docs/research/aibrix/)
-- mooncake master API（submodule 源码，符号锚点）：`master_service.h`（`CreateCopyTask` / `SubmitReplicaActionProposal` / `Remove` / `BatchEvict` / `CreateDrainJob`）、`master_config.h`（`enable_kv_events` 开关，E8）、`master_service.cpp`（`CopyStart:6444` 幂等三层防护；`CreateCopyTask:13677` 提交层无去重；reaper `10654` 附近）
+- mooncake master API（submodule 源码，符号锚点）：`master_service.h`（`CreateCopyTask` / `SubmitReplicaActionProposal` / `Remove` / `BatchEvict` / `CreateDrainJob`）、`master_config.h`（`enable_kv_events` 开关，E8）、`master_service.cpp`（`CopyStart:6444` 幂等三层防护；`CreateCopyTask:13677` 提交层无去重；reaper `:10653-10700`）
 - mooncake Conductor（池事件的自家消费者）：`mooncake-conductor/src/kvevent/object_key_parser.cpp`（`ParseVllmObjectKey:160` / `ParseSglangObjectKey:99`）、`src/zmq/msg_decoder.cpp`（`ParseVllmEvent:365` / `DecodeVllmEventBatch:886`——vLLM 引擎格式解码，kvcm 补发「一套接口」可被消费的实现证据）、`docs/source/design/conductor/conductor-architecture-design.md`
 - 事件/索引标准化与消费先例：RFC #1527（引擎 → KV 感知 router 事件线格式）、RFC #1403（Indexer API：`/register` 注册事件源端点、`/query` 与 `/query_by_hash` 两种查询入参）；Dynamo 池事件消费先例 `lib/llm/src/kv_router/shared_cache.rs::HicacheSharedKvCache`；Dynamo RFC #1403 实现 `lib/kv-router/src/services/indexer/`（`standalone-indexer.md`）
 - 关键差异：现有系统的事件都是单源（引擎侧或池侧），我们是多源（引擎原生事件 + kvcm 补发 + 池 publisher 删除事件），权威归属与合并规则要自己定（D1 §2/§3）。
