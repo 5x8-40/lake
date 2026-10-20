@@ -191,7 +191,7 @@
 
 **D5. 故障衔接** — ✅ 已闭环
 
-- 事实：copy 期间源实例掉线即失败（master 把任务派给源属主，D1 F4）。
+- 事实：copy 期间源实例掉线即失败（master 把任务派给源 seg 属主，D1 F4）。
 - 事实：源属主宕机后，在途任务标记由 master 的定期清理线程（reaper）清掉（`master_service.cpp:10653-10700` @main）；清理完成前重发同一 copy 会收到 `OBJECT_HAS_REPLICATION_TASK` 报错（幂等语义见 D1 F11-F12）。
 - 半成品副本的清理：✅ 已核实（两版本同行为）
   - 半成品副本 = copy/move 已把数据写到目标、但还没标完成的副本

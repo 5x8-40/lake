@@ -29,7 +29,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F1 mooncake_master 是放置权威**：key → 副本 → seg 由 mooncake_master 记录；读路径 get 时 `BatchQuery` 现查（`real_client.cpp` 8 处调用点，客户端无位置缓存）；没有其他位置通知通道（池 publisher 不带位置，F14）。
 - **F2 一把 key = 一个满块在一个 rank 上的切片**：KV 按 block 切开（本模型 128 token 一块）；TP 下每个 rank 只持有块的一部分，同一块在不同 rank 内容不同——「满块 × rank」的每一片是池里一个独立对象 = 一把 key，尾部带 rank 编号（`head_or_tp_rank`）。例：801 token 前缀 = 6 个满块（768 token，余 33 不满一块不进池），TP=2 → 6 × 2 = **12 把 key**（详见 README「三个对象」）。
 - **F3 读路径：先查后选，本机优先**：引擎读池分两步——先向 master 查副本列表（`BatchQuery`，F1），再开读会话搬数据。非 layerwise 读时 `SelectBestReplica` 本机内存副本优先（`replica_selection.h:122`）。layerwise 的读会话（get session）建立时从列表里选定一个副本（本机优先，`SelectCompleteMemoryReplica`，`real_client.cpp:470`），整个会话只从它读（读时校验锁定的必须恰好一个，否则报 `INVALID_REPLICA`，`:6470`）；会话本身带租约，建立后一个 TTL 窗口内有效（`:6464`）。推论：复制必须在会话建立前落位，本次才用得上；赶不上，选择器自动挑远端副本，跨机读，只影响当前这一次请求（[kv-prefetch.md](kv-prefetch.md) 时序节）。
-- **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源属主客户端（写入该 key 的引擎）必须在线；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
+- **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源 seg 属主客户端必须在线（预热场景即写入该 key 的引擎；一般情形 = 挂载源 seg 的 client，源由 master 随机挑，D2 F7）；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
 - **F5 副本无 pin：READY 后随时可能被池驱逐**：
   - 复制路径不加 pin / lease（F15），副本落位后不受保护，池驱逐策略说收就收。
   - 属主实例（最初写入 key 的引擎）下线后，实测 key 连同所有机器上的副本一起消失——**我们预热到 B 的副本也在其中**（实测 exist 0/32；代码核实清理是副本级、与实测矛盾，归因待 E5——详见 D2 F6b；实测记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
@@ -85,7 +85,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   1. **目标 seg 已有副本 → 跳过**：按 seg 粒度去重——`GetReplicaBySegmentName(tgt) == nullptr` 才计数（`:6498`）、才分配（`:6595`）；全部目标已有副本 → 返回空 targets → 客户端 `replica_copy_skipped / target_replicas_already_exist`，按**成功** no-op（`client_service.cpp:4363`）。同 seg 不会产生第二份同 key 副本。
   2. **同 key 有在途任务 → 拒绝**：`HasReplicationTask()` → 第二个 `CopyStart` 失败 `OBJECT_HAS_REPLICATION_TASK`（`:6488`）——并发重发不会建两个任务；但这是**任务失败**（`query_task` 可见）不是静默成功，控制面重发时要把该错误码按「已在途」处理，不当失败。
   3. **部分重叠按 seg 粒度**：targets 中部分 seg 已有副本 → 只给缺失的 seg 建副本，非全有或全无。
-- **F12 提交层无去重**：`CreateCopyTask`（`master_service.cpp:13677`）只校验 key 存在 + 目标 seg 可分配，不查目标已有副本、不查在途任务——两个 `create_copy_task` 都会拿到任务 ID；去重发生在源属主执行 `Copy→CopyStart` 时（F11），时序：先执行者赢，后者按 F11-2 失败。
+- **F12 提交层无去重**：`CreateCopyTask`（`master_service.cpp:13677`）只校验 key 存在 + 目标 seg 可分配，不查目标已有副本、不查在途任务——两个 `create_copy_task` 都会拿到任务 ID；去重发生在源 seg 属主执行 `Copy→CopyStart` 时（F11），时序：先执行者赢，后者按 F11-2 失败。
 - **F13 同机不同 seg 的重复是设计内**：防护是 per-(key, seg)；同机多实例各有 seg，同 key 在同机不同 seg 各一份是异构同机的正常工作形态（README 异构 TP 节）。key 不同的内容重复（不同模型/hash 命名空间）不在防护范围。
 
 ## 基线：无 kvcm 时怎么运作

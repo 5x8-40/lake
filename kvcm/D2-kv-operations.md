@@ -28,9 +28,10 @@
 
 ### 背景概念
 
-- **key 与副本**：池里一把 key 一份元数据，元数据里挂着副本列表；同一 key 可有多个副本（replica），落在不同机器的 segment（seg，一段注册进池的 DRAM）上
-- **副本 = 元数据里的一条记录**：内容是「数据在某 seg 的某块 buffer 上」+ 状态。所以副本天然有**两个关联**——逻辑上属于 key（它是 key 元数据的一部分），物理上位于 seg（buffer 分配在 seg 上，seg 注册在 client 名下）。后文「副本跟 seg 死活」「按 key 删副本」分别对应这两个关联
+- **key 与副本**：池里一把 key 一份元数据（`ObjectMetadata`），元数据里挂着副本列表（`replicas_`）；同一 key 可有多个副本（replica），落在不同机器的 segment（seg，一段注册进池的 DRAM）上
+- **副本 = 元数据里的一条记录**（`replica.h::Replica`）：字段 = 位置（内存副本记某 seg 上的 buffer；盘副本记写盘 client 名下的文件路径）+ 状态 + 任务引用计数（refcnt，任务级，F8）——**没有 client_id**（副本无属主，见下「属主」条）。所以副本天然有**两个关联**——逻辑上属于 key（它是 key 元数据的一部分），物理上位于 seg（buffer 分配在 seg 上，seg 注册在 client 名下）。后文「副本跟 seg 死活」「按 key 删副本」分别对应这两个关联
 - **副本两个状态**：写中（PROCESSING，不可读）与就绪（COMPLETE，可读）
+- **存亡两个方向**：key 删（Remove 系）→ 元数据连同副本列表一起删，不管副本在哪（F6 全图①）；key 在、某副本所在 seg/client 死 → 只清那一条记录（F6 全图③）；副本清到一条不剩，key 只剩元数据空壳
 - **属主（owner）**：每把 key 的元数据里记录 `client_id` = 最后写入它的客户端 UUID。注意三层区分，后文反复用到
   - 属主是 **key 级**字段：一把 key 一个属主，与它有几个副本无关；用途**只是鉴权**（谁有权中止写、谁有权定点清副本，F6），不是副本的归属声明
   - **副本自身没有属主字段**：副本的存亡由它**所在的 seg** 决定——client 死 → seg 被摘 → 挂在死 seg 上的副本记录被清，扫描按 seg 走、不看 key 属主（F7）
@@ -95,11 +96,12 @@
   - **不管**：copy / move / get / exist——复制与读取路径完全不读属主字段（F7 代码核实）；且 copy 的副本登记走独立 RPC 对 `CopyStart`/`CopyEnd`（不经 Put/Upsert），全程不碰 `client_id`——**copy 后 key 属主不变**，仍是最初写入的引擎（`master_service.cpp:1849` @0.3.11）；**move 同样不改属主**——`MoveStart`（`:2069`）/ `MoveEnd`（`:2160`）/ `CreateMoveTask`（`:5832` @0.3.11）全程不写 `metadata.client_id`，main 版 `MoveStart` 函数体 `client_id =` 赋值 0 处。注意 `MoveEnd` 的 `ILLEGAL_CLIENT` 校验是任务执行者校验（谁 Start 谁 End），不是属主校验——故「按 key 属主删」口径下 move 解不了 retain（§4）
 - **清理路径全图**（「清理 API 能不能清到某副本」的完整答案）
   1. **整 key 删**：`Remove` / `BatchRemove` / `RemoveByRegex` / `RemoveAll`——key 元数据连同全部副本一起删（不管副本在哪个 seg）；**不鉴权**，kvcm 可用（§4 release）
-  2. **定点清单个副本**：`BatchReplicaClear(keys, client_id, seg)`——只清指定 client 指定 seg 上的副本、其他 seg 的保留；**限 key 属主自调**（F6②），kvcm 调不动 → kvcm 做不了「只清 A seg 副本、留着 B seg」的定点手术
+  2. **定点清副本**：`BatchReplicaClear(keys, client_id, seg)`（`:913-1010` @0.3.11）——属主传自己的 UUID + 任意 seg 名，清自己 key 在该 seg 上的副本；校验「key 属主 == 参数 client_id」，kvcm 传自己 UUID 过不了 → kvcm 做不了「只清 A seg 副本、留着 B seg」的定点手术。**不区分副本来源**：put/copy/move 产物同一把 `replicas_` 列表，都在管辖内——属主引擎随时能清掉 kvcm 预热到别机的副本。三条 D2 此前未记的门槛：lease 未过期 → skip（与 Remove 的保险同向）；PROCESSING 副本免清（指定 seg 时不匹配；seg 传空时要求全部 COMPLETE 才动手，防打断在途写）——在途 copy/move 的半成品它碰不了（归 reaper，D5）；seg 传空时不是清副本、是 `Erase()` 删整 key——「属主限定 + 带 lease 检查版的 Remove」
   3. **级联清理**：client 死亡 → 其 seg 全摘 → 挂在死 seg 上的副本记录清掉（disk 副本随死 client 清）——按 seg/client 维度扫，**不看 key 属主**；master 自动触发（F6b 有代码与实测的口径矛盾，归 E5）
 - **F6b 级联删除：实测现象与代码核实不一致（归因归 E5）**
   - **实测**（D1 F5 / EXPERIMENTS #3）：属主 A 重启 → client TTL 过期 → key 记录连同全部副本记录（**含预热到 B seg 上的**）消失，`batch_is_exist` 0/32；现象疑似「副本存活性绑定属主 client」
   - **代码核实**（0.3.11.post1）：client 过期处理（`master_service.cpp:4930-5015` @0.3.11）= unmount 该 client 全部 seg + `ClearInvalidHandles` 全量扫——清理是**副本级**的（`CleanupStaleHandles :2530`）：内存副本随死 seg 清、disk 副本随死登记 client 清。**活 seg 上其他 client 的副本按代码不该被清**；全库无「按 key 属主删」路径
+  - **main 侧印证**：main 把副本隶属显式化为 `Replica::isAffiliatedWith`（`replica.h:553` @main）——内存副本比 buffer 所属 client、盘副本比登记 client、DFS 副本恒 false（不隶属任何 client）；client 下线清理（`ProcessClientOffboardingJob`，`:2976` @main）的清理谓词只走这个副本隶属维度，同样不看 key 属主——「清理走副本隶属」两版本同
   - **不一致点**：实测时 B 的 seg 活着、B 副本 COMPLETE 可读（B 命中 88.2%），按代码应存活，实测却消失——待 E5 对照实验厘清（master 是否与引擎同机一起死了 / 副本实际状态 / 其他清理路径）
   - **设计含义**：0.3.11 过渡期的 retain 手段有效性依赖口径判定（§4）——E5 证实「按 key 属主删」则改属主有效，证实「按 seg 清理」则 move 到活 seg 有效；main 的池机制（retained client / DFS 副本，F13）不依赖此口径，是 E5 之外的独立解
 
@@ -201,7 +203,7 @@
 - `GetReplicaListForAdmin`：查副本状态但**零副作用**（不续租、不触发 promote、不计命中统计）——核验专用（F11b）
 - `GetAllKeys` / `GetReplicaListByRegex`：全量/模式列举 key——台账比对重建用
 - `ProbeKey`：纯探测在不在，不续租（F9）；实现确认也不喂命中统计（`ExistKeyImpl(grant_lease=false)` 不触发 promote 计数与动态副本观测）——main 下最轻的存在性核验
-- 副本位置一跳到位、无需额外查询：`GetReplicaList` 的副本 descriptor 自带 `transport_endpoint_`（内存副本 `AllocatedBuffer::Descriptor`，`allocator.h`；盘副本 `LocalDiskDescriptor` 还外加 `client_id`）。`BatchQueryIp`（client_id → IP，两版本同有）对 kvcm 仅边角用途：已登记引擎 UUID 重连后查当前地址——注意它答的是「client 在哪」，答不了「key 属主是谁」（属主 = 最初写入引擎，copy 后不变；key→属主无查询接口，F13⑥，台账只能写入时自登）
+- 副本位置一跳到位、无需额外查询：`GetReplicaList` 的副本 descriptor 自带 `transport_endpoint_`（内存副本 `AllocatedBuffer::Descriptor`，`allocator.h`；盘副本 `LocalDiskDescriptor` 还外加 `client_id`）。`BatchQueryIp`（client_id → IP，两版本同有）对 kvcm 仅边角用途：已登记引擎 UUID 重连后查当前地址——注意它答的是「client 在哪」，答不了「key 属主是谁」（属主 = 最初写入引擎，copy/move 后都不变（F6「不管」条）；key→属主无查询接口，F13⑥，台账只能写入时自登）
 - `GetStorageUsageSnapshot`（main）：分层容量快照——demote 触发条件「DRAM 压力」的数据源
 - 台账失效通知增强（main）：KV 事件流（ZMQ，stored/removed/cleared，D1 F14）的 removed/cleared 事件可让台账条目立即失效，不必等下轮全量比对；stored 不含 seg/位置（D1 F14 已析），代替不了比对——索引面用途归 D1，kvcm 台账只借失效通知
 
@@ -899,7 +901,7 @@ sequenceDiagram
     - 有用的前提：key 带结构化前缀（P1 要求命名空间含 model_id/revision，如 `qwen3:v2:dc9fdff8…`）——此时 `qwen3:v2:.*` 一条删掉整个模型版本
     - 多模型安全性：池是多模型共享的，命名空间前缀就是隔离边界——kvcm 台账登记每把 key 的 (model_id, revision)，发 Remove 系操作前按台账校验目标 key 的模型归属，防跨模型误删；main 可进一步把模型映射为 tenant，获得 RPC 命名空间 + 配额 + 驱逐三重隔离（F13）
   - `RemoveAll()`：全池清空（运维重置）——main 改为异步：master 置标志、各 client 轮询 `PollRemoveAll` 自清 SSD（F13），完成时机以台账比对为准
-  - `BatchReplicaClear(keys, client_id, seg)`：清指定 client 指定 seg 上的副本——限 key 属主自调（F6②），引擎下线前自清理用；kvcm 调不动别人的 key
+  - `BatchReplicaClear(keys, client_id, seg)`：定点清副本——限 key 属主自调，另有 lease 未过期 skip、PROCESSING 免清两道门槛，seg 传空 = 删整 key（机制全图见 F6②）；引擎下线前自清理用；kvcm 调不动别人的 key
   - `EvictDiskReplica` / `BatchEvictDiskReplica`（两版本同有，F13③）：client 盘副本被逐后的**上报**通道。对 kvcm 有用的地方有两处：
     - `LOCAL_DISK` 限属主——kvcm 自挂 SSD 后是自己盘副本的属主，可主动清（自挂形态的收尾工具）
     - `DISK`（DFS 副本）不验 client_id——能清 DFS 副本；但语义是「驱逐上报」不是主动删除，误用它清副本是把「上报」当「命令」用，release 正式路径仍走 Remove 系
