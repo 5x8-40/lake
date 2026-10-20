@@ -23,7 +23,7 @@
 | 异构跨机正向 245(TP2)→217(TP4) 回归（2026-10-12，bc6b5be 单入口 + #15835 补丁） | **通过**：32 keys READY、8/8 token 逐字一致、零 invalid、external hit 88.2%（滚动累计口径，非单请求） |
 | 异构跨机反向 217(TP4)→245(TP2) **同步 load**（2026-10-12，bc6b5be + #15835 补丁） | **通过**：36/36 key 对号、每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 分发生效、8/8 token 逐字一致、74.6→79.7% hit、零 invalid |
 
-完整实验史（总表 14 条 + 异构实录 + 撤回记录）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」；遗留问题与下一步计划见 [backlog.md](backlog.md)。
+完整实验史（总表 14 条 + 异构实录 + 撤回记录）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」；总结与待办见 [summary.md](summary.md)。
 
 ## 快速开始
 
@@ -223,7 +223,7 @@ sequenceDiagram
     Note over B: 客户端 local-first（SelectBestReplica）<br/>选本机 seg → 本机 DRAM 读，零跨机 RDMA
 ```
 
-注：图中「READY → 放行」目前由 `run_e2e.sh` / 手工顺序保证，接 gateway/router 的编排集成见 [backlog.md](backlog.md) D4；「哪个 key 在哪个 seg」无需通知任何人——mooncake_master 是放置权威，get 时 `BatchQuery` 现查；副本无 pin，READY 后受池驱逐策略管理。
+注：图中「READY → 放行」目前由 `run_e2e.sh` / 手工顺序保证，接 gateway/router 的编排集成见 [summary.md](summary.md) D4；「哪个 key 在哪个 seg」无需通知任何人——mooncake_master 是放置权威，get 时 `BatchQuery` 现查；副本无 pin，READY 后受池驱逐策略管理。
 
 ### 数据来源与日志边界
 
@@ -347,8 +347,7 @@ kvcm/
 ├── kv-prefetch.md           # 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测）
 ├── D1-router-scheduling.md  # 生产化设计 D1：Router 集成与请求调度
 ├── D2-kv-operations.md      # 生产化设计 D2：KV 调度操作集
-├── summary.md               # backlog 闭环条目存档
-└── backlog.md               # 遗留问题与下一步计划（D1-D7 / P1-P8 / E1-E16 登记处）
+└── summary.md               # 设计与工程总结（D1-D7 / P1-P8 / E1-E16 登记处）
 ```
 
 | 文档 | 作用 |
@@ -359,8 +358,7 @@ kvcm/
 | `kv-prefetch.md` | 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测） |
 | `D1-router-scheduling.md` | 生产化设计 D1：Router 集成与请求调度 |
 | `D2-kv-operations.md` | 生产化设计 D2：KV 调度操作集 |
-| `summary.md` | backlog 闭环条目存档 |
-| `backlog.md` | 遗留问题与下一步计划（设计决策 D1-D7 / 潜在问题 P1-P8 / 工程项 E1-E16） |
+| `summary.md` | 设计与工程总结（设计决策 D1-D7 / 潜在问题 P1-P8 / 工程项 E1-E16，含已闭环结论与待办） |
 
 ## 操作参考
 
@@ -422,7 +420,7 @@ kvcm/
 ## 边界与已知限制
 
 - **验证覆盖面**
-  - 只验证 **非 layerwise** + **本机 DRAM** 目标；layerwise / 落盘 / 编排集成见 [backlog.md](backlog.md)（D6 / D3 / D4）。
+  - 只验证 **非 layerwise** + **本机 DRAM** 目标；layerwise / 落盘 / 编排集成见 [summary.md](summary.md)（D6 / D3 / D4）。
   - 新路径（rank↔seg 对号）只重跑过同构同机 TP=2，同构跨机与 TP=4 仍是 10/08 旧 key×N 路径结果（见「验证状态」表注）。
   - 「验证状态」表 10/08-09 各条为重构前控制面结果；现行控制面（bc6b5be 单入口）已验证异构跨机双向（#13/#14，含同步 load，手工分步）；`run_e2e.sh` 一键编排（同构/异构）未真机重跑。
   - 全部实测为 GQA（`put_step=1`）；`put_step>1`（MLA 塌缩，key 全在 rank 0）时 plan 全落 `targets[0]`——功能正确但其余 rank 读远端副本，该映射未验证。
@@ -436,6 +434,6 @@ kvcm/
 
 ## 开放问题（待讨论）
 
-底层 B2 已实测；开放问题统一登记在 [backlog.md](backlog.md)：设计决策 D1-D7（D1 已闭环：[D1-router-scheduling.md](D1-router-scheduling.md)）、潜在问题 P1-P8、工程项 E1-E16，含状态与依赖关系。
+底层 B2 已实测；开放问题统一登记在 [summary.md](summary.md)：设计决策 D1-D7（D1 已闭环：[D1-router-scheduling.md](D1-router-scheduling.md)）、潜在问题 P1-P8、工程项 E1-E16，含状态与依赖关系。
 
 

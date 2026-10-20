@@ -1,7 +1,7 @@
 # D1: Router 集成与请求调度（预复制的选路侧）
 
 - 状态: **已闭环**——事实基线（F1-F15）已核实；六个设计问题全部闭环
-- 上游问题: [backlog.md](backlog.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
+- 上游问题: [summary.md](summary.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
 - 角色约定: kvcm 目前没有 router 组件。本文选路面逻辑上分两层（§1）：**索引**（订阅事件流建索引）与 **Router**（查索引、决定请求发往哪个实例；gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能）。索引进程形态（内置 Router / 独立组件）归 D4
 
 ## 参考实现
@@ -15,7 +15,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 | lake 单向边界 | [`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「池放置·调度读视图」 | 调度读视图、不反向指挥放置的边界形态 | lake 的池有自主放置能力；Mooncake 池没有，放置智能只能在外置控制面 |
 | llm-d Router | [`../docs/research/llm-d/overview.md`](../docs/research/llm-d/overview.md)「核心结论」；[`../docs/research/llm-d/architecture.md`](../docs/research/llm-d/architecture.md) §4 | 推测索引（事件确认前先用推测条目顶上，TTL 2s 自动过期） | llm-d 索引是事件流派生的副本视图（引擎才是真相）；master 直读没有该窗口 |
 | Dynamo router | [`../docs/research/dynamo/overview.md`](../docs/research/dynamo/overview.md)「Router(KV-aware)」 | 成本模型（分层命中×权重 + decode 占用 + 在途请求）；分层成本 device 1.0 / host 0.75 / disk 0.25；在途负载无权威、router 本地记账 | Dynamo 缓存状态权威在 worker 本地索引，router 靠事件逼近（丢事件需 gap→快照重放）；直读 master 无此失效模式。外部重算 block hash 链 Dynamo 已为先例（keys.py 同款） |
-| Mooncake Conductor | mooncake 仓内 `mooncake-conductor/`：`object_key_parser.cpp::ParseVllmObjectKey`；HTTP 契约 RFC #1403（F14） | 现成独立索引组件：订阅引擎/池事件建全局前缀索引，Router 走 HTTP 查询；object_key 解析已覆盖 vLLM-Ascend key 布局（keys.py 一族） | Conductor 是只读索引，不管复制/保活/补发——与 kvcm 职责互补；组件级替代评估归 backlog D4 |
+| Mooncake Conductor | mooncake 仓内 `mooncake-conductor/`：`object_key_parser.cpp::ParseVllmObjectKey`；HTTP 契约 RFC #1403（F14） | 现成独立索引组件：订阅引擎/池事件建全局前缀索引，Router 走 HTTP 查询；object_key 解析已覆盖 vLLM-Ascend key 布局（keys.py 一族） | Conductor 是只读索引，不管复制/保活/补发——与 kvcm 职责互补；组件级替代评估归 summary D4 |
 | Dynamo standalone indexer | dynamo 仓内 `lib/kv-router/src/services/indexer/`；`standalone-indexer.md` | RFC #1403 契约参照实现：`/register`（含 replay_endpoint）/ `/query` / **`/query_by_hash`**；gap 检测 + replay；P2P recovery（`--peers`，独立索引的 HA 答案）；`/query` 按 gpu/cpu/disk 分层返回 | 它只订引擎事件不订池。只有引擎一个事件源时，独立索引进程建出来的表和 router 自己建的内容完全一样，还多绕一跳网络——所以 Dynamo 的主流形态（kv-router）把索引放在 router 进程内，池视图另用 shared_cache 直订 master（F14）；`/register` 端点注册、`/query_by_hash`、gap replay、P2P recovery 可直接对标 |
 | Dynamo router 形态谱系 | dynamo 仓内 `router-operations.md`「Dynamo-Native Remote Indexer」；`configuration-and-tuning.md`「KV Indexer / Approx KV Indexer」 | 「索引放哪」在 Dynamo 是部署选项而不是架构定律，三种摆法：① 索引建在 router 进程内（默认）；② 独立 indexer 进程（索引与查询都移出 router）；③ 索引仍建在 router 进程内，但该 router 把查询开成 HTTP 服务（`--serve-indexer`），别的 router 来查（`--use-remote-indexer`）、自己不再建索引。另有 predict-on-route side indexer：router 把每次选路决定先写进一棵短 TTL 的辅助树，查询时主树辅树取较大值——解决「同前缀的一批请求同时到达、引擎还没来得及发 stored」被全部当 miss 打散的问题；辅助树要单独开，因为 router 自算的 hash 与引擎的 hash 口径不同，写进主树会把同一物理块挂成两个条目 | 辅助树那个约束我们不背：kvcm 补发用 keys.py 复算，与引擎同口径，可直接进主树（§2 方案 a）；「批内竞态要不要辅助树」归 D4 |
 | Mooncake 界限 | [`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「为何池必须自长 radix」 | Mooncake store 只存不透明字节块（无内容寻址、无前缀匹配）——预复制控制面是外置的「懂前缀 + 懂位置」层 | 不照搬 lake 的池内 radix：keys.py 按 key 逐把算，不建树；前缀匹配退化为「连续满块命中长度」 |
@@ -180,7 +180,7 @@ flowchart TB
     - 好处：多事件源聚合、独立 HA
     - 代价：请求路径多一跳 HTTP（同步选路路径的毫秒级延迟预算；缓解：提前查询、异步化）
 - **辅助预测树**（兄弟请求批内竞态：一批同前缀请求同时到达、引擎尚未发 stored——Dynamo side indexer / llm-d 推测索引先例）与形态无关，独立决策
-- Conductor 组件级评估见 backlog D4
+- Conductor 组件级评估见 summary D4
 
 三种索引形态对比（三种摆法索引内容相同，区别只在谁建索引、查询是否跨进程；kvcm 补发端点三形态相同，零适配）：
 
@@ -292,7 +292,7 @@ flowchart LR
 
 ## 留给后续
 
-编号登记处（含 P/E 系列、状态与依赖）：[backlog.md](backlog.md)。
+编号登记处（含 P/E 系列、状态与依赖）：[summary.md](summary.md)。
 
 - **D2**：KV 调度操作集（copy/move/keepalive/pin/demote/promote/retain/remove 八项；pin 两版本都挂在写路径上、复制路径带不了（F5），候选方案与属主问题见 D2 §2；释放有 `Remove` 系现成）
 - **D3**：副本生命周期与 READY 语义（F5 属主下线移除、TTL、属主下线后的副本归属）

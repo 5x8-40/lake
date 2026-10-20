@@ -8,8 +8,8 @@
   - §2 pin：候选已列出；落地选择依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞
   - §3 demote / promote：设计完成
   - §4 retain / release：定型；retain 的池机制正式路径在 main（retained client 或 DFS 副本，F13），0.3.11 下的过渡手段待 E5 实验判定（F6b）
-  - 未决问题（详见 backlog）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）；级联删除「代码 vs 实测」口径不一致（E5）
-- 上游问题：backlog D2（kvcm 对池内 KV 的操作面）
+  - 未决问题（详见 summary）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）；级联删除「代码 vs 实测」口径不一致（E5）
+- 上游问题：summary D2（kvcm 对池内 KV 的操作面）
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
   - **0.3.11.post1**：测试床实际部署的 wheel
   - **main @ 1fc27b62**：submodule 源码，代表升级后获得的能力
@@ -152,7 +152,7 @@
   - master 的 RPC 没有「key → 属主 UUID」查询
     - `GetReplicaList` 返回副本描述符（副本的位置信息），内存副本的只有 seg 名和地址，不含 client_id（`replica.h:240`）
     - master 内部有现成的「seg 名 → client UUID」查询 `GetClientIdBySegmentName`（CreateCopyTask 自己就在用），但没暴露成 RPC
-  - kvcm 与引擎之间**没有直接通道**：kvcm 的视野来自 master 的 segment 信息（seg 名 = `IP:rpc_port`，见 [README.md](README.md)）；「端点 → 实例」的注册方向是 kvcm 注册给索引（backlog D4/E13），不是引擎注册给 kvcm
+  - kvcm 与引擎之间**没有直接通道**：kvcm 的视野来自 master 的 segment 信息（seg 名 = `IP:rpc_port`，见 [README.md](README.md)）；「端点 → 实例」的注册方向是 kvcm 注册给索引（summary D4/E13），不是引擎注册给 kvcm
 - **F11b 核验通道的版本分工**（main 新增 `GetReplicaListForAdmin` / `BatchGetReplicaListForAdmin`，`master_service.h:424` @main）
   - 与 `GetReplicaList` 返回相同内容，但**零副作用**：不授 lease、不触发 promote、不污染命中统计——正是 kvcm 核验/比对想要的语义（`GetReplicaList` 的授 lease 副作用对核验是污染、对续租才是目的）
   - 分工：续租用 `ExistKey`（F9，要的就是续租）；副本状态核验在 main 用 admin 查询，0.3.11 只能用 `GetReplicaList` 连带副作用
@@ -298,7 +298,7 @@
 
 | 操作 | 出处 | 评估 |
 |---|---|---|
-| **prefetch 终止/取消** | HiCache `can_terminate_prefetch` / `mark_terminate`（三策略：best_effort / wait_complete / timeout） | **真缺口**：请求改道 / 源消失时在途 copy 白白占用带宽、只能等它自己结束；**copy/move 任务两版本都无取消 RPC**（main 只有 `CancelQueuedOffloadTask` 能取消 offload 任务、且镜像被取走即失败，F13）——补法：池侧扩展（改 mooncake）或「弃置 + 事后清副本」（kvcm 侧可做的弱版）。已登记 backlog P9 |
+| **prefetch 终止/取消** | HiCache `can_terminate_prefetch` / `mark_terminate`（三策略：best_effort / wait_complete / timeout） | **真缺口**：请求改道 / 源消失时在途 copy 白白占用带宽、只能等它自己结束；**copy/move 任务两版本都无取消 RPC**（main 只有 `CancelQueuedOffloadTask` 能取消 offload 任务、且镜像被取走即失败，F13）——补法：池侧扩展（改 mooncake）或「弃置 + 事后清副本」（kvcm 侧可做的弱版）。已登记 summary P9 |
 | compress（KV 压缩） | LMCache controller 命令集 | 远期能力，当前不补 |
 | health / full_sync（比对） | LMCache controller 命令集 | 半缺口：状态记录③有「全量比对重建台账」概念但未操作化——应列为运维操作 |
 | 在途状态查询 | KVCR `query` 四态（HIT / **FETCHING** / FETCHABLE / MISS） | 半缺口：kvcm 有 `QueryTask`（任务视角）+ exist（在/不在），缺 KVCR 那种 **key 视角**四态；「预热中」状态存于 sqlite 任务状态机，是否暴露给索引归 D4 接口设计 |
@@ -312,7 +312,7 @@
 | move 显式搬迁 | FlexKV/UCM/HiCache 层间移动是驱逐/prefetch 的副作用，无显式 move | 下线迁移/副本归拢要确定性搬迁（LMCache controller 有 move，不孤立） |
 | retain 属主下线存续 | 引擎插件层（FlexKV/UCM/HiCache L1L2）引擎死缓存失效拉倒；KVCR-Guard/LMCache daemon 才做 | kvcm 是独立控制面：预热投入要跨实例存亡保住 |
 
-- **审计结论**：不做 pin/keepalive/retain 的系统，共同点是有读者替它们保活、或引擎死了认栽——kvcm 的预热副本恰好「无读者 + 要跨实例存亡」，这三样是定位需要，不是冗余。**唯一真缺口 = prefetch 终止**（backlog P9）
+- **审计结论**：不做 pin/keepalive/retain 的系统，共同点是有读者替它们保活、或引擎死了认栽——kvcm 的预热副本恰好「无读者 + 要跨实例存亡」，这三样是定位需要，不是冗余。**唯一真缺口 = prefetch 终止**（summary P9）
 
 ### kvcm 能力边界（功能视角分级）
 
@@ -777,7 +777,7 @@ sequenceDiagram
 - **决策条件（外部依赖，非单方可定）**
   1. mooncake 代码可改性——多人合作的开源项目，不是单方说了算
      - 上游提 PR（纯暴露只读接口，接受度预期高，节奏不可控）或 fork 维护本地 patch——是**独立成本**；升级拿 publisher 是官方功能零 patch，与此无关
-  2. kvcm 实现语言（backlog E10/E11 未定）
+  2. kvcm 实现语言（summary E10/E11 未定）
      - 若落 Python，空写通道也需绑定补丁 → 方案一同样改 mooncake
 - 属主语义若要变，与 retain 议题（§4）统一评估，不在 pin 单独定
 - **注意**：若 pin 全走 hard pin 级 ①（lease 调大），属主问题只剩读删写一处触发，权重下降
