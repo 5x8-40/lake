@@ -244,9 +244,8 @@
 
 - **操作完成信号**：每个原子操作都有完成确认——任务类（copy/move）查 `QueryTask`，再统一核验副本状态（`GetReplicaList`；main 用零副作用的 admin 版，F11b），kvcm 据以更新台账
 - **READY** 是完成信号里特指「可以把请求调度过来」的那一类：DRAM 副本就位、核验通过时上报（D1 §4）
-  - 有 READY（2 个）：**copy（预热）、promote**——唯二「让某实例新具备本地命中条件」的操作
-  - 无 READY（6 个）：
-    - move——主场景（计划下线）路由切换走「摘流 A + 索引更新」（图⑨ P3），不推 READY；位置优化子场景的完成核验与 copy 同形态
+  - 有 READY（3 个）：**copy（预热）、move、promote**——「让某实例新具备本地命中条件」的操作，完成核验同任务框架（QueryTask + `GetReplicaList`，F7）；move 附带源实例索引失效（源删）
+  - 无 READY（5 个）：
     - keepalive / pin / retain——数据位置不变，完成 = RPC 返回 + 台账
     - demote——完成信号 = 「盘副本在册」，只更新台账、不上报调度（可调度性下降，语义相反）
     - release——反向信号：台账清除 + 索引同步失效
