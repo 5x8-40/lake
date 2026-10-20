@@ -135,7 +135,7 @@
   - 教训：「用不了」不等于「不需要懂」——对照性机制要挖到能回答「为什么不是它」的深度
 - 事实输入：E6（已闭环，见本文 E6 条）。
 
-**D3. 副本生命周期与 READY 语义** — 🟡 大部已定（READY/保活已写死；属主归属等 E5 实验结论）
+**D3. 副本生命周期与 READY 语义** — 🟡 部分已定（READY/保活机制已定；保活策略与属主归属未定）
 
 - 事实：
   - 副本没有 pin，READY 后池仍可驱逐
@@ -146,11 +146,11 @@
   - 谁有：copy / move / promote 三个——做完后某实例新具备「请求发过来就能直接用本机 KV」的条件
   - 谁没有：keepalive / pin / retain（不动数据）、demote（只记台账）、release（通知索引删除）
   - 「本机」= 本机 HBM + 本机池 seg 两层（D1 §3）
-- 保活：✅ 已定型（D2 §1/F9，机制事实 D1 F15）
-  - 做法：keepalive 周期调 `ExistKey` 续租约（lease）——`batch_is_exist` 调用会顺带续租（`ProbeKey` 不续），TTL = master 配置（D2 F9），保护窗口 = 租约时长
+- 保活：🟡 机制已定、策略未定（机制 D2 §1/F9，事实 D1 F15）
+  - 机制已定：keepalive 周期调 `ExistKey` 续租约（lease）——`batch_is_exist` 调用会顺带续租（`ProbeKey` 不续），TTL = master 配置（D2 F9），保护窗口 = 租约时长
   - 预复制不续租的话，一个 TTL 窗口内没有读流量就可能被驱逐
-  - 保活循环必须有界（会话期 / 固定窗口 / 首流量后停租）——无限续租事实上等于 pin
-  - kvcm 断线后租约到期自然失效，不残留
+  - 约束已定：保活循环必须有界——无限续租事实上等于 pin；kvcm 断线后租约到期自然失效，不残留
+  - 策略未定：续多久、何时停——候选 = 会话期 / 固定窗口 / 首流量后停租，未选定
 - 属主下线后副本归属：🟡 机制已定（D2 §4 retain）——main 有两条池机制并列（retained client / DFS 副本）；0.3.11 的过渡手段（改属主 / move）哪个有效，等 E5 实验结论；不依赖该结论的办法 = kvcm 自挂 SSD
 - 计划下线迁移：归 D2 retain 条（`CreateDrainJob` 两版本都有，把指定 seg 上的数据迁空到目标 seg，带并发上限、job 级可取消）
 - 落盘（写到 SSD）：Mooncake 的 DRAM→SSD 是池内冷热分层（client 侧 `enable_ssd_offload`，默认 `false`），不是「预复制时直接指定写盘」；SSD 只作容量/恢复用的异步 demote 去向（机制归 D2 demote 条）
@@ -201,9 +201,11 @@
   - 证据：`master_service.cpp:10653-10700` @main（清理动作写操作日志，主备切换后可恢复）；`:3259-3309` @0.3.11（注释原话「Discard expired CopyStart/MoveStart operations」）
   - 目标 seg 上占的物理内存：副本从 master 元数据丢弃后，由引擎自己的内存管理回收
 - 故障重路由衔接：✅ 已定
-  - 请求侧不等：按 D1 §4 的兜底链走——副本还在池里就远端读，kvcm 出故障不放大成请求失败
-  - KV 侧动作：kvcm 按 intent 对新目标实例重新预热（同一 intent 重发不会重复搬，P2 幂等键）
-  - kvcm 自己不做「故障后第一步做什么、第二步做什么」的固定应对预案：实例挂了之后请求发哪台，由 Router 按当时的集群状态重新选——这是 Router 每次选路都在做的事，不是 kvcm 的故障预案（lake「不设降级链」同一原则，[../docs/architecture/consistency.md](../docs/architecture/consistency.md) §5）；kvcm 只需响应新的预热 intent
+  - 原待定问题：源实例在 copy 期间掉线，与故障重路由怎么衔接——重新预热，还是容忍本次远端读
+  - 答：两件都做，各管一段
+    - 请求侧 = 容忍本次远端读：Router 按当时的集群状态把请求发到别的实例；前缀副本还在池里就跨机远端读——慢、不出错（F3）。这段不用 kvcm 做任何事，改道是 Router 每次选路的本职（D1 §4 职责边界）
+    - KV 侧 = 重新预热：kvcm 按 intent 对新目标实例重新发起 copy（intent 幂等，同一前缀同一目标重发不重复搬，P2）
+  - 结论：kvcm 在故障里的动作只有「收 intent、重新预热」，和平时没有区别——不需要任何故障专用预案；失败 copy 留下的在途任务标记与半成品副本由 master reaper 清（上两条已核实），也不用 kvcm 兜底
 
 **D6. layerwise 选型**
 
@@ -247,7 +249,7 @@
   - 0.3.11 已有：lease / offload / promotion 心跳取任务、Admin 查询三件套、`EvictDiskReplica`、`BatchExistKey` 续租（D1 F15）、soft pin（D2 F9）
   - main 才有：`ProbeKey`/`BatchProbeKey`、零副作用 Admin 查询（`GetReplicaListForAdmin`）、租户配额五件套、KV 事件、容量快照、`UnmountLocalDiskSegment`
   - `default_kv_lease_ttl` 测试床配置 11s（D2 F9）
-  - 缺口清单 = D2 F13⑥（per-key 降层 RPC、copy/move 取消、key→属主查询）——这些就是要改 mooncake 池侧的工作量
+  - 缺口清单 = D2 F13⑥（per-key 降层 RPC、copy/move 取消、key→属主查询）——kvcm 侧组合达不到完整语义，要补得动 mooncake 池侧（copy 取消有 kvcm 弱版「弃置 + 事后清副本」，P9）；改不改、何时补未议
 - **E7. MLA 实测**——`put_step>1` 时传输计划全部分配到 `targets[0]`、其余 rank 读远端：功能上推断正确但还没实测；hybrid/sparse 被上游的开关检查排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——✅ 已闭环（结论写在 D1 F14）
 
