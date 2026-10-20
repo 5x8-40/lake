@@ -24,8 +24,8 @@
 
 - **key 与副本**：池里一把 key 存一份 KV 数据；同一 key 可有多个副本（replica），落在不同机器的 segment（seg，一段注册进池的 DRAM）上
 - **副本两个状态**：写中（PROCESSING，不可读）与就绪（COMPLETE，可读）
-- **属主（owner）**：每把 key 的元数据里记录 `client_id` = 写入它的客户端 UUID
-- **属主管辖范围**（F6 详述）：只影响「属主下线时 key 是否级联删除」和「谁能撤销未完成的写」，与复制、读取无关
+- ~~**属主（owner）**：每把 key 的元数据里记录 `client_id` = 写入它的客户端 UUID~~ **[10-20 勘误]** key 元数据里**没有写入者字段**；memory 副本只记 buffer + seg 名，副本的「属地」= buffer 从哪个 seg 分出（绑该 seg 挂载者的 liveness，`segment_allocator_registration.cpp` `Allocate`；main `replica.h::isAffiliatedWith`）。client_id 只出现在 RPC 身份校验（谁能 CopyEnd/MoveEnd）与任务派发（copy/move 派给源 seg 属主）
+- **属主管辖范围**（F6 详述）：~~只影响「属主下线时 key 是否级联删除」和「谁能撤销未完成的写」~~ 属主下线**只清其自己 seg 上的副本，远端副本保留**（10-20 复验，总表 #15）；「谁能撤销未完成的写」照旧，与复制、读取无关
 - **lease（读租约）**
   - 读路径（`GetReplicaList` / `ExistKey`）授予，lease 期内该 key **绝对不可逐**（驱逐硬过滤直接跳过，F11）
   - **新 put 的 key 出生无租约**：`PutEnd` 里 `GrantLease(0, ...)` 把 lease_timeout 设为 now——「the object has no lease at beginning」（`master_service.cpp:1422` 注释 @0.3.11）；第一次被读/touch 才获得保护
@@ -76,7 +76,7 @@
 ### 属主字段管辖范围
 
 - **F6 属主管辖两件事，其余一概不管**
-  1. **级联删除**：属主进程心跳超时被 master 判定下线后，它写入的 key 连同所有副本（包括 kvcm 预热到其他机器上的）一起被元数据级删除（D1 F5，实测 exist 0/32）
+  1. ~~**级联删除**：属主进程心跳超时被 master 判定下线后，它写入的 key 连同所有副本（包括 kvcm 预热到其他机器上的）一起被元数据级删除（D1 F5，实测 exist 0/32）~~ **[10-20 勘误]** 级联删除**不存在**：属主下线只触发 unmount 其自己 seg + 清其上的副本；远端副本不受影响（清账谓词按副本所在 seg 判定、非写入者；0/32 实测为 key 名漂移假失败——[EXPERIMENTS.md](EXPERIMENTS.md) 踩坑 3 勘误、总表 #15）。真下线风险只剩「副本全在死属主 seg 上的 key」整 key 消失
   2. **写中止权限**：Revoke 校验属主身份（F5）
 - **不管**：copy / move / get / exist——复制与读取路径完全不读属主字段（F7 代码核实）
 
@@ -146,7 +146,7 @@
 - **防驱逐相关操作的语义界定**（keepalive / pin / retain 的区别）
   - **keepalive**（动作）：周期 touch 续 lease（F11）——窗口 = lease_ttl、轻、高频；kvcm 断线，lease 过期即失效
   - **pin**（元数据标记）：设一次长期有效——soft = 驱逐排最后 + TTL 窗口；hard = 绝对不可逐
-  - **retain**（目的，不是机制）：「属主下线/长期未命中时副本继续活着」——手段 = keepalive + pin + 属主方案（§2）
+  - **retain**（目的，不是机制）：「长期未命中时副本继续活着」——手段 = keepalive + pin（§2）。~~属主下线场景~~ **[10-20 勘误]** 属主下线不再需要 retain 兜底（远端副本本就保留）；retain 的真实对手只剩 lease 过期→驱逐
   - touch 哪些 key、何时开始、周期多少 = **kvcm 策略层逻辑**（保活注册表驱动），不是原子操作语义的一部分
 - **状态记录四类**（按可丢性分级）
   1. **任务状态机**（可丢）：在途任务进度；丢了可重发——master 侧操作幂等（重复 copy 同 key 同目标不产生重复副本）
@@ -195,13 +195,14 @@
 
 ### 属主问题：两个并列方案（空写与读删写重建共同面对）
 
+- **[10-20 勘误]** 本节原立论「防属主下线级联删除」不成立（级联删除不存在，见 F6 勘误、[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15）；属主方案剩余价值仅剩「写中止权限的属主身份」（Revoke/在途写撤销）
 - 起因：upsert/put 必然把属主改成调用方（F3①）
 
 | | 方案一：属主改归 kvcm | 方案二：不改属主（借名） |
 |---|---|---|
 | 做法 | kvcm 传自己的 UUID（自己就是 client，天然持有；sqlite 持久化，重启同 id 重注册） | kvcm 先查得原属主 UUID，调用时原样传回（F4） |
 | mooncake 代码 | **不改**（前提：空写通道不落 Python，F9） | **要改**：master 加「key → 属主 UUID」查询 RPC（数据内部现成，纯暴露，F8） |
-| 属主语义 | **改变**：引擎下线后 key 不再级联删除（正是 retain 想要的收益）；代价 = kvcm 下线 → 名下 key 全删（新单点；缓解 = UUID 持久化 + 重启快于 master 心跳超时） | **不变**：引擎下线 key 删（维持现状语义） |
+| 属主语义 | ~~**改变**：引擎下线后 key 不再级联删除（正是 retain 想要的收益）~~ 收益随 F6 勘误消失；剩余代价 = kvcm 成在途写的持有者（新单点） | **不变**（维持现状语义） |
 | 引擎配合 | 无 | 无（补丁打在 master，引擎零感知） |
 
 - **决策条件（外部依赖，非单方可定）**

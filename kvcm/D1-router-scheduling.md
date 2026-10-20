@@ -32,7 +32,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源属主客户端（写入该 key 的引擎）必须在线；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
 - **F5 副本无 pin：READY 后随时可能被池驱逐**：
   - 复制路径不加 pin / lease（F15），副本落位后不受保护，池驱逐策略说收就收。
-  - 属主实例（最初写入 key 的引擎）下线后，master 把它写入的 key 连同这些 key 在**所有机器**上的副本一起删除——**我们预热到 B 的副本也在其中，一起没**（实测：属主下线后 exist 0/32，机制与时机待确认 → E5；记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
+  - 属主实例（最初写入 key 的引擎）下线后，master 只清**属主自己 seg 上的副本**；key 在其他机器上的副本**不受影响、继续可读**（10-20 受控复验：kill A 后 32/32、副本仍在 B seg、字节级读回成功；代码锚点 v0.3.11 `CleanupStaleHandles` / main `replica.h::isAffiliatedWith`——副本存亡绑定所在 seg 挂载者，非写入者。10-12 的 0/32 观测为 key 名漂移假失败，见 [EXPERIMENTS.md](EXPERIMENTS.md) 踩坑 3 勘误与总表 #15）。
   - mooncake main 有 pin 机制，但都挂在写路径上（`PutStart` / `UpsertStart` 收 `ReplicateConfig`，`master_service.h:452` / `:515`）：
     - **soft pin**（`soft_pin_action`，`replica.h:64-68`）：key 粒度的**限时**驱逐保护——默认 30min、上限 24h（`types.h:85-89`），到期自动失效（`CleanupExpiredSoftPins`，`master_service.h:1468`）；驱逐两轮制把它排最后——第一轮只驱逐无 soft pin 的对象，第一轮凑不够且 `allow_evict_soft_pinned_objects`（默认 true，`types.h:90`）时软 pin 也可被驱逐（`master_service.h:987-995`），所以叫「软」。
     - **hard pin**（`with_hard_pin`，`replica.h:113`）：显式 pin，不可驱逐——写入时设置并固化进对象元数据（`master_service.cpp:6068`），全驱逐路径检查 `IsHardPinned`（`:8117` / `:11918` / `:12213` / `:12434`）。
@@ -54,7 +54,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   2. **连接器（池 put）**：worker 侧在引擎自己 put 成功后生成 `BlockStored(medium="cpu")`（`kv_transfer.py:1162`、`pool_worker.py:3111`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py:213`）；门控 `enable_kv_cache_events`（`pool_scheduler.py:108`）。池副本的删除/驱逐不在这条引擎通道上发——那是 master publisher 的事（另一条通道，F14，0.3.11 不含）。
   - 范围：本部署只挂 AscendStoreConnector；`preempt_offload` connector 另有事件路径（`preempt_offload/manager.py:732`，cpu_block_pool 事件），不在本部署范围。
 - **F9 盲区一：预复制在两条通道上都不会自动产生事件**：引擎事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码），`create_copy_task` 完全在引擎之外 → 引擎通道**结构上**不会有预复制事件；master publisher（F14，0.3.12 起）是另一条通道，其复制路径同样零发布——所以预复制落位只能由 kvcm 补发（§2 方案 a）。
-- **F10 盲区二：引擎事件通道上看不到池副本的删除**：vllm-ascend 全仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / 属主下线删除，F5）对引擎事件消费者不可见。注意三条通道别混淆：HBM 淘汰有 Removed（引擎通道，F8-1）；池删除有 removed（master publisher 通道，F14，0.3.11 不含）；引擎通道的池 put 只有 Stored 没有 Removed。
+- **F10 盲区二：引擎事件通道上看不到池副本的删除**：vllm-ascend 全仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / 属主下线清其 seg 内副本，F5）对引擎事件消费者不可见。注意三条通道别混淆：HBM 淘汰有 Removed（引擎通道，F8-1）；池删除有 removed（master publisher 通道，F14，0.3.11 不含）；引擎通道的池 put 只有 Stored 没有 Removed。
 - **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`），ZMQ 传输，schema 套用 RFC #1527。
   - **schema 从哪来、为谁设计**：RFC #1527 是「推理引擎 → KV 感知 router/indexer」的事件线格式（原文：事件告知 router 每个 worker 上哪些块被存/删，供缓存感知调度），hash 是核心字段。mooncake 存储侧套用了这个 schema，但**池是内容无关的字节块存储——只认识 PoolKey 字符串，不知道 token 与 hash 链（hash 只有写入方知道）**，所以字段名兼容 vLLM（legacy `type:"BlockStored"` / `block_hashes` / `parent_block_hash`）但**内容全空/nil**（`kv_event_publisher.cpp:440-462`；config 注释「parent_hash and token_ids are not interpreted by the storage publisher」）。
   - **配套的索引契约（RFC #1403，KV-Store Indexer API）**：消费侧的标准形态是**逻辑分层**——索引组件订阅事件流建索引，Router 查索引而不订阅流。事件源（引擎或池）向索引组件 `/register` 注册端点（`type` 支持 vLLM / Mooncake / SGLang，附 `endpoint` 与 `replay_endpoint`）；Router 侧 `/query` 查询，**支持 token_ids 或 block hash key 两种入参**（`/query_by_hash`）——Router 自算请求的 hash 链查 hash 接口即可，不依赖原始 token 文本。Conductor 与 Dynamo standalone indexer 是该契约的两个实现。
@@ -72,7 +72,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
     | 事件 | 发布点 |
     |------|--------|
     | stored | `PutEnd:5372`（引擎 put 提交，唯一） |
-    | removed | `EraseMetadata:2338`（删除 / 属主下线）+ 驱逐四路径（`:8161`/`:8314`/`:11366`/`:12549`） |
+    | removed | `EraseMetadata:2338`（删除；属主下线仅当 key 剩余副本全在其 seg 时连带触发）+ 驱逐四路径（`:8161`/`:8314`/`:11366`/`:12549`） |
     | cleared | `RemoveAll` |
     | 复制路径（`CopyStart:6444` / `CopyEnd:6666`） | **零发布——预复制副本落位不会自动产生池事件** |
 
@@ -189,7 +189,7 @@ flowchart LR
 - **kvcm 轮询对账（不做）**：周期拉 master 全量快照、与自己的记录 diff——唯一价值在删除面（能发现副本没了）；只为删除做一个对账器得不偿失，删除由升级解决。
 - **router 条目 TTL（当前不做）**：纯删除兜底，与预复制放置无关（它不携带「B 有了」的任何信息）；router 侧独立机制，不需要任何新通道。升级前若删除面要兜底可再议。
 
-**索引条目过时的后果**：删除面接通前，池副本被删（驱逐 / TTL / 属主下线，F5/F10）router 收不到通知 → 索引里 cpu 条目只增不减，会把请求导向其实已经没有副本的实例。后果只是变慢：请求打过去 get miss，引擎自动跨机读或重算（F3），不出错。HBM 条目有淘汰事件（F8-1），不过时。
+**索引条目过时的后果**：删除面接通前，池副本被删（驱逐 / TTL / 属主下线清其 seg 内副本，F5/F10）router 收不到通知 → 索引里 cpu 条目只增不减，会把请求导向其实已经没有副本的实例。后果只是变慢：请求打过去 get miss，引擎自动跨机读或重算（F3），不出错。HBM 条目有淘汰事件（F8-1），不过时。
 
 **方案 a 落地（复用与身份）**
 
@@ -256,18 +256,18 @@ flowchart LR
 手段三个 + 兜底一个：
 
 - **主路径·停保活（软释放）**：副本活着是因为有读在续租、或控制面在保活（F15）——释放不需要新动作，停止动作就行：控制面停掉某前缀的保活，租约到期池自然收走。保护机制：任何实例还在读这个前缀，读路径会自动续租，key 不受影响——停保活只是控制面不再续租，动不了仍在使用的数据。
-- **中间档·demote（降层）**：不删除，DRAM → SSD，前缀还在池里可读（更慢）。两个用途：「近期不用、但可能还会用」的前缀降层省 DRAM；**实例计划下线前把它的 KV 降层保存，避免属主下线 key 被整批删除（F5）**——下线删除是否连 disk 副本一起清未核实（归 E5/D3），核实前此用途按候选记账。操作集归 D2（`enable_ssd_offload` / `EvictDiskReplica`）。
+- **中间档·demote（降层）**：不删除，DRAM → SSD，前缀还在池里可读（更慢）。用途：「近期不用、但可能还会用」的前缀降层省 DRAM。~~实例计划下线前降层保存以避「属主下线整批删除」~~——该动机 **10-20 勘误撤销**（属主下线只清其 seg 内副本，远端副本本就保留，见总表 #15）。操作集归 D2（`enable_ssd_offload` / `EvictDiskReplica`）。
 - **例外通道·主动 Remove（硬释放）**：等不了自然过期、要立即腾地方时用；key 全局删除（A 的原本一起删），门槛 = 确认前缀谁都不再用（会话明确结束、前缀一次性）。`Remove` / `BatchRemove` 现成（D2）。
 - **兜底·池驱逐（非手段）**：即使控制面出错（没停保活、没发 Remove），池的 TTL 与驱逐也会最终回收——不会出现没人记得、永远占着内存的孤儿副本。三个手段只让回收更快更准，正确性不靠它们。
 
-已知缺口（登记，不归 D1）：显式 pin（hard pin）只在写路径可设，无事后加/解 pin 的独立 RPC，预复制带不了（F5 → D2）；属主下线副本一并移除（F5 → D3/D5）。
+已知缺口（登记，不归 D1）：显式 pin（hard pin）只在写路径可设，无事后加/解 pin 的独立 RPC，预复制带不了（F5 → D2）；~~属主下线副本一并移除~~（**10-20 勘误撤销**：远端副本不随属主消失，见总表 #15）。
 
 ## 留给后续
 
 编号登记处（含 P/E 系列、状态与依赖）：[backlog.md](backlog.md)。
 
 - **D2**：KV 调度操作集（pin/demote/prefetch/retain/release；master 无显式 pin → `SubmitReplicaActionProposal` lease 机制；释放有 `Remove`/`BatchRemove` 现成）
-- **D3**：副本生命周期与 READY 语义（F5 属主下线移除、TTL、属主下线后的副本归属）
+- **D3**：副本生命周期与 READY 语义（~~F5 属主下线移除~~ 已勘误：副本属地=所在 seg 挂载者，属主下线只清其 seg 内副本、远端副本保留；TTL、驱逐候选资格仍是 D3 输入）
 - **D4**：编排进程形态（预复制控制面独立进程或并入选路方；READY 确认接 gateway；seg→实例与「端点→实例」注册通道；预复制视图由控制面补发事件注入，§2）
 - **D5**：故障衔接（源属主掉线 copy 失败（F4）、与重路由的先后）
 - **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../docs/research/vllm-ascend/layerwise-taxonomy.md)）
