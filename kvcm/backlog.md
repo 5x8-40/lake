@@ -72,7 +72,7 @@
 
 - 事实：copy 期间源实例掉线即失败（master 给源属主派任务，D1 F4）。
 - 事实：源属主挂死后，在途任务标记由 master reaper 清理（`master_service.cpp:10654` 附近）；清理窗口内重发同一 copy 吃 `OBJECT_HAS_REPLICATION_TASK`（幂等语义见 D1 F11-F12）。
-- staged 副本清理：✅ 已核实（`master_service.cpp:10653-10700` @main）——reaper 按任务 TTL（`put_start_release_timeout_sec_`）扫到后，按任务的 `replica_ids` **精确丢弃目标 staged 副本**：key 还有其它 COMPLETE 副本（copy 场景源副本）则保留 key 只丢 staged；staged 是唯一副本则整 key REMOVE；清理写 oplog（HA 可恢复）。目标 seg 的物理空间随副本从 metadata 丢弃由引擎 allocator 回收
+- staged 副本清理：✅ 已核实（两版本同行为）——reaper 按任务 TTL（`put_start_release_timeout_sec_`）扫到后，按任务的 `replica_ids` **精确丢弃目标 staged 副本**：key 还有其它 COMPLETE 副本（copy 场景源副本）则保留 key 只丢 staged；staged 是唯一副本则整 key 移除（`master_service.cpp:10653-10700` @main，清理写 oplog 保 HA；`:3259-3309` @0.3.11，注释原话「Discard expired CopyStart/MoveStart operations」）。目标 seg 的物理空间随副本从 metadata 丢弃由引擎 allocator 回收
 - 故障重路由衔接：✅ 已收口（既有原则直接推论）——请求不等（D1 §4 兜底链：Pool 命中则远端读，kvcm 故障不放大为请求失败）；KV 侧动作 = kvcm 按 intent 对新目标重新预热（幂等键去重，P2）；无预设 fallback 阶梯，重选模选点归 Router 依最新状态重跑
 
 **D6. layerwise 选型**
