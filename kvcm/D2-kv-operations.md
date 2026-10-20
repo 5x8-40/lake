@@ -38,6 +38,7 @@
 - **lease（读租约）**
   - 读路径（`GetReplicaList` / `ExistKey`）授予，lease 期内该 key **绝对不可逐**（驱逐硬过滤直接跳过，F8）
   - **新 put 的 key 出生无租约**：`PutEnd` 里 `GrantLease(0, ...)` 把 lease_timeout 设为 now——「the object has no lease at beginning」（`master_service.cpp:1422` 注释 @0.3.11）；第一次被读/被续租才获得保护
+  - **只延不缩、无撤销 RPC**（两版本同）：续租只把期限往后推、已发出的租约缩不短（0.3.11 `master_service.h:946`；main `lease.h::Lease::GrantReadLease`）；要提前让 key 可删只能 `Remove(force=true)` 跳过 lease 检查（§4）
 - **kvcm 自身 = mooncake client**：client 是库不是独立进程；kvcm 调 copy/move/upsert 必须链接它，构造时自动持有一个 UUID——§2 方案一中「kvcm 自己的 UUID」零额外成本
 
 ### pin 机制
@@ -91,7 +92,7 @@
   1. **写中止权限**：`PutRevoke` / `UpsertRevoke` 校验属主身份（`:1364` / `:1482` @0.3.11，F5）
   2. **副本清理权限**：`BatchReplicaClear` 校验请求者必须是属主（`:937` @0.3.11）——kvcm 非属主调不动
   3. **upsert 改写**：「谁最后写谁是属主」（F3①）
-  - **不管**：copy / move / get / exist——复制与读取路径完全不读属主字段（F7 代码核实）；且 copy 的副本登记走独立 RPC 对 `CopyStart`/`CopyEnd`（不经 Put/Upsert），全程不碰 `client_id`——**copy 后 key 属主不变**，仍是最初写入的引擎（`master_service.cpp:1849` @0.3.11）
+  - **不管**：copy / move / get / exist——复制与读取路径完全不读属主字段（F7 代码核实）；且 copy 的副本登记走独立 RPC 对 `CopyStart`/`CopyEnd`（不经 Put/Upsert），全程不碰 `client_id`——**copy 后 key 属主不变**，仍是最初写入的引擎（`master_service.cpp:1849` @0.3.11）；**move 同样不改属主**——`MoveStart`（`:2069`）/ `MoveEnd`（`:2160`）/ `CreateMoveTask`（`:5832` @0.3.11）全程不写 `metadata.client_id`，main 版 `MoveStart` 函数体 `client_id =` 赋值 0 处。注意 `MoveEnd` 的 `ILLEGAL_CLIENT` 校验是任务执行者校验（谁 Start 谁 End），不是属主校验——故「按 key 属主删」口径下 move 解不了 retain（§4）
 - **清理路径全图**（「清理 API 能不能清到某副本」的完整答案）
   1. **整 key 删**：`Remove` / `BatchRemove` / `RemoveByRegex` / `RemoveAll`——key 元数据连同全部副本一起删（不管副本在哪个 seg）；**不鉴权**，kvcm 可用（§4 release）
   2. **定点清单个副本**：`BatchReplicaClear(keys, client_id, seg)`——只清指定 client 指定 seg 上的副本、其他 seg 的保留；**限 key 属主自调**（F6②），kvcm 调不动 → kvcm 做不了「只清 A seg 副本、留着 B seg」的定点手术
@@ -758,7 +759,7 @@ sequenceDiagram
 
 ### pin 的取消
 
-- **①**：停止续租，lease 到期自然失效（= §4 软释放级）；无「立即撤销 lease」RPC，等待窗口 = TTL（分钟级）
+- **①**：停止续租，lease 到期自然失效（= §4 软释放级）；无「立即撤销 lease」RPC（背景概念节，两版本同），等待窗口 = TTL（分钟级）
 - **空写 soft pin**：主动取消 = 空写传 `with_soft_pin=false`（0.3.11）/ `SoftPinAction::DISABLE`（main 三态，`replica.h:64-68` @main）；或停止续期等 TTL 到期自动失效。注意 0.3.11 下取消可能**被动发生**（布尔坑，F1）
 - **读删写（hard pin）**：**没有 unpin**——两版本都是或运算保留（`with_hard_pin || IsHardPinned()`，`master_service.cpp:1741-1742` @0.3.11 / `:6068` @main；`hard_pinned is const`，`:1696` @0.3.11）——取消 = 再读删写一遍（读出 → Remove → 不带 hard_pin 重 put）
 - 操作集因此不单列 unpin：取消分别由 停 keepalive（软释放）/ pin 同机制逆操作 / remove 系 覆盖
