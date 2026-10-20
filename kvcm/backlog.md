@@ -101,7 +101,7 @@
     - `promotion_on_hit`：命中时池被动提回
     - kvcm 主动①：反复调 `GetReplicaList` 看命中计数，过线就触发
     - kvcm 主动②：读删写自己搬
-    - main 里 promote 的执行端改为引擎来取（`PromotionObjectHeartbeat`，触发链不变）
+    - promote 执行端 = 引擎来取（`PromotionObjectHeartbeat`，两版本都有，触发链不变）
   - copy/move 到不了 SSD（disk seg 没有 seg 名，两版本同）
   - 触发时机（会话结束 / 变冷 / DRAM 压力 / 计划下线）归策略层
   - 真正的功能缺口：写回模式下确定性的 demote——没有 per-key 降层 RPC，`BatchReplicaClear` 又限属主，offload 取消也不对外 → 需要池侧扩展
@@ -111,25 +111,28 @@
   - 决策归属 D1 §6
   - kvcm 可用：`Remove` / `BatchRemove` / `RemoveByRegex`（要配 key 命名空间才有意义）/ `RemoveAll`
   - `BatchReplicaClear` 限 key 属主自己调——kvcm 动不了别人的 key
-  - `EvictDiskReplica`（main）是通知型：`LOCAL_DISK` 限属主（kvcm 自挂 SSD 后可用来收尾）、`DISK` 不验属主（误用风险已登记，不作正式路径）
+  - `EvictDiskReplica`（两版本）是通知型：`LOCAL_DISK` 限属主（kvcm 自挂 SSD 后可用来收尾）、`DISK` 不验属主（误用风险已登记，不作正式路径）
   - `force` 仅限「确认没人用」
   - 收尾 = 清台账 + 同步索引
-- 机制查缺补漏：✅ 已闭环（结论写在 [D2-kv-operations.md](D2-kv-operations.md) F13⑤/③、§1 对照表、§3 远期方案、§4 retain/release，分支 docs/d2-mechanism-refill）
-  - 做法：八项操作逐项过一遍「还能利用什么池机制」
-  - 第一轮新发现：
-    - ① 动态副本（main）：kvcm 能触发、不能指定目标（反复调 `GetReplicaList` 观测，和 promote 同一种做法，观测在同一个函数里）——只适合池级自动调节，满足不了预热语义
-    - ② promotion 在 main 同样改引擎来取（`PromotionObjectHeartbeat`）
-    - ③ offload 取消不对外（`CancelQueuedOffloadTask` 唯一调用点是 `UpsertStart` 内部）
-    - ④ `EvictDiskReplica`（main 新 RPC）：通知型；`LOCAL_DISK` 限属主（kvcm 自挂 SSD 后可用来收尾），`DISK` 不验属主（误用风险已登记）
-    - ⑤ `AddReplica` 两版本都不是独立 RPC（是 `NotifyOffloadSuccess` 的内部步骤）——kvcm 自挂 SSD 的上报登记路径随之修正
-    - ⑥ retained client 注册在 client 库（`BufferRegistrationAction::kRetained`）——kvcm 同库可注册，自挂 SSD 在 main 下强化为「kvcm 死亡也保留」
-  - copy / move / keepalive / pin 确认没有新机制可用
+- 机制查缺补漏：✅ 已闭环（结论写在 [D2-kv-operations.md](D2-kv-operations.md) F13⑤/③、§1 对照表、§3 远期方案、§4 retain/release）
+  - 做法：八项操作逐项过一遍「还能利用什么池机制」+ 三版本 RPC 注册表全量 diff（v0.3.11 与 v0.3.11.post1 完全相同）
+  - 机制结论：
+    - 动态副本（main）：kvcm 能触发、不能指定目标（反复调 `GetReplicaList` 观测，和 promote 同一种做法，观测在同一个函数里）——只适合池级自动调节，满足不了预热语义
+    - offload / promotion 的执行端两版本都是引擎来取（`OffloadObjectHeartbeat` / `PromotionObjectHeartbeat`），kvcm 触发链不变
+    - offload 取消不对外（`CancelQueuedOffloadTask` 唯一调用点是 `UpsertStart` 内部）
+    - `EvictDiskReplica`（两版本）：通知型；`LOCAL_DISK` 限属主（kvcm 自挂 SSD 后可用来收尾），`DISK` 不验属主（误用风险已登记）
+    - `AddReplica` 不是独立 RPC（是 `NotifyOffloadSuccess` 的内部步骤）——kvcm 自挂 SSD 走 `NotifyOffloadSuccess` 上报登记
+    - retained client 注册在 client 库（`BufferRegistrationAction::kRetained`），kvcm 同库可注册——main 下 kvcm 以 retained 身份注册，kvcm 死亡数据也保留
+    - `BatchQueryIp`（两版本）：client_id→IP，副本位置解析的最后一环
+    - `GetStorageUsageSnapshot`（main）：分层容量快照，demote 触发输入
+    - 台账失效通知（main）：KV 事件流 removed/cleared；stored 事件没有位置信息，代替不了定期比对
+    - `MountNoFSegment`：挂盘形态（盘不绑机器）
+    - `ReMountSegment` 排除：重连时重新登记，不是复活旧副本
+    - 租户配额五件套（main）：tenant 在 `Client::Create` 绑定，client 级粒度，正好匹配「一个模型版本一个租户」
+  - 否决项：
+    - Upsert：同 size 原位复用 buffer，只剩盘副本时写盘 buffer 提不回 DRAM，两版本同行为
+    - copy / move / keepalive / pin 没有新机制可用
   - 教训：「用不了」不等于「不需要懂」——对照性机制要挖到能回答「为什么不是它」的深度
-  - 第二轮（接口全集反查，三版本 RPC diff）：
-    - 纠偏：`EvictDiskReplica`、offload/promotion 心跳取任务、Admin 查询三件套都是 0.3.11 已有（不是 main 新增）
-    - 新登记：`BatchQueryIp`（client_id→IP，副本位置解析的最后一环，两版本都有）、`GetStorageUsageSnapshot`（main，分层容量快照，demote 触发输入）、台账失效通知（KV 事件流 removed/cleared，main；stored 事件没有位置信息，代替不了定期比对）、`MountNoFSegment` 挂盘形态（盘不绑机器）、`ReMountSegment` 排除（重连时重新登记，不是复活旧副本）
-    - 配额：补五件套 RPC 名 + tenant 在 `Client::Create` 绑定（client 级粒度，正好匹配「一个模型版本一个租户」）
-    - Upsert 再确认否决：同 size 原位复用 buffer，只剩盘副本时写盘 buffer 提不回 DRAM，两版本同行为
 - 事实输入：E6。
 
 **D3. 副本生命周期与 READY 语义** — 🟡 大部已定（READY/保活已写死；属主归属等 E5 实验结论）
@@ -143,15 +146,14 @@
   - 谁有：copy / move / promote 三个——做完后某实例新具备「请求发过来就能直接用本机 KV」的条件
   - 谁没有：keepalive / pin / retain（不动数据）、demote（只记台账）、release（通知索引删除）
   - 「本机」= 本机 HBM + 本机池 seg 两层（D1 §3）
-- 保活策略：✅ 已定型（D2 §1/F9）——keepalive 周期调 `ExistKey` 续租约（lease），保护窗口 = 租约时长；kvcm 断线后租约到期自然失效，不残留
-- 属主下线后副本归属：🟡 机制已定（D2 §4 retain）——main 有两条池机制并列（retained client / DFS 副本）；0.3.11 的过渡手段（改属主 / move）哪个有效，等 E5 实验结论；不依赖该结论的办法 = kvcm 自挂 SSD
-- 保活机制事实（D1 F15）：
-  - `batch_is_exist` 调用会顺带续租（`ProbeKey` 不续）；默认 TTL 10s
+- 保活：✅ 已定型（D2 §1/F9，机制事实 D1 F15）
+  - 做法：keepalive 周期调 `ExistKey` 续租约（lease）——`batch_is_exist` 调用会顺带续租（`ProbeKey` 不续），默认 TTL 10s，保护窗口 = 租约时长
   - 预复制不续租的话，一个 TTL 窗口内没有读流量就可能被驱逐
   - 保活循环必须有界（会话期 / 固定窗口 / 首流量后停租）——无限续租事实上等于 pin
-  - 策略（续多久、何时停）已在上面定型
-- 下线迁移事实：main 有 `CreateDrainJob`（`master_service.h:872`，把指定 seg 上的数据迁空到目标 seg，带并发上限）——实例计划下线前的迁移路径，评估结论见上面 retain 条
-- 落盘（写到 SSD）子项：Mooncake 的 DRAM→SSD（`enable_ssd_offload`，本目录默认 `false`）是池内冷热分层，不是「预复制时直接指定写盘」；SSD 只作容量/恢复用的异步 demote 去向
+  - kvcm 断线后租约到期自然失效，不残留
+- 属主下线后副本归属：🟡 机制已定（D2 §4 retain）——main 有两条池机制并列（retained client / DFS 副本）；0.3.11 的过渡手段（改属主 / move）哪个有效，等 E5 实验结论；不依赖该结论的办法 = kvcm 自挂 SSD
+- 计划下线迁移：归 D2 retain 条（`CreateDrainJob` 两版本都有，把指定 seg 上的数据迁空到目标 seg，带并发上限、job 级可取消）
+- 落盘（写到 SSD）：Mooncake 的 DRAM→SSD 是池内冷热分层（client 侧 `enable_ssd_offload`，默认 `false`），不是「预复制时直接指定写盘」；SSD 只作容量/恢复用的异步 demote 去向（机制归 D2 demote 条）
 - 直接影响故障恢复时已预热前缀的可用性（D5）。事实输入：E5。
 
 **D4. 编排集成**
@@ -219,7 +221,7 @@
 - **P2. 并发预热去重**——🟡 池层幂等已核实（D1 F11-F13：重发不产生重复副本，在途报 `OBJECT_HAS_REPLICATION_TASK`）；仍待做：控制面（前缀 × 目标实例）幂等键合并，避免多请求/多 router 实例并发触发时重复占带宽。
 - **P3. 快照语义**——copy 期间源前缀还在增长（在途请求继续产生 block），precopy 是快照，快照点之后的新 block 谁补。
 - **P4. 读与驱逐竞态**——🟡 部分已由 D1 F15 回答：读路径（`BatchGetReplicaList:4566` / `GetReplicaList:4401`）调用即给 lease（默认 10s），从查询到读完的窗口受 lease 保护（驱逐候选必须等 lease 过期）；副本级 refcount 与长读请求的语义仍待确认（与 D2 retain 耦合）。
-- **P5. 多租户与配额**——多模型共池的隔离。E6 已核实：tenant quota 五件套只在 main 有，0.3.11 没有——要用须升级 mooncake（D2 F13）；tenant 在 `Client::Create` 绑定，client 级粒度，正好匹配「一个模型版本一个租户」。
+- **P5. 多租户与配额**——多模型共池的隔离。tenant quota 五件套只在 main 有，0.3.11 没有——要用须升级 mooncake（E6/D2 F13）；tenant 在 `Client::Create` 绑定，client 级粒度，正好匹配「一个模型版本一个租户」。
 - **P6. 鉴权边界**——现状能连 master 就能 `create_copy_task`/`Remove`。生产需要接入控制；控制面权限应大于引擎（引擎只需读写自己 seg）。
 - **P7. 预热成本核算**——预热后请求没来或去了别实例的浪费；READY 延迟（带宽×块数）vs 请求到达时间的窗口预测。与 D1 §4/§5 耦合（已闭环，口径见 D1）。
 - **P8. 指标归因**——命中率要拆「预热贡献 vs 引擎内部 HBM cache」：测试床已遇到第二次命中被引擎内部 cache 吃掉（外部 get=0），生产监控同样会混淆。
@@ -234,14 +236,14 @@
 - **E3. 多卡自动匹配验证**——resolve 的 `VLLM::Worker_TP<N>` proctitle 匹配在多卡真机走通（现在是 `--targets` 手工指定对应关系；匹配失效时必须明确报错，不能默不作声地配错）。
 - **E4. 单 token 不一致的根因**——输出里偶发有一个 token 与预期不同：旧非 DEBUG 实例偶发，新实例未复现；首次外部读的输出逐字一致，怀疑是不同执行路径的数值扰动。生产化前必须查清（[EXPERIMENTS.md](EXPERIMENTS.md) #10）。
 - **E5. 副本消失机制核实**——属主下线后 key+副本被移除的时机与条件（TTL、GC 扫描窗口）对照实验 → D3 事实输入。
-  - **D2 代码核实发现一个矛盾**（[D2-kv-operations.md](D2-kv-operations.md) F6b）：代码上清理是副本级的（活着的 seg 上其他 client 的副本不该被清，也没有按 key 属主删的路径），但实测 exist 0/32——B seg 上的副本也消失了
+  - **代码与实测矛盾**（[D2-kv-operations.md](D2-kv-operations.md) F6b）：代码上清理是副本级的（活着的 seg 上其他 client 的副本不该被清，也没有按 key 属主删的路径），但实测 exist 0/32——B seg 上的副本也消失了
   - 实验要判定两种解释哪个对：
     - 「按 key 属主删」→ 则改属主有效
     - 「按 seg 清理」→ 则 move 有效
   - 不依赖该结论的兜底（0.3.11）：kvcm 自挂 SSD；main 的 retained client / DFS 副本是 E5 之外的独立解
   - 排查方向：master 是否与引擎同机一起死了 / 副本实际状态 / 其他清理路径
-- **E6. 0.3.11 API 子集核对**——✅ 已闭环（PR #59 两轮接口反查）
-  - 做法：三个版本的 RPC 注册表 diff（v0.3.11 与 v0.3.11.post1 完全相同），核对结果写在 D2 F13
+- **E6. 0.3.11 API 子集核对**——✅ 已闭环（结论写在 D2 F13）
+  - 做法：三个版本的 RPC 注册表 diff（v0.3.11 与 v0.3.11.post1 完全相同）
   - 0.3.11 已有：lease / offload / promotion 心跳取任务、Admin 查询三件套、`EvictDiskReplica`、`BatchExistKey` 续租（D1 F15）、soft pin（D2 F9）
   - main 才有：`ProbeKey`/`BatchProbeKey`、零副作用 Admin 查询（`GetReplicaListForAdmin`）、租户配额五件套、KV 事件、容量快照、`UnmountLocalDiskSegment`
   - `default_kv_lease_ttl` 测试床实测 11s（D2 F9）
@@ -277,7 +279,7 @@
 
 ### C. 性能与生产化
 
-- **E15. copy 并行与限速**——现在逐 key 串行、与在线读共享带宽；大批量预热要并行化 + 带宽控制。可直接开工。新增输入：网卡繁忙感知——用 RDMA/ethtool 计数器采样链路利用率，传输忙时预热避让/限速（参考 vLLM-Ascend AI-QoS 的流量冲突问题定义；Router 侧用同一信号打分归 D1 §5，已登记）。
+- **E15. copy 并行与限速**——现在逐 key 串行、与在线读共享带宽；大批量预热要并行化 + 带宽控制。可直接开工。带宽控制的输入还包括网卡繁忙感知：用 RDMA/ethtool 计数器采样链路利用率，传输忙时预热避让/限速（参考 vLLM-Ascend AI-QoS 的流量冲突问题定义；Router 侧用同一信号打分归 D1 §5）。
 - **E16. 生产化缺口**——EP 拓扑实测、master HA、监控指标（READY 延迟、copy 失败率、external hit；命中率归因口径与 P8 耦合）。
 
 ## 参考锚点

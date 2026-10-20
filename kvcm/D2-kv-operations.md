@@ -897,7 +897,7 @@ sequenceDiagram
     - 多模型安全性：池是多模型共享的，命名空间前缀就是隔离边界——kvcm 台账登记每把 key 的 (model_id, revision)，发 Remove 系操作前按台账校验目标 key 的模型归属，防跨模型误删；main 可进一步把模型映射为 tenant，获得 RPC 命名空间 + 配额 + 驱逐三重隔离（F13）
   - `RemoveAll()`：全池清空（运维重置）——main 改为异步：master 置标志、各 client 轮询 `PollRemoveAll` 自清 SSD（F13），完成时机以台账对账为准
   - `BatchReplicaClear(keys, client_id, seg)`：清指定 client 指定 seg 上的副本——限 key 属主自调（F6②），引擎下线前自清理用；kvcm 调不动别人的 key
-  - `EvictDiskReplica` / `BatchEvictDiskReplica`（main，F13③）：client 盘副本被逐后的**上报**通道。对 kvcm 有用的地方有两处：
+  - `EvictDiskReplica` / `BatchEvictDiskReplica`（两版本同有，F13③）：client 盘副本被逐后的**上报**通道。对 kvcm 有用的地方有两处：
     - `LOCAL_DISK` 限属主——kvcm 自挂 SSD 后是自己盘副本的属主，可主动清（自挂形态的收尾工具）
     - `DISK`（DFS 副本）不验 client_id——能清 DFS 副本；但语义是「驱逐上报」不是主动删除，误用它清副本是把「上报」当「命令」用，release 正式路径仍走 Remove 系
   - 公共参数 `force`：Remove 默认有两道保险——① lease 未过期拒删（最近有人读过，可能还在用）② copy/offload 任务在途拒删（传输中删除会破坏数据）；`force=true` 跳过保险强删
