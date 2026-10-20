@@ -2,67 +2,15 @@
 
 来源：[issue #54](https://github.com/5x8-40/lake/issues/54)（KV-CM 遗留问题总清单）；本文是活文档，条目状态随讨论与实验更新。
 
-编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环即从本文删除，结论写进对应正式文档（D 系文档 / `kv-prefetch.md` / README）。
+编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环即移入 [summary.md](summary.md) 存档（正式结论以指向的正式文档为准：D 系文档 / `kv-prefetch.md` / README），本文原位置留编号占位。
 
-依赖主线：D1/D2 是设计主线（E5/E6/E8/E9 是其事实输入）；E10→E11→E12/E13/E14 是服务化主线（重构先行、协议随后）；P1-P8 大多随 D1/D2 定型一并回答。
+依赖主线：D1（已闭环，见 summary）/ D2 是设计主线（E5 是剩余事实输入）；E10→E11→E12/E13/E14 是服务化主线（重构先行、协议随后）；P1-P8 大多随 D1/D2 定型一并回答。
 
 状态标记：✅ 已闭环（附结论写在哪个文档）｜🟡 部分闭环｜无标记 = 待定。
 
 ## 一、设计决策
 
-**D1. Router 集成与请求调度** — ✅ 已闭环
-
-最终形态：router 决策请求发哪个实例 → precopy 预热该实例 → 并决定哪些 KV 释放。工作文档：[D1-router-scheduling.md](D1-router-scheduling.md)（事实基线 F1-F15 已核实，含复制幂等性与 lease 语义；六问全闭环，「待定问题」已转「设计决策」）。
-
-六个问题（全部闭环，结论写在 D1 对应小节）：
-
-1. **选路输入**——✅（D1 §1）
-   - 选路逻辑分两层：
-     - 索引：订阅事件流，维护「block hash → 实例」的表
-     - Router：自己算请求的 hash 链去查索引（RFC #1403 `/query` 支持 token_ids 或 hash key 两种入参，不需要原始 token 文本）
-   - 索引的数据来源两个：引擎原生事件 + kvcm 补发（预复制放置）；kvcm 负责补齐引擎看不到的部分
-   - Router 不访问池 key——池里的位置信息是控制面的事
-   - 索引做成什么进程形态（Router 内置 / 独立进程 / 内置但对外暴露查询——全量索引只有一份；辅助预测树单独决策）与事件开关、传输接线归 D4
-2. **可见性**（索引怎么知道 KV 放在哪、删了没）——✅（D1 §2）。拆两问：
-   - **放置** = 方案 a：控制面补发 `BlockStored` 事件
-     - 为什么只能补发：池事件不带机器位置、复制路径本身不发布任何事件（任何版本都如此，F14）
-     - 补发时机：READY 核验通过后，即「全 rank 都备好、可以路由」——master 的单 key 粒度给不了这个判断
-   - **删除** = 升级 mooncake、开 master publisher
-     - 首选：索引侧直接订阅 publisher，解析 PoolKey 得出 block hash（Conductor `ParseVllmObjectKey` 现成；Dynamo `shared_cache.rs` 自己维护 hash↔key 映射，思路相同，F14）
-     - 备选：kvcm 订阅后翻译成引擎格式重发
-     - 前提：0.3.11 不含 publisher，须升级（E8 已核）
-   - 明确不做：轮询比对（只为删除信号不值得）、索引条目 TTL（与放置无关的独立兜底，不需要）、Router 直读 master（排除）
-   - 方案 a 的复用要点：事件字段全是 keys.py 的中间产物，发布直接 import 上游 `ZmqEventPublisher`；事件身份 = 端点（每个目标实例一个补发端点，「端点 → 实例」注册归 D4/E13；索引做成独立进程时走 RFC #1403 `/register` 注册）
-3. **「哪个实例拥有前缀」怎么定义**——✅（D1 §3）
-   - 实例 X 拥有前缀 P：P 的连续满块链的 KV 在 X 本机——HBM（gpu 事件）和本机池 seg（cpu 事件 / kvcm 补发）都算
-   - 命中长度 = 连续满块数 × block_size
-   - HBM 与 DRAM 的差异留到 §5 打分处理
-   - rank 维度不用管：事件只在全 rank 齐备时才发，Router 不需要 per-rank 索引
-4. **时序**——✅（D1 §4）
-   - 请求不等 READY：照常走 F3 兜底链（副本在池里就远端读），复制在后台追
-   - 复制的三个时机并存：
-     - 顺手补：请求路过时顺带触发
-     - 提前备：前端 agent/coder 钩子在请求发出前先把信号给控制面（最终形态，归 D4）
-     - 直接用现成的：Router 前缀亲和本来就倾向把请求发到已有所需 KV 的实例
-   - intent 以（前缀 × 目标实例）为幂等键去重
-   - 边界：kvcm 不决策选路；Router 不直接下复制命令，用 intent 表达意图（Router → kvcm 下行）；事件上行（kvcm → 索引）
-5. **选路目标函数**——✅（D1 §5）
-   - 归 Router 内部实现，kvcm 不参与决策（§1-§3 之后 Router 的输入已齐）
-   - 候选已列：分级兜底 / 打分制（Dynamo 的分层成本可借来当初值）/ 传输成本两级
-   - 权重待真机校准（P7）
-6. **release 归谁**——✅（D1 §6）
-   - 分工：Router 提供会话生命周期线索，控制面决策执行，池驱逐兜底
-   - 三个手段：
-     - 主路径：停保活（软释放——有读就自动续租，动不了正在用的数据）
-     - 中间级：demote 降层（DRAM→SSD，不删，归 D2）
-     - 例外：主动 `Remove`（key 是全局的，别的实例上的原始副本会一起删）——仅限「确认没人用」
-
-已知现状：
-
-- 引擎事件通道上看不到池副本删除（F10）→ 索引里池副本条目只增不减，条目过时只损性能（F3）
-- GPU 侧有 Removed 事件（F8）
-- 池原生 publisher 有 removed 事件，但 0.3.11 不含、且载荷只说 key 怎么了、不说在哪台机器（F14，E8 已核）——升级后首选索引侧直接订阅解析（D1 §2 方案 b），kvcm 翻译重发为备选
-- 选路方进程形态与 D4 耦合；E11-E14 依赖设计定型，E10/E11 骨架可先行
+**D1. Router 集成与请求调度** — ✅ 已闭环，结论存档：[summary.md](summary.md)（正式文档：[D1-router-scheduling.md](D1-router-scheduling.md)）
 
 **D2. KV 调度操作集（pin / demote / prefetch / retain / release）**
 
@@ -133,7 +81,7 @@
     - Upsert：同 size 原位复用 buffer，只剩盘副本时写盘 buffer 提不回 DRAM，两版本同行为
     - copy / move / keepalive / pin 没有新机制可用
   - 教训：「用不了」不等于「不需要懂」——对照性机制要挖到能回答「为什么不是它」的深度
-- 事实输入：E6。
+- 事实输入：E6（已闭环，见 [summary.md](summary.md)）。
 
 **D3. 副本生命周期与 READY 语义** — 🟡 大部已定（READY/保活已写死；属主归属等 E5 实验结论）
 
@@ -147,14 +95,14 @@
   - 谁没有：keepalive / pin / retain（不动数据）、demote（只记台账）、release（通知索引删除）
   - 「本机」= 本机 HBM + 本机池 seg 两层（D1 §3）
 - 保活：✅ 已定型（D2 §1/F9，机制事实 D1 F15）
-  - 做法：keepalive 周期调 `ExistKey` 续租约（lease）——`batch_is_exist` 调用会顺带续租（`ProbeKey` 不续），默认 TTL 10s，保护窗口 = 租约时长
+  - 做法：keepalive 周期调 `ExistKey` 续租约（lease）——`batch_is_exist` 调用会顺带续租（`ProbeKey` 不续），TTL = master 配置（D2 F9），保护窗口 = 租约时长
   - 预复制不续租的话，一个 TTL 窗口内没有读流量就可能被驱逐
   - 保活循环必须有界（会话期 / 固定窗口 / 首流量后停租）——无限续租事实上等于 pin
   - kvcm 断线后租约到期自然失效，不残留
 - 属主下线后副本归属：🟡 机制已定（D2 §4 retain）——main 有两条池机制并列（retained client / DFS 副本）；0.3.11 的过渡手段（改属主 / move）哪个有效，等 E5 实验结论；不依赖该结论的办法 = kvcm 自挂 SSD
 - 计划下线迁移：归 D2 retain 条（`CreateDrainJob` 两版本都有，把指定 seg 上的数据迁空到目标 seg，带并发上限、job 级可取消）
 - 落盘（写到 SSD）：Mooncake 的 DRAM→SSD 是池内冷热分层（client 侧 `enable_ssd_offload`，默认 `false`），不是「预复制时直接指定写盘」；SSD 只作容量/恢复用的异步 demote 去向（机制归 D2 demote 条）
-- 直接影响故障恢复时已预热前缀的可用性（D5）。事实输入：E5。
+- 直接影响故障恢复时已预热前缀的可用性（D5，已闭环见 summary）。事实输入：E5。
 
 **D4. 编排集成**
 
@@ -187,23 +135,9 @@
     - 组件级：索引直接用 Conductor——方案 b 的删除信号它自己订阅解析，kvcm 的翻译层消失；方案 a 的补发仍需要（经 RFC #1403 `/register` 注册端点即被它消费）
     - 代码级：自研索引则对照它的 parser
   - 待评估：成熟度（0.3.11 不含、随升级获得）、在线路径 HTTP 查询延迟 vs 进程内索引、HA、与 §5 打分逻辑的结合
-- 是 D1 时序问题的执行面。骨架先行：E12/E13。
+- 是 D1（已闭环，见 summary）时序问题的执行面。骨架先行：E12/E13。
 
-**D5. 故障衔接** — ✅ 已闭环
-
-- 事实：copy 期间源实例掉线即失败（master 把任务派给源属主，D1 F4）。
-- 事实：源属主宕机后，在途任务标记由 master 的定期清理线程（reaper）清掉（`master_service.cpp:10654` 附近）；清理完成前重发同一 copy 会收到 `OBJECT_HAS_REPLICATION_TASK` 报错（幂等语义见 D1 F11-F12）。
-- 半成品副本的清理：✅ 已核实（两版本同行为）
-  - 半成品副本 = copy/move 已把数据写到目标、但还没标完成的副本
-  - master 的定期清理线程（reaper）发现任务超时（TTL = `put_start_release_timeout_sec_`）后，按任务记录的 `replica_ids` 精确丢弃这些半成品：
-    - key 还有其它完成态副本（copy 场景的源副本）→ 保留 key，只丢半成品
-    - 半成品是唯一副本 → 整个 key 删掉
-  - 证据：`master_service.cpp:10653-10700` @main（清理动作写操作日志，主备切换后可恢复）；`:3259-3309` @0.3.11（注释原话「Discard expired CopyStart/MoveStart operations」）
-  - 目标 seg 上占的物理内存：副本从 master 元数据丢弃后，由引擎自己的内存管理回收
-- 故障重路由衔接：✅ 已定（既有原则的直接推论）
-  - 请求侧不等：按 D1 §4 的兜底链走——副本还在池里就远端读，kvcm 出故障不放大成请求失败
-  - KV 侧动作：kvcm 按 intent 对新目标实例重新预热（同一 intent 重发不会重复搬，P2 幂等键）
-  - 没有预设的降级步骤表：路由由 Router 按最新集群状态重新选
+**D5. 故障衔接** — ✅ 已闭环，结论存档：[summary.md](summary.md)
 
 **D6. layerwise 选型**
 
@@ -217,11 +151,11 @@
 
 ## 二、潜在问题
 
-- **P1. KV 与模型版本绑定**——vLLM block hash 不含权重 revision，权重更新后旧 KV 会被误命中、输出错了也不报错。key 命名空间必须含 model_id/revision。随 D1 key 表定型一并回答。
+- **P1. KV 与模型版本绑定**——vLLM block hash 不含权重 revision，权重更新后旧 KV 会被误命中、输出错了也不报错。key 命名空间必须含 model_id/revision（要求已写入 D2 §4 release；落地随 kvcm 实现，E11/E12）。
 - **P2. 并发预热去重**——🟡 池层幂等已核实（D1 F11-F13：重发不产生重复副本，在途报 `OBJECT_HAS_REPLICATION_TASK`）；仍待做：控制面（前缀 × 目标实例）幂等键合并，避免多请求/多 router 实例并发触发时重复占带宽。
 - **P3. 快照语义**——copy 期间源前缀还在增长（在途请求继续产生 block），precopy 是快照，快照点之后的新 block 谁补。
-- **P4. 读与驱逐竞态**——🟡 部分已由 D1 F15 回答：读路径（`BatchGetReplicaList:4566` / `GetReplicaList:4401`）调用即给 lease（默认 10s），从查询到读完的窗口受 lease 保护（驱逐候选必须等 lease 过期）；副本级 refcount 与长读请求的语义仍待确认（与 D2 retain 耦合）。
-- **P5. 多租户与配额**——多模型共池的隔离。tenant quota 五件套只在 main 有，0.3.11 没有——要用须升级 mooncake（E6/D2 F13）；tenant 在 `Client::Create` 绑定，client 级粒度，正好匹配「一个模型版本一个租户」。
+- **P4. 读与驱逐竞态**——🟡 部分已由 D1 F15 回答：读路径（`BatchGetReplicaList:4566` / `GetReplicaList:4401`）调用即给 lease（时长 = master 配置，D2 F9），从查询到读完的窗口受 lease 保护（驱逐候选必须等 lease 过期）；副本级 refcount 与长读请求的语义仍待确认（与 D2 retain 耦合）。
+- **P5. 多租户与配额**——多模型共池的隔离。tenant quota 五件套只在 main 有，0.3.11 没有——要用须升级 mooncake（D2 F13）；tenant 在 `Client::Create` 绑定，client 级粒度，正好匹配「一个模型版本一个租户」。
 - **P6. 鉴权边界**——现状能连 master 就能 `create_copy_task`/`Remove`。生产需要接入控制；控制面权限应大于引擎（引擎只需读写自己 seg）。
 - **P7. 预热成本核算**——预热后请求没来或去了别实例的浪费；READY 延迟（带宽×块数）vs 请求到达时间的窗口预测。与 D1 §4/§5 耦合（已闭环，口径见 D1）。
 - **P8. 指标归因**——命中率要拆「预热贡献 vs 引擎内部 HBM cache」：测试床已遇到第二次命中被引擎内部 cache 吃掉（外部 get=0），生产监控同样会混淆。
@@ -242,25 +176,17 @@
     - 「按 seg 清理」→ 则 move 有效
   - 不依赖该结论的兜底（0.3.11）：kvcm 自挂 SSD；main 的 retained client / DFS 副本是 E5 之外的独立解
   - 排查方向：master 是否与引擎同机一起死了 / 副本实际状态 / 其他清理路径
-- **E6. 0.3.11 API 子集核对**——✅ 已闭环（结论写在 D2 F13）
-  - 做法：三个版本的 RPC 注册表 diff（v0.3.11 与 v0.3.11.post1 完全相同）
-  - 0.3.11 已有：lease / offload / promotion 心跳取任务、Admin 查询三件套、`EvictDiskReplica`、`BatchExistKey` 续租（D1 F15）、soft pin（D2 F9）
-  - main 才有：`ProbeKey`/`BatchProbeKey`、零副作用 Admin 查询（`GetReplicaListForAdmin`）、租户配额五件套、KV 事件、容量快照、`UnmountLocalDiskSegment`
-  - `default_kv_lease_ttl` 测试床实测 11s（D2 F9）
-  - 缺口清单 = D2 F13⑥（per-key 降层 RPC、copy/move 取消、key→属主查询）——这些就是要改 mooncake 池侧的工作量
+- **E6. 0.3.11 API 子集核对**——✅ 已闭环，结论存档：[summary.md](summary.md)（正式结论写在 D2 F13）
 - **E7. MLA 实测**——`put_step>1` 时传输计划全部分配到 `targets[0]`、其余 rank 读远端：功能上推断正确但还没实测；hybrid/sparse 被上游的开关检查排除（异构不支持，同构可用）。
-- **E8. mooncake kv_event schema 核对**——✅ 已闭环（结论写在 D1 F14）：publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medium+tenant+group，**无 seg/机器位置**；ZMQ 传输；CMake 默认 OFF、官方 wheel 构建 ON。**0.3.11.post1 不含此机制**（publisher 代码在 v0.3.11 之后进仓，tag 上无 `kv_event/` 目录、无构建开关）——D1 路径 b 要用须升级 mooncake 版本。
-- **E9. vLLM 事件载荷核对**——✅ 已闭环（结论写在 D1 事实基线 F7-F10）
-  - `BlockStored` 含 `medium` 字段
-  - 两个发布源：引擎发的 GPU 块事件（含 Removed，上游既有）、连接器发的池 put 事件（无 Removed）
-  - 预复制不经过引擎，结构上就没有事件——只能靠控制面补发
+- **E8. mooncake kv_event schema 核对**——✅ 已闭环，结论存档：[summary.md](summary.md)（正式结论写在 D1 F14）
+- **E9. vLLM 事件载荷核对**——✅ 已闭环，结论存档：[summary.md](summary.md)（正式结论写在 D1 F7-F10）
 
 ### B. 服务化重构（骨架可直接开工，接口依赖设计）
 
 - **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），重构成类结构（KeyComputer / SegResolver / StoreClient / Orchestrator），明确状态归属与接口边界，为进程化打基础。**可直接开工**。
 - **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。
 - **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC 候选，与仓内跨语言 RPC 选型一致）。协议字段依赖 D4 定型；通道骨架可先行。
-- **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例启动 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3/D5 耦合）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
+- **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例启动 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3 耦合；D5 已闭环，见 summary）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
 - **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自己产生引擎格式的事件
   - **发布端（pub）**：
     - 直接 import 上游 `ZmqEventPublisher`（`kv_events.py:304`）

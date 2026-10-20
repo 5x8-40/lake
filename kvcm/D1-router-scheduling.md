@@ -34,7 +34,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   - 复制路径不加 pin / lease（F15），副本落位后不受保护，池驱逐策略说收就收。
   - 属主实例（最初写入 key 的引擎）下线后，实测 key 连同所有机器上的副本一起消失——**我们预热到 B 的副本也在其中**（实测 exist 0/32；代码核实清理是副本级、与实测矛盾，归因待 E5——详见 D2 F6b；实测记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
   - mooncake 有 pin 机制（两版本），但都挂在写路径上（`PutStart` / `UpsertStart` 收 `ReplicateConfig`）：
-    - **soft pin**：key 粒度的**限时**驱逐保护——0.3.11 是布尔开关 `with_soft_pin`（`replica.h:84-85` @0.3.11），main 升级为三态 `soft_pin_action`（`replica.h:64-68` @main）；TTL 默认 30min、上限 24h（`types.h:84-90` @main），到期自动失效；驱逐两轮制把它排最后（第一轮只逐无 soft pin 的，凑不够且 `allow_evict_soft_pinned_objects` 时软 pin 也可逐）——机制细节与版本差异以 D2 F1 为准。
+    - **soft pin**：key 粒度的**限时**驱逐保护——0.3.11 是布尔开关 `with_soft_pin`（`replica.h:84-85` @0.3.11），main 升级为三态 `soft_pin_action`（`replica.h:64-68` @main）；TTL 默认 30min、上限 24h（`types.h:86-89` @main），到期自动失效；驱逐两轮制把它排最后（第一轮只逐无 soft pin 的，凑不够且 `allow_evict_soft_pinned_objects` 时软 pin 也可逐）——机制细节与版本差异以 D2 F1 为准。
     - **hard pin**（`with_hard_pin`）：显式 pin，不可驱逐——写入时设置并固化进对象元数据，之后改不了（D2 F1）。
   - **`CreateCopyTask` 没有 config 参数，预复制路径带不了 pin**；也没有给已有 key 事后加/解 pin 的独立 RPC——`SubmitReplicaActionProposal` 不是 pin（action 只有 ADD，`rpc_types.h:17-19`）。预热副本怎么保护归 D2 §2。
 - **F6 引擎 APC（HBM 前缀缓存）私有**：APC 是引擎私有 LRU——无 pin、无池元数据、外部不可见（kv-prefetch.md 方案 A 注意节）。
@@ -270,7 +270,7 @@ flowchart LR
 
 - **分级兜底（最简）**：全本地 > 池远端 > 重算，字典序定级，级内按负载选。
 - **打分制**：命中收益（连续本地满块数 × 分层成本；Dynamo 成本 device 1.0 / host 0.75 / disk 0.25 可借作初值）− 负载惩罚（队列长 / in-flight；在途负载无权威，router 本地记账，参考实现·Dynamo）。
-- **传输成本两级**：显式比较（跨机字节 / 有效带宽 vs 重算成本，不划算换实例重算）或简化（远端副本固定扣分）。
+- **传输成本两种算法**：显式比较（跨机字节 / 有效带宽 vs 重算成本，不划算换实例重算）或简化（远端副本固定扣分）。
 - **传输繁忙的测量（「有效带宽」怎么来）**：网卡/链路计数器采样——Linux RDMA 计数器（`/sys/class/infiniband/*/ports/*/counters`）或 ethtool 统计，按 Δbytes / (链路速率 × Δt) 估链路利用率；实例上报或控制面采集，router 打分把「目标实例传输忙」计入负载惩罚，kvcm 预热/搬迁据此避让与限速（E15）。参考实现：vLLM-Ascend AI-QoS（`tools/ai_qos/` + 官方介绍 `docs/source/user_guide/feature_guide/Ai_QoS_introduction_en.md`，vllm-project/vllm-ascend）——它证明 KVCache 传输与集合通信/算子下发在交换机上真实冲突（生产级问题）；它的解法是执行层流量分级（NPU channel 优先级映射 UB 交换机 Virtual Lane，严格优先级调度），与我们互补：它管「冲突时谁先走」（单机/交换机 QoS），本条管「什么时候搬、往哪台调度」（集群层避让）。
 
 权重待真机校准（与 P7 耦合）；layerwise 下逐层远端更贵，远端成本按 D6 选型修正。

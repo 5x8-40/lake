@@ -346,6 +346,8 @@ kvcm/
 ├── README.md / REPRODUCE.md / EXPERIMENTS.md
 ├── kv-prefetch.md           # 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测）
 ├── D1-router-scheduling.md  # 生产化设计 D1：Router 集成与请求调度
+├── D2-kv-operations.md      # 生产化设计 D2：KV 调度操作集
+├── summary.md               # backlog 闭环条目存档
 └── backlog.md               # 遗留问题与下一步计划（D1-D7 / P1-P8 / E1-E16 登记处）
 ```
 
@@ -356,6 +358,8 @@ kvcm/
 | `EXPERIMENTS.md` | 实验总表 14 条 + 异构实录 + 踩坑记录（含撤回历史） |
 | `kv-prefetch.md` | 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测） |
 | `D1-router-scheduling.md` | 生产化设计 D1：Router 集成与请求调度 |
+| `D2-kv-operations.md` | 生产化设计 D2：KV 调度操作集 |
+| `summary.md` | backlog 闭环条目存档 |
 | `backlog.md` | 遗留问题与下一步计划（设计决策 D1-D7 / 潜在问题 P1-P8 / 工程项 E1-E16） |
 
 ## 操作参考

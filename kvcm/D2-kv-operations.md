@@ -50,7 +50,7 @@
   - 设置方式（per-key，config 随每次写请求携带）
     - 0.3.11：`ReplicateConfig.with_soft_pin / with_hard_pin` 布尔开关（`replica.h:84-85` @0.3.11）；soft pin 时长取全局配置 `default_kv_soft_pin_ttl`
       - 坑：布尔默认 false——upsert 一个已有 pin 的 key 时忘带 true，已有 pin 被清除（F3②）
-    - main：soft pin 升级**三态** `SoftPinAction`（`replica.h:64-68`）——`PRESERVE`（=0，**默认值**，不动现状）/ `ENABLE`（开启，可带 `soft_pin_ttl_ms` 单次覆盖，省略用 master 默认 30min、上限 24h，`types.h:85-89`）/ `DISABLE`（清除）——三态修掉了 0.3.11 的布尔坑；无新增 RPC 入口
+    - main：soft pin 升级**三态** `SoftPinAction`（`replica.h:64-68`）——`PRESERVE`（=0，**默认值**，不动现状）/ `ENABLE`（开启，可带 `soft_pin_ttl_ms` 单次覆盖，省略用 master 默认 30min、上限 24h，`types.h:86-89`）/ `DISABLE`（清除）——三态修掉了 0.3.11 的布尔坑；无新增 RPC 入口
   - 可达性（关键约束）
     - 新建 key：写入时两种 pin 都可带
     - 已有 key：只能改 soft pin（经 upsert，F3）；hard pin 创建时固化、之后改不了（`master_service.cpp:1738` 注释 @0.3.11）
@@ -164,6 +164,8 @@
     - 继续用 Python → 需要给绑定层打补丁（改 mooncake）
 
 ### F13 main 相对 0.3.11 的能力增量（按「对 kvcm 有什么用」分六组；各处引用统一指向本条）
+
+- 版本归属逐条标注：标「两版本同有」的是查缺补漏时归拢在此的既有机制、非 main 增量；未标注的条目才是 main 新增
 
 - **消费方四分总纲**（读六组前先立框架）：main 的能力补齐分四个消费方向
   - **master 内部自治**：动态副本、热度统计——按访问统计自动调节，不对外
