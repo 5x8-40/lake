@@ -48,12 +48,12 @@
     - 保护不是绝对的：master 驱逐分两轮——第一轮只从无 soft pin 的 key 里挑；凑不够且 `allow_evict_soft_pinned_objects`（默认 true）时，第二轮才逐有 soft pin 的。语义 =「最后才被逐」，不是「不逐」
   - **hard pin** = 不可驱逐（绝对保护，无到期概念）；被 hard pin 的 key 仍可正常读写、upsert
   - 设置方式（per-key，config 随每次写请求携带）
-    - 0.3.11：`ReplicateConfig.with_soft_pin / with_hard_pin` 布尔开关（`replica.h:84-85`）；soft pin 时长取全局配置 `default_kv_soft_pin_ttl`
+    - 0.3.11：`ReplicateConfig.with_soft_pin / with_hard_pin` 布尔开关（`replica.h:84-85` @0.3.11）；soft pin 时长取全局配置 `default_kv_soft_pin_ttl`
       - 坑：布尔默认 false——upsert 一个已有 pin 的 key 时忘带 true，已有 pin 被清除（F3②）
     - main：soft pin 升级**三态** `SoftPinAction`（`replica.h:64-68`）——`PRESERVE`（=0，**默认值**，不动现状）/ `ENABLE`（开启，可带 `soft_pin_ttl_ms` 单次覆盖，省略用 master 默认 30min、上限 24h，`types.h:85-89`）/ `DISABLE`（清除）——三态修掉了 0.3.11 的布尔坑；无新增 RPC 入口
   - 可达性（关键约束）
     - 新建 key：写入时两种 pin 都可带
-    - 已有 key：只能改 soft pin（经 upsert，F3）；hard pin 创建时固化、之后改不了（`master_service.cpp:1737` 注释 @0.3.11）
+    - 已有 key：只能改 soft pin（经 upsert，F3）；hard pin 创建时固化、之后改不了（`master_service.cpp:1738` 注释 @0.3.11）
   - `CreateCopyTask` 不接受写请求配置（两版本同）→ kvcm 的复制路径带不了 pin，pin 必须事后单独加
   - 排除项：`AddReplica`（`master_service.cpp:1426` @0.3.11）
     - 是磁盘副本登记接口，只收 LOCAL_DISK、不带 pin——对「已有 key 事后加 pin」此路不通
@@ -98,7 +98,7 @@
   3. **级联清理**：client 死亡 → 其 seg 全摘 → 挂在死 seg 上的副本记录清掉（disk 副本随死 client 清）——按 seg/client 维度扫，**不看 key 属主**；master 自动触发（F6b 有代码与实测的口径矛盾，归 E5）
 - **F6b 级联删除：实测现象与代码核实不一致（归因归 E5）**
   - **实测**（D1 F5 / EXPERIMENTS #3）：属主 A 重启 → client TTL 过期 → key 记录连同全部副本记录（**含预热到 B seg 上的**）消失，`batch_is_exist` 0/32；现象疑似「副本存活性绑定属主 client」
-  - **代码核实**（0.3.11.post1）：client 过期处理（`master_service.cpp:4930-5015`）= unmount 该 client 全部 seg + `ClearInvalidHandles` 全量扫——清理是**副本级**的（`CleanupStaleHandles :2530`）：内存副本随死 seg 清、disk 副本随死登记 client 清。**活 seg 上其他 client 的副本按代码不该被清**；全库无「按 key 属主删」路径
+  - **代码核实**（0.3.11.post1）：client 过期处理（`master_service.cpp:4930-5015` @0.3.11）= unmount 该 client 全部 seg + `ClearInvalidHandles` 全量扫——清理是**副本级**的（`CleanupStaleHandles :2530`）：内存副本随死 seg 清、disk 副本随死登记 client 清。**活 seg 上其他 client 的副本按代码不该被清**；全库无「按 key 属主删」路径
   - **不一致点**：实测时 B 的 seg 活着、B 副本 COMPLETE 可读（B 命中 88.2%），按代码应存活，实测却消失——待 E5 对照实验厘清（master 是否与引擎同机一起死了 / 副本实际状态 / 其他清理路径）
   - **设计含义**：0.3.11 过渡期的 retain 手段有效性依赖口径判定（§4）——E5 证实「按 key 属主删」则改属主有效，证实「按 seg 清理」则 move 到活 seg 有效；main 的池机制（retained client / DFS 副本，F13）不依赖此口径，是 E5 之外的独立解
 
@@ -120,7 +120,7 @@
 - **副本没有属主字段，生死跟随所在 seg**：copy 到 B 的副本属 B 的 seg——源引擎下线不影响它；目标引擎（B）下线它才随 seg 失效（代码口径；与实测的不一致见 F6b）
 - **介质边界：copy/move 只在 DRAM seg 之间，接不了 SSD**（两版本一致）
   - disk seg 不在 seg 名字空间：0.3.11 挂盘单独登记在 client 名下（`segment.cpp:133` `MountLocalDiskSegment`，不进 seg 名注册表）；main 改由 `local_ssd_manager_.RegisterClient` 按 client 登记（`master_service.cpp:8407`），同样没有 seg 名——copy/move 的目标校验只认内存 seg 名，**disk 做不了目标**
-  - copy 源从「副本的 seg 名」里挑，而 disk 副本没有 seg 名（`replica.h:610` `get_segment_names`，两版本同一实现）——**SSD 副本做不了源**
+  - copy 源从「副本的 seg 名」里挑，而 disk 副本没有 seg 名（`get_segment_names`，`replica.h:610` @0.3.11 / `:886` @main，两版本同一实现）——**SSD 副本做不了源**
   - 推论：跨介质迁移只能走池自己的通道——offload（降 SSD）/ promotion（提 DRAM），copy/move 帮不上忙（§3）
 
 ### lease 与驱逐
@@ -136,9 +136,9 @@
     - kvcm 同周期续租的 key 剩余 TTL 趋同，本就无排序区分度
 - **F9 一次续租调用同续两个时钟**（`GrantLease`，`master_service.h:938` @0.3.11）
   - `lease_timeout` 续到 `now + default_kv_lease_ttl`；若 key 已有 soft pin，`soft_pin_timeout` 续到 `now + default_kv_soft_pin_ttl`（max 语义，只延不缩）
-  - 配置值
-    - 0.3.11：两个 TTL 均为 master 必填配置（`master_config.h:119-120`）；测试床配 `default_kv_lease_ttl=11s`（`start_master.sh:34`），soft pin TTL 未显式配置
-    - main：soft pin TTL 默认 30min（`types.h:86`）；lease TTL 分两层——内嵌服务层 `MasterServiceConfig` 有默认 10s（`master_config.h:893`，常量 `types.h:84`），supervisor 部署层仍必填（`master_config.h:238`、未设抛错 `:500`）
+  - 配置值（两版本都有默认、均非必填；flag 默认 = 内嵌层 `MasterServiceConfig` 默认 = `types.h` 常量，三处同源）
+    - lease TTL：0.3.11 默认 5s（`master.cpp:33`、`types.h:85-86` @0.3.11）→ main 默认 10s（`master.cpp:49`、`types.h:84-85` @main）；测试床显式覆盖为 11s（`start_master.sh:34`）
+    - soft pin TTL：两版本默认均 30min（flag 默认 `"1800000"`，`master.cpp:34` @0.3.11 / `:50` @main；`types.h:87-88` @0.3.11 / `:86-87` @main）；上限 24h 为 main 新增（`types.h:88-89` @main，0.3.11 无上限配置）
   - `ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`）；`ProbeKey` 不续（纯探测：结果为 true 只说「调用那一刻在」，`master_service.h:268` @main）——kvcm 的续租调用用前者；**`ProbeKey` 为 main 新增、0.3.11 不含**
 - **F10 lease 时长是全局读租约，不是 kvcm 私有参数**
   - 调大（如 5min）的连锁反应：任何 key 被读一次 → 窗口内不可逐 → 驱逐候选池缩小；极端（高流量池）候选不足时，压力集中到无 lease 的 key——**新 put 的 key 恰好出生无租约（背景概念），首当其冲**
@@ -148,7 +148,7 @@
 
 - **F11 kvcm 拿不到引擎的 client UUID**
   - UUID 在客户端进程构造时随机生成（`client_service.cpp:431`），无法按实例名推算
-  - C++ 客户端有公开 `getClientId()`（`client_service.h:67`），但 **Python 绑定 0.3.11 与 main 都未暴露**——vLLM 走 Python，读不到自己的 UUID
+  - C++ 客户端有公开 `getClientId()`（`client_service.h:80` @main），但 **Python 绑定 0.3.11 与 main 都未暴露**——vLLM 走 Python，读不到自己的 UUID
   - master 的 RPC 没有「key → 属主 UUID」查询
     - `GetReplicaList` 返回副本描述符（副本的位置信息），内存副本的只有 seg 名和地址，不含 client_id（`replica.h:240`）
     - master 内部有现成的「seg 名 → client UUID」查询 `GetClientIdBySegmentName`（CreateCopyTask 自己就在用），但没暴露成 RPC
@@ -726,7 +726,7 @@ sequenceDiagram
   - 侵入改引擎；且引擎不知道哪些该 pin，全 pin 则第一轮驱逐无候选、直接进第二轮——pin 失去区分度 = 没有 pin
 - **读锁（kvcm 持续持有读引用挡驱逐）——机制不存在**
   - 设想：refcnt>0 的副本被驱逐硬过滤跳过（F8），kvcm 挂住一个读引用即可 pin
-  - 实情：读者的保护是 lease 不是 refcnt——`GetReplicaList` 两版本只授 lease（`master_service.cpp:1112` @0.3.11），不碰 refcnt；refcnt 的增减全在 copy/move/offload/promotion 任务路径（`:1936`/`:2151`/`:2890` @0.3.11），是**任务级**保护、master 内部自用——两版本均无「读者持引用」RPC，kvcm 无锁可持
+  - 实情：读者的保护是 lease 不是 refcnt——`GetReplicaList` 两版本只授 lease（`master_service.cpp:1113` @0.3.11），不碰 refcnt；refcnt 的增减全在 copy/move/offload/promotion 任务路径（`:1936`/`:2151`/`:2890` @0.3.11），是**任务级**保护、master 内部自用——两版本均无「读者持引用」RPC，kvcm 无锁可持
   - 想要此形态只能池侧扩展（给 mooncake 加读者引用 RPC），不作现役方案
 
 ### soft pin 级（驱逐排最后，极端情况可逐）：空写 upsert 设 soft pin
@@ -821,7 +821,7 @@ sequenceDiagram
   - 写回模式下先停 keepalive、等 lease 过期（否则驱逐轮不到它，永不落盘）
   - 落盘时机（kvcm 只能促、不能定）
     - 写穿模式：SSD 副本**写入时已有**——数据早已在盘上，DRAM 副本待自然驱逐释放即可（何时释放无所谓，它只是个缓存副本）
-    - 写回模式：key 进驱逐候选后，池驱逐时自动先落 SSD 再释放 DRAM（`BatchEvict` 里 `PushOffloadingQueue`，`master_service.cpp:11622` @0.3.11）——时机不可控：池不满就不驱逐、不落盘
+    - 写回模式：key 进驱逐候选后，池驱逐时自动先落 SSD 再释放 DRAM（`BatchEvict` 里 `PushOffloadingQueue`，`master_service.cpp:4545` @0.3.11 / `:11624` @main）——时机不可控：池不满就不驱逐、不落盘
   - **核验**：`GetReplicaList` 确认 disk 副本在册（降层完成的判定）
 - **缺口（真功能缺口，归池侧扩展）**
   - **写回模式下无确定性 demote**：offload 任务的入队时机只有 put 完成时（写穿）和驱逐选中时（写回）两处（两版本同）——kvcm 想让指定 key 立刻、确定性地落盘，做不到；池不满就永不落盘

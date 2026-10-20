@@ -263,7 +263,7 @@
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例启动 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3/D5 耦合）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
 - **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自己产生引擎格式的事件
   - **发布端（pub）**：
-    - 直接 import 上游 `ZmqEventPublisher`（`kv_events.py:305`）
+    - 直接 import 上游 `ZmqEventPublisher`（`kv_events.py:304`）
     - 事件字段取自 keys.py 的中间产物（hash 链 / token ids）
     - READY 核验后按目标实例各发一条 `BlockStored`
     - 每个目标实例一个发布端点；「端点 → 实例」注册归 D4/E13

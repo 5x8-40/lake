@@ -42,7 +42,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
   - lease 挂在 key 的元数据上（`metadata.lease_`，group 内共享 `RegisterGroupMember:1669`），副本没有独立 TTL。
   - 读路径续租：`GrantReadLease(default_kv_lease_ttl_)`（`ExistKeyImpl:3299` / `GetReplicaList:4401` / `BatchGetReplicaList:4566`）；`CopyStart` 不触碰 lease（`:6444` 起）。
   - 删除与驱逐：TTL 到期 / 驱逐一律走 `EraseMetadata`——删 key 元数据并释放**全部**副本（`:2308-2313` 注释、`:2374-2375`）；驱逐候选必须 lease 已过期（`:8117` / `:8299` / `:12434`）。
-  - 续租 API：`ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`，`:3271` / `:3307` @main）；`ProbeKey` / `BatchProbeKey` 不续租（`:3276` / `:3312` @main；`ProbeKey` 为 main 新增、0.3.11 不含——D2 F9）；TTL 值 = master 配置（0.3.11 必填；main 内嵌服务层默认 10s、supervisor 部署层必填，`master_config.h:893`/`:238` @main；测试床配 11s——D2 F9）。
+  - 续租 API：`ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`，`:3271` / `:3307` @main）；`ProbeKey` / `BatchProbeKey` 不续租（`:3276` / `:3312` @main；`ProbeKey` 为 main 新增、0.3.11 不含——D2 F9）；TTL 值 = master 配置（两版本都有默认：0.3.11 = 5s → main = 10s；测试床显式覆盖为 11s——口径与出处见 D2 F9）。
   - 推论一：lease 在 key 上，不存在「原副本 TTL 到、复制的副本没到」的状态；removed 是 key 全局事件，无需位置。
   - 推论二：复制不续租，READY 后一个 TTL 窗口内无流量即进入可驱逐状态——控制面需有界保活（周期 `batch_is_exist`，kvcm 现成调用）；保活必须有界，无限续租事实上等于 pin，池永远收不走这些 key。保活策略归 D3。
 
@@ -50,9 +50,9 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 - **F7 事件 schema 带介质字段**：`MEDIUM_GPU` / `MEDIUM_CPU`（上游 `vllm/distributed/kv_events.py:51-52`）；`BlockStored{block_hashes, parent_block_hash, token_ids, block_size, medium}`（`:56-68`）。medium 标记 KV 在哪种介质上——gpu = HBM 显存、cpu = DRAM 内存池；router 据此区分命中层级（§5 分层成本）。
 - **F8 事件有两个发布源**：
-  1. **引擎核（GPU/APC 块）**：上游 `BlockPool` 在块进 HBM 缓存时发 `BlockStored(medium="gpu")`、驱逐时发 `BlockRemoved(medium="gpu")`（上游 `vllm/v1/core/block_pool.py:362` / `:548` / `:621`）；vllm-ascend 的 coordinator patch 原样建 `BlockPool` 并透传门控（`patch_kv_cache_coordinator.py:150-154`）。
-  2. **连接器（池 put）**：worker 侧在引擎自己 put 成功后生成 `BlockStored(medium="cpu")`（`kv_transfer.py:1162`、`pool_worker.py:3111`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py:213`）；门控 `enable_kv_cache_events`（`pool_scheduler.py:108`）。池副本的删除/驱逐不在这条引擎通道上发——那是 master publisher 的事（另一条通道，F14，0.3.11 不含）。
-  - 范围：本部署只挂 AscendStoreConnector；`preempt_offload` connector 另有事件路径（`preempt_offload/manager.py:732`，cpu_block_pool 事件），不在本部署范围。
+  1. **引擎核（GPU/APC 块）**：上游 `BlockPool` 在块进 HBM 缓存时发 `BlockStored(medium="gpu")`、驱逐时发 `BlockRemoved(medium="gpu")`（上游 `vllm/v1/core/block_pool.py:362` / `:548` / `:621`）；vllm-ascend 的 coordinator patch 原样建 `BlockPool` 并透传门控（`patch_kv_cache_coordinator.py:120-127`）。
+  2. **连接器（池 put）**：worker 侧在引擎自己 put 成功后生成 `BlockStored(medium="cpu")`（`kv_transfer.py:870-876`、`pool_worker.py:2071-2077`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py:198`）；门控 `enable_kv_cache_events`（`pool_worker.py:328`）。池副本的删除/驱逐不在这条引擎通道上发——那是 master publisher 的事（另一条通道，F14，0.3.11 不含）。
+  - 范围：本部署只挂 AscendStoreConnector；recompute_cpu_offload（旧名 preempt_offload）connector 另有事件路径（`recompute_cpu_offload/manager.py:107`，cpu_block_pool 事件），不在本部署范围。
 - **F9 盲区一：预复制在两条通道上都不会自动产生事件**：引擎事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码），`create_copy_task` 完全在引擎之外 → 引擎通道**结构上**不会有预复制事件；master publisher（F14，main 才有、0.3.11 不含）是另一条通道，其复制路径同样零发布——所以预复制落位只能由 kvcm 补发（§2 方案 a）。
 - **F10 盲区二：引擎事件通道上看不到池副本的删除**：vllm-ascend 全仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / 属主下线删除，F5）对引擎事件消费者不可见。注意三条通道别混淆：HBM 淘汰有 Removed（引擎通道，F8-1）；池删除有 removed（master publisher 通道，F14，0.3.11 不含）；引擎通道的池 put 只有 Stored 没有 Removed。
 - **F14 池原生事件流（main 有，0.3.11 无）**：mooncake main 有 `KvEventPublisher`（`mooncake-store/include/kv_event/kv_event_publisher.h`），ZMQ 传输，schema 套用 RFC #1527。
@@ -230,7 +230,7 @@ flowchart LR
 | `block_size` | 参数 |
 | `medium` | 与引擎池 put 事件对齐（F8；上游常量 `MEDIUM_CPU`，`kv_events.py:51`） |
 
-- **发布组件**：直接 import 上游 `ZmqEventPublisher`（`kv_events.py:305`）——构造给 `endpoint`/`topic`，`publish(EventBatch)` 一次调用；wire 格式（topic + seq + msgpack 三帧）与 replay buffer 内置。kvcm 容器路径本就已 import vllm / vllm_ascend（keys.py），零新增依赖；沿用 keys.py/common.py 的 lazy import 形态，debug 路径不背 vllm。
+- **发布组件**：直接 import 上游 `ZmqEventPublisher`（`kv_events.py:304`）——构造给 `endpoint`/`topic`，`publish(EventBatch)` 一次调用；wire 格式（topic + seq + msgpack 三帧）与 replay buffer 内置。kvcm 容器路径本就已 import vllm / vllm_ascend（keys.py），零新增依赖；沿用 keys.py/common.py 的 lazy import 形态，debug 路径不背 vllm。
 - **身份（哪台机器）**：事件体无实例字段（仅 `data_parallel_rank`，`kv_events.py:39`），上游机制是**身份 = 端点**——索引按订阅端点把事件归入实例；一个实例多个端点有现成先例（DP rank 端口偏移 `offset_endpoint_port`，`kv_events.py:528`）。因此 kvcm **每个目标实例开一个发布端点**，由编排把「端点 → 实例」注册给索引（索引做成独立进程时走 RFC #1403 `/register`，与引擎端点同一通道；内置形态同理，归 D4/E13）；索引把补发端点并入该实例的端点集合即可，不需要新概念。ZMQ topic 是消息分拣标签（订阅端按它过滤消息），多个发布者可共用同一个 topic——它标不出「来自哪台机器」，所以身份只能走端点。
 - **发布时机**：READY 核验通过（`precopy.py::assert_targets_have_replicas`）后，一次预复制发一条 `BlockStored`（block_hashes = 前缀连续满块链；引擎侧经 `KVEventAggregator` 跨 rank 聚合后同语义）。
 - **幂等**：索引是集合语义，补发与引擎自发重复无害；重复预热重复补发亦无害（池层幂等 F11）。
