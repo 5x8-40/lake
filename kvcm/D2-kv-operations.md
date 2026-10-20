@@ -243,12 +243,16 @@
 | 下线迁移 | copy + remove（或 move 一步完成） |
 
 - **操作完成信号**：每个原子操作都有完成确认——任务类（copy/move）查 `QueryTask`，再统一核验副本状态（`GetReplicaList`；main 用零副作用的 admin 版，F11b），kvcm 据以更新台账
-- **READY** 是完成信号里特指「可以把请求调度过来」的那一类：DRAM 副本就位、核验通过时上报（D1 §4）
-  - 有 READY（3 个）：**copy（预热）、move、promote**——「让某实例新具备本地命中条件」的操作，完成核验同任务框架（QueryTask + `GetReplicaList`，F7）；move 附带源实例索引失效（源删）
+- **READY** 是完成信号里特指「可以把请求调度过来」的那一类
+  - 含义：目标实例的 DRAM 副本已写好、kvcm 核验通过后，上报 Router（D1 §4）
+  - 有 READY（3 个）：**copy（预热）、move、promote**
+    - 共同点：做完之后，某个实例新具备了「请求发过来就能直接用本机 KV」的条件
+    - 核验方式相同：查 `QueryTask` 确认任务结束，再查 `GetReplicaList` 确认副本状态（F7）
+    - move 多一件事：源副本被删，要同步通知索引「源实例不再有这份 KV」
   - 无 READY（5 个）：
-    - keepalive / pin / retain——数据位置不变，完成 = RPC 返回 + 台账
-    - demote——完成信号 = 「盘副本在册」，只更新台账、不上报调度（可调度性下降，语义相反）
-    - release——反向信号：台账清除 + 索引同步失效
+    - keepalive / pin / retain：不动数据，RPC 返回即完成，记台账即可
+    - demote：完成信号 = 「盘副本在册」，只记台账——降层后请求本来就不能直接发过去，没有「可调度」可上报
+    - release：语义相反——不是「可以发过去」，而是「别再发过来」：清台账 + 同步索引删除
 
 - copy 与 move 的分工
   - **copy 保副本数**：新增副本，源由 master 随机选（F7）
