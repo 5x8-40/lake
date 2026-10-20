@@ -5,11 +5,11 @@
   - 本文定这些操作的语义、实现机制、失败处理
 - 状态：**设计完成**
   - §1 操作集框架：闭环——八项操作业界逐项对照、完备性审计、kvcm 能力边界（只能被动等池的真缺口 2 条，归池侧扩展 vs 无专用 RPC 但组合可达 7 条）
-  - §2 pin：候选已摆平；落地裁决依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞
+  - §2 pin：候选已列出；落地选择依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞
   - §3 demote / promote：设计完成
-  - §4 retain / release：定型；retain 的池机制正式路径在 main（retained client 或 DFS 副本，F13），0.3.11 下的过渡手段待 E5 实验裁决（F6b）
-  - 未决问题（详见 backlog）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）；级联删除「代码 vs 实测」口径不一致（E5）
-- 上游问题：backlog D2（kvcm 对池内 KV 的操作面）
+  - §4 retain / release：定型；retain 的池机制正式路径在 main（retained client 或 DFS 副本，F13），0.3.11 下的过渡手段待 E5 实验判定（F6b）
+  - 未决问题（详见 summary）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）；级联删除「代码 vs 实测」口径不一致（E5）
+- 上游问题：summary D2（kvcm 对池内 KV 的操作面）
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
   - **0.3.11.post1**：测试床实际部署的 wheel
   - **main @ 1fc27b62**：submodule 源码，代表升级后获得的能力
@@ -37,7 +37,7 @@
   - 清理路径分三种、权限各不同（F6 末尾全图）：整 key 删（Remove 系，**不鉴权**，kvcm 可用）/ 定点清单个副本（`BatchReplicaClear`，**限 key 属主自调**，kvcm 调不动）/ 级联清理（client 死亡自动触发）
 - **lease（读租约）**
   - 读路径（`GetReplicaList` / `ExistKey`）授予，lease 期内该 key **绝对不可逐**（驱逐硬过滤直接跳过，F8）
-  - **新 put 的 key 出生无租约**：`PutEnd` 里 `GrantLease(0, ...)` 把 lease_timeout 设为 now——「the object has no lease at beginning」（`master_service.cpp:1422` 注释 @0.3.11）；第一次被读/touch 才获得保护
+  - **新 put 的 key 出生无租约**：`PutEnd` 里 `GrantLease(0, ...)` 把 lease_timeout 设为 now——「the object has no lease at beginning」（`master_service.cpp:1422` 注释 @0.3.11）；第一次被读/被续租才获得保护
 - **kvcm 自身 = mooncake client**：client 是库不是独立进程；kvcm 调 copy/move/upsert 必须链接它，构造时自动持有一个 UUID——§2 方案一中「kvcm 自己的 UUID」零额外成本
 
 ### pin 机制
@@ -48,12 +48,12 @@
     - 保护不是绝对的：master 驱逐分两轮——第一轮只从无 soft pin 的 key 里挑；凑不够且 `allow_evict_soft_pinned_objects`（默认 true）时，第二轮才逐有 soft pin 的。语义 =「最后才被逐」，不是「不逐」
   - **hard pin** = 不可驱逐（绝对保护，无到期概念）；被 hard pin 的 key 仍可正常读写、upsert
   - 设置方式（per-key，config 随每次写请求携带）
-    - 0.3.11：`ReplicateConfig.with_soft_pin / with_hard_pin` 布尔开关（`replica.h:84-85`）；soft pin 时长取全局配置 `default_kv_soft_pin_ttl`
+    - 0.3.11：`ReplicateConfig.with_soft_pin / with_hard_pin` 布尔开关（`replica.h:84-85` @0.3.11）；soft pin 时长取全局配置 `default_kv_soft_pin_ttl`
       - 坑：布尔默认 false——upsert 一个已有 pin 的 key 时忘带 true，已有 pin 被清除（F3②）
-    - main：soft pin 升级**三态** `SoftPinAction`（`replica.h:64-68`）——`PRESERVE`（=0，**默认值**，不动现状）/ `ENABLE`（开启，可带 `soft_pin_ttl_ms` 单次覆盖，省略用 master 默认 30min、上限 24h，`types.h:85-89`）/ `DISABLE`（清除）——三态修掉了 0.3.11 的布尔坑；无新增 RPC 入口
+    - main：soft pin 升级**三态** `SoftPinAction`（`replica.h:64-68`）——`PRESERVE`（=0，**默认值**，不动现状）/ `ENABLE`（开启，可带 `soft_pin_ttl_ms` 单次覆盖，省略用 master 默认 30min、上限 24h，`types.h:86-89`）/ `DISABLE`（清除）——三态修掉了 0.3.11 的布尔坑；无新增 RPC 入口
   - 可达性（关键约束）
     - 新建 key：写入时两种 pin 都可带
-    - 已有 key：只能改 soft pin（经 upsert，F3）；hard pin 创建时固化、之后改不了（`master_service.cpp:1737` 注释 @0.3.11）
+    - 已有 key：只能改 soft pin（经 upsert，F3）；hard pin 创建时固化、之后改不了（`master_service.cpp:1738` 注释 @0.3.11）
   - `CreateCopyTask` 不接受写请求配置（两版本同）→ kvcm 的复制路径带不了 pin，pin 必须事后单独加
   - 排除项：`AddReplica`（`master_service.cpp:1426` @0.3.11）
     - 是磁盘副本登记接口，只收 LOCAL_DISK、不带 pin——对「已有 key 事后加 pin」此路不通
@@ -98,9 +98,9 @@
   3. **级联清理**：client 死亡 → 其 seg 全摘 → 挂在死 seg 上的副本记录清掉（disk 副本随死 client 清）——按 seg/client 维度扫，**不看 key 属主**；master 自动触发（F6b 有代码与实测的口径矛盾，归 E5）
 - **F6b 级联删除：实测现象与代码核实不一致（归因归 E5）**
   - **实测**（D1 F5 / EXPERIMENTS #3）：属主 A 重启 → client TTL 过期 → key 记录连同全部副本记录（**含预热到 B seg 上的**）消失，`batch_is_exist` 0/32；现象疑似「副本存活性绑定属主 client」
-  - **代码核实**（0.3.11.post1）：client 过期处理（`master_service.cpp:4930-5015`）= unmount 该 client 全部 seg + `ClearInvalidHandles` 全量扫——清理是**副本级**的（`CleanupStaleHandles :2530`）：内存副本随死 seg 清、disk 副本随死登记 client 清。**活 seg 上其他 client 的副本按代码不该被清**；全库无「按 key 属主删」路径
-  - **不一致点**：实测时 B 的 seg 活着、B 副本 COMPLETE 可读（B 命中 88.2%），按代码应存活，实测却消失——待 E5 对照实验厘清（master 是否同机陪葬 / 副本实际状态 / 其他清理路径）
-  - **设计含义**：0.3.11 过渡期的 retain 手段有效性依赖口径裁决（§4）——E5 证实「按 key 属主删」则改属主有效，证实「按 seg 清理」则 move 到活 seg 有效；main 的池机制（retained client / DFS 副本，F13）不依赖此口径，是 E5 之外的独立解
+  - **代码核实**（0.3.11.post1）：client 过期处理（`master_service.cpp:4930-5015` @0.3.11）= unmount 该 client 全部 seg + `ClearInvalidHandles` 全量扫——清理是**副本级**的（`CleanupStaleHandles :2530`）：内存副本随死 seg 清、disk 副本随死登记 client 清。**活 seg 上其他 client 的副本按代码不该被清**；全库无「按 key 属主删」路径
+  - **不一致点**：实测时 B 的 seg 活着、B 副本 COMPLETE 可读（B 命中 88.2%），按代码应存活，实测却消失——待 E5 对照实验厘清（master 是否与引擎同机一起死了 / 副本实际状态 / 其他清理路径）
+  - **设计含义**：0.3.11 过渡期的 retain 手段有效性依赖口径判定（§4）——E5 证实「按 key 属主删」则改属主有效，证实「按 seg 清理」则 move 到活 seg 有效；main 的池机制（retained client / DFS 副本，F13）不依赖此口径，是 E5 之外的独立解
 
 ### copy / move 机制
 
@@ -120,7 +120,7 @@
 - **副本没有属主字段，生死跟随所在 seg**：copy 到 B 的副本属 B 的 seg——源引擎下线不影响它；目标引擎（B）下线它才随 seg 失效（代码口径；与实测的不一致见 F6b）
 - **介质边界：copy/move 只在 DRAM seg 之间，接不了 SSD**（两版本一致）
   - disk seg 不在 seg 名字空间：0.3.11 挂盘单独登记在 client 名下（`segment.cpp:133` `MountLocalDiskSegment`，不进 seg 名注册表）；main 改由 `local_ssd_manager_.RegisterClient` 按 client 登记（`master_service.cpp:8407`），同样没有 seg 名——copy/move 的目标校验只认内存 seg 名，**disk 做不了目标**
-  - copy 源从「副本的 seg 名」里挑，而 disk 副本没有 seg 名（`replica.h:610` `get_segment_names`，两版本同一实现）——**SSD 副本做不了源**
+  - copy 源从「副本的 seg 名」里挑，而 disk 副本没有 seg 名（`get_segment_names`，`replica.h:610` @0.3.11 / `:886` @main，两版本同一实现）——**SSD 副本做不了源**
   - 推论：跨介质迁移只能走池自己的通道——offload（降 SSD）/ promotion（提 DRAM），copy/move 帮不上忙（§3）
 
 ### lease 与驱逐
@@ -133,13 +133,13 @@
   - 第一轮：无 soft pin 的候选；不够且 `allow_evict_soft_pinned_objects_` 时进第二轮：soft pin 候选
   - **两轮排序依据都是 `lease_timeout`（租约到期早晚 ≈ 最近被读时间）**，不是 LRU 计数、也不是 soft pin 剩余 TTL
     - soft pin TTL 的作用仅是「pin 还有效吗」——决定进哪一轮，不作排序依据
-    - kvcm 同周期 touch 的 key 剩余 TTL 趋同，本就无排序区分度
-- **F9 一次 touch 同续两个时钟**（`GrantLease`，`master_service.h:938` @0.3.11）
+    - kvcm 同周期续租的 key 剩余 TTL 趋同，本就无排序区分度
+- **F9 一次续租调用同续两个时钟**（`GrantLease`，`master_service.h:938` @0.3.11）
   - `lease_timeout` 续到 `now + default_kv_lease_ttl`；若 key 已有 soft pin，`soft_pin_timeout` 续到 `now + default_kv_soft_pin_ttl`（max 语义，只延不缩）
-  - 配置值
-    - 0.3.11：两个 TTL 均为 master 必填配置（`master_config.h:119-120`）；测试床配 `default_kv_lease_ttl=11s`（`start_master.sh:34`），soft pin TTL 未显式配置
-    - main：soft pin TTL 默认 30min（`types.h:86`）；lease TTL 仍必填
-  - `ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`）；`ProbeKey` 不续（纯探测：结果为 true 只说「调用那一刻在」，`master_service.h:268` @main）——kvcm 的 touch 用前者；**`ProbeKey` 为 main 新增、0.3.11 不含**
+  - 配置值（两版本都有默认、均非必填；flag 默认 = 内嵌层 `MasterServiceConfig` 默认 = `types.h` 常量，三处同源）
+    - lease TTL：0.3.11 默认 5s（`master.cpp:33`、`types.h:85-86` @0.3.11）→ main 默认 10s（`master.cpp:49`、`types.h:84-85` @main）；测试床显式覆盖为 11s（`start_master.sh:34`）
+    - soft pin TTL：两版本默认均 30min（flag 默认 `"1800000"`，`master.cpp:34` @0.3.11 / `:50` @main；`types.h:87-88` @0.3.11 / `:86-87` @main）；上限 24h 为 main 新增（`types.h:88-89` @main，0.3.11 无上限配置）
+  - `ExistKey` / `BatchExistKey` 顺带续租（`grant_lease=true`）；`ProbeKey` 不续（纯探测：结果为 true 只说「调用那一刻在」，`master_service.h:268` @main）——kvcm 的续租调用用前者；**`ProbeKey` 为 main 新增、0.3.11 不含**
 - **F10 lease 时长是全局读租约，不是 kvcm 私有参数**
   - 调大（如 5min）的连锁反应：任何 key 被读一次 → 窗口内不可逐 → 驱逐候选池缩小；极端（高流量池）候选不足时，压力集中到无 lease 的 key——**新 put 的 key 恰好出生无租约（背景概念），首当其冲**
   - soft pin 的设计意义正是解耦：lease 保持短（驱逐候选充足）+ pin 给少数 key 定向长保护
@@ -148,14 +148,14 @@
 
 - **F11 kvcm 拿不到引擎的 client UUID**
   - UUID 在客户端进程构造时随机生成（`client_service.cpp:431`），无法按实例名推算
-  - C++ 客户端有公开 `getClientId()`（`client_service.h:67`），但 **Python 绑定 0.3.11 与 main 都未暴露**——vLLM 走 Python，读不到自己的 UUID
+  - C++ 客户端有公开 `getClientId()`（`client_service.h:80` @main），但 **Python 绑定 0.3.11 与 main 都未暴露**——vLLM 走 Python，读不到自己的 UUID
   - master 的 RPC 没有「key → 属主 UUID」查询
     - `GetReplicaList` 返回副本描述符（副本的位置信息），内存副本的只有 seg 名和地址，不含 client_id（`replica.h:240`）
     - master 内部有现成的「seg 名 → client UUID」查询 `GetClientIdBySegmentName`（CreateCopyTask 自己就在用），但没暴露成 RPC
-  - kvcm 与引擎之间**没有直接通道**：kvcm 的视野来自 master 的 segment 信息（seg 名 = `IP:rpc_port`，见 [README.md](README.md)）；「端点 → 实例」的注册方向是 kvcm 注册给索引（backlog D4/E13），不是引擎注册给 kvcm
+  - kvcm 与引擎之间**没有直接通道**：kvcm 的视野来自 master 的 segment 信息（seg 名 = `IP:rpc_port`，见 [README.md](README.md)）；「端点 → 实例」的注册方向是 kvcm 注册给索引（summary D4/E13），不是引擎注册给 kvcm
 - **F11b 核验通道的版本分工**（main 新增 `GetReplicaListForAdmin` / `BatchGetReplicaListForAdmin`，`master_service.h:424` @main）
-  - 与 `GetReplicaList` 返回相同内容，但**零副作用**：不授 lease、不触发 promote、不污染命中统计——正是 kvcm 核验/对账想要的语义（`GetReplicaList` 的授 lease 副作用对核验是污染、对 touch 才是目的）
-  - 分工：touch 续租用 `ExistKey`（F9，要的就是续租）；副本状态核验在 main 用 admin 查询，0.3.11 只能用 `GetReplicaList` 连带副作用
+  - 与 `GetReplicaList` 返回相同内容，但**零副作用**：不授 lease、不触发 promote、不污染命中统计——正是 kvcm 核验/比对想要的语义（`GetReplicaList` 的授 lease 副作用对核验是污染、对续租才是目的）
+  - 分工：续租用 `ExistKey`（F9，要的就是续租）；副本状态核验在 main 用 admin 查询，0.3.11 只能用 `GetReplicaList` 连带副作用
 - **F12 空写的发送通道**
   - master 协议层：`UpsertStart` / `UpsertEnd` 是公开 RPC（`master_service.h:331/:338` @0.3.11）
   - Python 绑定：只有「带数据、一次完成」的一体化接口 `upsert_tensor`，没有 start/end 分开调的接口——空写从 Python 发不出来
@@ -164,6 +164,8 @@
     - 继续用 Python → 需要给绑定层打补丁（改 mooncake）
 
 ### F13 main 相对 0.3.11 的能力增量（按「对 kvcm 有什么用」分六组；各处引用统一指向本条）
+
+- 版本归属逐条标注：标「两版本同有」的是查缺补漏时归拢在此的既有机制、非 main 增量；未标注的条目才是 main 新增
 
 - **消费方四分总纲**（读六组前先立框架）：main 的能力补齐分四个消费方向
   - **master 内部自治**：动态副本、热度统计——按访问统计自动调节，不对外
@@ -194,13 +196,13 @@
   - `DISK`（DFS 副本）：不验 client_id——kvcm 调用可清 DFS 副本
     - 机制事实登记；语义是「驱逐上报」，拿它当主动删除属于误用，release 不走这条路（§4）
 
-**④ 查询与核验**（kvcm 的台账/对账工具）
+**④ 查询与核验**（kvcm 的台账/比对工具）
 - `GetReplicaListForAdmin`：查副本状态但**零副作用**（不续租、不触发 promote、不计命中统计）——核验专用（F11b）
-- `GetAllKeys` / `GetReplicaListByRegex`：全量/模式列举 key——台账对账重建用
+- `GetAllKeys` / `GetReplicaListByRegex`：全量/模式列举 key——台账比对重建用
 - `ProbeKey`：纯探测在不在，不续租（F9）；实现确认也不喂命中统计（`ExistKeyImpl(grant_lease=false)` 不触发 promote 计数与动态副本观测）——main 下最轻的存在性核验
-- 副本位置无需补环：`GetReplicaList` 的副本 descriptor 自带 `transport_endpoint_`（内存副本 `AllocatedBuffer::Descriptor`，`allocator.h`；盘副本 `LocalDiskDescriptor` 还外加 `client_id`）——「副本在哪台机器」一跳到位。`BatchQueryIp`（client_id → IP，两版本同有）对 kvcm 仅边角用途：已登记引擎 UUID 重连后查当前地址——注意它答的是「client 在哪」，答不了「key 属主是谁」（属主 = 最初写入引擎，copy 后不变；key→属主无查询接口，F13⑥，台账只能写入时自登）
+- 副本位置一跳到位、无需额外查询：`GetReplicaList` 的副本 descriptor 自带 `transport_endpoint_`（内存副本 `AllocatedBuffer::Descriptor`，`allocator.h`；盘副本 `LocalDiskDescriptor` 还外加 `client_id`）。`BatchQueryIp`（client_id → IP，两版本同有）对 kvcm 仅边角用途：已登记引擎 UUID 重连后查当前地址——注意它答的是「client 在哪」，答不了「key 属主是谁」（属主 = 最初写入引擎，copy 后不变；key→属主无查询接口，F13⑥，台账只能写入时自登）
 - `GetStorageUsageSnapshot`（main）：分层容量快照——demote 触发条件「DRAM 压力」的数据源
-- 台账失效通知增强（main）：KV 事件流（ZMQ，stored/removed/cleared，D1 F14）的 removed/cleared 事件可让台账条目立即失效，不必等下轮全量对账；stored 不含 seg/位置（D1 F14 已析），替不了对账——索引面用途归 D1，kvcm 台账只借失效通知
+- 台账失效通知增强（main）：KV 事件流（ZMQ，stored/removed/cleared，D1 F14）的 removed/cleared 事件可让台账条目立即失效，不必等下轮全量比对；stored 不含 seg/位置（D1 F14 已析），代替不了比对——索引面用途归 D1，kvcm 台账只借失效通知
 
 **⑤ 任务机制变化**
 - offload / promotion 任务两版本都是**引擎来取**：master 把任务放进引擎的盘任务队列（mailbox），引擎的 store worker 心跳来取执行（`OffloadObjectHeartbeat` / `PromotionObjectHeartbeat`，两版本同有——0.3.11 实现确认从 `promotion_objects` 队列取任务，`master_service.cpp:2920` @0.3.11）；`PromotionAllocStart`（引擎主动开口要）两版本同有
@@ -210,14 +212,14 @@
   - 全链路：
     1. `GetReplicaList` 观测点——与 promote 观测并排（`master_service.cpp:4441` @main），**一次调用同时给两个机制计数**
     2. 滑窗计数——窗口内命中 ≥ `ceil(QPS 阈值 × 窗长)` 时，恰好到线那次入队
-    3. 三档模式：`kOff`（默认）/ `kObserve`（只打日志）/ `kEnforce`
+    3. 三种模式：`kOff`（默认）/ `kObserve`（只打日志）/ `kEnforce`
     4. 准入线程批量提交 proposal
     5. 校验链：lease 幂等 + 冷却 + version_epoch 乐观锁
     6. 落 `REPLICA_COPY` 任务，派源 seg 属主执行
   - **不对外暴露**：`rpc_service.h` 未注册、`master_client` 无
   - 动作类型只有 `ADD`（`rpc_types.h:17-19` @main），**不能用来降层**
   - **kvcm 能触发、但结果不满足 copy 语义**
-    - 能触发：连调 `GetReplicaList` 使滑窗计数过线，master 即自动加副本（与 promote 同一种触发手法）
+    - 能触发：反复调 `GetReplicaList` 使滑窗计数过线，master 即自动加副本（与 promote 同一种触发做法）
     - 不满足语义：目标 seg 由 master 自选（异机优先 → 最空优先 → 稳定哈希决胜，`SelectDynamicReplicaPlan:9511` @main），kvcm 指定不了（`preferred_target_segment` 字段只是预留，且 proposal RPC 不对外）
     - 结论：预热要的是「放到指定引擎」，这条路只适合「不加区分给热 key 加一份」的池级自动调节场景，且要求 master 配 `kEnforce` + 副本数未达上限
   - 「无 per-key 立即降层 RPC」的结论两版本成立
@@ -243,21 +245,30 @@
 | 下线迁移 | copy + remove（或 move 一步完成） |
 
 - **操作完成信号**：每个原子操作都有完成确认——任务类（copy/move）查 `QueryTask`，再统一核验副本状态（`GetReplicaList`；main 用零副作用的 admin 版，F11b），kvcm 据以更新台账
-- **READY** 是其中特指「可以把请求调度过来」的那一类：DRAM 副本就位、核验通过时上报（D1 §4）——copy（预热）与 promote 完成时产生；demote 的完成信号是「盘副本在册」，只更新台账、不上报调度
+- **READY** 是完成信号里特指「可以把请求调度过来」的那一类
+  - 含义：目标实例的 DRAM 副本已写好、kvcm 核验通过后，上报 Router（D1 §4）
+  - 有 READY（3 个）：**copy（预热）、move、promote**
+    - 共同点：做完之后，某个实例新具备了「请求发过来就能直接用本机 KV」的条件
+    - 核验方式相同：查 `QueryTask` 确认任务结束，再查 `GetReplicaList` 确认副本状态（F7）
+    - move 多一件事：源副本被删，要同步通知索引「源实例不再有这份 KV」
+  - 无 READY（5 个）：
+    - keepalive / pin / retain：不动数据，RPC 返回即完成，记台账即可
+    - demote：完成信号 = 「盘副本在册」，只记台账——降层后请求本来就不能直接发过去，没有「可调度」可上报
+    - release：语义相反——不是「可以发过去」，而是「别再发过来」：清台账 + 同步索引删除
 
 - copy 与 move 的分工
   - **copy 保副本数**：新增副本，源由 master 随机选（F7）
   - **move 减副本数/搬迁**：指定源→目标，完成后源删（F7）
   - 用途：下线迁移、副本归拢用 move
 - **防驱逐相关操作的语义界定**（keepalive / pin / retain 的区别）
-  - **keepalive**（动作）：周期 touch 续 lease（F9）——窗口 = lease_ttl、轻、高频；kvcm 断线，lease 过期即失效
+  - **keepalive**（动作）：周期续租（F9）——窗口 = lease_ttl、轻、高频；kvcm 断线，lease 过期即失效
   - **pin**（元数据标记）：设一次长期有效——soft = 驱逐排最后 + TTL 窗口；hard = 绝对不可逐
   - **retain**（目的，不是机制）：「属主下线/长期未命中时副本继续活着」——手段组合见 §4
-  - touch 哪些 key、何时开始、周期多少 = **kvcm 策略层逻辑**（保活注册表驱动），不是原子操作语义的一部分
+  - 给哪些 key 续租、何时开始、周期多少 = **kvcm 策略层逻辑**（保活注册表驱动），不是原子操作语义的一部分
 - **状态记录四类**（按可丢性分级）
   1. **任务状态机**（可丢）：在途任务进度；丢了可重发——master 侧操作幂等（重复 copy 同 key 同目标不产生重复副本）
   2. **保活注册表**（不可丢）：哪些 key 在保活循环里；丢了就停止保活，等效提前释放
-  3. **副本台账**（半可丢）：「前缀 × 目标实例」分布；丢了可从 master 查询重建，代价一轮全量对账
+  3. **副本台账**（半可丢）：「前缀 × 目标实例」分布；丢了可从 master 查询重建，代价一轮全量比对
   4. **会话绑定**（不可丢）：key 与会话的归属；丢了不知何时停保活——保活永不停 = 事实永久 pin
 - **部署形态**
   - kvcm 单实例跟随 mooncake master：master 单实例则 kvcm 单实例；master 将来多实例时再议 kvcm 的 HA 与共享存储
@@ -267,19 +278,19 @@
 
 | kvcm 操作 | 业界对应 | 异同 |
 |---|---|---|
-| copy | LMCache `P2PBackend` 跨实例直传 + controller 命令（lookup/pin/**move**/clear，`lmcache/v1/cache_controller`）；KVCR hint 驱动 P2P（**目的地发起**，源侧 `claim/pin` 配合）；llm-d P2P（索引只作 hint、握手兜底）；HiCache `prefetch_from_storage`（L3→L2→L1，三策略终止）；mooncake 动态副本（main 内部机制，热度驱动自动加副本） | 命令面与数据面分离是各家共同形态。kvcm 的 `CreateCopyTask`（master 指派源端执行）与 LMCache controller 同为集中式；KVCR/llm-d 的「目的地发起」依赖派生索引 + 握手，kvcm 有 master 权威视图，集中式成立。mooncake 动态副本 kvcm 能触发不能指定目标（连调 `GetReplicaList` 同一种手法，F13⑤）——只适合池级自动调节，不满足预热「指定目标」语义 |
+| copy | LMCache `P2PBackend` 跨实例直传 + controller 命令（lookup/pin/**move**/clear，`lmcache/v1/cache_controller`）；KVCR hint 驱动 P2P（**目的地发起**，源侧 `claim/pin` 配合）；llm-d P2P（索引只作 hint、握手兜底）；HiCache `prefetch_from_storage`（L3→L2→L1，三策略终止）；mooncake 动态副本（main 内部机制，热度驱动自动加副本） | 命令面与数据面分离是各家共同形态。kvcm 的 `CreateCopyTask`（master 指派源端执行）与 LMCache controller 同为集中式；KVCR/llm-d 的「目的地发起」依赖派生索引 + 握手，kvcm 有 master 权威视图，集中式成立。mooncake 动态副本 kvcm 能触发不能指定目标（反复调 `GetReplicaList`，同一种做法，F13⑤）——只适合池级自动调节，不满足预热「指定目标」语义 |
 | move | LMCache controller 命令集含 `move`；KVCR `deliver`（纯搬运层模式） | move 作控制面原语在多家存在；`CreateMoveTask` 指定源、删源，语义一致 |
-| keepalive | LMCache 后端接口 `touch_cache`；FlexKV lease「保证传输期间块有效」；llm-d 推测索引 TTL 2s（`defaultSpeculativeTTL`，代码注释自承是经验值） | 周期 touch 续租在多家存在；llm-d 的「TTL 是经验值」提示 lease_ttl 须真机校准（F10 已记） |
+| keepalive | LMCache 后端接口 `touch_cache`；FlexKV lease「保证传输期间块有效」；llm-d 推测索引 TTL 2s（`defaultSpeculativeTTL`，代码注释自承是经验值） | 周期续租在多家存在；llm-d 的「TTL 是经验值」提示 lease_ttl 须真机校准（F10 已记） |
 | pin | LMCache `pin`/`unpin`（后端接口级）；KVCR `claim/pin`/`release_pin`（**传输窗口专用**，`FETCHABLE` 须等 pin 成功才确定）；TensorCast `pinned` policy（必须驻留 + 溢出**拒绝写入**）；HiCache `lock_ref`（`protected_size_` vs `evictable_size_`，dec 到 0 ≠ 释放、仍可命中） | mooncake 三件套（lease/soft/hard）比多数系统细。差异：TensorCast `pinned` 溢出拒绝写入，mooncake hard pin 无此语义（创建时固化、之后改不了，F1）；KVCR 的传输窗口 pin 在 mooncake 由「copy 任务在途拒 upsert」覆盖（F2） |
 | demote | §3 专节（FlexKV/LMCache/UCM/KVBM/MemCache 对照 + HiCache 写穿/写回） | —— |
-| promote | HiCache `load_back`（L2→L1 提回）；FlexKV SSD→GPU 的 H2D 回填；KVCR `fetch`；mooncake `promotion_on_hit`（命中达阈值自动提回） | 被动提升（读命中驱动）是各家主路径；kvcm 另有主动两条：`GetReplicaList` 连调至命中计数过线触发 / 读删写自搬（§3） |
+| promote | HiCache `load_back`（L2→L1 提回）；FlexKV SSD→GPU 的 H2D 回填；KVCR `fetch`；mooncake `promotion_on_hit`（命中达阈值自动提回） | 被动提升（读命中驱动）是各家主路径；kvcm 另有主动两条：反复调 `GetReplicaList` 至命中计数过线触发 / 读删写自搬（§3） |
 | retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择；kvcm 的正式路径 = main 的 retained client 机制（client 断线数据保留，§4），存储统一在 mooncake。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：属主管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是属主 |
-| remove | LMCache `remove`/`clear`；SGLang 分层放弃（`block-lifecycle.md`）：无 L3 时 `evict` 删叶 = 彻底；**有 L3 时引擎永不主动放弃**——删除下放 L3 后端独立 LRU/TTL，引擎看不到 | SGLang 的「释放 = 逐层剥离」（L1 摘节点降层 → L2 摘除 → L3 后端自决）对应 kvcm 三档（软释放 / demote / remove）。「L3 删除引擎不可见」提醒：kvcm remove 后索引侧条目需同步清（D1 已知：池副本删除事件通道缺失） |
+| remove | LMCache `remove`/`clear`；SGLang 分层放弃（`block-lifecycle.md`）：无 L3 时 `evict` 删叶 = 彻底；**有 L3 时引擎永不主动放弃**——删除下放 L3 后端独立 LRU/TTL，引擎看不到 | SGLang 的「释放 = 逐层剥离」（L1 摘节点降层 → L2 摘除 → L3 后端自决）对应 kvcm 三级（软释放 / demote / remove）。「L3 删除引擎不可见」提醒：kvcm remove 后索引侧条目需同步清（D1 已知：池副本删除事件通道缺失） |
 
 - **总观察**
   1. LMCache 后端七方法 + controller 命令集与 kvcm 八项近一一对应——操作集合理性的直接证据
   2. TensorCast policy 预设（`cache/durable/ha/cold/warm/pinned`，`tensorcast/api/_config.py::StorePolicyProfile`）是声明式放置契约：kvcm 的操作可视为给 key 改 policy（demote≈`cold`、pin≈`pinned`、默认≈`cache`）；API 形态（声明式 policy vs 命令式操作）留待 E11 协议设计时参考
-  3. SGLang「释放是逐层剥离不是单动作」——kvcm 软释放/demote/remove 三档粒度与之相同
+  3. SGLang「释放是逐层剥离不是单动作」——kvcm 软释放/demote/remove 三级粒度与之相同
 
 ### 操作集完备性审计（双向对照）
 
@@ -287,9 +298,9 @@
 
 | 操作 | 出处 | 评估 |
 |---|---|---|
-| **prefetch 终止/取消** | HiCache `can_terminate_prefetch` / `mark_terminate`（三策略：best_effort / wait_complete / timeout） | **真缺口**：请求改道 / 源消失时 copy 白耗带宽只能等自生自灭；**copy/move 任务两版本都无取消 RPC**（main 只有 `CancelQueuedOffloadTask` 能取消 offload 任务、且镜像被取走即失败，F13）——补法：池侧扩展（改 mooncake）或「弃置 + 事后清副本」（kvcm 侧可做的弱版）。已登记 backlog P9 |
+| **prefetch 终止/取消** | HiCache `can_terminate_prefetch` / `mark_terminate`（三策略：best_effort / wait_complete / timeout） | **真缺口**：请求改道 / 源消失时在途 copy 白白占用带宽、只能等它自己结束；**copy/move 任务两版本都无取消 RPC**（main 只有 `CancelQueuedOffloadTask` 能取消 offload 任务、且镜像被取走即失败，F13）——补法：池侧扩展（改 mooncake）或「弃置 + 事后清副本」（kvcm 侧可做的弱版）。已登记 summary P9 |
 | compress（KV 压缩） | LMCache controller 命令集 | 远期能力，当前不补 |
-| health / full_sync（对账） | LMCache controller 命令集 | 半缺口：状态记录③有「全量对账重建台账」概念但未操作化——应列为运维操作 |
+| health / full_sync（比对） | LMCache controller 命令集 | 半缺口：状态记录③有「全量比对重建台账」概念但未操作化——应列为运维操作 |
 | 在途状态查询 | KVCR `query` 四态（HIT / **FETCHING** / FETCHABLE / MISS） | 半缺口：kvcm 有 `QueryTask`（任务视角）+ exist（在/不在），缺 KVCR 那种 **key 视角**四态；「预热中」状态存于 sqlite 任务状态机，是否暴露给索引归 D4 接口设计 |
 
 - **kvcm 有、别人不做的**
@@ -301,7 +312,7 @@
 | move 显式搬迁 | FlexKV/UCM/HiCache 层间移动是驱逐/prefetch 的副作用，无显式 move | 下线迁移/副本归拢要确定性搬迁（LMCache controller 有 move，不孤立） |
 | retain 属主下线存续 | 引擎插件层（FlexKV/UCM/HiCache L1L2）引擎死缓存失效拉倒；KVCR-Guard/LMCache daemon 才做 | kvcm 是独立控制面：预热投入要跨实例存亡保住 |
 
-- **审计结论**：不做 pin/keepalive/retain 的系统，共同点是有读者替它们保活、或引擎死了认栽——kvcm 的预热副本恰好「无读者 + 要跨实例存亡」，这三样是定位需要，不是冗余。**唯一真缺口 = prefetch 终止**（backlog P9）
+- **审计结论**：不做 pin/keepalive/retain 的系统，共同点是有读者替它们保活、或引擎死了认栽——kvcm 的预热副本恰好「无读者 + 要跨实例存亡」，这三样是定位需要，不是冗余。**唯一真缺口 = prefetch 终止**（summary P9）
 
 ### kvcm 能力边界（功能视角分级）
 
@@ -318,9 +329,9 @@
 
 | 功能 | 组合路径 | 代价 / 延迟 |
 |---|---|---|
-| promote | `GetReplicaList` 连调至命中计数过线触发 / 读删写自搬（§3） | 触发要 DRAM 不紧张才批；自搬数据过本地 |
+| promote | 反复调 `GetReplicaList` 至命中计数过线触发 / 读删写自搬（§3） | 触发要 DRAM 不紧张才批；自搬数据过本地 |
 | hard pin 取消 | 再读删写一遍（§2） | 数据过本地 |
-| lease 撤销（软释放） | 停 touch 等过期（§4） | 固定延迟 = TTL（分钟级，确定） |
+| lease 撤销（软释放） | 停续租等过期（§4） | 固定延迟 = TTL（分钟级，确定） |
 | 指定源 copy | `CreateMoveTask`（要保源则 move 完再 copy 回，F7） | 绕一步 |
 | 死引擎副本清理 | `Remove` / `RemoveByRegex`（不鉴权，§4） | 比等心跳扫描快 |
 | 给新 put 腾 DRAM | `Remove` 冷 key | —— |
@@ -416,7 +427,7 @@ sequenceDiagram
 
 - 缺口：copy/move 的单个任务无取消 RPC（两版本同，P9）——下线场景用 DrainJob 白得 job 级取消；`SubmitReplicaActionProposal` 不做 move（动作仅 ADD，F13⑤）
 
-**③ keepalive（注册表驱动的周期 touch，无数据流）**
+**③ keepalive（注册表驱动的周期续租，无数据流）**
 
 ```mermaid
 sequenceDiagram
@@ -433,12 +444,12 @@ sequenceDiagram
     end
     Note over K: 会话结束 / 软释放（§4，router 线索）
     K->>R: 摘除 key
-    Note over K,M: 停 touch → lease 到期失效 → 驱逐兜底
+    Note over K,M: 停续租 → lease 到期失效 → 驱逐兜底
 ```
 
-- 读路径 `GetReplicaList` 也授 lease——kvcm 的 touch 不用它（F11b 分工）；`ProbeKey` 不续租（纯探测，仅 main）
+- 读路径 `GetReplicaList` 也授 lease——kvcm 的续租不用它（F11b 分工）；`ProbeKey` 不续租（纯探测，仅 main）
 
-**④ pin（三方案时序，rect 底色区分：蓝 = soft pin 档、绿 = hard 档①、橙 = hard 档②，§2）**
+**④ pin（三方案时序，rect 底色区分：蓝 = soft pin 级、绿 = hard 级①、橙 = hard 级②，§2）**
 
 ```mermaid
 sequenceDiagram
@@ -447,7 +458,7 @@ sequenceDiagram
     participant A as 引擎 A（副本所在）
 
     rect rgb(222, 235, 247)
-    Note over K,M: soft pin 档：空写 upsert（驱逐排最后）
+    Note over K,M: soft pin 级：空写 upsert（驱逐排最后）
     K->>M: S1 GetReplicaList（查原尺寸）
     K->>M: S2 UpsertStart(key, 原尺寸, with_soft_pin)
     Note over M: 副本标写中，key 不可读（毫秒级，F3④）
@@ -462,7 +473,7 @@ sequenceDiagram
         K->>M: L1 ExistKey / BatchExistKey（grant_lease=true）
         Note over M: lease_timeout 续期（有 soft pin 一并续，F9）
     end
-    Note over K,M: 取消：停 touch，lease 到期自然失效（= §4 软释放；无立即撤销 lease RPC）
+    Note over K,M: 取消：停续租，lease 到期自然失效（= §4 软释放；无立即撤销 lease RPC）
     end
 
     rect rgb(255, 235, 214)
@@ -544,7 +555,7 @@ sequenceDiagram
 
     rect rgb(255, 235, 214)
     Note over K,H: kvcm 主动触发（轻，不等真实流量）
-    K->>M: GetReplicaList 连调至计数过线（与真实流量同池累计）
+    K->>M: 反复调 GetReplicaList 至计数过线（与真实流量同池累计）
     Note over M: 同样要 DRAM 不紧张才派任务
     M->>H: 派提升任务
     Note over H: 读本机 SSD → 写 DRAM
@@ -565,7 +576,7 @@ sequenceDiagram
     end
 ```
 
-- 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 连调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本属主引擎在线
+- 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 反复调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本属主引擎在线
 - `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本属主引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
 
 **⑦ retain（属主下线后副本存续；六方案时序：绿 = main 正式路径两条、橙 = 0.3.11 过渡三手段、灰 = 接受现状，§4）**
@@ -620,13 +631,13 @@ sequenceDiagram
     end
 
     rect rgb(230, 230, 230)
-    Note over E,DFS: 或接受现状：引擎下线 = 数据失效，预热投入重来（E5 钉死口径后评估）
+    Note over E,DFS: 或接受现状：引擎下线 = 数据失效，预热投入重来（E5 判定口径后评估）
     end
 ```
 
 - 先说清 demote 在 0.3.11 解不了 retain：盘副本绑登记它的引擎 client，引擎死照样清（§3）——所以过渡手段里没有 demote
 
-**⑧ remove（release 四档时序：绿 = 软释放、蓝 = 主动 Remove、灰 = 全池清；决策归 D1 §6，§4）**
+**⑧ remove（release 四级时序：绿 = 软释放、蓝 = 主动 Remove、灰 = 全池清；决策归 D1 §6，§4）**
 
 ```mermaid
 sequenceDiagram
@@ -637,18 +648,18 @@ sequenceDiagram
     participant R as Router/索引
 
     rect rgb(223, 242, 223)
-    Note over K,R: 档一：软释放（默认档）
+    Note over K,R: 级一：软释放（默认级）
     K->>K: 停 keepalive（保活注册表摘除，图③）
     Note over M: lease 到期失效（测试床 11s）→ 池驱逐兜底回收
     end
 
     rect rgb(223, 242, 223)
-    Note over K,R: 档二：demote 降层（留 SSD 不删）——完整时序走图⑤
+    Note over K,R: 级二：demote 降层（留 SSD 不删）——完整时序走图⑤
     K->>M: 停保活（写回模式）→ 等驱逐落盘 → 核验盘副本在册
     end
 
     rect rgb(222, 235, 247)
-    Note over K,R: 档三：主动 Remove（仅「确认没人用」）
+    Note over K,R: 级三：主动 Remove（仅「确认没人用」）
     K->>T: 按台账校验目标 key 的模型归属（防跨模型误删）
     K->>M: Remove / BatchRemove（按 key 精确删）<br/>或 RemoveByRegex（配命名空间前缀，如 qwen3:v2:.* 删整个模型版本）
     Note over M: 两道保险：lease 未过期拒删、任务在途拒删<br/>被拒 → 等 lease 过期再删；force=true 跳过保险强删（慎用）
@@ -657,11 +668,11 @@ sequenceDiagram
     end
 
     rect rgb(230, 230, 230)
-    Note over K,R: 档四：RemoveAll 全池清（运维重置）
+    Note over K,R: 级四：RemoveAll 全池清（运维重置）
     Note over M: 0.3.11：同步调用，阻塞到清完
     M->>E: main 异步：master 置标志
     E->>E: 轮询 PollRemoveAll → 各自清盘（F13③）
-    K->>M: 台账对账确认完成
+    K->>M: 台账比对确认完成
     end
 ```
 
@@ -680,9 +691,9 @@ sequenceDiagram
     rect rgb(223, 242, 223)
     Note over R,C: P1 prefetch 预热（Router 结果介入）
     K->>M: ① copy + 核验（图①）
-    K-->>R: ② READY（副本就位，可调度）
+    K-->>R: ② READY（副本写好，可调度）
     R->>E: ③ 按新副本位置调度请求
-    Note over K: ④ 保活注册（注册表）→ 周期 touch（图③）
+    Note over K: ④ 保活注册（注册表）→ 周期续租（图③）
     end
 
     rect rgb(255, 235, 214)
@@ -717,10 +728,10 @@ sequenceDiagram
   - 侵入改引擎；且引擎不知道哪些该 pin，全 pin 则第一轮驱逐无候选、直接进第二轮——pin 失去区分度 = 没有 pin
 - **读锁（kvcm 持续持有读引用挡驱逐）——机制不存在**
   - 设想：refcnt>0 的副本被驱逐硬过滤跳过（F8），kvcm 挂住一个读引用即可 pin
-  - 实情：读者的保护是 lease 不是 refcnt——`GetReplicaList` 两版本只授 lease（`master_service.cpp:1112` @0.3.11），不碰 refcnt；refcnt 的增减全在 copy/move/offload/promotion 任务路径（`:1936`/`:2151`/`:2890` @0.3.11），是**任务级**保护、master 内部自用——两版本均无「读者持引用」RPC，kvcm 无锁可持
+  - 实情：读者的保护是 lease 不是 refcnt——`GetReplicaList` 两版本只授 lease（`master_service.cpp:1113` @0.3.11），不碰 refcnt；refcnt 的增减全在 copy/move/offload/promotion 任务路径（`:1936`/`:2151`/`:2890` @0.3.11），是**任务级**保护、master 内部自用——两版本均无「读者持引用」RPC，kvcm 无锁可持
   - 想要此形态只能池侧扩展（给 mooncake 加读者引用 RPC），不作现役方案
 
-### soft pin 档（驱逐排最后，极端情况可逐）：空写 upsert 设 soft pin
+### soft pin 级（驱逐排最后，极端情况可逐）：空写 upsert 设 soft pin
 
 - 做法：`UpsertStart`(key, 原尺寸, with_soft_pin) → 不写数据 → `UpsertEnd`；原尺寸由 `GetReplicaList` 查
 - mooncake 代码：不改（前提：空写通道不落 Python，F12）
@@ -730,24 +741,24 @@ sequenceDiagram
 - 持续开销：每 key 每 TTL 一次空写续期
 - 副作用：两 RPC 之间 key 不可读（毫秒级，F3④）；0.3.11 布尔坑——忘带 true 的 upsert 顺手清 pin（F1）
 
-### hard pin 档（绝对不可驱逐）：两个候选
+### hard pin 级（绝对不可驱逐）：两个候选
 
 | | ① lease 调大 + keepalive | ② 读删写 |
 |---|---|---|
-| 做法 | master 配置 `default_kv_lease_ttl` 调大（如 5min）+ kvcm 周期 touch（F9） | 读出数据 → `Remove` → 带 hard_pin 重新 put → 校验副本 |
+| 做法 | master 配置 `default_kv_lease_ttl` 调大（如 5min）+ kvcm 周期续租（F9） | 读出数据 → `Remove` → 带 hard_pin 重新 put → 校验副本 |
 | 保护强度 | lease 期内绝对不可逐 | 绝对不可逐，创建时固化、无到期概念（F1） |
 | mooncake 代码 | **不改** | 不改 |
 | 属主问题 | **无**（不碰写路径） | **有**（Remove 后走 Case A 新建，PutStart 传谁 UUID 谁是属主——见「属主问题」节） |
 | kvcm 失联 | 保护剩 lease_ttl 余量，到期失效 | **失联也安全**——保护存于池内元数据，不依赖任何角色存活 |
-| 持续开销 | 每 key 每窗口一次 touch | 一次重建，零持续开销 |
+| 持续开销 | 每 key 每窗口一次续租 | 一次重建，零持续开销 |
 | 副作用 | 全局读租约变长（F10：驱逐候选缩小，调参项，需真机观察定值） | 重建窗口 key 短暂不可读；数据过 kvcm 本地（带宽）；kvcm 本地持有数据直到校验成功，只有本地也丢才真丢 |
 
 - 选择：要「kvcm 长期失联也安全」→ 只有读删写；接受「kvcm 活着才保护」→ ①更轻（零属主问题、不动数据、可随时停）
-- ① 的保护来自 lease（F9），与 mooncake 的 hard pin 机制无关——放此档是按驱逐过滤下的实际效果（lease 未过期 = 硬过滤跳过，F8）；两者取消语义不同（见下节）
+- ① 的保护来自 lease（F9），与 mooncake 的 hard pin 机制无关——放此级是按驱逐过滤下的实际效果（lease 未过期 = 硬过滤跳过，F8）；两者取消语义不同（见下节）
 
 ### pin 的取消
 
-- **①**：停止 touch，lease 到期自然失效（= §4 软释放档）；无「立即撤销 lease」RPC，等待窗口 = TTL（分钟级）
+- **①**：停止续租，lease 到期自然失效（= §4 软释放级）；无「立即撤销 lease」RPC，等待窗口 = TTL（分钟级）
 - **空写 soft pin**：主动取消 = 空写传 `with_soft_pin=false`（0.3.11）/ `SoftPinAction::DISABLE`（main 三态，`replica.h:64-68` @main）；或停止续期等 TTL 到期自动失效。注意 0.3.11 下取消可能**被动发生**（布尔坑，F1）
 - **读删写（hard pin）**：**没有 unpin**——两版本都是或运算保留（`with_hard_pin || IsHardPinned()`，`master_service.cpp:1741-1742` @0.3.11 / `:6068` @main；`hard_pinned is const`，`:1696` @0.3.11）——取消 = 再读删写一遍（读出 → Remove → 不带 hard_pin 重 put）
 - 操作集因此不单列 unpin：取消分别由 停 keepalive（软释放）/ pin 同机制逆操作 / remove 系 覆盖
@@ -766,10 +777,10 @@ sequenceDiagram
 - **决策条件（外部依赖，非单方可定）**
   1. mooncake 代码可改性——多人合作的开源项目，不是单方说了算
      - 上游提 PR（纯暴露只读接口，接受度预期高，节奏不可控）或 fork 维护本地 patch——是**独立成本**；升级拿 publisher 是官方功能零 patch，与此无关
-  2. kvcm 实现语言（backlog E10/E11 未定）
+  2. kvcm 实现语言（summary E10/E11 未定）
      - 若落 Python，空写通道也需绑定补丁 → 方案一同样改 mooncake
 - 属主语义若要变，与 retain 议题（§4）统一评估，不在 pin 单独定
-- **注意**：若 pin 全走 hard pin 档 ①（lease 调大），属主问题只剩读删写一处触发，权重下降
+- **注意**：若 pin 全走 hard pin 级 ①（lease 调大），属主问题只剩读删写一处触发，权重下降
 
 ## §3 demote / promote（层间迁移）
 
@@ -812,7 +823,7 @@ sequenceDiagram
   - 写回模式下先停 keepalive、等 lease 过期（否则驱逐轮不到它，永不落盘）
   - 落盘时机（kvcm 只能促、不能定）
     - 写穿模式：SSD 副本**写入时已有**——数据早已在盘上，DRAM 副本待自然驱逐释放即可（何时释放无所谓，它只是个缓存副本）
-    - 写回模式：key 进驱逐候选后，池驱逐时自动先落 SSD 再释放 DRAM（`BatchEvict` 里 `PushOffloadingQueue`，`master_service.cpp:11622` @0.3.11）——时机不可控：池不满就不驱逐、不落盘
+    - 写回模式：key 进驱逐候选后，池驱逐时自动先落 SSD 再释放 DRAM（`BatchEvict` 里 `PushOffloadingQueue`，`master_service.cpp:4545` @0.3.11 / `:11624` @main）——时机不可控：池不满就不驱逐、不落盘
   - **核验**：`GetReplicaList` 确认 disk 副本在册（降层完成的判定）
 - **缺口（真功能缺口，归池侧扩展）**
   - **写回模式下无确定性 demote**：offload 任务的入队时机只有 put 完成时（写穿）和驱逐选中时（写回）两处（两版本同）——kvcm 想让指定 key 立刻、确定性地落盘，做不到；池不满就永不落盘
@@ -826,7 +837,7 @@ sequenceDiagram
 ### promote 实现
 
 - **被动路径（流量驱动）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本属主 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
-- **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——对只剩盘副本的 key 连调 `GetReplicaList` 至命中计数过线（默认 2 次）：计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），kvcm 的调用与真实流量同池累计，到线即触发上面的被动路径
+- **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——对只剩盘副本的 key 反复调 `GetReplicaList` 至命中计数过线（默认 2 次）：计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），kvcm 的调用与真实流量同池累计，到线即触发上面的被动路径
   - 前提：`promotion_on_hit` 开启 + DRAM 还没满到要驱逐的程度（内存紧张时 master 不批——提回来也马上被逐）+ 盘副本属主引擎在线
   - 触发必须用 `GetReplicaList`——`ExistKey` 触发不了（只授 lease、不计命中次数，`master_service.cpp:752-770` @0.3.11）；触发顺带授 lease（F11b 的副作用在此是正作用：提回期间防逐）
 - **kvcm 主动路径二：读删写（重，确定性自搬）**——读盘副本数据 → `Remove` → `PutStart` 新建 DRAM 副本 → 写数据 → `PutEnd` → 校验
@@ -867,31 +878,31 @@ sequenceDiagram
     - **main 下此方案再强化**：kvcm 以 retained client 身份注册（client 库 `kRetained`，上条）——连 kvcm 自己死亡，名下盘副本也保留，等新 kvcm 接管
     - 挂盘另一形态：`MountNoFSegment`（两版本同有）挂 NVMe-oF 远端盘——盘在远端阵列、不绑 kvcm 机器，比挂本地盘更接近「kvcm 死也保留」
     - 排除项：`ReMountSegment` 是 client 重连后重新申报 seg（幂等），不是死掉副本的复活——retain 走不了这条
-  - 或接受现状：「引擎下线 = 池内数据失效」，预热投入重来——由 E5 钉死口径后评估是否可接受
+  - 或接受现状：「引擎下线 = 池内数据失效」，预热投入重来——由 E5 判定口径后评估是否可接受
 - **计划下线的编排**（控制面主导，四步）
   1. **Router 摘流**：该实例不再接新请求，在途请求跑完
   2. **kvcm 迁 KV**：这台 seg 上的预热副本 copy/move 到他机，或 demote 落盘
   3. **宽限期卸载**：引擎调 `GracefulUnmountSegment`（`master_service.cpp:669` @0.3.11）告诉 master「给我 N 毫秒宽限再摘 seg」——它是迁移的**时间窗保障**（防搬到一半 seg 被摘、数据随 seg 失效），由编排流程触发；不是引擎自己决定何时下线
   4. **缩容停引擎**
-  - `CreateDrainJob`（两版本同有，F7）：master 后台 job 把指定 seg 上的副本逐个迁到别的 seg（带并发上限默认 4），排空后 seg 置 DRAINED 安全下线——可替代第 2 步的手动搬迁，且 job 级可取消（`CancelDrainJob`），比裸 copy/move 多一层控制；编排用法归 D3 评估
+  - `CreateDrainJob`（两版本同有，F7）：master 后台 job 把指定 seg 上的副本逐个迁到别的 seg（带并发上限默认 4），排空后 seg 置 DRAINED 安全下线——可替代第 2 步的手动搬迁，且 job 级可取消（`CancelDrainJob`），比裸 copy/move 多一层控制
 - **长期未命中副本**：demote 到 SSD（§3）；何时降、降哪些归策略层编排
 - 与 D3 的边界：副本生命周期（TTL / READY 语义）归 D3；本节只定「属主下线」场景的机制组合
 
 ### release（主动释放）：定型
 
-- **决策归属已闭环**（D1 §6）：router 提供会话生命周期线索 → 控制面决策执行 → 池驱逐兜底；三档 = 软释放（停保活）/ demote（降层）/ 主动 Remove（确认没人用）
+- **决策归属已闭环**（D1 §6）：router 提供会话生命周期线索 → 控制面决策执行 → 池驱逐兜底；三级 = 软释放（停保活）/ demote（降层）/ 主动 Remove（确认没人用）
 - kvcm 是管理控制面，Remove 系 API **全部可用，按场景选用**（`master_service.h:440-464` @0.3.11）
   - `Remove(key)` / `BatchRemove(keys)`：按 key 精确删
   - `RemoveByRegex(pattern)`：模式批量删
     - key 的实际形态是 block hash 的十六进制串（如 `dc9fdff8…`）——同一 prompt 前缀的 key 是各自独立的 hash，字符串上没有公共部分，正则**匹配不了「同一前缀族」**
     - 有用的前提：key 带结构化前缀（P1 要求命名空间含 model_id/revision，如 `qwen3:v2:dc9fdff8…`）——此时 `qwen3:v2:.*` 一条删掉整个模型版本
     - 多模型安全性：池是多模型共享的，命名空间前缀就是隔离边界——kvcm 台账登记每把 key 的 (model_id, revision)，发 Remove 系操作前按台账校验目标 key 的模型归属，防跨模型误删；main 可进一步把模型映射为 tenant，获得 RPC 命名空间 + 配额 + 驱逐三重隔离（F13）
-  - `RemoveAll()`：全池清空（运维重置）——main 改为异步：master 置标志、各 client 轮询 `PollRemoveAll` 自清 SSD（F13），完成时机以台账对账为准
+  - `RemoveAll()`：全池清空（运维重置）——main 改为异步：master 置标志、各 client 轮询 `PollRemoveAll` 自清 SSD（F13），完成时机以台账比对为准
   - `BatchReplicaClear(keys, client_id, seg)`：清指定 client 指定 seg 上的副本——限 key 属主自调（F6②），引擎下线前自清理用；kvcm 调不动别人的 key
-  - `EvictDiskReplica` / `BatchEvictDiskReplica`（main，F13③）：client 盘副本被逐后的**上报**通道。对 kvcm 有用的地方有两处：
+  - `EvictDiskReplica` / `BatchEvictDiskReplica`（两版本同有，F13③）：client 盘副本被逐后的**上报**通道。对 kvcm 有用的地方有两处：
     - `LOCAL_DISK` 限属主——kvcm 自挂 SSD 后是自己盘副本的属主，可主动清（自挂形态的收尾工具）
     - `DISK`（DFS 副本）不验 client_id——能清 DFS 副本；但语义是「驱逐上报」不是主动删除，误用它清副本是把「上报」当「命令」用，release 正式路径仍走 Remove 系
   - 公共参数 `force`：Remove 默认有两道保险——① lease 未过期拒删（最近有人读过，可能还在用）② copy/offload 任务在途拒删（传输中删除会破坏数据）；`force=true` 跳过保险强删
-    - 仅「确认没人用」（D1 §6 例外档，如全局废弃前缀）才用 force
+    - 仅「确认没人用」（D1 §6 例外级，如全局废弃前缀）才用 force
     - 常规删除不用 force：被拒就等 lease 过期（测试床 11s）再删
 - **收尾责任**：remove 后 kvcm 清自己台账 + 索引条目同步清（池副本删除事件通道缺失，D1 F10/F14；llm-d 幽灵条目同坑）
