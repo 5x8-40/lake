@@ -31,7 +31,7 @@
 - **术语：身份与归属**（全文统一口径，括号内代码名）
   - **client**：mooncake 客户端库实例（引擎与 kvcm 各持一个）；**client_id** = 它的身份 UUID（构造时随机生成，F11）
   - **key 属主（owner）**：key 元数据的 `client_id` 字段 = 最后写入该 key 的 client；用途仅鉴权与 upsert 改写（F6）。「属主」单独出现时专指 key 属主
-  - **副本隶属（affiliation）**：副本数据所在的 client——内存副本隶属 seg 属主 client、盘副本隶属写盘登记 client、DFS 副本不隶属任何 client（main 显式化为 `isAffiliatedWith`，F6b）。**副本没有属主**，「副本属主」是禁用说法——说「副本隶属某 client」或「副本在某 seg」
+  - **副本隶属（affiliation）**：副本数据所在的 client——内存副本隶属 seg 属主 client、盘副本隶属写盘登记 client、DFS 副本不隶属任何 client（main 显式化为 `isAffiliatedWith`，F6b）。**副本没有属主**，「副本属主」是禁用说法——说「副本隶属某 client」或「副本在某 seg」（后文「副本绑 seg / 绑某 client」的「绑」= 隶属）
   - **seg 属主**：挂载该 seg 的 client；「源 seg 属主」「盘副本登记 client」都是副本隶属维度的派生说法
   - **两个维度正交**：鉴权（Revoke / `BatchReplicaClear` 的属主校验）比 key 属主；级联清理走副本隶属（F6 全图）
 - **key 与副本**：池里一把 key 一份元数据（`ObjectMetadata`），元数据里挂着副本列表（`replicas_`）；同一 key 可有多个副本（replica），落在不同机器的 segment（seg，一段注册进池的 DRAM）上
@@ -77,7 +77,7 @@
     - 该 key 有 copy/offload 任务在途 → `OBJECT_HAS_REPLICATION_TASK`
   - 参数校验在分支判断之前：要求副本数等配置合法（`replica_num≥1`）——空写虽不走分配，config 也须填合法值
 - **F3 Case B 的四个行为**（`:1698-1737` @0.3.11）
-  1. **改写属主**：`metadata.client_id = client_id` 无条件执行——「谁最后写，谁是属主」是 upsert 的固有语义，真实写数据与空写都触发
+  1. **改写属主**：`metadata.client_id = client_id`（右值 = 调用方传入的 UUID）无条件执行——「谁最后写，谁是属主」是 upsert 的固有语义，真实写数据与空写都触发
   2. **设置/清除 soft pin**：按 config 的 `with_soft_pin`——true 且当前无 pin → 授予；false 且当前有 pin → 清除
   3. **hard pin 不动**（F1 可达性）
   4. **副本标为写中**：COMPLETE→PROCESSING，该 key 对所有读者不可见，直到 UpsertEnd 标回——空写的「不可读窗口」来自这里
@@ -209,7 +209,7 @@
 - `GetReplicaListForAdmin`：查副本状态但**零副作用**（不续租、不触发 promote、不计命中统计）——核验专用（F11b）
 - `GetAllKeys` / `GetReplicaListByRegex`：全量/模式列举 key——台账比对重建用
 - `ProbeKey`：纯探测在不在，不续租（F9）；实现确认也不喂命中统计（`ExistKeyImpl(grant_lease=false)` 不触发 promote 计数与动态副本观测）——main 下最轻的存在性核验
-- 副本位置一跳到位、无需额外查询：`GetReplicaList` 的副本 descriptor 自带 `transport_endpoint_`（内存副本 `AllocatedBuffer::Descriptor`，`allocator.h`；盘副本 `LocalDiskDescriptor` 还外加 `client_id`）。`BatchQueryIp`（client_id → IP，两版本同有）对 kvcm 仅边角用途：已登记引擎 UUID 重连后查当前地址——注意它答的是「client 在哪」，答不了「key 属主是谁」（属主 = 最初写入引擎，copy/move 后都不变（F6「不管」条）；key→属主无查询接口，F13⑥，台账只能写入时自登）
+- 副本位置一跳到位、无需额外查询：`GetReplicaList` 的副本 descriptor 自带 `transport_endpoint_`（内存副本 `AllocatedBuffer::Descriptor`，`allocator.h`；盘副本 `LocalDiskDescriptor` 还外加 `client_id`——descriptor 是 RPC 视图，这个 client_id 是盘副本隶属的对外可见形式；与「`Replica` 记录本身不存 client_id」（背景概念）不矛盾）。`BatchQueryIp`（client_id → IP，两版本同有）对 kvcm 仅边角用途：已登记引擎 UUID 重连后查当前地址——注意它答的是「client 在哪」，答不了「key 属主是谁」（属主 = 最初写入引擎，copy/move 后都不变（F6「不管」条）；key→属主无查询接口，F13⑥，台账只能写入时自登）
 - `GetStorageUsageSnapshot`（main）：分层容量快照——demote 触发条件「DRAM 压力」的数据源
 - 台账失效通知增强（main）：KV 事件流（ZMQ，stored/removed/cleared，D1 F14）的 removed/cleared 事件可让台账条目立即失效，不必等下轮全量比对；stored 不含 seg/位置（D1 F14 已析），代替不了比对——索引面用途归 D1，kvcm 台账只借失效通知
 
