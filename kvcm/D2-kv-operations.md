@@ -48,42 +48,51 @@
   - **只延不缩、无撤销 RPC**（两版本同）：续租只把期限往后推、已发出的租约缩不短（0.3.11 `master_service.h:946`；main `lease.h::Lease::GrantReadLease`）；要提前让 key 可删只能 `Remove(force=true)` 跳过 lease 检查（§4）
 - **kvcm 自身 = mooncake client**：client 是库不是独立进程；kvcm 调 copy/move/upsert 必须链接它，构造时自动持有一个 UUID——§2 方案一中「kvcm 自己的 UUID」零额外成本
 
-**实体与位置**（这些词各是什么、存在哪里；示例状态：key 由引擎 A 写入，一份内存副本在 seg A、一份盘副本在 A 的 SSD、一份 DFS 副本）：
+**实体与位置**（这些词各是什么、存在哪里；示例状态：key 由引擎 A 写入——内存副本在 seg A、kvcm copy 出的副本在 seg B、盘副本在 A 的 SSD、DFS 副本在共享 3FS）：
 
-```mermaid
-flowchart TB
-    subgraph M["master 进程（元数据全在 master 内存）"]
-        META["key 元数据 ObjectMetadata"]
-        OID["· client_id 字段 = key 属主"]
-        PROT["· lease / soft pin / hard pin"]
-        REPS["· replicas_ 副本列表"]
-        META --> OID & PROT & REPS
-        R1["副本记录①：位置 = seg A 的 buffer"]
-        R2["副本记录②：位置 = A 的 SSD 文件路径"]
-        R3["副本记录③：位置 = DFS 路径<br/>（不隶属任何 client）"]
-        REPS --> R1 & R2 & R3
-    end
+```text
+┌─ master 进程（元数据全在内存，不持数据） ──────────────┐
+│  key 元数据 ObjectMetadata                                │
+│  ├─ client_id 字段 ＝ key 属主 【属】                     │
+│  ├─ lease / soft pin / hard pin（key 级保护，护全部副本） │
+│  └─ replicas_ 副本列表                                    │
+│       ├─ 副本记录①：位置 → 【①】                          │
+│       ├─ 副本记录②：位置 → 【②】                          │
+│       ├─ 副本记录③：位置 → 【③】                          │
+│       └─ 副本记录④：位置 → 【④】                          │
+└───────────────────────────────────────────────────────────┘
+        位置字段 → 同名编号处的数据本体（下图）
 
-    subgraph EA["引擎 A（机器）"]
-        EAP["引擎进程（client 库）：<br/>client_id，UUID，构造时生成"]
-        MEM["DRAM：seg A（一段注册进池的内存）"]
-        BUF["buffer（seg 内分出的一块，KV 数据本体）"]
-        SSD["SSD：盘副本文件"]
-        MEM --> BUF
-    end
-    DFS["共享 3FS（仅 main）：DFS 副本文件"]
+┌─ 引擎 A（机器） ───────────────────────────────────┐
+│  引擎进程（client 库）：client_id（UUID），构造时生成 │
+│    ▲ 【属】                                           │
+│    │ 挂载 → seg 属主                                  │
+│    ▼                                                  │
+│  DRAM：seg A（一段注册进池的内存）                    │
+│   └─ buffer 【①】＝ KV 数据本体（seg 内分出的一块）   │
+│  SSD：盘副本文件 【③】                                │
+└───────────────────────────────────────────────────────┘
 
-    EAP -. "挂载 → seg 属主" .-> MEM
-    OID -. "key 属主" .-> EAP
-    R1 -. "隶属（buffer 在谁的 seg）" .-> MEM
-    R2 -. "隶属（写盘时登记的 client）" .-> EAP
+┌─ 引擎 B（机器） ────────────────────────────────────────────────┐
+│  引擎进程（client 库）：client_id（UUID）                          │
+│    │ 挂载 → seg 属主                                               │
+│    ▼                                                               │
+│  DRAM：seg B                                                       │
+│   └─ buffer 【②】＝ KV 数据本体（kvcm copy 产物，与 put 产物同构） │
+└────────────────────────────────────────────────────────────────────┘
 
-    R1 == "位置指向" ==> BUF
-    R2 == "位置指向" ==> SSD
-    R3 == "位置指向" ==> DFS
+┌─ 共享 3FS（仅 main） ┐
+│  DFS 副本文件 【④】    │
+└────────────────────────┘
+
+副本隶属（副本数据在哪个 client 手里）：
+  ① → 引擎 A（buffer 在 seg A）   ② → 引擎 B
+  ③ → 引擎 A（写盘时登记）        ④ → 不隶属任何 client
+key 属主【属】＝ 引擎 A（最后写入者；copy/move 不改）
+kvcm 与引擎同为 client（也持自己的 UUID），图中略
 ```
 
-- 读法：实线 = 结构包含（元数据 → 字段 → 副本列表 → 副本记录；seg → buffer）；虚线 = 归属（key 属主 / 副本隶属 / seg 属主）；粗线 = 副本记录的位置字段指向数据本体。**元数据全在 master 内存；数据本体全在引擎侧介质**（DRAM buffer / SSD 文件 / DFS）——master 不持数据，引擎不持元数据
+- 读法：框与缩进 = 结构包含（元数据 → 字段 → 副本列表 → 副本记录；seg → buffer）；▲▼ 与底部归属表 = 归属（key 属主 / seg 属主 / 副本隶属）；编号 = 副本记录的「位置」字段指向同编号的数据本体。**元数据全在 master 内存；数据本体全在引擎侧介质**（DRAM buffer / SSD 文件 / DFS）——master 不持数据，引擎不持元数据；同一 key 的副本可分布在不同机器（副本②隶属 B、key 属主仍是 A）——归属与位置正交
 
 **归属两个维度**（上图的归属线分别被谁消费；示例状态：key 属主 = A，kvcm 把它 copy 到 seg B → 新副本隶属 B、key 属主仍是 A——「两个维度正交」的实例）：
 
