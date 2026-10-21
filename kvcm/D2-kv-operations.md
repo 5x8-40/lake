@@ -892,7 +892,7 @@ sequenceDiagram
      - 上游提 PR（纯暴露只读接口，接受度预期高，节奏不可控）或 fork 维护本地 patch——是**独立成本**；升级拿 publisher 是官方功能零 patch，与此无关
   2. kvcm 实现语言（summary E10/E11 未定）
      - 若落 Python，空写通道也需绑定补丁 → 方案一同样改 mooncake
-- 属主语义若要变，与 retain 议题（§4）统一评估，不在 pin 单独定
+- 属主方案与 retain 已脱钩（E5 闭环：改属主救不了副本，§4 不定它）——本决策只看 pin 挂载与权限归属，纯工程成本权衡
 - **注意**：若 pin 全走 hard pin 级 ①（lease 调大），属主问题只剩读删写一处触发，权重下降
 
 ## §3 demote / promote（层间迁移）
@@ -982,7 +982,7 @@ sequenceDiagram
     - 前提：引擎以此身份运行
   - **DFS 副本**：demote 的目标层选共享 3FS 而非本机 SSD——副本天然跨 client 存亡存活（F13）。前提：部署 3FS
   - 两条不互斥：retained client 解「引擎进程下线」，DFS 解「整机/整实例灭失 + 跨机可读」
-- **0.3.11 过渡期手段**（正式形态是上面的池机制）
+- **0.3.11 过渡期手段**（正式形态是上面的池机制；E5 已定：**主路径 = move 到活 seg**，加强项 = kvcm 自挂 SSD）
   - **先说清 demote 在 0.3.11 解不了 retain**：盘副本绑登记它的 client，而 client 库活在引擎进程内——引擎进程死 = client 死 = 盘副本清（§3）。demote 落的是引擎自己的盘，引擎一死照样带走
   - **move 到活 seg（E5 证实有效）**：清理按 seg 维度走（F6b）——把副本迁到长寿 seg（kvcm 机、或确定后死的实例），源引擎下线带不走它。**改属主对 retain 无效**：改的是鉴权字段，副本还绑在原 seg 上，引擎死照清（F6b）；改属主的用途在权限与 pin（§2），不在副本存亡
   - **kvcm 自己挂 SSD（0.3.11 下不依赖任何引擎存活的兜底）**：kvcm 以独立 client 身份挂本机盘（`MountLocalDiskSegment`，与引擎同样的挂法），把关键 KV 落一份到自己名下、`NotifyOffloadSuccess` 上报登记（F1）

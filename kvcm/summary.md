@@ -80,7 +80,7 @@
   - 取消方式：① 停续租等过期 / 空写传 false 或 `SoftPinAction::DISABLE` / hard pin 没有 unpin，只能再读删写一遍
   - 读锁方案已否决：refcnt 是任务级保护，两个版本都没有读者引用 RPC
   - 属主问题两个方案并列（空写与读删写都要面对）：
-    - 属主改归 kvcm：不改 mooncake；语义变（引擎下线 key 不删；kvcm 成新单点）
+    - 属主改归 kvcm：不改 mooncake；语义变（Revoke/`BatchReplicaClear` 权限归 kvcm，kvcm 死期间锁死、可 upsert 接管）；与副本存亡无关——两方案下引擎下线行为一致（E5 已闭环）
     - 借原属主 UUID：语义不变；需 master 加「key → 属主 UUID」查询 RPC（内部数据现成）
     - 决策条件：mooncake 能不能改（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、属主管辖、lease 与驱逐、UUID 与空写通道）
@@ -135,11 +135,11 @@
   - 教训：「用不了」不等于「不需要懂」——对照性机制要挖到能回答「为什么不是它」的深度
 - 事实输入：E6（已闭环，见本文 E6 条）。
 
-**D3. 副本生命周期与 READY 语义** — 🟡 部分已定（READY/保活机制已定；保活策略与属主归属未定）
+**D3. 副本生命周期与 READY 语义** — 🟡 部分已定（READY/保活机制/副本存亡已定；保活策略未定）
 
 - 事实：
   - 副本没有 pin，READY 后池仍可驱逐
-  - key 属主实例下线后，key 连同远端副本被 master 从元数据里删掉——数据字节还在各机器上、但已无从索引（实测 exist 0/32，见 [EXPERIMENTS.md](EXPERIMENTS.md)）——D1 F5
+  - key 属主实例下线后，master 只清它自己 seg 上的副本（含其登记的盘副本）；远端副本保留、继续可读——副本存亡绑 seg 挂载者，不绑写入者（E5 已闭环：10-20 复验 32/32 + 字节级读回，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15）——D1 F5
   - lease 是 key 粒度：读会续租、`CopyStart` 不续租、TTL 到期或驱逐时删整个 key、释放全部副本——D1 F15
 - READY 语义：✅ 已定型（D2 §1 完成信号，八项逐一点名）
   - 什么是 READY：目标实例的 DRAM 副本写好、kvcm 核验通过后，上报 Router「可以把请求调度过来」
