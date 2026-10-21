@@ -96,4 +96,4 @@ precopy 映射：eff rank i → B seg `i // num_sub_keys`，**由 precopy 自动
 
 - **B 侧重复请求偶发 1-token 贪心翻转**：仅 10/09 旧非 DEBUG 实例出现（同 prompt 偶数次输出在近平局 token 处偏 1 个字符），新 DEBUG 实例未复现；非字节错乱，复现条件与根因待查（实验记录见 [EXPERIMENTS.md](EXPERIMENTS.md) #10）。
 - **Mamba 异构不支持**（hybrid 模型被 tp_mismatch gate 排除，见 §2③）；Mamba 同构 TP=4 跨机已通过（`--block-size 1536`）。
-- 通用边界（副本无 pin、串行 copy、源属主须在线、带宽共享、验证覆盖面）见 [README.md](README.md)「边界与已知限制」。
+- 通用边界（副本无 pin、串行 copy、源 seg 属主须在线、带宽共享、验证覆盖面）见 [README.md](README.md)「边界与已知限制」。

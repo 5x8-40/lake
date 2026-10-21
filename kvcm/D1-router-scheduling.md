@@ -32,7 +32,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源 seg 属主客户端必须在线（预热场景即写入该 key 的引擎；一般情形 = 挂载源 seg 的 client，源由 master 随机挑，D2 F7）；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
 - **F5 副本无 pin：READY 后随时可能被池驱逐**：
   - 复制路径不加 pin / lease（F15），副本落位后不受保护，池驱逐策略说收就收。
-  - 属主实例（最初写入 key 的引擎）下线后，实测 key 连同所有机器上的副本一起消失——**我们预热到 B 的副本也在其中**（实测 exist 0/32；代码核实清理是副本级、与实测矛盾，归因待 E5——详见 D2 F6b；实测记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
+  - key 属主实例（最初写入 key 的引擎）下线后，实测 key 连同所有机器上的副本一起消失——**我们预热到 B 的副本也在其中**（实测 exist 0/32；代码核实清理是副本级、与实测矛盾，归因待 E5——详见 D2 F6b；实测记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
   - mooncake 有 pin 机制（两版本），但都挂在写路径上（`PutStart` / `UpsertStart` 收 `ReplicateConfig`）：
     - **soft pin**：key 粒度的**限时**驱逐保护——0.3.11 是布尔开关 `with_soft_pin`（`replica.h:84-85` @0.3.11），main 升级为三态 `soft_pin_action`（`replica.h:64-68` @main）；TTL 默认 30min、上限 24h（`types.h:86-89` @main），到期自动失效；驱逐两轮制把它排最后（第一轮只逐无 soft pin 的，凑不够且 `allow_evict_soft_pinned_objects` 时软 pin 也可逐）——机制细节与版本差异以 D2 F1 为准。
     - **hard pin**（`with_hard_pin`）：显式 pin，不可驱逐——写入时设置并固化进对象元数据，之后改不了（D2 F1）。
@@ -136,7 +136,7 @@ flowchart TB
 - **两条单向通道（§4）**：intent 下行 ②（Router → kvcm），事件上行 ⑥（kvcm → 索引）。
 - **选路面逻辑分层（§1）**：Router 不订阅事件流——索引订阅事件建索引，Router 自算请求的 hash 链查索引（token_ids 或 hash 两种入参，不依赖原始 token 文本），拿命中分数选路（⑩）。
 - **索引部署两种形态**（右上形态一 / 主链左侧形态二）：0.3.11 现状没有池 publisher、没有 Conductor，事件只有引擎 ⑦ 与 kvcm 补发 ⑥ 两条源，由 Router 进程内索引消费——kvcm 视野外的池删除不可见（引擎 put 的 KV 被驱逐/TTL），索引条目过时只损性能（F3/§2）；升级 mooncake 后 publisher 与 Conductor 上线，Conductor 消费三条源（⑥⑦⑨），Router 走 HTTP 查询。kvcm 补发在两种形态下走同一套端点、同一套引擎格式（§2 方案 a 形态无关性），差异只在编排层注册动作。
-- **kvcm 只碰控制面**：复制 / 核验 / 保活 / 释放走 master RPC（③，含 §6 停保活 / demote / Remove 三手段）；数据面复制（⑤ RDMA）由 master 派单（④）、源属主执行。池驱逐兜底不在图上（master 内部行为）。
+- **kvcm 只碰控制面**：复制 / 核验 / 保活 / 释放走 master RPC（③，含 §6 停保活 / demote / Remove 三手段）；数据面复制（⑤ RDMA）由 master 派单（④）、源 seg 属主执行。池驱逐兜底不在图上（master 内部行为）。
 - ① 是「提前备」的提前量来源（§4）：前端钩子比请求早到，Router 拿到预告后按 ② 表达意图，复制与否由 kvcm 决策。
 - 请求不等复制完成（⑩ 直接下发）；读路径先查后选（⑪ BatchQuery → ⑫ 跨机读兜底，F1/F3）——预复制只是提高本地命中概率，不是读路径前提。
 
@@ -297,6 +297,6 @@ flowchart LR
 - **D2**：KV 调度操作集（copy/move/keepalive/pin/demote/promote/retain/remove 八项；pin 两版本都挂在写路径上、复制路径带不了（F5），候选方案与属主问题见 D2 §2；释放有 `Remove` 系现成）
 - **D3**：副本生命周期与 READY 语义（F5 属主下线移除、TTL、属主下线后的副本归属）
 - **D4**：编排进程形态（预复制控制面独立进程或并入选路方；READY 确认接 gateway；seg→实例与「端点→实例」注册通道；预复制视图由控制面补发事件注入，§2）
-- **D5**：故障衔接（源属主掉线 copy 失败（F4）、与重路由的先后）
+- **D5**：故障衔接（源 seg 属主掉线 copy 失败（F4）、与重路由的先后）
 - **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../docs/research/vllm-ascend/layerwise-taxonomy.md)）
 - **D7**：方案 A（壳请求进 HBM）去留与叠加顺序

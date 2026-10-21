@@ -139,7 +139,7 @@
 
 - 事实：
   - 副本没有 pin，READY 后池仍可驱逐
-  - 属主实例下线后，key 连同远端副本被 master 从元数据里删掉——数据字节还在各机器上、但已无从索引（实测 exist 0/32，见 [EXPERIMENTS.md](EXPERIMENTS.md)）——D1 F5
+  - key 属主实例下线后，key 连同远端副本被 master 从元数据里删掉——数据字节还在各机器上、但已无从索引（实测 exist 0/32，见 [EXPERIMENTS.md](EXPERIMENTS.md)）——D1 F5
   - lease 是 key 粒度：读会续租、`CopyStart` 不续租、TTL 到期或驱逐时删整个 key、释放全部副本——D1 F15
 - READY 语义：✅ 已定型（D2 §1 完成信号，八项逐一点名）
   - 什么是 READY：目标实例的 DRAM 副本写好、kvcm 核验通过后，上报 Router「可以把请求调度过来」
@@ -192,7 +192,7 @@
 **D5. 故障衔接** — ✅ 已闭环
 
 - 事实：copy 期间源实例掉线即失败（master 把任务派给源 seg 属主，D1 F4）。
-- 事实：源属主宕机后，在途任务标记由 master 的定期清理线程（reaper）清掉（`master_service.cpp:10653-10700` @main）；清理完成前重发同一 copy 会收到 `OBJECT_HAS_REPLICATION_TASK` 报错（幂等语义见 D1 F11-F12）。
+- 事实：源 seg 属主宕机后，在途任务标记由 master 的定期清理线程（reaper）清掉（`master_service.cpp:10653-10700` @main）；清理完成前重发同一 copy 会收到 `OBJECT_HAS_REPLICATION_TASK` 报错（幂等语义见 D1 F11-F12）。
 - 半成品副本的清理：✅ 已核实（两版本同行为）
   - 半成品副本 = copy/move 已把数据写到目标、但还没标完成的副本
   - master 的定期清理线程（reaper）发现任务超时（TTL = `put_start_release_timeout_sec_`）后，按任务记录的 `replica_ids` 精确丢弃这些半成品：

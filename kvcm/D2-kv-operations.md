@@ -28,6 +28,12 @@
 
 ### 背景概念
 
+- **术语：身份与归属**（全文统一口径，括号内代码名）
+  - **client**：mooncake 客户端库实例（引擎与 kvcm 各持一个）；**client_id** = 它的身份 UUID（构造时随机生成，F11）
+  - **key 属主（owner）**：key 元数据的 `client_id` 字段 = 最后写入该 key 的 client；用途仅鉴权与 upsert 改写（F6）。「属主」单独出现时专指 key 属主
+  - **副本隶属（affiliation）**：副本数据所在的 client——内存副本隶属 seg 属主 client、盘副本隶属写盘登记 client、DFS 副本不隶属任何 client（main 显式化为 `isAffiliatedWith`，F6b）。**副本没有属主**，「副本属主」是禁用说法——说「副本隶属某 client」或「副本在某 seg」
+  - **seg 属主**：挂载该 seg 的 client；「源 seg 属主」「盘副本登记 client」都是副本隶属维度的派生说法
+  - **两个维度正交**：鉴权（Revoke / `BatchReplicaClear` 的属主校验）比 key 属主；级联清理走副本隶属（F6 全图）
 - **key 与副本**：池里一把 key 一份元数据（`ObjectMetadata`），元数据里挂着副本列表（`replicas_`）；同一 key 可有多个副本（replica），落在不同机器的 segment（seg，一段注册进池的 DRAM）上
 - **副本 = 元数据里的一条记录**（`replica.h::Replica`）：字段 = 位置（内存副本记某 seg 上的 buffer；盘副本记写盘 client 名下的文件路径）+ 状态 + 任务引用计数（refcnt，任务级，F8）——**没有 client_id**（副本无属主，见下「属主」条）。所以副本天然有**两个关联**——逻辑上属于 key（它是 key 元数据的一部分），物理上位于 seg（buffer 分配在 seg 上，seg 注册在 client 名下）。后文「副本跟 seg 死活」「按 key 删副本」分别对应这两个关联
 - **副本两个状态**：写中（PROCESSING，不可读）与就绪（COMPLETE，可读）
@@ -110,7 +116,7 @@
 - **F7 CreateCopyTask**（`master_service.cpp:5777` @0.3.11）
   - 入参：key + 目标 seg 名列表；**调用方不能指定从哪个副本复制**
   - 源选择：master 从该 key 现有副本所在的 seg 里**随机挑一个**（`:5816`）
-  - 执行模型：master 不搬数据，只生成任务记录；任务派给「源 seg 所属的客户端进程」执行——复制要求源属主在线
+  - 执行模型：master 不搬数据，只生成任务记录；任务派给「源 seg 所属的客户端进程」执行——复制要求源 seg 属主在线
   - 校验：key 存在、目标 seg 已挂载可分配
 - **CreateMoveTask**（key, source, target，`:5845`）
   - 唯一能指定源的路径；语义是**移动**——完成后源副本删除
@@ -195,7 +201,7 @@
 - `UnmountLocalDiskSegment`（main 新增——0.3.11 挂了本地盘就摘不掉）：引擎死前主动摘掉盘的登记（效果等同死后被清，但更干净可控）
 - `RemoveAll` 改异步（main）：master 置个标志，各 client 轮询到（`PollRemoveAll`）后各自清盘——全池清空不再是同步调用
 - `EvictDiskReplica` / `BatchEvictDiskReplica`（两版本同有）：client 盘副本被逐后向 master **上报**、清元数据（通知型，不是「命令 master 驱逐」）。鉴权分介质：
-  - `LOCAL_DISK`：限盘副本属主（descriptor 的 client_id 须匹配，`master_service.cpp:6336-6346` @main）
+  - `LOCAL_DISK`：限盘副本登记 client（descriptor 的 client_id 须匹配，`master_service.cpp:6336-6346` @main）
   - `DISK`（DFS 副本）：不验 client_id——kvcm 调用可清 DFS 副本
     - 机制事实登记；语义是「驱逐上报」，拿它当主动删除属于误用，release 不走这条路（§4）
 
@@ -545,7 +551,7 @@ sequenceDiagram
     participant K as kvcm
     participant M as master
     participant R as 读请求引擎
-    participant H as 盘副本属主引擎
+    participant H as 写盘引擎（盘副本登记 client）
 
     rect rgb(223, 242, 223)
     Note over K,H: 被动路径（真实读流量驱动）
@@ -579,8 +585,8 @@ sequenceDiagram
     end
 ```
 
-- 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 反复调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本属主引擎在线
-- `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本属主引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
+- 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 反复调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖写盘引擎在线
+- `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许写盘引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
 
 **⑦ retain（属主下线后副本存续；六方案时序：绿 = main 正式路径两条、橙 = 0.3.11 过渡三手段、灰 = 接受现状，§4）**
 
@@ -839,15 +845,15 @@ sequenceDiagram
 
 ### promote 实现
 
-- **被动路径（流量驱动）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本属主 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
+- **被动路径（流量驱动）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本登记 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
 - **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——对只剩盘副本的 key 反复调 `GetReplicaList` 至命中计数过线（默认 2 次）：计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），kvcm 的调用与真实流量同池累计，到线即触发上面的被动路径
-  - 前提：`promotion_on_hit` 开启 + DRAM 还没满到要驱逐的程度（内存紧张时 master 不批——提回来也马上被逐）+ 盘副本属主引擎在线
+  - 前提：`promotion_on_hit` 开启 + DRAM 还没满到要驱逐的程度（内存紧张时 master 不批——提回来也马上被逐）+ 写盘引擎在线
   - 触发必须用 `GetReplicaList`——`ExistKey` 触发不了（只授 lease、不计命中次数，`master_service.cpp:752-770` @0.3.11）；触发顺带授 lease（F11b 的副作用在此是正作用：提回期间防逐）
 - **kvcm 主动路径二：读删写（重，确定性自搬）**——读盘副本数据 → `Remove` → `PutStart` 新建 DRAM 副本 → 写数据 → `PutEnd` → 校验
   - 为什么不能更省事：`PutStart` 对已存在 key 报 `OBJECT_ALREADY_EXISTS`（@0.3.11）；`UpsertStart` 对已有 key 是原位更新（Case B 复用现有 buffer 地址，`:1693` @0.3.11；main 注释同一行为——同 size 复用现有 buffer）——只剩盘副本时原位写的是盘 buffer，提不回 DRAM。所以必须 Remove 后重 put（Upsert 否决结论两版本成立）
   - 属主问题同 §2 读删写（PutStart 传谁 UUID 谁是属主）；数据过 kvcm 本地（带宽）
   - 对比触发路径：不等计数、不管 DRAM 紧不紧张，**确定性**——「必须提回」的场景用它
-- **池的主动 RPC 链（`PromotionAllocStart` → 搬运 → `NotifyPromotionSuccess`，`master_service.h:559-590` @0.3.11）kvcm 用不了**——必须先有 master 准入的在途任务（只由命中驱动产生）、只许盘副本属主 client 执行。这只是池通道的内部机制说明，不妨碍上面两条 kvcm 路径成立
+- **池的主动 RPC 链（`PromotionAllocStart` → 搬运 → `NotifyPromotionSuccess`，`master_service.h:559-590` @0.3.11）kvcm 用不了**——必须先有 master 准入的在途任务（只由命中驱动产生）、只许盘副本登记 client 执行。这只是池通道的内部机制说明，不妨碍上面两条 kvcm 路径成立
 
 ### 副本归属与引擎下线
 
