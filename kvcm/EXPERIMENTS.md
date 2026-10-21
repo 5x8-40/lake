@@ -20,6 +20,7 @@
 | 12 | 10/09 深夜 | 跨机 245→217 异构重验（全新 prompt ×2：961/801 tok）+ **杀源实例终判** | **通过** + **杀源实例法确证读本机副本**（仅剩 217 副本时 B 首中全部外部 get 成功、零 invalid、输出与 A 逐字一致）。两认知：判定须用**全新 prompt 首中**（第二次被内部 HBM cache 接住，外部 get=0）；netdev 不计 RDMA（#9 撤回依据） | 见「实验实录 · 跨机」；判定方法 [REPRODUCE.md](REPRODUCE.md) §3 |
 | 13 | 10/12 上午 | 跨机 245→217 异构，**bc6b5be 单入口控制面 + 两端 #15835 完整补丁** | 正向回归（升级后首测）：warm A → 单入口 precopy（32 keys=8 满块×4 eff）READY → B 首中 external **88.2%**（滚动累计口径，非单请求）、零 invalid、16-tok ×6 + 64-tok ×2 **8/8 逐字一致**（1-token 翻转未复现）。B 机容器无 `ss`：用 admin `:9003/get_all_segments` + 显式 `--targets` | 本次会话记录；见「实验实录 · 10-12 回归 · 正向」 |
 | 14 | 10/12 下午 | 跨机 **反向 217(TP4)→245(TP2)，A 同步 load（无 LOAD_ASYNC）** | **通过**：36/36 key 对号入 A 两 seg（18+18）；每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 证 hunk3 同步分发生效；8/8 token 与 B(TP4) 参考逐字一致；external hit 74.6→79.7%、零 invalid。踩坑：首跑 A 侧 peer 误配成 2（=自身 TP）→ mismatch 静默禁用 → `-800`（指纹 `Failed to get 9 keys`=每块 1 key）；改回 `PEER=4` 即通——同步 load mismatch 由此闭环 | 见「实验实录 · 10-12 回归 · 反向（同步 load）」 |
+| 15 | 10/20 | 跨机正向 keys（#13 的 32 keys）不动，**kill 属主 A 全进程树 → 等 client TTL 过期 → 复验** | **「副本随属主消失」不成立（纠正踩坑 3 早期误判）**：基线 32/32 → kill（17:06:51）→ 17:08:57 master `client_expired` + unmount A 两 seg（**零驱逐零 remove**）→ `batch_is_exist` **32/32**、副本全在 B 四 seg → 裸 client 跨机 `get` **3/3 字节级读回**（各 4.5MB）→ A 复活后终态仍 32/32。结论：副本存亡绑定所在 seg 挂载者，属主下线只清其 seg 内副本，远端副本保留 | master 日志切片（本机 `va-precopy/logs/`，不入仓）；见踩坑 3 |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
 
@@ -107,7 +108,7 @@
 
 1. **PYTHONHASHSEED 未设 → 控制面 key 全体漂移**：vllm `kv_cache_utils.init_none_hash`（rc1 容器版 `kv_cache_utils.py:111-114`；main 已重构为 `resolve_none_hash_seed`）在 seed 未设时 `NONE_HASH = os.urandom(32)` 折入**每个** block hash，且 sha256 不在 `_CBOR_HASH_FUNCTIONS` 警告名单——**静默**。实测同一 prompt 两次算出 `dc9fdff8…`/`948bbe7a…` 两个 key 集，`batch_is_exist` 0/N 假失败（引擎其实已 put）。引擎侧 `start_worker.sh` 已带 seed；控制面（keys.py/precopy/手工探测脚本）此前没带。已修：`keys.py::_hash_prompt` fail loud；顺带勘误 README 前置表「默认 sha256 不需要」的说法。
 2. **孤儿 EngineCore 占卡**：重启 A 时只 kill 了 api_server（按 pid 段过滤漏掉 EngineCore/Worker——其 pid 与 api_server 相差悬殊），HBM 被孤儿占住，新实例 worker 起不来；segs 还是旧实例的。清理须按 `npu-smi`（卡→pid）+ `ss`（端口→pid）对号出的实际 pid 杀。
-3. **副本随属主消失（元数据级）**：属主 A 重启 → client TTL 过期 → master 把 key 记录连同全部副本记录（含 B seg 上的）一起移除，`batch_is_exist` 0/32。B 侧 DRAM 字节并未被擦除，但失去元数据即不可寻址，等同消失（原地残留至 seg 空间复用）。副本存活性疑似绑定属主 client，影响故障恢复语义，已列 README「开放问题」。
+3. **「副本随属主消失」是误判，级联删除不存在**：10-12 观察到的 0/32 是踩坑 1 的假失败（控制面未带 PYTHONHASHSEED → key 名漂移 → `batch_is_exist` 假失败），并非属主级联删除。10-20 受控复验：kill 属主 A → client TTL 过期 unmount 其 seg（master 日志零驱逐零 remove）→ `batch_is_exist` 仍 32/32 且副本全在 B seg，跨机裸 client `get` 字节级读回 3/3。结论：**副本存亡绑定「副本所在的 seg 挂载者」，不绑定写入者；属主下线只清其自己 seg 上的副本，远端副本保留**（代码锚点：v0.3.11 `master_service.cpp` `CleanupStaleHandles` 谓词 = 副本所在 seg 是否失效；main `replica.h::isAffiliatedWith` 同义）。复验记录见总表 #15。
 4. **ssh 限速下 expect 的正确姿势**：`timeout` 杀掉 expect 后孤儿 ssh 仍握住管道写端，`| tail` 等 EOF 会把整个外层命令拖挂（实测被拖 300s+）。姿势：输出重定向落文件 + expect timeout 分支显式 `close`。
 
 ### 10-12 对既有结论的影响
