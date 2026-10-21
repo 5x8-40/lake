@@ -24,7 +24,7 @@
 
 - **key 与副本**：池里一把 key 存一份 KV 数据；同一 key 可有多个副本（replica），落在不同机器的 segment（seg，一段注册进池的 DRAM）上
 - **副本两个状态**：写中（PROCESSING，不可读）与就绪（COMPLETE，可读）
-- ~~**属主（owner）**：每把 key 的元数据里记录 `client_id` = 写入它的客户端 UUID~~ **[10-20 勘误]** key 元数据里**没有写入者字段**；memory 副本只记 buffer + seg 名，副本的「属地」= buffer 从哪个 seg 分出（绑该 seg 挂载者的 liveness，`segment_allocator_registration.cpp` `Allocate`；main `replica.h::isAffiliatedWith`）。client_id 只出现在 RPC 身份校验（谁能 CopyEnd/MoveEnd）与任务派发（copy/move 派给源 seg 属主）
+- ~~**属主（owner）**：每把 key 的元数据里记录 `client_id` = 写入它的客户端 UUID~~ **[10-21 修正]** 前述「元数据无写入者字段」**说错了**：main `object_metadata.h` `ObjectMetadata::client_id`（:98）**就是写入者字段**，UpsertStart Case B 更新（`master_service.cpp:6019`）。但**它只管写权限，不管副本存亡**：PutEnd 校验（:5226/:5533）、`BatchReplicaClear` 权限（:4052）、offload 记账（:8718）；清理谓词全部走 `replica.h::isAffiliatedWith`（副本所在 seg 挂载者），`client_id` 零参与。**move 确实不改 `client_id`**（MoveStart/MoveEnd 无赋值）——但 move **改副本属地**：`MoveStart` :7010 在目标 seg `AllocateFrom` 分新 buffer（绑目标挂载者）、`MoveEnd` :7196 起删源副本。即：**「move 不改 key 的 client_id」成立，但副本跟谁共存亡由挂载者决定、move 会转移**——两个是不同字段、不同机制
 - **属主管辖范围**（F6 详述）：~~只影响「属主下线时 key 是否级联删除」和「谁能撤销未完成的写」~~ 属主下线**只清其自己 seg 上的副本，远端副本保留**（10-20 复验，总表 #15）；「谁能撤销未完成的写」照旧，与复制、读取无关
 - **lease（读租约）**
   - 读路径（`GetReplicaList` / `ExistKey`）授予，lease 期内该 key **绝对不可逐**（驱逐硬过滤直接跳过，F11）
