@@ -151,7 +151,7 @@
   - 预复制不续租的话，一个 TTL 窗口内没有读流量就可能被驱逐
   - 约束已定：保活循环必须有界——无限续租事实上等于 pin；kvcm 断线后租约到期自然失效，不残留
   - 策略未定：续多久、何时停——候选 = 会话期 / 固定窗口 / 首流量后停租，未选定
-- 属主下线后副本归属：🟡 机制已定（D2 §4 retain）——main 有两条池机制并列（retained client / DFS 副本）；0.3.11 的过渡手段（改属主 / move）哪个有效，等 E5 实验结论；不依赖该结论的办法 = kvcm 自挂 SSD
+- key 属主下线后的副本存亡：🟡 机制已定（D2 §4 retain）——main 有两条池机制并列（retained client / DFS 副本）；0.3.11 的过渡手段（改属主 / move）哪个有效，等 E5 实验结论；不依赖该结论的办法 = kvcm 自挂 SSD
 - 计划下线迁移：归 D2 retain 条（`CreateDrainJob` 两版本都有，把指定 seg 上的数据迁空到目标 seg，带并发上限、job 级可取消）
 - 落盘（写到 SSD）：Mooncake 的 DRAM→SSD 是池内冷热分层（client 侧 `enable_ssd_offload`，默认 `false`），不是「预复制时直接指定写盘」；SSD 只作容量/恢复用的异步 demote 去向（机制归 D2 demote 条）
 - 直接影响故障恢复时已预热前缀的可用性（D5，已闭环，见本文）。事实输入：E5。

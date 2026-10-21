@@ -32,7 +32,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源 seg 属主客户端必须在线（预热场景即写入该 key 的引擎；一般情形 = 挂载源 seg 的 client，源由 master 随机挑，D2 F7）；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
 - **F5 副本无 pin：READY 后随时可能被池驱逐**：
   - 复制路径不加 pin / lease（F15），副本落位后不受保护，池驱逐策略说收就收。
-  - key 属主实例（最初写入 key 的引擎）下线后，实测 key 连同所有机器上的副本一起消失——**我们预热到 B 的副本也在其中**（实测 exist 0/32；代码核实清理是副本级、与实测矛盾，归因待 E5——详见 D2 F6b；实测记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
+  - key 属主实例（最后写入 key 的引擎）下线后，实测 key 连同所有机器上的副本一起消失——**我们预热到 B 的副本也在其中**（实测 exist 0/32；代码核实清理是副本级、与实测矛盾，归因待 E5——详见 D2 F6b；实测记录见 [EXPERIMENTS.md](EXPERIMENTS.md)）。
   - mooncake 有 pin 机制（两版本），但都挂在写路径上（`PutStart` / `UpsertStart` 收 `ReplicateConfig`）：
     - **soft pin**：key 粒度的**限时**驱逐保护——0.3.11 是布尔开关 `with_soft_pin`（`replica.h:84-85` @0.3.11），main 升级为三态 `soft_pin_action`（`replica.h:64-68` @main）；TTL 默认 30min、上限 24h（`types.h:86-89` @main），到期自动失效；驱逐两轮制把它排最后（第一轮只逐无 soft pin 的，凑不够且 `allow_evict_soft_pinned_objects` 时软 pin 也可逐）——机制细节与版本差异以 D2 F1 为准。
     - **hard pin**（`with_hard_pin`）：显式 pin，不可驱逐——写入时设置并固化进对象元数据，之后改不了（D2 F1）。
@@ -295,7 +295,7 @@ flowchart LR
 编号登记处（含 P/E 系列、状态与依赖）：[summary.md](summary.md)。
 
 - **D2**：KV 调度操作集（copy/move/keepalive/pin/demote/promote/retain/remove 八项；pin 两版本都挂在写路径上、复制路径带不了（F5），候选方案与属主问题见 D2 §2；释放有 `Remove` 系现成）
-- **D3**：副本生命周期与 READY 语义（F5 属主下线移除、TTL、属主下线后的副本归属）
+- **D3**：副本生命周期与 READY 语义（F5 属主下线移除、TTL、key 属主下线后的副本存亡）
 - **D4**：编排进程形态（预复制控制面独立进程或并入选路方；READY 确认接 gateway；seg→实例与「端点→实例」注册通道；预复制视图由控制面补发事件注入，§2）
 - **D5**：故障衔接（源 seg 属主掉线 copy 失败（F4）、与重路由的先后）
 - **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../docs/research/vllm-ascend/layerwise-taxonomy.md)）
