@@ -48,7 +48,44 @@
   - **只延不缩、无撤销 RPC**（两版本同）：续租只把期限往后推、已发出的租约缩不短（0.3.11 `master_service.h:946`；main `lease.h::Lease::GrantReadLease`）；要提前让 key 可删只能 `Remove(force=true)` 跳过 lease 检查（§4）
 - **kvcm 自身 = mooncake client**：client 是库不是独立进程；kvcm 调 copy/move/upsert 必须链接它，构造时自动持有一个 UUID——§2 方案一中「kvcm 自己的 UUID」零额外成本
 
-**归属关系全图**（示例状态：key 由引擎 A 写入 → key 属主 = A；kvcm 把它 copy 到 seg B → 新副本隶属 B、key 属主仍是 A——「两个维度正交」的实例）：
+**实体与位置**（这些词各是什么、存在哪里；示例状态：key 由引擎 A 写入，一份内存副本在 seg A、一份盘副本在 A 的 SSD、一份 DFS 副本）：
+
+```mermaid
+flowchart TB
+    subgraph M["master 进程（元数据全在 master 内存）"]
+        META["key 元数据 ObjectMetadata"]
+        OID["· client_id 字段 = key 属主"]
+        PROT["· lease / soft pin / hard pin"]
+        REPS["· replicas_ 副本列表"]
+        META --> OID & PROT & REPS
+        R1["副本记录①：位置 = seg A 的 buffer"]
+        R2["副本记录②：位置 = A 的 SSD 文件路径"]
+        R3["副本记录③：位置 = DFS 路径<br/>（不隶属任何 client）"]
+        REPS --> R1 & R2 & R3
+    end
+
+    subgraph EA["引擎 A（机器）"]
+        EAP["引擎进程（client 库）：<br/>client_id，UUID，构造时生成"]
+        MEM["DRAM：seg A（一段注册进池的内存）"]
+        BUF["buffer（seg 内分出的一块，KV 数据本体）"]
+        SSD["SSD：盘副本文件"]
+        MEM --> BUF
+    end
+    DFS["共享 3FS（仅 main）：DFS 副本文件"]
+
+    EAP -. "挂载 → seg 属主" .-> MEM
+    OID -. "key 属主" .-> EAP
+    R1 -. "隶属（buffer 在谁的 seg）" .-> MEM
+    R2 -. "隶属（写盘时登记的 client）" .-> EAP
+
+    R1 == "位置指向" ==> BUF
+    R2 == "位置指向" ==> SSD
+    R3 == "位置指向" ==> DFS
+```
+
+- 读法：实线 = 结构包含（元数据 → 字段 → 副本列表 → 副本记录；seg → buffer）；虚线 = 归属（key 属主 / 副本隶属 / seg 属主）；粗线 = 副本记录的位置字段指向数据本体。**元数据全在 master 内存；数据本体全在引擎侧介质**（DRAM buffer / SSD 文件 / DFS）——master 不持数据，引擎不持元数据
+
+**归属两个维度**（上图的归属线分别被谁消费；示例状态：key 属主 = A，kvcm 把它 copy 到 seg B → 新副本隶属 B、key 属主仍是 A——「两个维度正交」的实例）：
 
 ```mermaid
 flowchart TB
@@ -62,7 +99,7 @@ flowchart TB
         R1["内存副本<br/>位置 = seg A 的 buffer"]
         R2["内存副本<br/>位置 = seg B 的 buffer<br/>（kvcm copy 产物，同构）"]
         R3["盘副本<br/>位置 = A 的 SSD 文件路径"]
-        R4["DFS 副本<br/>位置 = 共享 3FS（仅 main）"]
+        R4["DFS 副本<br/>位置 = 共享 3FS（仅 main）<br/>（不隶属任何 client）"]
     end
     REPS --> R1 & R2 & R3 & R4
 
@@ -78,7 +115,6 @@ flowchart TB
     R1 -. "隶属" .-> EA
     R2 -. "隶属" .-> EB
     R3 -. "隶属（写盘登记）" .-> EA
-    R4 -. "不隶属任何 client" .-> NIL[" "]
 
     OID == "维度① 鉴权" ==> AUTH["Revoke / BatchReplicaClear<br/>比对 key 属主"]
     R1 & R2 & R3 == "维度② 级联清理" ==> CLEAN["client 死 →<br/>清隶属它的副本，不看 key 属主"]
