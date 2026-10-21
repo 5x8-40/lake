@@ -32,7 +32,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源属主客户端（写入该 key 的引擎）必须在线；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
 - **F5 副本无 pin：READY 后随时可能被池驱逐**：
   - 复制路径不加 pin / lease（F15），副本落位后不受保护，池驱逐策略说收就收。
-  - 属主实例（最初写入 key 的引擎）下线后，master 只清**属主自己 seg 上的副本**；key 在其他机器上的副本**不受影响、继续可读**（10-20 受控复验：kill A 后 32/32、副本仍在 B seg、字节级读回成功；代码锚点 v0.3.11 `CleanupStaleHandles` / main `replica.h::isAffiliatedWith`——副本存亡绑定所在 seg 挂载者，非写入者。10-12 的 0/32 观测为 key 名漂移假失败，见 [EXPERIMENTS.md](EXPERIMENTS.md) 踩坑 3 勘误与总表 #15）。
+  - 属主实例（最初写入 key 的引擎）下线后，master 只清**属主自己 seg 上的副本**；key 在其他机器上的副本**不受影响、继续可读**（代码锚点 v0.3.11 `CleanupStaleHandles` / main `replica.h::isAffiliatedWith`——副本存亡绑定所在 seg 挂载者，非写入者。10-20 受控复验：kill A 后 32/32、副本仍在 B seg、字节级读回成功，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15；早期 0/32 观测为 key 名漂移假失败，踩坑 3）。
   - mooncake main 有 pin 机制，但都挂在写路径上（`PutStart` / `UpsertStart` 收 `ReplicateConfig`，`master_service.h:452` / `:515`）：
     - **soft pin**（`soft_pin_action`，`replica.h:64-68`）：key 粒度的**限时**驱逐保护——默认 30min、上限 24h（`types.h:85-89`），到期自动失效（`CleanupExpiredSoftPins`，`master_service.h:1468`）；驱逐两轮制把它排最后——第一轮只驱逐无 soft pin 的对象，第一轮凑不够且 `allow_evict_soft_pinned_objects`（默认 true，`types.h:90`）时软 pin 也可被驱逐（`master_service.h:987-995`），所以叫「软」。
     - **hard pin**（`with_hard_pin`，`replica.h:113`）：显式 pin，不可驱逐——写入时设置并固化进对象元数据（`master_service.cpp:6068`），全驱逐路径检查 `IsHardPinned`（`:8117` / `:11918` / `:12213` / `:12434`）。
@@ -256,18 +256,18 @@ flowchart LR
 手段三个 + 兜底一个：
 
 - **主路径·停保活（软释放）**：副本活着是因为有读在续租、或控制面在保活（F15）——释放不需要新动作，停止动作就行：控制面停掉某前缀的保活，租约到期池自然收走。保护机制：任何实例还在读这个前缀，读路径会自动续租，key 不受影响——停保活只是控制面不再续租，动不了仍在使用的数据。
-- **中间档·demote（降层）**：不删除，DRAM → SSD，前缀还在池里可读（更慢）。用途：「近期不用、但可能还会用」的前缀降层省 DRAM。~~实例计划下线前降层保存以避「属主下线整批删除」~~——该动机 **10-20 勘误撤销**（属主下线只清其 seg 内副本，远端副本本就保留，见总表 #15）。操作集归 D2（`enable_ssd_offload` / `EvictDiskReplica`）。
+- **中间档·demote（降层）**：不删除，DRAM → SSD，前缀还在池里可读（更慢）。用途：「近期不用、但可能还会用」的前缀降层省 DRAM。操作集归 D2（`enable_ssd_offload` / `EvictDiskReplica`）。
 - **例外通道·主动 Remove（硬释放）**：等不了自然过期、要立即腾地方时用；key 全局删除（A 的原本一起删），门槛 = 确认前缀谁都不再用（会话明确结束、前缀一次性）。`Remove` / `BatchRemove` 现成（D2）。
 - **兜底·池驱逐（非手段）**：即使控制面出错（没停保活、没发 Remove），池的 TTL 与驱逐也会最终回收——不会出现没人记得、永远占着内存的孤儿副本。三个手段只让回收更快更准，正确性不靠它们。
 
-已知缺口（登记，不归 D1）：显式 pin（hard pin）只在写路径可设，无事后加/解 pin 的独立 RPC，预复制带不了（F5 → D2）；~~属主下线副本一并移除~~（**10-20 勘误撤销**：远端副本不随属主消失，见总表 #15）。
+已知缺口（登记，不归 D1）：显式 pin（hard pin）只在写路径可设，无事后加/解 pin 的独立 RPC，预复制带不了（F5 → D2）。
 
 ## 留给后续
 
 编号登记处（含 P/E 系列、状态与依赖）：[backlog.md](backlog.md)。
 
 - **D2**：KV 调度操作集（pin/demote/prefetch/retain/release；master 无显式 pin → `SubmitReplicaActionProposal` lease 机制；释放有 `Remove`/`BatchRemove` 现成）
-- **D3**：副本生命周期与 READY 语义（~~F5 属主下线移除~~ 已勘误：副本属地=所在 seg 挂载者，属主下线只清其 seg 内副本、远端副本保留；TTL、驱逐候选资格仍是 D3 输入）
+- **D3**：副本生命周期与 READY 语义（副本属地 = 所在 seg 挂载者：属主下线只清其 seg 内副本、远端副本保留；TTL、驱逐候选资格仍是 D3 输入）
 - **D4**：编排进程形态（预复制控制面独立进程或并入选路方；READY 确认接 gateway；seg→实例与「端点→实例」注册通道；预复制视图由控制面补发事件注入，§2）
 - **D5**：故障衔接（源属主掉线 copy 失败（F4）、与重路由的先后）
 - **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../docs/research/vllm-ascend/layerwise-taxonomy.md)）

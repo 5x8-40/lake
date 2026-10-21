@@ -24,8 +24,8 @@
 
 - **key 与副本**：池里一把 key 存一份 KV 数据；同一 key 可有多个副本（replica），落在不同机器的 segment（seg，一段注册进池的 DRAM）上
 - **副本两个状态**：写中（PROCESSING，不可读）与就绪（COMPLETE，可读）
-- ~~**属主（owner）**：每把 key 的元数据里记录 `client_id` = 写入它的客户端 UUID~~ **[10-21 修正]** 前述「元数据无写入者字段」**说错了**：**0.3.11 与 main 都有** `ObjectMetadata::client_id` 写入者字段（v0.3.11 `master_service.h` 内嵌 struct；main `object_metadata.h:98`，UpsertStart 更新于 `master_service.cpp:6019`）。但**它只管写权限，不管副本存亡**：PutEnd 校验（v0.3.11 :1364/:1482、main :5226/:5533）、删除权限（v0.3.11 :937、main `BatchReplicaClear` :4052）、指标记账（v0.3.11 :5596）；清理谓词两版都不碰它——v0.3.11 `CleanupStaleHandles` = `has_invalid_mem_handle() || has_stale_local_disk_client`，main 走 `replica.h::isAffiliatedWith`（副本所在 seg 挂载者）。**move 确实不改 `client_id`**（两版 MoveStart/MoveEnd 均无赋值）——但 move **改副本属地**：`MoveStart` 在目标 seg 分新 buffer（绑目标挂载者；main :7010 `AllocateFrom`）、`MoveEnd` 删源副本（main :7196 起）。即：**「move 不改 key 的 client_id」成立，但副本跟谁共存亡由挂载者决定、move 会转移**——两个是不同字段、不同机制
-- **属主管辖范围**（F6 详述）：~~只影响「属主下线时 key 是否级联删除」和「谁能撤销未完成的写」~~ 属主下线**只清其自己 seg 上的副本，远端副本保留**（10-20 复验，总表 #15）；「谁能撤销未完成的写」照旧，与复制、读取无关
+- **属主字段（client_id）**：每把 key 的元数据记 `client_id` = 最后写入它的客户端 UUID（v0.3.11 `master_service.h` 内嵌 struct；main `object_metadata.h:98`，UpsertStart 更新于 `master_service.cpp:6019`）。它只管写权限——PutEnd 校验（v0.3.11 :1364/:1482、main :5226/:5533）、`BatchReplicaClear` 删除权限（v0.3.11 :937、main :4052）、指标记账（v0.3.11 :5596）——**不管副本存亡**（两版清理谓词都不读它）。copy/move 不改 `client_id`；决定副本存亡的是**副本属地**：副本 buffer 从哪个 seg 分出，就绑那个 seg 挂载者的 liveness（`segment_allocator_registration.cpp:37` `bindClientLiveness`；v0.3.11 `CleanupStaleHandles` 谓词 / main `replica.h::isAffiliatedWith`）。move 转移副本属地：`MoveStart` 在目标 seg 分新 buffer、`MoveEnd` 删源副本（main :7010 / :7196 起）
+- **属主管辖范围**（F6 详述）：属主下线只清其自己 seg 上的副本，远端副本保留、继续可读（10-20 复验，总表 #15）；「谁能撤销未完成的写」照旧，与复制、读取无关
 - **lease（读租约）**
   - 读路径（`GetReplicaList` / `ExistKey`）授予，lease 期内该 key **绝对不可逐**（驱逐硬过滤直接跳过，F11）
   - **新 put 的 key 出生无租约**：`PutEnd` 里 `GrantLease(0, ...)` 把 lease_timeout 设为 now——「the object has no lease at beginning」（`master_service.cpp:1422` 注释 @0.3.11）；第一次被读/touch 才获得保护
@@ -76,9 +76,9 @@
 ### 属主字段管辖范围
 
 - **F6 属主管辖两件事，其余一概不管**
-  1. ~~**级联删除**：属主进程心跳超时被 master 判定下线后，它写入的 key 连同所有副本（包括 kvcm 预热到其他机器上的）一起被元数据级删除（D1 F5，实测 exist 0/32）~~ **[10-20 勘误]** 级联删除**不存在**：属主下线只触发 unmount 其自己 seg + 清其上的副本；远端副本不受影响（清账谓词按副本所在 seg 判定、非写入者；0/32 实测为 key 名漂移假失败——[EXPERIMENTS.md](EXPERIMENTS.md) 踩坑 3 勘误、总表 #15）。真下线风险只剩「副本全在死属主 seg 上的 key」整 key 消失
+  1. **副本属地**：属主下线只触发 unmount 其自己 seg + 清其上的副本；远端副本不受影响、继续可读。清账谓词按副本所在 seg 判定、与写入者无关——v0.3.11 `CleanupStaleHandles` = `has_invalid_mem_handle() || has_stale_local_disk_client`，main 走 `replica.h::isAffiliatedWith`。真下线风险只剩「副本全在死属主 seg 上的 key」整 key 消失（10-20 受控复验 32/32 + 字节级读回：[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15）
   2. **写中止权限**：Revoke 校验属主身份（F5）
-- **不管**：copy / move / get / exist——复制与读取路径完全不读属主字段（F7 代码核实）
+- **不管**：copy / move / get / exist——复制与读取路径完全不读属主字段（F7 代码核实）；copy/move 也不改属主字段
 
 ### copy / move 机制
 
@@ -146,7 +146,7 @@
 - **防驱逐相关操作的语义界定**（keepalive / pin / retain 的区别）
   - **keepalive**（动作）：周期 touch 续 lease（F11）——窗口 = lease_ttl、轻、高频；kvcm 断线，lease 过期即失效
   - **pin**（元数据标记）：设一次长期有效——soft = 驱逐排最后 + TTL 窗口；hard = 绝对不可逐
-  - **retain**（目的，不是机制）：「长期未命中时副本继续活着」——手段 = keepalive + pin（§2）。~~属主下线场景~~ **[10-20 勘误]** 属主下线不再需要 retain 兜底（远端副本本就保留）；retain 的真实对手只剩 lease 过期→驱逐
+  - **retain**（目的，不是机制）：「长期未命中时副本继续活着」——手段 = keepalive + pin（§2）。属主下线不需要 retain 兜底（远端副本本就保留，F6）；retain 的真实对手只剩 lease 过期→驱逐
   - touch 哪些 key、何时开始、周期多少 = **kvcm 策略层逻辑**（保活注册表驱动），不是原子操作语义的一部分
 - **状态记录四类**（按可丢性分级）
   1. **任务状态机**（可丢）：在途任务进度；丢了可重发——master 侧操作幂等（重复 copy 同 key 同目标不产生重复副本）
@@ -195,14 +195,13 @@
 
 ### 属主问题：两个并列方案（空写与读删写重建共同面对）
 
-- **[10-20 勘误]** 本节原立论「防属主下线级联删除」不成立（级联删除不存在，见 F6 勘误、[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15）；属主方案剩余价值仅剩「写中止权限的属主身份」（Revoke/在途写撤销）
-- 起因：upsert/put 必然把属主改成调用方（F3①）
+- 起因：upsert/put 必然把属主改成调用方（F3①）。属主方案面对的问题只剩「写中止权限的属主身份」（Revoke/在途写撤销）——属主下线不清远端副本（F6），不存在需要防的级联删除
 
 | | 方案一：属主改归 kvcm | 方案二：不改属主（借名） |
 |---|---|---|
 | 做法 | kvcm 传自己的 UUID（自己就是 client，天然持有；sqlite 持久化，重启同 id 重注册） | kvcm 先查得原属主 UUID，调用时原样传回（F4） |
 | mooncake 代码 | **不改**（前提：空写通道不落 Python，F9） | **要改**：master 加「key → 属主 UUID」查询 RPC（数据内部现成，纯暴露，F8） |
-| 属主语义 | ~~**改变**：引擎下线后 key 不再级联删除（正是 retain 想要的收益）~~ 收益随 F6 勘误消失；剩余代价 = kvcm 成在途写的持有者（新单点） | **不变**（维持现状语义） |
+| 属主语义 | 改变：kvcm 成在途写的持有者（新单点）；属主下线行为两方案无差异（本就不清远端副本，F6） | **不变**（维持现状语义） |
 | 引擎配合 | 无 | 无（补丁打在 master，引擎零感知） |
 
 - **决策条件（外部依赖，非单方可定）**
@@ -219,3 +218,32 @@
 - retain 的已有输入
   - 与属主语义（§2 两方案）、D3 副本生命周期直接耦合
   - `AddReplicaForRetainedClient`（master 为「保留副本的客户端」补登记副本的接口）为 main 独有、0.3.11 不含（E6 已核）→ 候选机制，届时评估
+
+## 附图：copy 完成后的静态全景（key / client_id / seg / buffer 各在哪）
+
+```
+┌───────────── master（独立进程，可能在任何一台机器）─────────────┐
+│                                                                │
+│   key: "K1"                                                    │
+│     ├─ client_id = A        ←元数据字段，登记在 master 这一级    │
+│     ├─ lease / pin 等元数据                                     │
+│     ├─ 副本[0] ── 指向 ──→ seg_A 上的 buffer#1                 │
+│     └─ 副本[1] ── 指向 ──→ seg_B 上的 buffer#2                 │
+│                                                                │
+│   （master 只存「指针」，不存数据本体）                          │
+└────────────────────────────────────────────────────────────────┘
+               │ 指向 seg_A                  │ 指向 seg_B
+               ▼                            ▼
+┌── A 机器 ────────────────────┐   ┌── B 机器 ────────────────────┐
+│                              │   │                              │
+│  seg_A ←A 启动时向 master 注册│   │  seg_B ←B 启动时向 master 注册│
+│    └─ buffer#1               │   │    └─ buffer#2               │
+│       （K1 数据本体）         │   │       （K1 数据副本）         │
+│       内部绑定：挂载者=A      │   │       内部绑定：挂载者=B      │
+│                              │   │                              │
+└──────────────────────────────┘   └──────────────────────────────┘
+```
+
+- 四样东西各在哪：**key** 是 master 元数据里的一条记录（名字+指针），不落任何机器；**client_id** 是这条记录里的一个字段，只在 master 手里；**seg** 是各机器注册进池子的内存区域；**buffer** 是 seg 里切出来的块，数据本体所在。
+- 关键：**client_id 与副本属地是两层、互不相干**。copy/move 后 `client_id` 不变（写入者字段，仅 PutEnd 校验 / `BatchReplicaClear` 权限 / 记账用，清理谓词不看它——见 F6）；副本生死只看 buffer 所在 seg 的挂载者（v0.3.11 `CleanupStaleHandles` / main `isAffiliatedWith`）。
+- copy 与 move 的唯一区别：copy 后源、目标各留一份（副本数 +1）；move 完源副本删除（副本数不变），落户逻辑相同。

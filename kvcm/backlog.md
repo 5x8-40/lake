@@ -42,15 +42,15 @@
     - 借原属主 UUID：语义不变、需 master 加「key → 属主 UUID」查询 RPC（内部数据现成）
     - 决策条件 = mooncake 可改性（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、属主管辖、lease 与驱逐、UUID 与空写通道）
-- retain：长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。~~属主下线场景~~（10-20 勘误：属主下线远端副本本就保留，retain 只对 lease 过期→驱逐）。
-- demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（若以落盘为 READY，等待落盘的时间会把预热收益抵消）。~~用途二：实例计划下线前降层保存 KV，避免属主下线整批删除~~（10-20 勘误撤销：该动机不成立，属主下线只清其 seg 内副本 → D1 F5 勘误）。
+- retain：长期未命中时副本存续，与 D3 直接相关；master 有 `AddReplicaForRetainedClient` 可考察。属主下线远端副本本就保留（D1 F5），retain 只对 lease 过期→驱逐。
+- demote：DRAM→SSD 降层。master 有 offload/promotion 心跳与 `EvictDiskReplica`；READY 是否含落盘归入此项（若以落盘为 READY，等待落盘的时间会把预热收益抵消）。
 - release：前缀失效主动释放，`Remove`/`BatchRemove`/`RemoveByRegex`/`BatchReplicaClear` 现成；归谁决策已闭环（D1 §6：router 提供会话生命周期线索，控制面决策，池兜底；含中间档 demote）。
 - 事实输入：E6。
 
 **D3. 副本生命周期与 READY 语义**
 
-- 事实：副本无 pin，READY 后池可驱逐；~~属主实例下线后 key 连同远端副本被 master 元数据级移除~~ **[10-20 勘误]** 副本存亡绑定所在 seg 挂载者、非写入者——属主下线只清其自己 seg 上的副本，远端副本保留（10-20 受控复验 32/32 + 字节级读回；0/32 旧观测为 key 名漂移假失败，见 [EXPERIMENTS.md](EXPERIMENTS.md) 踩坑 3 勘误、总表 #15）——D1 F5。lease 为 key 粒度：读续租、`CopyStart` 不续租、TTL/驱逐删 key 释放全部副本——D1 F15。
-- 待定：READY 是否 =「本机 DRAM 必达」；保活策略；~~属主下线后副本归属（保留/驱逐/迁移）~~（已核实：远端副本保留，原地可读）。
+- 事实：副本无 pin，READY 后池可驱逐；副本存亡绑定所在 seg 挂载者——属主下线只清其自己 seg 上的副本，远端副本保留、原地可读（10-20 受控复验 32/32 + 字节级读回，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15；早期 0/32 观测为 key 名漂移假失败，踩坑 3）——D1 F5。lease 为 key 粒度：读续租、`CopyStart` 不续租、TTL/驱逐删 key 释放全部副本——D1 F15。
+- 待定：READY 是否 =「本机 DRAM 必达」；保活策略。
 - 保活机制事实（D1 F15）：`batch_is_exist` 顺带续租（`ProbeKey` 不续），默认 TTL 10s——预复制不续租则一个 TTL 窗口内无流量即可驱逐；保活循环必须有界（会话期 / 固定窗口 / 首流量后停租），无限续租事实上等于 pin。策略（续多久、何时停）本节定型。
 - 下线迁移事实：main 有 `CreateDrainJob`（`master_service.h:872`，把指定 seg 优雅排空到目标 seg，带并发上限）——实例计划下线前的迁移路径，归本节评估。
 - 落盘子项：Mooncake DRAM→SSD（`enable_ssd_offload`，本目录默认 `false`）是池内冷热，不是「预复制直指定 disk」；SSD 仅作容量/恢复异步 demote。
@@ -101,7 +101,7 @@
 - **E2. key 哨兵容器单跑**——`test_keys.py` 在容器内跑通（运行期 `batch_is_exist` 32/32、36/36 证据已齐）。
 - **E3. 多卡自动匹配验证**——resolve 的 `VLLM::Worker_TP<N>` proctitle 匹配在多卡真机走通（现为 `--targets` + 手工对号；失效时明确报错而非静默错配）。
 - **E4. 1-token 翻转根因**——旧非 DEBUG 实例偶发，新实例未复现；首次外部读输出逐字一致，疑路径交替数值扰动。生产化前必须查清（[EXPERIMENTS.md](EXPERIMENTS.md) #10）。
-- **E5. 副本消失机制核实**——✅ 已闭环（10-20 受控复验，落 D3/D1 F5 勘误）：属主下线只清其自己 seg 上的副本，**远端副本保留且可读**（kill A → TTL 过期 unmount → 32/32 + 跨机字节级 get 3/3；master 日志零驱逐零 remove）；原「级联删除」为 0/32 key 名漂移假失败的误判（[EXPERIMENTS.md](EXPERIMENTS.md) 踩坑 3 勘误、总表 #15）。剩余事实输入：lease TTL 11s（master 实配 `default_kv_lease_ttl=11000` 毫秒）+ 驱逐候选资格（lease 过期→驱逐首选）仍归 D3/TTL 议题。
+- **E5. 副本消失机制核实**——✅ 已闭环（10-20 受控复验，落 D1 F5/D2 F6）：副本存亡绑定所在 seg 挂载者，属主下线只清其自己 seg 上的副本，远端副本保留且可读（kill A → TTL 过期 unmount → 32/32 + 跨机字节级 get 3/3；master 日志零驱逐零 remove）；早期 0/32 观测为 key 名漂移假失败（[EXPERIMENTS.md](EXPERIMENTS.md) 踩坑 3、总表 #15）。剩余事实输入：lease TTL 11s（master 实配 `default_kv_lease_ttl=11000` 毫秒）+ 驱逐候选资格（lease 过期→驱逐首选）仍归 D3/TTL 议题。
 - **E6. 0.3.11 API 子集核对**——D2 引用的 lease/offload/promotion 是 mooncake main 的符号，测试床 wheel 是 0.3.11.post1，逐个核对可用子集，缺的即池侧扩展工作量 → D2/P5 输入。新增核对：`BatchExistKey` 的 `grant_lease` 续租语义与 `BatchProbeKey`（D1 F15）、soft pin（D2 pin 候选）、`default_kv_lease_ttl` 实际配置值。
 - **E7. MLA 实测**——`put_step>1` 时 plan 全落 `targets[0]`、其余 rank 读远端，功能推断正确未实测；hybrid/sparse 被上游 gate 排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——✅ 已闭环（落 D1 F14）：publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medium+tenant+group，**无 seg/机器位置**；ZMQ 传输；CMake 默认 OFF、官方 wheel 构建 ON。**0.3.11.post1 不含此机制**（publisher 代码在 v0.3.11 之后进仓，tag 上无 `kv_event/` 目录、无构建开关）——D1 路径 b 要用须升级 mooncake 版本。
