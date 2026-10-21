@@ -50,40 +50,42 @@
 
 **实体、位置与归属**（这些词各是什么、存在哪里、归属线分别被谁消费；示例状态：key 由引擎 A 写入——内存副本在 seg A、kvcm copy 出的副本在 seg B、盘副本在 A 的 SSD、DFS 副本在共享 3FS；key 的 client_id = A，copy 出的新副本在 B 手里、key 的 client_id 仍是 A——「两个维度正交」的实例）：
 
-```mermaid
-flowchart TB
-    subgraph META["key 元数据（ObjectMetadata，master 权威）"]
-        OID["client_id 字段<br/>（= 最后写入的 client；upsert 改写，copy/move 不改）"]
-        PROT["lease / soft pin / hard pin<br/>（key 级保护，护全部副本）"]
-        REPS["replicas_ 副本列表"]
-    end
+```text
+┌─ master 进程（元数据全在内存，不持数据） ────────────────────┐
+│ key 元数据 ObjectMetadata                                    │
+│ ├─ client_id ＝ 引擎 A（最后写入）                           │
+│ ├─ lease / soft pin / hard pin（key 级保护，护全部副本）     │
+│ └─ replicas_ 副本列表（副本记录无 client_id 字段）           │
+│     ├─ 副本记录①：位置 → seg A 的 buffer                     │
+│     ├─ 副本记录②：位置 → seg B 的 buffer                     │
+│     ├─ 副本记录③：位置 → A 的 SSD 文件路径                   │
+│     └─ 副本记录④：位置 → DFS 路径                            │
+└──────────────────────────────────────────────────────────────┘
 
-    subgraph REP["副本（Replica，无 client_id 字段）"]
-        R1["内存副本<br/>位置 = seg A 的 buffer"]
-        R2["内存副本<br/>位置 = seg B 的 buffer<br/>（kvcm copy 产物，同构）"]
-        R3["盘副本<br/>位置 = A 的 SSD 文件路径"]
-        R4["DFS 副本<br/>位置 = 共享 3FS（仅 main）<br/>（不在任何 client）"]
-    end
-    REPS --> R1 & R2 & R3 & R4
+  ①                                             ②
+  ▼                                             ▼
+┌─ 引擎 A（机器） ───────────────────────────┐   ┌─ 引擎 B（机器） ───────────────────────────┐
+│ 引擎进程（client 库）：client_id（UUID）   │   │ 引擎进程（client 库）：client_id（UUID）   │
+│   ▲ 【master 记的 client_id = 本进程】     │   │                                            │
+│   │ 挂载 → seg 所在 client                 │   │   │ 挂载 → seg 所在 client                 │
+│   ▼                                        │   │   ▼                                        │
+│ DRAM：seg A（注册进池的内存）              │   │ DRAM：seg B                                │
+│  └─ buffer【①】＝ KV 数据本体（put 产物）  │   │  └─ buffer【②】＝ KV 数据副本              │
+│ SSD：盘副本文件【③】                       │   │     （kvcm copy 产物，与 put 同构）        │
+└────────────────────────────────────────────┘   └────────────────────────────────────────────┘
 
-    subgraph CLT["client（进程身份，UUID）"]
-        EA["引擎 A"]
-        EB["引擎 B"]
-        KV["kvcm"]
-    end
-    EA -->|"挂载 → seg 所在 client"| SA["seg A"]
-    EB -->|"挂载 → seg 所在 client"| SB["seg B"]
+┌─ 共享 3FS（仅 main） ────────┐
+│ DFS 副本文件【④】            │
+└──────────────────────────────┘
 
-    OID -. "key 的 client_id = A" .-> EA
-    R1 -. "所在" .-> EA
-    R2 -. "所在" .-> EB
-    R3 -. "所在（写盘登记）" .-> EA
-
-    OID == "维度① 鉴权" ==> AUTH["Revoke / BatchReplicaClear<br/>比对 key 的 client_id"]
-    R1 & R2 & R3 == "维度② 级联清理" ==> CLEAN["client 死 →<br/>清在它手里的副本，不看 key 的 client_id"]
+副本所在 client（副本数据在谁手里）—— 维度②：级联清理按它走（client 死 → 清在它手里的副本，不看 key 的 client_id）
+  ① → 引擎 A（buffer 在 seg A）   ② → 引擎 B（buffer 在 seg B）
+  ③ → 引擎 A（写盘时登记）         ④ → 不在任何 client
+key 的 client_id ＝ 引擎 A（最后写入者；copy/move 不改）—— 维度①：鉴权按它走（Revoke / BatchReplicaClear 比对）
+kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，是 copy 的发起者
 ```
 
-- 读法：实线 = 结构包含/挂载；虚线 = 归属指向（key 的 client_id / 副本所在 client）；粗线 = 两个维度各自的消费方。**元数据全在 master 内存，数据本体全在引擎侧介质**（DRAM buffer / SSD 文件 / DFS）——master 不持数据，引擎不持元数据；同一 key 的副本可分布在不同机器（副本 R2 在 B、key 的 client_id 仍是 A）——归属与位置正交。kvcm（CLT 框内）与引擎同为 client——它能调 copy/move/Remove（不鉴权），但过不了 client_id 校验（F6），也改不了副本所在 client（副本挂哪台机器由物理位置决定，不由谁发起）
+- 读法：框与缩进 = 结构包含（元数据 → 字段 → 副本列表 → 副本记录；seg → buffer）；▼ 箭头 = 内存副本的位置指向（盘 / DFS 副本以编号对应）；▲【】标注与底部归属表 = 归属及其消费方（维度① 鉴权按 key 的 client_id 走 / 维度② 级联清理按副本所在 client 走）。**元数据全在 master 内存；数据本体全在引擎侧介质**（DRAM buffer / SSD 文件 / DFS）——master 不持数据，引擎不持元数据；同一 key 的副本可分布在不同机器（副本②在 B、key 的 client_id 仍是 A）——归属与位置正交。kvcm 与引擎同为 client——它能调 copy/move/Remove（不鉴权），但过不了 client_id 校验（F6），也改不了副本所在 client（副本挂哪台机器由物理位置决定，不由谁发起）
 
 ### pin 机制
 
