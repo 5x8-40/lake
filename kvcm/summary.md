@@ -139,7 +139,7 @@
 
 - 事实：
   - 副本没有 pin，READY 后池仍可驱逐
-  - key 的 client_id 实例下线后，master 只清它自己 seg 上的副本（含其登记的盘副本）；远端副本保留、继续可读——副本存亡绑 seg 所在 client，不绑写入者（E5 已闭环：10-20 复验 32/32 + 字节级读回，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15）——D1 F5
+  - 任一 client 下线后，master 只清它 seg 上的副本（含其登记的盘副本）；他机副本保留、继续可读——副本存亡绑 seg 所在 client，不绑写入者（E5 已闭环：10-20 复验 32/32 + 字节级读回，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15）——D1 F5
   - lease 是 key 粒度：读会续租、`CopyStart` 不续租、TTL 到期或驱逐时删整个 key、释放全部副本——D1 F15
 - READY 语义：✅ 已定型（D2 §1 完成信号，八项逐一点名）
   - 什么是 READY：目标实例的 DRAM 副本写好、kvcm 核验通过后，上报 Router「可以把请求调度过来」
