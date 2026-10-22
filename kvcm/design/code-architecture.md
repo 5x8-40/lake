@@ -10,16 +10,17 @@
 L1 接口层     IntentReceiver / EventPublisher / InstanceWatcher
               进程对外通道；不含任何存储概念
 L2 编排层     复合流程 = 原子操作的编排
-              只调 L3 接口；代码里不出现 seg / lease / client_id / PoolKey
+              只调 L3 接口；代码里不出现 seg / lease / client_id / PoolKey / rank
 L3 原子操作层 copy / move / keepalive / pin / demote / promote / retain / remove
               抽象接口（语义规格 = D2 §1）+ capability 声明
-L4 后端适配层 MooncakeBackend = StoreClient + KeyComputer + Topology
-              一后端一适配器；未来 MemCacheBackend
+L4 适配层     两个正交维度，各一实现：
+              StoreBackend（存储）MooncakeBackend = StoreClient + SegTopology
+              EngineAdapter（引擎）VLLMAdapter = KeyComputer + RankTopology + 事件格式
 L5 状态层     Ledger（sqlite，四类状态记录）
 ```
 
 - 依赖方向只允许向下：L1 → L2 → L3 ← L4；L5 被 L2/L4 持有
-- 核心思想：**原子操作屏蔽后端语义**——L2 编排对任何存储后端成立，换后端只换 L4
+- 核心思想：**原子操作屏蔽后端与引擎语义**——L2 编排对任何存储后端、任何推理引擎成立；换后端换 StoreBackend，换引擎换 EngineAdapter
 
 ## L1 接口层（进程对外通道）
 
@@ -58,6 +59,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 **capability 声明（显式，不藏在接口后面假装统一）**
 
+- 版本口径：**目标基线 = mooncake main**——E10 落地按 main 填充能力、按 main 语义实现；0.3.11 列仅为当前部署（demo 测试床 wheel）约束记录，部署升级后该列即废弃
 - 初版清单（每项都能指回 D2 事实条目）：
 
 | 能力 | mooncake 0.3.11 | mooncake main | 出处 |
@@ -75,18 +77,37 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 - L2 按能力选路径：D2 §3 的写穿/写回分支、§4 的 retained client/DFS 前提，本质就是能力分支——本层把它落成显式声明
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
 
-## L4 后端适配层
+## L4 适配层（两个正交维度）
 
-**MooncakeBackend**（首个实现）= 现有代码重组 + 三个子件：
+适配分两个正交维度：**存储后端**与**推理引擎**——两者各自独立可换，各建一个适配器。L3 原子操作的实现同时持有两者（引擎侧算 key 与 rank 拓扑，存储侧执行 RPC）。
+
+### StoreBackend（存储后端适配）
+
+**MooncakeBackend**（首个实现）：
 
 | 子件 | 职责 | 现有代码来源 |
 |------|------|-------------|
 | StoreClient | master RPC 封装（copy/move/exist/GetReplicaList/Remove/upsert…）+ client UUID 持久化（sqlite，D2 §2 方案一） | `demo/precopy/common.py` + `demo/precopy/precopy.py` 的 RPC 调用段 |
-| KeyComputer | 前缀 → hash 链 → PoolKey（与引擎同口径） | `demo/precopy/keys.py` |
-| Topology | rank↔seg、seg→实例映射 | `demo/precopy/resolve.py` 降为适配器（生产权威源 = L1 InstanceWatcher 注册，D1 §3/E13） |
+| SegTopology | seg→client/实例映射；seg、client_id、lease 语义 | `demo/precopy/resolve.py` 的 seg 侧（生产权威源 = L1 InstanceWatcher 注册，D1 §3/E13） |
+| capability 填充 | 按后端版本填充能力声明（目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | 新增，L3 表驱动 |
 
-- **key 格式与拓扑必须归本层**：PoolKey 格式、seg 概念、client_id/lease 语义全是 mooncake 特有——留在通用层则抽象漏
+- **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——留在通用层则抽象漏
 - **第二后端候选已登记在案**：昇腾 MemCache（`3rdparty/memcache`；kv-prefetch.md 待定项「生产默认走 MemCache，还是留 Mooncake」）——L3 抽象现在建正是时候；但只建一层接口，第二后端真接入时再修接口，不为假想后端过度设计
+
+### EngineAdapter（引擎适配）
+
+**VLLMAdapter**（首个实现）：
+
+| 子件 | 职责 | 现有代码来源 |
+|------|------|-------------|
+| KeyComputer | 前缀 → hash 链 → PoolKey（与引擎同口径） | `demo/precopy/keys.py`（lazy-import vllm-ascend `KeyMetadata`/`PoolKey` 保证同口径） |
+| RankTopology | rank↔KV shard 形状（TP/PP/DP 切分；异构 TP 的 `decode_tp_size`/`prefill_tp_size` 语义）；rank↔seg 对号 | `demo/precopy/resolve.py` 的 rank 侧降为对号实现 |
+| 事件格式 | 引擎 KV 事件（`BlockStored` 等）schema 的生成/解析 | EventPublisher 补发时按本格式构造 |
+| engine config | block_size / num_kv_heads / head_size / 层数读取（KV 大小估算，E14 容量规划输入） | 新增 |
+
+- **KeyComputer 归引擎侧，不归存储侧**——PoolKey 的权威定义在**引擎**（引擎写 KV 时就以此 key 落池，kvcm 只是按同口径找回）；mooncake 对 key 无格式要求（不透明字符串），后端不掺和 key 语义
+- **引擎之间 key 计算不一样**：vLLM 是链式 block hash（`vllm/v1/core/kv_cache_utils.py::hash_block_tokens`，`prefix_caching_hash_algo` + `init_none_hash` 的 seed 折入、block_size、Mamba/MLA 模型类型均影响结果）；SGLang 是 `RadixKey` = token id 序列本身（`sglang/srt/mem_cache/radix_cache.py`）——连 key 形态都不同（hash 值 vs token 序列）。KeyComputer 放通用层或存储侧都是错位的
+- **引擎强关联物全归本层**：key 计算、rank 拓扑、事件 schema、engine config——换引擎（如 SGLangAdapter）时 StoreBackend 一行不动
 
 ## L5 状态层
 
@@ -95,16 +116,17 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 ## 设计原则
 
-1. **原子操作屏蔽后端语义**：L2 不出现 seg / lease / client_id / PoolKey——这些词只允许出现在 L4
+1. **原子操作屏蔽后端与引擎语义**：L2 不出现 seg / lease / client_id / PoolKey / rank——这些词只允许出现在 L4
 2. **能力显式，不假装统一**：后端差异走 capability 声明，L2 按能力分支；不在接口里塞进只有 mooncake 有的概念
 3. **只建一层抽象**：L3 接口服务当前唯一后端（mooncake），第二后端（MemCache）接入时再修——不预判假想需求
 4. **语义规格以 D1/D2 为准**：本文任何接口定义与 D1/D2 冲突时，改本文
+5. **多实现形式：先落地一种，其余登记**：一个接口有多种实现形式时（如 IntentReceiver 可走 gRPC / HTTP / 文件，EventPublisher 可走引擎事件 / 轮询 master），**优先实现一种**，其余作为已知替代形式登记在 API 文档（字段、能力差异、补齐条件），后续按需补充——不并行铺开
 
 ## 与 E10 / E11 / E15 的对位
 
 - **E10（重构）三步**
   1. 定义 L3 原子操作抽象基类 + capability 声明（把 D2 §1 八项落成接口）
-  2. 现有 1577 行重组为 MooncakeBackend（L4）+ Ledger（L5）——测试现成（`demo/tools/test_keys.py` / `demo/tools/test_resolve.py`）
+  2. 现有 1577 行重组为 MooncakeBackend + VLLMAdapter（L4 两维度）+ Ledger（L5）——测试现成（`demo/tools/test_keys.py` / `demo/tools/test_resolve.py`）
   3. `precopy.py` 编排逻辑改写为 L2 PrefetchFlow（只调 L3）；L1/L2 其余模块出空骨架（类与接口先行）
 - **E11（进程化）**：进程壳 + TaskEngine + Keepalive/Release/Retain 三个 Loop 常驻化；IntentReceiver / InstanceWatcher 占位接口随 E12/E13 填
 - **E15（并行限速）**：TaskEngine 内的并发调度 + 限速器（链路利用率采样，D1 §5）——不独立做
