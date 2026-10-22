@@ -45,7 +45,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 支撑组件（同进程内的常驻循环，E11 进程化的主体）：
 
-- **TaskEngine**：任务状态机（排队 / 进行 / READY / 失败）+ 并发上限 + **限速器**——E11 的核心、E15 的落点（限速输入 = 网卡/RDMA 计数器采样的链路利用率，D1 §5）
+- **TaskEngine**：任务状态机（排队 / 进行 / READY / 失败）+ 并发上限 + **限速器**——E11 的核心、E15 的落点（限速输入 = 网卡/RDMA 计数器采样的链路利用率，D1 §5）。**失败态策略（此处只留接口，随 E10 细化）**：失败后的动作 = 重发 / 弃置 + 事后清副本（P9「无任务取消」下的弱版，D2 §1）/ 源掉线衔接（D5，已闭环）——语义引 D2 §1 与 D5，不新造
 - **KeepaliveLoop**：保活注册表驱动的周期续租（D3；机制 D2 F9，策略未定）
 - **ReleaseLoop**：软释放 / demote / 主动 Remove 三级（D1 §6）
 - **RetainLoop**：retain 与计划下线编排（D2 §4）
@@ -91,7 +91,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 | 子件 | 职责 | 现有代码来源 |
 |------|------|-------------|
-| StoreClient | master RPC 封装（copy/move/exist/GetReplicaList/Remove/upsert…）+ client UUID 持久化（sqlite，D2 §2 方案一） | `demo/precopy/common.py` + `demo/precopy/precopy.py` 的 RPC 调用段 |
+| StoreClient | master RPC 封装（copy/move/exist/GetReplicaList/Remove/upsert…）+ client UUID 持久化（sqlite）——**持久化仅在 §2 方案一（client_id 改归 kvcm）下需要，方案一/二尚未拍板**：若走方案二（借名）则无持久化诉求、代价转为 master 加「key → client_id」查询 RPC（D2 §2 决策条件），届时随决策调整本子件 | `demo/precopy/common.py` + `demo/precopy/precopy.py` 的 RPC 调用段 |
 | SegTopology | seg→client/实例映射；seg、client_id、lease 语义 | `demo/precopy/resolve.py` 的 seg 侧（生产权威源 = L1 InstanceWatcher 注册，D1 §3/E13） |
 | capability 填充 | 按后端版本填充能力声明（目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | 新增，L3 表驱动 |
 
