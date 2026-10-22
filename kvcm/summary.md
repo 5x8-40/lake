@@ -80,7 +80,7 @@
   - 取消方式：① 停续租等过期 / 空写传 false 或 `SoftPinAction::DISABLE` / hard pin 没有 unpin，只能再读删写一遍
   - 读锁方案已否决：refcnt 是任务级保护，两个版本都没有读者引用 RPC
   - client_id 问题两个方案并列（空写与读删写都要面对）：
-    - client_id 改归 kvcm：不改 mooncake；语义变（Revoke/`BatchReplicaClear` 权限归 kvcm，kvcm 死期间锁死、可 upsert 接管）；与副本存亡无关——两方案下引擎下线行为一致（E5 已闭环）
+    - client_id 改归 kvcm：不改 mooncake；语义变（Revoke/`BatchReplicaClear` 权限归 kvcm，kvcm 死期间锁死；死透时逃生门 = 任一 client upsert 把 client_id 改写成自己、接管权限，upsert 不验身份）；与副本存亡无关——两方案下引擎下线行为一致（E5 已闭环）
     - 借原 client_id UUID：语义不变；需 master 加「key → client_id」查询 RPC（内部数据现成）
     - 决策条件：mooncake 能不能改（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）

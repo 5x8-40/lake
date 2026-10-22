@@ -164,7 +164,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 语义：源 seg 置 DRAINING（仍可读、不再接受新分配，`segment.h:24` 注释 @0.3.11）→ master 后台 job 线程（`JobDispatchThreadFunc` → `ProcessDrainJobs`）周期扫源 seg 上的 key、逐个派搬迁任务 → 排空后 seg 置 DRAINED，可安全下线
   - 与 CreateMoveTask 对比：粒度 = seg 批量 vs key 单发；驱动 = 后台 job 循环调度 vs 即时单任务；**可取消性 = job 有 `CancelDrainJob` / `QueryDrainJob`，task 无取消（P9）**——下线场景白得取消能力
   - 用途：计划下线（§4）
-- **副本没有client_id 字段，生死跟随所在 seg**：copy 到 B 的副本属 B 的 seg——源引擎下线不影响它；目标引擎（B）下线它才随 seg 失效（代码口径；与实测的不一致见 F6b）
+- **副本没有 client_id 字段，生死跟随所在 seg**：copy 到 B 的副本属 B 的 seg——源引擎下线不影响它；目标引擎（B）下线它才随 seg 失效（E5 已闭环证实，F6b）
 - **介质边界：copy/move 只在 DRAM seg 之间，接不了 SSD**（两版本一致）
   - disk seg 不在 seg 名字空间：0.3.11 挂盘单独登记在 client 名下（`segment.cpp:133` `MountLocalDiskSegment`，不进 seg 名注册表）；main 改由 `local_ssd_manager_.RegisterClient` 按 client 登记（`master_service.cpp:8407`），同样没有 seg 名——copy/move 的目标校验只认内存 seg 名，**disk 做不了目标**
   - copy 源从「副本的 seg 名」里挑，而 disk 副本没有 seg 名（`get_segment_names`，`replica.h:610` @0.3.11 / `:886` @main，两版本同一实现）——**SSD 副本做不了源**
@@ -872,7 +872,7 @@ sequenceDiagram
 |---|---|---|
 | 做法 | kvcm 传自己的 UUID（自己就是 client，天然持有；sqlite 持久化，重启同 id 重注册） | kvcm 先查得原 client_id UUID，调用时原样传回（F4） |
 | mooncake 代码 | **不改**（前提：空写通道不落 Python，F12） | **要改**：master 加「key → client_id」查询 RPC（数据内部现成，纯暴露，F11） |
-| client_id 语义 | 改变：kvcm 成在途写与 `BatchReplicaClear` 的权限持有者（kvcm 死期间这些权限锁死；缓解 = UUID 持久化 + 重启快于 master 心跳超时，或由任一 client upsert 改写 client_id 接管——F4 不验身份）；key 的 client_id 下线行为两方案无差异——本就不清远端副本（F6b） | **不变**（维持现状语义） |
+| client_id 语义 | 改变：kvcm 成在途写与 `BatchReplicaClear` 的权限持有者，kvcm 死期间这些权限锁死；缓解两道：① UUID 持久化 + 重启快于 master 心跳超时，kvcm 复活即恢复；② kvcm 死透（UUID 也丢）时，任一 client 对 key 调 upsert 即可把 client_id 改写成自己、接管权限——upsert 不验身份（F4），这是死透时的逃生门。key 的 client_id 下线行为两方案无差异——本就不清远端副本（F6b） | **不变**（维持现状语义） |
 | 引擎配合 | 无 | 无（补丁打在 master，引擎零感知） |
 
 - **决策条件（外部依赖，非单方可定）**
@@ -958,7 +958,7 @@ sequenceDiagram
 ### retain（key 的 client_id 下线后副本存续）：机制定型
 
 - **目标**：写入引擎（= key 的 client_id）下线后，它写的 KV 副本仍可用
-- **副本生死的绑定关系**（E5 已闭环：代码口径即实际行为，实测印证见 F6b）
+- **副本生死的绑定关系**（E5 已闭环，机制与实测互证见 F6b）
   - 内存副本绑 seg：seg 所在 client 死 → seg 失效 → 副本清
   - disk 副本绑「写盘的 client」：该 client 死 → 副本清（§3）
   - **DFS 副本不绑任何 client 生死**（main，F13）——清理条件不覆盖它，释放只走 key 级删除
@@ -979,7 +979,7 @@ sequenceDiagram
     - **main 下此方案再强化**：kvcm 以 retained client 身份注册（client 库 `kRetained`，上条）——连 kvcm 自己死亡，名下盘副本也保留，等新 kvcm 接管
     - 挂盘另一形态：`MountNoFSegment`（两版本同有）挂 NVMe-oF 远端盘——盘在远端阵列、不绑 kvcm 机器，比挂本地盘更接近「kvcm 死也保留」
     - 排除项：`ReMountSegment` 是 client 重连后重新申报 seg（幂等），不是死掉副本的复活——retain 走不了这条
-  - 或接受现状：副本全在死引擎 seg 上的 key 整 key 消失，预热投入重来——已预热到他机的 key 不受影响（F6b），可接受度比旧口径高
+  - 或接受现状：副本全在死引擎 seg 上的 key 整 key 消失，预热投入重来——已预热到他机的 key 不受影响（F6b），损失面只限这一部分
 - **计划下线的编排**（控制面主导，四步）
   1. **Router 摘流**：该实例不再接新请求，在途请求跑完
   2. **kvcm 迁 KV**：这台 seg 上的预热副本 copy/move 到他机，或 demote 落盘
