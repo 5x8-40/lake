@@ -60,21 +60,25 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 **capability 声明（显式，不藏在接口后面假装统一）**
 
 - 版本口径：**目标基线 = mooncake main**——E10 落地按 main 填充能力、按 main 语义实现；0.3.11 列仅为当前部署（demo 测试床 wheel）约束记录，部署升级后该列即废弃
-- 初版清单（每项都能指回 D2 事实条目）：
+- 初版清单（每项都能指回 D2 事实条目）。**格内口径再分两层，避免混淆**：
+  - **RPC**：mooncake C++ 客户端 / master 是否具备该能力（与 kvcm 语言无关）
+  - **绑定**：kvcm（Python）当前实际可调（以 `store_py.cpp` 暴露为准，@1fc27b6 清点）；**L2 按能力选路径看绑定**
+  - RPC ✓ 而绑定 ✗ = 「打绑定补丁即可解锁」——比池侧扩展便宜得多（例：空写 upsert、admin 查询）；△ = 待 E6 核对
 
-| 能力 | mooncake 0.3.11 | mooncake main | 出处 |
-|------|----------------|---------------|------|
-| has_lease（读续租） | ✓ | ✓ | D2 F9 |
-| can_pin_after_write（事后加 pin） | ✗ | ✗ | D1 F5（pin 挂写路径） |
+| 能力 | mooncake 0.3.11（部署现状） | mooncake main（目标基线） | 出处 |
+|------|------------------------------|----------------------------|------|
+| has_lease（读续租） | RPC ✓ 绑 ✓（`is_exist`） | RPC ✓ 绑 ✓ | D2 F9 |
+| soft pin 事后加（空写 upsert 通道） | RPC ✓ 绑 ✗（绑定只有一步式 `upsert_tensor`） | RPC ✓ 绑 ✗ | D2 F1/F12 |
+| hard pin 事后加 | ✗（创建时固化、无 unpin） | ✗ | D2 F1 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源） | ✗ | D2 F7 |
-| has_offload / has_promotion（池通道降层/提回） | ✓ | ✓ | D2 §3 |
+| has_offload / has_promotion（池通道降层/提回） | RPC ✓ 绑 △（停保活可促驱逐；刷计数需 `GetReplicaList` 绑定，缺） | RPC ✓ 绑 △ | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
-| has_retained_client（保留身份注册） | ✗ | ✓ | D2 F13② |
-| has_dfs_replica（共享 3FS 副本） | ✗ | ✓ | D2 F13② |
-| has_admin_query（零副作用核验） | ✗（`GetReplicaList` 顺带续租） | ✓ | D2 F11b |
+| has_retained_client（保留身份注册） | ✗ | RPC ✓ 绑 ✗（绑定未暴露 `kRetained` 注册） | D2 F13② |
+| has_dfs_replica（共享 3FS 副本） | ✗ | RPC ✓ 绑 △（写入路径待 E6 核对） | D2 F13② |
+| has_admin_query（零副作用核验） | ✗ | RPC ✓ 绑 ✗（绑定未暴露） | D2 F11b |
 
-- L2 按能力选路径：D2 §3 的写穿/写回分支、§4 的 retained client/DFS 前提，本质就是能力分支——本层把它落成显式声明
+- L2 按能力选路径（**看绑定**）：D2 §3 的写穿/写回分支、§4 的 retained client/DFS 前提，本质就是能力分支——本层把它落成显式声明
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
 
 ## L4 适配层（两个正交维度）
