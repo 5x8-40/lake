@@ -347,6 +347,7 @@ kvcm/
 ├── kv-prefetch.md           # 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测）
 ├── D1-router-scheduling.md  # 生产化设计 D1：Router 集成与请求调度
 ├── D2-kv-operations.md      # 生产化设计 D2：KV 调度操作集
+├── code-architecture.md     # 服务化代码架构（五层：原子操作抽象屏蔽后端语义）
 └── summary.md               # 设计与工程总结（D1-D7 / P1-P8 / E1-E16 登记处）
 ```
 
@@ -358,6 +359,7 @@ kvcm/
 | `kv-prefetch.md` | 预取方案设计（A 壳请求 / B2 副本复制；B2 已实测） |
 | `D1-router-scheduling.md` | 生产化设计 D1：Router 集成与请求调度 |
 | `D2-kv-operations.md` | 生产化设计 D2：KV 调度操作集 |
+| `code-architecture.md` | 服务化代码架构：五层分层（接口/编排/原子操作/后端适配/状态），E10/E11/E15 设计依据 |
 | `summary.md` | 设计与工程总结（设计决策 D1-D7 / 潜在问题 P1-P8 / 工程项 E1-E16，含已闭环结论与待办） |
 
 ## 操作参考

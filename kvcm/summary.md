@@ -256,8 +256,8 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 ### B. 服务化重构（骨架可直接开工，接口依赖设计）
 
-- **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），重构成类结构（KeyComputer / SegResolver / StoreClient / Orchestrator），明确状态归属与接口边界，为进程化打基础。**可直接开工**。
-- **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。
+- **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），按五层架构重组（L3 原子操作抽象屏蔽后端语义 + L4 mooncake 适配器 + L2 编排层只调 L3），明确状态归属与接口边界，为进程化打基础。**可直接开工**。设计：[code-architecture.md](code-architecture.md)
+- **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。分层与模块划分：[code-architecture.md](code-architecture.md)
 - **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC 候选，与仓内跨语言 RPC 选型一致）。协议字段依赖 D4 定型；通道骨架可先行。
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例启动 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3 耦合；D5 已闭环，见本文）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
 - **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自己产生引擎格式的事件
@@ -278,7 +278,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 ### C. 性能与生产化
 
-- **E15. copy 并行与限速**——现在逐 key 串行、与在线读共享带宽；大批量预热要并行化 + 带宽控制。可直接开工。带宽控制的输入还包括网卡繁忙感知：用 RDMA/ethtool 计数器采样链路利用率，传输忙时预热避让/限速（参考 vLLM-Ascend AI-QoS 的流量冲突问题定义；Router 侧用同一信号打分归 D1 §5）。
+- **E15. copy 并行与限速**——现在逐 key 串行、与在线读共享带宽；大批量预热要并行化 + 带宽控制。落点 = E11 任务状态机内的并发调度与限速器（[code-architecture.md](code-architecture.md) TaskEngine），不独立做。带宽控制的输入还包括网卡繁忙感知：用 RDMA/ethtool 计数器采样链路利用率，传输忙时预热避让/限速（参考 vLLM-Ascend AI-QoS 的流量冲突问题定义；Router 侧用同一信号打分归 D1 §5）。
 - **E16. 生产化缺口**——EP 拓扑实测、master HA、监控指标（READY 延迟、copy 失败率、external hit；命中率归因口径与 P8 耦合）。
 
 ## 参考锚点
