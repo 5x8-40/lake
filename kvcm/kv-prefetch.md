@@ -123,7 +123,7 @@ Mooncake 客户端有本地热缓存（`LocalHotCache`，`local_hot_cache.h`）�
 sequenceDiagram
     participant W as 预取进程（独立，任意机器）
     participant M as Mooncake master
-    participant S as 源节点 store 客户端<br/>（源 segment 属主）
+    participant S as 源节点 store 客户端<br/>（源 seg 所在 client）
     participant T as 目标节点 segment<br/>（目标 worker 进程内客户端贡献）
     W->>M: create_copy_task(key, [目标 segment])<br/>Python 绑定 store_py.cpp:3362
     M->>M: 校验；从现有副本随机选源<br/>master_service.cpp:13677 CreateCopyTask
@@ -165,7 +165,7 @@ flowchart LR
 - **时序**：`create_copy_task` 必须在目标节点的 get session 建立**之前**完成——session 建立时锁定单副本，复制晚于 session 则该请求仍读远端。进阶联动见下节
 - **目标指定**：segment 名 = worker 的 `local_seg`（`hostname:rpc_port`，`mooncake_backend.py:263`；fabric-mem 路径为裸 hostname，L276）
 - **key 名单**：**不要从头写 hash 链**——copy 与 put/get/exists 共用同一 key 字符串命名空间，直接复用 vllm-ascend 调度侧的现成计算（纯 Python，可移植进预取进程）：`get_block_hashes`（`pool_scheduler.py:478` 调用处）+ `block_hash_to_str` + `make_hit_check_keys`（`pool_scheduler.py:377`，按 block hash 枚举全 rank 的 key）；非 layerwise 路径对照 `_generate_store_query_keys`。`QueryByRegex` 无 Python 绑定；放置结果用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）
-- **依赖**：源属主客户端必须在线（即贡献了源 segment 的 worker 进程内客户端）
+- **依赖**：源 seg 所在 client client 必须在线（贡献了源 segment 的 worker 进程内客户端）
 
 #### 进阶：与请求调度联动（解决时序约束）
 

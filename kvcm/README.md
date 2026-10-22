@@ -209,7 +209,7 @@ sequenceDiagram
     CP->>M: batch_is_exist 核对（格式漂移哨兵）
     loop 每个 key（当前串行，可并行化）
         CP->>M: create_copy_task(key@rank:i, [B seg_i])
-        M-->>A: 给源属主派 REPLICA_COPY 后台任务
+        M-->>A: 给源 seg 所在 client 派 REPLICA_COPY 后台任务
         A->>B: Mooncake 客户端后台线程传输<br/>（引擎不参与，可限速）
         CP->>M: query_task 轮询至 SUCCESS
     end
@@ -426,7 +426,7 @@ kvcm/
   - 全部实测为 GQA（`put_step=1`）；`put_step>1`（MLA 塌缩，key 全在 rank 0）时 plan 全落 `targets[0]`——功能正确但其余 rank 读远端副本，该映射未验证。
 - **复制与副本**
   - copy 按 key **串行**；未做并行 / 本机扩散 / 带宽限速（与在线读共享带宽）。
-  - 副本 **无 pin**：READY 后可能被池驱逐；源属主客户端（worker-A）必须在线，掉线则 copy 失败。
+  - 副本 **无 pin**：READY 后可能被池驱逐；源 seg 所在 client（worker-A）必须在线，掉线则 copy 失败。
 - **控制面依赖**
   - `protocol` 须与 `mooncake.json` 一致（store 半程可 `tcp`，NPU 集群用 `ascend`）。
   - `resolve.py`：master admin `:9003` 在线（mooncake_master 内置默认，见 `start_master.sh` 注释）；`start_worker.sh` 写的 pidfile（跨机经 `--ssh` 读 B 机）；TP>1 时 rank 号依赖进程名 `VLLM::Worker_TP<N>`——vLLM 改命名会 **fail loud**（不静默错配），届时按 `pgrep -af 'VLLM::'` 实际输出更新模块内模式。

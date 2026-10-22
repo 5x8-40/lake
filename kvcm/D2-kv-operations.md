@@ -7,8 +7,8 @@
   - §1 操作集框架：闭环——八项操作业界逐项对照、完备性审计、kvcm 能力边界（只能被动等池的真缺口 2 条，归池侧扩展 vs 无专用 RPC 但组合可达 7 条）
   - §2 pin：候选已列出；落地选择依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞
   - §3 demote / promote：设计完成
-  - §4 retain / release：定型；retain 的池机制正式路径在 main（retained client 或 DFS 副本，F13），0.3.11 下的过渡手段待 E5 实验判定（F6b）
-  - 未决问题（详见 summary）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）；级联删除「代码 vs 实测」口径不一致（E5）
+  - §4 retain / release：定型；retain 的池机制正式路径在 main（retained client 或 DFS 副本，F13），0.3.11 下的过渡手段 = move 到活 seg / kvcm 自挂 SSD（E5 已闭环，F6b）
+  - 未决问题（详见 summary）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）
 - 上游问题：summary D2（kvcm 对池内 KV 的操作面）
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
   - **0.3.11.post1**：测试床实际部署的 wheel
@@ -28,18 +28,64 @@
 
 ### 背景概念
 
-- **key 与副本**：池里一把 key 一份元数据，元数据里挂着副本列表；同一 key 可有多个副本（replica），落在不同机器的 segment（seg，一段注册进池的 DRAM）上
-- **副本 = 元数据里的一条记录**：内容是「数据在某 seg 的某块 buffer 上」+ 状态。所以副本天然有**两个关联**——逻辑上属于 key（它是 key 元数据的一部分），物理上位于 seg（buffer 分配在 seg 上，seg 注册在 client 名下）。后文「副本跟 seg 死活」「按 key 删副本」分别对应这两个关联
+- **术语：身份与归属**（全文统一口径，括号内代码名；归属问题一律用 client / client_id 直说，不设额外汉语标签）
+  - **client**：mooncake 客户端库实例（引擎与 kvcm 各持一个）；**client_id** = 它的身份 UUID（构造时随机生成，F11）
+  - **key 的 client_id**：key 元数据的字段 = 最后写入该 key 的 client（代码注释称 owns / belongs to，F6）；用途仅鉴权与 upsert 改写
+  - **副本所在 client**：副本数据落在哪个 client 手里——内存副本在 seg 所在 client 手里、盘副本在写盘登记 client 手里（0.3.11 注释称 owner client / `owner_client_id`）、DFS 副本不在任何 client（main 显式化为 `isAffiliatedWith`，F6b）。**副本自身没有 client_id 字段**，「副本属主」是禁用说法——说「副本所在 client」或「副本在某 seg」（后文「副本绑 seg / 绑某 client」的「绑」= 所在）
+  - **seg 所在 client**：注册（MountSegment）该 seg 的 client——seg 内存就在它的进程地址空间里；「源 seg 所在 client」「盘副本登记 client」都是「副本所在 client」的派生说法
+  - **两个维度正交**：鉴权（Revoke / `BatchReplicaClear` 的client_id 校验）比 key 的 client_id；级联清理走副本所在 client（F6 全图）
+- **key 与副本**：池里一把 key 一份元数据（`ObjectMetadata`），元数据里挂着副本列表（`replicas_`）；同一 key 可有多个副本（replica）——内存副本落在不同机器的 segment（seg，一段注册进池的 DRAM）上；盘副本与 DFS 副本的位置形态见下条与 F7 介质边界
+- **副本 = 元数据里的一条记录**（`replica.h::Replica`）：字段 = 位置（内存副本记某 seg 上的 buffer；盘副本记写盘 client 名下的文件路径）+ 状态 + 任务引用计数（refcnt，任务级，F8）——**没有 client_id**（副本没有自己的 client_id 字段（术语条））。所以副本天然有**两个关联**——逻辑上属于 key（它是 key 元数据的一部分），物理上位于 seg（buffer 分配在 seg 上，seg 注册在 client 名下）。后文「副本跟 seg 死活」「按 key 删副本」分别对应这两个关联
 - **副本两个状态**：写中（PROCESSING，不可读）与就绪（COMPLETE，可读）
-- **属主（owner）**：每把 key 的元数据里记录 `client_id` = 最后写入它的客户端 UUID。注意三层区分，后文反复用到
-  - 属主是 **key 级**字段：一把 key 一个属主，与它有几个副本无关；用途**只是鉴权**（谁有权中止写、谁有权定点清副本，F6），不是副本的归属声明
-  - **副本自身没有属主字段**：副本的存亡由它**所在的 seg** 决定——client 死 → seg 被摘 → 挂在死 seg 上的副本记录被清，扫描按 seg 走、不看 key 属主（F7）
-  - 清理路径分三种、权限各不同（F6 末尾全图）：整 key 删（Remove 系，**不鉴权**，kvcm 可用）/ 定点清单个副本（`BatchReplicaClear`，**限 key 属主自调**，kvcm 调不动）/ 级联清理（client 死亡自动触发）
+- **存亡两个方向**：key 删（Remove 系）→ 元数据连同副本列表一起删，不管副本在哪（F6 全图①）；key 在、某副本所在 seg/client 死 → 只清那一条记录（F6 全图③）；副本清到一条不剩，key 只剩元数据空壳
+- **key 的 client_id（owner）**：每把 key 的元数据里记录 `client_id` = 最后写入它的客户端 UUID（v0.3.11 `master_service.h` 内嵌 struct；main `object_metadata.h:98`，UpsertStart 更新于 `master_service.cpp:6019` @main）。注意三层区分，后文反复用到
+  - client_id 是 **key 级**字段：一把 key 一个值，与它有几个副本无关；**用途只是鉴权**——PutEnd 校验「谁 Start 谁 End」（0.3.11 `master_service.cpp:1364/:1482`、main `:5226/:5533`）、`BatchReplicaClear` 限 key 的 client_id 自调（0.3.11 `:937`、main `:4052`）；此外仅随元数据一起被序列化落盘（`SerializeMetadata :5596` @0.3.11，这是元数据字段的必然结果，不算用途）。**它不声明副本归谁**：副本记在哪个 seg 上与它无关，0.3.11 与 main 的 client 死亡清理都不看它（下条与 F6b）
+  - **副本自身没有 client_id 字段**：副本的存亡由它**所在的 seg** 决定——副本 buffer 从哪个 seg 分出，就绑那个 seg 所在 client 的 liveness（main `segment_allocator_registration.cpp:37` `bindClientLiveness`；0.3.11 `CleanupStaleHandles` 的清理条件 / main `replica.h::isAffiliatedWith`）：client 死 → seg 被摘 → 挂在死 seg 上的副本记录被清，扫描按 seg 走、不看 key 的 client_id（F7）
+  - 清理路径分三种、权限各不同（F6 末尾全图）：整 key 删（Remove 系，**不鉴权**，kvcm 可用）/ 定点清副本（`BatchReplicaClear`，**限 key 的 client_id 自调**，kvcm 调不动）/ 级联清理（client 死亡自动触发）
 - **lease（读租约）**
   - 读路径（`GetReplicaList` / `ExistKey`）授予，lease 期内该 key **绝对不可逐**（驱逐硬过滤直接跳过，F8）
   - **新 put 的 key 出生无租约**：`PutEnd` 里 `GrantLease(0, ...)` 把 lease_timeout 设为 now——「the object has no lease at beginning」（`master_service.cpp:1422` 注释 @0.3.11）；第一次被读/被续租才获得保护
   - **只延不缩、无撤销 RPC**（两版本同）：续租只把期限往后推、已发出的租约缩不短（0.3.11 `master_service.h:946`；main `lease.h::Lease::GrantReadLease`）；要提前让 key 可删只能 `Remove(force=true)` 跳过 lease 检查（§4）
 - **kvcm 自身 = mooncake client**：client 是库不是独立进程；kvcm 调 copy/move/upsert 必须链接它，构造时自动持有一个 UUID——§2 方案一中「kvcm 自己的 UUID」零额外成本
+
+**实体、位置与归属**（这些词各是什么、存在哪里、归属线分别被谁消费；示例状态：key 由引擎 A 写入——内存副本在 seg A、kvcm copy 出的副本在 seg B、盘副本在 A 的 SSD、DFS 副本在共享 3FS；key 的 client_id = A，copy 出的新副本在 B 手里、key 的 client_id 仍是 A——「两个维度正交」的实例）：
+
+```text
+┌─ master 进程（元数据全在内存，不持数据） ────────────────────┐
+│ key 元数据 ObjectMetadata                                    │
+│ ├─ client_id ＝ 引擎 A（最后写入）                           │
+│ ├─ lease / soft pin / hard pin（key 级保护，护全部副本）     │
+│ └─ replicas_ 副本列表（副本记录无 client_id 字段）           │
+│     ├─ 副本记录①：位置 → seg A 的 buffer                     │
+│     ├─ 副本记录②：位置 → seg B 的 buffer                     │
+│     ├─ 副本记录③：位置 → A 的 SSD 文件路径                   │
+│     └─ 副本记录④：位置 → DFS 路径                            │
+└──────────────────────────────────────────────────────────────┘
+
+  ①                                             ②
+  ▼                                             ▼
+┌─ 引擎 A（机器） ───────────────────────────┐   ┌─ 引擎 B（机器） ───────────────────────────┐
+│ 引擎进程（client 库）：client_id（UUID）   │   │ 引擎进程（client 库）：client_id（UUID）   │
+│   ▲ 【master 记的 client_id = 本进程】     │   │                                            │
+│   │ 挂载 → seg 所在 client                 │   │   │ 挂载 → seg 所在 client                 │
+│   ▼                                        │   │   ▼                                        │
+│ DRAM：seg A（注册进池的内存）              │   │ DRAM：seg B                                │
+│  └─ buffer【①】＝ KV 数据本体（put 产物）  │   │  └─ buffer【②】＝ KV 数据副本              │
+│ SSD：盘副本文件【③】                       │   │     （kvcm copy 产物，与 put 同构）        │
+└────────────────────────────────────────────┘   └────────────────────────────────────────────┘
+
+┌─ 共享 3FS（仅 main） ────────┐
+│ DFS 副本文件【④】            │
+└──────────────────────────────┘
+
+副本所在 client（副本数据在谁手里）—— 维度②：级联清理按它走（client 死 → 清在它手里的副本，不看 key 的 client_id）
+  ① → 引擎 A（buffer 在 seg A）   ② → 引擎 B（buffer 在 seg B）
+  ③ → 引擎 A（写盘时登记）         ④ → 不在任何 client
+key 的 client_id ＝ 引擎 A（最后写入者；copy/move 不改）—— 维度①：鉴权按它走（Revoke / BatchReplicaClear 比对）
+kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，是 copy 的发起者
+```
+
+- 读法：框与缩进 = 结构包含（元数据 → 字段 → 副本列表 → 副本记录；seg → buffer）；▼ 箭头 = 内存副本的位置指向（盘 / DFS 副本以编号对应）；▲【】标注与底部归属表 = 归属及其消费方（维度① 鉴权按 key 的 client_id 走 / 维度② 级联清理按副本所在 client 走）。**元数据全在 master 内存；数据本体全在引擎侧介质**（DRAM buffer / SSD 文件 / DFS）——master 不持数据，引擎不持元数据；同一 key 的副本可分布在不同机器（副本②在 B、key 的 client_id 仍是 A）——归属与位置正交。kvcm 与引擎同为 client——它能调 copy/move/Remove（不鉴权），但过不了 client_id 校验（F6），也改不了副本所在 client（副本挂哪台机器由物理位置决定，不由谁发起）
 
 ### pin 机制
 
@@ -70,55 +116,55 @@
     - 该 key 有 copy/offload 任务在途 → `OBJECT_HAS_REPLICATION_TASK`
   - 参数校验在分支判断之前：要求副本数等配置合法（`replica_num≥1`）——空写虽不走分配，config 也须填合法值
 - **F3 Case B 的四个行为**（`:1698-1737` @0.3.11）
-  1. **改写属主**：`metadata.client_id = client_id` 无条件执行——「谁最后写，谁是属主」是 upsert 的固有语义，真实写数据与空写都触发
+  1. **改写 client_id**：`metadata.client_id = client_id`（右值 = 调用方传入的 UUID）无条件执行——「谁最后写，client_id 就是谁」是 upsert 的固有语义，真实写数据与空写都触发
   2. **设置/清除 soft pin**：按 config 的 `with_soft_pin`——true 且当前无 pin → 授予；false 且当前有 pin → 清除
   3. **hard pin 不动**（F1 可达性）
   4. **副本标为写中**：COMPLETE→PROCESSING，该 key 对所有读者不可见，直到 UpsertEnd 标回——空写的「不可读窗口」来自这里
 - **F4 UpsertStart 不验身份**
-  - 对调用方 client_id 无任何校验（不要求等于原属主、不要求活跃注册，只查参数合法性）
-  - 推论：kvcm 调用时把**原属主的 UUID 原样传回**，行为 1 就把属主赋回它自己 = 属主实际不变，pin 照加（「借名」方案的机制基础）
-  - 一个例外条件：upsert 开头 master 顺手做**单 key 惰性清理**（`CleanupStaleHandles`，`:2530`）——只遍历当前这把 key 自己的副本（O(副本数)），把挂在已死客户端 seg 上的副本清掉；若清完无有效副本，请求落入 Case A 新建。所以借名 upsert 要求原属主当时在线（预热场景成立）
+  - 对调用方 client_id 无任何校验（不要求等于原 client_id、不要求活跃注册，只查参数合法性）
+  - 推论：kvcm 调用时把**原 client_id 的 UUID 原样传回**，行为 1 就把 client_id 赋回它自己 = client_id 实际不变，pin 照加（「借名」方案的机制基础）
+  - 一个例外条件：upsert 开头 master 顺手做**单 key 惰性清理**（`CleanupStaleHandles`，`:2530`）——只遍历当前这把 key 自己的副本（O(副本数)），把挂在已死客户端 seg 上的副本清掉；若清完无有效副本，请求落入 Case A 新建。所以借名 upsert 要求原 client_id 当时在线（预热场景成立）
 - **F5 Revoke = 写中止**
   - `UpsertEnd / UpsertRevoke` 直通 `PutEnd / PutRevoke`（`:1770` 附近 @0.3.11）
   - 用途：PutStart/UpsertStart 分配了 buffer、副本标为写中之后，客户端写失败或放弃 → 调 Revoke 把写中的副本释放掉
   - 约束
-    - 校验属主：非属主调用 → `ILLEGAL_CLIENT`（只有发起写的人能中止）
+    - 校验 client_id：与 key 的 client_id 不符调用 → `ILLEGAL_CLIENT`（只有发起写的人能中止）
     - 只撤写中副本；副本已就绪则拒绝 → `INVALID_WRITE`
   - 与 kvcm 的关系：空写若在 Start/End 之间崩溃，副本卡写中——恢复时扫描任务记录，补 End 或 Revoke 清理（归 §1 状态记录①的崩溃恢复）
 
-### 属主字段与级联删除
+### client_id 字段与级联清理
 
-- **F6 属主字段代码上管三件事**（`metadata.client_id` 全库共四处使用）
-  1. **写中止权限**：`PutRevoke` / `UpsertRevoke` 校验属主身份（`:1364` / `:1482` @0.3.11，F5）
-  2. **副本清理权限**：`BatchReplicaClear` 校验请求者必须是属主（`:937` @0.3.11）——kvcm 非属主调不动
-  3. **upsert 改写**：「谁最后写谁是属主」（F3①）
-  - **不管**：copy / move / get / exist——复制与读取路径完全不读属主字段（F7 代码核实）；且 copy 的副本登记走独立 RPC 对 `CopyStart`/`CopyEnd`（不经 Put/Upsert），全程不碰 `client_id`——**copy 后 key 属主不变**，仍是最初写入的引擎（`master_service.cpp:1849` @0.3.11）；**move 同样不改属主**——`MoveStart`（`:2069`）/ `MoveEnd`（`:2160`）/ `CreateMoveTask`（`:5832` @0.3.11）全程不写 `metadata.client_id`，main 版 `MoveStart` 函数体 `client_id =` 赋值 0 处。注意 `MoveEnd` 的 `ILLEGAL_CLIENT` 校验是任务执行者校验（谁 Start 谁 End），不是属主校验——故「按 key 属主删」口径下 move 解不了 retain（§4）
+- **F6 client_id 字段代码上管三件事**（`metadata.client_id` 全库共四处使用）
+  1. **写中止权限**：`PutRevoke` / `UpsertRevoke` 校验client_id（`:1364` / `:1482` @0.3.11，F5）
+  2. **副本清理权限**：`BatchReplicaClear` 校验请求者 client_id == key 的 client_id（`:937` @0.3.11）——kvcm 的 UUID 对不上，调不动
+  3. **upsert 改写**：「谁最后写 client_id 是谁」（F3①）
+  - **不管**：copy / move / get / exist——复制与读取路径完全不读 client_id 字段（F7 代码核实）；且 copy 的副本登记走独立 RPC 对 `CopyStart`/`CopyEnd`（不经 Put/Upsert），全程不碰 `client_id`——**copy 后 key 的 client_id 不变**，仍是最后写入的引擎（`master_service.cpp:1849` @0.3.11）；**move 同样不改 client_id**——`MoveStart`（`:2069`）/ `MoveEnd`（`:2160`）/ `CreateMoveTask`（`:5832` @0.3.11）全程不写 `metadata.client_id`，main 版 `MoveStart` 函数体 `client_id =` 赋值 0 处。注意 `MoveEnd` 的 `ILLEGAL_CLIENT` 校验是任务执行者校验（谁 Start 谁 End），不是 client_id 校验
 - **清理路径全图**（「清理 API 能不能清到某副本」的完整答案）
   1. **整 key 删**：`Remove` / `BatchRemove` / `RemoveByRegex` / `RemoveAll`——key 元数据连同全部副本一起删（不管副本在哪个 seg）；**不鉴权**，kvcm 可用（§4 release）
-  2. **定点清单个副本**：`BatchReplicaClear(keys, client_id, seg)`——只清指定 client 指定 seg 上的副本、其他 seg 的保留；**限 key 属主自调**（F6②），kvcm 调不动 → kvcm 做不了「只清 A seg 副本、留着 B seg」的定点手术
-  3. **级联清理**：client 死亡 → 其 seg 全摘 → 挂在死 seg 上的副本记录清掉（disk 副本随死 client 清）——按 seg/client 维度扫，**不看 key 属主**；master 自动触发（F6b 有代码与实测的口径矛盾，归 E5）
-- **F6b 级联删除：实测现象与代码核实不一致（归因归 E5）**
-  - **实测**（D1 F5 / EXPERIMENTS #3）：属主 A 重启 → client TTL 过期 → key 记录连同全部副本记录（**含预热到 B seg 上的**）消失，`batch_is_exist` 0/32；现象疑似「副本存活性绑定属主 client」
-  - **代码核实**（0.3.11.post1）：client 过期处理（`master_service.cpp:4930-5015` @0.3.11）= unmount 该 client 全部 seg + `ClearInvalidHandles` 全量扫——清理是**副本级**的（`CleanupStaleHandles :2530`）：内存副本随死 seg 清、disk 副本随死登记 client 清。**活 seg 上其他 client 的副本按代码不该被清**；全库无「按 key 属主删」路径
-  - **不一致点**：实测时 B 的 seg 活着、B 副本 COMPLETE 可读（B 命中 88.2%），按代码应存活，实测却消失——待 E5 对照实验厘清（master 是否与引擎同机一起死了 / 副本实际状态 / 其他清理路径）
-  - **设计含义**：0.3.11 过渡期的 retain 手段有效性依赖口径判定（§4）——E5 证实「按 key 属主删」则改属主有效，证实「按 seg 清理」则 move 到活 seg 有效；main 的池机制（retained client / DFS 副本，F13）不依赖此口径，是 E5 之外的独立解
+  2. **定点清副本**：`BatchReplicaClear(keys, client_id, seg)`（`:913-1010` @0.3.11）——key 的 client_id 所在 client 传自己的 UUID + 任意 seg 名，清自己 key 在该 seg 上的副本；校验「key 的 client_id == 参数 client_id」，kvcm 传自己 UUID 过不了 → kvcm 做不了「只清 A seg 副本、留着 B seg」的定点手术。**不区分副本来源**：put/copy/move 产物同一把 `replicas_` 列表，都在管辖内——写入引擎随时能清掉 kvcm 预热到别机的副本。三道门槛：lease 未过期 → skip（与 Remove 的保险同向）；PROCESSING 副本免清（指定 seg 时不匹配；seg 传空时要求全部 COMPLETE 才动手，防打断在途写）——在途 copy/move 的半成品它碰不了（归 reaper，D5）；seg 传空时不是清副本、是 `Erase()` 删整 key——「client_id 限定 + 带 lease 检查版的 Remove」
+  3. **级联清理**：client 死亡 → 其 seg 全摘 → 挂在死 seg 上的副本记录清掉（disk 副本随死 client 清）——按 seg/client 维度扫，**不看 key 的 client_id**；master 自动触发（E5 已闭环，F6b）
+- **F6b 级联清理 = 副本所在 client 维度（E5 已闭环）**
+  - **结论**（代码核实，0.3.11.post1）：client 过期处理（`master_service.cpp:4930-5015` @0.3.11）= unmount 该 client 全部 seg + `ClearInvalidHandles` 全量扫——清理是**副本级**的（`CleanupStaleHandles :2530`，清一个副本的条件 = `has_invalid_mem_handle() || has_stale_local_disk_client`，即「它的 seg 失效」或「它登记的盘 client 已死」）：内存副本随死 seg 清、disk 副本随死登记 client 清。活 seg 上其他 client 的副本**不动、继续可读**；全库无「按 key 的 client_id 删」路径。真下线风险只剩「副本全在死 client seg 上的 key」整 key 消失
+  - **main 侧印证**：main 把副本所在 client 显式化为 `Replica::isAffiliatedWith`（`replica.h:553` @main）——内存副本比 buffer 所在 client、盘副本比登记 client、DFS 副本恒 false（不在任何 client）；client 下线清理（`ProcessClientOffboardingJob`，`:2976` @main）的清理条件只看副本所在 client 这个维度，同样不看 key 的 client_id——「清理走副本所在 client」两版本同
+  - **实验闭环**（10-20 受控复验，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15 / 踩坑 3）：kill 写入者 A 全进程树 → client TTL 过期 → master unmount A 两 seg（日志零驱逐零 remove）→ `batch_is_exist` 仍 32/32、副本全在 B 四个 seg → 裸 client 跨机 `get` 3/3 字节级读回。早期「key 连同全部副本消失、exist 0/32」的观测是 key 名漂移假失败（控制面未带 `PYTHONHASHSEED`，踩坑 1），不是级联删除
+  - **设计含义**：retain 不需要为「key 的 client_id 下线」兜底——远端副本本就保留，retain 的对手只剩 lease 过期→驱逐（§4）；move 的 retain 价值在「把副本挪到活得久的 seg 上」——副本所在 client 随 move 转移（`MoveStart` 在目标 seg 分新 buffer、`MoveEnd` 删源副本，main `:7010` / `:7196` 起），挪完即脱离将死 seg
 
 ### copy / move 机制
 
 - **F7 CreateCopyTask**（`master_service.cpp:5777` @0.3.11）
   - 入参：key + 目标 seg 名列表；**调用方不能指定从哪个副本复制**
   - 源选择：master 从该 key 现有副本所在的 seg 里**随机挑一个**（`:5816`）
-  - 执行模型：master 不搬数据，只生成任务记录；任务派给「源 seg 所属的客户端进程」执行——复制要求源属主在线
+  - 执行模型：master 不搬数据，只生成任务记录；任务派给源 seg 所在 client 进程执行——复制要求源 seg 所在 client 在线
   - 校验：key 存在、目标 seg 已挂载可分配
 - **CreateMoveTask**（key, source, target，`:5845`）
   - 唯一能指定源的路径；语义是**移动**——完成后源副本删除
-  - 执行模型与 copy 相同：任务派给源 seg 属主执行（`GetClientIdBySegmentName(source)`），同样要求源在线；失败则源保留
+  - 执行模型与 copy 相同：任务派给源 seg 所在 client 执行（`GetClientIdBySegmentName(source)`），同样要求源在线；失败则源保留
 - **CreateDrainJob**（两版本同有：`master_service.cpp:5970` @0.3.11，`ProcessDrainJobs` `:6354` @0.3.11 / `:14434` @main）
   - seg 级批量搬迁：入参 = 一批源 seg 名 + 可选目标 seg 列表 + 并发上限（默认 4，`CreateDrainJobRequest` 字段两版本一字不差）
   - 语义：源 seg 置 DRAINING（仍可读、不再接受新分配，`segment.h:24` 注释 @0.3.11）→ master 后台 job 线程（`JobDispatchThreadFunc` → `ProcessDrainJobs`）周期扫源 seg 上的 key、逐个派搬迁任务 → 排空后 seg 置 DRAINED，可安全下线
   - 与 CreateMoveTask 对比：粒度 = seg 批量 vs key 单发；驱动 = 后台 job 循环调度 vs 即时单任务；**可取消性 = job 有 `CancelDrainJob` / `QueryDrainJob`，task 无取消（P9）**——下线场景白得取消能力
   - 用途：计划下线（§4）
-- **副本没有属主字段，生死跟随所在 seg**：copy 到 B 的副本属 B 的 seg——源引擎下线不影响它；目标引擎（B）下线它才随 seg 失效（代码口径；与实测的不一致见 F6b）
+- **副本没有 client_id 字段，生死跟随所在 seg**：copy 到 B 的副本属 B 的 seg——源引擎下线不影响它；目标引擎（B）下线它才随 seg 失效（E5 已闭环证实，F6b）
 - **介质边界：copy/move 只在 DRAM seg 之间，接不了 SSD**（两版本一致）
   - disk seg 不在 seg 名字空间：0.3.11 挂盘单独登记在 client 名下（`segment.cpp:133` `MountLocalDiskSegment`，不进 seg 名注册表）；main 改由 `local_ssd_manager_.RegisterClient` 按 client 登记（`master_service.cpp:8407`），同样没有 seg 名——copy/move 的目标校验只认内存 seg 名，**disk 做不了目标**
   - copy 源从「副本的 seg 名」里挑，而 disk 副本没有 seg 名（`get_segment_names`，`replica.h:610` @0.3.11 / `:886` @main，两版本同一实现）——**SSD 副本做不了源**
@@ -150,7 +196,7 @@
 - **F11 kvcm 拿不到引擎的 client UUID**
   - UUID 在客户端进程构造时随机生成（`client_service.cpp:431`），无法按实例名推算
   - C++ 客户端有公开 `getClientId()`（`client_service.h:80` @main），但 **Python 绑定 0.3.11 与 main 都未暴露**——vLLM 走 Python，读不到自己的 UUID
-  - master 的 RPC 没有「key → 属主 UUID」查询
+  - master 的 RPC 没有「key → client_id」查询
     - `GetReplicaList` 返回副本描述符（副本的位置信息），内存副本的只有 seg 名和地址，不含 client_id（`replica.h:240`）
     - master 内部有现成的「seg 名 → client UUID」查询 `GetClientIdBySegmentName`（CreateCopyTask 自己就在用），但没暴露成 RPC
   - kvcm 与引擎之间**没有直接通道**：kvcm 的视野来自 master 的 segment 信息（seg 名 = `IP:rpc_port`，见 [README.md](README.md)）；「端点 → 实例」的注册方向是 kvcm 注册给索引（summary D4/E13），不是引擎注册给 kvcm
@@ -193,7 +239,7 @@
 - `UnmountLocalDiskSegment`（main 新增——0.3.11 挂了本地盘就摘不掉）：引擎死前主动摘掉盘的登记（效果等同死后被清，但更干净可控）
 - `RemoveAll` 改异步（main）：master 置个标志，各 client 轮询到（`PollRemoveAll`）后各自清盘——全池清空不再是同步调用
 - `EvictDiskReplica` / `BatchEvictDiskReplica`（两版本同有）：client 盘副本被逐后向 master **上报**、清元数据（通知型，不是「命令 master 驱逐」）。鉴权分介质：
-  - `LOCAL_DISK`：限盘副本属主（descriptor 的 client_id 须匹配，`master_service.cpp:6336-6346` @main）
+  - `LOCAL_DISK`：限盘副本登记 client（descriptor 的 client_id 须匹配，`master_service.cpp:6336-6346` @main）
   - `DISK`（DFS 副本）：不验 client_id——kvcm 调用可清 DFS 副本
     - 机制事实登记；语义是「驱逐上报」，拿它当主动删除属于误用，release 不走这条路（§4）
 
@@ -201,7 +247,7 @@
 - `GetReplicaListForAdmin`：查副本状态但**零副作用**（不续租、不触发 promote、不计命中统计）——核验专用（F11b）
 - `GetAllKeys` / `GetReplicaListByRegex`：全量/模式列举 key——台账比对重建用
 - `ProbeKey`：纯探测在不在，不续租（F9）；实现确认也不喂命中统计（`ExistKeyImpl(grant_lease=false)` 不触发 promote 计数与动态副本观测）——main 下最轻的存在性核验
-- 副本位置一跳到位、无需额外查询：`GetReplicaList` 的副本 descriptor 自带 `transport_endpoint_`（内存副本 `AllocatedBuffer::Descriptor`，`allocator.h`；盘副本 `LocalDiskDescriptor` 还外加 `client_id`）。`BatchQueryIp`（client_id → IP，两版本同有）对 kvcm 仅边角用途：已登记引擎 UUID 重连后查当前地址——注意它答的是「client 在哪」，答不了「key 属主是谁」（属主 = 最初写入引擎，copy 后不变；key→属主无查询接口，F13⑥，台账只能写入时自登）
+- 副本位置一跳到位、无需额外查询：`GetReplicaList` 的副本 descriptor 自带 `transport_endpoint_`（内存副本 `AllocatedBuffer::Descriptor`，`allocator.h`；盘副本 `LocalDiskDescriptor` 还外加 `client_id`——descriptor 是 RPC 视图，这个 client_id 是盘副本所在 client 的对外可见形式；与「`Replica` 记录本身不存 client_id」（背景概念）不矛盾）。`BatchQueryIp`（client_id → IP，两版本同有）对 kvcm 仅边角用途：已登记引擎 UUID 重连后查当前地址——注意它答的是「client 在哪」，答不了「key 的 client_id 是谁」（client_id = 最后写入的引擎，copy/move 后都不变（F6「不管」条）；key→client_id 无查询接口，F13⑥，台账只能写入时自登）
 - `GetStorageUsageSnapshot`（main）：分层容量快照——demote 触发条件「DRAM 压力」的数据源
 - 台账失效通知增强（main）：KV 事件流（ZMQ，stored/removed/cleared，D1 F14）的 removed/cleared 事件可让台账条目立即失效，不必等下轮全量比对；stored 不含 seg/位置（D1 F14 已析），代替不了比对——索引面用途归 D1，kvcm 台账只借失效通知
 
@@ -216,7 +262,7 @@
     3. 三种模式：`kOff`（默认）/ `kObserve`（只打日志）/ `kEnforce`
     4. 准入线程批量提交 proposal
     5. 校验链：lease 幂等 + 冷却 + version_epoch 乐观锁
-    6. 落 `REPLICA_COPY` 任务，派源 seg 属主执行
+    6. 落 `REPLICA_COPY` 任务，派源 seg 所在 client 执行
   - **不对外暴露**：`rpc_service.h` 未注册、`master_client` 无
   - 动作类型只有 `ADD`（`rpc_types.h:17-19` @main），**不能用来降层**
   - **kvcm 能触发、但结果不满足 copy 语义**
@@ -226,11 +272,11 @@
   - 「无 per-key 立即降层 RPC」的结论两版本成立
 
 **⑥ main 仍没有的**（别去找了）
-- per-key 立即降层 RPC、copy/move 任务取消、Python 绑定的空写通道、key→属主 UUID 查询
+- per-key 立即降层 RPC、copy/move 任务取消、Python 绑定的空写通道、key→client_id 查询
 
 ## §1 操作集框架
 
-- **本节与专节的分工**：本节是八项操作的公共面（语义界定、分工、完成信号、业界对照、能力边界、操作图解）；专节只给需要方案取舍或缺口分析的操作——§2 pin（三方案 + 属主问题）、§3 demote/promote（组合路径 + 真功能缺口）、§4 retain/release（多机制组合）。copy / move / keepalive 不设专节：单 RPC 操作、无候选分歧，机制在事实基线（F7 / F9）、语义分工在本节、缺口在能力边界表——三处合读即全覆盖
+- **本节与专节的分工**：本节是八项操作的公共面（语义界定、分工、完成信号、业界对照、能力边界、操作图解）；专节只给需要方案取舍或缺口分析的操作——§2 pin（三方案 + client_id 问题）、§3 demote/promote（组合路径 + 真功能缺口）、§4 retain/release（多机制组合）。copy / move / keepalive 不设专节：单 RPC 操作、无候选分歧，机制在事实基线（F7 / F9）、语义分工在本节、缺口在能力边界表——三处合读即全覆盖
 - **操作集八项**：copy / move / keepalive / pin / demote / promote / retain / remove
   - 按性质分三类
     - **原子动作**：copy / move / keepalive / demote / promote / remove——原子指**语义**：一个操作一个效果、无中间态对外。实现上 copy/move/keepalive/remove 各对应单 RPC；demote/promote 是组合动作（池通道或 kvcm 读写组合 + 核验，§3），对外仍呈现单步语义
@@ -261,10 +307,64 @@
   - **copy 保副本数**：新增副本，源由 master 随机选（F7）
   - **move 减副本数/搬迁**：指定源→目标，完成后源删（F7）
   - 用途：下线迁移、副本归拢用 move
+
+**copy 完成后的静态全景**（key / client_id / seg / buffer 各在哪）：
+
+```text
+┌───────────── master（独立进程，可能在任何一台机器）──────────────┐
+│                                                                  │
+│   key: "K1"                                                      │
+│     ├─ client_id = A        ←元数据字段，登记在 master 这一级    │
+│     ├─ lease / pin 等元数据                                      │
+│     ├─ 副本[0] ── 指向 ──→ seg_A 上的 buffer#1                   │
+│     └─ 副本[1] ── 指向 ──→ seg_B 上的 buffer#2                   │
+│                                                                  │
+│   （master 只存「指针」，不存数据本体）                          │
+└──────────────────────────────────────────────────────────────────┘
+               │ 指向 seg_A                  │ 指向 seg_B
+               ▼                            ▼
+┌── A 机器 ─────────────────────┐   ┌── B 机器 ─────────────────────┐
+│                               │   │                               │
+│  seg_A ←A 启动时向 master 注册│   │  seg_B ←B 启动时向 master 注册│
+│    └─ buffer#1                │   │    └─ buffer#2                │
+│       （K1 数据本体）         │   │       （K1 数据副本）         │
+│       所在 client：A          │   │       所在 client：B          │
+│                               │   │                               │
+└───────────────────────────────┘   └───────────────────────────────┘
+```
+
+- 四样东西各在哪：**key** 是 master 元数据里的一条记录（名字+指针），不落任何机器；**client_id** 是这条记录里的一个字段，只在 master 手里；**seg** 是各机器注册进池的内存区域；**buffer** 是 seg 里切出来的块，数据本体所在（盘副本 / DFS 副本形态见背景节「实体、位置与归属」图）
+- 关键：**client_id 与副本所在 client 是两层、互不相干**（背景节术语条「两个维度正交」）。copy/move 后 `client_id` 不变（写入者字段，仅 PutEnd 校验 / `BatchReplicaClear` 权限用，清理不看它——F6）；副本生死只看 buffer 所在 seg 的所在 client（F6b）
+- copy 与 move 的唯一区别：copy 后源、目标各留一份（副本数 +1）；move 完源副本删除（副本数不变），落位逻辑相同
+
+**move 完成后的静态全景**（承接上图：kvcm 调 `CreateMoveTask(K1, source=seg_B, target=seg_C)` 之后）：
+
+```text
+┌─ master（元数据） ───────────────────────────────┐
+│ key: "K1"                                        │
+│  ├─ client_id = A ← move 不改（F6）              │
+│  ├─ lease / pin                                  │
+│  ├─ 副本[0] ──→ seg_A buffer#1（不动）           │
+│  └─ 副本[1] ──→ seg_C buffer#3（位置改写）       │
+└──────────────────────────────────────────────────┘
+
+ ①                          ✕（源已删）                                      ②
+ ▼                                                                           ▼
+┌─ A 机器 ─────────────┐   ┌─ B 机器 ─────────────┐   ┌─ C 机器 ─────────────┐
+│ seg_A                │   │ seg_B                │   │ seg_C                │
+│  └─ buffer#1         │   │   buffer#2 已释放    │   │  └─ buffer#3         │
+│     K1 数据本体【①】 │   │   ——MoveEnd 删源     │   │     K1 数据副本【②】 │
+│ 所在 client：A       │   │ （不再持 K1 副本）   │   │ 所在 client：C       │
+└──────────────────────┘   └──────────────────────┘   └──────────────────────┘
+```
+
+- 净效果 = 搬迁：副本[1] 还是那一条记录，位置从 seg_B 改写为 seg_C；源 buffer#2 由 `MoveEnd` 释放——副本总数不变（copy 是 +1）
+- 不变的两样：`client_id = A`（move 全程不写client_id 字段，F6「不管」条）；副本[0] 不动（move 显式指定源，F7）
+- 所在 client 随数据走：buffer#3 从 seg_C 分出 → 副本落到 C 手里，B 与 K1 再无关系——retain 主路径「move 到活 seg」（§4）靠它让副本脱离将死引擎；`MoveStart` 先在 seg_C 分新 buffer（写中态归任务）、`MoveEnd` 才删源，中途失败源保留（F7）
 - **防驱逐相关操作的语义界定**（keepalive / pin / retain 的区别）
   - **keepalive**（动作）：周期续租（F9）——窗口 = lease_ttl、轻、高频；kvcm 断线，lease 过期即失效
   - **pin**（元数据标记）：设一次长期有效——soft = 驱逐排最后 + TTL 窗口；hard = 绝对不可逐
-  - **retain**（目的，不是机制）：「属主下线/长期未命中时副本继续活着」——手段组合见 §4
+  - **retain**（目的，不是机制）：「长期未命中时副本继续活着」——手段组合见 §4。key 的 client_id 下线不需要 retain 兜底（远端副本本就保留，F6b）；retain 的对手只剩 lease 过期→驱逐
   - 给哪些 key 续租、何时开始、周期多少 = **kvcm 策略层逻辑**（保活注册表驱动），不是原子操作语义的一部分
 - **状态记录四类**（按可丢性分级）
   1. **任务状态机**（可丢）：在途任务进度；丢了可重发——master 侧操作幂等（重复 copy 同 key 同目标不产生重复副本）
@@ -285,7 +385,7 @@
 | pin | LMCache `pin`/`unpin`（后端接口级）；KVCR `claim/pin`/`release_pin`（**传输窗口专用**，`FETCHABLE` 须等 pin 成功才确定）；TensorCast `pinned` policy（必须驻留 + 溢出**拒绝写入**）；HiCache `lock_ref`（`protected_size_` vs `evictable_size_`，dec 到 0 ≠ 释放、仍可命中） | mooncake 三件套（lease/soft/hard）比多数系统细。差异：TensorCast `pinned` 溢出拒绝写入，mooncake hard pin 无此语义（创建时固化、之后改不了，F1）；KVCR 的传输窗口 pin 在 mooncake 由「copy 任务在途拒 upsert」覆盖（F2） |
 | demote | §3 专节（FlexKV/LMCache/UCM/KVBM/MemCache 对照 + HiCache 写穿/写回） | —— |
 | promote | HiCache `load_back`（L2→L1 提回）；FlexKV SSD→GPU 的 H2D 回填；KVCR `fetch`；mooncake `promotion_on_hit`（命中达阈值自动提回） | 被动提升（读命中驱动）是各家主路径；kvcm 另有主动两条：反复调 `GetReplicaList` 至命中计数过线触发 / 读删写自搬（§3） |
-| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择；kvcm 的正式路径 = main 的 retained client 机制（client 断线数据保留，§4），存储统一在 mooncake。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：属主管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是属主 |
+| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择；kvcm 的正式路径 = main 的 retained client 机制（client 断线数据保留，§4），存储统一在 mooncake。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：client_id 管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是 key 的 client_id |
 | remove | LMCache `remove`/`clear`；SGLang 分层放弃（`block-lifecycle.md`）：无 L3 时 `evict` 删叶 = 彻底；**有 L3 时引擎永不主动放弃**——删除下放 L3 后端独立 LRU/TTL，引擎看不到 | SGLang 的「释放 = 逐层剥离」（L1 摘节点降层 → L2 摘除 → L3 后端自决）对应 kvcm 三级（软释放 / demote / remove）。「L3 删除引擎不可见」提醒：kvcm remove 后索引侧条目需同步清（D1 已知：池副本删除事件通道缺失） |
 
 - **总观察**
@@ -311,7 +411,7 @@
 | pin 显式标记 | UCM/FlexKV 交给后端 LRU/TTL；SGLang 有 L3 时引擎**永不主动放弃**（删除下放后端容量管理） | 预热副本**没有读者**，「读即续租」保不住——预热场景特有 |
 | keepalive 独立保活 | 多数系统靠读路径被动续租，无控制面保活 | 同上（LMCache `touch_cache` 是同类例外） |
 | move 显式搬迁 | FlexKV/UCM/HiCache 层间移动是驱逐/prefetch 的副作用，无显式 move | 下线迁移/副本归拢要确定性搬迁（LMCache controller 有 move，不孤立） |
-| retain 属主下线存续 | 引擎插件层（FlexKV/UCM/HiCache L1L2）引擎死缓存失效拉倒；KVCR-Guard/LMCache daemon 才做 | kvcm 是独立控制面：预热投入要跨实例存亡保住 |
+| retain key 的 client_id 下线存续 | 引擎插件层（FlexKV/UCM/HiCache L1L2）引擎死缓存失效拉倒；KVCR-Guard/LMCache daemon 才做 | kvcm 是独立控制面：预热投入要跨实例存亡保住 |
 
 - **审计结论**：不做 pin/keepalive/retain 的系统，共同点是有读者替它们保活、或引擎死了认栽——kvcm 的预热副本恰好「无读者 + 要跨实例存亡」，这三样是定位需要，不是冗余。**唯一真缺口 = prefetch 终止**（summary P9）
 
@@ -323,7 +423,7 @@
 
 | 功能 | 卡点 | kvcm 现状手段 |
 |---|---|---|
-| 写回模式确定性 demote（含「只清 DRAM 副本、留盘副本」） | 无 per-key 降层 RPC（两版本同）+ `BatchReplicaClear` 限 key 属主（F6②） | 停保活进驱逐候选，时机不可控；远期：kvcm 自己挂 SSD + 上报登记（§3） |
+| 写回模式确定性 demote（含「只清 DRAM 副本、留盘副本」） | 无 per-key 降层 RPC（两版本同）+ `BatchReplicaClear` 限 key 的 client_id（F6②） | 停保活进驱逐候选，时机不可控；远期：kvcm 自己挂 SSD + 上报登记（§3） |
 | 在途 copy/move 任务取消（止损） | 无任务取消 RPC（两版本同，P9） | 弃置 + 事后清副本——止不住在途带宽，只清结果 |
 
 **功能对齐，组合实现（mooncake 无直接可用接口）**
@@ -384,7 +484,7 @@ sequenceDiagram
     participant R as Router
 
     K->>M: ① CreateCopyTask(key, [B.seg])
-    M->>A: ② 派任务给源 seg 属主（随机选源，F7）
+    M->>A: ② 派任务给源 seg 所在 client（随机选源，F7）
     A->>B: ③ RDMA：A.DRAM → B.DRAM
     A->>M: ④ CopyEnd
     K->>M: ⑤ QueryTask + GetReplicaList 核验
@@ -406,7 +506,7 @@ sequenceDiagram
     rect rgb(223, 242, 223)
     Note over K,B: 单 key 搬迁：CreateMoveTask（唯一能指定源的路径，F7）
     K->>M: ① CreateMoveTask(key, A.seg→B.seg)
-    M->>A: ② 派任务给源 seg 属主
+    M->>A: ② 派任务给源 seg 所在 client
     A->>B: ③ RDMA：A.DRAM → B.DRAM
     A->>M: ④ MoveEnd
     Note over M: 源副本随任务完成删除（失败则源保留）
@@ -493,7 +593,7 @@ sequenceDiagram
     end
 ```
 
-- S2 与 R3 的**发起方身份 = 新属主**（F3①）：传自己 UUID 改归 kvcm / 传原属主 UUID 借名（需 master 加查询 RPC）——两选择的取舍见 §2「属主问题」节
+- S2 与 R3 的**发起方身份 = 新 client_id**（F3①）：传自己 UUID 改归 kvcm / 传原 client_id UUID 借名（需 master 加查询 RPC）——两选择的取舍见 §2「client_id 问题」节
 - 效果与代价（保护语义、断线窗口、持续开销）见 §2 对比表；取消方式的机制依据见「pin 的取消」节
 
 **⑤ demote（DRAM→SSD；三形态时序：绿 = 写穿、橙 = 写回、蓝 = 远期 kvcm 自挂 SSD，§3）**
@@ -534,7 +634,7 @@ sequenceDiagram
     end
 ```
 
-- 「立即清 DRAM 副本、只留盘副本」走不通：`BatchReplicaClear` 限 key 属主（F6②）——与「写回模式无确定性 demote」同属真功能缺口（§1 能力边界）
+- 「立即清 DRAM 副本、只留盘副本」走不通：`BatchReplicaClear` 限 key 的 client_id（F6②）——与「写回模式无确定性 demote」同属真功能缺口（§1 能力边界）
 
 **⑥ promote（SSD→DRAM；三路径时序：绿 = 被动、橙 = kvcm 主动触发、蓝 = kvcm 读删写，§3）**
 
@@ -543,7 +643,7 @@ sequenceDiagram
     participant K as kvcm
     participant M as master
     participant R as 读请求引擎
-    participant H as 盘副本属主引擎
+    participant H as 盘副本所在引擎（登记 client）
 
     rect rgb(223, 242, 223)
     Note over K,H: 被动路径（真实读流量驱动）
@@ -577,10 +677,10 @@ sequenceDiagram
     end
 ```
 
-- 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 反复调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本属主引擎在线
-- `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本属主引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
+- 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 反复调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本所在引擎在线
+- `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本所在引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
 
-**⑦ retain（属主下线后副本存续；六方案时序：绿 = main 正式路径两条、橙 = 0.3.11 过渡三手段、灰 = 接受现状，§4）**
+**⑦ retain（key 的 client_id 下线后副本存续；五方案时序：绿 = main 正式路径两条、橙 = 0.3.11 过渡两手段、灰 = 接受现状，§4）**
 
 ```mermaid
 sequenceDiagram
@@ -608,21 +708,14 @@ sequenceDiagram
     end
 
     rect rgb(255, 235, 214)
-    Note over E,DFS: 过渡①（0.3.11）：改属主——有效依赖 E5「按 key 属主删」成立才行
-    K->>M: 空写 upsert 传 kvcm UUID（属主改归 kvcm，F3①）
-    E--xM: 引擎死
-    Note over M: key 属主 = kvcm（活着）→ 若按属主删则 key 存活
-    end
-
-    rect rgb(255, 235, 214)
-    Note over E,DFS: 过渡②（0.3.11）：move 到活 seg——有效依赖 E5「按 seg 清理」成立才行
+    Note over E,DFS: 过渡①（0.3.11）：move 到活 seg——E5 证实有效（清理按 seg 维度）
     K->>M: CreateMoveTask（副本迁到他机活 seg）
     E--xM: 源引擎死
-    Note over M: 副本绑活 seg（F7）→ 若按 seg 清则副本存活
+    Note over M: 副本绑活 seg（F7）→ 存活
     end
 
     rect rgb(255, 235, 214)
-    Note over E,DFS: 过渡③（0.3.11）：kvcm 自挂 SSD——不依赖 E5 的兜底
+    Note over E,DFS: 过渡②（0.3.11）：kvcm 自挂 SSD——不依赖任何引擎存活的兜底
     K->>E: 读关键 KV
     E-->>K: 数据
     K->>KS: 写 kvcm 本机盘
@@ -632,11 +725,11 @@ sequenceDiagram
     end
 
     rect rgb(230, 230, 230)
-    Note over E,DFS: 或接受现状：引擎下线 = 数据失效，预热投入重来（E5 判定口径后评估）
+    Note over E,DFS: 或接受现状：副本全在死引擎 seg 上的 key 整 key 消失，预热投入重来
     end
 ```
 
-- 先说清 demote 在 0.3.11 解不了 retain：盘副本绑登记它的引擎 client，引擎死照样清（§3）——所以过渡手段里没有 demote
+- 先说清 demote 在 0.3.11 解不了 retain：盘副本绑登记它的引擎 client，引擎死照样清（§3）——所以过渡手段里没有 demote；改 client_id 同样不在——改的是鉴权字段，副本还绑在原 seg 上，引擎死照清（§4）
 
 **⑧ remove（release 四级时序：绿 = 软释放、蓝 = 主动 Remove、灰 = 全池清；决策归 D1 §6，§4）**
 
@@ -677,7 +770,7 @@ sequenceDiagram
     end
 ```
 
-- `BatchReplicaClear`（定点清单个副本）**不进图**：限 key 属主自调（F6②），kvcm 调不动——仅引擎下线前自清理场景归引擎用
+- `BatchReplicaClear`（定点清副本）**不进图**：限 key 的 client_id 自调（F6②），kvcm 调不动——仅引擎下线前自清理场景归引擎用
 
 **⑨ 复合流程——Router 的介入点（全在流程层，不在原子操作层；三段时序）**
 
@@ -736,7 +829,7 @@ sequenceDiagram
 
 - 做法：`UpsertStart`(key, 原尺寸, with_soft_pin) → 不写数据 → `UpsertEnd`；原尺寸由 `GetReplicaList` 查
 - mooncake 代码：不改（前提：空写通道不落 Python，F12）
-- 属主问题：**有**（upsert 必改写属主，F3①——见「属主问题」节）
+- client_id 问题：**有**（upsert 必改写 client_id，F3①——见「client_id 问题」节）
 - 保护语义：驱逐两轮里只排第二轮（F8），第一轮候选凑不够时仍可逐——这是 mooncake soft pin 的本义，与「防驱逐」有缝，接受才用
 - kvcm 失联：TTL 内保护自持（时钟在池里，main 默认 30min），到期不续才失效
 - 持续开销：每 key 每 TTL 一次空写续期
@@ -749,12 +842,12 @@ sequenceDiagram
 | 做法 | master 配置 `default_kv_lease_ttl` 调大（如 5min）+ kvcm 周期续租（F9） | 读出数据 → `Remove` → 带 hard_pin 重新 put → 校验副本 |
 | 保护强度 | lease 期内绝对不可逐 | 绝对不可逐，创建时固化、无到期概念（F1） |
 | mooncake 代码 | **不改** | 不改 |
-| 属主问题 | **无**（不碰写路径） | **有**（Remove 后走 Case A 新建，PutStart 传谁 UUID 谁是属主——见「属主问题」节） |
+| client_id 问题 | **无**（不碰写路径） | **有**（Remove 后走 Case A 新建，PutStart 传谁 UUID client_id 就是谁——见「client_id 问题」节） |
 | kvcm 失联 | 保护剩 lease_ttl 余量，到期失效 | **失联也安全**——保护存于池内元数据，不依赖任何角色存活 |
 | 持续开销 | 每 key 每窗口一次续租 | 一次重建，零持续开销 |
 | 副作用 | 全局读租约变长（F10：驱逐候选缩小，调参项，需真机观察定值） | 重建窗口 key 短暂不可读；数据过 kvcm 本地（带宽）；kvcm 本地持有数据直到校验成功，只有本地也丢才真丢 |
 
-- 选择：要「kvcm 长期失联也安全」→ 只有读删写；接受「kvcm 活着才保护」→ ①更轻（零属主问题、不动数据、可随时停）
+- 选择：要「kvcm 长期失联也安全」→ 只有读删写；接受「kvcm 活着才保护」→ ①更轻（零client_id 问题、不动数据、可随时停）
 - ① 的保护来自 lease（F9），与 mooncake 的 hard pin 机制无关——放此级是按驱逐过滤下的实际效果（lease 未过期 = 硬过滤跳过，F8）；两者取消语义不同（见下节）
 
 ### pin 的取消
@@ -764,15 +857,15 @@ sequenceDiagram
 - **读删写（hard pin）**：**没有 unpin**——两版本都是或运算保留（`with_hard_pin || IsHardPinned()`，`master_service.cpp:1741-1742` @0.3.11 / `:6068` @main；`hard_pinned is const`，`:1696` @0.3.11）——取消 = 再读删写一遍（读出 → Remove → 不带 hard_pin 重 put）
 - 操作集因此不单列 unpin：取消分别由 停 keepalive（软释放）/ pin 同机制逆操作 / remove 系 覆盖
 
-### 属主问题：两个并列方案（空写与读删写重建共同面对）
+### client_id 问题：两个并列方案（空写与读删写重建共同面对）
 
-- 起因：upsert/put 必然把属主改成调用方（F3①）
+- 起因：upsert/put 必然把 client_id 改成调用方（F3①）。client_id 方案面对的问题只剩「写中止权限的 client_id」（Revoke/在途写撤销）——key 的 client_id 下线不清远端副本（F6），不存在需要防的级联删除
 
-| | 方案一：属主改归 kvcm | 方案二：不改属主（借名） |
+| | 方案一：client_id 改归 kvcm | 方案二：不改 client_id（借名） |
 |---|---|---|
-| 做法 | kvcm 传自己的 UUID（自己就是 client，天然持有；sqlite 持久化，重启同 id 重注册） | kvcm 先查得原属主 UUID，调用时原样传回（F4） |
-| mooncake 代码 | **不改**（前提：空写通道不落 Python，F12） | **要改**：master 加「key → 属主 UUID」查询 RPC（数据内部现成，纯暴露，F11） |
-| 属主语义 | **改变**：引擎下线后 key 不再级联删除（retain 收益——**有效性依赖 E5 口径**：若级联按 key 属主删则成立；若按 seg 维度清理则 seg 失效照清副本、与 key 属主无关，见 F6b）；代价 = kvcm 下线 → 名下 key 全删（新单点；缓解 = UUID 持久化 + 重启快于 master 心跳超时） | **不变**：引擎下线 key 删（维持现状语义） |
+| 做法 | kvcm 传自己的 UUID（自己就是 client，天然持有；sqlite 持久化，重启同 id 重注册） | kvcm 先查得原 client_id UUID，调用时原样传回（F4） |
+| mooncake 代码 | **不改**（前提：空写通道不落 Python，F12） | **要改**：master 加「key → client_id」查询 RPC（数据内部现成，纯暴露，F11） |
+| client_id 语义 | 改变：kvcm 成在途写与 `BatchReplicaClear` 的权限持有者，kvcm 死期间这些权限锁死；缓解两道：① UUID 持久化 + 重启快于 master 心跳超时，kvcm 复活即恢复；② kvcm 死透（UUID 也丢）时，任一 client 对 key 调 upsert 即可把 client_id 改写成自己、接管权限——upsert 不验身份（F4），这是死透时的逃生门。key 的 client_id 下线行为两方案无差异——本就不清远端副本（F6b） | **不变**（维持现状语义） |
 | 引擎配合 | 无 | 无（补丁打在 master，引擎零感知） |
 
 - **决策条件（外部依赖，非单方可定）**
@@ -780,8 +873,8 @@ sequenceDiagram
      - 上游提 PR（纯暴露只读接口，接受度预期高，节奏不可控）或 fork 维护本地 patch——是**独立成本**；升级拿 publisher 是官方功能零 patch，与此无关
   2. kvcm 实现语言（summary E10/E11 未定）
      - 若落 Python，空写通道也需绑定补丁 → 方案一同样改 mooncake
-- 属主语义若要变，与 retain 议题（§4）统一评估，不在 pin 单独定
-- **注意**：若 pin 全走 hard pin 级 ①（lease 调大），属主问题只剩读删写一处触发，权重下降
+- client_id 方案与 retain 已脱钩（E5 闭环：改 client_id 救不了副本，§4 不定它）——本决策只看 pin 挂载与权限归属，纯工程成本权衡
+- **注意**：若 pin 全走 hard pin 级 ①（lease 调大），client_id 问题只剩读删写一处触发，权重下降
 
 ## §3 demote / promote（层间迁移）
 
@@ -828,7 +921,7 @@ sequenceDiagram
   - **核验**：`GetReplicaList` 确认 disk 副本在册（降层完成的判定）
 - **缺口（真功能缺口，归池侧扩展）**
   - **写回模式下无确定性 demote**：offload 任务的入队时机只有 put 完成时（写穿）和驱逐选中时（写回）两处（两版本同）——kvcm 想让指定 key 立刻、确定性地落盘，做不到；池不满就永不落盘
-  - 「立即清掉内存副本、只留盘副本」同属此缺口：`BatchReplicaClear` 校验请求者必须是 key 属主（F6②），kvcm 非属主调不动
+  - 「立即清掉内存副本、只留盘副本」同属此缺口：`BatchReplicaClear` 校验请求者必须是 key 的 client_id（F6②），kvcm 的 UUID 对不上，调不动
 - **远期可行性方案（与 §4「kvcm 挂 SSD」形态绑定）**
   - 流程：kvcm `MountLocalDiskSegment` 挂盘 → 读 DRAM 数据 → 写自己本机盘文件 → `NotifyOffloadSuccess` 上报登记盘副本
   - 要点：`AddReplica` 两版本均非独立 RPC，是该上报的内部步骤、无在途 offload 任务时同样登记（F1）；只收 LOCAL_DISK、不带 pin
@@ -837,49 +930,49 @@ sequenceDiagram
 
 ### promote 实现
 
-- **被动路径（流量驱动）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本属主 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
+- **被动路径（流量驱动）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本登记 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
 - **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——对只剩盘副本的 key 反复调 `GetReplicaList` 至命中计数过线（默认 2 次）：计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），kvcm 的调用与真实流量同池累计，到线即触发上面的被动路径
-  - 前提：`promotion_on_hit` 开启 + DRAM 还没满到要驱逐的程度（内存紧张时 master 不批——提回来也马上被逐）+ 盘副本属主引擎在线
+  - 前提：`promotion_on_hit` 开启 + DRAM 还没满到要驱逐的程度（内存紧张时 master 不批——提回来也马上被逐）+ 盘副本所在引擎在线
   - 触发必须用 `GetReplicaList`——`ExistKey` 触发不了（只授 lease、不计命中次数，`master_service.cpp:752-770` @0.3.11）；触发顺带授 lease（F11b 的副作用在此是正作用：提回期间防逐）
 - **kvcm 主动路径二：读删写（重，确定性自搬）**——读盘副本数据 → `Remove` → `PutStart` 新建 DRAM 副本 → 写数据 → `PutEnd` → 校验
   - 为什么不能更省事：`PutStart` 对已存在 key 报 `OBJECT_ALREADY_EXISTS`（@0.3.11）；`UpsertStart` 对已有 key 是原位更新（Case B 复用现有 buffer 地址，`:1693` @0.3.11；main 注释同一行为——同 size 复用现有 buffer）——只剩盘副本时原位写的是盘 buffer，提不回 DRAM。所以必须 Remove 后重 put（Upsert 否决结论两版本成立）
-  - 属主问题同 §2 读删写（PutStart 传谁 UUID 谁是属主）；数据过 kvcm 本地（带宽）
+  - client_id 问题同 §2 读删写（PutStart 传谁 UUID client_id 就是谁）；数据过 kvcm 本地（带宽）
   - 对比触发路径：不等计数、不管 DRAM 紧不紧张，**确定性**——「必须提回」的场景用它
-- **池的主动 RPC 链（`PromotionAllocStart` → 搬运 → `NotifyPromotionSuccess`，`master_service.h:559-590` @0.3.11）kvcm 用不了**——必须先有 master 准入的在途任务（只由命中驱动产生）、只许盘副本属主 client 执行。这只是池通道的内部机制说明，不妨碍上面两条 kvcm 路径成立
+- **池的主动 RPC 链（`PromotionAllocStart` → 搬运 → `NotifyPromotionSuccess`，`master_service.h:559-590` @0.3.11）kvcm 用不了**——必须先有 master 准入的在途任务（只由命中驱动产生）、只许盘副本登记 client 执行。这只是池通道的内部机制说明，不妨碍上面两条 kvcm 路径成立
 
-### 副本归属与引擎下线
+### 副本所在 client 与引擎下线
 
-- disk 副本的登记者 = 写盘的 client——写穿/写回两种模式下都是**引擎自己**（master 把 offload 任务派给源副本所在 seg 的属主 client）
+- disk 副本的登记者 = 写盘的 client——写穿/写回两种模式下都是**引擎自己**（master 把 offload 任务派给源副本 seg 所在 client）
 - 引擎进程死亡（心跳超时）后的连锁清理：master 的例行扫描发现「这个 client 心跳断了」→ 摘掉它名下的盘登记 → 它登记在盘上的副本一并清除（`CleanupStaleHandles` @0.3.11；main 由 client 过期分支做同样的事，引擎也可死前主动 `UnmountLocalDiskSegment` 摘登记）
 - 所以 **0.3.11 下「引擎下线后盘副本继续存活」没有池机制**（main 有：retained client / DFS 副本，F13）——这是 retain 要解决的问题，见 §4
 
 ## §4 retain / release
 
-### retain（属主下线后副本存续）：机制定型
+### retain（key 的 client_id 下线后副本存续）：机制定型
 
-- **目标**：写入引擎（属主）下线后，它写的 KV 副本仍可用
-- **副本生死的绑定关系**（代码口径；与实测的不一致见 F6b）
-  - 内存副本绑 seg：seg 属主死 → seg 失效 → 副本清
+- **目标**：写入引擎（= key 的 client_id）下线后，它写的 KV 副本仍可用
+- **副本生死的绑定关系**（E5 已闭环，机制与实测互证见 F6b）
+  - 内存副本绑 seg：seg 所在 client 死 → seg 失效 → 副本清
   - disk 副本绑「写盘的 client」：该 client 死 → 副本清（§3）
-  - **DFS 副本不绑任何 client 生死**（main，F13）——清理谓词不覆盖它，释放只走 key 级删除
+  - **DFS 副本不绑任何 client 生死**（main，F13）——清理条件不覆盖它，释放只走 key 级删除
   - copy 到他机的副本绑他机 seg（F7）——源引擎下线不影响它
-- **正式路径 = main 的池机制，两条并列**（0.3.11 都没有，升级获得；均不依赖 E5 口径）
+- **正式路径 = main 的池机制，两条并列**（0.3.11 都没有，升级获得；与副本所在 client 清理正交，直接生效）
   - **retained client**：client 以「保留」身份注册后，即使断线，master 也不立刻清它的数据，留时间让它重连接管——类似「停机保号」
     - 入口：`AddReplicaForRetainedClient`（`master_service.cpp:5400` @main）
     - 注册侧在 client 库：`BufferRegistrationAction::kRetained`（`dummy_client.h:260` @main）——引擎与 kvcm 链接同一 client 库，**kvcm 同样能以保留身份注册**
     - 前提：引擎以此身份运行
   - **DFS 副本**：demote 的目标层选共享 3FS 而非本机 SSD——副本天然跨 client 存亡存活（F13）。前提：部署 3FS
   - 两条不互斥：retained client 解「引擎进程下线」，DFS 解「整机/整实例灭失 + 跨机可读」
-- **0.3.11 过渡期手段**（正式形态是上面的池机制）
+- **0.3.11 过渡期手段**（正式形态是上面的池机制；E5 已定：**主路径 = move 到活 seg**，加强项 = kvcm 自挂 SSD）
   - **先说清 demote 在 0.3.11 解不了 retain**：盘副本绑登记它的 client，而 client 库活在引擎进程内——引擎进程死 = client 死 = 盘副本清（§3）。demote 落的是引擎自己的盘，引擎一死照样带走
-  - **改属主 / move**：有效性依赖 E5 口径（F6b）——E5 证实「按 key 属主删」则改属主有效；证实「按 seg 清理」则 move 到活 seg 有效
-  - **kvcm 自己挂 SSD（0.3.11 下唯一不依赖 E5 的兜底）**：kvcm 以独立 client 身份挂本机盘（`MountLocalDiskSegment`，与引擎同样的挂法），把关键 KV 落一份到自己名下、`NotifyOffloadSuccess` 上报登记（F1）
+  - **move 到活 seg（E5 证实有效）**：清理按 seg 维度走（F6b）——把副本迁到长寿 seg（kvcm 机、或确定后死的实例），源引擎下线带不走它。**改 client_id 对 retain 无效**：改的是鉴权字段，副本还绑在原 seg 上，引擎死照清（F6b）；改 client_id 的用途在权限与 pin（§2），不在副本存亡
+  - **kvcm 自己挂 SSD（0.3.11 下不依赖任何引擎存活的兜底）**：kvcm 以独立 client 身份挂本机盘（`MountLocalDiskSegment`，与引擎同样的挂法），把关键 KV 落一份到自己名下、`NotifyOffloadSuccess` 上报登记（F1）
     - 效果：盘副本绑 kvcm 而非引擎，引擎全灭仍存活；也是远期「资源用满」的形态（§3 存储形态）
     - 代价：kvcm 机器要带盘、kvcm 自身变有状态
     - **main 下此方案再强化**：kvcm 以 retained client 身份注册（client 库 `kRetained`，上条）——连 kvcm 自己死亡，名下盘副本也保留，等新 kvcm 接管
     - 挂盘另一形态：`MountNoFSegment`（两版本同有）挂 NVMe-oF 远端盘——盘在远端阵列、不绑 kvcm 机器，比挂本地盘更接近「kvcm 死也保留」
     - 排除项：`ReMountSegment` 是 client 重连后重新申报 seg（幂等），不是死掉副本的复活——retain 走不了这条
-  - 或接受现状：「引擎下线 = 池内数据失效」，预热投入重来——由 E5 判定口径后评估是否可接受
+  - 或接受现状：副本全在死引擎 seg 上的 key 整 key 消失，预热投入重来——已预热到他机的 key 不受影响（F6b），损失面只限这一部分
 - **计划下线的编排**（控制面主导，四步）
   1. **Router 摘流**：该实例不再接新请求，在途请求跑完
   2. **kvcm 迁 KV**：这台 seg 上的预热副本 copy/move 到他机，或 demote 落盘
@@ -887,7 +980,7 @@ sequenceDiagram
   4. **缩容停引擎**
   - `CreateDrainJob`（两版本同有，F7）：master 后台 job 把指定 seg 上的副本逐个迁到别的 seg（带并发上限默认 4），排空后 seg 置 DRAINED 安全下线——可替代第 2 步的手动搬迁，且 job 级可取消（`CancelDrainJob`），比裸 copy/move 多一层控制
 - **长期未命中副本**：demote 到 SSD（§3）；何时降、降哪些归策略层编排
-- 与 D3 的边界：副本生命周期（TTL / READY 语义）归 D3；本节只定「属主下线」场景的机制组合
+- 与 D3 的边界：副本生命周期（TTL / READY 语义）归 D3；本节只定「key 的 client_id 下线」场景的机制组合
 
 ### release（主动释放）：定型
 
@@ -899,9 +992,9 @@ sequenceDiagram
     - 有用的前提：key 带结构化前缀（P1 要求命名空间含 model_id/revision，如 `qwen3:v2:dc9fdff8…`）——此时 `qwen3:v2:.*` 一条删掉整个模型版本
     - 多模型安全性：池是多模型共享的，命名空间前缀就是隔离边界——kvcm 台账登记每把 key 的 (model_id, revision)，发 Remove 系操作前按台账校验目标 key 的模型归属，防跨模型误删；main 可进一步把模型映射为 tenant，获得 RPC 命名空间 + 配额 + 驱逐三重隔离（F13）
   - `RemoveAll()`：全池清空（运维重置）——main 改为异步：master 置标志、各 client 轮询 `PollRemoveAll` 自清 SSD（F13），完成时机以台账比对为准
-  - `BatchReplicaClear(keys, client_id, seg)`：清指定 client 指定 seg 上的副本——限 key 属主自调（F6②），引擎下线前自清理用；kvcm 调不动别人的 key
+  - `BatchReplicaClear(keys, client_id, seg)`：定点清副本——限 key 的 client_id 自调，另有 lease 未过期 skip、PROCESSING 免清两道门槛，seg 传空 = 删整 key（机制全图见 F6②）；引擎下线前自清理用；kvcm 调不动别人的 key
   - `EvictDiskReplica` / `BatchEvictDiskReplica`（两版本同有，F13③）：client 盘副本被逐后的**上报**通道。对 kvcm 有用的地方有两处：
-    - `LOCAL_DISK` 限属主——kvcm 自挂 SSD 后是自己盘副本的属主，可主动清（自挂形态的收尾工具）
+    - `LOCAL_DISK` 限登记 client 本人——kvcm 自挂 SSD 后是自己盘副本的登记 client，可主动清（自挂形态的收尾工具）
     - `DISK`（DFS 副本）不验 client_id——能清 DFS 副本；但语义是「驱逐上报」不是主动删除，误用它清副本是把「上报」当「命令」用，release 正式路径仍走 Remove 系
   - 公共参数 `force`：Remove 默认有两道保险——① lease 未过期拒删（最近有人读过，可能还在用）② copy/offload 任务在途拒删（传输中删除会破坏数据）；`force=true` 跳过保险强删
     - 仅「确认没人用」（D1 §6 例外级，如全局废弃前缀）才用 force
