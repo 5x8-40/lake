@@ -138,7 +138,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   1. **写中止权限**：`PutRevoke` / `UpsertRevoke` 校验client_id（`:1364` / `:1482` @0.3.11，F5）
   2. **副本清理权限**：`BatchReplicaClear` 校验请求者 client_id == key 的 client_id（`:937` @0.3.11）——kvcm 的 UUID 对不上，调不动
   3. **upsert 改写**：「谁最后写 client_id 是谁」（F3①）
-  - **不管**：copy / move / get / exist——复制与读取路径完全不读client_id 字段（F7 代码核实）；且 copy 的副本登记走独立 RPC 对 `CopyStart`/`CopyEnd`（不经 Put/Upsert），全程不碰 `client_id`——**copy 后 key 的 client_id 不变**，仍是最后写入的引擎（`master_service.cpp:1849` @0.3.11）；**move 同样不改 client_id**——`MoveStart`（`:2069`）/ `MoveEnd`（`:2160`）/ `CreateMoveTask`（`:5832` @0.3.11）全程不写 `metadata.client_id`，main 版 `MoveStart` 函数体 `client_id =` 赋值 0 处。注意 `MoveEnd` 的 `ILLEGAL_CLIENT` 校验是任务执行者校验（谁 Start 谁 End），不是client_id 校验
+  - **不管**：copy / move / get / exist——复制与读取路径完全不读 client_id 字段（F7 代码核实）；且 copy 的副本登记走独立 RPC 对 `CopyStart`/`CopyEnd`（不经 Put/Upsert），全程不碰 `client_id`——**copy 后 key 的 client_id 不变**，仍是最后写入的引擎（`master_service.cpp:1849` @0.3.11）；**move 同样不改 client_id**——`MoveStart`（`:2069`）/ `MoveEnd`（`:2160`）/ `CreateMoveTask`（`:5832` @0.3.11）全程不写 `metadata.client_id`，main 版 `MoveStart` 函数体 `client_id =` 赋值 0 处。注意 `MoveEnd` 的 `ILLEGAL_CLIENT` 校验是任务执行者校验（谁 Start 谁 End），不是 client_id 校验
 - **清理路径全图**（「清理 API 能不能清到某副本」的完整答案）
   1. **整 key 删**：`Remove` / `BatchRemove` / `RemoveByRegex` / `RemoveAll`——key 元数据连同全部副本一起删（不管副本在哪个 seg）；**不鉴权**，kvcm 可用（§4 release）
   2. **定点清副本**：`BatchReplicaClear(keys, client_id, seg)`（`:913-1010` @0.3.11）——key 的 client_id 所在 client 传自己的 UUID + 任意 seg 名，清自己 key 在该 seg 上的副本；校验「key 的 client_id == 参数 client_id」，kvcm 传自己 UUID 过不了 → kvcm 做不了「只清 A seg 副本、留着 B seg」的定点手术。**不区分副本来源**：put/copy/move 产物同一把 `replicas_` 列表，都在管辖内——写入引擎随时能清掉 kvcm 预热到别机的副本。三道门槛：lease 未过期 → skip（与 Remove 的保险同向）；PROCESSING 副本免清（指定 seg 时不匹配；seg 传空时要求全部 COMPLETE 才动手，防打断在途写）——在途 copy/move 的半成品它碰不了（归 reaper，D5）；seg 传空时不是清副本、是 `Erase()` 删整 key——「client_id 限定 + 带 lease 检查版的 Remove」
@@ -680,7 +680,7 @@ sequenceDiagram
 - 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 反复调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本所在引擎在线
 - `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本所在引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
 
-**⑦ retain（key 的 client_id 下线后副本存续；六方案时序：绿 = main 正式路径两条、橙 = 0.3.11 过渡三手段、灰 = 接受现状，§4）**
+**⑦ retain（key 的 client_id 下线后副本存续；五方案时序：绿 = main 正式路径两条、橙 = 0.3.11 过渡两手段、灰 = 接受现状，§4）**
 
 ```mermaid
 sequenceDiagram
@@ -708,21 +708,14 @@ sequenceDiagram
     end
 
     rect rgb(255, 235, 214)
-    Note over E,DFS: 过渡①（0.3.11）：改 client_id——E5 已证伪此路：清理走副本所在 client，改 client_id 救不了 seg 上的副本
-    K->>M: 空写 upsert 传 kvcm UUID（client_id 改归 kvcm，F3①）
-    E--xM: 引擎死
-    Note over M: key 的 client_id = kvcm（活着），但副本还绑在死 seg 上 → 照清（F6b）
-    end
-
-    rect rgb(255, 235, 214)
-    Note over E,DFS: 过渡②（0.3.11）：move 到活 seg——E5 证实有效（清理按 seg 维度）
+    Note over E,DFS: 过渡①（0.3.11）：move 到活 seg——E5 证实有效（清理按 seg 维度）
     K->>M: CreateMoveTask（副本迁到他机活 seg）
     E--xM: 源引擎死
     Note over M: 副本绑活 seg（F7）→ 存活
     end
 
     rect rgb(255, 235, 214)
-    Note over E,DFS: 过渡③（0.3.11）：kvcm 自挂 SSD——不依赖任何引擎存活的兜底
+    Note over E,DFS: 过渡②（0.3.11）：kvcm 自挂 SSD——不依赖任何引擎存活的兜底
     K->>E: 读关键 KV
     E-->>K: 数据
     K->>KS: 写 kvcm 本机盘
@@ -736,7 +729,7 @@ sequenceDiagram
     end
 ```
 
-- 先说清 demote 在 0.3.11 解不了 retain：盘副本绑登记它的引擎 client，引擎死照样清（§3）——所以过渡手段里没有 demote
+- 先说清 demote 在 0.3.11 解不了 retain：盘副本绑登记它的引擎 client，引擎死照样清（§3）——所以过渡手段里没有 demote；改 client_id 同样不在——改的是鉴权字段，副本还绑在原 seg 上，引擎死照清（§4）
 
 **⑧ remove（release 四级时序：绿 = 软释放、蓝 = 主动 Remove、灰 = 全池清；决策归 D1 §6，§4）**
 
