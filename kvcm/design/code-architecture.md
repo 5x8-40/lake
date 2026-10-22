@@ -2,7 +2,7 @@
 
 - 定位：kvcm 服务化（E10 重构 / E11 进程化 / E15 并行限速）的模块分层设计，E10 开工依据
 - 本文**不新增机制结论**——操作语义、完成信号、幂等性、能力事实全部引自 [D1-router-scheduling.md](D1-router-scheduling.md) / [D2-kv-operations.md](D2-kv-operations.md)；本文只把它们落成代码结构
-- 语言：Python（继承现有 `precopy/` 1577 行与 mooncake store_py 绑定、keys.py 与引擎同口径；换语言属独立决策，不在本文）
+- 语言：Python（继承现有 `demo/precopy/` 1577 行与 mooncake store_py 绑定、keys.py 与引擎同口径；换语言属独立决策，不在本文）
 
 ## 分层总览
 
@@ -81,9 +81,9 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 | 子件 | 职责 | 现有代码来源 |
 |------|------|-------------|
-| StoreClient | master RPC 封装（copy/move/exist/GetReplicaList/Remove/upsert…）+ client UUID 持久化（sqlite，D2 §2 方案一） | `precopy/common.py` + `precopy/precopy.py` 的 RPC 调用段 |
-| KeyComputer | 前缀 → hash 链 → PoolKey（与引擎同口径） | `precopy/keys.py` |
-| Topology | rank↔seg、seg→实例映射 | `precopy/resolve.py` 降为适配器（生产权威源 = L1 InstanceWatcher 注册，D1 §3/E13） |
+| StoreClient | master RPC 封装（copy/move/exist/GetReplicaList/Remove/upsert…）+ client UUID 持久化（sqlite，D2 §2 方案一） | `demo/precopy/common.py` + `demo/precopy/precopy.py` 的 RPC 调用段 |
+| KeyComputer | 前缀 → hash 链 → PoolKey（与引擎同口径） | `demo/precopy/keys.py` |
+| Topology | rank↔seg、seg→实例映射 | `demo/precopy/resolve.py` 降为适配器（生产权威源 = L1 InstanceWatcher 注册，D1 §3/E13） |
 
 - **key 格式与拓扑必须归本层**：PoolKey 格式、seg 概念、client_id/lease 语义全是 mooncake 特有——留在通用层则抽象漏
 - **第二后端候选已登记在案**：昇腾 MemCache（`3rdparty/memcache`；kv-prefetch.md 待定项「生产默认走 MemCache，还是留 Mooncake」）——L3 抽象现在建正是时候；但只建一层接口，第二后端真接入时再修接口，不为假想后端过度设计
@@ -104,13 +104,13 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 - **E10（重构）三步**
   1. 定义 L3 原子操作抽象基类 + capability 声明（把 D2 §1 八项落成接口）
-  2. 现有 1577 行重组为 MooncakeBackend（L4）+ Ledger（L5）——测试现成（`tools/test_keys.py` / `tools/test_resolve.py`）
+  2. 现有 1577 行重组为 MooncakeBackend（L4）+ Ledger（L5）——测试现成（`demo/tools/test_keys.py` / `demo/tools/test_resolve.py`）
   3. `precopy.py` 编排逻辑改写为 L2 PrefetchFlow（只调 L3）；L1/L2 其余模块出空骨架（类与接口先行）
 - **E11（进程化）**：进程壳 + TaskEngine + Keepalive/Release/Retain 三个 Loop 常驻化；IntentReceiver / InstanceWatcher 占位接口随 E12/E13 填
 - **E15（并行限速）**：TaskEngine 内的并发调度 + 限速器（链路利用率采样，D1 §5）——不独立做
 
 ## 参考实现
 
-- **UCM 可插拔 KVStore**（[`../docs/research/ucm/architecture.md`](../docs/research/ucm/architecture.md)）与 **LMCache 多存储后端**（[`../docs/research/lmcache/sharing-and-backends.md`](../docs/research/lmcache/sharing-and-backends.md)）：后端抽象同构。关键差异：它们的抽象在**数据面**（connector get/put），本架构 L3 在**管理面**（copy/pin/lease/remove 控制操作）——管理语义无跨后端天然对应物，故 capability 必须显式
+- **UCM 可插拔 KVStore**（[`../docs/research/ucm/architecture.md`](../../docs/research/ucm/architecture.md)）与 **LMCache 多存储后端**（[`../docs/research/lmcache/sharing-and-backends.md`](../../docs/research/lmcache/sharing-and-backends.md)）：后端抽象同构。关键差异：它们的抽象在**数据面**（connector get/put），本架构 L3 在**管理面**（copy/pin/lease/remove 控制操作）——管理语义无跨后端天然对应物，故 capability 必须显式
 - **LMCache controller**（D2 §1 完备性审计同表）：控制面对外 = 命令集——L1 IntentReceiver 对应其命令入口
 - **Dynamo standalone indexer**（`3rdparty/dynamo/lib/kv-router/src/services/indexer/`）：独立进程 + 契约接口的组件形态参照；本架构是 kvcm 单进程内部结构，组件拓扑已定（kvcm 独立控制面、索引归 Router 侧，D1 §4）

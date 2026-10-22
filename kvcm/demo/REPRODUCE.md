@@ -1,5 +1,7 @@
 # KVCM 复现参考（客户版）
 
+> **demo 记录**：precopy 预热验证（kvcm 八项操作中仅 **copy** 一项）的复现参考。**本文命令的工作目录均为 `kvcm/demo/`**。生产化设计见 [../design/D1-router-scheduling.md](../design/D1-router-scheduling.md) / [../design/D2-kv-operations.md](../design/D2-kv-operations.md)。
+
 在 **vllm-ascend** 上做 Mooncake KV **预复制（pre-copy）**：真实请求打到目标实例之前，用 Mooncake `create_copy_task` 把已有前缀 KV 复制到该实例的本机 DRAM segment，使读路径 local-first、避免跨机拉 KV。
 
 本文是**复现参考**：只保留已跑通的结论、必配项与必须注意的 bug/陷阱。完整设计说明见 [README.md](README.md)，实验史与踩坑记录见 [EXPERIMENTS.md](EXPERIMENTS.md)。

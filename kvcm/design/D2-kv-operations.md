@@ -146,7 +146,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 - **F6b 级联清理 = 副本所在 client 维度（E5 已闭环）**
   - **结论**（代码核实，0.3.11.post1）：client 过期处理（`master_service.cpp:4930-5015` @0.3.11）= unmount 该 client 全部 seg + `ClearInvalidHandles` 全量扫——清理是**副本级**的（`CleanupStaleHandles :2530`，清一个副本的条件 = `has_invalid_mem_handle() || has_stale_local_disk_client`，即「它的 seg 失效」或「它登记的盘 client 已死」）：内存副本随死 seg 清、disk 副本随死登记 client 清。活 seg 上其他 client 的副本**不动、继续可读**；全库无「按 key 的 client_id 删」路径。真下线风险只剩「副本全在死 client seg 上的 key」整 key 消失
   - **main 侧印证**：main 把副本所在 client 显式化为 `Replica::isAffiliatedWith`（`replica.h:553` @main）——内存副本比 buffer 所在 client、盘副本比登记 client、DFS 副本恒 false（不在任何 client）；client 下线清理（`ProcessClientOffboardingJob`，`:2976` @main）的清理条件只看副本所在 client 这个维度，同样不看 key 的 client_id——「清理走副本所在 client」两版本同
-  - **实验闭环**（10-20 受控复验，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15 / 踩坑 3）：kill 写入者 A 全进程树 → client TTL 过期 → master unmount A 两 seg（日志零驱逐零 remove）→ `batch_is_exist` 仍 32/32、副本全在 B 四个 seg → 裸 client 跨机 `get` 3/3 字节级读回。早期「key 连同全部副本消失、exist 0/32」的观测是 key 名漂移假失败（控制面未带 `PYTHONHASHSEED`，踩坑 1），不是级联删除
+  - **实验闭环**（10-20 受控复验，[EXPERIMENTS.md](../demo/EXPERIMENTS.md) 总表 #15 / 踩坑 3）：kill 写入者 A 全进程树 → client TTL 过期 → master unmount A 两 seg（日志零驱逐零 remove）→ `batch_is_exist` 仍 32/32、副本全在 B 四个 seg → 裸 client 跨机 `get` 3/3 字节级读回。早期「key 连同全部副本消失、exist 0/32」的观测是 key 名漂移假失败（控制面未带 `PYTHONHASHSEED`，踩坑 1），不是级联删除
   - **设计含义**：retain 不需要为「key 的 client_id 下线」兜底——远端副本本就保留，retain 的对手只剩 lease 过期→驱逐（§4）；move 的 retain 价值在「把副本挪到活得久的 seg 上」——副本所在 client 随 move 转移（`MoveStart` 在目标 seg 分新 buffer、`MoveEnd` 删源副本，main `:7010` / `:7196` 起），挪完即脱离将死 seg
 
 ### copy / move 机制
@@ -199,7 +199,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - master 的 RPC 没有「key → client_id」查询
     - `GetReplicaList` 返回副本描述符（副本的位置信息），内存副本的只有 seg 名和地址，不含 client_id（`replica.h:240`）
     - master 内部有现成的「seg 名 → client UUID」查询 `GetClientIdBySegmentName`（CreateCopyTask 自己就在用），但没暴露成 RPC
-  - kvcm 与引擎之间**没有直接通道**：kvcm 的视野来自 master 的 segment 信息（seg 名 = `IP:rpc_port`，见 [README.md](README.md)）；「端点 → 实例」的注册方向是 kvcm 注册给索引（summary D4/E13），不是引擎注册给 kvcm
+  - kvcm 与引擎之间**没有直接通道**：kvcm 的视野来自 master 的 segment 信息（seg 名 = `IP:rpc_port`，见 [README.md](../demo/README.md)）；「端点 → 实例」的注册方向是 kvcm 注册给索引（summary D4/E13），不是引擎注册给 kvcm
 - **F11b 核验通道的版本分工**（main 新增 `GetReplicaListForAdmin` / `BatchGetReplicaListForAdmin`，`master_service.h:424` @main）
   - 与 `GetReplicaList` 返回相同内容，但**零副作用**：不授 lease、不触发 promote、不污染命中统计——正是 kvcm 核验/比对想要的语义（`GetReplicaList` 的授 lease 副作用对核验是污染、对续租才是目的）
   - 分工：续租用 `ExistKey`（F9，要的就是续租）；副本状态核验在 main 用 admin 查询，0.3.11 只能用 `GetReplicaList` 连带副作用
@@ -899,7 +899,7 @@ sequenceDiagram
   - **写回（write-back）**：先只写 DRAM，驱逐时才落 SSD——mooncake `offload_on_evict=true`
   - 对照：HiCache 的 `write_through` / `write_back` 策略（`hiradix_cache.py`，write_back 走 `_evict_write_back` 驱逐时回写）——同名同义
 - FlexKV 是 inclusive 分层（put 先写 CPU 层、再补 SSD 层未命中块）；demote/promote 是存储分层的标准术语对（tiering：冷数据下沉、热数据上浮）
-- 各产品降层对照（详见 [../docs/research/hbm-tier-and-offload.md](../docs/research/hbm-tier-and-offload.md)）
+- 各产品降层对照（详见 [../docs/research/hbm-tier-and-offload.md](../../docs/research/hbm-tier-and-offload.md)）
 
 | 产品 | 触发 | 搬运者 | 引擎死后副本 |
 |---|---|---|---|

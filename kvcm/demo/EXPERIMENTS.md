@@ -1,5 +1,7 @@
 # va-precopy 实验总表与踩坑记录
 
+> **demo 记录**：precopy 预热验证（kvcm 八项操作中仅 **copy** 一项）的实验史。生产化设计见 [../design/](../design/)；kvcm 全貌见 [../README.md](../README.md)。
+
 2026-10-08 ~ 10-12 全量实验史（含已撤回证据），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。
 
 模型除注明外均为 `/data/models/Qwen3-VL-8B-w8a8c16`（GQA 8 KV head，block_size 128，`PYTHONHASHSEED=0`）；主机 245=7.242.105.245，217=7.242.105.217；容器镜像 `quay.io/ascend/vllm-ascend:v0.26.0rc1`；mooncake wheel `mooncake_transfer_engine_npu-0.3.11.post1`（除注明外）；master 在 245 宿主机 `:50088`。

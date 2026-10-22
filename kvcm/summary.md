@@ -2,7 +2,9 @@
 
 来源：[issue #54](https://github.com/5x8-40/lake/issues/54)（KV-CM 遗留问题总清单）。本文是 kvcm 预复制生产化的总结文档：设计决策、潜在问题、工程项三类条目的总登记处——已闭环条目在原地标 ✅、结论指向正式文档，待定条目随讨论与实验更新。
 
-编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环后在原位置标 ✅，结论落对应正式文档（D 系文档 / `kv-prefetch.md` / README）。
+文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（仅验证 copy 一项的端到端链路）；本文 = 登记处。
+
+编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环后在原位置标 ✅，结论落对应正式文档（`design/` 系设计文档 / `demo/` 系 demo 文档）。
 
 依赖主线：D1（已闭环）/ D2 是设计主线（E5 已闭环，结论见本文 E 节）；E10→E11→E12/E13/E14 是服务化主线（重构先行、协议随后）；P1-P8 大多随 D1/D2 定型一并回答。
 
@@ -12,7 +14,7 @@
 
 **D1. Router 集成与请求调度** — ✅ 已闭环
 
-最终形态：router 决策请求发哪个实例 → precopy 预热该实例 → 并决定哪些 KV 释放。工作文档：[D1-router-scheduling.md](D1-router-scheduling.md)（事实基线 F1-F15 已核实，含复制幂等性与 lease 语义；六问全闭环，「待定问题」已转「设计决策」）。
+最终形态：router 决策请求发哪个实例 → precopy 预热该实例 → 并决定哪些 KV 释放。工作文档：[D1-router-scheduling.md](design/D1-router-scheduling.md)（事实基线 F1-F15 已核实，含复制幂等性与 lease 语义；六问全闭环，「待定问题」已转「设计决策」）。
 
 六个问题（全部闭环，结论写在 D1 对应小节）：
 
@@ -68,9 +70,9 @@
 
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
-- 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
+- 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐——🟡 候选已列出，结论写在 [D2-kv-operations.md](D2-kv-operations.md) §2
+- pin：READY 后防驱逐——🟡 候选已列出，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
   - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert 一个方案：
     - 好处：不动全局 lease、断线窗口 30 分钟级
     - 代价：空写通道（Python 绑定没有分离接口）+ client_id 问题
@@ -84,7 +86,7 @@
     - 借原 client_id UUID：语义不变；需 master 加「key → client_id」查询 RPC（内部数据现成）
     - 决策条件：mooncake 能不能改（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）
-- retain：🟡 机制已定，结论写在 [D2-kv-operations.md](D2-kv-operations.md) §4
+- retain：🟡 机制已定，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
   - 正式路径 = main 的两条池机制并列：
     - retained client：断线后数据保留、等重连接管（`AddReplicaForRetainedClient` + client 库 `BufferRegistrationAction::kRetained` 注册）——应对引擎进程下线；kvcm 用同一个库也能注册
     - DFS 副本：写共享 3FS，不随 client 死被清——应对整机灭失；前提是部署 3FS
@@ -92,7 +94,7 @@
   - 0.3.11 的过渡办法（E5 已闭环）：move 到活 seg 有效；改 client_id 对副本存亡无效（只动鉴权字段）；kvcm 自挂 SSD 兜底（不依赖任何引擎存活；main 下 kvcm 以 retained 身份注册，则 kvcm 自己死了数据也保留）
   - 计划下线：`GracefulUnmountSegment`（0.3.11）/ `CreateDrainJob`（两版本都有，job 级可取消）
   - 长期未命中 → demote 到 SSD，由策略层定
-- demote / promote：🟡 设计完成，结论写在 [D2-kv-operations.md](D2-kv-operations.md) §3
+- demote / promote：🟡 设计完成，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
   - 框架：语义是原子的，实现是组合动作（池通道或 kvcm 读写组合 + 核验）；存储统一归 mooncake（引擎实例挂本机 SSD 做分层，kvcm 自己不持存储）
   - demote = 池开 `enable_offload`：
     - 写穿 / 写回两模式（≈ HiCache write_through / write_back）
@@ -107,14 +109,14 @@
   - 真正的功能缺口：写回模式下确定性的 demote——没有 per-key 降层 RPC，`BatchReplicaClear` 又限 key 的 client_id，offload 取消也不对外 → 需要池侧扩展
   - 远期：kvcm 自己挂 SSD + `NotifyOffloadSuccess` 上报登记（`AddReplica` 不是独立 RPC，是它的内部步骤）
   - 每个操作都有完成信号；READY 特指 DRAM 副本写好、可以调度
-- release：✅ 已闭环，结论写在 [D2-kv-operations.md](D2-kv-operations.md) §4
+- release：✅ 已闭环，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
   - 决策归属 D1 §6
   - kvcm 可用：`Remove` / `BatchRemove` / `RemoveByRegex`（要配 key 命名空间才有意义）/ `RemoveAll`
   - `BatchReplicaClear` 限 key 的 client_id 自己调——kvcm 动不了别人的 key
   - `EvictDiskReplica`（两版本）是通知型：`LOCAL_DISK` 限登记 client（kvcm 自挂 SSD 后可用来收尾）、`DISK` 不验 client_id（误用风险已登记，不作正式路径）
   - `force` 仅限「确认没人用」
   - 收尾 = 清台账 + 同步索引
-- 机制查缺补漏：✅ 已闭环（结论写在 [D2-kv-operations.md](D2-kv-operations.md) F13⑤/③、§1 对照表、§3 远期方案、§4 retain/release）
+- 机制查缺补漏：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) F13⑤/③、§1 对照表、§3 远期方案、§4 retain/release）
   - 做法：八项操作逐项过一遍「还能利用什么池机制」+ 三版本 RPC 注册表全量 diff（v0.3.11 与 v0.3.11.post1 完全相同）
   - 机制结论：
     - 动态副本（main）：kvcm 能触发、不能指定目标（反复调 `GetReplicaList` 观测，和 promote 同一种做法，观测在同一个函数里）——只适合池级自动调节，满足不了预热语义
@@ -139,7 +141,7 @@
 
 - 事实：
   - 副本没有 pin，READY 后池仍可驱逐
-  - 任一 client 下线后，master 只清它 seg 上的副本（含其登记的盘副本）；他机副本保留、继续可读——副本存亡绑 seg 所在 client，不绑写入者（E5 已闭环：10-20 复验 32/32 + 字节级读回，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15）——D1 F5
+  - 任一 client 下线后，master 只清它 seg 上的副本（含其登记的盘副本）；他机副本保留、继续可读——副本存亡绑 seg 所在 client，不绑写入者（E5 已闭环：10-20 复验 32/32 + 字节级读回，[EXPERIMENTS.md](demo/EXPERIMENTS.md) 总表 #15）——D1 F5
   - lease 是 key 粒度：读会续租、`CopyStart` 不续租、TTL 到期或驱逐时删整个 key、释放全部副本——D1 F15
 - READY 语义：✅ 已定型（D2 §1 完成信号，八项逐一点名）
   - 什么是 READY：目标实例的 DRAM 副本写好、kvcm 核验通过后，上报 Router「可以把请求调度过来」
@@ -213,7 +215,7 @@
 
 **D7. 方案 A 去留**
 
-- 待定：壳请求（方案 A 的预取请求：`max_tokens=1`、不真正生成、只为把 KV 带进 HBM，定义见 [kv-prefetch.md](kv-prefetch.md)）这条路是否保留、与 B2 的叠加顺序。
+- 待定：壳请求（方案 A 的预取请求：`max_tokens=1`、不真正生成、只为把 KV 带进 HBM，定义见 [kv-prefetch.md](design/kv-prefetch.md)）这条路是否保留、与 B2 的叠加顺序。
 
 ## 二、潜在问题
 
@@ -225,17 +227,17 @@
 - **P6. 鉴权边界**——现状能连 master 就能 `create_copy_task`/`Remove`。生产需要接入控制；控制面权限应大于引擎（引擎只需读写自己 seg）。
 - **P7. 预热成本核算**——预热后请求没来或去了别实例的浪费；READY 延迟（带宽×块数）vs 请求到达时间的窗口预测。与 D1 §4/§5 耦合（已闭环，口径见 D1）。
 - **P8. 指标归因**——命中率要拆「预热贡献 vs 引擎内部 HBM cache」：测试床已遇到第二次命中被引擎内部 cache 吃掉（外部 get=0），生产监控同样会混淆。
-- **P9. prefetch 终止**——请求改道/源消失时在途 copy 白白占用带宽。对照 HiCache `can_terminate_prefetch` 三策略；mooncake 0.3.11 只有 `CancelDrainJob`，copy/move 无取消 RPC——补法：池侧扩展（改 mooncake）或 kvcm 弱版（弃置 + 事后清副本）。来源：D2 操作集完备性审计（[D2-kv-operations.md](D2-kv-operations.md) §1）。
+- **P9. prefetch 终止**——请求改道/源消失时在途 copy 白白占用带宽。对照 HiCache `can_terminate_prefetch` 三策略；mooncake 0.3.11 只有 `CancelDrainJob`，copy/move 无取消 RPC——补法：池侧扩展（改 mooncake）或 kvcm 弱版（弃置 + 事后清副本）。来源：D2 操作集完备性审计（[D2-kv-operations.md](design/D2-kv-operations.md) §1）。
 
 ## 三、工程项
 
 ### A. 验证类（可直接开工，除注明外）
 
-- **E1. 真机冒烟**——`run_e2e.sh` 一键（同构 TP=2 + 异构双向）+ 同构跨机 rank↔seg 新路径重跑。实质路径已手工验证，单测 19 例 + dry run（不真正搬数据）覆盖，风险只剩编排层。
+- **E1. 真机冒烟**——`demo/run_e2e.sh` 一键（同构 TP=2 + 异构双向）+ 同构跨机 rank↔seg 新路径重跑。实质路径已手工验证，单测 19 例 + dry run（不真正搬数据）覆盖，风险只剩编排层。
 - **E2. key 一致性校验在容器内跑通**——`test_keys.py` 里有一个「上游漂移哨兵」用例：把 keys.py 算出的 key 与真实 vllm-ascend 的 PoolKey 逐字节比对，红了说明上游改了 key 格式。该用例要在 vllm-ascend 容器内跑（运行期 `batch_is_exist` 32/32、36/36 证据已齐）。
 - **E3. 多卡自动匹配验证**——resolve 的 `VLLM::Worker_TP<N>` proctitle 匹配在多卡真机走通（现在是 `--targets` 手工指定对应关系；匹配失效时必须明确报错，不能默不作声地配错）。
-- **E4. 单 token 不一致的根因**——输出里偶发有一个 token 与预期不同：旧非 DEBUG 实例偶发，新实例未复现；首次外部读的输出逐字一致，怀疑是不同执行路径的数值扰动。生产化前必须查清（[EXPERIMENTS.md](EXPERIMENTS.md) #10）。
-- **E5. 副本消失机制核实**——✅ 已闭环（10-20 受控复验，结论落 D1 F5 / [D2-kv-operations.md](D2-kv-operations.md) F6b）：副本存亡绑定所在 seg 所在 client（副本所在 client），key 的 client_id 下线只清其自己 seg 上的副本，远端副本保留且可读（kill A → TTL 过期 unmount → `batch_is_exist` 32/32 + 跨机字节级 get 3/3；master 日志零驱逐零 remove）。早期「key 连同全部副本消失、exist 0/32」是 key 名漂移假失败（控制面未带 `PYTHONHASHSEED`，[EXPERIMENTS.md](EXPERIMENTS.md) 踩坑 1/3、总表 #15），不是级联删除
+- **E4. 单 token 不一致的根因**——输出里偶发有一个 token 与预期不同：旧非 DEBUG 实例偶发，新实例未复现；首次外部读的输出逐字一致，怀疑是不同执行路径的数值扰动。生产化前必须查清（[EXPERIMENTS.md](demo/EXPERIMENTS.md) #10）。
+- **E5. 副本消失机制核实**——✅ 已闭环（10-20 受控复验，结论落 D1 F5 / [D2-kv-operations.md](design/D2-kv-operations.md) F6b）：副本存亡绑定所在 seg 所在 client（副本所在 client），key 的 client_id 下线只清其自己 seg 上的副本，远端副本保留且可读（kill A → TTL 过期 unmount → `batch_is_exist` 32/32 + 跨机字节级 get 3/3；master 日志零驱逐零 remove）。早期「key 连同全部副本消失、exist 0/32」是 key 名漂移假失败（控制面未带 `PYTHONHASHSEED`，[EXPERIMENTS.md](demo/EXPERIMENTS.md) 踩坑 1/3、总表 #15），不是级联删除
   - 对设计的落地：改 client_id 对副本存亡无效（只动鉴权字段）；move 到活 seg 有效；kvcm 自挂 SSD 是不依赖任何引擎存活的兜底；main 的 retained client / DFS 副本是正式路径
   - 剩余事实输入：lease TTL 11s（master 实配 `default_kv_lease_ttl=11000` 毫秒）+ 驱逐候选资格（lease 过期→驱逐首选）仍归 D3/TTL 议题
 - **E6. 0.3.11 API 子集核对**——✅ 已闭环（结论写在 D2 F13）
@@ -256,8 +258,8 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 ### B. 服务化重构（骨架可直接开工，接口依赖设计）
 
-- **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），按五层架构重组（L3 原子操作抽象屏蔽后端语义 + L4 mooncake 适配器 + L2 编排层只调 L3），明确状态归属与接口边界，为进程化打基础。**可直接开工**。设计：[code-architecture.md](code-architecture.md)
-- **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。分层与模块划分：[code-architecture.md](code-architecture.md)
+- **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），按五层架构重组（L3 原子操作抽象屏蔽后端语义 + L4 mooncake 适配器 + L2 编排层只调 L3），明确状态归属与接口边界，为进程化打基础。**可直接开工**。设计：[code-architecture.md](design/code-architecture.md)
+- **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。分层与模块划分：[code-architecture.md](design/code-architecture.md)
 - **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC 候选，与仓内跨语言 RPC 选型一致）。协议字段依赖 D4 定型；通道骨架可先行。
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例启动 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3 耦合；D5 已闭环，见本文）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
 - **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自己产生引擎格式的事件
@@ -278,7 +280,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 ### C. 性能与生产化
 
-- **E15. copy 并行与限速**——现在逐 key 串行、与在线读共享带宽；大批量预热要并行化 + 带宽控制。落点 = E11 任务状态机内的并发调度与限速器（[code-architecture.md](code-architecture.md) TaskEngine），不独立做。带宽控制的输入还包括网卡繁忙感知：用 RDMA/ethtool 计数器采样链路利用率，传输忙时预热避让/限速（参考 vLLM-Ascend AI-QoS 的流量冲突问题定义；Router 侧用同一信号打分归 D1 §5）。
+- **E15. copy 并行与限速**——现在逐 key 串行、与在线读共享带宽；大批量预热要并行化 + 带宽控制。落点 = E11 任务状态机内的并发调度与限速器（[code-architecture.md](design/code-architecture.md) TaskEngine），不独立做。带宽控制的输入还包括网卡繁忙感知：用 RDMA/ethtool 计数器采样链路利用率，传输忙时预热避让/限速（参考 vLLM-Ascend AI-QoS 的流量冲突问题定义；Router 侧用同一信号打分归 D1 §5）。
 - **E16. 生产化缺口**——EP 拓扑实测、master HA、监控指标（READY 延迟、copy 失败率、external hit；命中率归因口径与 P8 耦合）。
 
 ## 参考锚点
