@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id  TEXT NOT NULL,
     prefix_key  TEXT NOT NULL,
     instance    TEXT NOT NULL,
+    model_id    TEXT NOT NULL,
     token_ids   TEXT NOT NULL,
     bound_at    REAL NOT NULL,
     PRIMARY KEY (session_id, prefix_key)
@@ -57,6 +58,7 @@ CREATE TABLE IF NOT EXISTS sessions (
 _MIGRATIONS = (
     ("keepalive", "token_ids", "ALTER TABLE keepalive ADD COLUMN token_ids TEXT NOT NULL DEFAULT ''"),
     ("sessions", "token_ids", "ALTER TABLE sessions ADD COLUMN token_ids TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "model_id", "ALTER TABLE sessions ADD COLUMN model_id TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -237,12 +239,13 @@ class Ledger:
 
     def bind_session(self, session_id: str, prefix: Prefix, instance: str) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, prefix_key, instance, token_ids, bound_at)"
-            " VALUES (?, ?, ?, ?, ?)",
+            "INSERT OR REPLACE INTO sessions (session_id, prefix_key, instance, model_id, token_ids, bound_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
             (
                 session_id,
                 prefix_key(prefix),
                 instance,
+                prefix.model_id,
                 json.dumps(list(prefix.token_ids)),
                 time.time(),
             ),
@@ -256,16 +259,17 @@ class Ledger:
     def list_session(self, session_id: str) -> list[Prefix]:
         """会话绑定的前缀（还原为 Prefix；token_ids 持久化的必要性同
         list_keepalive——会话结束要 demote 的前缀重启后必须能展开 key）。
-        model_id 从 prefix_key（"model:digest"）解析。"""
+        model_id 用独立列（prefix_key 首个冒号切割会被含冒号的 model_id
+        截断）；老库行的空 token_ids 跳过（无法还原，唯一诚实做法）。"""
         rows = self._conn.execute(
-            "SELECT prefix_key, token_ids FROM sessions WHERE session_id = ?",
+            "SELECT model_id, token_ids FROM sessions WHERE session_id = ?",
             (session_id,),
         ).fetchall()
         return [
             Prefix(
-                model_id=pk.split(":", 1)[0],
+                model_id=model_id,
                 token_ids=tuple(json.loads(token_ids_json)),
             )
-            for pk, token_ids_json in rows
+            for model_id, token_ids_json in rows
             if token_ids_json
         ]

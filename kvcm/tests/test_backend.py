@@ -498,6 +498,24 @@ def test_ledger_status_validation() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_sessions_model_id_with_colon_roundtrip() -> None:
+    """model_id 含冒号：独立列还原，不被 prefix_key 首个冒号截断。"""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    try:
+        p = Prefix(model_id="org:team:qwen3", token_ids=(1, 2, 3))
+        with Ledger(path) as led:
+            led.bind_session("s1", p, "inst-B")
+        with Ledger(path) as led2:
+            restored = led2.list_session("s1")
+            assert restored == [p]
+            assert restored[0].model_id == "org:team:qwen3"
+    finally:
+        os.unlink(path)
+
+
 def test_ledger_replicas_and_sessions_crud() -> None:
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
         path = f.name
@@ -537,17 +555,19 @@ def test_ledger_gc_tasks() -> None:
             p = Prefix(model_id="q", token_ids=(1,))
             led.upsert_task("old-ready", op="copy", prefix=p, target="i", status="ready")
             led.upsert_task("old-failed", op="copy", prefix=p, target="i", status="failed")
+            led.upsert_task("old-abandoned", op="copy", prefix=p, target="i", status="abandoned")
             led.upsert_task("old-running", op="copy", prefix=p, target="i", status="running")
             led.upsert_task("new-ready", op="copy", prefix=p, target="i", status="ready")
-            # 手工把三行的 updated_at 拨到 8 天前
+            # 手工把四行的 updated_at 拨到 8 天前
             old = time.time() - 8 * 24 * 3600
             led._conn.execute(
                 "UPDATE tasks SET updated_at = ? WHERE task_id != 'new-ready'", (old,)
             )
             led._conn.commit()
-            assert led.gc_tasks() == 2  # old-ready + old-failed
+            assert led.gc_tasks() == 3  # old-ready + old-failed + old-abandoned
             assert led.get_task("old-ready") is None
             assert led.get_task("old-failed") is None
+            assert led.get_task("old-abandoned") is None  # abandoned 是终态，超龄同删
             # running 再老也不动（在途或孤儿，处置归恢复策略）
             assert led.get_task("old-running") is not None
             # 新终态不动

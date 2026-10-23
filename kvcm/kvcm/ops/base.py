@@ -91,17 +91,16 @@ class KvOps(ABC):
 
     抽象方法只留五项（capability / copy / query_task / abandon / exists）
     ——跑通 copy 流程的最小集。其余操作基类给默认实现（抛
-    UnsupportedCapabilityError）：语义等于「该后端适配器未接通本操作，
-    编排层按通道不具备处理」；适配器落地某项时 override 并细化（通道
-    具备但未接线抛 NotImplementedError，通道不具备抛
+    UnsupportedCapabilityError，消息注明适配器未接线）：编排层判断可
+    用性应读 capability()，异常只是兜底；适配器落地某项时 override
+    并细化（通道具备但未接线抛 NotImplementedError，通道不具备抛
     UnsupportedCapabilityError——mooncake 后端的 pin 即此形态）。第二
     后端接入时不必先 stub 全部操作。
     """
 
     def _unsupported(self, op: str) -> UnsupportedCapabilityError:
         return UnsupportedCapabilityError(
-            f"{op}：后端适配器未实现本操作（视为通道不具备；"
-            "支持需在适配器内接线）"
+            f"{op}：后端适配器未接线本操作"
         )
 
     @abstractmethod
