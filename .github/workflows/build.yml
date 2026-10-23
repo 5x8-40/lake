@@ -45,7 +45,9 @@ jobs:
           cmx=false
           kvcm_pkg=false
           kvcm_demo=false
-          if echo "$files" | grep -qE '^(rust|go|python|proto|scripts|deploy|bench)/|^\.github/workflows/build\.yml'; then
+          # build.yml 自身改动不触发任何语言 job：CI 文件改动 ≠ 代码改动，
+          # 其正确性由 workflow 可运行性验证；需要全量验证时在 PR 手动确认。
+          if echo "$files" | grep -qE '^(rust|go|python|proto|scripts|deploy|bench)/'; then
             code=true
           fi
           if echo "$files" | grep -qE '^tools/cmx-sim/'; then
@@ -53,10 +55,10 @@ jobs:
           fi
           # kvcm 隔离：产品代码/测试改动才跑单测；demo 改动才跑 demo 冒烟；
           # kvcm/design、README、summary 等纯文档改动两个 job 都不触发。
-          if echo "$files" | grep -qE '^kvcm/(kvcm|tests)/|^\.github/workflows/build\.yml'; then
+          if echo "$files" | grep -qE '^kvcm/(kvcm|tests)/'; then
             kvcm_pkg=true
           fi
-          if echo "$files" | grep -qE '^kvcm/demo/|^\.github/workflows/build\.yml'; then
+          if echo "$files" | grep -qE '^kvcm/demo/'; then
             kvcm_demo=true
           fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
