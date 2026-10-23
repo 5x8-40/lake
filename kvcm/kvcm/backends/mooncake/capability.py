@@ -13,7 +13,11 @@ def mooncake_v0311() -> BackendCapability:
     """mooncake 0.3.11（当前部署版本）。"""
 
     return BackendCapability(
-        has_lease=Capability(Support.YES, Support.YES, "通道 = is_exist，读即续租"),
+        has_lease=Capability(
+            Support.YES,
+            Support.YES,
+            "通道 = is_exist，读即续租（预热前置检查的 exists 调用同样续租——保活免费搭车）",
+        ),
         soft_pin_after=Capability(
             Support.YES,
             Support.NO,
@@ -43,7 +47,11 @@ def mooncake_main() -> BackendCapability:
     """mooncake 最新主线（目标基线）。"""
 
     return BackendCapability(
-        has_lease=Capability(Support.YES, Support.YES, "通道 = is_exist，读即续租"),
+        has_lease=Capability(
+            Support.YES,
+            Support.YES,
+            "通道 = is_exist，读即续租（预热前置检查的 exists 调用同样续租——保活免费搭车）",
+        ),
         soft_pin_after=Capability(
             Support.YES, Support.NO, "同 0.3.11；自封装 .so 候选"
         ),

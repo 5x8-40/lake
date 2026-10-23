@@ -110,6 +110,15 @@ def test_plan_tp1_single_seg() -> None:
     assert kc.build_plan(keys, ["10.0.0.1:5001"]) == [(k, "10.0.0.1:5001") for k in keys]
 
 
+def test_plan_single_rank_extra_targets_fails() -> None:
+    """单 rank key + 多 targets：多余 seg 静默被吞 = locate 返回脏列表，
+    必须报错而不是替调用方猜（fail loud）。"""
+    kc = km.KeyComputer(model_name="qwen", tp_size=1)
+    keys = kc.expand(["h0"])
+    with pytest.raises(ValueError, match="rank 0 but 2 targets"):
+        kc.build_plan(keys, ["10.0.0.1:5001", "10.0.0.1:5002"])
+
+
 def test_plan_tp2_rank_mapped() -> None:
     kc = km.KeyComputer(model_name="qwen", tp_size=2)
     keys = kc.expand(["h0"])

@@ -51,16 +51,20 @@ class PrefetchFlow:
         poll_s: float = 0.5,
         timeout_s: float = 120.0,
     ) -> None:
-        """同步执行到 READY；失败抛 PrefetchError。"""
+        """同步执行到 READY；失败抛 PrefetchError。
+
+        timeout_s 从 exists 通过起算、覆盖 copy 提交——大前缀逐 key 串行
+        提交本身可达几十秒，不计入则超时预算失真。
+        """
         if not self._ops.exists(prefix):
             raise PrefetchError(
                 "prefix not fully in pool — warm 未覆盖该前缀，或 key 口径与引擎漂移"
             )
+        deadline = time.monotonic() + timeout_s
         try:
             handle = self._ops.copy(prefix, target)
         except SubmitError as e:
             raise PrefetchError(f"copy submit failed: {e}") from e
-        deadline = time.monotonic() + timeout_s
         while True:
             try:
                 status = self._ops.query_task(handle)
