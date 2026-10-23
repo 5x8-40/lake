@@ -149,6 +149,10 @@ class MooncakeBackend(KvOps):
         """
         from mooncake.store import TaskStatus as StoreTaskStatus
 
+        # 空句柄（task_ids=()）：无异步工作的路径（如保留身份注册一次
+        # RPC 即完成）——立即 READY，不查登记、不做副本核验。
+        if not handle.task_ids:
+            return TaskStatus.READY
         entry = self._plans.get(handle)
         if entry is None:
             raise KeyError(f"unknown task handle: {handle}")
@@ -264,7 +268,8 @@ class MooncakeBackend(KvOps):
     # 是整数对，编码知识只在本层，编排层不该懂；②状态迁移的时机——
     # query_task 是本层判定的，顺手迁移。编排层记账则两头都缺：编码要
     # 本层翻译好再上交，路径一多还会漏（超时、异常分支没人写）。原则：
-    # 谁手里有原始信息，谁就记账。（状态机可丢，重启后从 master 重查）
+    # 谁手里有原始信息，谁就记账。（状态机可丢：裸状态可按 task_id
+    # 从 master 重查；跟踪关系由 rebuild() 用可重算输入现场重算重建）
     # ------------------------------------------------------------------
 
     def _record(
@@ -290,18 +295,28 @@ class MooncakeBackend(KvOps):
         可重算输入——model_id/token_ids/target/op；plan 由 KeyComputer
         现场重算，key/seg 不落库）。返回恢复的 handle 数。
 
-        仅恢复 copy（唯一已落地操作）；重算失败（实例已不在、口径漂移）
-        跳过该行——在途任务交由 gc_tasks / 下一次预热处理。
+        规则：
+        - 仅恢复 copy（唯一已落地操作）
+        - 空 handle_id / 空 token_ids / 重算出空 plan：跳过（老库迁移行
+          或口径漂移——登记空 plan 会在任务成功后假 READY）
+        - 重算失败（实例已不在）：跳过，交由 gc_tasks / 下一次预热
+        - 观测态恢复：同组已有冲突 failed 兄弟（部分 running 部分
+          failed 的组，failed 行只可能是冲突失败——真失败会整组终态），
+          恢复的 handle 同时进 _watch：冲突任务保持 failed，之后只核验
+          副本，缺副本保持 RUNNING（不抛 VerifyError）
         """
         if self._ledger is None:
             return 0
+        running = self._ledger.list_running_tasks()
         groups: dict[str, list] = {}
-        for rec in self._ledger.list_running_tasks():
+        for rec in running:
             groups.setdefault(rec.handle_id, []).append(rec)
         restored = 0
         for handle_id, rows in groups.items():
+            if not handle_id:
+                continue
             r0 = rows[0]
-            if r0.op != OpKind.COPY.value:
+            if r0.op != OpKind.COPY.value or not r0.token_ids:
                 continue
             prefix = Prefix(model_id=r0.model_id, token_ids=r0.token_ids)
             target = InstanceId(r0.target)
@@ -310,11 +325,21 @@ class MooncakeBackend(KvOps):
                 plan = self._keys.build_plan(keys, list(self._locate(target)))
             except Exception:
                 continue
+            if not plan:
+                continue
             handle = TaskHandle(
                 op=OpKind.COPY,
                 task_ids=tuple(decode_task_id(r.task_id) for r in rows),
             )
             self._plans[handle] = (prefix, target, plan, handle_id)
+            # 观测态恢复：同组的冲突 failed 兄弟进 _watch
+            conflicted = tuple(
+                decode_task_id(r.task_id)
+                for r in self._ledger.list_tasks_by_handle(handle_id)
+                if r.status == "failed"
+            )
+            if conflicted:
+                self._watch[handle] = conflicted
             restored += 1
         return restored
 

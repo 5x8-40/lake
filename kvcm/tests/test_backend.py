@@ -437,6 +437,111 @@ def test_rebuild_restores_running_handle(fake_store_module, monkeypatch) -> None
         os.unlink(path)
 
 
+def test_rebuild_skips_empty_inputs(fake_store_module, monkeypatch) -> None:
+    """空 handle_id / 空 token_ids（老库迁移行）不登记——防空 plan 假 READY。"""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        # 模拟老库迁移行：handle_id 空、token_ids 空（upsert 走正常通道后手工改空）
+        p = Prefix(model_id="qwen", token_ids=(1,))
+        led.upsert_task("t-old", handle_id="h-old", op="copy", prefix=p, target="i", status="running")
+        led._conn.execute("UPDATE tasks SET handle_id = '', token_ids = ''")
+        led._conn.commit()
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+        b = MooncakeBackend(
+            client=FakeClient(),
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+        )
+        assert b.rebuild() == 0
+        assert not b._plans
+    finally:
+        led.close()
+        os.unlink(path)
+
+
+def test_rebuild_restores_watch_state(fake_store_module, monkeypatch) -> None:
+    """观测态恢复：同组冲突 failed 兄弟进 _watch——缺副本保持 RUNNING
+    （不抛 VerifyError），副本到位后 READY 且冲突行保持 failed。"""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+
+        class ConflictClient(FakeClient):
+            def query_task(self, task_id):
+                self.queried.append(task_id)
+                if task_id == (1, 101):  # 第一个任务：冲突失败
+                    return _FakeConflictResp()
+                return _FakeTaskResp(self._status)
+
+        class _FakeConflictResp:
+            status = _FakeStoreTaskStatus.FAILED
+            message = "OBJECT_HAS_REPLICATION_TASK (max retries reached: 3)"
+
+        # 第一次生命：copy → 任务 1 冲突失败、任务 2 在途 → 进观测态
+        # （副本只到 seg-A，观测态等 seg-B）
+        client = ConflictClient(
+            task_status=_FakeStoreTaskStatus.RUNNING, replicas_on=["seg-A"]
+        )
+        b1 = MooncakeBackend(
+            client=client, key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(), ledger=led,
+        )
+        h1 = b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        assert b1.query_task(h1) is TaskStatus.RUNNING  # 观测态等副本
+        assert h1 in b1._watch
+
+        # 重启：副本未到位 → RUNNING（不得 VerifyError）；冲突行保持 failed
+        client2 = ConflictClient(
+            task_status=_FakeStoreTaskStatus.SUCCESS, replicas_on=["seg-A"]  # 只到一个
+        )
+        b2 = MooncakeBackend(
+            client=client2, key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(), ledger=led,
+        )
+        assert b2.rebuild() == 1
+        h2 = next(iter(b2._plans))
+        assert h2 in b2._watch  # 观测态恢复了
+        assert b2.query_task(h2) is TaskStatus.RUNNING  # 缺 seg-B 副本：等，不是终态
+
+        # 副本全部到位 → READY；冲突行保持 failed，其余 ready
+        client2._replicas_on = ["seg-A", "seg-B"]
+        assert b2.query_task(h2) is TaskStatus.READY
+        assert led.get_task(encode_task_id((1, 101))).status == "failed"  # type: ignore[union-attr]
+        assert led.get_task(encode_task_id((2, 102))).status == "ready"  # type: ignore[union-attr]
+    finally:
+        led.close()
+        os.unlink(path)
+
+
+def test_empty_handle_is_immediately_ready(fake_store_module) -> None:
+    """空句柄（task_ids=()，retained 注册类无异步工作路径）立即 READY，
+    不查登记、不核验。"""
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=KeyComputer(model_name="qwen", tp_size=1),
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+    )
+    from kvcm.ops.base import TaskHandle
+
+    empty = TaskHandle(op=OpKind.COPY, task_ids=())
+    assert b.query_task(empty) is TaskStatus.READY
+
+
 def test_rebuild_skips_unresolvable(fake_store_module, monkeypatch) -> None:
     """目标实例已不在（locate 失败）：跳过该组，不炸恢复流程。"""
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:

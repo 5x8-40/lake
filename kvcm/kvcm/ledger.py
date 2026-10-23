@@ -1,7 +1,9 @@
 """Ledger：状态层（sqlite）。
 
 四类状态记录，按可丢性分级：
-- 任务状态机（可丢）：重启后任务终态可从 master 重查
+- 任务状态机（可丢）：裸状态可按 task_id 从 master 重查；跟踪关系
+  （handle → plan）由 backend.rebuild() 用本表存的可重算输入
+  （token_ids + target + op，key/seg 不落库）现场重算 plan 重建
 - 保活注册表（不可丢）：丢了 = 保活停止 = 副本被驱逐
 - 副本台账（半可丢）：可从 master 副本查询重建
 - 会话绑定（不可丢）：丢了 = 会话结束时不知道该释放哪些前缀
@@ -201,6 +203,17 @@ class Ledger:
             "SELECT task_id, handle_id, op, prefix_key, target, status, model_id,"
             " token_ids, created_at, updated_at FROM tasks"
             " WHERE status = 'running' ORDER BY rowid"
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
+    def list_tasks_by_handle(self, handle_id: str) -> list[TaskRecord]:
+        """同一 handle 分组的全部任务（含终态；观测态恢复要读出冲突
+        failed 兄弟）。"""
+        rows = self._conn.execute(
+            "SELECT task_id, handle_id, op, prefix_key, target, status, model_id,"
+            " token_ids, created_at, updated_at FROM tasks"
+            " WHERE handle_id = ? ORDER BY rowid",
+            (handle_id,),
         ).fetchall()
         return [self._row_to_record(r) for r in rows]
 

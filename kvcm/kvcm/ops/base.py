@@ -6,7 +6,8 @@
 - 目的型：retain——由其他操作组合实现，对外仍呈现单步语义
 
 完成信号：copy / move / promote 有 READY（任务状态完成 + 目标侧副本
-核验通过）；其余五项无 READY。任务状态经 query_task 查询。
+核验通过）；retain 返回空句柄（task_ids=()，无异步工作的路径）时
+query_task 立即 READY；其余五项无 READY。任务状态经 query_task 查询。
 
 幂等：以（前缀 × 目标实例）为幂等键——在途不重复发、完成不重复发；
 后端幂等兜底。
