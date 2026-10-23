@@ -2,7 +2,7 @@
 
 - 定位：kvcm 服务化（E10 重构 / E11 进程化 / E15 并行限速）的模块分层设计，E10 开工依据
 - 本文**不新增机制结论**——操作语义、完成信号、幂等性、能力事实全部引自 [D1-router-scheduling.md](D1-router-scheduling.md) / [D2-kv-operations.md](D2-kv-operations.md)；本文只把它们落成代码结构
-- 语言：Python（继承现有 `demo/precopy/` 1577 行与 mooncake store_py 绑定、keys.py 与引擎同口径；换语言属独立决策，不在本文）
+- 语言：Python（**已定**，2026-10-23 拍板：继承现有 `demo/precopy/` 1577 行与 mooncake store_py 绑定、keys.py 与引擎同口径）
 
 ## 分层总览
 
@@ -141,10 +141,10 @@ L5 状态层     Ledger（sqlite，四类状态记录）
   - 方法参数和返回是 C++ 类型（`std::string` 的 SSO 布局、`UUID` struct、`tl::expected` 返回值），在 Python 里按字节拼这些对象 = 手工复刻编译器的类型布局，且布局随 libstdc++ 版本变
   - 所以中间必须有一层 C++：它用头文件调类方法（布局由编译器保证），对 Python 只暴露 C 类型
   - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）
-- 两个断点（E6 在测试机验证）：
-  1. 符号可见性：client 类符号是否从 wheel 的 .so 导出（`nm -D --defined-only <so> | c++filt`；符号不导出则此路不通，退回替代实现）
-  2. ABI 匹配：封装层编译环境（gcc/libstdc++）与 wheel 构建环境不一致则不可用；走路径 A 另要求 shim 的 pybind11 internals 版本与 wheel 内 store_py 的一致
-- E6 另核：`/query_key` 的续租副作用在核验场景能否接受。（已核一条：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定，上游亦原生支持 NPU——v0.3.11 tag 已有 `ascend_transport` 目录）
+- 两个断点（E6；x86 参考已核一半，npu wheel 待测试机复核）：
+  1. 符号可见性：**x86 0.3.13 wheel 已验证通过**——`Client` 类方法本体全部导出（`nm -D` 实测：`BatchUpsert` / `CreateCopyTask` / `CreateMoveTask` 及 `RealClient::upsert_*_helper` 均在，连 `MooncakeStorePyWrapper` 自身符号也导出）；npu 0.3.11 wheel 待测试机复核（同一构建系统，预期一致；符号不导出则此路不通，退回替代实现）
+  2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机；路径 A 的 pybind11 对齐已查明：mooncake 锁定 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a），shim 编译用同版本即可对齐 internals
+- E6 另核：`/query_key` 的续租副作用在核验场景能否接受；retained 注册的具体符号名按 main 源码确认（0.3.13 x86 wheel 未见 retained 符号）。（已核一条：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定，上游亦原生支持 NPU——v0.3.11 tag 已有 `ascend_transport` 目录）
 
 ### EngineAdapter（引擎适配）
 
