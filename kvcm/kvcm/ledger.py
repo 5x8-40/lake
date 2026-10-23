@@ -22,10 +22,13 @@ from kvcm.ops.types import Prefix
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tasks (
     task_id     TEXT NOT NULL,
+    handle_id   TEXT NOT NULL,
     op          TEXT NOT NULL,
     prefix_key  TEXT NOT NULL,
     target      TEXT NOT NULL,
     status      TEXT NOT NULL,
+    model_id    TEXT NOT NULL,
+    token_ids   TEXT NOT NULL,
     created_at  REAL NOT NULL,
     updated_at  REAL NOT NULL,
     PRIMARY KEY (task_id)
@@ -59,6 +62,9 @@ _MIGRATIONS = (
     ("keepalive", "token_ids", "ALTER TABLE keepalive ADD COLUMN token_ids TEXT NOT NULL DEFAULT ''"),
     ("sessions", "token_ids", "ALTER TABLE sessions ADD COLUMN token_ids TEXT NOT NULL DEFAULT ''"),
     ("sessions", "model_id", "ALTER TABLE sessions ADD COLUMN model_id TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "token_ids", "ALTER TABLE tasks ADD COLUMN token_ids TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "handle_id", "ALTER TABLE tasks ADD COLUMN handle_id TEXT NOT NULL DEFAULT ''"),
+    ("tasks", "model_id", "ALTER TABLE tasks ADD COLUMN model_id TEXT NOT NULL DEFAULT ''"),
 )
 
 
@@ -73,10 +79,13 @@ def prefix_key(prefix: Prefix) -> str:
 @dataclass(frozen=True)
 class TaskRecord:
     task_id: str
+    handle_id: str
     op: str
     prefix_key: str
     target: str
     status: str
+    model_id: str
+    token_ids: tuple[int, ...]
     created_at: float
     updated_at: float
 
@@ -125,35 +134,83 @@ class Ledger:
     # ------------------------------------------------------------------
 
     def upsert_task(
-        self, task_id: str, *, op: str, prefix: Prefix, target: str, status: str
+        self,
+        task_id: str,
+        *,
+        handle_id: str,
+        op: str,
+        prefix: Prefix,
+        target: str,
+        status: str,
     ) -> None:
-        self.upsert_tasks([task_id], op=op, prefix=prefix, target=target, status=status)
+        self.upsert_tasks(
+            [task_id], handle_id=handle_id, op=op, prefix=prefix, target=target, status=status
+        )
 
     def upsert_tasks(
-        self, task_ids: list[str], *, op: str, prefix: Prefix, target: str, status: str
+        self,
+        task_ids: list[str],
+        *,
+        handle_id: str,
+        op: str,
+        prefix: Prefix,
+        target: str,
+        status: str,
     ) -> None:
-        """批量 upsert（单事务）——多任务同时迁移时不出现半新半旧。"""
+        """批量 upsert（单事务）——多任务同时迁移时不出现半新半旧。
+
+        存的是**可重算输入**（token_ids + target + op），不存 key/seg—
+        —重启后由 KeyComputer 现场重算 plan 重建跟踪（D-4 裁定）。
+        """
         if status not in self._TASK_STATUSES:
             raise ValueError(f"unknown task status: {status!r}")
         now = time.time()
+        token_json = json.dumps(list(prefix.token_ids))
         with self._conn:
             self._conn.executemany(
-                "INSERT INTO tasks (task_id, op, prefix_key, target, status, created_at, updated_at)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?)"
-                " ON CONFLICT(task_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
+                "INSERT INTO tasks (task_id, handle_id, op, prefix_key, target, status, model_id, token_ids, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(task_id) DO UPDATE SET status=excluded.status,"
+                " updated_at=excluded.updated_at",
                 [
-                    (tid, op, prefix_key(prefix), target, status, now, now)
+                    (tid, handle_id, op, prefix_key(prefix), target, status,
+                     prefix.model_id, token_json, now, now)
                     for tid in task_ids
                 ],
             )
 
+    def _row_to_record(self, row: tuple) -> TaskRecord:
+        (task_id, handle_id, op, pk, target, status, model_id,
+         token_json, created_at, updated_at) = row
+        return TaskRecord(
+            task_id=task_id,
+            handle_id=handle_id,
+            op=op,
+            prefix_key=pk,
+            target=target,
+            status=status,
+            model_id=model_id,
+            token_ids=tuple(json.loads(token_json)) if token_json else (),
+            created_at=created_at,
+            updated_at=updated_at,
+        )
+
+    def list_running_tasks(self) -> list[TaskRecord]:
+        """全部 running 任务（重启恢复跟踪的输入）。"""
+        rows = self._conn.execute(
+            "SELECT task_id, handle_id, op, prefix_key, target, status, model_id,"
+            " token_ids, created_at, updated_at FROM tasks"
+            " WHERE status = 'running' ORDER BY rowid"
+        ).fetchall()
+        return [self._row_to_record(r) for r in rows]
+
     def get_task(self, task_id: str) -> TaskRecord | None:
         row = self._conn.execute(
-            "SELECT task_id, op, prefix_key, target, status, created_at, updated_at"
-            " FROM tasks WHERE task_id = ?",
+            "SELECT task_id, handle_id, op, prefix_key, target, status, model_id,"
+            " token_ids, created_at, updated_at FROM tasks WHERE task_id = ?",
             (task_id,),
         ).fetchone()
-        return TaskRecord(*row) if row else None
+        return self._row_to_record(row) if row else None
 
     def gc_tasks(self, *, max_age_s: float = 7 * 24 * 3600) -> int:
         """清理终态老任务（ready/failed/abandoned 且 updated_at 超龄），

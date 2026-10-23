@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import uuid
 from typing import Callable, Sequence
 
 from kvcm.backends.mooncake.client import StoreClient, StoreClientError
@@ -38,7 +39,7 @@ def encode_task_id(task_id: object) -> str:
     """任务标识 → 可逆字符串编码（Ledger 持久化用）。
 
     mooncake 任务号为 (uint64, uint64) 整数对，编码为 "hi:lo"；其他形态
-    兜底 str()。解码不在本步（任务状态机可丢，重启后从 master 重查）。
+    兜底 str()。
     """
     if isinstance(task_id, (tuple, list)) and len(task_id) == 2:
         try:
@@ -46,6 +47,17 @@ def encode_task_id(task_id: object) -> str:
         except (TypeError, ValueError):
             pass
     return str(task_id)
+
+
+def decode_task_id(s: str) -> object:
+    """encode_task_id 的逆（重启恢复用）："hi:lo" → (hi, lo)；其余原样。"""
+    parts = s.split(":")
+    if len(parts) == 2:
+        try:
+            return (int(parts[0]), int(parts[1]))
+        except ValueError:
+            pass
+    return s
 
 
 class MooncakeBackend(KvOps):
@@ -73,9 +85,13 @@ class MooncakeBackend(KvOps):
         self._locate = locate
         self._cap = capability
         self._ledger = ledger
-        # handle → (prefix, target, plan [(key, target_seg), ...])：
+        # handle → (prefix, target, plan [(key, target_seg), ...], handle_id)：
         # READY 核验与 Ledger 迁移登记；终态即删（防长驻泄漏）。
-        self._plans: dict[TaskHandle, tuple[Prefix, InstanceId, list[tuple[str, str]]]] = {}
+        # handle_id = 同一次操作发起的一组任务的分组键（uuid），写进
+        # Ledger 供重启恢复时把同一组的任务重新拼成一个 handle。
+        self._plans: dict[
+            TaskHandle, tuple[Prefix, InstanceId, list[tuple[str, str]], str]
+        ] = {}
         # 在途冲突观测态：handle → 冲突失败的任务号。任务被
         # OBJECT_HAS_REPLICATION_TASK 拒（别人在复制同 key，D1 §4 按
         # 「在途」不当失败）后，不再查任务、转为只核验副本——副本到位
@@ -115,7 +131,7 @@ class MooncakeBackend(KvOps):
                 f"(submitted ids: {task_ids}): {e}"
             ) from e
         handle = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
-        self._plans[handle] = (prefix, target, plan)
+        self._plans[handle] = (prefix, target, plan, uuid.uuid4().hex)
         self._record(handle, "running")
         return handle
 
@@ -136,7 +152,7 @@ class MooncakeBackend(KvOps):
         entry = self._plans.get(handle)
         if entry is None:
             raise KeyError(f"unknown task handle: {handle}")
-        _, _, plan = entry
+        _, _, plan, _ = entry
         if handle in self._watch:
             # 在途冲突观测态：任务已死（冲突失败，账已记），只等副本到位
             return self._verify_watch(handle, plan)
@@ -259,14 +275,48 @@ class MooncakeBackend(KvOps):
         entry = self._plans.get(handle)
         if entry is None:
             return
-        prefix, target, _ = entry
+        prefix, target, _, handle_id = entry
         self._ledger.upsert_tasks(
             [encode_task_id(tid) for tid in (tids if tids is not None else handle.task_ids)],
+            handle_id=handle_id,
             op=handle.op.value,
             prefix=prefix,
             target=str(target),
             status=status,
         )
+
+    def rebuild(self) -> int:
+        """重启后恢复 running 任务的跟踪登记（D-4 裁定：tasks 表存的是
+        可重算输入——model_id/token_ids/target/op；plan 由 KeyComputer
+        现场重算，key/seg 不落库）。返回恢复的 handle 数。
+
+        仅恢复 copy（唯一已落地操作）；重算失败（实例已不在、口径漂移）
+        跳过该行——在途任务交由 gc_tasks / 下一次预热处理。
+        """
+        if self._ledger is None:
+            return 0
+        groups: dict[str, list] = {}
+        for rec in self._ledger.list_running_tasks():
+            groups.setdefault(rec.handle_id, []).append(rec)
+        restored = 0
+        for handle_id, rows in groups.items():
+            r0 = rows[0]
+            if r0.op != OpKind.COPY.value:
+                continue
+            prefix = Prefix(model_id=r0.model_id, token_ids=r0.token_ids)
+            target = InstanceId(r0.target)
+            try:
+                keys = self._keys.keys_for_tokens(prefix.token_ids)
+                plan = self._keys.build_plan(keys, list(self._locate(target)))
+            except Exception:
+                continue
+            handle = TaskHandle(
+                op=OpKind.COPY,
+                task_ids=tuple(decode_task_id(r.task_id) for r in rows),
+            )
+            self._plans[handle] = (prefix, target, plan, handle_id)
+            restored += 1
+        return restored
 
     def _finish(self, handle: TaskHandle, status: str) -> None:
         """终态处理：Ledger 迁移 + 删核验登记（防长驻进程泄漏）。"""
@@ -311,7 +361,7 @@ class MooncakeBackend(KvOps):
     def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         raise NotImplementedError("promote：随提回流程落地")
 
-    def retain(self, prefix: Prefix) -> None:
+    def retain(self, prefix: Prefix) -> TaskHandle:
         raise NotImplementedError("retain：随保留流程落地（能力集 has_retained_client）")
 
     def remove(self, prefix: Prefix) -> None:

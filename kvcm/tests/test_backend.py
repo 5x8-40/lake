@@ -387,6 +387,93 @@ def test_ledger_survives_reopen() -> None:
 
 
 # ---------------------------------------------------------------------------
+# rebuild（重启恢复跟踪：tasks 表存可重算输入，plan 现场重算）
+# ---------------------------------------------------------------------------
+
+
+def test_rebuild_restores_running_handle(fake_store_module, monkeypatch) -> None:
+    """重启恢复：新 backend 从同一 Ledger 重建 running 跟踪，继续到 READY。"""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+        # 第一次生命：copy 发起，Ledger 记 running
+        b1 = MooncakeBackend(
+            client=FakeClient(task_status=_FakeStoreTaskStatus.RUNNING),
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+        )
+        b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        assert len(led.list_running_tasks()) == 2  # 两 key 两任务
+
+        # 模拟重启：全新 backend（空 _plans），同一 Ledger、同一 master
+        client2 = FakeClient(
+            task_status=_FakeStoreTaskStatus.SUCCESS,
+            replicas_on=["seg-A", "seg-B"],
+        )
+        b2 = MooncakeBackend(
+            client=client2,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+        )
+        assert b2.rebuild() == 1  # 一个 handle（两任务一组）
+        handle = next(iter(b2._plans))
+        # 任务号解码回整数对（与创建时同形态）
+        assert all(isinstance(t, tuple) for t in handle.task_ids)
+        # 继续 query_task → 核验通过 → READY；Ledger 迁移 ready
+        assert b2.query_task(handle) is TaskStatus.READY
+        for tid in handle.task_ids:
+            assert led.get_task(encode_task_id(tid)).status == "ready"  # type: ignore[union-attr]
+    finally:
+        led.close()
+        os.unlink(path)
+
+
+def test_rebuild_skips_unresolvable(fake_store_module, monkeypatch) -> None:
+    """目标实例已不在（locate 失败）：跳过该组，不炸恢复流程。"""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+        b1 = MooncakeBackend(
+            client=FakeClient(task_status=_FakeStoreTaskStatus.RUNNING),
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+        )
+        b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+
+        def dead_locate(_inst):
+            raise RuntimeError("instance gone")
+
+        b2 = MooncakeBackend(
+            client=FakeClient(),
+            key_computer=kc,
+            locate=dead_locate,
+            capability=mooncake_v0311(),
+            ledger=led,
+        )
+        assert b2.rebuild() == 0
+        assert not b2._plans
+    finally:
+        led.close()
+        os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
 # abandon（放弃跟踪）
 # ---------------------------------------------------------------------------
 
@@ -470,7 +557,7 @@ def test_ledger_upsert_tasks_single_transaction() -> None:
     try:
         with Ledger(path) as led:
             p = Prefix(model_id="qwen", token_ids=(1,))
-            led.upsert_tasks(["t1", "t2", "t3"], op="copy", prefix=p, target="i", status="running")
+            led.upsert_tasks(["t1", "t2", "t3"], handle_id="h1", op="copy", prefix=p, target="i", status="running")
             for tid in ("t1", "t2", "t3"):
                 assert led.get_task(tid).status == "running"  # type: ignore[union-attr]
     finally:
@@ -486,7 +573,7 @@ def test_ledger_status_validation() -> None:
         with Ledger(path) as led:
             with pytest.raises(ValueError, match="unknown task status"):
                 led.upsert_task(
-                    "t1", op="copy", prefix=Prefix(model_id="q", token_ids=(1,)),
+                    "t1", handle_id="h1", op="copy", prefix=Prefix(model_id="q", token_ids=(1,)),
                     target="i", status="reddy",  # 拼写错误必须在写入时失败
                 )
     finally:
@@ -553,11 +640,11 @@ def test_ledger_gc_tasks() -> None:
     try:
         with Ledger(path) as led:
             p = Prefix(model_id="q", token_ids=(1,))
-            led.upsert_task("old-ready", op="copy", prefix=p, target="i", status="ready")
-            led.upsert_task("old-failed", op="copy", prefix=p, target="i", status="failed")
-            led.upsert_task("old-abandoned", op="copy", prefix=p, target="i", status="abandoned")
-            led.upsert_task("old-running", op="copy", prefix=p, target="i", status="running")
-            led.upsert_task("new-ready", op="copy", prefix=p, target="i", status="ready")
+            led.upsert_task("old-ready", handle_id="h1", op="copy", prefix=p, target="i", status="ready")
+            led.upsert_task("old-failed", handle_id="h2", op="copy", prefix=p, target="i", status="failed")
+            led.upsert_task("old-abandoned", handle_id="h3", op="copy", prefix=p, target="i", status="abandoned")
+            led.upsert_task("old-running", handle_id="h4", op="copy", prefix=p, target="i", status="running")
+            led.upsert_task("new-ready", handle_id="h5", op="copy", prefix=p, target="i", status="ready")
             # 手工把四行的 updated_at 拨到 8 天前
             old = time.time() - 8 * 24 * 3600
             led._conn.execute(
