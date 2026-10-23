@@ -36,10 +36,15 @@ class TaskStatus(enum.Enum):
 
 @dataclass(frozen=True)
 class TaskHandle:
-    """任务类操作的句柄：操作类型 + 任务标识。"""
+    """任务类操作的句柄：操作类型 + 后端任务标识列表。
+
+    一次前缀操作展开为多个后端任务（每 key 一个），句柄承载全部标识；
+    READY 核验所需的 key/目标映射由实现侧登记（任务状态机归状态层），
+    不随句柄泄漏存储概念。
+    """
 
     op: str  # "copy" / "move" / "promote"
-    task_id: str
+    task_ids: tuple[str, ...]
 
 
 class UnsupportedCapabilityError(Exception):
