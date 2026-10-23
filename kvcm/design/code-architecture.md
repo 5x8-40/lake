@@ -121,10 +121,11 @@ L5 状态层     Ledger（sqlite，四类状态记录）
    - 查询类走这面的好处：不用注册 client，kvcm 进程死了也不在 master 留任何状态
    - 版本差异：0.3.11 的 `/batch_query_keys` 走普通 `BatchGetReplicaList`（有续租副作用）；main 走 `BatchGetReplicaListForAdmin`（零副作用）
 3. **C 接口**（`mooncake-store/include/store_c.h`，ctypes 可直调）
-   - 只有数据面基础操作：put/get/is_exist/remove/register_buffer
-   - 控制面操作（copy/move/upsert/retained）都不在——kvcm 用不上
+   - 数据面操作：put / get / is_exist / remove / register_buffer
+   - put 的 config 带完整 pin 支持（`with_hard_pin`、`soft_pin_action` ENABLE/DISABLE/PRESERVE、TTL）——但注释明确是 `on publish`，即「写新 key 时挂 pin」：写新 key 是引擎的活，kvcm 不写新 key；kvcm 要的 pin 全是**事后操作**（key 已在池里）
+   - 事后加/解 pin 的唯一通道 = upsert（D2 F3/F12），C 接口只有 put 没有 upsert；copy/move、retained 注册、admin 查询也都不在——所以补洞仍要自封装
 
-**自封装 .so**（补两个缺口：空写 upsert、retained 注册——绑定和 HTTP 都没有，C++ client 类有）：
+**自封装 .so**（补两个缺口：空写 upsert、retained 注册——绑定、HTTP、C 接口都没有，C++ client 类有）：
 
 - 写法：照 `store_py.cpp` 的写法——`#include` mooncake 头文件，调 C++ client 类方法，对外暴露 pybind 或 extern "C" 接口；产物放 kvcm 侧，不改 mooncake 源码
 - 为什么不能 Python 直调（ctypes）：
