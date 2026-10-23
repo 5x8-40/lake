@@ -87,7 +87,22 @@ class SubmitError(RuntimeError):
 
 
 class KvOps(ABC):
-    """原子操作接口。实现由存储后端适配器提供（如 mooncake 后端）。"""
+    """原子操作接口。实现由存储后端适配器提供（如 mooncake 后端）。
+
+    抽象方法只留五项（capability / copy / query_task / abandon / exists）
+    ——跑通 copy 流程的最小集。其余操作基类给默认实现（抛
+    UnsupportedCapabilityError）：语义等于「该后端适配器未接通本操作，
+    编排层按通道不具备处理」；适配器落地某项时 override 并细化（通道
+    具备但未接线抛 NotImplementedError，通道不具备抛
+    UnsupportedCapabilityError——mooncake 后端的 pin 即此形态）。第二
+    后端接入时不必先 stub 全部操作。
+    """
+
+    def _unsupported(self, op: str) -> UnsupportedCapabilityError:
+        return UnsupportedCapabilityError(
+            f"{op}：后端适配器未实现本操作（视为通道不具备；"
+            "支持需在适配器内接线）"
+        )
 
     @abstractmethod
     def capability(self) -> BackendCapability:
@@ -98,7 +113,6 @@ class KvOps(ABC):
         """在目标实例本机层级为前缀 KV 建副本；源副本由池侧选择。
         READY：任务完成 + 目标侧副本核验通过。"""
 
-    @abstractmethod
     def move(
         self,
         prefix: Prefix,
@@ -107,42 +121,43 @@ class KvOps(ABC):
     ) -> TaskHandle:
         """把前缀 KV 的副本归属转移到目标实例，源副本释放；可指定源实例
         （复制无此能力，移动才有）。READY 同 copy。"""
+        raise self._unsupported("move")
 
-    @abstractmethod
     def keepalive(self, prefix: Prefix) -> None:
         """注册保活：对前缀 KV 周期续租防驱逐。停止经 stop_keepalive。
         无 READY。"""
+        raise self._unsupported("keepalive")
 
-    @abstractmethod
     def stop_keepalive(self, prefix: Prefix) -> None:
         """注销保活。不是第九项操作——是 keepalive 注册的管理面。"""
+        raise self._unsupported("stop_keepalive")
 
-    @abstractmethod
     def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
         """元数据标记防驱逐：对已存在的 KV 生效，不写数据。
         SOFT 可解；HARD 写入时固化、不可解，已存在的 KV 无法事后补标
         （能力集 hard_pin_after）。无 READY。"""
+        raise self._unsupported("pin")
 
-    @abstractmethod
     def demote(self, prefix: Prefix) -> None:
         """放弃前缀 KV 的热层位置。本接口不指定目标层——去向由池的冷热
         策略决定；是否立即生效取决于后端能力（has_per_key_demote 全版本
         均无，实际为停止保活后的自然降层）。无 READY。"""
+        raise self._unsupported("demote")
 
-    @abstractmethod
     def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """把前缀 KV 提回指定实例本机层级（调度意图，与 demote 的
         「放弃位置」不对称是刻意的）。READY 同 copy。"""
+        raise self._unsupported("promote")
 
-    @abstractmethod
     def retain(self, prefix: Prefix) -> None:
         """目的型：让前缀 KV 在源引擎下线后仍存活。按后端能力组合实现
         （保留身份注册 / 共享文件系统副本 / 迁往存活节点），目标节点由
         实现结合拓扑与存活信息选择。对外单步语义。无 READY。"""
+        raise self._unsupported("retain")
 
-    @abstractmethod
     def remove(self, prefix: Prefix) -> None:
         """删除前缀 KV 的全部副本，全局生效。无 READY。"""
+        raise self._unsupported("remove")
 
     @abstractmethod
     def query_task(self, handle: TaskHandle) -> TaskStatus:

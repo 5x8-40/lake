@@ -70,7 +70,14 @@ class TaskRecord:
 
 
 class Ledger:
-    """sqlite 状态记录。单进程使用（kvcm 单实例）。"""
+    """sqlite 状态记录。单进程使用（kvcm 单实例）。
+
+    并发约束：sqlite 连接默认 check_same_thread——本类只能在创建它的
+    线程里用。当前全部调用方（MooncakeBackend._record 链路与流程层）
+    同线程，无锁。E11 进程化把 TaskEngine 挪进独立线程时，要么在调用
+    侧加锁，要么改每线程一连接——届时第一件事就是处理这条，否则第一
+    次跨线程调用即 ProgrammingError。
+    """
 
     _TASK_STATUSES = frozenset({"running", "ready", "failed", "abandoned"})
 

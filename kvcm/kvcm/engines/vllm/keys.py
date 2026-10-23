@@ -347,10 +347,22 @@ class KeyComputer:
         targets[i // n_sub]（seg 列表按倍数展开）；其余超界组合直接报错。
         rank 知识（key 格式、TP 配置）全部归本类——存储侧只消费计划，
         不解释 key。
+
+        单 rank（全部 key 都是 rank 0）时 targets 必须恰为一个 seg——
+        多余的 seg 被静默忽略意味着 locate 返回了脏列表（同机另一实例的
+        seg 混进来），按 fail-loud 原则直接报错，不替调用方猜。
         """
         by_rank = group_keys_by_rank(keys)
         max_rank = max(by_rank) if by_rank else -1
-        if len(targets) == 1 and max_rank <= 0:
+        if max_rank <= 0:
+            if not by_rank:
+                return []
+            if len(targets) != 1:
+                raise ValueError(
+                    f"all keys are rank 0 but {len(targets)} targets given "
+                    f"(targets={list(targets)}) — single-rank target should "
+                    "resolve to exactly one segment; dirty locate result?"
+                )
             return [(k, targets[0]) for k in keys]
         if max_rank >= len(targets):
             local_tp = self.tp_size

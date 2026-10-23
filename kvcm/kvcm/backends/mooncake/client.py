@@ -9,7 +9,9 @@
 都按这个身份走。是否持有存储由 global_segment_size 决定（控制面 = 0，
 纯控制身份）。
 
-引擎不参与复制：copy 是 store client 后台传输，由 master 协调。
+引擎不发起、也不协调复制：copy 由本进程发起、master 协调；但数据面传
+输的执行者是源/目标 seg 所在 client——源侧通常就是源引擎进程内的
+store client（它必须在线，否则 master 派不了源任务）。
 """
 
 from __future__ import annotations
@@ -122,6 +124,11 @@ class StoreClient:
             raise StoreClientError(f"query_task failed err={err} task_id={task_id}")
         return resp
 
+    # ------------------------------------------------------------------
+    # 同步便利封装（demo 脚本用；MooncakeBackend 的异步 query_task 路径
+    # 不走这里——以下方法当前无 L3/L2 调用方，删除前先确认 demo 不再用）
+    # ------------------------------------------------------------------
+
     def wait_task(self, task_id: object, *, poll_s: float = 0.5, timeout_s: float = 120.0) -> object:
         """轮询到终态（SUCCESS/FAILED）或超时。"""
         from mooncake.store import TaskStatus
@@ -152,10 +159,14 @@ class StoreClient:
     # ------------------------------------------------------------------
     # 副本核验（绑定通道；注意：本通道有续租副作用。
     # 零副作用核验走 HTTP 管理端点，仅新版本有——随版本接线）
+    #
+    # 调用方现状：MooncakeBackend 只用 batch 版；单 key 版与
+    # assert_targets_have_replicas 为 demo 脚本遗留的便利封装，L3/L2
+    # 当前无调用方。
     # ------------------------------------------------------------------
 
     def memory_replica_endpoints(self, key: str) -> list[str]:
-        """单个 key 的内存副本传输端点列表。"""
+        """单个 key 的内存副本传输端点列表（demo 脚本用；L3 走 batch 版）。"""
         endpoints: list[str] = []
         for desc in self._s().get_replica_desc(key):
             if not desc.is_memory_replica:
@@ -181,7 +192,12 @@ class StoreClient:
     def assert_targets_have_replicas(
         self, keys: Iterable[str], targets: Sequence[str]
     ) -> dict[str, list[str]]:
-        """核验：每个 key 在每个目标 seg 上都有内存副本，否则抛错。"""
+        """核验：每个 key 在每个目标 seg 上都有内存副本，否则抛错。
+
+        demo 脚本用；L3（MooncakeBackend.query_task 的 READY 核验）按
+        「每个 key 在其映射目标上有副本」逐 key 判定，不走这里——本方法
+        的语义是「每个 key 在每个目标上都有」，对 rank 映射计划过强。
+        """
         key_list = list(keys)
         placement = self.batch_memory_replica_endpoints(key_list)
         missing: list[str] = []

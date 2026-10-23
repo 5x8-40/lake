@@ -62,7 +62,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 - 版本口径：**目标基线 = mooncake main**——E10 落地按 main 填充能力、按 main 语义实现；0.3.11 列仅为当前部署（demo 测试床 wheel）约束记录，部署升级后该列即废弃
 - 初版清单（每项都能指回 D2 事实条目）。格内口径分两层：
   - **RPC**：master / C++ 客户端是否具备该能力（与 kvcm 语言无关）
-    - 线协议 = ylt coro_rpc + struct_pack（`rpc_service.h` / `rpc_types.h` 的 `YLT_REFL`）
+    - 线协议 = ylt coro_rpc，序列化走 `rpc_types.h` 的 `YLT_REFL`（struct_pack 结构体反射——与 HA 快照落盘同一套宏，非 RPC 层专属证据；协议骨架在 `rpc_service.h`）
     - 没有独立的协议描述文件（无 `.proto` 类 IDL）：协议定义只在 C++ 结构体与编译产物里
     - 跨语言直连 = 自己实现一套协议客户端（编码规则、framing、函数 ID 都要从 C++ 源码反推），几千行且随版本漂移
     - 结论：kvcm 不看「RPC 有没有」，看下一条的「通道」
