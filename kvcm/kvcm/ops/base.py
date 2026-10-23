@@ -69,6 +69,14 @@ class VerifyError(RuntimeError):
     """
 
 
+class QueryError(RuntimeError):
+    """任务状态查询失败（RPC 错误等瞬时原因，可重试）。
+
+    与 VerifyError（终态）和编程错误（KeyError/TypeError 等，直接传播）
+    区分：编排层只应把本类当可重试处理。
+    """
+
+
 class KvOps(ABC):
     """原子操作接口。实现由存储后端适配器提供（如 mooncake 后端）。"""
 
@@ -129,7 +137,21 @@ class KvOps(ABC):
 
     @abstractmethod
     def query_task(self, handle: TaskHandle) -> TaskStatus:
-        """查询任务状态。任务管理面，非第九项 KV 操作。"""
+        """查询任务状态。任务管理面，非第九项 KV 操作。
+
+        失败语义：核验失败抛 VerifyError（终态）；查询本身失败抛
+        QueryError（可重试）；未知句柄抛 KeyError（编程错误，直接传播）。
+        """
+
+    @abstractmethod
+    def abandon(self, handle: TaskHandle) -> None:
+        """放弃跟踪：删除核验登记，任务状态记为 abandoned。
+
+        不是任务取消——后端没有任务取消能力，已发起的传输可能仍在进
+        行甚至成功；本方法只断开本进程与任务的跟踪关系（放弃等
+        READY），副本的后续清理由 remove 负责。调用场景：编排层超时或
+        主动放弃等待。放弃后句柄失效（再 query_task 抛 KeyError）。
+        """
 
     @abstractmethod
     def exists(self, prefix: Prefix) -> bool:

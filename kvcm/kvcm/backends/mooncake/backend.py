@@ -23,6 +23,7 @@ from kvcm.ledger import Ledger
 from kvcm.ops.base import (
     KvOps,
     OpKind,
+    QueryError,
     TaskHandle,
     TaskStatus,
     UnsupportedCapabilityError,
@@ -125,7 +126,10 @@ class MooncakeBackend(KvOps):
         if entry is None:
             raise KeyError(f"unknown task handle: {handle}")
         _, _, plan = entry
-        statuses = [self._client.query_task(tid).status for tid in handle.task_ids]
+        try:
+            statuses = [self._client.query_task(tid).status for tid in handle.task_ids]
+        except StoreClientError as e:
+            raise QueryError(str(e)) from e
         if any(s == StoreTaskStatus.FAILED for s in statuses):
             self._finish(handle, "failed")
             return TaskStatus.FAILED
@@ -134,7 +138,10 @@ class MooncakeBackend(KvOps):
         # READY 核验：每个 key 在其映射目标上有内存副本（不是每个 seg）
         missing: list[str] = []
         for key, seg in plan:
-            endpoints = self._client.batch_memory_replica_endpoints([key]).get(key, [])
+            try:
+                endpoints = self._client.batch_memory_replica_endpoints([key]).get(key, [])
+            except StoreClientError as e:
+                raise QueryError(str(e)) from e
             if seg not in endpoints:
                 missing.append(f"{key} missing on {seg} (have={sorted(endpoints)})")
         if missing:
@@ -145,6 +152,14 @@ class MooncakeBackend(KvOps):
             )
         self._finish(handle, "ready")
         return TaskStatus.READY
+
+    def abandon(self, handle: TaskHandle) -> None:
+        """放弃跟踪：Ledger 记 abandoned 并删登记（不取消后端任务——后
+        端无任务取消能力，在途传输可能仍完成；副本清理由 remove 负责）。"""
+        if handle not in self._plans:
+            raise KeyError(f"unknown task handle: {handle}")
+        self._record(handle, "abandoned")
+        self._plans.pop(handle, None)
 
     def exists(self, prefix: Prefix) -> bool:
         """全部 key 在池才为真（batch_is_exist；读即续租）。
@@ -207,15 +222,17 @@ class MooncakeBackend(KvOps):
         raise NotImplementedError("stop_keepalive：随保活注册表落地")
 
     def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
-        if kind is PinKind.HARD or self._cap.hard_pin_after.channel is not Support.YES:
-            if kind is PinKind.HARD:
+        if kind is PinKind.HARD:
+            if self._cap.hard_pin_after.channel is not Support.YES:
                 raise UnsupportedCapabilityError(
                     "hard pin 写入时固化，已存在的 KV 无法事后补标（全版本无此能力）"
                 )
+            raise NotImplementedError("hard pin：通道具备但尚未接线")
+        if self._cap.soft_pin_after.channel is not Support.YES:
             raise UnsupportedCapabilityError(
                 "soft pin 事后加：通道不具备（自封装 .so 接线前）"
             )
-        raise NotImplementedError("pin：事后通道待自封装 .so")
+        raise NotImplementedError("soft pin：通道具备但尚未接线")
 
     def demote(self, prefix: Prefix) -> None:
         raise NotImplementedError("demote：随释放流程落地")

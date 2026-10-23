@@ -5,7 +5,14 @@ from __future__ import annotations
 import pytest
 
 from kvcm.flows import PrefetchError, PrefetchFlow
-from kvcm.ops.base import KvOps, OpKind, TaskHandle, TaskStatus, VerifyError
+from kvcm.ops.base import (
+    KvOps,
+    OpKind,
+    QueryError,
+    TaskHandle,
+    TaskStatus,
+    VerifyError,
+)
 from kvcm.ops.capability import BackendCapability
 from kvcm.ops.types import InstanceId, PinKind, Prefix
 
@@ -38,6 +45,9 @@ class FakeOps(KvOps):
         if isinstance(nxt, Exception):
             raise nxt
         return nxt
+
+    def abandon(self, handle: TaskHandle) -> None:
+        self.calls.append("abandon")
 
     # 其余操作本流程不触及
     def move(self, prefix, target, source=None):
@@ -90,14 +100,23 @@ def test_verify_error_is_terminal_with_detail() -> None:
         PrefetchFlow(ops).run(_P, _T, poll_s=0)
 
 
-def test_query_rpc_error_retries_then_ready() -> None:
-    """查询 RPC 失败可重试：第一次抛错，第二次 READY，流程应成功。"""
-    ops = FakeOps(exists=True, seq=[RuntimeError("rpc boom"), TaskStatus.READY])
+def test_query_error_retries_then_ready() -> None:
+    """查询失败（QueryError）可重试：第一次抛错，第二次 READY，流程成功。"""
+    ops = FakeOps(exists=True, seq=[QueryError("rpc boom"), TaskStatus.READY])
     PrefetchFlow(ops).run(_P, _T, poll_s=0)
     assert ops.calls.count("query_task") == 2
 
 
-def test_timeout_raises() -> None:
+def test_programming_error_propagates_not_swallowed() -> None:
+    """编程错误（非 QueryError）直接传播——不得被吞成超时重试。"""
+    ops = FakeOps(exists=True, seq=[TypeError("boom: wrong type")])
+    with pytest.raises(TypeError, match="wrong type"):
+        PrefetchFlow(ops).run(_P, _T, poll_s=0, timeout_s=60)
+
+
+def test_timeout_abandons_handle() -> None:
+    """超时收口：放弃跟踪（abandon），再抛 PrefetchError。"""
     ops = FakeOps(exists=True, seq=[])  # 永远 RUNNING
     with pytest.raises(PrefetchError, match="not READY"):
         PrefetchFlow(ops).run(_P, _T, poll_s=0, timeout_s=0.01)
+    assert "abandon" in ops.calls

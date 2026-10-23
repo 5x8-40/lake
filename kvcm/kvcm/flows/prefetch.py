@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import time
 
-from kvcm.ops.base import KvOps, TaskStatus, VerifyError
+from kvcm.ops.base import KvOps, QueryError, TaskStatus, VerifyError
 from kvcm.ops.types import InstanceId, Prefix
 
 
@@ -62,14 +62,18 @@ class PrefetchFlow:
             except VerifyError as e:
                 # 任务完成但副本不到位：终态，带明细
                 raise PrefetchError(f"replica verify failed: {e}") from e
-            except Exception:
-                # 查询 RPC 失败：可重试，超时兜底（失败分类随 TaskEngine 细化）
+            except QueryError:
+                # 查询 RPC 失败：可重试，超时兜底。只捕获 QueryError——
+                # 编程错误（KeyError/TypeError 等）直接传播，不得吞成超时。
                 status = None
             if status is TaskStatus.READY:
                 return
             if status is TaskStatus.FAILED:
                 raise PrefetchError(f"copy task failed (handle={handle})")
             if time.monotonic() >= deadline:
+                # 超时收口：放弃跟踪（删登记 + 记 abandoned）；后端任务
+                # 可能仍在进行，副本清理由 remove 负责。
+                self._ops.abandon(handle)
                 raise PrefetchError(
                     f"copy not READY after {timeout_s}s (handle={handle})"
                 )

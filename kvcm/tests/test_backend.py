@@ -14,12 +14,17 @@ import types
 import pytest
 
 from kvcm.backends.mooncake.backend import MooncakeBackend, encode_task_id
-from kvcm.backends.mooncake.capability import mooncake_v0311
+from kvcm.backends.mooncake.capability import mooncake_v0311, mooncake_main
 from kvcm.backends.mooncake.client import StoreClient, entry_exists
 from kvcm.engines.vllm.keys import KeyComputer
 from kvcm.ledger import Ledger, prefix_key
-from kvcm.ops.base import OpKind, TaskStatus, VerifyError
-from kvcm.ops.types import InstanceId, Prefix
+from kvcm.ops.base import (
+    OpKind,
+    TaskStatus,
+    UnsupportedCapabilityError,
+    VerifyError,
+)
+from kvcm.ops.types import InstanceId, PinKind, Prefix
 
 # ---------------------------------------------------------------------------
 # fake mooncake.store 绑定
@@ -128,11 +133,25 @@ def test_task_failed_is_terminal_and_purged(fake_store_module, monkeypatch) -> N
 def test_verify_failure_raises_with_detail(fake_store_module, monkeypatch) -> None:
     """任务全部成功但副本不到位：VerifyError 带明细（非静默 FAILED）。"""
     client = FakeClient(replicas_on=["seg-ELSEWHERE"])
-    b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-    with pytest.raises(VerifyError, match="missing on seg-A"):
-        b.query_task(handle)
-    assert handle not in b._plans
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _backend(
+            client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led
+        )
+        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        with pytest.raises(VerifyError, match="missing on seg-A"):
+            b.query_task(handle)
+        assert handle not in b._plans
+        # 核验失败是终态：Ledger 迁 failed
+        for tid in handle.task_ids:
+            assert led.get_task(encode_task_id(tid)).status == "failed"  # type: ignore[union-attr]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
 
 
 def test_empty_prefix_raises(fake_store_module, monkeypatch) -> None:
@@ -239,5 +258,104 @@ def test_ledger_survives_reopen() -> None:
         led2 = Ledger(path)
         assert led2.list_keepalive() == [prefix_key(p)]
         led2.close()
+    finally:
+        os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# abandon（放弃跟踪）
+# ---------------------------------------------------------------------------
+
+
+def test_abandon_purges_and_marks(fake_store_module, monkeypatch) -> None:
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _backend(
+            FakeClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led
+        )
+        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        b.abandon(handle)
+        assert handle not in b._plans
+        for tid in handle.task_ids:
+            assert led.get_task(encode_task_id(tid)).status == "abandoned"  # type: ignore[union-attr]
+        # 放弃后句柄失效
+        with pytest.raises(KeyError):
+            b.query_task(handle)
+        with pytest.raises(KeyError):
+            b.abandon(handle)
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# pin 能力判定（SOFT 看 soft_pin_after，HARD 看 hard_pin_after）
+# ---------------------------------------------------------------------------
+
+
+def _pin_backend(monkeypatch, cap) -> MooncakeBackend:
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    return MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=cap,
+    )
+
+
+def test_pin_soft_unsupported_when_channel_no(fake_store_module, monkeypatch) -> None:
+    b = _pin_backend(monkeypatch, mooncake_v0311())  # soft 通道 NO
+    with pytest.raises(UnsupportedCapabilityError, match="soft pin"):
+        b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT)
+
+
+def test_pin_hard_always_unsupported(fake_store_module, monkeypatch) -> None:
+    b = _pin_backend(monkeypatch, mooncake_main())  # hard 通道 NO（全版本）
+    with pytest.raises(UnsupportedCapabilityError, match="hard pin"):
+        b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD)
+
+
+def test_pin_soft_not_implemented_when_channel_yes(fake_store_module, monkeypatch) -> None:
+    cap = mooncake_v0311()
+    from dataclasses import replace
+
+    from kvcm.ops.capability import Capability, Support
+
+    cap_yes = replace(
+        cap, soft_pin_after=Capability(Support.YES, Support.YES, "fake channel")
+    )
+    b = _pin_backend(monkeypatch, cap_yes)
+    with pytest.raises(NotImplementedError):
+        b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT)
+
+
+# ---------------------------------------------------------------------------
+# Ledger 副本/会话表（增删）
+# ---------------------------------------------------------------------------
+
+
+def test_ledger_replicas_and_sessions_crud() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    try:
+        led = Ledger(path)
+        p = Prefix(model_id="qwen", token_ids=(1, 2, 3))
+        led.put_replica("k1", "inst-B")
+        led.put_replica("k1", "inst-C")
+        assert sorted(led.list_replicas("k1")) == ["inst-B", "inst-C"]
+        led.delete_replica("k1", "inst-B")
+        assert led.list_replicas("k1") == ["inst-C"]
+        led.bind_session("s1", p, "inst-B")
+        led.bind_session("s1", Prefix(model_id="qwen", token_ids=(4,)), "inst-B")
+        assert len(led.list_session("s1")) == 2
+        led.unbind_session("s1")
+        assert led.list_session("s1") == []
+        led.close()
     finally:
         os.unlink(path)
