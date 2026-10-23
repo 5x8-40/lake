@@ -15,7 +15,8 @@ jobs:
     outputs:
       code: ${{ steps.filter.outputs.code }}
       cmx: ${{ steps.filter.outputs.cmx }}
-      precopy: ${{ steps.filter.outputs.precopy }}
+      kvcm_pkg: ${{ steps.filter.outputs.kvcm_pkg }}
+      kvcm_demo: ${{ steps.filter.outputs.kvcm_demo }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -32,7 +33,8 @@ jobs:
             if [ -z "$BEFORE" ] || [[ "$BEFORE" =~ ^0+$ ]]; then
               echo "code=true" >> "$GITHUB_OUTPUT"
               echo "cmx=true" >> "$GITHUB_OUTPUT"
-              echo "precopy=true" >> "$GITHUB_OUTPUT"
+              echo "kvcm_pkg=true" >> "$GITHUB_OUTPUT"
+              echo "kvcm_demo=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             RANGE="${BEFORE}...HEAD"
@@ -41,19 +43,26 @@ jobs:
           echo "$files"
           code=false
           cmx=false
-          precopy=false
+          kvcm_pkg=false
+          kvcm_demo=false
           if echo "$files" | grep -qE '^(rust|go|python|proto|scripts|deploy|bench)/|^\.github/workflows/build\.yml'; then
             code=true
           fi
           if echo "$files" | grep -qE '^tools/cmx-sim/'; then
             cmx=true
           fi
-          if echo "$files" | grep -qE '^kvcm/|^\.github/workflows/build\.yml'; then
-            precopy=true
+          # kvcm 隔离：产品代码/测试改动才跑单测；demo 改动才跑 demo 冒烟；
+          # kvcm/design、README、summary 等纯文档改动两个 job 都不触发。
+          if echo "$files" | grep -qE '^kvcm/(kvcm|tests)/|^\.github/workflows/build\.yml'; then
+            kvcm_pkg=true
+          fi
+          if echo "$files" | grep -qE '^kvcm/demo/|^\.github/workflows/build\.yml'; then
+            kvcm_demo=true
           fi
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "cmx=$cmx" >> "$GITHUB_OUTPUT"
-          echo "precopy=$precopy" >> "$GITHUB_OUTPUT"
+          echo "kvcm_pkg=$kvcm_pkg" >> "$GITHUB_OUTPUT"
+          echo "kvcm_demo=$kvcm_demo" >> "$GITHUB_OUTPUT"
 
   # 文档门禁:每条流水线都跑——纯文档 PR 的唯一必跑任务。
   docs-check:
@@ -67,11 +76,29 @@ jobs:
           python-version: "3.12"
       - run: python scripts/check_doc_links.py
 
-  # kvcm 冒烟(PR #53 review §四.B):无 NPU 依赖的离线检查——语法/编译/单测/干跑三向。
-  # 补丁对 rc1 源码的应用检查与上游逐字节比对需容器源码,留在本地,此处只做可解析性。
+  # kvcm 产品单测:kvcm/kvcm 与 kvcm/tests 改动才触发（pytest，无第三方依赖）。
   kvcm:
     needs: filter
-    if: needs.filter.outputs.precopy == 'true'
+    if: needs.filter.outputs.kvcm_pkg == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: kvcm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: python -m pytest tests/ -q
+
+  # kvcm demo 冒烟(PR #53 review §四.B):仅 kvcm/demo 改动触发——无 NPU 依赖的离线检查:
+  # 语法/编译/demo 单测/干跑三向。补丁对 rc1 源码的应用检查与上游逐字节比对需容器源码,留在本地。
+  kvcm-demo:
+    needs: filter
+    if: needs.filter.outputs.kvcm_demo == 'true'
     runs-on: ubuntu-latest
     defaults:
       run:
