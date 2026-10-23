@@ -1,7 +1,7 @@
 # D1: Router 集成与请求调度（预复制的选路侧）
 
 - 状态: **已闭环**——事实基线（F1-F15）已核实；六个设计问题全部闭环
-- 上游问题: [summary.md](summary.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
+- 上游问题: [summary.md](../summary.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
 - 角色约定: kvcm 目前没有 router 组件。本文选路面逻辑上分两层（§1）：**索引**（订阅事件流建索引）与 **Router**（查索引、决定请求发往哪个实例；gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能）。索引进程形态（内置 Router / 独立组件）归 D4
 
 ## 参考实现
@@ -10,15 +10,15 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 | 参考 | 锚点 | 借什么 | 关键差异 |
 |------|------|--------|----------|
-| lake 选路面 | `../go/router/modeselect.go::SelectExecMode` + `prefixHint`；[`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「权威、镜像与本地 overlay」 | 反向过时也不回查（只损性能）、miss 回退权威的经验 | lake router 是池感知组件（持位置视图镜像）；kvcm router 走经典事件驱动，不碰池位置 |
-| lake 命中定义 | [`../docs/features/features.md`](../docs/features/features.md)「Pool 命中 vs 本地命中」 | 术语：Pool 命中（省重算需传输）≠ 本地命中（省传输） | lake 本地命中指 L0/HBM 池放置；kvcm 的「本机」含 HBM 与本机 DRAM 两层，经 gpu/cpu 事件均可观测（§3） |
-| lake 单向边界 | [`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「池放置·调度读视图」 | 调度读视图、不反向指挥放置的边界形态 | lake 的池有自主放置能力；Mooncake 池没有，放置智能只能在外置控制面 |
-| llm-d Router | [`../docs/research/llm-d/overview.md`](../docs/research/llm-d/overview.md)「核心结论」；[`../docs/research/llm-d/architecture.md`](../docs/research/llm-d/architecture.md) §4 | 推测索引（事件确认前先用推测条目顶上，TTL 2s 自动过期） | llm-d 索引是事件流派生的副本视图（引擎才是真相）；master 直读没有该窗口 |
-| Dynamo router | [`../docs/research/dynamo/overview.md`](../docs/research/dynamo/overview.md)「Router(KV-aware)」 | 成本模型（分层命中×权重 + decode 占用 + 在途请求）；分层成本 device 1.0 / host 0.75 / disk 0.25；在途负载无权威、router 本地记账 | Dynamo 缓存状态权威在 worker 本地索引，router 靠事件逼近（丢事件需 gap→快照重放）；直读 master 无此失效模式。外部重算 block hash 链 Dynamo 已为先例（keys.py 同款） |
+| lake 选路面 | `../go/router/modeselect.go::SelectExecMode` + `prefixHint`；[`../docs/architecture/kv-cache-pool.md`](../../docs/architecture/kv-cache-pool.md)「权威、镜像与本地 overlay」 | 反向过时也不回查（只损性能）、miss 回退权威的经验 | lake router 是池感知组件（持位置视图镜像）；kvcm router 走经典事件驱动，不碰池位置 |
+| lake 命中定义 | [`../docs/features/features.md`](../../docs/features/features.md)「Pool 命中 vs 本地命中」 | 术语：Pool 命中（省重算需传输）≠ 本地命中（省传输） | lake 本地命中指 L0/HBM 池放置；kvcm 的「本机」含 HBM 与本机 DRAM 两层，经 gpu/cpu 事件均可观测（§3） |
+| lake 单向边界 | [`../docs/architecture/kv-cache-pool.md`](../../docs/architecture/kv-cache-pool.md)「池放置·调度读视图」 | 调度读视图、不反向指挥放置的边界形态 | lake 的池有自主放置能力；Mooncake 池没有，放置智能只能在外置控制面 |
+| llm-d Router | [`../docs/research/llm-d/overview.md`](../../docs/research/llm-d/overview.md)「核心结论」；[`../docs/research/llm-d/architecture.md`](../../docs/research/llm-d/architecture.md) §4 | 推测索引（事件确认前先用推测条目顶上，TTL 2s 自动过期） | llm-d 索引是事件流派生的副本视图（引擎才是真相）；master 直读没有该窗口 |
+| Dynamo router | [`../docs/research/dynamo/overview.md`](../../docs/research/dynamo/overview.md)「Router(KV-aware)」 | 成本模型（分层命中×权重 + decode 占用 + 在途请求）；分层成本 device 1.0 / host 0.75 / disk 0.25；在途负载无权威、router 本地记账 | Dynamo 缓存状态权威在 worker 本地索引，router 靠事件逼近（丢事件需 gap→快照重放）；直读 master 无此失效模式。外部重算 block hash 链 Dynamo 已为先例（keys.py 同款） |
 | Mooncake Conductor | mooncake 仓内 `mooncake-conductor/`：`object_key_parser.cpp::ParseVllmObjectKey`；HTTP 契约 RFC #1403（F14） | 现成独立索引组件：订阅引擎/池事件建全局前缀索引，Router 走 HTTP 查询；object_key 解析已覆盖 vLLM-Ascend key 布局（keys.py 一族） | Conductor 是只读索引，不管复制/保活/补发——与 kvcm 职责互补；组件级替代评估归 summary D4 |
 | Dynamo standalone indexer | dynamo 仓内 `lib/kv-router/src/services/indexer/`；`standalone-indexer.md` | RFC #1403 契约参照实现：`/register`（含 replay_endpoint）/ `/query` / **`/query_by_hash`**；gap 检测 + replay；P2P recovery（`--peers`，独立索引的 HA 答案）；`/query` 按 gpu/cpu/disk 分层返回 | 它只订引擎事件不订池。只有引擎一个事件源时，独立索引进程建出来的表和 router 自己建的内容完全一样，还多绕一跳网络——所以 Dynamo 的主流形态（kv-router）把索引放在 router 进程内，池视图另用 shared_cache 直订 master（F14）；`/register` 端点注册、`/query_by_hash`、gap replay、P2P recovery 可直接对标 |
 | Dynamo router 形态谱系 | dynamo 仓内 `router-operations.md`「Dynamo-Native Remote Indexer」；`configuration-and-tuning.md`「KV Indexer / Approx KV Indexer」 | 「索引放哪」在 Dynamo 是部署选项而不是架构定律，三种摆法：① 索引建在 router 进程内（默认）；② 独立 indexer 进程（索引与查询都移出 router）；③ 索引仍建在 router 进程内，但该 router 把查询开成 HTTP 服务（`--serve-indexer`），别的 router 来查（`--use-remote-indexer`）、自己不再建索引。另有 predict-on-route side indexer：router 把每次选路决定先写进一棵短 TTL 的辅助树，查询时主树辅树取较大值——解决「同前缀的一批请求同时到达、引擎还没来得及发 stored」被全部当 miss 打散的问题；辅助树要单独开，因为 router 自算的 hash 与引擎的 hash 口径不同，写进主树会把同一物理块挂成两个条目 | 辅助树那个约束我们不背：kvcm 补发用 keys.py 复算，与引擎同口径，可直接进主树（§2 方案 a）；「批内竞态要不要辅助树」归 D4 |
-| Mooncake 界限 | [`../docs/architecture/kv-cache-pool.md`](../docs/architecture/kv-cache-pool.md)「为何池必须自长 radix」 | Mooncake store 只存不透明字节块（无内容寻址、无前缀匹配）——预复制控制面是外置的「懂前缀 + 懂位置」层 | 不照搬 lake 的池内 radix：keys.py 按 key 逐把算，不建树；前缀匹配退化为「连续满块命中长度」 |
+| Mooncake 界限 | [`../docs/architecture/kv-cache-pool.md`](../../docs/architecture/kv-cache-pool.md)「为何池必须自长 radix」 | Mooncake store 只存不透明字节块（无内容寻址、无前缀匹配）——预复制控制面是外置的「懂前缀 + 懂位置」层 | 不照搬 lake 的池内 radix：keys.py 按 key 逐把算，不建树；前缀匹配退化为「连续满块命中长度」 |
 
 ## 事实基线（代码核实）
 
@@ -32,7 +32,7 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 - **F4 复制 API**：`create_copy_task(key, [seg])`（Python 绑定 `mooncake-integration/store/store_py.cpp:3362`）；master 只校验 key 存在 + 目标 seg 可分配（`master_service.cpp:13677 CreateCopyTask`）；整对象复制；源 seg 所在 client 必须在线（预热场景即写入该 key 的引擎；一般情形 = 挂载源 seg 的 client，源由 master 随机挑，D2 F7）；副本落位用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）。
 - **F5 副本无 pin：READY 后随时可能被池驱逐**：
   - 复制路径不加 pin / lease（F15），副本落位后不受保护，池驱逐策略说收就收。
-  - key 的 client_id 实例（最后写入 key 的引擎）下线后，master 只清**它自己 seg 上的副本**；key 在其他机器上的副本**不受影响、继续可读**——副本存亡绑定所在 seg 所在 client（副本所在 client），与 key 的 client_id 无关（代码锚点 v0.3.11 `CleanupStaleHandles` / main `replica.h::isAffiliatedWith`；10-20 受控复验：kill A 后 32/32、副本仍在 B seg、字节级读回成功，[EXPERIMENTS.md](EXPERIMENTS.md) 总表 #15；早期 0/32 观测为 key 名漂移假失败，踩坑 3——E5 已闭环，详见 D2 F6b）。
+  - key 的 client_id 实例（最后写入 key 的引擎）下线后，master 只清**它自己 seg 上的副本**；key 在其他机器上的副本**不受影响、继续可读**——副本存亡绑定所在 seg 所在 client（副本所在 client），与 key 的 client_id 无关（代码锚点 v0.3.11 `CleanupStaleHandles` / main `replica.h::isAffiliatedWith`；10-20 受控复验：kill A 后 32/32、副本仍在 B seg、字节级读回成功，[EXPERIMENTS.md](../demo/EXPERIMENTS.md) 总表 #15；早期 0/32 观测为 key 名漂移假失败，踩坑 3——E5 已闭环，详见 D2 F6b）。
   - mooncake 有 pin 机制（两版本），但都挂在写路径上（`PutStart` / `UpsertStart` 收 `ReplicateConfig`）：
     - **soft pin**：key 粒度的**限时**驱逐保护——0.3.11 是布尔开关 `with_soft_pin`（`replica.h:84-85` @0.3.11），main 升级为三态 `soft_pin_action`（`replica.h:64-68` @main）；TTL 默认 30min、上限 24h（`types.h:86-89` @main），到期自动失效；驱逐两轮制把它排最后（第一轮只逐无 soft pin 的，凑不够且 `allow_evict_soft_pinned_objects` 时软 pin 也可逐）——机制细节与版本差异以 D2 F1 为准。
     - **hard pin**（`with_hard_pin`）：显式 pin，不可驱逐——写入时设置并固化进对象元数据，之后改不了（D2 F1）。
@@ -292,11 +292,11 @@ flowchart LR
 
 ## 留给后续
 
-编号登记处（含 P/E 系列、状态与依赖）：[summary.md](summary.md)。
+编号登记处（含 P/E 系列、状态与依赖）：[summary.md](../summary.md)。
 
 - **D2**：KV 调度操作集（copy/move/keepalive/pin/demote/promote/retain/remove 八项；pin 两版本都挂在写路径上、复制路径带不了（F5），候选方案与client_id 问题见 D2 §2；释放有 `Remove` 系现成）
 - **D3**：副本生命周期与 READY 语义（副本所在 client = 所在 seg 所在 client：key 的 client_id 下线只清其 seg 内副本、远端副本保留（F5，E5 已闭环）；TTL、驱逐候选资格仍是 D3 输入）
 - **D4**：编排进程形态（预复制控制面独立进程或并入选路方；READY 确认接 gateway；seg→实例与「端点→实例」注册通道；预复制视图由控制面补发事件注入，§2）
 - **D5**：故障衔接（源 seg 所在 client 掉线 copy 失败（F4）、与重路由的先后）
-- **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../docs/research/vllm-ascend/layerwise-taxonomy.md)）
+- **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../../docs/research/vllm-ascend/layerwise-taxonomy.md)）
 - **D7**：方案 A（壳请求进 HBM）去留与叠加顺序

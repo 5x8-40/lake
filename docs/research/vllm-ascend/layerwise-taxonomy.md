@@ -89,7 +89,7 @@ sequenceDiagram
 - HBM 全层驻留：`extract_layout_config` 返回 None（`mooncake_layerwise.py:77-80`，docstring 原文 "Block-key transfer does not opt into GVA-backed physical reuse"）→ worker 不建共享 buffer（`worker.py:635-636`）
 - 读落点 = 请求自己的 block：`pool_worker.py:2263`（`request.block_ids[block_index]`）
 - 本地 APC 命中的块不重读：`start_block = vllm_cached_tokens // block_size`（`pool_worker.py:2229`；hybrid 路径 `mooncake_layerwise.py:345`）
-- → **HBM 预热成立**（见 [kv-prefetch.md](../../../kvcm/kv-prefetch.md) 方案 A）
+- → **HBM 预热成立**（见 [kv-prefetch.md](../../../kvcm/design/kv-prefetch.md) 方案 A）
 
 ## ③ 池 layerwise（gva 层复用）：`AscendStoreConnector` + Memcache
 
