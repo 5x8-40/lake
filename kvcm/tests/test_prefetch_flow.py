@@ -9,6 +9,7 @@ from kvcm.ops.base import (
     KvOps,
     OpKind,
     QueryError,
+    SubmitError,
     TaskHandle,
     TaskStatus,
     VerifyError,
@@ -23,9 +24,12 @@ _T = InstanceId("inst-B")
 class FakeOps(KvOps):
     """脚本化的 KvOps：记录调用顺序，按构造参数演出 exists/状态序列。"""
 
-    def __init__(self, *, exists: bool, seq: list[object]) -> None:
+    def __init__(
+        self, *, exists: bool, seq: list[object], copy_error: Exception | None = None
+    ) -> None:
         self._exists = exists
         self._seq = list(seq)
+        self._copy_error = copy_error
         self.calls: list[str] = []
 
     def capability(self) -> BackendCapability:
@@ -37,6 +41,8 @@ class FakeOps(KvOps):
 
     def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         self.calls.append("copy")
+        if self._copy_error is not None:
+            raise self._copy_error
         return TaskHandle(op=OpKind.COPY, task_ids=((1, 2), (3, 4)))
 
     def query_task(self, handle: TaskHandle) -> TaskStatus:
@@ -86,6 +92,15 @@ def test_exists_false_fails_before_copy() -> None:
     with pytest.raises(PrefetchError, match="not fully in pool"):
         PrefetchFlow(ops).run(_P, _T, poll_s=0)
     assert ops.calls == ["exists"]  # copy 未发起
+
+
+def test_submit_error_wrapped_as_prefetch_error() -> None:
+    """copy 提交失败（SubmitError 带明细）统一出口为 PrefetchError。"""
+    ops = FakeOps(
+        exists=True, seq=[], copy_error=SubmitError("1/2 tasks submitted: [(1, 101)]")
+    )
+    with pytest.raises(PrefetchError, match=r"copy submit failed.*\(1, 101\)"):
+        PrefetchFlow(ops).run(_P, _T, poll_s=0)
 
 
 def test_task_failed_raises() -> None:

@@ -72,9 +72,17 @@ class TaskRecord:
 class Ledger:
     """sqlite 状态记录。单进程使用（kvcm 单实例）。"""
 
+    _TASK_STATUSES = frozenset({"running", "ready", "failed", "abandoned"})
+
     def __init__(self, path: str) -> None:
         self._conn = sqlite3.connect(path)
         self._conn.executescript(_SCHEMA)
+
+    def __enter__(self) -> "Ledger":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
 
     def close(self) -> None:
         self._conn.close()
@@ -86,14 +94,25 @@ class Ledger:
     def upsert_task(
         self, task_id: str, *, op: str, prefix: Prefix, target: str, status: str
     ) -> None:
+        self.upsert_tasks([task_id], op=op, prefix=prefix, target=target, status=status)
+
+    def upsert_tasks(
+        self, task_ids: list[str], *, op: str, prefix: Prefix, target: str, status: str
+    ) -> None:
+        """批量 upsert（单事务）——多任务同时迁移时不出现半新半旧。"""
+        if status not in self._TASK_STATUSES:
+            raise ValueError(f"unknown task status: {status!r}")
         now = time.time()
-        self._conn.execute(
-            "INSERT INTO tasks (task_id, op, prefix_key, target, status, created_at, updated_at)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?)"
-            " ON CONFLICT(task_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
-            (task_id, op, prefix_key(prefix), target, status, now, now),
-        )
-        self._conn.commit()
+        with self._conn:
+            self._conn.executemany(
+                "INSERT INTO tasks (task_id, op, prefix_key, target, status, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(task_id) DO UPDATE SET status=excluded.status, updated_at=excluded.updated_at",
+                [
+                    (tid, op, prefix_key(prefix), target, status, now, now)
+                    for tid in task_ids
+                ],
+            )
 
     def get_task(self, task_id: str) -> TaskRecord | None:
         row = self._conn.execute(

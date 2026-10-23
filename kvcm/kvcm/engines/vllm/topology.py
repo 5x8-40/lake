@@ -128,9 +128,11 @@ def _listen_ports_by_pid() -> dict[int, list[int]]:
     ``ss`` 缺失（极简容器）时兜底 /proc 解析。
     """
     try:
-        proc = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True)
+        proc = subprocess.run(["ss", "-ltnp"], capture_output=True, text=True, timeout=10)
     except FileNotFoundError:
         return _listen_ports_by_pid_proc()
+    except subprocess.TimeoutExpired as e:
+        raise ProbeError(_PROBE_NO_SS, f"ss -ltnp timed out after 10s: {e}") from e
     out: dict[int, set[int]] = {}
     for ln in proc.stdout.splitlines():
         m = re.search(r"pid=(\d+)", ln)
@@ -251,7 +253,10 @@ def probe_ssh(ssh_cmd: str, pidfile: str) -> list[tuple[int, int | None, list[in
     with open(os.path.abspath(__file__), encoding="utf-8") as f:
         src = f.read()
     cmd = shlex.split(ssh_cmd) + ["python3", "-", "--local-probe", pidfile]
-    proc = subprocess.run(cmd, input=src, capture_output=True, text=True)
+    try:
+        proc = subprocess.run(cmd, input=src, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired as e:
+        raise ProbeError(-1, f"ssh probe timed out after 30s: {e}") from e
     if proc.returncode != 0:
         raise ProbeError(
             proc.returncode,

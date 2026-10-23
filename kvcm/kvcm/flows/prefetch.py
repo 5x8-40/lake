@@ -8,26 +8,28 @@
 4. 保活注册与 READY 事件补发随后续接线（保活落地后注册；补发归接口
    层 EventPublisher）
 
-失败分类：
+失败分类（统一出口 = PrefetchError；编程错误除外，直接传播）：
+- 前置检查不过 / copy 提交失败（SubmitError，带已发任务号明细）——
+  终态上抛
 - 核验失败（VerifyError：任务完成但副本不到位）——终态，带明细上抛
-- 查询失败（RPC 错误）——可重试，继续轮询到超时兜底
-- 任务 FAILED / 超时——终态上抛
+- 查询失败（QueryError：RPC 错误）——可重试，继续轮询到超时兜底
+- 任务 FAILED / 超时——终态上抛；超时先 abandon 收口（删登记 + 记
+  abandoned），再抛
 
 任务状态同步轮询是本步形态；进程化后由 TaskEngine 跟踪（并发上限 +
 限速器），流程本体不变。重发 / 弃置清副本 / 源掉线衔接的策略归
 TaskEngine。
 
-任务状态记录（Ledger）由后端实现侧在 copy / query_task 时登记迁移，
-本流程不直接写——记账需要任务号的持久化编码与状态迁移的时机，两
-样都只在实现侧手里；编排层记账两头都缺，还会漏分支（超时、异常路
-径没人写）。
+任务状态记录（Ledger）由后端实现侧在 copy / query_task / abandon 时
+登记迁移，本流程不直接写——记账需要任务号的持久化编码与状态迁移
+的时机，两样都只在实现侧手里。
 """
 
 from __future__ import annotations
 
 import time
 
-from kvcm.ops.base import KvOps, QueryError, TaskStatus, VerifyError
+from kvcm.ops.base import KvOps, QueryError, SubmitError, TaskStatus, VerifyError
 from kvcm.ops.types import InstanceId, Prefix
 
 
@@ -54,7 +56,10 @@ class PrefetchFlow:
             raise PrefetchError(
                 "prefix not fully in pool — warm 未覆盖该前缀，或 key 口径与引擎漂移"
             )
-        handle = self._ops.copy(prefix, target)
+        try:
+            handle = self._ops.copy(prefix, target)
+        except SubmitError as e:
+            raise PrefetchError(f"copy submit failed: {e}") from e
         deadline = time.monotonic() + timeout_s
         while True:
             try:

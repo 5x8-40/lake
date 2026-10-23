@@ -65,6 +65,12 @@ class StoreClient:
             master_server_address,
         )
         if rc != 0:
+            # setup 失败的对象仍可能持有已初始化的内部资源（注册线程等），
+            # 显式 close 再抛，不靠 GC 碰运气。
+            try:
+                store.close()
+            except Exception:
+                pass
             raise StoreClientError(
                 f"store setup failed rc={rc} "
                 f"host={local_hostname} master={master_server_address}"

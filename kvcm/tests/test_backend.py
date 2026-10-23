@@ -20,6 +20,7 @@ from kvcm.engines.vllm.keys import KeyComputer
 from kvcm.ledger import Ledger, prefix_key
 from kvcm.ops.base import (
     OpKind,
+    SubmitError,
     TaskStatus,
     UnsupportedCapabilityError,
     VerifyError,
@@ -178,7 +179,7 @@ def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> N
 
     client = BoomClient()
     b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    with pytest.raises(Exception, match=r"1/2 tasks.*\[\(1, 101\)\]"):
+    with pytest.raises(SubmitError, match=r"1/2 tasks.*\[\(1, 101\)\]"):
         b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
 
 
@@ -331,6 +332,42 @@ def test_pin_soft_not_implemented_when_channel_yes(fake_store_module, monkeypatc
     b = _pin_backend(monkeypatch, cap_yes)
     with pytest.raises(NotImplementedError):
         b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT)
+
+
+# ---------------------------------------------------------------------------
+# Ledger：批量事务 / status 校验 / 上下文管理器
+# ---------------------------------------------------------------------------
+
+
+def test_ledger_upsert_tasks_single_transaction() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    try:
+        with Ledger(path) as led:
+            p = Prefix(model_id="qwen", token_ids=(1,))
+            led.upsert_tasks(["t1", "t2", "t3"], op="copy", prefix=p, target="i", status="running")
+            for tid in ("t1", "t2", "t3"):
+                assert led.get_task(tid).status == "running"  # type: ignore[union-attr]
+    finally:
+        os.unlink(path)
+
+
+def test_ledger_status_validation() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    try:
+        with Ledger(path) as led:
+            with pytest.raises(ValueError, match="unknown task status"):
+                led.upsert_task(
+                    "t1", op="copy", prefix=Prefix(model_id="q", token_ids=(1,)),
+                    target="i", status="reddy",  # 拼写错误必须在写入时失败
+                )
+    finally:
+        os.unlink(path)
 
 
 # ---------------------------------------------------------------------------

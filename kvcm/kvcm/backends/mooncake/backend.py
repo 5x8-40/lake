@@ -24,6 +24,7 @@ from kvcm.ops.base import (
     KvOps,
     OpKind,
     QueryError,
+    SubmitError,
     TaskHandle,
     TaskStatus,
     UnsupportedCapabilityError,
@@ -104,7 +105,7 @@ class MooncakeBackend(KvOps):
         except Exception as e:
             # 已发起的任务必须带在异常上——否则这些任务无句柄可查，
             # 成为池里没人跟踪的在途传输。
-            raise StoreClientError(
+            raise SubmitError(
                 f"copy submit failed after {len(task_ids)}/{len(plan)} tasks "
                 f"(submitted ids: {task_ids}): {e}"
             ) from e
@@ -189,14 +190,13 @@ class MooncakeBackend(KvOps):
         if entry is None:
             return
         prefix, target, _ = entry
-        for tid in handle.task_ids:
-            self._ledger.upsert_task(
-                encode_task_id(tid),
-                op=handle.op.value,
-                prefix=prefix,
-                target=str(target),
-                status=status,
-            )
+        self._ledger.upsert_tasks(
+            [encode_task_id(tid) for tid in handle.task_ids],
+            op=handle.op.value,
+            prefix=prefix,
+            target=str(target),
+            status=status,
+        )
 
     def _finish(self, handle: TaskHandle, status: str) -> None:
         """终态处理：Ledger 迁移 + 删核验登记（防长驻进程泄漏）。"""
