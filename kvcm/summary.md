@@ -258,7 +258,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 ### B. 服务化重构（骨架可直接开工，接口依赖设计）
 
-- **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），按五层架构重组（L3 原子操作抽象屏蔽后端语义 + L4 mooncake 适配器 + L2 编排层只调 L3），明确状态归属与接口边界，为进程化打基础。**可直接开工**。设计：[code-architecture.md](design/code-architecture.md)
+- **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），按五层架构重组（L3 原子操作抽象屏蔽后端语义 + L4 mooncake 适配器 + L2 编排层只调 L3），明确状态归属与接口边界，为进程化打基础。🟡 **进行中**——三步（Ledger / L3+L4 / L2+API）已落地，PR 审核中。设计：[code-architecture.md](design/code-architecture.md)
 - **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。分层与模块划分：[code-architecture.md](design/code-architecture.md)
 - **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC 候选，与仓内跨语言 RPC 选型一致）。协议字段依赖 D4 定型；通道骨架可先行。
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例启动 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3 耦合；D5 已闭环，见本文）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。

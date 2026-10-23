@@ -2,7 +2,7 @@
 
 - 定位：kvcm 服务化（E10 重构 / E11 进程化 / E15 并行限速）的模块分层设计，E10 开工依据
 - 本文**不新增机制结论**——操作语义、完成信号、幂等性、能力事实全部引自 [D1-router-scheduling.md](D1-router-scheduling.md) / [D2-kv-operations.md](D2-kv-operations.md)；本文只把它们落成代码结构
-- 语言：Python（继承现有 `demo/precopy/` 1577 行与 mooncake store_py 绑定、keys.py 与引擎同口径；换语言属独立决策，不在本文）
+- 语言：Python（**已定**，2026-10-23 拍板：继承现有 `demo/precopy/` 1577 行与 mooncake store_py 绑定、keys.py 与引擎同口径）
 
 ## 分层总览
 
@@ -19,7 +19,7 @@ L4 适配层     两个正交维度，各一实现：
 L5 状态层     Ledger（sqlite，四类状态记录）
 ```
 
-- 依赖方向只允许向下：L1 → L2 → L3 ← L4；L5 被 L2/L4 持有
+- 依赖方向只允许向下：L1 → L2 → L3 ← L4；L5 由 L4（后端实现侧）持有，L2 不直接碰——L2 经 L3 操作间接受益于实现侧记账（任务状态迁移的时机只有实现侧知道）
 - 核心思想：**原子操作屏蔽后端与引擎语义**——L2 编排对任何存储后端、任何推理引擎成立；换后端换 StoreBackend，换引擎换 EngineAdapter
 
 ## L1 接口层（进程对外通道）
@@ -62,7 +62,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 - 版本口径：**目标基线 = mooncake main**——E10 落地按 main 填充能力、按 main 语义实现；0.3.11 列仅为当前部署（demo 测试床 wheel）约束记录，部署升级后该列即废弃
 - 初版清单（每项都能指回 D2 事实条目）。格内口径分两层：
   - **RPC**：master / C++ 客户端是否具备该能力（与 kvcm 语言无关）
-    - 线协议 = ylt coro_rpc + struct_pack（`rpc_service.h` / `rpc_types.h` 的 `YLT_REFL`）
+    - 线协议 = ylt coro_rpc，序列化走 `rpc_types.h` 的 `YLT_REFL`（struct_pack 结构体反射——与 HA 快照落盘同一套宏，非 RPC 层专属证据；协议骨架在 `rpc_service.h`）
     - 没有独立的协议描述文件（无 `.proto` 类 IDL）：协议定义只在 C++ 结构体与编译产物里
     - 跨语言直连 = 自己实现一套协议客户端（编码规则、framing、函数 ID 都要从 C++ 源码反推），几千行且随版本漂移
     - 结论：kvcm 不看「RPC 有没有」，看下一条的「通道」
@@ -106,6 +106,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 | capability 填充 | 按后端版本填充能力声明（目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | 新增，L3 表驱动 |
 
 - **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——放通用层会把后端概念带进通用接口
+- **一个后端实例 = 一种 (源 TP, 目标 TP, put_step) 组合**：KeyComputer 的异构展开口径在构造期定死（`kvcm/engines/vllm/keys.py::KeyComputer` docstring 记了完整前提链），换组合必须新建实例——编排层持多组合时按组合各建一个，不复用
 - **第二后端候选已登记在案**：昇腾 MemCache（`3rdparty/memcache`；kv-prefetch.md 待定项「生产默认走 MemCache，还是留 Mooncake」）——L3 抽象现在建正是时候；但只建一层接口，第二后端真接入时再修接口，不为假想后端过度设计
 
 #### 三条接入通道（mooncake）
@@ -128,23 +129,23 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 **自封装 .so**（补两个缺口：空写 upsert、retained 注册——绑定、HTTP、C 接口都没有，C++ client 类有）：
 
 - 写法：照 `store_py.cpp` 的写法——`#include` mooncake 头文件，调 C++ client 类方法，对外暴露 pybind 或 extern "C" 接口；产物放 kvcm 侧，不改 mooncake 源码
-- 单 client 保证（约束见上「三条接入通道」节：store_py 与 shim 必须共用同一 client 实例/UUID）：
-  - 不能走的写法：shim 自己 `RealClient::create()` 再建一个 → 两个 UUID 两套心跳
-  - **路径 A（首选）：shim 复用 store_py 已建的 client**
+- 单 client 保证（约束见上「三条接入通道」节：store_py 与自封装 .so 必须共用同一 client 实例/UUID）：
+  - 不能走的写法：自封装 .so 自己 `RealClient::create()` 再建一个 → 两个 UUID 两套心跳
+  - **路径 A（首选）：自封装 .so 复用 store_py 已建的 client**
     - 依据：`MooncakeStorePyWrapper` 的成员 `store_` 是 public（`store_py.cpp:288`，holder 为 `std::shared_ptr<PyClient>`），另有 public 访问器 `get_real_client()`（`:1075`）
-    - 做法：shim 用 pybind11 写，函数参数声明为 `MooncakeStorePyWrapper&`；Python 侧把 store_py 建好的 store 对象传进来，pybind11 跨模块按 typeid 查全局 registry 还原 C++ 对象 → 经 `store_` / `get_real_client()` 拿到同一个 `RealClient`，调缺口方法
-    - 效果：全进程一个 client 实例、一个 UUID、一套心跳；已有绑定与 shim 缺口方法落在同一 client 上
-    - 前提：shim 编译用的 pybind11 与 wheel 内 store_py 的 internals 版本一致（不一致则跨模块 cast 查不到类型）；RTTI 开启（wheel 默认开）
-  - **路径 B（退路）：shim 取代 store_py**——shim 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）+ 缺口方法重新绑定一遍，Python 只 import shim；天然单 client、不依赖跨模块 cast，代价是复制绑定面
+    - 做法：自封装 .so 用 pybind11 写，函数参数声明为 `MooncakeStorePyWrapper&`；Python 侧把 store_py 建好的 store 对象传进来，pybind11 跨模块按 typeid 查全局 registry 还原 C++ 对象 → 经 `store_` / `get_real_client()` 拿到同一个 `RealClient`，调缺口方法
+    - 效果：全进程一个 client 实例、一个 UUID、一套心跳；已有绑定与自封装 .so 缺口方法落在同一 client 上
+    - 前提：自封装 .so 编译用的 pybind11 与 wheel 内 store_py 的 internals 版本一致（不一致则跨模块 cast 查不到类型）；RTTI 开启（wheel 默认开）
+  - **路径 B（退路）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）+ 缺口方法重新绑定一遍，Python 只 import 自封装 .so；天然单 client、不依赖跨模块 cast，代价是复制绑定面
 - 为什么不能 Python 直调（ctypes）：
   - ctypes 能调 C 函数，但造不了 C++ 对象
   - 方法参数和返回是 C++ 类型（`std::string` 的 SSO 布局、`UUID` struct、`tl::expected` 返回值），在 Python 里按字节拼这些对象 = 手工复刻编译器的类型布局，且布局随 libstdc++ 版本变
   - 所以中间必须有一层 C++：它用头文件调类方法（布局由编译器保证），对 Python 只暴露 C 类型
   - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）
-- 两个断点（E6 在测试机验证）：
-  1. 符号可见性：client 类符号是否从 wheel 的 .so 导出（`nm -D --defined-only <so> | c++filt`；符号不导出则此路不通，退回替代实现）
-  2. ABI 匹配：封装层编译环境（gcc/libstdc++）与 wheel 构建环境不一致则不可用；走路径 A 另要求 shim 的 pybind11 internals 版本与 wheel 内 store_py 的一致
-- E6 另核：`/query_key` 的续租副作用在核验场景能否接受。（已核一条：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定，上游亦原生支持 NPU——v0.3.11 tag 已有 `ascend_transport` 目录）
+- 两个断点（E6；x86 参考已核一半，npu wheel 待测试机复核）：
+  1. 符号可见性：**x86 0.3.13 wheel 已验证通过**——`Client` 类方法本体全部导出（`nm -D` 实测：`BatchUpsert` / `CreateCopyTask` / `CreateMoveTask` 及 `RealClient::upsert_*_helper` 均在，连 `MooncakeStorePyWrapper` 自身符号也导出）；npu 0.3.11 wheel 待测试机复核（同一构建系统，预期一致；符号不导出则此路不通，退回替代实现）
+  2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机；路径 A 的 pybind11 对齐已查明：mooncake 锁定 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a），自封装 .so 编译用同版本即可对齐 internals
+- E6 另核：`/query_key` 的续租副作用在核验场景能否接受；retained 注册的具体符号名按 main 源码确认（0.3.13 x86 wheel 未见 retained 符号）。（已核一条：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定，上游亦原生支持 NPU——v0.3.11 tag 已有 `ascend_transport` 目录）
 
 ### EngineAdapter（引擎适配）
 
@@ -153,7 +154,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 | 子件 | 职责 | 现有代码来源 |
 |------|------|-------------|
 | KeyComputer | 前缀 → hash 链 → PoolKey（与引擎同口径） | `demo/precopy/keys.py`（lazy-import vllm-ascend `KeyMetadata`/`PoolKey` 保证同口径） |
-| RankTopology | rank↔KV shard 形状（TP/PP/DP 切分；异构 TP 的 `decode_tp_size`/`prefill_tp_size` 语义）；rank↔seg 对号 | `demo/precopy/resolve.py` 的 rank 侧降为对号实现 |
+| RankTopology | rank↔KV shard 形状（TP/PP/DP 切分；异构 TP 的对端 TP 语义——引擎 env `PEER_TP_SIZE`，10-12 已由 `decode_tp_size`/`prefill_tp_size` 正名，kvcm `peer_tp_size` 须与之同值）；rank↔seg 对号 | `demo/precopy/resolve.py` 的 rank 侧降为对号实现 |
 | 事件格式 | 引擎 KV 事件（`BlockStored` 等）schema 的生成/解析 | EventPublisher 补发时按本格式构造 |
 | engine config | block_size / num_kv_heads / head_size / 层数读取（KV 大小估算，E14 容量规划输入） | 新增 |
 
