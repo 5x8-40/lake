@@ -112,3 +112,11 @@ class KvOps(ABC):
     @abstractmethod
     def query_task(self, handle: TaskHandle) -> TaskStatus:
         """查询任务状态。任务管理面，非第九项 KV 操作。"""
+
+    @abstractmethod
+    def exists(self, prefix: Prefix) -> bool:
+        """前缀 KV 是否完整在池（全部 key 都在）。
+
+        查询面，非第九项 KV 操作。注意：读即续租（能力集 has_lease）——
+        本检查同时是保活机制的续租通道；预热编排用它做前置检查（warm
+        未覆盖前缀或 key 口径漂移时 fail fast，复制无意义）。"""

@@ -127,6 +127,13 @@ class MooncakeBackend(KvOps):
             return TaskStatus.FAILED
         return TaskStatus.READY
 
+    def exists(self, prefix: Prefix) -> bool:
+        """全部 key 在池才为真（batch_is_exist；读即续租）。"""
+        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        if not keys:
+            return False
+        return all(self._client.is_exist(keys))
+
     # ------------------------------------------------------------------
     # 以下操作随能力接线逐个落地
     # ------------------------------------------------------------------
