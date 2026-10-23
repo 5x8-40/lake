@@ -128,14 +128,14 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 **自封装 .so**（补两个缺口：空写 upsert、retained 注册——绑定、HTTP、C 接口都没有，C++ client 类有）：
 
 - 写法：照 `store_py.cpp` 的写法——`#include` mooncake 头文件，调 C++ client 类方法，对外暴露 pybind 或 extern "C" 接口；产物放 kvcm 侧，不改 mooncake 源码
-- 单 client 保证（约束见上「三条接入通道」节：store_py 与 shim 必须共用同一 client 实例/UUID）：
-  - 不能走的写法：shim 自己 `RealClient::create()` 再建一个 → 两个 UUID 两套心跳
-  - **路径 A（首选）：shim 复用 store_py 已建的 client**
+- 单 client 保证（约束见上「三条接入通道」节：store_py 与自封装 .so 必须共用同一 client 实例/UUID）：
+  - 不能走的写法：自封装 .so 自己 `RealClient::create()` 再建一个 → 两个 UUID 两套心跳
+  - **路径 A（首选）：自封装 .so 复用 store_py 已建的 client**
     - 依据：`MooncakeStorePyWrapper` 的成员 `store_` 是 public（`store_py.cpp:288`，holder 为 `std::shared_ptr<PyClient>`），另有 public 访问器 `get_real_client()`（`:1075`）
-    - 做法：shim 用 pybind11 写，函数参数声明为 `MooncakeStorePyWrapper&`；Python 侧把 store_py 建好的 store 对象传进来，pybind11 跨模块按 typeid 查全局 registry 还原 C++ 对象 → 经 `store_` / `get_real_client()` 拿到同一个 `RealClient`，调缺口方法
-    - 效果：全进程一个 client 实例、一个 UUID、一套心跳；已有绑定与 shim 缺口方法落在同一 client 上
-    - 前提：shim 编译用的 pybind11 与 wheel 内 store_py 的 internals 版本一致（不一致则跨模块 cast 查不到类型）；RTTI 开启（wheel 默认开）
-  - **路径 B（退路）：shim 取代 store_py**——shim 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）+ 缺口方法重新绑定一遍，Python 只 import shim；天然单 client、不依赖跨模块 cast，代价是复制绑定面
+    - 做法：自封装 .so 用 pybind11 写，函数参数声明为 `MooncakeStorePyWrapper&`；Python 侧把 store_py 建好的 store 对象传进来，pybind11 跨模块按 typeid 查全局 registry 还原 C++ 对象 → 经 `store_` / `get_real_client()` 拿到同一个 `RealClient`，调缺口方法
+    - 效果：全进程一个 client 实例、一个 UUID、一套心跳；已有绑定与自封装 .so 缺口方法落在同一 client 上
+    - 前提：自封装 .so 编译用的 pybind11 与 wheel 内 store_py 的 internals 版本一致（不一致则跨模块 cast 查不到类型）；RTTI 开启（wheel 默认开）
+  - **路径 B（退路）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）+ 缺口方法重新绑定一遍，Python 只 import 自封装 .so；天然单 client、不依赖跨模块 cast，代价是复制绑定面
 - 为什么不能 Python 直调（ctypes）：
   - ctypes 能调 C 函数，但造不了 C++ 对象
   - 方法参数和返回是 C++ 类型（`std::string` 的 SSO 布局、`UUID` struct、`tl::expected` 返回值），在 Python 里按字节拼这些对象 = 手工复刻编译器的类型布局，且布局随 libstdc++ 版本变
@@ -143,7 +143,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
   - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）
 - 两个断点（E6；x86 参考已核一半，npu wheel 待测试机复核）：
   1. 符号可见性：**x86 0.3.13 wheel 已验证通过**——`Client` 类方法本体全部导出（`nm -D` 实测：`BatchUpsert` / `CreateCopyTask` / `CreateMoveTask` 及 `RealClient::upsert_*_helper` 均在，连 `MooncakeStorePyWrapper` 自身符号也导出）；npu 0.3.11 wheel 待测试机复核（同一构建系统，预期一致；符号不导出则此路不通，退回替代实现）
-  2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机；路径 A 的 pybind11 对齐已查明：mooncake 锁定 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a），shim 编译用同版本即可对齐 internals
+  2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机；路径 A 的 pybind11 对齐已查明：mooncake 锁定 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a），自封装 .so 编译用同版本即可对齐 internals
 - E6 另核：`/query_key` 的续租副作用在核验场景能否接受；retained 注册的具体符号名按 main 源码确认（0.3.13 x86 wheel 未见 retained 符号）。（已核一条：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定，上游亦原生支持 NPU——v0.3.11 tag 已有 `ascend_transport` 目录）
 
 ### EngineAdapter（引擎适配）
