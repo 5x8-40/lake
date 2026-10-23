@@ -1,15 +1,11 @@
-#!/usr/bin/env python3
 """MooncakeBackend._build_plan 与 Ledger 单元检查（离线，无 mooncake 依赖）。"""
 
 from __future__ import annotations
 
 import os
-import sys
 import tempfile
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+import pytest
 
 from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.client import StoreClient
@@ -37,8 +33,9 @@ def _keys(tp: int, hashes: list[str] | None = None) -> list[str]:
 
 def test_plan_tp1_single_seg() -> None:
     b = _backend(tp=1)
-    plan = b._build_plan(_keys(1), ["10.0.0.1:5001"])
-    assert plan == [(k, "10.0.0.1:5001") for k in _keys(1)]
+    keys = _keys(1)
+    plan = b._build_plan(keys, ["10.0.0.1:5001"])
+    assert plan == [(k, "10.0.0.1:5001") for k in keys]
 
 
 def test_plan_tp2_rank_mapped() -> None:
@@ -61,12 +58,8 @@ def test_plan_hetero_reverse_expands() -> None:
 def test_plan_rank_overflow_fails() -> None:
     b = _backend(tp=2)
     keys = _keys(4)  # rank 0..3，但无 peer 配置 → 不展开
-    try:
+    with pytest.raises(ValueError, match="rank max=3"):
         b._build_plan(keys, ["10.0.0.1:5001", "10.0.0.1:5002"])
-    except ValueError as e:
-        assert "rank max=3" in str(e)
-        return
-    raise AssertionError("expected ValueError")
 
 
 # ---------------------------------------------------------------------------
@@ -105,17 +98,3 @@ def test_ledger_four_tables() -> None:
         led.close()
     finally:
         os.unlink(path)
-
-
-TESTS = [
-    test_plan_tp1_single_seg,
-    test_plan_tp2_rank_mapped,
-    test_plan_hetero_reverse_expands,
-    test_plan_rank_overflow_fails,
-    test_ledger_four_tables,
-]
-
-if __name__ == "__main__":
-    for t in TESTS:
-        t()
-    print(f"test_backend: PASS ({len(TESTS)} cases)")

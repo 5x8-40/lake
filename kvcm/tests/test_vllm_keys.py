@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """kvcm.engines.vllm.keys 单元检查。
 
 纯字符串用例随处可跑；``test_upstream_parity`` 是容器内漂移哨兵：内置
@@ -9,11 +8,9 @@ rc1 镜像与真实 vllm-ascend PoolKey 逐字节比对——变红 = 上游改�
 from __future__ import annotations
 
 import os
-import sys
+import tempfile
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if _ROOT not in sys.path:
-    sys.path.insert(0, _ROOT)
+import pytest
 
 from kvcm.engines.vllm import keys as km
 from kvcm.engines.vllm.keys import (
@@ -41,10 +38,7 @@ def test_layer_key_format() -> None:
 
 def test_expand_tp2() -> None:
     keys = expand_store_keys(
-        model_name="qwen",
-        chunk_hashes=["h0"],
-        tp_size=2,
-        prefer_upstream=False,
+        model_name="qwen", chunk_hashes=["h0"], tp_size=2, prefer_upstream=False
     )
     assert len(keys) == 2
     assert "head_or_tp_rank:0" in keys[0]
@@ -53,10 +47,7 @@ def test_expand_tp2() -> None:
 
 def test_expand_tp4_two_blocks() -> None:
     keys = expand_store_keys(
-        model_name="qwen",
-        chunk_hashes=["h0", "h1"],
-        tp_size=4,
-        prefer_upstream=False,
+        model_name="qwen", chunk_hashes=["h0", "h1"], tp_size=4, prefer_upstream=False
     )
     assert len(keys) == 8
     by = group_keys_by_rank(keys)
@@ -87,11 +78,33 @@ def test_expand_layerwise() -> None:
     assert all("@layer_id:" in k for k in keys)
 
 
+def test_load_keys_file() -> None:
+    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
+        f.write("# comment\n\nkey_a\n  key_b  \n")
+        path = f.name
+    try:
+        assert load_keys_file(path) == ["key_a", "key_b"]
+    finally:
+        os.unlink(path)
+
+
+def test_key_computer_expand() -> None:
+    kc = km.KeyComputer(model_name="qwen", tp_size=2)
+    keys = kc.expand(["h0"])
+    assert len(keys) == 2
+    assert parse_key_rank(keys[0]) == 0
+    # 异构 TP：peer 更大则按 peer 展开
+    kc_h = km.KeyComputer(model_name="qwen", tp_size=2, peer_tp_size=4)
+    assert kc_h.effective_tp == 4
+    assert len(kc_h.expand(["h0"])) == 4
+
+
+@pytest.mark.skipif(
+    km.upstream_key_classes() is None,
+    reason="vllm_ascend not importable (offline)",
+)
 def test_upstream_parity() -> None:
     """容器内哨兵：镜像必须与上游 PoolKey 逐字节一致。"""
-    if km.upstream_key_classes() is None:
-        print("skip upstream parity: vllm_ascend not importable (offline)")
-        return
     for tp, step in [(1, 1), (2, 1), (4, 1), (4, 2), (4, 4)]:
         up = expand_store_keys(
             model_name="qwen",
@@ -129,44 +142,3 @@ def test_upstream_parity() -> None:
         prefer_upstream=False,
     )
     assert up_l == mir_l, f"DRIFT (layerwise): upstream={up_l}\nmirror={mir_l}"
-
-
-def test_load_keys_file() -> None:
-    import tempfile
-
-    with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as f:
-        f.write("# comment\n\nkey_a\n  key_b  \n")
-        path = f.name
-    try:
-        assert load_keys_file(path) == ["key_a", "key_b"]
-    finally:
-        os.unlink(path)
-
-
-def test_key_computer_expand() -> None:
-    kc = km.KeyComputer(model_name="qwen", tp_size=2)
-    keys = kc.expand(["h0"])
-    assert len(keys) == 2
-    assert parse_key_rank(keys[0]) == 0
-    # 异构 TP：peer 更大则按 peer 展开
-    kc_h = km.KeyComputer(model_name="qwen", tp_size=2, peer_tp_size=4)
-    assert kc_h.effective_tp == 4
-    assert len(kc_h.expand(["h0"])) == 4
-
-
-TESTS = [
-    test_pool_key_format,
-    test_layer_key_format,
-    test_expand_tp2,
-    test_expand_tp4_two_blocks,
-    test_parse_and_group,
-    test_expand_layerwise,
-    test_load_keys_file,
-    test_key_computer_expand,
-    test_upstream_parity,
-]
-
-if __name__ == "__main__":
-    for t in TESTS:
-        t()
-    print(f"test_vllm_keys: PASS ({len(TESTS)} cases)")
