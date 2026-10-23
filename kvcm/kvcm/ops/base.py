@@ -34,21 +34,39 @@ class TaskStatus(enum.Enum):
     FAILED = "failed"  # 失败（处理策略归编排层：重发 / 弃置清副本 / 衔接）
 
 
+class OpKind(enum.Enum):
+    """任务类操作的类型。"""
+
+    COPY = "copy"
+    MOVE = "move"
+    PROMOTE = "promote"
+
+
 @dataclass(frozen=True)
 class TaskHandle:
     """任务类操作的句柄：操作类型 + 后端任务标识列表。
 
-    一次前缀操作展开为多个后端任务（每 key 一个），句柄承载全部标识；
-    READY 核验所需的 key/目标映射由实现侧登记（任务状态机归状态层），
-    不随句柄泄漏存储概念。
+    一次前缀操作展开为多个后端任务（每 key 一个），句柄承载全部标识。
+    任务标识是**不透明对象**：本层不解释其类型（不同后端的任务号形态
+    不同，如整数对），只在 copy/move/promote 与 query_task 之间透传；
+    需要持久化时由实现侧负责可逆编码。READY 核验所需的 key/目标映射
+    由实现侧登记（任务状态机归状态层），不随句柄泄漏存储概念。
     """
 
-    op: str  # "copy" / "move" / "promote"
-    task_ids: tuple[str, ...]
+    op: OpKind
+    task_ids: tuple[object, ...]
 
 
 class UnsupportedCapabilityError(Exception):
     """调用了后端通道不具备能力的操作（capability().xxx.channel 为 NO）。"""
+
+
+class VerifyError(RuntimeError):
+    """READY 核验失败：任务全部完成但目标侧副本不到位（终态，带明细）。
+
+    与「查询失败」（RPC 错误，可重试）区分：核验失败意味着任务白跑，
+    调用方应按终态处理并带原因上抛。
+    """
 
 
 class KvOps(ABC):

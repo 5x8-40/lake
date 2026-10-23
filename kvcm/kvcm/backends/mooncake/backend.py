@@ -2,24 +2,48 @@
 
 组装两个适配维度的子件：
 - 存储侧：StoreClient（绑定 + HTTP 双通道）、SegTopology、能力集（按版本）
-- 引擎侧：KeyComputer（前缀 → key 列表）、rank 拓扑（实例 → seg 列表，
-  以 locate 可调用注入——demo 环境 = pidfile/proctitle 探测，生产 = 实
-  例注册）
+- 引擎侧：KeyComputer（前缀 → key 列表 → rank 映射计划）、实例 → seg
+  列表（以 locate 可调用注入——demo 环境 = pidfile/proctitle 探测，生产
+  = 实例注册）
 
-本步落地 copy（唯一经端到端验证的操作）；其余操作随能力接线逐个落地，
-未落地的抛 NotImplementedError。
+任务标识（mooncake 为整数对）在本实现内原样透传，不做字符串化；需要
+写入 Ledger 时由本实现做可逆编码（"hi:lo"）。
+
+本步落地 copy / exists / query_task；其余操作随能力接线逐个落地，未落
+地的抛 NotImplementedError，通道不具备的抛 UnsupportedCapabilityError。
 """
 
 from __future__ import annotations
 
 from typing import Callable, Sequence
 
-from kvcm.backends.mooncake.capability import mooncake_main
-from kvcm.backends.mooncake.client import StoreClient
-from kvcm.engines.vllm.keys import KeyComputer, group_keys_by_rank, parse_key_rank
-from kvcm.ops.base import KvOps, TaskHandle, TaskStatus
-from kvcm.ops.capability import BackendCapability
+from kvcm.backends.mooncake.client import StoreClient, StoreClientError
+from kvcm.engines.vllm.keys import KeyComputer
+from kvcm.ledger import Ledger
+from kvcm.ops.base import (
+    KvOps,
+    OpKind,
+    TaskHandle,
+    TaskStatus,
+    UnsupportedCapabilityError,
+    VerifyError,
+)
+from kvcm.ops.capability import BackendCapability, Support
 from kvcm.ops.types import InstanceId, PinKind, Prefix
+
+
+def encode_task_id(task_id: object) -> str:
+    """任务标识 → 可逆字符串编码（Ledger 持久化用）。
+
+    mooncake 任务号为 (uint64, uint64) 整数对，编码为 "hi:lo"；其他形态
+    兜底 str()。解码不在本步（任务状态机可丢，重启后从 master 重查）。
+    """
+    if isinstance(task_id, (tuple, list)) and len(task_id) == 2:
+        try:
+            return f"{int(task_id[0])}:{int(task_id[1])}"
+        except (TypeError, ValueError):
+            pass
+    return str(task_id)
 
 
 class MooncakeBackend(KvOps):
@@ -31,21 +55,25 @@ class MooncakeBackend(KvOps):
         client: StoreClient,
         key_computer: KeyComputer,
         locate: Callable[[InstanceId], Sequence[str]],
-        capability: BackendCapability | None = None,
+        capability: BackendCapability,
+        ledger: Ledger | None = None,
     ) -> None:
         """
         client：已 connect 的 StoreClient（控制面身份，global_segment_size=0）。
-        key_computer：引擎侧 key 计算器（持展开配置）。
+        key_computer：引擎侧 key 计算器（持展开配置与 rank 映射知识）。
         locate：实例 → rank 有序 seg 列表（targets[i] = rank i 的本机 seg）。
-        capability：按后端版本填充的能力集；缺省取目标基线（main）。
+        capability：按连接上的后端版本填充的能力集（必填——能力宣告不
+            允许默认冒充，填错版本 = 编排层选错路径）。
+        ledger：任务状态记录（可选；不注入则任务状态只留进程内）。
         """
         self._client = client
         self._keys = key_computer
         self._locate = locate
-        self._cap = capability or mooncake_main()
-        # handle → (keys, plan)：READY 核验登记（任务状态机；进程内，
-        # 持久化归状态层）。plan = [(key, target_seg), ...]
-        self._plans: dict[TaskHandle, tuple[list[str], list[tuple[str, str]]]] = {}
+        self._cap = capability
+        self._ledger = ledger
+        # handle → (prefix, target, plan [(key, target_seg), ...])：
+        # READY 核验与 Ledger 迁移登记；终态即删（防长驻泄漏）。
+        self._plans: dict[TaskHandle, tuple[Prefix, InstanceId, list[tuple[str, str]]]] = {}
 
     def capability(self) -> BackendCapability:
         return self._cap
@@ -54,85 +82,105 @@ class MooncakeBackend(KvOps):
     # copy（已落地）
     # ------------------------------------------------------------------
 
-    def _build_plan(self, keys: list[str], targets: list[str]) -> list[tuple[str, str]]:
-        """key → 目标 seg 的映射计划：rank i 的 key → targets[i]。
-
-        异构反向（目标 rank 数 < key 展开的 effective_tp）：eff rank i 归
-        targets[i // n_sub]（seg 列表按倍数展开）；其余超界组合直接报错。
-        """
-        by_rank = group_keys_by_rank(keys)
-        max_rank = max(by_rank) if by_rank else -1
-        if len(targets) == 1 and max_rank <= 0:
-            return [(k, targets[0]) for k in keys]
-        if max_rank >= len(targets):
-            local_tp = self._keys.tp_size
-            peer_tp = self._keys.peer_tp_size
-            eff = max(local_tp, peer_tp or 0)
-            n_sub = eff // local_tp if local_tp else 1
-            if (
-                peer_tp
-                and peer_tp > local_tp
-                and local_tp > 0
-                and eff % local_tp == 0
-                and len(targets) == local_tp
-                and max_rank == eff - 1
-            ):
-                targets = [targets[i // n_sub] for i in range(eff)]
-            else:
-                raise ValueError(
-                    f"key rank max={max_rank} but only {len(targets)} targets "
-                    f"(need targets[0..{max_rank}])"
-                )
-        unknown = [r for r in by_rank if r < 0 or r >= len(targets)]
-        if unknown:
-            raise ValueError(f"ranks out of range for targets: {unknown}")
-        return [(k, targets[parse_key_rank(k)]) for k in keys]
-
     def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机 seg 为前缀 KV 建副本（发起式；READY 经 query_task）。
 
         内部展开：前缀 → key 列表（引擎侧）→ 目标实例 seg 列表（locate）
-        → rank 映射计划 → 逐 key 发起复制任务。「复制前确认 warm 已覆盖前
-        缀」的存在性检查归编排层，不在本操作内。
+        → rank 映射计划（引擎侧）→ 逐 key 发起复制任务。「复制前确认
+        warm 已覆盖前缀」的存在性检查归编排层，不在本操作内。
         """
         keys = self._keys.keys_for_tokens(prefix.token_ids)
+        if not keys:
+            raise ValueError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
         targets = list(self._locate(target))
-        plan = self._build_plan(keys, targets)
-        task_ids = tuple(
-            str(self._client.create_copy_task(key, [seg])) for key, seg in plan
-        )
-        handle = TaskHandle(op="copy", task_ids=task_ids)
-        self._plans[handle] = (keys, plan)
+        plan = self._keys.build_plan(keys, targets)
+        task_ids: list[object] = []
+        try:
+            for key, seg in plan:
+                task_ids.append(self._client.create_copy_task(key, [seg]))
+        except Exception as e:
+            # 已发起的任务必须带在异常上——否则这些任务无句柄可查，
+            # 成为池里没人跟踪的在途传输。
+            raise StoreClientError(
+                f"copy submit failed after {len(task_ids)}/{len(plan)} tasks "
+                f"(submitted ids: {task_ids}): {e}"
+            ) from e
+        handle = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
+        self._plans[handle] = (prefix, target, plan)
+        self._record(handle, "running")
         return handle
 
     def query_task(self, handle: TaskHandle) -> TaskStatus:
-        """聚合判定：任一任务失败 → FAILED；全部成功 + 副本核验通过 →
-        READY；核验不过 → FAILED；否则 RUNNING。"""
+        """聚合判定：任一任务失败 → FAILED（终态）；全部成功且副本核验
+        通过 → READY（终态）；否则 RUNNING。终态即删核验登记。
+
+        查询本身的 RPC 失败直接上抛（调用方可重试，不是任务终态）；
+        副本核验失败（任务白跑）抛 VerifyError（终态，带明细）。
+        """
         from mooncake.store import TaskStatus as StoreTaskStatus
 
         entry = self._plans.get(handle)
         if entry is None:
             raise KeyError(f"unknown task handle: {handle}")
-        keys, plan = entry
+        _, _, plan = entry
         statuses = [self._client.query_task(tid).status for tid in handle.task_ids]
         if any(s == StoreTaskStatus.FAILED for s in statuses):
+            self._finish(handle, "failed")
             return TaskStatus.FAILED
         if not all(s == StoreTaskStatus.SUCCESS for s in statuses):
             return TaskStatus.RUNNING
         # READY 核验：每个 key 在其映射目标上有内存副本（不是每个 seg）
-        try:
-            for key, seg in plan:
-                self._client.assert_targets_have_replicas([key], [seg])
-        except Exception:
-            return TaskStatus.FAILED
+        missing: list[str] = []
+        for key, seg in plan:
+            endpoints = self._client.batch_memory_replica_endpoints([key]).get(key, [])
+            if seg not in endpoints:
+                missing.append(f"{key} missing on {seg} (have={sorted(endpoints)})")
+        if missing:
+            self._finish(handle, "failed")
+            raise VerifyError(
+                "task(s) succeeded but replica verify failed:\n  "
+                + "\n  ".join(missing)
+            )
+        self._finish(handle, "ready")
         return TaskStatus.READY
 
     def exists(self, prefix: Prefix) -> bool:
-        """全部 key 在池才为真（batch_is_exist；读即续租）。"""
+        """全部 key 在池才为真（batch_is_exist；读即续租）。
+
+        返回列表长度与 key 数不一致视为不存在（绑定异常时可能短回）。
+        """
         keys = self._keys.keys_for_tokens(prefix.token_ids)
         if not keys:
             return False
-        return all(self._client.is_exist(keys))
+        result = self._client.is_exist(keys)
+        return len(result) == len(keys) and all(result)
+
+    # ------------------------------------------------------------------
+    # 任务状态记录（Ledger 注入时；状态机可丢，重启后从 master 重查）
+    # ------------------------------------------------------------------
+
+    def _record(self, handle: TaskHandle, status: str) -> None:
+        if self._ledger is None:
+            return
+        entry = self._plans.get(handle)
+        if entry is None:
+            return
+        prefix, target, _ = entry
+        for tid in handle.task_ids:
+            self._ledger.upsert_task(
+                encode_task_id(tid),
+                op=handle.op.value,
+                prefix=prefix,
+                target=str(target),
+                status=status,
+            )
+
+    def _finish(self, handle: TaskHandle, status: str) -> None:
+        """终态处理：Ledger 迁移 + 删核验登记（防长驻进程泄漏）。"""
+        self._record(handle, status)
+        self._plans.pop(handle, None)
 
     # ------------------------------------------------------------------
     # 以下操作随能力接线逐个落地
@@ -153,7 +201,15 @@ class MooncakeBackend(KvOps):
         raise NotImplementedError("stop_keepalive：随保活注册表落地")
 
     def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
-        raise NotImplementedError("pin：事后通道待自封装 .so（能力集 soft_pin_after）")
+        if kind is PinKind.HARD or self._cap.hard_pin_after.channel is not Support.YES:
+            if kind is PinKind.HARD:
+                raise UnsupportedCapabilityError(
+                    "hard pin 写入时固化，已存在的 KV 无法事后补标（全版本无此能力）"
+                )
+            raise UnsupportedCapabilityError(
+                "soft pin 事后加：通道不具备（自封装 .so 接线前）"
+            )
+        raise NotImplementedError("pin：事后通道待自封装 .so")
 
     def demote(self, prefix: Prefix) -> None:
         raise NotImplementedError("demote：随释放流程落地")

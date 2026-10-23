@@ -2,18 +2,22 @@
 
 from kvcm.ops.base import (
     KvOps,
+    OpKind,
     TaskHandle,
     TaskStatus,
     UnsupportedCapabilityError,
+    VerifyError,
 )
 from kvcm.ops.capability import BackendCapability, Capability, Support
 from kvcm.ops.types import InstanceId, PinKind, Prefix
 
 __all__ = [
     "KvOps",
+    "OpKind",
     "TaskHandle",
     "TaskStatus",
     "UnsupportedCapabilityError",
+    "VerifyError",
     "BackendCapability",
     "Capability",
     "Support",

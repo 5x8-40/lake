@@ -329,13 +329,52 @@ class KeyComputer:
         )
 
     def expand(self, chunk_hashes: list[str]) -> list[str]:
-        """已知块 hash → PoolKey 展开（离线可用，走镜像回退）。"""
+        """已知块 hash → PoolKey 展开。容器内走上游 PoolKey；不可导入时
+        回退内置镜像（offline，stderr 警告）。"""
         return expand_store_keys(
             model_name=self.model_name,
             chunk_hashes=chunk_hashes,
             tp_size=self.effective_tp,
             put_step=self.put_step,
         )
+
+    def build_plan(
+        self, keys: list[str], targets: list[str]
+    ) -> list[tuple[str, str]]:
+        """key → 目标 seg 的映射计划：rank i 的 key → targets[i]。
+
+        异构反向（目标 rank 数 < key 展开的 effective_tp）：eff rank i 归
+        targets[i // n_sub]（seg 列表按倍数展开）；其余超界组合直接报错。
+        rank 知识（key 格式、TP 配置）全部归本类——存储侧只消费计划，
+        不解释 key。
+        """
+        by_rank = group_keys_by_rank(keys)
+        max_rank = max(by_rank) if by_rank else -1
+        if len(targets) == 1 and max_rank <= 0:
+            return [(k, targets[0]) for k in keys]
+        if max_rank >= len(targets):
+            local_tp = self.tp_size
+            peer_tp = self.peer_tp_size
+            eff = max(local_tp, peer_tp or 0)
+            n_sub = eff // local_tp if local_tp else 1
+            if (
+                peer_tp
+                and peer_tp > local_tp
+                and local_tp > 0
+                and eff % local_tp == 0
+                and len(targets) == local_tp
+                and max_rank == eff - 1
+            ):
+                targets = [targets[i // n_sub] for i in range(eff)]
+            else:
+                raise ValueError(
+                    f"key rank max={max_rank} but only {len(targets)} targets "
+                    f"(need targets[0..{max_rank}])"
+                )
+        unknown = [r for r in by_rank if r < 0 or r >= len(targets)]
+        if unknown:
+            raise ValueError(f"ranks out of range for targets: {unknown}")
+        return [(k, targets[parse_key_rank(k)]) for k in keys]
 
 
 def load_keys_file(path: str) -> list[str]:

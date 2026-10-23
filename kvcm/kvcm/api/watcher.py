@@ -1,12 +1,12 @@
 """InstanceWatcher：推理实例上线/销毁事件接入（下行通道）。
 
 - 新实例启动 → 触发热点前缀预热
-- 实例销毁 → 其 seg 上副本的清理/归属处理
+- 实例销毁 → 该实例持有的副本的清理/归属处理
 
-同时是「端点 → 实例」「seg → 实例」注册的权威来源（生产环境的实例发
-现取代 demo 的 pidfile/proctitle 探测，SegTopology/RankTopology 的数据
-源换到这里的注册）。事件源选型（K8s watch / 部署系统通知）随设计定
-型；本步仅占位接口形态。
+同时是实例注册的权威来源（生产环境的实例发现取代 demo 的
+pidfile/proctitle 探测：适配层的拓扑子件把数据源换到这里的注册即可，
+本层不出现任何存储概念）。事件源选型（K8s watch / 部署系统通知）随
+设计定型；本步仅占位接口形态。
 """
 
 from __future__ import annotations

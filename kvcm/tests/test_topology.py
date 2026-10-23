@@ -134,8 +134,12 @@ def test_end_to_end_tp1() -> None:
 
 
 def test_stale_pidfile_fails() -> None:
+    # 起进程再杀掉收尸，拿一个确定已死的 pid（不写死 magic pid）
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+    proc.kill()
+    proc.wait()
     with tempfile.NamedTemporaryFile("w", delete=False) as f:
-        f.write("999999")  # 几乎必然已死
+        f.write(str(proc.pid))
         pidfile = f.name
     try:
         with pytest.raises(ResolveError, match="stale"):

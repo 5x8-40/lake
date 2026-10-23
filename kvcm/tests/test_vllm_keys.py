@@ -99,6 +99,43 @@ def test_key_computer_expand() -> None:
     assert len(kc_h.expand(["h0"])) == 4
 
 
+# ---------------------------------------------------------------------------
+# KeyComputer.build_plan（key → 目标 seg 映射；rank 知识归引擎侧）
+# ---------------------------------------------------------------------------
+
+
+def test_plan_tp1_single_seg() -> None:
+    kc = km.KeyComputer(model_name="qwen", tp_size=1)
+    keys = kc.expand(["h0"])
+    assert kc.build_plan(keys, ["10.0.0.1:5001"]) == [(k, "10.0.0.1:5001") for k in keys]
+
+
+def test_plan_tp2_rank_mapped() -> None:
+    kc = km.KeyComputer(model_name="qwen", tp_size=2)
+    keys = kc.expand(["h0"])
+    plan = kc.build_plan(keys, ["10.0.0.1:5001", "10.0.0.1:5002"])
+    assert plan[0] == (keys[0], "10.0.0.1:5001")
+    assert plan[1] == (keys[1], "10.0.0.1:5002")
+
+
+def test_plan_hetero_reverse_expands() -> None:
+    """peer 4 > 目标 2：eff rank i → targets[i//2]（seg 列表按倍展开）。"""
+    kc = km.KeyComputer(model_name="qwen", tp_size=2, peer_tp_size=4)
+    keys = kc.expand(["h0"])  # 经 effective_tp=4 展开
+    plan = kc.build_plan(keys, ["10.0.0.1:5001", "10.0.0.1:5002"])
+    expect = ["10.0.0.1:5001", "10.0.0.1:5001", "10.0.0.1:5002", "10.0.0.1:5002"]
+    assert [seg for _, seg in plan] == expect
+
+
+def test_plan_rank_overflow_fails() -> None:
+    kc = km.KeyComputer(model_name="qwen", tp_size=2)  # 无 peer → 不展开
+    keys = km.expand_store_keys(
+        model_name="qwen", chunk_hashes=["h0"], tp_size=4, prefer_upstream=False
+    )
+    with pytest.raises(ValueError, match="rank max=3"):
+        kc.build_plan(keys, ["10.0.0.1:5001", "10.0.0.1:5002"])
+
+
 @pytest.mark.skipif(
     km.upstream_key_classes() is None,
     reason="vllm_ascend not importable (offline)",
