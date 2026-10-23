@@ -60,23 +60,33 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 **capability 声明（显式，不藏在接口后面假装统一）**
 
 - 版本口径：**目标基线 = mooncake main**——E10 落地按 main 填充能力、按 main 语义实现；0.3.11 列仅为当前部署（demo 测试床 wheel）约束记录，部署升级后该列即废弃
-- 初版清单（每项都能指回 D2 事实条目）。**格内口径再分两层，避免混淆**：
-  - **RPC**：master / C++ 客户端是否具备该能力（与 kvcm 语言无关）。注意 mooncake 线协议 = **ylt coro_rpc + struct_pack**（`rpc_service.h` / `rpc_types.h` 的 `YLT_REFL` 编译期反射）——**无 IDL/schema，协议形态烙在 C++ 编译产物里**（注册方式 `rpc_service.cpp::RegisterRpcService` = 编译期绑函数指针）；跨语言直连 = 逆向重造协议客户端（编码规则 + framing + 函数 ID 算法全要反推，几千行 + 版本跟漂）。故 kvcm 不看「RPC 有没有」，看下面的现成通道
-  - **通道**：kvcm（Python）当前实际可调 = **store_py 绑定 ∪ HTTP admin 面**（绑定以 `store_py.cpp` @1fc27b6 清点 67 符号为上游口径，0.3.11 部署实际是 NPU fork wheel 的绑定、另含 `create_copy_task` / `batch_get_replica_desc`；HTTP admin 端点两版本都有）；**L2 按能力选路径看通道**
-  - RPC ✓ 而通道 ✗ 的解锁序：**自封装 .so**（dlopen 路线：照 `store_py.cpp` 同款手法自写封装，link wheel 的 C++ 库，不改 mooncake 源码；符号可见性与 ABI 待 E6 验证）→ **替代实现**（原则 5）→ 自研协议客户端（仅兜底）；△ = 待 E6 核对
+- 初版清单（每项都能指回 D2 事实条目）。格内口径分两层：
+  - **RPC**：master / C++ 客户端是否具备该能力（与 kvcm 语言无关）
+    - 线协议 = ylt coro_rpc + struct_pack（`rpc_service.h` / `rpc_types.h` 的 `YLT_REFL`）
+    - 没有独立的协议描述文件（无 `.proto` 类 IDL）：协议定义只在 C++ 结构体与编译产物里
+    - 跨语言直连 = 自己实现一套协议客户端（编码规则、framing、函数 ID 都要从 C++ 源码反推），几千行且随版本漂移
+    - 结论：kvcm 不看「RPC 有没有」，看下一条的「通道」
+  - **通道**：kvcm（Python）当前实际可调 = **store_py 绑定 ∪ HTTP admin**；**L2 按能力选路径看通道**
+    - 绑定：`store_py.cpp` @1fc27b6 共 67 个符号（上游口径）；0.3.11 部署用 NPU fork wheel，另含 `create_copy_task` / `batch_get_replica_desc`
+    - HTTP admin：两版本都有（端点见下「三条接入通道」节）
+  - RPC ✓ 而通道 ✗ 时的处理顺序：
+    1. **自封装 .so**：照 `store_py.cpp` 的写法自写封装，link wheel 的 C++ 库，不改 mooncake 源码（两个断点待 E6 验证，见下）
+    2. **替代实现**：原则 5
+    3. **自研协议客户端**：仅兜底
+  - △ = 待 E6 核对
 
 | 能力 | mooncake 0.3.11（部署现状） | mooncake main（目标基线） | 出处 |
 |------|------------------------------|----------------------------|------|
 | has_lease（读续租） | RPC ✓ 通道 ✓（`is_exist`） | RPC ✓ 通道 ✓ | D2 F9 |
-| soft pin 事后加（空写 upsert 通道） | RPC ✓ 通道 ✗（绑定只有一步式 `upsert_tensor`；HTTP 无写类端点） | RPC ✓ 通道 ✗（同上；自封装 .so 候选） | D2 F1/F12 |
+| soft pin 事后加（空写 upsert 通道） | RPC ✓ 通道 ✗（绑定只有一步式 `upsert_tensor`；HTTP 无写类端点） | RPC ✓ 通道 ✗（同左；自封装 .so 候选） | D2 F1/F12 |
 | hard pin 事后加 | ✗（创建时固化、无 unpin） | ✗ | D2 F1 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源） | ✗ | D2 F7 |
-| has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活促驱逐，无需后端调用；提回 = HTTP `/query_key` 走 `GetReplicaList` 刷计数，续租副作用恰为正作用） | RPC ✓ 通道 ✓（同左） | D2 §3 |
+| has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活即可，无需调后端；提回 = HTTP `/query_key`） | RPC ✓ 通道 ✓（同左） | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
-| has_retained_client（保留身份注册） | ✗ | RPC ✓ 通道 ✗（绑定未暴露 `kRetained`；HTTP 无暴露——自封装 .so 候选；替代 = move 到活 seg） | D2 F13② |
+| has_retained_client（保留身份注册） | ✗ | RPC ✓ 通道 ✗（绑定、HTTP 均无；自封装 .so 候选；替代 = move 到活 seg） | D2 F13② |
 | has_dfs_replica（共享 3FS 副本） | ✗ | RPC ✓ 通道 △（写入路径待 E6 核对） | D2 F13② |
-| has_admin_query（零副作用核验） | 零副作用 ✗；HTTP 有带副作用版（`/batch_query_keys` → 普通 `BatchGetReplicaList`，续租 + 计命中） | **HTTP ✓**（`/batch_query_keys` → `BatchGetReplicaListForAdmin`，零副作用；ForAdmin 系列不注册 client RPC 面、仅 HTTP 面可调） | D2 F11b |
+| has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**（`/batch_query_keys` 零副作用） | D2 F11b |
 
 - L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 的 retained client/DFS 前提，本质就是能力分支——本层把它落成显式声明
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
@@ -91,25 +101,41 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 | 子件 | 职责 | 现有代码来源 |
 |------|------|-------------|
-| StoreClient | **双通道**：控制类走 store_py 绑定（copy/move/exist/Remove/upsert…）；查询/核验类走 HTTP admin 面（urllib：`/batch_query_keys` 副本核验、`/get_all_segments` seg 拓扑）+ client UUID 持久化（sqlite）——**持久化仅在 §2 方案一（client_id 改归 kvcm）下需要，方案一/二尚未拍板**：若走方案二（借名）则无持久化诉求、代价转为 master 加「key → client_id」查询 RPC（D2 §2 决策条件），届时随决策调整本子件 | `demo/precopy/common.py` + `demo/precopy/precopy.py` 的 RPC 调用段 + `demo/precopy/resolve.py` 的 admin HTTP 调用段 |
+| StoreClient | **双通道**：控制类走 store_py 绑定（copy/move/exist/Remove/upsert…）；查询/核验类走 HTTP admin（urllib：`/batch_query_keys` 副本核验、`/get_all_segments` seg 拓扑）+ client UUID 持久化（sqlite）——**持久化仅在 §2 方案一（client_id 改归 kvcm）下需要，方案一/二尚未拍板**：若走方案二（借名）则无持久化诉求、代价转为 master 加「key → client_id」查询 RPC（D2 §2 决策条件），届时随决策调整本子件 | `demo/precopy/common.py` + `demo/precopy/precopy.py` 的 RPC 调用段 + `demo/precopy/resolve.py` 的 admin HTTP 调用段 |
 | SegTopology | seg→client/实例映射；seg、client_id、lease 语义 | `demo/precopy/resolve.py` 的 seg 侧（生产权威源 = L1 InstanceWatcher 注册，D1 §3/E13） |
 | capability 填充 | 按后端版本填充能力声明（目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | 新增，L3 表驱动 |
 
 - **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——留在通用层则抽象漏
 - **第二后端候选已登记在案**：昇腾 MemCache（`3rdparty/memcache`；kv-prefetch.md 待定项「生产默认走 MemCache，还是留 Mooncake」）——L3 抽象现在建正是时候；但只建一层接口，第二后端真接入时再修接口，不为假想后端过度设计
 
-#### 接入通道三面格局（mooncake）
+#### 三条接入通道（mooncake）
 
-- **client RPC 面**（`:50088`，coro_rpc + struct_pack）：控制面全集（`RegisterRpcService` 注册 67 方法）。**要 client 身份**——控制类 RPC 的身份与任务语义全挂 client UUID（`CopyStart/CopyEnd` 谁 Start 谁 End、副本绑 seg 所在 client 的 liveness、下线清理按 client 走）。**dlopen 动态库 ≡ 伪装 client**：store_py.so 本就是官方预封装的动态库，import 它 = 进程内实例化 C++ client（注册 UUID、心跳保活）；自封装 .so 同理。client 是控制面唯一门票——这不是权宜，是正门。**两路 .so 必须共用同一 client 实例/UUID**：各注册一个 = 两个身份两份心跳，D2 §2 的 client_id 问题翻倍
-- **HTTP admin 面**（`:9003`，标准 HTTP+JSON，**匿名无身份**）：查询/观测端点（`/batch_query_keys` `/query_key` `/get_all_keys` `/get_all_segments` `/query_segment` `/health` `/metrics` 等；0.3.11 实现于 `rpc_service.cpp`，main 拆出 `master_admin_service.cpp`）。**ForAdmin 系列（零副作用核验）只注册在这一面**——`GetReplicaListForAdmin` 等是 master 进程内方法、不经 client RPC 面，任何语言的 client 走 RPC 都调不到，HTTP 是唯一通道。查询面走 HTTP 反而干净：不留 client 生命周期痕迹（无注册、无心跳、进程死了无清理负担）。副作用差异：0.3.11 `/batch_query_keys` 走普通 `BatchGetReplicaList`（续租 + 计命中），main 走 `BatchGetReplicaListForAdmin`（零副作用）
-- **C 接口**（`mooncake-store/include/store_c.h`，ctypes 可直调）：put/get/is_exist/remove/register_buffer——**数据面小子集；控制面操作（copy/move/upsert/retained）一个都不在**，kvcm 基本用不上
+1. **client RPC 面**（`:50088`，coro_rpc）
+   - 控制类操作全在这面（`RegisterRpcService` 注册 67 个方法）
+   - 调用前必须先注册 client（UUID + 心跳）：控制类 RPC 的语义挂在 client UUID 上——任务校验「谁 Start 谁 End」、副本绑 seg 所在 client 的 liveness、下线清理按 client 走
+   - kvcm 的接入方式只有一种：dlopen 动态库、在进程内实例化 client——store_py.so 是官方封装好的，自封装 .so 是自己补的，两者是同一件事。**所以 kvcm 在 master 眼里必然是一个 client**，这与它是否持有存储无关
+   - store_py 与自封装 .so 必须共用同一个 client 实例/UUID：各注册一个 = 两份身份两份心跳，D2 §2 的 client_id 问题翻倍
+2. **HTTP admin 面**（`:9003`，HTTP+JSON，无需 client 身份）
+   - 查询/观测端点：`/batch_query_keys` `/query_key` `/get_all_keys` `/get_all_segments` `/query_segment` `/health` `/metrics` 等（0.3.11 在 `rpc_service.cpp`，main 拆到 `master_admin_service.cpp`）
+   - `ForAdmin` 系列（零副作用核验）只在这面：它们是 master 进程内方法，不注册到 client RPC 面——RPC 调不到，HTTP 是唯一通道
+   - 查询类走这面的好处：不用注册 client，kvcm 进程死了也不在 master 留任何状态
+   - 版本差异：0.3.11 的 `/batch_query_keys` 走普通 `BatchGetReplicaList`（有续租副作用）；main 走 `BatchGetReplicaListForAdmin`（零副作用）
+3. **C 接口**（`mooncake-store/include/store_c.h`，ctypes 可直调）
+   - 只有数据面基础操作：put/get/is_exist/remove/register_buffer
+   - 控制面操作（copy/move/upsert/retained）都不在——kvcm 用不上
 
-**自封装 .so 补两洞**（空写 upsert、retained 注册——绑定与 HTTP 都不暴露，C++ client 类有）：
+**自封装 .so**（补两个缺口：空写 upsert、retained 注册——绑定和 HTTP 都没有，C++ client 类有）：
 
-- 手法：照 `store_py.cpp` 同款——`#include` mooncake 头文件、调 C++ client 类方法、对外露 pybind / extern "C" 薄口；产物放 kvcm 侧，**不改 mooncake 一行源码**
-- **为什么这层 C++ 必须有**：ctypes 会「调函数」但不会「造 C++ 对象」——`std::string` 的 SSO 布局、`UUID` struct、`tl::expected` 返回值都要按编译器布局字节级人肉拼，libstdc++ 版本一变全碎；封装层把类型翻译交还给编译器（头文件保证布局永远正确），边界只过 C 类型（`char*` / 整数 / 指针）。偏门备选：`cppyy`（JIT 解析 C++ 头文件直调类方法，免手写封装；与 C++20 协程/模板密集的 mooncake 头文件兼容性待验证）
-- **两个断点，归 E6 在测试机验证**：① 符号可见性——client 类符号在 wheel 的 .so 里是否导出（`nm -D --defined-only <so> | c++filt`；静态 link 且 visibility hidden 则此路断，退回替代实现）② ABI 匹配——封装层（shim）编译环境（gcc/libstdc++）与 NPU wheel 构建环境不一致则崩
-- E6 另核：NPU fork 绑定与上游 `store_py.cpp` 的差异清单（fork 含 `create_copy_task` / `batch_get_replica_desc`，上游 @1fc27b6 无）；`/query_key` 续租副作用在核验场景的容忍度
+- 写法：照 `store_py.cpp` 的写法——`#include` mooncake 头文件，调 C++ client 类方法，对外暴露 pybind 或 extern "C" 接口；产物放 kvcm 侧，不改 mooncake 源码
+- 为什么不能 Python 直调（ctypes）：
+  - ctypes 能调 C 函数，但造不了 C++ 对象
+  - 方法参数和返回是 C++ 类型（`std::string` 的 SSO 布局、`UUID` struct、`tl::expected` 返回值），在 Python 里按字节拼这些对象 = 自己扮演 C++ 编译器，且布局随 libstdc++ 版本变
+  - 所以中间必须有一层 C++：它用头文件调类方法（布局由编译器保证），对 Python 只暴露 C 类型
+  - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）
+- 两个断点（E6 在测试机验证）：
+  1. 符号可见性：client 类符号是否从 wheel 的 .so 导出（`nm -D --defined-only <so> | c++filt`；符号不导出则此路不通，退回替代实现）
+  2. ABI 匹配：封装层编译环境（gcc/libstdc++）与 NPU wheel 构建环境不一致则不可用
+- E6 另核：NPU fork 绑定与上游 `store_py.cpp` 的差异（fork 多 `create_copy_task` / `batch_get_replica_desc`）；`/query_key` 的续租副作用在核验场景能否接受
 
 ### EngineAdapter（引擎适配）
 
@@ -150,7 +176,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 ## 参考实现
 
-- **mooncake 接入通道**（L4 通道格局的直接依据，均 @1fc27b6）：`mooncake-store/src/rpc_service.cpp::RegisterRpcService`（client RPC 面 67 方法注册清单；`ForAdmin` 系列不在其中）＋ `mooncake-store/src/master_admin_service.cpp`（main 的 HTTP admin 面；0.3.11 在 `rpc_service.cpp` 内）＋ `mooncake-store/include/store_c.h`（C 接口，数据面小子集）＋ `mooncake-integration/store/store_py.cpp`（pybind 层 67 符号，自封装 .so 的样板）；线协议符号：`mooncake-store/include/rpc_service.h:8`（coro_rpc）、`rpc_types.h`（`YLT_REFL`）
+- **mooncake 三条通道的代码依据**（均 @1fc27b6）：`rpc_service.cpp::RegisterRpcService`（client RPC 面 67 个注册方法，无 `ForAdmin` 系列）；`master_admin_service.cpp`（HTTP admin 面，main；0.3.11 在 `rpc_service.cpp` 内）；`store_c.h`（C 接口）；`store_py.cpp`（pybind 绑定，自封装 .so 的参照）；线协议：`rpc_service.h:8`（coro_rpc）、`rpc_types.h`（`YLT_REFL`）
 - **UCM 可插拔 KVStore**（[`../docs/research/ucm/architecture.md`](../../docs/research/ucm/architecture.md)）与 **LMCache 多存储后端**（[`../docs/research/lmcache/sharing-and-backends.md`](../../docs/research/lmcache/sharing-and-backends.md)）：后端抽象同构。关键差异：它们的抽象在**数据面**（connector get/put），本架构 L3 在**管理面**（copy/pin/lease/remove 控制操作）——管理语义无跨后端天然对应物，故 capability 必须显式
 - **LMCache controller**（D2 §1 完备性审计同表）：控制面对外 = 命令集——L1 IntentReceiver 对应其命令入口
 - **Dynamo standalone indexer**（`3rdparty/dynamo/lib/kv-router/src/services/indexer/`）：独立进程 + 契约接口的组件形态参照；本架构是 kvcm 单进程内部结构，组件拓扑已定（kvcm 独立控制面、索引归 Router 侧，D1 §4）
