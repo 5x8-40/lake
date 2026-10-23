@@ -37,6 +37,7 @@ _SOCKET_RE = re.compile(r"socket:\[(\d+)\]")
 _PROBE_MISSING = 3  # pidfile 缺失/为空
 _PROBE_STALE = 4  # pidfile 根进程已死
 _PROBE_NO_SS = 5  # 无端口列举来源（ss 缺失且 /proc 兜底失败）
+_PROBE_NO_PS = 6  # 无进程树来源（/proc/*/stat 全不可读且 ps 缺失/失败）
 
 
 class ResolveError(RuntimeError):
@@ -93,9 +94,18 @@ def _pid_children_map() -> dict[int, list[int]]:
         n_stat += 1
     if n_stat:
         return children
-    out = subprocess.run(
-        ["ps", "-eo", "pid=,ppid="], capture_output=True, text=True, check=True
-    ).stdout
+    try:
+        out = subprocess.run(
+            ["ps", "-eo", "pid=,ppid="], capture_output=True, text=True, check=True
+        ).stdout
+    except (FileNotFoundError, subprocess.CalledProcessError) as e:
+        # /proc 一个都读不到、ps 又没有/失败 → 无任何进程树来源，
+        # 裸逃 FileNotFoundError 会让调用方拿不到可行动的诊断。
+        raise ProbeError(
+            _PROBE_NO_PS,
+            f"no process-tree source (/proc/*/stat unreadable, ps fallback "
+            f"failed: {e})",
+        ) from e
     for ln in out.splitlines():
         parts = ln.split()
         if len(parts) != 2:
@@ -408,6 +418,12 @@ def resolve_segments(
                 "fallback failed — hidepid / no read access to other pids' fd?) — "
                 "alternatives: pass segments explicitly, or resolve rank<->seg "
                 "by hand (npu-smi card->pid)"
+            ) from e
+        if e.code == _PROBE_NO_PS:
+            raise ResolveError(
+                f"no process-tree source on {where} (/proc/*/stat unreadable "
+                "and ps missing/failed — hidepid?) — alternatives: pass "
+                "segments explicitly, or resolve rank<->seg by hand"
             ) from e
         raise ResolveError(f"probe failed on {where}: {e}") from e
     if not rows:

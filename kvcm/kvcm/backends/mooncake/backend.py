@@ -76,6 +76,11 @@ class MooncakeBackend(KvOps):
         # handle → (prefix, target, plan [(key, target_seg), ...])：
         # READY 核验与 Ledger 迁移登记；终态即删（防长驻泄漏）。
         self._plans: dict[TaskHandle, tuple[Prefix, InstanceId, list[tuple[str, str]]]] = {}
+        # 在途冲突观测态：handle → 冲突失败的任务号。任务被
+        # OBJECT_HAS_REPLICATION_TASK 拒（别人在复制同 key，D1 §4 按
+        # 「在途」不当失败）后，不再查任务、转为只核验副本——副本到位
+        # 即 READY（字节是谁搬的不重要，到位是目的）。
+        self._watch: dict[TaskHandle, tuple[object, ...]] = {}
 
     def capability(self) -> BackendCapability:
         return self._cap
@@ -118,6 +123,11 @@ class MooncakeBackend(KvOps):
         """聚合判定：任一任务失败 → FAILED（终态）；全部成功且副本核验
         通过 → READY（终态）；否则 RUNNING。终态即删核验登记。
 
+        例外——在途冲突：失败任务的 message 全部含
+        OBJECT_HAS_REPLICATION_TASK 时，说明别的任务在复制同 key
+        （D1 §4 按「在途」不当失败），本方法转入副本观测态：冲突任务
+        如实记 failed，之后只核验副本，副本到位即 READY。
+
         查询本身的 RPC 失败直接上抛（调用方可重试，不是任务终态）；
         副本核验失败（任务白跑）抛 VerifyError（终态，带明细）。
         """
@@ -127,24 +137,34 @@ class MooncakeBackend(KvOps):
         if entry is None:
             raise KeyError(f"unknown task handle: {handle}")
         _, _, plan = entry
+        if handle in self._watch:
+            # 在途冲突观测态：任务已死（冲突失败，账已记），只等副本到位
+            return self._verify_watch(handle, plan)
         try:
-            statuses = [self._client.query_task(tid).status for tid in handle.task_ids]
+            resps = [self._client.query_task(tid) for tid in handle.task_ids]
         except StoreClientError as e:
             raise QueryError(str(e)) from e
-        if any(s == StoreTaskStatus.FAILED for s in statuses):
+        failed = [r for r in resps if r.status == StoreTaskStatus.FAILED]
+        if failed:
+            conflicted = tuple(
+                tid
+                for tid, r in zip(handle.task_ids, resps)
+                if r.status == StoreTaskStatus.FAILED
+                and "OBJECT_HAS_REPLICATION_TASK" in getattr(r, "message", "")
+            )
+            if len(conflicted) == len(failed):
+                # 全部失败都是在途冲突：别的任务在复制同 key（典型 = 同
+                # intent 重发）。按 D1 §4 不当失败——冲突任务如实记
+                # failed，转副本观测态，立刻核一轮。
+                self._record(handle, "failed", tids=list(conflicted))
+                self._watch[handle] = conflicted
+                return self._verify_watch(handle, plan)
             self._finish(handle, "failed")
             return TaskStatus.FAILED
-        if not all(s == StoreTaskStatus.SUCCESS for s in statuses):
+        if not all(r.status == StoreTaskStatus.SUCCESS for r in resps):
             return TaskStatus.RUNNING
         # READY 核验：每个 key 在其映射目标上有内存副本（不是每个 seg）
-        missing: list[str] = []
-        for key, seg in plan:
-            try:
-                endpoints = self._client.batch_memory_replica_endpoints([key]).get(key, [])
-            except StoreClientError as e:
-                raise QueryError(str(e)) from e
-            if seg not in endpoints:
-                missing.append(f"{key} missing on {seg} (have={sorted(endpoints)})")
+        missing = self._verify_missing(plan)
         if missing:
             self._finish(handle, "failed")
             raise VerifyError(
@@ -154,23 +174,71 @@ class MooncakeBackend(KvOps):
         self._finish(handle, "ready")
         return TaskStatus.READY
 
+    def _verify_missing(self, plan: list[tuple[str, str]]) -> list[str]:
+        """副本核验：每个 key 在其映射目标 seg 上有内存副本；返回缺失明细
+        （空 = 通过）。核验 RPC 失败抛 QueryError（可重试）。
+
+        TODO(版本接线)：capability has_admin_query = YES（main）时应切
+        HTTP /batch_query_keys 零副作用通道——当前写死绑定通道，每次
+        核验都给 key 续租（GetReplicaList 副作用），0.3.11 别无选择。
+        """
+        missing: list[str] = []
+        for key, seg in plan:
+            try:
+                endpoints = self._client.batch_memory_replica_endpoints([key]).get(key, [])
+            except StoreClientError as e:
+                raise QueryError(str(e)) from e
+            if seg not in endpoints:
+                missing.append(f"{key} missing on {seg} (have={sorted(endpoints)})")
+        return missing
+
+    def _verify_watch(
+        self, handle: TaskHandle, plan: list[tuple[str, str]]
+    ) -> TaskStatus:
+        """在途冲突观测：副本全部到位 → READY；否则 RUNNING 继续等。
+
+        局限：在途任务的目标 seg 未必是本计划的 seg（可能来自别的
+        intent）——等不到由编排层超时兜底（abandon）。核验失败不抛
+        VerifyError：本模式不保证「任务成功过」，缺失只意味着还没传完。
+        """
+        missing = self._verify_missing(plan)
+        if missing:
+            return TaskStatus.RUNNING
+        # 目的达成（副本核验为准）：非冲突任务记 ready；冲突任务保持
+        # failed（如实——它们确实失败了，数据是别人搬的）。
+        conflicted = set(self._watch.pop(handle, ()))
+        rest = [t for t in handle.task_ids if t not in conflicted]
+        if rest:
+            self._record(handle, "ready", tids=rest)
+        self._plans.pop(handle, None)
+        return TaskStatus.READY
+
     def abandon(self, handle: TaskHandle) -> None:
         """放弃跟踪：Ledger 记 abandoned 并删登记（不取消后端任务——后
-        端无任务取消能力，在途传输可能仍完成；副本清理由 remove 负责）。"""
+        端无任务取消能力，在途传输可能仍完成；副本清理由 remove 负责）。
+        观测态的冲突任务保持 failed 不改写。"""
         if handle not in self._plans:
             raise KeyError(f"unknown task handle: {handle}")
-        self._record(handle, "abandoned")
+        conflicted = set(self._watch.pop(handle, ()))
+        rest = [t for t in handle.task_ids if t not in conflicted]
+        if rest:
+            self._record(handle, "abandoned", tids=rest)
         self._plans.pop(handle, None)
 
     def exists(self, prefix: Prefix) -> bool:
         """全部 key 在池才为真（batch_is_exist；读即续租）。
 
+        查询本身失败（RPC/单 key -1）抛 QueryError——「查不出来」与
+        「不存在」语义不同：前者调用方可重试，后者才触发重算/预热。
         返回列表长度与 key 数不一致视为不存在（绑定异常时可能短回）。
         """
         keys = self._keys.keys_for_tokens(prefix.token_ids)
         if not keys:
             return False
-        result = self._client.is_exist(keys)
+        try:
+            result = self._client.is_exist(keys)
+        except StoreClientError as e:
+            raise QueryError(str(e)) from e
         return len(result) == len(keys) and all(result)
 
     # ------------------------------------------------------------------
@@ -183,7 +251,9 @@ class MooncakeBackend(KvOps):
     # 谁手里有原始信息，谁就记账。（状态机可丢，重启后从 master 重查）
     # ------------------------------------------------------------------
 
-    def _record(self, handle: TaskHandle, status: str) -> None:
+    def _record(
+        self, handle: TaskHandle, status: str, tids: list[object] | None = None
+    ) -> None:
         if self._ledger is None:
             return
         entry = self._plans.get(handle)
@@ -191,7 +261,7 @@ class MooncakeBackend(KvOps):
             return
         prefix, target, _ = entry
         self._ledger.upsert_tasks(
-            [encode_task_id(tid) for tid in handle.task_ids],
+            [encode_task_id(tid) for tid in (tids if tids is not None else handle.task_ids)],
             op=handle.op.value,
             prefix=prefix,
             target=str(target),
@@ -201,6 +271,7 @@ class MooncakeBackend(KvOps):
     def _finish(self, handle: TaskHandle, status: str) -> None:
         """终态处理：Ledger 迁移 + 删核验登记（防长驻进程泄漏）。"""
         self._record(handle, status)
+        self._watch.pop(handle, None)
         self._plans.pop(handle, None)
 
     # ------------------------------------------------------------------

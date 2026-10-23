@@ -25,7 +25,7 @@ from typing import Iterable, Sequence
 
 def entry_exists(e) -> bool:
     """batch_is_exist 返回项的_truthy 判定——唯一的判定定义，所有
-    「key 是否在池」的调用共用。"""
+    「key 是否在池」的调用共用（错误项 -1 不到这里，is_exist 先抛）。"""
     return e == 1 or e is True or (isinstance(e, int) and e > 0)
 
 
@@ -96,8 +96,21 @@ class StoreClient:
     # ------------------------------------------------------------------
 
     def is_exist(self, keys: Sequence[str]) -> list[bool]:
-        """batch_is_exist → bool 列表（读即续租——保活机制利用这一点）。"""
-        return [entry_exists(e) for e in self._s().batch_is_exist(list(keys))]
+        """batch_is_exist → bool 列表（读即续租——保活机制利用这一点）。
+
+        单 key 查询失败（返回 -1）不吞成「不存在」——抛
+        StoreClientError，由调用方按可重试错误处理（吞掉会让
+        「查询失败」被当成「缓存不存在」，误触发重算/预热）。
+        """
+        keys = list(keys)
+        raw = self._s().batch_is_exist(keys)
+        failed = [k for k, e in zip(keys, raw) if e == -1]
+        if failed:
+            raise StoreClientError(
+                f"batch_is_exist per-key query failed ({len(failed)}/{len(keys)}): "
+                f"{failed[:4]}{'...' if len(failed) > 4 else ''}"
+            )
+        return [entry_exists(e) for e in raw]
 
     # ------------------------------------------------------------------
     # 复制任务
@@ -106,9 +119,18 @@ class StoreClient:
     def create_copy_task(self, key: str, targets: Sequence[str]) -> object:
         """发起复制：为 key 在目标 seg 各建一个副本；返回任务 id。
 
-        master 只校验 key 存在 + 目标 seg 已挂载且可分配——不查目标已有
-        副本、不查在途任务（重复发起各拿任务 id，执行时先完成者赢、后者
-        按幂等规则失败）。源由 master 选择，源 seg 所在 client 必须在线。
+        master 只校验 key 存在 + 目标 seg 已挂载且可分配。重复发起的
+        两种归宿（两版本同）：
+        - 目标已有 COMPLETE 副本：CopyStart 跳过已占 seg（0.3.11
+          `master_service.cpp:1899` / main `:6497`），targets 全占则
+          返回空列表 → client 侧 `replica_copy_skipped` 直接成功
+          （0.3.11 `client_service.cpp:2604`）——**完成重复 = 幂等成功**；
+        - 同 key 有任务在途：CopyStart 报 `OBJECT_HAS_REPLICATION_TASK`
+          （0.3.11 `master_service.cpp:1875` / main `:6488`）——
+          **在途重复 = 任务失败**，query_task 的 message 带该错误码名
+          （`types.cpp:32`）。按 D1 §4 此情形是「别人在干同一件事」，
+          不当真失败（MooncakeBackend.query_task 已按此处理）。
+        源由 master 选择，源 seg 所在 client 必须在线。
         """
         task_id, err = self._s().create_copy_task(key, list(targets))
         if err != 0:

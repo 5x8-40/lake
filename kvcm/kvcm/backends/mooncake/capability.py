@@ -70,6 +70,8 @@ def mooncake_main() -> BackendCapability:
         has_admin_query=Capability(
             Support.YES,
             Support.YES,
-            "HTTP /batch_query_keys 走零副作用核验路径",
+            "HTTP /batch_query_keys 走零副作用核验路径；消费点 = "
+            "MooncakeBackend._verify_missing 的 TODO（当前写死绑定通道，"
+            "本版本接线后切 HTTP）",
         ),
     )

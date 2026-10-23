@@ -19,7 +19,7 @@ L4 适配层     两个正交维度，各一实现：
 L5 状态层     Ledger（sqlite，四类状态记录）
 ```
 
-- 依赖方向只允许向下：L1 → L2 → L3 ← L4；L5 被 L2/L4 持有
+- 依赖方向只允许向下：L1 → L2 → L3 ← L4；L5 由 L4（后端实现侧）持有，L2 不直接碰——L2 经 L3 操作间接受益于实现侧记账（任务状态迁移的时机只有实现侧知道）
 - 核心思想：**原子操作屏蔽后端与引擎语义**——L2 编排对任何存储后端、任何推理引擎成立；换后端换 StoreBackend，换引擎换 EngineAdapter
 
 ## L1 接口层（进程对外通道）
@@ -106,6 +106,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 | capability 填充 | 按后端版本填充能力声明（目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | 新增，L3 表驱动 |
 
 - **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——放通用层会把后端概念带进通用接口
+- **一个后端实例 = 一种 (源 TP, 目标 TP, put_step) 组合**：KeyComputer 的异构展开口径在构造期定死（`kvcm/engines/vllm/keys.py::KeyComputer` docstring 记了完整前提链），换组合必须新建实例——编排层持多组合时按组合各建一个，不复用
 - **第二后端候选已登记在案**：昇腾 MemCache（`3rdparty/memcache`；kv-prefetch.md 待定项「生产默认走 MemCache，还是留 Mooncake」）——L3 抽象现在建正是时候；但只建一层接口，第二后端真接入时再修接口，不为假想后端过度设计
 
 #### 三条接入通道（mooncake）
@@ -153,7 +154,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 | 子件 | 职责 | 现有代码来源 |
 |------|------|-------------|
 | KeyComputer | 前缀 → hash 链 → PoolKey（与引擎同口径） | `demo/precopy/keys.py`（lazy-import vllm-ascend `KeyMetadata`/`PoolKey` 保证同口径） |
-| RankTopology | rank↔KV shard 形状（TP/PP/DP 切分；异构 TP 的 `decode_tp_size`/`prefill_tp_size` 语义）；rank↔seg 对号 | `demo/precopy/resolve.py` 的 rank 侧降为对号实现 |
+| RankTopology | rank↔KV shard 形状（TP/PP/DP 切分；异构 TP 的对端 TP 语义——引擎 env `PEER_TP_SIZE`，10-12 已由 `decode_tp_size`/`prefill_tp_size` 正名，kvcm `peer_tp_size` 须与之同值）；rank↔seg 对号 | `demo/precopy/resolve.py` 的 rank 侧降为对号实现 |
 | 事件格式 | 引擎 KV 事件（`BlockStored` 等）schema 的生成/解析 | EventPublisher 补发时按本格式构造 |
 | engine config | block_size / num_kv_heads / head_size / 层数读取（KV 大小估算，E14 容量规划输入） | 新增 |
 

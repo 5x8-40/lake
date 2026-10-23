@@ -9,10 +9,14 @@
    层 EventPublisher）
 
 失败分类（统一出口 = PrefetchError；编程错误除外，直接传播）：
-- 前置检查不过 / copy 提交失败（SubmitError，带已发任务号明细）——
-  终态上抛
+- 前置检查不过（前缀确实不在池）/ copy 提交失败（SubmitError，带
+  已发任务号明细）——终态上抛
+- 前置检查查询失败（QueryError：RPC/单 key 查询错误）——**不经
+  PrefetchError 包装，直接传播**：「查不出来」可重试，「不存在」
+  才终态，两者不得混
 - 核验失败（VerifyError：任务完成但副本不到位）——终态，带明细上抛
-- 查询失败（QueryError：RPC 错误）——可重试，继续轮询到超时兜底
+- 任务状态查询失败（QueryError：RPC 错误）——可重试，继续轮询到
+  超时兜底
 - 任务 FAILED / 超时——终态上抛；超时先 abandon 收口（删登记 + 记
   abandoned），再抛
 
@@ -58,7 +62,9 @@ class PrefetchFlow:
         """
         if not self._ops.exists(prefix):
             raise PrefetchError(
-                "prefix not fully in pool — warm 未覆盖该前缀，或 key 口径与引擎漂移"
+                "prefix not fully in pool — warm 未覆盖该前缀、key 口径与引擎漂移，"
+                "或异构前提未满足（源引擎未开 tp_mismatch / PEER_TP_SIZE 两端错位，"
+                "则 effective 空间 key 全 miss）"
             )
         deadline = time.monotonic() + timeout_s
         try:

@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -32,6 +33,7 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS keepalive (
     prefix_key      TEXT PRIMARY KEY,
     model_id        TEXT NOT NULL,
+    token_ids       TEXT NOT NULL,
     registered_at   REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS replicas (
@@ -44,10 +46,18 @@ CREATE TABLE IF NOT EXISTS sessions (
     session_id  TEXT NOT NULL,
     prefix_key  TEXT NOT NULL,
     instance    TEXT NOT NULL,
+    token_ids   TEXT NOT NULL,
     bound_at    REAL NOT NULL,
     PRIMARY KEY (session_id, prefix_key)
 );
 """
+
+# 老库文件的列增补（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）。
+# kvcm 未正式部署，此处仅为 demo 期遗留 db 兜底。
+_MIGRATIONS = (
+    ("keepalive", "token_ids", "ALTER TABLE keepalive ADD COLUMN token_ids TEXT NOT NULL DEFAULT ''"),
+    ("sessions", "token_ids", "ALTER TABLE sessions ADD COLUMN token_ids TEXT NOT NULL DEFAULT ''"),
+)
 
 
 def prefix_key(prefix: Prefix) -> str:
@@ -84,6 +94,20 @@ class Ledger:
     def __init__(self, path: str) -> None:
         self._conn = sqlite3.connect(path)
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """老库文件补列（缺列才 ALTER，已齐则零动作）。"""
+        for table, column, ddl in _MIGRATIONS:
+            cols = {
+                row[1]
+                for row in self._conn.execute(
+                    f"PRAGMA table_info({table})"
+                ).fetchall()
+            }
+            if column not in cols:
+                self._conn.execute(ddl)
+        self._conn.commit()
 
     def __enter__(self) -> "Ledger":
         return self
@@ -129,15 +153,32 @@ class Ledger:
         ).fetchone()
         return TaskRecord(*row) if row else None
 
+    def gc_tasks(self, *, max_age_s: float = 7 * 24 * 3600) -> int:
+        """清理终态老任务（ready/failed/abandoned 且 updated_at 超龄），
+        返回删除行数。running 行不动（在途或孤儿，处置归恢复策略）。
+
+        调用归 E11 的周期循环；本表此前只增不删，长跑必胀。"""
+        cur = self._conn.execute(
+            "DELETE FROM tasks WHERE status != 'running' AND updated_at < ?",
+            (time.time() - max_age_s,),
+        )
+        self._conn.commit()
+        return cur.rowcount
+
     # ------------------------------------------------------------------
     # 保活注册表（不可丢）
     # ------------------------------------------------------------------
 
     def register_keepalive(self, prefix: Prefix) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO keepalive (prefix_key, model_id, registered_at)"
-            " VALUES (?, ?, ?)",
-            (prefix_key(prefix), prefix.model_id, time.time()),
+            "INSERT OR REPLACE INTO keepalive (prefix_key, model_id, token_ids, registered_at)"
+            " VALUES (?, ?, ?, ?)",
+            (
+                prefix_key(prefix),
+                prefix.model_id,
+                json.dumps(list(prefix.token_ids)),
+                time.time(),
+            ),
         )
         self._conn.commit()
 
@@ -147,9 +188,25 @@ class Ledger:
         )
         self._conn.commit()
 
-    def list_keepalive(self) -> list[str]:
-        rows = self._conn.execute("SELECT prefix_key FROM keepalive").fetchall()
-        return [r[0] for r in rows]
+    def list_keepalive(self) -> list[Prefix]:
+        """全部在保前缀（还原为 Prefix——KeepaliveLoop 重启恢复的直接输入）。
+
+        token_ids 必须随表持久化：prefix_key 是单向 digest，反推不出
+        token 序列；没有本列则重启后保活无法恢复（「不可丢」名不符实）。
+        老库迁移而来的行 token_ids 为 ''（无法还原），跳过并留给
+        KeepaliveLoop 决定如何处理（重新注册或告警）。
+        """
+        rows = self._conn.execute(
+            "SELECT model_id, token_ids FROM keepalive"
+        ).fetchall()
+        out: list[Prefix] = []
+        for model_id, token_ids_json in rows:
+            if not token_ids_json:
+                continue
+            out.append(
+                Prefix(model_id=model_id, token_ids=tuple(json.loads(token_ids_json)))
+            )
+        return out
 
     # ------------------------------------------------------------------
     # 副本台账（半可丢）
@@ -180,9 +237,15 @@ class Ledger:
 
     def bind_session(self, session_id: str, prefix: Prefix, instance: str) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, prefix_key, instance, bound_at)"
-            " VALUES (?, ?, ?, ?)",
-            (session_id, prefix_key(prefix), instance, time.time()),
+            "INSERT OR REPLACE INTO sessions (session_id, prefix_key, instance, token_ids, bound_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (
+                session_id,
+                prefix_key(prefix),
+                instance,
+                json.dumps(list(prefix.token_ids)),
+                time.time(),
+            ),
         )
         self._conn.commit()
 
@@ -190,8 +253,19 @@ class Ledger:
         self._conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
         self._conn.commit()
 
-    def list_session(self, session_id: str) -> list[str]:
+    def list_session(self, session_id: str) -> list[Prefix]:
+        """会话绑定的前缀（还原为 Prefix；token_ids 持久化的必要性同
+        list_keepalive——会话结束要 demote 的前缀重启后必须能展开 key）。
+        model_id 从 prefix_key（"model:digest"）解析。"""
         rows = self._conn.execute(
-            "SELECT prefix_key FROM sessions WHERE session_id = ?", (session_id,)
+            "SELECT prefix_key, token_ids FROM sessions WHERE session_id = ?",
+            (session_id,),
         ).fetchall()
-        return [r[0] for r in rows]
+        return [
+            Prefix(
+                model_id=pk.split(":", 1)[0],
+                token_ids=tuple(json.loads(token_ids_json)),
+            )
+            for pk, token_ids_json in rows
+            if token_ids_json
+        ]
