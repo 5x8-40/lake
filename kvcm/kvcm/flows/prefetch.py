@@ -15,8 +15,12 @@
 
 任务状态同步轮询是本步形态；进程化后由 TaskEngine 跟踪（并发上限 +
 限速器），流程本体不变。重发 / 弃置清副本 / 源掉线衔接的策略归
-TaskEngine。任务状态记录（Ledger）由后端实现侧在 copy/query_task 时
-登记迁移，本流程不直接写。
+TaskEngine。
+
+任务状态记录（Ledger）由后端实现侧在 copy / query_task 时登记迁移，
+本流程不直接写——记账需要任务号的持久化编码与状态迁移的时机，两
+样都只在实现侧手里；编排层记账两头都缺，还会漏分支（超时、异常路
+径没人写）。
 """
 
 from __future__ import annotations
