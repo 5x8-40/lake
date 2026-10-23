@@ -293,6 +293,18 @@ class KeyComputer:
 
     异构 TP：源与目标 TP 不同时按 effective_tp = max(local, peer) 展开
     （key 按较大 rank 数生成，缺侧由复制计划映射回较少 seg）。
+
+    **一个实例 = 一种 (tp_size, peer_tp_size, put_step) 组合**：异构
+    展开的 key 口径在构造期定死，换目标 TP / put_step 必须新建实例
+    （因此持它的后端实例同样是一对源-目标组合的）。编排层持多组合
+    时按组合各建一个后端实例，不要复用。
+
+    异构前提链（缺一环则 effective 空间 key 全 miss）：
+    1. 源引擎打 tp_mismatch 补丁（vllm-ascend #15835 backport），按
+       effective_tp 命名写 sub-key；
+    2. 两端引擎 env 的 PEER_TP_SIZE 互配为对端 TP（不是自身 TP；
+       配成自身则 mismatch 静默禁用、plain key 与 eff key 错位）；
+    3. 本类的 tp_size / peer_tp_size 与两端引擎实际 TP 一致。
     """
 
     def __init__(

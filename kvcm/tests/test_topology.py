@@ -269,3 +269,17 @@ def test_rank_topology_class() -> None:
         segs=["127.0.0.1:5001"], pidfile="/nonexistent/worker_B.pid"
     )
     assert targets == ["127.0.0.1:5001"]
+
+
+def test_pid_children_map_ps_fallback_failure_is_probe_error(monkeypatch) -> None:
+    """/proc 一个都读不到且 ps 缺失/失败 → ProbeError(_PROBE_NO_PS)，
+    不得让 FileNotFoundError/CalledProcessError 裸逃。"""
+    monkeypatch.setattr(tp_mod.os, "listdir", lambda _p: (_ for _ in ()).throw(OSError("no proc")))
+
+    def _boom(*a, **k):
+        raise FileNotFoundError("ps not found")
+
+    monkeypatch.setattr(tp_mod.subprocess, "run", _boom)
+    with pytest.raises(ProbeError) as ei:
+        tp_mod._pid_children_map()
+    assert ei.value.code == tp_mod._PROBE_NO_PS

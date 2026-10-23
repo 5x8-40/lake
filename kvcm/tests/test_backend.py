@@ -15,11 +15,12 @@ import pytest
 
 from kvcm.backends.mooncake.backend import MooncakeBackend, encode_task_id
 from kvcm.backends.mooncake.capability import mooncake_v0311, mooncake_main
-from kvcm.backends.mooncake.client import StoreClient, entry_exists
+from kvcm.backends.mooncake.client import StoreClient, StoreClientError, entry_exists
 from kvcm.engines.vllm.keys import KeyComputer
-from kvcm.ledger import Ledger, prefix_key
+from kvcm.ledger import Ledger
 from kvcm.ops.base import (
     OpKind,
+    QueryError,
     SubmitError,
     TaskStatus,
     UnsupportedCapabilityError,
@@ -40,8 +41,9 @@ class _FakeStoreTaskStatus(enum.Enum):
 
 
 class _FakeTaskResp:
-    def __init__(self, status):
+    def __init__(self, status, message=""):
         self.status = status
+        self.message = message
 
 
 @pytest.fixture()
@@ -184,6 +186,96 @@ def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> N
 
 
 # ---------------------------------------------------------------------------
+# 在途冲突观测态（OBJECT_HAS_REPLICATION_TASK → 不当失败，只核验副本）
+# ---------------------------------------------------------------------------
+
+_CONFLICT_MSG = "OBJECT_HAS_REPLICATION_TASK (max retries reached: 3)"
+
+
+class ConflictClient(FakeClient):
+    """全部任务报在途冲突；副本到位与否由 replicas_on 剧本控制。"""
+
+    def query_task(self, task_id):
+        self.queried.append(task_id)
+        return _FakeTaskResp(_FakeStoreTaskStatus.FAILED, _CONFLICT_MSG)
+
+
+def test_conflict_watch_running_then_ready(fake_store_module, monkeypatch) -> None:
+    """在途冲突 → 转观测态：副本未到位 RUNNING（不丢句柄），到位 READY。"""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        client = ConflictClient(replicas_on=[])  # 副本还没到位
+        b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led)
+        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        # 第一轮：全部失败且全是在途冲突 → 观测态 RUNNING，句柄保留
+        assert b.query_task(handle) is TaskStatus.RUNNING
+        assert handle in b._plans
+        # 冲突任务如实记 failed（它们确实失败了，数据是别人搬的）
+        for tid in handle.task_ids:
+            assert led.get_task(encode_task_id(tid)).status == "failed"  # type: ignore[union-attr]
+        # 观测态后续调用不再查任务（任务已死），只核验副本
+        n_queried = len(client.queried)
+        assert b.query_task(handle) is TaskStatus.RUNNING
+        assert len(client.queried) == n_queried
+        # 副本到位（别人的任务传完）→ READY，终态删登记
+        client._replicas_on = ["seg-A", "seg-B"]
+        assert b.query_task(handle) is TaskStatus.READY
+        assert handle not in b._plans
+        assert handle not in b._watch
+    finally:
+        led.close()
+        os.unlink(path)
+
+
+def test_conflict_mixed_with_real_failure_is_terminal(fake_store_module, monkeypatch) -> None:
+    """失败不全是冲突（混有真失败）→ 维持终态 FAILED，不进观测态。"""
+
+    class MixedClient(FakeClient):
+        def __init__(self):
+            super().__init__()
+            self._n = 0
+
+        def query_task(self, task_id):
+            self._n += 1
+            if self._n == 1:
+                return _FakeTaskResp(_FakeStoreTaskStatus.FAILED, _CONFLICT_MSG)
+            return _FakeTaskResp(_FakeStoreTaskStatus.FAILED, "OBJECT_NOT_FOUND")
+
+    b = _backend(MixedClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
+    handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+    assert b.query_task(handle) is TaskStatus.FAILED
+    assert handle not in b._plans
+    assert handle not in b._watch
+
+
+def test_abandon_during_watch_keeps_conflict_ledger(fake_store_module, monkeypatch) -> None:
+    """观测态放弃：冲突任务保持 failed 不改写，其余记 abandoned。"""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        client = ConflictClient(replicas_on=[])
+        b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led)
+        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        assert b.query_task(handle) is TaskStatus.RUNNING  # 进观测态
+        b.abandon(handle)
+        assert handle not in b._plans
+        assert handle not in b._watch
+        # 本例全部任务都冲突 → 全部保持 failed（无 abandoned 改写）
+        for tid in handle.task_ids:
+            assert led.get_task(encode_task_id(tid)).status == "failed"  # type: ignore[union-attr]
+    finally:
+        led.close()
+        os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
 # exists / entry_exists
 # ---------------------------------------------------------------------------
 
@@ -208,6 +300,33 @@ def test_exists_checks_length(fake_store_module, monkeypatch) -> None:
 def test_exists_all_present(fake_store_module, monkeypatch) -> None:
     b = _backend(FakeClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
     assert b.exists(Prefix(model_id="qwen", token_ids=(1,))) is True
+
+
+def test_is_exist_per_key_failure_raises() -> None:
+    """batch_is_exist 单 key 返 -1（查询失败）→ StoreClientError，
+    不得吞成「不存在」。"""
+
+    class FakeBinding:
+        def batch_is_exist(self, keys):
+            return [1, -1]
+
+    client = StoreClient()
+    client._store = FakeBinding()
+    with pytest.raises(StoreClientError, match=r"per-key query failed \(1/2\)"):
+        client.is_exist(["k0", "k1"])
+
+
+def test_exists_query_failure_is_retryable_query_error(fake_store_module, monkeypatch) -> None:
+    """exists 的查询失败（RPC/单 key -1）→ QueryError（可重试），
+    与「不存在」（False，触发重算/预热）严格区分。"""
+
+    class BoomClient(FakeClient):
+        def is_exist(self, keys):
+            raise StoreClientError("batch_is_exist per-key query failed (1/2): ['k1']")
+
+    b = _backend(BoomClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
+    with pytest.raises(QueryError):
+        b.exists(Prefix(model_id="qwen", token_ids=(1,)))
 
 
 # ---------------------------------------------------------------------------
@@ -255,9 +374,13 @@ def test_ledger_survives_reopen() -> None:
         p = Prefix(model_id="qwen", token_ids=(1, 2, 3))
         led = Ledger(path)
         led.register_keepalive(p)
+        led.bind_session("s1", p, "inst-B")
         led.close()
         led2 = Ledger(path)
-        assert led2.list_keepalive() == [prefix_key(p)]
+        # 重开必须还原 Prefix（token_ids 随表持久化——prefix_key 单向
+        # digest 反推不出 token 序列，重启恢复全靠本列）
+        assert led2.list_keepalive() == [p]
+        assert led2.list_session("s1") == [p]
         led2.close()
     finally:
         os.unlink(path)
@@ -394,5 +517,40 @@ def test_ledger_replicas_and_sessions_crud() -> None:
         led.unbind_session("s1")
         assert led.list_session("s1") == []
         led.close()
+    finally:
+        os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# Ledger tasks 表 GC（终态超龄删除；running 不动）
+# ---------------------------------------------------------------------------
+
+
+def test_ledger_gc_tasks() -> None:
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+    import time
+
+    try:
+        with Ledger(path) as led:
+            p = Prefix(model_id="q", token_ids=(1,))
+            led.upsert_task("old-ready", op="copy", prefix=p, target="i", status="ready")
+            led.upsert_task("old-failed", op="copy", prefix=p, target="i", status="failed")
+            led.upsert_task("old-running", op="copy", prefix=p, target="i", status="running")
+            led.upsert_task("new-ready", op="copy", prefix=p, target="i", status="ready")
+            # 手工把三行的 updated_at 拨到 8 天前
+            old = time.time() - 8 * 24 * 3600
+            led._conn.execute(
+                "UPDATE tasks SET updated_at = ? WHERE task_id != 'new-ready'", (old,)
+            )
+            led._conn.commit()
+            assert led.gc_tasks() == 2  # old-ready + old-failed
+            assert led.get_task("old-ready") is None
+            assert led.get_task("old-failed") is None
+            # running 再老也不动（在途或孤儿，处置归恢复策略）
+            assert led.get_task("old-running") is not None
+            # 新终态不动
+            assert led.get_task("new-ready") is not None
     finally:
         os.unlink(path)
