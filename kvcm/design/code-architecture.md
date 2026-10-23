@@ -67,7 +67,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
     - 跨语言直连 = 自己实现一套协议客户端（编码规则、framing、函数 ID 都要从 C++ 源码反推），几千行且随版本漂移
     - 结论：kvcm 不看「RPC 有没有」，看下一条的「通道」
   - **通道**：kvcm（Python）当前实际可调 = **store_py 绑定 ∪ HTTP admin**；**L2 按能力选路径看通道**
-    - 绑定：`store_py.cpp` @1fc27b6 共 67 个符号（上游口径）；0.3.11 部署用 NPU fork wheel，另含 `create_copy_task` / `batch_get_replica_desc`
+    - 绑定：`store_py.cpp` 的 pybind 绑定（v0.3.11 共 112 个 `.def` / @1fc27b6 共 120 个）；demo 部署的 `mooncake_transfer_engine_npu` wheel 是**官方 NPU 构建变体**（`scripts/build_wheel.sh` 改包名发布，同机制另有 `-efa` 变体），`create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），非 fork 私有
     - HTTP admin：两版本都有（端点见下「三条接入通道」节）
   - RPC ✓ 而通道 ✗ 时的处理顺序：
     1. **自封装 .so**：照 `store_py.cpp` 的写法自写封装，link wheel 的 C++ 库，不改 mooncake 源码（两个断点待 E6 验证，见下）
@@ -136,7 +136,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 - 两个断点（E6 在测试机验证）：
   1. 符号可见性：client 类符号是否从 wheel 的 .so 导出（`nm -D --defined-only <so> | c++filt`；符号不导出则此路不通，退回替代实现）
   2. ABI 匹配：封装层编译环境（gcc/libstdc++）与 NPU wheel 构建环境不一致则不可用
-- E6 另核：NPU fork 绑定与上游 `store_py.cpp` 的差异（fork 多 `create_copy_task` / `batch_get_replica_desc`）；`/query_key` 的续租副作用在核验场景能否接受
+- E6 另核：`/query_key` 的续租副作用在核验场景能否接受。（已核一条：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定，上游亦原生支持 NPU——v0.3.11 tag 已有 `ascend_transport` 目录）
 
 ### EngineAdapter（引擎适配）
 
