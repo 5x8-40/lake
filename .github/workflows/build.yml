@@ -93,7 +93,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest
+      - run: pip install -r requirements-dev.txt
       - run: python -m pytest tests/ -q
 
   # kvcm demo 冒烟(PR #53 review §四.B):仅 kvcm/demo 改动触发——无 NPU 依赖的离线检查:
