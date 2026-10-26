@@ -297,7 +297,7 @@ class MooncakeBackend(KvOps):
 
         规则：
         - 仅恢复 copy（唯一已落地操作）
-        - 空 handle_id / 空 token_ids / 重算出空 plan：跳过（老库迁移行
+        - 空 handle_id / 空 token_ids / 重算出空 plan：跳过（数据残缺行
           或口径漂移——登记空 plan 会在任务成功后假 READY）
         - 重算失败（实例已不在）：跳过，交由 gc_tasks / 下一次预热
         - 观测态恢复：同组已有冲突 failed 兄弟（部分 running 部分

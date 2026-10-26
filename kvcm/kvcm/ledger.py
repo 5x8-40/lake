@@ -58,17 +58,6 @@ CREATE TABLE IF NOT EXISTS sessions (
 );
 """
 
-# 老库文件的列增补（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）。
-# kvcm 未正式部署，此处仅为 demo 期遗留 db 兜底。
-_MIGRATIONS = (
-    ("keepalive", "token_ids", "ALTER TABLE keepalive ADD COLUMN token_ids TEXT NOT NULL DEFAULT ''"),
-    ("sessions", "token_ids", "ALTER TABLE sessions ADD COLUMN token_ids TEXT NOT NULL DEFAULT ''"),
-    ("sessions", "model_id", "ALTER TABLE sessions ADD COLUMN model_id TEXT NOT NULL DEFAULT ''"),
-    ("tasks", "token_ids", "ALTER TABLE tasks ADD COLUMN token_ids TEXT NOT NULL DEFAULT ''"),
-    ("tasks", "handle_id", "ALTER TABLE tasks ADD COLUMN handle_id TEXT NOT NULL DEFAULT ''"),
-    ("tasks", "model_id", "ALTER TABLE tasks ADD COLUMN model_id TEXT NOT NULL DEFAULT ''"),
-)
-
 
 def prefix_key(prefix: Prefix) -> str:
     """前缀的稳定标识（model + token 序列的内容 hash）。"""
@@ -105,22 +94,10 @@ class Ledger:
     _TASK_STATUSES = frozenset({"running", "ready", "failed", "abandoned"})
 
     def __init__(self, path: str) -> None:
+        # kvcm 未正式部署，只管新建库（CREATE TABLE IF NOT EXISTS 建全
+        # 列）；不做老库迁移——遇到旧结构的库文件应直接删除重建。
         self._conn = sqlite3.connect(path)
         self._conn.executescript(_SCHEMA)
-        self._migrate()
-
-    def _migrate(self) -> None:
-        """老库文件补列（缺列才 ALTER，已齐则零动作）。"""
-        for table, column, ddl in _MIGRATIONS:
-            cols = {
-                row[1]
-                for row in self._conn.execute(
-                    f"PRAGMA table_info({table})"
-                ).fetchall()
-            }
-            if column not in cols:
-                self._conn.execute(ddl)
-        self._conn.commit()
 
     def __enter__(self) -> "Ledger":
         return self
@@ -265,7 +242,7 @@ class Ledger:
 
         token_ids 必须随表持久化：prefix_key 是单向 digest，反推不出
         token 序列；没有本列则重启后保活无法恢复（「不可丢」名不符实）。
-        老库迁移而来的行 token_ids 为 ''（无法还原），跳过并留给
+        数据残缺的行（token_ids 为 ''，无法还原），跳过并留给
         KeepaliveLoop 决定如何处理（重新注册或告警）。
         """
         rows = self._conn.execute(
@@ -330,7 +307,7 @@ class Ledger:
         """会话绑定的前缀（还原为 Prefix；token_ids 持久化的必要性同
         list_keepalive——会话结束要 demote 的前缀重启后必须能展开 key）。
         model_id 用独立列（prefix_key 首个冒号切割会被含冒号的 model_id
-        截断）；老库行的空 token_ids 跳过（无法还原，唯一诚实做法）。"""
+        截断）；空 token_ids 的残缺行跳过（无法还原，唯一诚实做法）。"""
         rows = self._conn.execute(
             "SELECT model_id, token_ids FROM sessions WHERE session_id = ?",
             (session_id,),

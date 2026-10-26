@@ -438,14 +438,14 @@ def test_rebuild_restores_running_handle(fake_store_module, monkeypatch) -> None
 
 
 def test_rebuild_skips_empty_inputs(fake_store_module, monkeypatch) -> None:
-    """空 handle_id / 空 token_ids（老库迁移行）不登记——防空 plan 假 READY。"""
+    """空 handle_id / 空 token_ids（数据残缺行）不登记——防空 plan 假 READY。"""
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
         path = f.name
     import os
 
     led = Ledger(path)
     try:
-        # 模拟老库迁移行：handle_id 空、token_ids 空（upsert 走正常通道后手工改空）
+        # 模拟数据残缺行：handle_id 空、token_ids 空（upsert 走正常通道后手工改空）
         p = Prefix(model_id="qwen", token_ids=(1,))
         led.upsert_task("t-old", handle_id="h-old", op="copy", prefix=p, target="i", status="running")
         led._conn.execute("UPDATE tasks SET handle_id = '', token_ids = ''")
