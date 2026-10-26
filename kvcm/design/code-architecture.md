@@ -1,22 +1,21 @@
 # kvcm 代码架构（五层）
 
-- 定位：kvcm 服务化（E10 重构 / E11 进程化 / E15 并行限速）的模块分层设计，E10 开工依据
+- 定位：kvcm 服务化（E10 重构 / E11 进程化 / E15 并行限速）的模块分层设计。**E10 已落地**（[PR #67](https://github.com/5x8-40/lake/pull/67)，三步全量 + 九轮 review 终审），本文 = E10 落地定稿 + E11 开工依据
 - 本文**不新增机制结论**——操作语义、完成信号、幂等性、能力事实全部引自 [D1-router-scheduling.md](D1-router-scheduling.md) / [D2-kv-operations.md](D2-kv-operations.md)；本文只把它们落成代码结构
-- 语言：Python（**已定**，2026-10-23 拍板：继承现有 `demo/precopy/` 1577 行与 mooncake store_py 绑定、keys.py 与引擎同口径）
+- 语言：Python（**已定**，2026-10-23 定：继承现有 `demo/precopy/` 1577 行与 mooncake store_py 绑定、keys.py 与引擎同口径）
 
 ## 分层总览
 
 ```text
-L1 接口层     IntentReceiver / EventPublisher / InstanceWatcher
-              进程对外通道；不含任何存储概念
-L2 编排层     复合流程 = 原子操作的编排
+L1 接口层     IntentReceiver / EventPublisher / InstanceWatcher      kvcm/api/
+              进程对外通道；不含任何存储概念（空骨架，协议随 D4/E12/E13）
+L2 编排层     PrefetchFlow 已落地；SessionEnd/Drain/Retain 待做      kvcm/flows/
               只调 L3 接口；代码里不出现 seg / lease / client_id / PoolKey / rank
-L3 原子操作层 copy / move / keepalive / pin / demote / promote / retain / remove
-              抽象接口（语义规格 = D2 §1）+ capability 声明
-L4 适配层     两个正交维度，各一实现：
-              StoreBackend（存储）MooncakeBackend = StoreClient + SegTopology
-              EngineAdapter（引擎）VLLMAdapter = KeyComputer + RankTopology + 事件格式
-L5 状态层     Ledger（sqlite，四类状态记录）
+L3 原子操作层 KvOps：八操作 + query_task / exists / abandon          kvcm/ops/
+              抽象接口（语义规格 = D2 §1）+ capability 声明结构
+L4 适配层     MooncakeBackend = StoreClient + SegTopology            kvcm/backends/mooncake/
+              VLLMAdapter（子件）= KeyComputer + RankTopology         kvcm/engines/vllm/
+L5 状态层     Ledger（sqlite，四类状态记录）                          kvcm/kvcm/ledger.py
 ```
 
 - 依赖方向只允许向下：L1 → L2 → L3 ← L4；L5 由 L4（后端实现侧）持有，L2 不直接碰——L2 经 L3 操作间接受益于实现侧记账（任务状态迁移的时机只有实现侧知道）
@@ -36,12 +35,14 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 复合流程由原子操作编排而成（D2 §1「复合流程表」即规格），一个流程 = 一段只调 L3 的编排代码：
 
-| 流程 | 编排 | 出处 |
+| 流程 | 编排 | 状态 |
 |------|------|------|
-| PrefetchFlow | copy×N + 核验 + keepalive 注册 + READY 后触发补发 | D2 §1、D1 §4 |
-| SessionEndFlow | 停 keepalive + demote | D1 §6 |
-| DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | D2 §4 计划下线四步 |
-| RetainFlow | move 到活 seg（副本脱离将死引擎） | D2 §4 |
+| PrefetchFlow | exists 前置检查 → copy → query_task 轮询到 READY（keepalive 注册与 READY 补发待接线） | **已落地**（`flows/prefetch.py`） |
+| SessionEndFlow | 停 keepalive + demote | 待做（D1 §6） |
+| DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 待做（D2 §4 计划下线四步） |
+| RetainFlow | retain（主路径 = retained client 注册；0.3.11 过渡 = move 到活 seg） | 待做（D2 §4） |
+
+- **失败分类（编排统一出口 = PrefetchError，编程错误除外直接传播）**：前置检查不过 / 提交失败（SubmitError，带已发任务号明细）→ 终态；核验失败（VerifyError）→ 终态带明细；查询失败（QueryError）→ 可重试继续轮询；任务 FAILED → 终态；超时 → 先 abandon 收口再抛
 
 支撑组件（同进程内的常驻循环，E11 进程化的主体）：
 
@@ -56,6 +57,14 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 - 八项分三类（D2 §1）：**原子动作**（copy / move / keepalive / demote / promote / remove）、**元数据标记**（pin）、**目的型**（retain——由 demote / move / pin 组合实现，对外仍呈现单步语义）
 - 完成信号：任务类（copy/move）查任务状态 + 核验副本 → READY；READY 有三个（copy / move / promote），其余五个无（D2 §1 完成信号节）
 - 幂等：控制面以（前缀 × 目标实例）为幂等键，在途不重复发、完成不重复发（D1 §4）；后端幂等兜底（D1 F11）
+
+**接口形态（已定稿，`kvcm/ops/`）**
+
+- **抽象收窄到五项最小集**：`capability / copy / query_task / abandon / exists` 为 abstractmethod；其余操作基类默认抛「适配器未接线」（UnsupportedCapabilityError）——第二后端接入不必先 stub 全部操作；编排层判断可用性读 capability()，异常只是兜底
+- **任务号不透明对象**：`TaskHandle.task_ids: tuple[object, ...]`——L3 不透传不解释（mooncake 任务号是整数对，`str()` 化会让真实绑定的 `query_task` TypeError）；持久化编码 `"hi:lo"` 归实现侧（`encode_task_id`/`decode_task_id`，重启可还原）。一次前缀操作展开为 N 个后端任务（每 key 一个），句柄承载全部
+- **READY 规则**：copy / move / promote 有 READY（任务完成 + 目标侧副本核验通过）；**retain 返回 TaskHandle**（D-5 裁定：结果必须可观测）——主路径 = main retained client 注册（一次 RPC，无异步工作）返回空句柄 `task_ids=()`，`query_task` 入口直接 READY；0.3.11 过渡 move 返回真句柄。其余方法（keepalive / stop_keepalive / pin / demote / remove）无 READY
+- **exists 查询面**（非第九项操作）：读即续租（has_lease），兼预热前置检查与保活续租通道；查询失败（RPC/单 key -1）与「不存在」分家——前者转 QueryError 可重试，后者才触发重算/预热
+- **abandon（放弃跟踪）**：删核验登记 + Ledger 记 abandoned；**非任务取消**（后端无此能力，在途传输可能仍完成），副本清理归 remove；放弃后句柄失效
 
 **capability 声明（显式，不藏在接口后面假装统一）**
 
@@ -91,20 +100,49 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 - L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 的 retained client/DFS 前提，本质就是能力分支——本层把它落成显式声明
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
 
+## 失败语义与任务生命周期
+
+**失败语义三类**（`kvcm/ops/base.py`；编排层统一出口 PrefetchError，编程错误直接传播不被吞）：
+
+| 异常 | 语义 | 调用方处置 |
+|------|------|-----------|
+| SubmitError | 提交失败（copy/move/promote 发起阶段；消息带已发任务号——中途失败的任务需要跟踪） | 终态，重试策略归编排（幂等键 + 后端幂等兜底） |
+| QueryError | 查询失败（RPC 错误等瞬时原因） | 可重试，继续轮询到超时兜底 |
+| VerifyError | 核验失败（任务全部完成但副本不到位） | 终态，带缺失明细上抛 |
+
+**在途冲突观测态**（D1 §4「在途不当失败」的代码落实）：任务失败 message 全部含 `OBJECT_HAS_REPLICATION_TASK`（别人在复制同 key，典型 = 同 intent 重发）时，**不按失败处理**——冲突任务如实记 failed，之后只核验副本，副本到位即 READY（字节是谁搬的不重要，到位是目的）。混合失败（部分冲突部分真失败）仍整组 FAILED。
+
+**copy 任务生命周期**：
+
+```text
+              ┌─ 全部成功 + 副本核验通过 ─────→ READY（终态，Ledger 记 ready）
+              ├─ 任一任务真失败 ──────────────→ failed（终态）
+running ──────┼─ 失败全是在途冲突 ────────────→ 观测态（只核验副本）：
+（query_task  │                                 ├─ 副本到位 → READY（冲突任务保持 failed）
+ 轮询）       │                                 └─ 未到位 → 保持 running
+              ├─ 任务成功但副本核验缺 ────────→ VerifyError → failed（终态）
+              └─ 编排超时 → abandon ─────────→ abandoned（终态；不取消后端任务）
+```
+
+- 终态即删进程内核验登记（`_plans`），防长驻泄漏；观测态登记（`_watch`）同生命周期
+- **全撞车组（全部任务冲突失败）重启不恢复是自洽设计**：该组没有在途传输，副本跟踪归第一遍任务组（仍 running 则由它恢复）；新请求 exists 兜底——不存在「副本没到却报成功」的路径
+
 ## L4 适配层（两个正交维度）
 
 适配分两个正交维度：**存储后端**与**推理引擎**——两者各自独立可换，各建一个适配器。L3 原子操作的实现同时持有两者（引擎侧算 key 与 rank 拓扑，存储侧执行 RPC）。
 
 ### StoreBackend（存储后端适配）
 
-**MooncakeBackend**（首个实现）：
+**MooncakeBackend**（首个实现，`backends/mooncake/backend.py`）：
 
-| 子件 | 职责 | 现有代码来源 |
-|------|------|-------------|
-| StoreClient | **双通道**：控制类走 store_py 绑定（copy/move/exist/Remove/upsert…）；查询/核验类走 HTTP admin（urllib：`/batch_query_keys` 副本核验、`/get_all_segments` seg 拓扑）+ client UUID 持久化（sqlite）——**持久化仅在 §2 方案一（client_id 改归 kvcm）下需要，方案一/二尚未定**：若走方案二（借名）则无持久化诉求、代价转为 master 加「key → client_id」查询 RPC（D2 §2 决策条件），届时随决策调整本子件 | `demo/precopy/common.py` + `demo/precopy/precopy.py` 的 RPC 调用段 + `demo/precopy/resolve.py` 的 admin HTTP 调用段 |
-| SegTopology | seg→client/实例映射；seg、client_id、lease 语义 | `demo/precopy/resolve.py` 的 seg 侧（生产权威源 = L1 InstanceWatcher 注册，D1 §3/E13） |
-| capability 填充 | 按后端版本填充能力声明（目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | 新增，L3 表驱动 |
+| 子件 | 职责 | 包路径 |
+|------|------|--------|
+| StoreClient | store 绑定生命周期（lazy import；connect/close，setup 失败先 close）+ **双通道**：控制类走绑定（create_copy_task / query_task / is_exist / remove…）；查询/观测走 HTTP admin。副本核验当前走绑定通道（有续租副作用）；main 的零副作用核验（`/batch_query_keys`）随版本接线（has_admin_query） | `client.py` + `http_admin.py` |
+| SegTopology | seg→client/实例映射（HTTP `/get_all_segments`）；seg、client_id、lease 语义 | `topology.py` |
+| capability 填充 | 按连接上的版本填充（**构造必填**——不许默认冒充 main；目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | `capability.py` |
 
+- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger?)`——`locate`（实例 → rank 有序 seg 列表）以可调用注入：demo 环境 = RankTopology 探测，生产 = L1 InstanceWatcher 注册，backend 不关心来源
+- **copy 已落地**（发起式）：前缀 → KeyComputer 算 key → locate 得 seg → `KeyComputer.build_plan` 做 rank 映射（异构 TP 反向展开）→ 逐 key 提交；`query_task` 聚合判定 READY。**rank 映射归引擎侧**——存储适配零 key 格式依赖（换引擎本类不动）
 - **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——放通用层会把后端概念带进通用接口
 - **一个后端实例 = 一种 (源 TP, 目标 TP, put_step) 组合**：KeyComputer 的异构展开口径在构造期定死（`kvcm/engines/vllm/keys.py::KeyComputer` docstring 记了完整前提链），换组合必须新建实例——编排层持多组合时按组合各建一个，不复用
 - **第二后端候选已登记在案**：昇腾 MemCache（`3rdparty/memcache`；kv-prefetch.md 待定项「生产默认走 MemCache，还是留 Mooncake」）——L3 抽象现在建正是时候；但只建一层接口，第二后端真接入时再修接口，不为假想后端过度设计
@@ -151,12 +189,12 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 **VLLMAdapter**（首个实现）：
 
-| 子件 | 职责 | 现有代码来源 |
-|------|------|-------------|
-| KeyComputer | 前缀 → hash 链 → PoolKey（与引擎同口径） | `demo/precopy/keys.py`（lazy-import vllm-ascend `KeyMetadata`/`PoolKey` 保证同口径） |
-| RankTopology | rank↔KV shard 形状（TP/PP/DP 切分；异构 TP 的对端 TP 语义——引擎 env `PEER_TP_SIZE`，10-12 已由 `decode_tp_size`/`prefill_tp_size` 正名，kvcm `peer_tp_size` 须与之同值）；rank↔seg 对号 | `demo/precopy/resolve.py` 的 rank 侧降为对号实现 |
-| 事件格式 | 引擎 KV 事件（`BlockStored` 等）schema 的生成/解析 | EventPublisher 补发时按本格式构造 |
-| engine config | block_size / num_kv_heads / head_size / 层数读取（KV 大小估算，E14 容量规划输入） | 新增 |
+| 子件 | 职责 | 包路径 |
+|------|------|--------|
+| KeyComputer | 前缀 → hash 链 → PoolKey（与引擎同口径：上游 lazy-import 双布局 + 离线镜像回退 + 容器内漂移哨兵）；`build_plan`（key → 目标 seg 的 rank 映射，异构反向展开）；PYTHONHASHSEED 守卫 | `engines/vllm/keys.py` |
+| RankTopology | rank↔KV shard 形状（TP/PP/DP 切分；异构 TP 的对端 TP 语义——引擎 env `PEER_TP_SIZE`，kvcm `peer_tp_size` 须与之同值）；rank↔seg 对号（probe：pidfile/进程树/ss//proc/ssh 自 pipe，ss/ssh 带超时） | `engines/vllm/topology.py` |
+| 事件格式 | 引擎 KV 事件（`BlockStored` 等）schema 的生成/解析 | 待做（EventPublisher 补发时按本格式构造） |
+| engine config | block_size / num_kv_heads / head_size / 层数读取（KV 大小估算，E14 容量规划输入） | 待做 |
 
 - **KeyComputer 归引擎侧，不归存储侧**——PoolKey 的权威定义在**引擎**（引擎写 KV 时就以此 key 落池，kvcm 只是按同口径找回）；mooncake 对 key 无格式要求（不透明字符串），后端不掺和 key 语义
 - **引擎之间 key 计算不一样**：vLLM 是链式 block hash（`vllm/v1/core/kv_cache_utils.py::hash_block_tokens`，`prefix_caching_hash_algo` + `init_none_hash` 的 seed 折入、block_size、Mamba/MLA 模型类型均影响结果）；SGLang 是 `RadixKey` = token id 序列本身（`sglang/srt/mem_cache/radix_cache.py`）——连 key 形态都不同（hash 值 vs token 序列）。KeyComputer 放通用层或存储侧都是放错了层
@@ -164,8 +202,25 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 ## L5 状态层
 
-- **Ledger**（sqlite）：状态记录四类（D2 §1 定型）——任务状态机（可丢）/ 保活注册表（不可丢）/ 副本台账（半可丢，可从 master 重建）/ 会话绑定（不可丢）
+**Ledger**（sqlite，`kvcm/ledger.py`）：状态记录四类，按可丢性分级——
+
+| 表 | 可丢性 | 内容 |
+|----|--------|------|
+| tasks 任务状态机 | 可丢 | task_id / handle_id（同组任务分组键）/ op / prefix_key / target / status（running/ready/failed/abandoned，写入校验）/ model_id / token_ids / 时间戳；`gc_tasks` 清超龄终态 |
+| keepalive 保活注册表 | 不可丢 | prefix_key / model_id / token_ids（还原 Prefix 必需，重启后续上保活） |
+| replicas 副本台账 | 半可丢 | key / instance / verified_at（可从 master 副本查询重建） |
+| sessions 会话绑定 | 不可丢 | session_id / prefix_key / instance / model_id / token_ids |
+
+- **记账归实现侧（L4 持有，L2 不直接碰）**：copy / query_task / abandon 时由 MooncakeBackend 经 Ledger 迁移状态——记账需要任务号的持久化编码与状态迁移的时机，两样都只在实现侧手里；编排层记账两头都缺还会漏分支
+- **批量写入单事务**（多任务同迁移不出现半新半旧）；只管新建库（kvcm 未部署，不做老库迁移，旧结构文件删除重建）
+- **单线程约束**：sqlite 连接 check_same_thread——E11 把 TaskEngine 挪进独立线程时第一件事处理（调用侧加锁或每线程一连接），否则第一次跨线程调用即 ProgrammingError
 - 部署形态：kvcm 单实例跟随 master（D2 §1）；上 HA 时再换 Redis/etcd
+
+**重启恢复（`MooncakeBackend.rebuild()`，D-4 裁定：放 token 不放 key）**
+
+- tasks 表只存**可重算输入**（model_id / token_ids / target / op），**key/seg 不落库**——重启后按 handle_id 分组，`KeyComputer` 现场重算 keys + `build_plan` 重建 `_plans`，`decode_task_id` 还原任务号
+- 规则：仅恢复 copy；空 handle_id / 空 token_ids / 重算空 plan 跳过（防假 READY）；locate 失败跳过（实例已不在，交 gc/新流程）；观测态恢复（同组冲突 failed 兄弟进 `_watch`，缺副本保持 RUNNING）
+- **已知边界（多模型/多实例共用同一 Ledger）**：rebuild 不区分任务归属——全部 running 按本实例 KeyComputer 口径重算，会错算别人的任务。当前单实例单模型无影响；**多模型前必须先加归属判定（行上 model_id 与本实例不符则跳过）**
 
 ## 设计原则
 
@@ -177,11 +232,8 @@ L5 状态层     Ledger（sqlite，四类状态记录）
 
 ## 与 E10 / E11 / E15 的对位
 
-- **E10（重构）三步**
-  1. 定义 L3 原子操作抽象基类 + capability 声明（把 D2 §1 八项落成接口）
-  2. 现有 1577 行重组为 MooncakeBackend + VLLMAdapter（L4 两维度）+ Ledger（L5）——测试现成（`demo/tools/test_keys.py` / `demo/tools/test_resolve.py`）
-  3. `precopy.py` 编排逻辑改写为 L2 PrefetchFlow（只调 L3）；L1/L2 其余模块出空骨架（类与接口先行）
-- **E11（进程化）**：进程壳 + TaskEngine + Keepalive/Release/Retain 三个 Loop 常驻化；IntentReceiver / InstanceWatcher 占位接口随 E12/E13 填
+- **E10（重构）✅ 已落地**（[PR #67](https://github.com/5x8-40/lake/pull/67)，三步全量 + 九轮 grok-4.7-high review 终审问题全清）：L3 抽象 + capability；1577 行重组为 MooncakeBackend + VLLMAdapter 子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，73 passed + 1 skipped；fake-store 锁任务号往返、重启恢复全剧本）；CI 路径隔离（`kvcm/kvcm/`+`kvcm/tests/` → kvcm job ~8s；`kvcm/demo/` → kvcm-demo 冒烟；文档与 build.yml 自身不触发语言 job）
+- **E11（进程化）**：进程壳 + TaskEngine + Keepalive/Release/Retain 三个 Loop 常驻化；IntentReceiver / InstanceWatcher 占位接口随 E12/E13 填。**前置提醒**：Ledger 线程约束（见 L5）；PrefetchFlow 的同步轮询由 TaskEngine 接管（并发上限 + 限速），流程本体不变
 - **E15（并行限速）**：TaskEngine 内的并发调度 + 限速器（链路利用率采样，D1 §5）——不独立做
 
 ## 参考实现
