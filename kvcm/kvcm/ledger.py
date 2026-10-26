@@ -139,7 +139,7 @@ class Ledger:
         """批量 upsert（单事务）——多任务同时迁移时不出现半新半旧。
 
         存的是**可重算输入**（token_ids + target + op），不存 key/seg—
-        —重启后由 KeyComputer 现场重算 plan 重建跟踪（D-4 裁定）。
+        —重启后由 KeyComputer 现场重算 plan 重建跟踪。
         """
         if status not in self._TASK_STATUSES:
             raise ValueError(f"unknown task status: {status!r}")

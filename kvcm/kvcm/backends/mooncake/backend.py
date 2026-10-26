@@ -291,9 +291,9 @@ class MooncakeBackend(KvOps):
         )
 
     def rebuild(self) -> int:
-        """重启后恢复 running 任务的跟踪登记（D-4 裁定：tasks 表存的是
-        可重算输入——model_id/token_ids/target/op；plan 由 KeyComputer
-        现场重算，key/seg 不落库）。返回恢复的 handle 数。
+        """重启后恢复 running 任务的跟踪登记（tasks 表存的是可重算输
+        入——model_id/token_ids/target/op；plan 由 KeyComputer 现场重
+        算，key/seg 不落库）。返回恢复的 handle 数。
 
         规则：
         - 仅恢复 copy（唯一已落地操作）
