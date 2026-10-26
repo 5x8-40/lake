@@ -217,6 +217,69 @@ sequenceDiagram
 - L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 的 retained client/DFS 前提，本质就是能力分支——本层把它落成显式声明
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
 
+### 模块依赖（参考）
+
+这张图只回答「谁 import 谁」，次于上面的数据流。实线是 import，虚线是调用，粗线是构造注入。
+
+```mermaid
+flowchart LR
+  subgraph gApi["api"]
+    Api["intents / events / watcher"]
+  end
+  subgraph gFlow["flows"]
+    Flow["flows.prefetch"]
+  end
+  subgraph gOps["ops"]
+    Base["ops.base"]
+    OCap["ops.capability"]
+    Types["ops.types"]
+  end
+  Led["ledger"]
+
+  subgraph gBe["backends.mooncake"]
+    BE["MooncakeBackend"]
+    SC["client<br/>StoreClient"]
+    McCap["capability"]
+    Seg["topology<br/>SegTopology"]
+    Http["http_admin"]
+  end
+  subgraph gEng["engines.vllm"]
+    KC["keys<br/>KeyComputer"]
+    RT["topology<br/>RankTopology"]
+  end
+  Loc["locate 参数<br/>无 kvcm 模块"]
+
+  Api -->|import| Types
+  Flow -->|import| Base
+  Flow -->|import| Types
+  Flow -.->|调用| Base
+  Flow ==>|构造注入 ops| Base
+  Base -->|import| OCap
+  Base -->|import| Types
+  Led -->|import| Types
+
+  BE -->|import| Base
+  BE -->|import| OCap
+  BE -->|import| Types
+  BE -->|import| Led
+  BE -->|import| SC
+  BE -->|import| KC
+  BE -.->|调用| SC
+  BE -.->|调用| KC
+  BE -.->|调用| Led
+  BE ==>|构造注入 client| SC
+  BE ==>|构造注入 key_computer| KC
+  BE ==>|构造注入 ledger| Led
+  BE ==>|构造注入 capability| OCap
+  BE ==>|构造注入 locate| Loc
+  McCap -->|import| OCap
+  Seg -->|import| Http
+```
+
+- `flows.prefetch` 的边只进 `ops`：import `ops.base` / `ops.types`，调用 `exists` / `copy` / `query_task` / `abandon`，构造注入 `ops`。没有指向 backend、engines、ledger 的边
+- `MooncakeBackend` 同时指向 `KeyComputer` 和 `StoreClient`（import，再加上 `__init__` 的 `key_computer` / `client`）。`capability`、`ledger`、`locate` 也是构造参数；`locate` 没有对应的 kvcm 模块
+- `engines.vllm.keys`、`RankTopology`、`client`、`http_admin` 不 import 任何 kvcm 模块。engines 没有指向 backend 的边。`SegTopology` 只 import `http_admin`，backend 不 import 它，也不 import `RankTopology`
+
 ## 失败语义与任务生命周期
 
 **失败语义三类**（`kvcm/ops/base.py`；编排层统一出口 PrefetchError，编程错误直接传播不被吞）：
