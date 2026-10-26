@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import threading
 import time
 from dataclasses import dataclass
 
@@ -81,14 +82,24 @@ class TaskRecord:
     updated_at: float
 
 
+@dataclass(frozen=True)
+class KeepaliveRecord:
+    """保活注册行（Prefix + 注册时刻）。KeepaliveLoop 的固定窗口按
+    registered_at 起算——重启恢复后窗口自然缩短（或已过期首扫即注销），
+    不需要额外的到期列。"""
+
+    prefix: Prefix
+    registered_at: float
+
+
 class Ledger:
     """sqlite 状态记录。单进程使用（kvcm 单实例）。
 
-    并发约束：sqlite 连接默认 check_same_thread——本类只能在创建它的
-    线程里用。当前全部调用方（MooncakeBackend._record 链路与流程层）
-    同线程，无锁。E11 进程化把 TaskEngine 挪进独立线程时，要么在调用
-    侧加锁，要么改每线程一连接——届时第一件事就是处理这条，否则第一
-    次跨线程调用即 ProgrammingError。
+    并发：一把 RLock 串行化全部公共方法（E11 决策一）。连接以
+    check_same_thread=False 创建（sqlite 自带的线程检查只认创建线程，
+    加锁也过不了）——线程安全检查由本锁接管：任何线程都可调用，同
+    一时刻只有一个线程进连接。不选每线程一连接：sqlite 写入本就串
+    行，多连接只徒增一致性死角。
     """
 
     _TASK_STATUSES = frozenset({"running", "ready", "failed", "abandoned"})
@@ -96,7 +107,8 @@ class Ledger:
     def __init__(self, path: str) -> None:
         # kvcm 未正式部署，只管新建库（CREATE TABLE IF NOT EXISTS 建全
         # 列）；不做老库迁移——遇到旧结构的库文件应直接删除重建。
-        self._conn = sqlite3.connect(path)
+        self._lock = threading.RLock()
+        self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.executescript(_SCHEMA)
 
     def __enter__(self) -> "Ledger":
@@ -106,7 +118,8 @@ class Ledger:
         self.close()
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._conn.close()
 
     # ------------------------------------------------------------------
     # 任务状态机（可丢）
@@ -145,7 +158,7 @@ class Ledger:
             raise ValueError(f"unknown task status: {status!r}")
         now = time.time()
         token_json = json.dumps(list(prefix.token_ids))
-        with self._conn:
+        with self._lock, self._conn:
             self._conn.executemany(
                 "INSERT INTO tasks (task_id, handle_id, op, prefix_key, target, status, model_id, token_ids, created_at, updated_at)"
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
@@ -176,30 +189,33 @@ class Ledger:
 
     def list_running_tasks(self) -> list[TaskRecord]:
         """全部 running 任务（重启恢复跟踪的输入）。"""
-        rows = self._conn.execute(
-            "SELECT task_id, handle_id, op, prefix_key, target, status, model_id,"
-            " token_ids, created_at, updated_at FROM tasks"
-            " WHERE status = 'running' ORDER BY rowid"
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id, handle_id, op, prefix_key, target, status, model_id,"
+                " token_ids, created_at, updated_at FROM tasks"
+                " WHERE status = 'running' ORDER BY rowid"
+            ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
     def list_tasks_by_handle(self, handle_id: str) -> list[TaskRecord]:
         """同一 handle 分组的全部任务（含终态；观测态恢复要读出冲突
         failed 兄弟）。"""
-        rows = self._conn.execute(
-            "SELECT task_id, handle_id, op, prefix_key, target, status, model_id,"
-            " token_ids, created_at, updated_at FROM tasks"
-            " WHERE handle_id = ? ORDER BY rowid",
-            (handle_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id, handle_id, op, prefix_key, target, status, model_id,"
+                " token_ids, created_at, updated_at FROM tasks"
+                " WHERE handle_id = ? ORDER BY rowid",
+                (handle_id,),
+            ).fetchall()
         return [self._row_to_record(r) for r in rows]
 
     def get_task(self, task_id: str) -> TaskRecord | None:
-        row = self._conn.execute(
-            "SELECT task_id, handle_id, op, prefix_key, target, status, model_id,"
-            " token_ids, created_at, updated_at FROM tasks WHERE task_id = ?",
-            (task_id,),
-        ).fetchone()
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT task_id, handle_id, op, prefix_key, target, status, model_id,"
+                " token_ids, created_at, updated_at FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
         return self._row_to_record(row) if row else None
 
     def gc_tasks(self, *, max_age_s: float = 7 * 24 * 3600) -> int:
@@ -207,111 +223,133 @@ class Ledger:
         返回删除行数。running 行不动（在途或孤儿，处置归恢复策略）。
 
         调用归 E11 的周期循环；本表此前只增不删，长跑必胀。"""
-        cur = self._conn.execute(
-            "DELETE FROM tasks WHERE status != 'running' AND updated_at < ?",
-            (time.time() - max_age_s,),
-        )
-        self._conn.commit()
-        return cur.rowcount
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM tasks WHERE status != 'running' AND updated_at < ?",
+                (time.time() - max_age_s,),
+            )
+            self._conn.commit()
+            return cur.rowcount
 
     # ------------------------------------------------------------------
     # 保活注册表（不可丢）
     # ------------------------------------------------------------------
 
     def register_keepalive(self, prefix: Prefix) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO keepalive (prefix_key, model_id, token_ids, registered_at)"
-            " VALUES (?, ?, ?, ?)",
-            (
-                prefix_key(prefix),
-                prefix.model_id,
-                json.dumps(list(prefix.token_ids)),
-                time.time(),
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO keepalive (prefix_key, model_id, token_ids, registered_at)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    prefix_key(prefix),
+                    prefix.model_id,
+                    json.dumps(list(prefix.token_ids)),
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
 
     def unregister_keepalive(self, prefix: Prefix) -> None:
-        self._conn.execute(
-            "DELETE FROM keepalive WHERE prefix_key = ?", (prefix_key(prefix),)
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM keepalive WHERE prefix_key = ?", (prefix_key(prefix),)
+            )
+            self._conn.commit()
 
-    def list_keepalive(self) -> list[Prefix]:
-        """全部在保前缀（还原为 Prefix——KeepaliveLoop 重启恢复的直接输入）。
+    def list_keepalive_records(self) -> list[KeepaliveRecord]:
+        """全部在保前缀（Prefix + registered_at）。KeepaliveLoop 的直接
+        输入：固定窗口按 registered_at 起算。
 
         token_ids 必须随表持久化：prefix_key 是单向 digest，反推不出
         token 序列；没有本列则重启后保活无法恢复（「不可丢」名不符实）。
         数据残缺的行（token_ids 为 ''，无法还原），跳过并留给
         KeepaliveLoop 决定如何处理（重新注册或告警）。
         """
-        rows = self._conn.execute(
-            "SELECT model_id, token_ids FROM keepalive"
-        ).fetchall()
-        out: list[Prefix] = []
-        for model_id, token_ids_json in rows:
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT model_id, token_ids, registered_at FROM keepalive"
+            ).fetchall()
+        out: list[KeepaliveRecord] = []
+        for model_id, token_ids_json, registered_at in rows:
             if not token_ids_json:
                 continue
             out.append(
-                Prefix(model_id=model_id, token_ids=tuple(json.loads(token_ids_json)))
+                KeepaliveRecord(
+                    prefix=Prefix(
+                        model_id=model_id,
+                        token_ids=tuple(json.loads(token_ids_json)),
+                    ),
+                    registered_at=registered_at,
+                )
             )
         return out
+
+    def list_keepalive(self) -> list[Prefix]:
+        """全部在保前缀（只还原 Prefix；需要 registered_at 的调用方用
+        list_keepalive_records）。"""
+        return [r.prefix for r in self.list_keepalive_records()]
 
     # ------------------------------------------------------------------
     # 副本台账（半可丢）
     # ------------------------------------------------------------------
 
     def put_replica(self, key: str, instance: str) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO replicas (key, instance, verified_at) VALUES (?, ?, ?)",
-            (key, instance, time.time()),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO replicas (key, instance, verified_at) VALUES (?, ?, ?)",
+                (key, instance, time.time()),
+            )
+            self._conn.commit()
 
     def list_replicas(self, key: str) -> list[str]:
-        rows = self._conn.execute(
-            "SELECT instance FROM replicas WHERE key = ?", (key,)
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT instance FROM replicas WHERE key = ?", (key,)
+            ).fetchall()
         return [r[0] for r in rows]
 
     def delete_replica(self, key: str, instance: str) -> None:
-        self._conn.execute(
-            "DELETE FROM replicas WHERE key = ? AND instance = ?", (key, instance)
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "DELETE FROM replicas WHERE key = ? AND instance = ?", (key, instance)
+            )
+            self._conn.commit()
 
     # ------------------------------------------------------------------
     # 会话绑定（不可丢）
     # ------------------------------------------------------------------
 
     def bind_session(self, session_id: str, prefix: Prefix, instance: str) -> None:
-        self._conn.execute(
-            "INSERT OR REPLACE INTO sessions (session_id, prefix_key, instance, model_id, token_ids, bound_at)"
-            " VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                session_id,
-                prefix_key(prefix),
-                instance,
-                prefix.model_id,
-                json.dumps(list(prefix.token_ids)),
-                time.time(),
-            ),
-        )
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO sessions (session_id, prefix_key, instance, model_id, token_ids, bound_at)"
+                " VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    prefix_key(prefix),
+                    instance,
+                    prefix.model_id,
+                    json.dumps(list(prefix.token_ids)),
+                    time.time(),
+                ),
+            )
+            self._conn.commit()
 
     def unbind_session(self, session_id: str) -> None:
-        self._conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
-        self._conn.commit()
+        with self._lock:
+            self._conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
+            self._conn.commit()
 
     def list_session(self, session_id: str) -> list[Prefix]:
         """会话绑定的前缀（还原为 Prefix；token_ids 持久化的必要性同
         list_keepalive——会话结束要 demote 的前缀重启后必须能展开 key）。
         model_id 用独立列（prefix_key 首个冒号切割会被含冒号的 model_id
         截断）；空 token_ids 的残缺行跳过（无法还原，唯一诚实做法）。"""
-        rows = self._conn.execute(
-            "SELECT model_id, token_ids FROM sessions WHERE session_id = ?",
-            (session_id,),
-        ).fetchall()
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT model_id, token_ids FROM sessions WHERE session_id = ?",
+                (session_id,),
+            ).fetchall()
         return [
             Prefix(
                 model_id=model_id,

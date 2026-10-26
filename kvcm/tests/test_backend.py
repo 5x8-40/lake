@@ -424,7 +424,7 @@ def test_rebuild_restores_running_handle(fake_store_module, monkeypatch) -> None
             capability=mooncake_v0311(),
             ledger=led,
         )
-        assert b2.rebuild() == 1  # 一个 handle（两任务一组）
+        assert len(b2.rebuild()) == 1  # 一个 handle（两任务一组）
         handle = next(iter(b2._plans))
         # 任务号解码回整数对（与创建时同形态）
         assert all(isinstance(t, tuple) for t in handle.task_ids)
@@ -459,7 +459,7 @@ def test_rebuild_skips_empty_inputs(fake_store_module, monkeypatch) -> None:
             capability=mooncake_v0311(),
             ledger=led,
         )
-        assert b.rebuild() == 0
+        assert b.rebuild() == []
         assert not b._plans
     finally:
         led.close()
@@ -512,7 +512,7 @@ def test_rebuild_restores_watch_state(fake_store_module, monkeypatch) -> None:
             locate=lambda _inst: ["seg-A", "seg-B"],
             capability=mooncake_v0311(), ledger=led,
         )
-        assert b2.rebuild() == 1
+        assert len(b2.rebuild()) == 1
         h2 = next(iter(b2._plans))
         assert h2 in b2._watch  # 观测态恢复了
         assert b2.query_task(h2) is TaskStatus.RUNNING  # 缺 seg-B 副本：等，不是终态
@@ -571,7 +571,7 @@ def test_rebuild_skips_unresolvable(fake_store_module, monkeypatch) -> None:
             capability=mooncake_v0311(),
             ledger=led,
         )
-        assert b2.rebuild() == 0
+        assert b2.rebuild() == []
         assert not b2._plans
     finally:
         led.close()

@@ -290,10 +290,11 @@ class MooncakeBackend(KvOps):
             status=status,
         )
 
-    def rebuild(self) -> int:
+    def rebuild(self) -> list[TaskHandle]:
         """重启后恢复 running 任务的跟踪登记（tasks 表存的是可重算输
         入——model_id/token_ids/target/op；plan 由 KeyComputer 现场重
-        算，key/seg 不落库）。返回恢复的 handle 数。
+        算，key/seg 不落库）。返回恢复的 handle 列表（E11 进程壳的恢
+        复轮询以返回值为输入；长度 = 恢复数）。
 
         规则：
         - 仅恢复 copy（唯一已落地操作）
@@ -318,12 +319,12 @@ class MooncakeBackend(KvOps):
         须先加归属判定（行上的 model_id 与本实例不符则跳过）。
         """
         if self._ledger is None:
-            return 0
+            return []
         running = self._ledger.list_running_tasks()
         groups: dict[str, list] = {}
         for rec in running:
             groups.setdefault(rec.handle_id, []).append(rec)
-        restored = 0
+        restored: list[TaskHandle] = []
         for handle_id, rows in groups.items():
             if not handle_id:
                 continue
@@ -352,7 +353,7 @@ class MooncakeBackend(KvOps):
             )
             if conflicted:
                 self._watch[handle] = conflicted
-            restored += 1
+            restored.append(handle)
         return restored
 
     def _finish(self, handle: TaskHandle, status: str) -> None:
