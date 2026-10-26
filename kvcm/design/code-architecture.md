@@ -6,20 +6,49 @@
 
 ## 分层总览
 
+箭头方向 = import 或调用方向（指向被依赖的一方）。节点名是代码里的类或模块。
+
 ```text
-L1 接口层     IntentReceiver / EventPublisher / InstanceWatcher      kvcm/api/
-              进程对外通道；不含任何存储概念（空骨架，协议随 D4/E12/E13）
-L2 编排层     PrefetchFlow 已落地；SessionEnd/Drain/Retain 待做      kvcm/flows/
-              只调 L3 接口；代码里不出现 seg / lease / client_id / PoolKey / rank
-L3 原子操作层 KvOps：八操作 + query_task / exists / abandon          kvcm/ops/
-              抽象接口（语义规格 = D2 §1）+ capability 声明结构
-L4 适配层     MooncakeBackend = StoreClient + SegTopology            kvcm/backends/mooncake/
-              VLLMAdapter（子件）= KeyComputer + RankTopology         kvcm/engines/vllm/
-L5 状态层     Ledger（sqlite，四类状态记录）                          kvcm/kvcm/ledger.py
+┌──────────────────────────────────┐      ┌──────────────────────────────────┐
+│ kvcm.api                         │      │ kvcm.flows                       │
+│ IntentReceiver                   │      │ PrefetchFlow                     │
+│ EventPublisher                   │      └──────────────────────────────────┘
+│ InstanceWatcher                  │                        │ 调用
+└──────────────────────────────────┘                        │ exists / copy
+                  │ import Prefix, InstanceId               │ query_task / abandon
+                  │                                         │
+                  ▼                                         ▼
+┌─────────────────┬─────────────────────────────────────────┬────────────────┐
+│ kvcm.ops                                                                   │
+│ KvOps · TaskHandle · TaskStatus                                            │
+│ Prefix · InstanceId · BackendCapability                                    │
+└─────────────────────────────────────┴──────────────────────────────────────┘
+                                      │ 继承并实现
+                                      ▼
+┌─────────────────────────────────────┬──────────────────────────────────────┐
+│ MooncakeBackend                                                            │
+│ 构造注入(不是 import): client · capability · ledger · locate               │
+└─────────┴─────────────────────────┴─────────────────────────┴──────────────┘
+          │ import                  │ import                  │ import
+          ▼                         ▼                         ▼
+┌─────────┬────────────┐  ┌─────────┬────────────┐  ┌─────────┬──────────────┐
+│ KeyComputer          │  │ Ledger               │  │ StoreClient            │
+│ engines.vllm.keys    │  │ kvcm.ledger          │  │ lazy import            │
+│                      │  │ import ops.types     │  │ mooncake.store (RPC)   │
+└──────────────────────┘  └──────────────────────┘  └────────────────────────┘
+
+┌──────────────────────────────────┐    ┌────────────────────────────────────┐
+│ RankTopology                     │    │ SegTopology                        │
+│ engines.vllm.topology            │    │ import AdminClient                 │
+│ 无任何 kvcm import               │    │ HTTP GET /get_all_segments         │
+└──────────────────────────────────┘    └────────────────────────────────────┘
 ```
 
-- 依赖方向只允许向下：L1 → L2 → L3 ← L4；L5 由 L4（后端实现侧）持有，L2 不直接碰——L2 经 L3 操作间接受益于实现侧记账（任务状态迁移的时机只有实现侧知道）
-- 核心思想：**原子操作屏蔽后端与引擎语义**——L2 编排对任何存储后端、任何推理引擎成立；换后端换 StoreBackend，换引擎换 EngineAdapter
+- 读图：`PrefetchFlow` 只指向 `KvOps`，没有指向 backend / engines / ledger。`MooncakeBackend` 同时指向 `KeyComputer` 和 `StoreClient`。`KeyComputer` 与 `RankTopology` 没有指向 backend 的箭头
+- `api` 只 import `Prefix` / `InstanceId`，没有 import `flows`。L1→L2 的调用要等 E11 接线，当前仓库里没有这条边
+- `client` / `capability` / `ledger` / `locate` 是 `MooncakeBackend.__init__` 的参数。`locate` 的来源不在本类的 import 里
+- 没有 import、由调用方拼装的边（当前只有测试在做）：`SegTopology.segments()` 的 seg 名单进 `RankTopology.resolve_segments`，结果当作 `locate` 注入；`mooncake_main()` / `mooncake_v0311()` 的返回值当作 `capability` 注入
+- 设计约束与上面的 import 一致：编排层不出现 seg / lease / client_id / PoolKey / rank。换存储后端换 `MooncakeBackend` 这一支，换引擎换 `KeyComputer`
 
 ## L1 接口层（进程对外通道）
 
@@ -44,6 +73,61 @@ L5 状态层     Ledger（sqlite，四类状态记录）                        
 
 - **失败分类（编排统一出口 = PrefetchError，编程错误除外直接传播）**：前置检查不过 / 提交失败（SubmitError，带已发任务号明细）→ 终态；核验失败（VerifyError）→ 终态带明细；查询失败（QueryError）→ 可重试继续轮询；任务 FAILED → 终态；超时 → 先 abandon 收口再抛
 
+### PrefetchFlow.run 数据流
+
+一次预热从 `Prefix` 进去，到 `READY` 或 `PrefetchError` 出来。图中每个方框是实际执行的类；方框之间的字是这一步的数据形态或 RPC。
+
+```text
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ PrefetchFlow.run(Prefix, InstanceId)                             │
+    └─────────────────────────────────┴────────────────────────────────┘
+                                      ▼ (1) exists(Prefix)
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ MooncakeBackend.exists                                               │
+  │ token_ids -> keys_for_tokens -> keys: list[str]                      │
+  └───────────────────────────────────┴──────────────────────────────────┘
+                                      ▼ RPC batch_is_exist
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ StoreClient.is_exist(keys) -> list[bool]                             │
+  └───────────────────────────────────┴──────────────────────────────────┘
+False -> PrefetchError, 不写 Ledger         QueryError 原样上抛
+                                      ▼ (2) copy
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ MooncakeBackend.copy                                                 │
+  │ locate(InstanceId) -> segs: list[str]                                │
+  │ build_plan -> plan: [(key, seg)]                                     │
+  │ 逐对 create_copy_task(key, [seg])                                    │
+  └───────────────────────────────────┴──────────────────────────────────┘
+SubmitError -> PrefetchError              RPC 返回 task_id (hi, lo)
+                                      ▼
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ TaskHandle(COPY, task_ids)                                           │
+  │ _plans[handle] = (Prefix, target, plan, handle_id)                   │
+  │ Ledger.upsert status = running                                       │
+  │ 列: hi:lo, handle_id, op, prefix_key,                                │
+  │     target, model_id, token_ids                                      │
+  └───────────────────────────────────┴──────────────────────────────────┘
+                                      ▼ (3) 轮询 query_task
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │ 不在 _watch: 每个 task_id 走 RPC query_task                          │
+  │ 在 _watch: 不再 query_task, 只核验副本                               │
+  │ 核验: RPC batch_get_replica_desc (不是 HTTP)                         │
+  │ HTTP /batch_query_keys 还没接线                                      │
+  └────────┴─────────────────────────┴─────────────────────────┴─────────┘
+           ▼                         ▼                         ▼
+┌──────────┬─────────┐    ┌──────────┬─────────┐  ┌────────────┬───────────┐
+│ READY              │    │ FAILED             │  │ RUNNING                │
+│ 流程返回           │    │ PrefetchError      │  │ sleep 后再查           │
+└────────────────────┘    └────────────────────┘  └────────────────────────┘
+超时: abandon, Ledger=abandoned, 再抛 PrefetchError
+VerifyError: 账本已记 failed, 流程包成 PrefetchError
+```
+
+- 形态变化：`Prefix` → `token_ids` → `keys` → `plan[(key, seg)]` → `task_id (hi, lo)` → Ledger 行（`"hi:lo"` + `handle_id` + `token_ids` JSON）
+- 这条链路上的 master 交互全是 store_py 绑定上的 RPC：`batch_is_exist`、`create_copy_task`、`query_task`、`batch_get_replica_desc`。HTTP 不在这条链上
+- Ledger 写点：copy 成功记 `running`；终态记 `ready` / `failed`；冲突只把冲突 id 改成 `failed`；超时 `abandon` 把其余行记 `abandoned`
+- `False` 和 `QueryError` 从 exists 分叉，不写账。`SubmitError` 从 copy 分叉，已发出的 task id 只出现在异常消息里，没有句柄、也没有 Ledger 行
+
 支撑组件（同进程内的常驻循环，E11 进程化的主体）：
 
 - **TaskEngine**：任务状态机（排队 / 进行 / READY / 失败）+ 并发上限 + **限速器**——E11 的核心，E15 限速在这里实现（限速输入 = 网卡/RDMA 计数器采样的链路利用率，D1 §5）。**失败态策略（此处只留接口，随 E10 细化）**，失败后的动作三种：① 重发；② 弃置 + 事后清副本（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 源掉线衔接（D5，已闭环）。语义引 D2 §1 与 D5，不新造语义
@@ -55,7 +139,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）                        
 
 - 接口规格直接抄 D2 §1：八项操作的语义、完成信号、READY 有无、幂等性都已定型——本层把它们落成 Python 抽象基类
 - 八项分三类（D2 §1）：**原子动作**（copy / move / keepalive / demote / promote / remove）、**元数据标记**（pin）、**目的型**（retain——由 demote / move / pin 组合实现，对外仍呈现单步语义）
-- 完成信号：任务类（copy/move）查任务状态 + 核验副本 → READY；READY 有三个（copy / move / promote），其余五个无（D2 §1 完成信号节）
+- 完成信号：copy / move / promote 有 READY（任务完成 + 目标侧副本核验）；retain 的空句柄在 `query_task` 入口直接 READY，0.3.11 的 move 过渡路径返回真句柄、走同一套轮询。keepalive / stop_keepalive / pin / demote / remove 无 READY（与 `kvcm/ops/base.py` 模块头一致）
 - 幂等：控制面以（前缀 × 目标实例）为幂等键，在途不重复发、完成不重复发（D1 §4）；后端幂等兜底（D1 F11）
 
 **接口形态（已定稿，`kvcm/ops/`）**
@@ -112,24 +196,45 @@ L5 状态层     Ledger（sqlite，四类状态记录）                        
 
 **在途冲突观测态**（D1 §4「在途不当失败」的代码落实）：任务失败 message 全部含 `OBJECT_HAS_REPLICATION_TASK`（别人在复制同 key，典型 = 同 intent 重发）时，**不按失败处理**——冲突任务如实记 failed，之后只核验副本，副本到位即 READY（字节是谁搬的不重要，到位是目的）。混合失败（部分冲突部分真失败）仍整组 FAILED。
 
-**copy 任务生命周期**：
+**copy 任务生命周期**（状态是节点，迁移条件写在边上。`观测态` 不是 `TaskStatus` 的一个枚举值，调用方看到的仍是 `RUNNING`）：
 
 ```text
-              ┌─ 全部成功 + 副本核验通过 ─────→ READY（终态，Ledger 记 ready）
-              ├─ 任一任务真失败 ──────────────→ failed（终态）
-running ──────┼─ 失败全是在途冲突 ────────────→ 观测态（只核验副本）：
-（query_task  │                                 ├─ 副本到位 → READY（冲突任务保持 failed）
- 轮询）       │                                 └─ 未到位 → 保持 running
-              ├─ 任务成功但副本核验缺 ────────→ VerifyError → failed（终态）
-              └─ 编排超时 → abandon ─────────→ abandoned（终态；不取消后端任务）
+                  copy() 成功, Ledger 记 running
+                                       ▼
+        ┌────────────────────────────────────────────────────────────┐
+        │ running    Ledger: running    _plans 有, _watch 无         │
+        └───┴──────────────────────────┴──────────────────────────┴──┘
+            ▼                          ▼                          ▼
+全冲突 FAILED               SUCCESS 且副本齐          真失败或核验缺
+┌───────────┬──────────┐   ┌───────────┬──────────┐   ┌───────────┬──────────┐
+│ 观测态               │   │ ready                │   │ failed               │
+│ 对外仍是 RUNNING     │   │ 非冲突行 = ready     │   │ 全组 Ledger failed   │
+│ _watch 有            │   │ 冲突行保持 failed    │   │ _plans 已删          │
+│ 冲突 id = failed     │   └──────────────────────┘   └──────────────────────┘
+└──────────────────────┘
+副本缺: 留在观测态 (不抛 VerifyError)
+副本齐: 观测态 -----------------> ready
+
+超时 abandon, 来自 running 或观测态
+                                       ▼
+                           ┌───────────┬──────────┐
+                           │ abandoned            │
+                           │ 冲突行保持 failed    │
+                           │ 其余行 = abandoned   │
+                           └──────────────────────┘
+自环: 查询未终态或 QueryError, 留在原状态
+rebuild: 无 failed 兄弟 -> running; 有则 -> 观测态
 ```
 
-- 终态即删进程内核验登记（`_plans`），防长驻泄漏；观测态登记（`_watch`）同生命周期
-- **全撞车组（全部任务冲突失败）重启不恢复是自洽设计**：该组没有在途传输，副本跟踪归第一遍任务组（仍 running 则由它恢复）；新请求 exists 兜底——不存在「副本没到却报成功」的路径
+- 从 `running` 出去的三条边对应 `query_task` 的三个分支：冲突 message 全中进观测态；全部 SUCCESS 且副本在每个 plan seg 上进 `ready`；有一条真失败，或 SUCCESS 但副本缺（`VerifyError`）进 `failed`
+- 观测态不再调用 `query_task` RPC。副本缺就留在观测态；副本齐才到 `ready`，冲突行保持 `failed`
+- 超时从 `running` 或观测态进 `abandoned`。后端任务不取消
+- 自环：mooncake 任务还是 PENDING/RUNNING，或抛了 `QueryError`，Ledger 不改
+- 全冲突（组里已经没有 `running` 行）重启后进不了 `rebuild`。下一次请求走 `exists`：已在就结束，不在就重新 `copy`，对方还在传会再次进观测态。没有「副本没到却返回成功」的边
 
 ## L4 适配层（两个正交维度）
 
-适配分两个正交维度：**存储后端**与**推理引擎**——两者各自独立可换，各建一个适配器。L3 原子操作的实现同时持有两者（引擎侧算 key 与 rank 拓扑，存储侧执行 RPC）。
+适配分两个正交维度：**存储后端**与**推理引擎**——两者各自独立可换。`MooncakeBackend` 的字段是 `StoreClient` 和 `KeyComputer`（算 key、做 `build_plan`）。`RankTopology` 只负责 rank↔seg 探测，结果经 `locate` 注入，不是 backend 的字段。
 
 ### StoreBackend（存储后端适配）
 
@@ -141,7 +246,7 @@ running ──────┼─ 失败全是在途冲突 ───────�
 | SegTopology | seg→client/实例映射（HTTP `/get_all_segments`）；seg、client_id、lease 语义 | `topology.py` |
 | capability 填充 | 按连接上的版本填充（**构造必填**——不许默认冒充 main；目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | `capability.py` |
 
-- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger?)`——`locate`（实例 → rank 有序 seg 列表）以可调用注入：demo 环境 = RankTopology 探测，生产 = L1 InstanceWatcher 注册，backend 不关心来源
+- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger?)`——`locate`（实例 → rank 有序 seg 列表）以可调用注入：demo 环境 = RankTopology 探测，生产 = L1 InstanceWatcher 注册，backend 不关心来源。本类不 import `SegTopology` / `RankTopology` / `AdminClient`，这三件不是它的字段
 - **copy 已落地**（发起式）：前缀 → KeyComputer 算 key → locate 得 seg → `KeyComputer.build_plan` 做 rank 映射（异构 TP 反向展开）→ 逐 key 提交；`query_task` 聚合判定 READY。**rank 映射归引擎侧**——存储适配零 key 格式依赖（换引擎本类不动）
 - **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——放通用层会把后端概念带进通用接口
 - **一个后端实例 = 一种 (源 TP, 目标 TP, put_step) 组合**：KeyComputer 的异构展开口径在构造期定死（`kvcm/engines/vllm/keys.py::KeyComputer` docstring 记了完整前提链），换组合必须新建实例——编排层持多组合时按组合各建一个，不复用
@@ -187,7 +292,7 @@ running ──────┼─ 失败全是在途冲突 ───────�
 
 ### EngineAdapter（引擎适配）
 
-**VLLMAdapter**（首个实现）：
+**VLLMAdapter**（文档里的分组名；代码里没有这个类，这一侧就是 `KeyComputer` 和 `RankTopology`）：
 
 | 子件 | 职责 | 包路径 |
 |------|------|--------|
@@ -218,9 +323,50 @@ running ──────┼─ 失败全是在途冲突 ───────�
 
 **重启恢复（`MooncakeBackend.rebuild()`，D-4 裁定：放 token 不放 key）**
 
-- tasks 表只存**可重算输入**（model_id / token_ids / target / op），**key/seg 不落库**——重启后按 handle_id 分组，`KeyComputer` 现场重算 keys + `build_plan` 重建 `_plans`，`decode_task_id` 还原任务号
-- 规则：仅恢复 copy；空 handle_id / 空 token_ids / 重算空 plan 跳过（防假 READY）；locate 失败跳过（实例已不在，交 gc/新流程）；观测态恢复（同组冲突 failed 兄弟进 `_watch`，缺副本保持 RUNNING）
-- **已知边界（多模型/多实例共用同一 Ledger）**：rebuild 不区分任务归属——全部 running 按本实例 KeyComputer 口径重算，会错算别人的任务。当前单实例单模型无影响；**多模型前必须先加归属判定（行上 model_id 与本实例不符则跳过）**
+key/seg 不落库。下图的输入只来自 `status='running'` 的行，输出是进程内的 `_plans` / `_watch`。
+
+```text
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ list_running_tasks()                                             │
+    │ 列: task_id, handle_id, op,                                      │
+    │     model_id, token_ids, target                                  │
+    └─────────────────────────────────┴────────────────────────────────┘
+                                      ▼ 按 handle_id 分组
+        ┌──────────────────────────────────────────────────────────┐
+        │ 取 rows[0] 作为整组代表                                  │
+        └─────────────────────────────┴────────────────────────────┘
+跳过 handle_id 空                     │
+跳过 op != copy                       │
+跳过 token_ids 空                     ▼
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ Prefix(model_id, token_ids)                                      │
+    │ keys = keys_for_tokens(token_ids)                                │
+    │ segs = locate(InstanceId)                                        │
+    │ plan = build_plan(keys, segs)                                    │
+    └─────────────────────────────────┴────────────────────────────────┘
+                                      │ 异常 -> 跳过
+                                      ▼ plan 空 -> 跳过
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ decode_task_id -> (hi, lo)                                       │
+    │ TaskHandle 只含 running 的 id                                    │
+    │ _plans[handle] = 四元组                                          │
+    │ (Prefix, target, plan, handle_id)                                │
+    └─────────────────────────────────┴────────────────────────────────┘
+                                      ▼ list_tasks_by_handle
+    ┌──────────────────────────────────────────────────────────────────┐
+    │ 同组 status==failed ?                                            │
+    │ 有 -> _watch[handle]=这些 id                                     │
+    │ 无 -> 不写 _watch                                                │
+    │ Ledger 不改, 冲突行仍是 failed                                   │
+    └──────────────────────────────────────────────────────────────────┘
+没有 running 行的全冲突组不进此流程
+返回值 = 放进 _plans 的 handle 数
+```
+
+- 分组键是 `handle_id`。空 id、非 copy、空 `token_ids` 在重算前丢掉；`locate` 抛错或 `plan` 为空在重算后丢掉，避免空核验被当成 READY
+- 重算用的是本实例的 `KeyComputer`，不按行上的 `model_id` 过滤。多模型共用一个 Ledger 时会把别人的 `running` 算进自己的 plan，并在终态写回别人的行。多模型前要先加「`model_id` 不符则跳过」
+- 同组若有 `failed` 行，恢复出来的 handle 放进 `_watch`，之后缺副本保持 RUNNING，不走 `VerifyError`
+- 全冲突组没有 `running` 行，所以没有出口指向 `_plans`。这不是漏画：那组没有自己的在途传输
 
 ## 设计原则
 
