@@ -2,16 +2,16 @@
 
 启动序列：
 1. 参数解析 → Ledger → StoreClient.connect → MooncakeBackend 组装
-2. `backend.rebuild()`：重启恢复 running 任务的跟踪登记（D-4）
-3. 恢复轮询线程：把 rebuild 恢复的 handle 跑到终态（极简过渡——
-   单线程顺序轮询，阶段 2 由 TaskEngine 收编）
-4. KeepaliveLoop 启动（固定窗口占位策略）
+2. `backend.rebuild()`：重启恢复 running 任务的跟踪登记（D-4），恢复
+   的 handle 交 TaskEngine.track 收编（轮询到终态，不重跑流程）
+3. KeepaliveLoop 启动（固定窗口占位策略）；TaskEngine 就绪（READY 后
+   经 KeepaliveLoop.register 接线保活）
+4. IntentReceiver 占位（--listen，HTTP POST /prefetch）启动
 5. 主线程等 SIGTERM/SIGINT
 
-优雅退出四步（E11 决策四）：停收入口（本期无对外入口，占位注释即
-TaskEngine 接入点）→ 在途任务 abandon（Ledger 记 abandoned，不等待、
-不阻塞退出——后端无任务取消能力，副本清理归 remove）→ Loop 停 →
-StoreClient.close()（demo 已知退出期析构竞态，显式 close 是既有结论）。
+优雅退出（决策四）：HTTP 停收 → TaskEngine.shutdown（在途 abandon，
+记账不等待）→ KeepaliveLoop 停 → StoreClient.close()（demo 已知退出
+期析构竞态，显式 close 是既有结论）。
 
 locate 本期静态注入（`--segs`，单实例冒烟形态）；生产 locate =
 L1 InstanceWatcher 注册，归 E13。
@@ -20,7 +20,8 @@ L1 InstanceWatcher 注册，归 E13。
     python -m kvcm.daemon --master 127.0.0.1:50088 \
         --local-hostname 127.0.0.1:13021 \
         --model-name qwen --tp-size 2 --segs seg0,seg1 \
-        --ledger /var/lib/kvcm/ledger.sqlite
+        --ledger /var/lib/kvcm/ledger.sqlite \
+        --listen 127.0.0.1:9000
 """
 
 from __future__ import annotations
@@ -28,19 +29,15 @@ from __future__ import annotations
 import argparse
 import signal
 import threading
-import time
 
+from kvcm.api.http_stub import PrefetchHttpServer
 from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.capability import mooncake_main, mooncake_v0311
 from kvcm.backends.mooncake.client import StoreClient
 from kvcm.engines.vllm.keys import KeyComputer
 from kvcm.ledger import Ledger
 from kvcm.loops import KeepaliveLoop
-from kvcm.ops.base import QueryError, TaskHandle, TaskStatus, VerifyError
-
-# 恢复轮询参数（极简过渡版，阶段 2 归 TaskEngine 统一）
-_RECOVER_POLL_S = 1.0
-_RECOVER_TIMEOUT_S = 300.0
+from kvcm.task_engine import TaskEngine
 
 
 def build_backend(
@@ -67,46 +64,13 @@ def build_backend(
     )
 
 
-def recover_poll(
-    backend: MooncakeBackend,
-    handles: list[TaskHandle],
-    stop: threading.Event,
-    *,
-    poll_s: float = _RECOVER_POLL_S,
-    timeout_s: float = _RECOVER_TIMEOUT_S,
-) -> None:
-    """把 rebuild 恢复的 handle 顺序跑到终态（极简过渡，阶段 2 归
-    TaskEngine）。查询失败（QueryError）跳过本轮；超时 abandon 收口
-    （与 PrefetchFlow 同一语义）。"""
-    deadline = time.monotonic() + timeout_s
-    pending = list(handles)
-    while pending and not stop.is_set():
-        handle = pending.pop(0)
-        try:
-            status = backend.query_task(handle)
-        except QueryError:
-            pending.append(handle)  # 可重试：挪到队尾下轮再查
-            time.sleep(poll_s)
-            continue
-        except VerifyError:
-            continue  # 终态（核验失败已记账），不再跟踪
-        if status in (TaskStatus.READY, TaskStatus.FAILED):
-            continue  # 终态已记账
-        if time.monotonic() >= deadline:
-            backend.abandon(handle)
-            continue
-        pending.append(handle)
-        time.sleep(poll_s)
-
-
 def run(args: argparse.Namespace, *, stop: threading.Event | None = None) -> int:
     """进程主流程（stop 注入便于测试不发信号；None = 自己装 signal handler）。"""
     ledger = Ledger(args.ledger)
     client = StoreClient()
-    backend: MooncakeBackend | None = None
     loop: KeepaliveLoop | None = None
-    recover_thread: threading.Thread | None = None
-    in_flight: list[TaskHandle] = []  # 在途 handle（退出时 abandon）
+    engine: TaskEngine | None = None
+    http: PrefetchHttpServer | None = None
     try:
         client.connect(
             local_hostname=args.local_hostname,
@@ -114,28 +78,24 @@ def run(args: argparse.Namespace, *, stop: threading.Event | None = None) -> int
             protocol=args.protocol,
         )
         backend = build_backend(args, client, ledger)
-        # 2. 重启恢复：running 任务重建跟踪 + 恢复轮询
-        restored = backend.rebuild()
-        in_flight.extend(restored)
-        if restored:
-            recover_stop = threading.Event()
-            recover_thread = threading.Thread(
-                target=recover_poll,
-                args=(backend, restored, recover_stop),
-                name="kvcm-recover",
-                daemon=True,
-            )
-            recover_thread.start()
-        else:
-            recover_stop = threading.Event()
-        # 3. KeepaliveLoop（重启恢复免特判：注册行在 Ledger，首扫接管）
         loop = KeepaliveLoop(
             backend,
             ledger,
             interval_s=args.keepalive_interval_s,
             window_s=args.keepalive_window_s,
         )
+        engine = TaskEngine(
+            backend, keepalive=loop, max_concurrent=args.max_concurrent
+        )
+        # 2. 重启恢复：running 任务重建跟踪，收编进 TaskEngine
+        for handle in backend.rebuild():
+            engine.track(handle)
+        # 3. 常驻组件启动
         loop.start()
+        if args.listen:
+            host, _, port = args.listen.rpartition(":")
+            http = PrefetchHttpServer((host or "127.0.0.1", int(port)), engine)
+            http.start()
 
         # 4. 等退出信号
         if stop is None:
@@ -148,19 +108,14 @@ def run(args: argparse.Namespace, *, stop: threading.Event | None = None) -> int
             signal.signal(signal.SIGINT, _handler)
         stop.wait()
 
-        # 优雅退出四步（决策四）
-        # ① 停收入口：本期无对外入口（TaskEngine/HTTP 占位归阶段 2）
+        # 优雅退出（决策四）
+        # ① 停收入口
+        if http is not None:
+            http.stop()
         # ② 在途 abandon（记账不等待；后端无取消能力，副本清理归 remove）
-        recover_stop.set()
-        for handle in in_flight:
-            try:
-                backend.abandon(handle)
-            except KeyError:
-                pass  # 已到终态被移除登记，正常
+        engine.shutdown()
         # ③ Loop 停
         loop.stop()
-        if recover_thread is not None:
-            recover_thread.join(timeout=5.0)
         return 0
     finally:
         # ④ client close（有序收尾，不靠退出期 GC/atexit）
@@ -191,6 +146,17 @@ def main(argv: list[str] | None = None) -> int:
         help="后端版本能力集（填错 = 编排选错路径）",
     )
     p.add_argument("--ledger", required=True, help="Ledger sqlite 路径")
+    p.add_argument(
+        "--max-concurrent",
+        type=int,
+        default=4,
+        help="TaskEngine 并发上限（同时执行的预热 intent 数）",
+    )
+    p.add_argument(
+        "--listen",
+        default="127.0.0.1:9000",
+        help="IntentReceiver 占位 HTTP 监听 host:port（空 = 不启用）",
+    )
     p.add_argument(
         "--keepalive-interval-s",
         type=float,

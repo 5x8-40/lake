@@ -54,11 +54,17 @@ class PrefetchFlow:
         *,
         poll_s: float = 0.5,
         timeout_s: float = 120.0,
+        handle_sink=None,
     ) -> None:
         """同步执行到 READY；失败抛 PrefetchError。
 
         timeout_s 从 exists 通过起算、覆盖 copy 提交——大前缀逐 key 串行
         提交本身可达几十秒，不计入则超时预算失真。
+
+        handle_sink：可选回调，copy 提交成功即带上句柄调用一次（在途
+        句柄上报——TaskEngine 退出收口（abandon）需要拿到句柄，句柄
+        此前只在流程局部作用域里，进程级收口无从下手）。不改变流程
+        语义。
         """
         if not self._ops.exists(prefix):
             raise PrefetchError(
@@ -71,6 +77,8 @@ class PrefetchFlow:
             handle = self._ops.copy(prefix, target)
         except SubmitError as e:
             raise PrefetchError(f"copy submit failed: {e}") from e
+        if handle_sink is not None:
+            handle_sink(handle)
         while True:
             try:
                 status = self._ops.query_task(handle)
