@@ -1,7 +1,8 @@
 """IntentReceiver：接收 Router 预热 intent 与会话结束线索（下行通道）。
 
-协议字段随设计定型后填充（通道候选 gRPC，与仓内跨语言 RPC 选型一致）；
-本步仅占位接口形态。
+预热 intent 通道已落地为 gRPC 服务（E12，`kvcm/api/grpc_server.py`，
+协议 `proto/kvcm_intent.proto`；语义 intent ≠ command，回执走
+GetTask）。本类剩余占位 = 会话结束线索入口，随设计定型填充。
 """
 
 from __future__ import annotations

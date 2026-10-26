@@ -6,10 +6,10 @@
    的 handle 交 TaskEngine.track 收编（轮询到终态，不重跑流程）
 3. KeepaliveLoop 启动（固定窗口占位策略）；TaskEngine 就绪（READY 后
    经 KeepaliveLoop.register 接线保活）
-4. IntentReceiver 占位（--listen，HTTP POST /prefetch）启动
+4. IntentReceiver gRPC 服务（--listen，E12 协议见 proto/）启动
 5. 主线程等 SIGTERM/SIGINT
 
-优雅退出（决策四）：HTTP 停收 → TaskEngine.shutdown（在途 abandon，
+优雅退出（决策四）：入口停收 → TaskEngine.shutdown（在途 abandon，
 记账不等待）→ KeepaliveLoop 停 → StoreClient.close()（demo 已知退出
 期析构竞态，显式 close 是既有结论）。
 
@@ -30,7 +30,7 @@ import argparse
 import signal
 import threading
 
-from kvcm.api.http_stub import PrefetchHttpServer
+from kvcm.api.grpc_server import IntentGrpcServer
 from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.capability import mooncake_main, mooncake_v0311
 from kvcm.backends.mooncake.client import StoreClient
@@ -70,7 +70,7 @@ def run(args: argparse.Namespace, *, stop: threading.Event | None = None) -> int
     client = StoreClient()
     loop: KeepaliveLoop | None = None
     engine: TaskEngine | None = None
-    http: PrefetchHttpServer | None = None
+    grpc_server: IntentGrpcServer | None = None
     try:
         client.connect(
             local_hostname=args.local_hostname,
@@ -94,8 +94,8 @@ def run(args: argparse.Namespace, *, stop: threading.Event | None = None) -> int
         loop.start()
         if args.listen:
             host, _, port = args.listen.rpartition(":")
-            http = PrefetchHttpServer((host or "127.0.0.1", int(port)), engine)
-            http.start()
+            grpc_server = IntentGrpcServer((host or "127.0.0.1", int(port)), engine)
+            grpc_server.start()
 
         # 4. 等退出信号
         if stop is None:
@@ -110,8 +110,8 @@ def run(args: argparse.Namespace, *, stop: threading.Event | None = None) -> int
 
         # 优雅退出（决策四）
         # ① 停收入口
-        if http is not None:
-            http.stop()
+        if grpc_server is not None:
+            grpc_server.stop()
         # ② 在途 abandon（记账不等待；后端无取消能力，副本清理归 remove）
         engine.shutdown()
         # ③ Loop 停
@@ -155,7 +155,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--listen",
         default="127.0.0.1:9000",
-        help="IntentReceiver 占位 HTTP 监听 host:port（空 = 不启用）",
+        help="IntentReceiver gRPC 监听 host:port（空 = 不启用）",
     )
     p.add_argument(
         "--keepalive-interval-s",

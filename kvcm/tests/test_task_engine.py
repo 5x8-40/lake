@@ -21,7 +21,7 @@ from kvcm.ops.base import (
 )
 from kvcm.ops.capability import BackendCapability
 from kvcm.ops.types import InstanceId, PinKind, Prefix
-from kvcm.task_engine import TaskEngine
+from kvcm.task_engine import IntentStatus, TaskEngine
 
 _P = Prefix(model_id="qwen", token_ids=(1, 2, 3))
 _T = InstanceId("inst-B")
@@ -177,6 +177,57 @@ def test_concurrent_intents_distinct_prefixes_no_crosstalk() -> None:
     assert ops.copy_count == 3
     assert sorted(ka.registered, key=lambda p: p.token_ids) == prefixes
     assert eng._in_flight == set()
+    eng.shutdown()
+
+
+# ---------------------------------------------------------------------------
+# intent 注册表（E12：幂等键 + 状态查询）
+# ---------------------------------------------------------------------------
+
+
+def test_intent_dedup_and_status_transitions() -> None:
+    """在途去重返回同键；状态 PENDING→READY；未知键 None。"""
+    gate = threading.Event()
+    ops = FakeOps(seq=[TaskStatus.READY], query_gate=gate)
+    eng = TaskEngine(ops)
+    k1 = eng.submit_intent(_P, _T, poll_s=0.01)
+    k2 = eng.submit_intent(_P, _T, poll_s=0.01)
+    assert k1 == k2  # 幂等键 = 前缀 × 目标实例
+    assert eng.intent_status(k1) is IntentStatus.PENDING
+    assert eng.intent_status("no-such") is None
+    gate.set()
+    deadline = time.monotonic() + 5
+    while eng.intent_status(k1) is IntentStatus.PENDING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert eng.intent_status(k1) is IntentStatus.READY
+    assert ops.copy_count == 1
+    eng.shutdown()
+
+
+def test_intent_resubmit_after_terminal_reexecutes() -> None:
+    """同键已终态 → 视为新意图重新执行（预热语义，不是永久去重）。"""
+    ops = FakeOps(seq=[TaskStatus.READY, TaskStatus.READY])
+    eng = TaskEngine(ops)
+    k1 = eng.submit_intent(_P, _T, poll_s=0.01)
+    deadline = time.monotonic() + 5
+    while eng.intent_status(k1) is IntentStatus.PENDING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    k2 = eng.submit_intent(_P, _T, poll_s=0.01)
+    assert k2 == k1  # 键不变，执行重来
+    deadline = time.monotonic() + 5
+    while eng.intent_status(k2) is IntentStatus.PENDING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert ops.copy_count == 2
+    eng.shutdown()
+
+
+def test_intent_failed_status() -> None:
+    eng = TaskEngine(FakeOps(seq=[TaskStatus.FAILED]))
+    k = eng.submit_intent(_P, _T, poll_s=0.01)
+    deadline = time.monotonic() + 5
+    while eng.intent_status(k) is IntentStatus.PENDING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert eng.intent_status(k) is IntentStatus.FAILED
     eng.shutdown()
 
 

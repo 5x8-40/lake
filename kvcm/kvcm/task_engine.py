@@ -13,12 +13,14 @@ submit（预热）的 handle 不相交。违反即 bug。
 
 from __future__ import annotations
 
+import enum
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable
 
 from kvcm.flows.prefetch import PrefetchFlow
+from kvcm.ledger import prefix_key
 from kvcm.loops import KeepaliveLoop
 from kvcm.ops.base import (
     KvOps,
@@ -31,6 +33,20 @@ from kvcm.ops.types import InstanceId, Prefix
 
 # 限速器钩子：() -> bool，False = 暂缓发起（E15 接入点，提交前询问）
 RateLimiter = Callable[[], bool]
+
+
+class IntentStatus(enum.Enum):
+    """intent 观测态（E12 回执通道）：Future 状态 + 异常与否的映射，
+    不另建状态存储。UNKNOWN 由调用方对缺失键自行表达（None）。"""
+
+    PENDING = 1  # 排队或执行中
+    READY = 2
+    FAILED = 3
+
+
+def intent_id_of(prefix: Prefix, target: InstanceId) -> str:
+    """intent 幂等键（D1 §4：前缀 × 目标实例）。"""
+    return f"{prefix_key(prefix)}|{target}"
 
 
 class TaskEngine:
@@ -56,6 +72,10 @@ class TaskEngine:
         self._lock = threading.Lock()
         self._in_flight: set[TaskHandle] = set()
         self._accepting = True
+        # intent 注册表（E12）：幂等键 → Future。在途去重；终态保留供
+        # GetTask 查询（entry 累积的 TTL/GC 归生产化，steady-state 体量
+        # ≈ 活跃前缀数，进程重启清零）
+        self._intents: dict[str, Future] = {}
 
     # ------------------------------------------------------------------
     # intent 入口
@@ -84,8 +104,48 @@ class TaskEngine:
         poll_s: float = 0.5,
         timeout_s: float = 120.0,
     ) -> None:
-        """同步提交（阻塞到 READY/失败）。占位 HTTP 入口与脚本用。"""
+        """同步提交（阻塞到 READY/失败）。脚本与调试通道用。"""
         self.submit(prefix, target, poll_s=poll_s, timeout_s=timeout_s).result()
+
+    # ------------------------------------------------------------------
+    # intent 幂等入口（E12：策略侧埋钩子调用；intent ≠ command）
+    # ------------------------------------------------------------------
+
+    def submit_intent(
+        self,
+        prefix: Prefix,
+        target: InstanceId,
+        *,
+        poll_s: float = 0.5,
+        timeout_s: float = 120.0,
+    ) -> str:
+        """幂等提交预热 intent，返回幂等键（intent_id）。
+
+        去重语义（D1 §4）：同键在途 → 返回既有 intent_id，不重复执行；
+        同键已终态 → 视为新意图，重新预热。受理 ≠ 完成：执行状态经
+        intent_status 查询。关闭中抛 RuntimeError（gRPC 层映射
+        UNAVAILABLE）。"""
+        key = intent_id_of(prefix, target)
+        with self._lock:
+            if not self._accepting:
+                raise RuntimeError("task engine is shutting down")
+            existing = self._intents.get(key)
+            if existing is not None and not existing.done():
+                return key  # 在途去重
+            self._intents[key] = self._executor.submit(
+                self._run_prefetch, prefix, target, poll_s, timeout_s
+            )
+            return key
+
+    def intent_status(self, intent_id: str) -> IntentStatus | None:
+        """查询 intent 执行状态（回执通道）。None = 未知 intent_id。"""
+        with self._lock:
+            fut = self._intents.get(intent_id)
+        if fut is None:
+            return None
+        if not fut.done():
+            return IntentStatus.PENDING
+        return IntentStatus.READY if fut.exception() is None else IntentStatus.FAILED
 
     def track(
         self,

@@ -48,6 +48,12 @@ SIGTERM/SIGINT → ① 停收 intent（占位入口关闭）→ ② 在途任务
 target}`），便于手工与脚本测试。协议字段、通道（gRPC 候选）随 E12 定型后替
 换——占位入口只调 TaskEngine 公开方法，替换不动引擎。
 
+> 执行注记（2026-10-26）：E12 已随 E11 一并落地——HTTP 占位直接替换为
+> gRPC（`proto/kvcm_intent.proto` + `api/grpc_server.py`），协议写明
+> **intent ≠ command**（kvcm 可推迟/去重/拒绝，对齐 SGLang #27574 hint
+> 语义），回执走 GetTask 查询（不在请求放行链路上，D1 §4）。TaskEngine
+> 加幂等注册表（前缀 × 目标实例为幂等键，在途去重、终态可重新预热）。
+
 ## 决策六：范围切分
 
 - **本期做**：进程壳（启动/退出/rebuild 接线）+ TaskEngine + **KeepaliveLoop**

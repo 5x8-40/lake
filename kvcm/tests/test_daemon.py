@@ -160,8 +160,8 @@ def test_graceful_shutdown_abandons_in_flight(monkeypatch, tmp_path) -> None:
     assert loop.stopped and client.closed
 
 
-def test_http_stub_started_when_listen_set(monkeypatch, tmp_path) -> None:
-    """--listen 非空时 HTTP 占位启动，退出时停收。"""
+def test_grpc_server_started_when_listen_set(monkeypatch, tmp_path) -> None:
+    """--listen 非空时 gRPC 入口启动，退出时停收。"""
     backend = FakeBackend()
     client = FakeClient()
     monkeypatch.setattr(daemon, "StoreClient", lambda: client)

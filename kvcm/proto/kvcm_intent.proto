@@ -1,0 +1,50 @@
+syntax = "proto3";
+
+package kvcm;
+
+// KvcmIntent：策略侧（Router / 前端 agent）向 kvcm 表达预热意图的下行
+// 通道（E12）。语义对齐 SGLang #27574 / vLLM #51428 的 hint 约定：
+//
+//   **intent ≠ command**——kvcm 按池现状（容量 / 在途任务 / 副本现状）
+//   决策执行：可推迟、去重、拒绝；调用方不得假设执行时机与结果。
+//   回执走 GetTask 查询（D1 §4：请求不等 READY，本服务不在放行链路
+//   上；READY/失败仅是观测面）。
+//
+// 幂等：intent 以（前缀 × 目标实例）为幂等键（D1 §4）；在途重复提交
+// 去重、返回同一 intent_id；已终态的同键提交视为新意图。
+service KvcmIntent {
+  // 提交预热 intent：某前缀接下来在 target 实例上用。
+  rpc SubmitIntent(SubmitIntentRequest) returns (SubmitIntentResponse);
+  // 查询 intent 执行状态（回执通道）。
+  rpc GetTask(GetTaskRequest) returns (GetTaskResponse);
+}
+
+message Prefix {
+  string model_id = 1;
+  repeated uint64 token_ids = 2;
+}
+
+message SubmitIntentRequest {
+  Prefix prefix = 1;
+  string target = 2; // 目标实例（InstanceId）
+}
+
+message SubmitIntentResponse {
+  // 幂等键（前缀 × 目标实例的稳定标识）；受理 ≠ 完成
+  string intent_id = 1;
+}
+
+message GetTaskRequest {
+  string intent_id = 1;
+}
+
+message GetTaskResponse {
+  enum Status {
+    STATUS_UNKNOWN = 0; // 未知 intent_id
+    PENDING = 1;        // 排队或执行中
+    READY = 2;          // 副本核验到位
+    FAILED = 3;         // 执行失败（detail 带原因）
+  }
+  Status status = 1;
+  string detail = 2;
+}
