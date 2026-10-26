@@ -1,6 +1,6 @@
 # kvcm 代码架构（五层）
 
-- 定位：kvcm 服务化（E10 重构 / E11 进程化 / E15 并行限速）的模块分层设计——E10 已完成，本文是 E11 开工依据
+- 定位：kvcm 服务化（E10 重构 / E11 进程化 / E15 并行限速）的模块分层设计——E10 已完成（[PR #67](https://github.com/5x8-40/lake/pull/67)），本文是 E11 开工依据
 - 本文**不新增机制结论**——操作语义、完成信号、幂等性、能力事实全部引自 [D1-router-scheduling.md](D1-router-scheduling.md) / [D2-kv-operations.md](D2-kv-operations.md)；本文只把它们落成代码结构
 - 语言：Python（继承现有 `demo/precopy/` 1577 行与 mooncake store_py 绑定、keys.py 与引擎同口径）
 
@@ -179,7 +179,7 @@ sequenceDiagram
 
 - **抽象收窄到五项最小集**：`capability / copy / query_task / abandon / exists` 为 abstractmethod；其余操作基类默认抛「适配器未接线」（UnsupportedCapabilityError）——第二后端接入不必先 stub 全部操作；编排层判断可用性读 capability()，异常只是兜底
 - **任务号不透明对象**：`TaskHandle.task_ids: tuple[object, ...]`——L3 不透传不解释（mooncake 任务号是整数对，`str()` 化会让真实绑定的 `query_task` TypeError）；持久化编码 `"hi:lo"` 归实现侧（`encode_task_id`/`decode_task_id`，重启可还原）。一次前缀操作展开为 N 个后端任务（每 key 一个），句柄承载全部
-- **READY 规则**：copy / move / promote 有 READY（任务完成 + 目标侧副本核验通过）；**retain 返回 TaskHandle**——结果必须可观测（「保住了没有」是本操作存在的意义）。主路径 = main retained client 注册（一次 RPC，无异步工作）返回空句柄 `task_ids=()`，`query_task` 入口直接 READY；0.3.11 过渡 move 返回真句柄。其余方法（keepalive / stop_keepalive / pin / demote / remove）无 READY
+- **READY 规则**：copy / move / promote 有 READY（任务完成 + 目标侧副本核验通过）；**retain 返回 TaskHandle**——结果必须可观测（「保住了没有」是本操作存在的意义；实现路径 = D2 §4）。主路径 = main retained client 注册（一次 RPC，无异步工作）返回空句柄 `task_ids=()`，`query_task` 入口直接 READY；0.3.11 过渡 move 返回真句柄。其余方法（keepalive / stop_keepalive / pin / demote / remove）无 READY
 - **exists 查询面**（非第九项操作）：读即续租（has_lease），兼预热前置检查与保活续租通道；查询失败（RPC/单 key -1）与「不存在」分家——前者转 QueryError 可重试，后者才触发重算/预热
 - **abandon（放弃跟踪）**：删核验登记 + Ledger 记 abandoned；**非任务取消**（后端无此能力，在途传输可能仍完成），副本清理归 remove；放弃后句柄失效
 
@@ -411,7 +411,7 @@ stateDiagram-v2
 - **单线程约束**：sqlite 连接 check_same_thread——E11 把 TaskEngine 挪进独立线程时第一件事处理（调用侧加锁或每线程一连接），否则第一次跨线程调用即 ProgrammingError
 - 部署形态：kvcm 单实例跟随 master（D2 §1）；上 HA 时再换 Redis/etcd
 
-**重启恢复（`MooncakeBackend.rebuild()`）**
+**重启恢复（`MooncakeBackend.rebuild()`；状态记录规格 = D2 §1）**
 
 key/seg 不落库。输入只有 `status='running'` 的行，输出是进程内的 `_plans` 和 `_watch`。
 
@@ -453,7 +453,7 @@ flowchart TD
 
 ## 与 E10 / E11 / E15 的对位
 
-- **E10（重构）✅ 已完成**：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，73 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
+- **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，73 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
 - **E11（进程化）**：进程壳 + TaskEngine + Keepalive/Release/Retain 三个 Loop 常驻化；IntentReceiver / InstanceWatcher 占位接口随 E12/E13 填。**前置提醒**：Ledger 线程约束（见 L5）；PrefetchFlow 的同步轮询由 TaskEngine 接管（并发上限 + 限速），流程本体不变
 - **E15（并行限速）**：TaskEngine 内的并发调度 + 限速器（链路利用率采样，D1 §5）——不独立做
 
