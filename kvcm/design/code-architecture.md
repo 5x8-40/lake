@@ -97,7 +97,7 @@ flowchart TB
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
 | RetainFlow | retain（主路径 = retained client 注册；0.3.11 过渡 = move 到存活节点的 seg） | 未实现（D2 §4） |
 
-- **失败处理**：流程对调用方只抛一种异常 `PrefetchError`——调用方不用关心失败发生在哪一步，具体原因写在异常消息里。编程错误（KeyError、TypeError 这类代码 bug）不包装，直接向上抛。各分支：
+- **失败处理**：流程对调用方只抛一种异常（当前叫 `PrefetchError`——这个名字绑死在 Prefetch 上，其他流程没法用，将改为一般化的 `FlowError`，随 KeySet 一起实施）——调用方不用关心失败发生在哪一步，具体原因写在异常消息里。编程错误（KeyError、TypeError 这类代码 bug）不包装，直接向上抛。各分支：
 
 | 发生了什么 | 流程怎么处理 |
 |-----------|-------------|
@@ -110,7 +110,7 @@ flowchart TB
 
 ### PrefetchFlow.run 数据流
 
-一次预热执行（`run()` 方法）的完整消息顺序。`PrefetchFlow` 只调用 `KvOps` 接口——运行时这个对象是 `MooncakeBackend`。成功与失败的各条路径在图里用分支块分开画。
+一次预热执行（`run()` 方法）的完整消息顺序。`PrefetchFlow` 只调用 `KvOps` 接口——运行时这个对象是 `MooncakeBackend`。图里的方块是条件分支：标 alt 的是「二选一」（满足哪个条件走哪条），标 opt 的是「可选步骤」（需要才执行）。
 
 ```mermaid
 sequenceDiagram
@@ -210,7 +210,7 @@ sequenceDiagram
 - **任务凭据（TaskHandle）**：一次 `copy(前缀)` 在 mooncake 上是逐条 key 各发一个复制任务——一个前缀通常对应多条 key（块数 × rank 数），所以一次操作会产生多个任务。凭据里的 `task_ids` 装着这次操作的全部任务号，查询时一起查。任务号的类型对 L3 不透明（`tuple[object, ...]`）：mooncake 的任务号是两个整数组成的整数对，L3 原样保存、原样回传，不做字符串化（`str()` 化后真实绑定的 `query_task` 会报 TypeError）；要写进 Ledger 时由实现侧编码成 `"整数:整数"` 的字符串（`encode_task_id`/`decode_task_id`，重启可还原）
 - **READY 规则**：copy / move / promote 有 READY（任务完成 + 目标侧副本核验通过）；**retain 返回 TaskHandle**——结果必须可观测（「保住了没有」是本操作存在的意义；实现路径 = D2 §4）。主路径 = mooncake 主线版本的 retained client 注册（一次 RPC，无异步工作）返回空凭据 `task_ids=()`，`query_task` 入口直接 READY；0.3.11 过渡 move 返回真凭据。其余方法（keepalive / stop_keepalive / pin / demote / remove）无 READY
 - **exists（查询，不是第九项管理操作）**：实现是 `batch_is_exist`，它有个副作用——被查到的 key 会被续租，所以预热前的存在性检查顺便就起了保活作用。两种结果必须分清：「不在池里」（key 确实没有 → 该预热）和「查询本身失败」（RPC 出错或单 key 返回 -1 → 转成 QueryError 等一会儿重查）——把查询失败当成「不在池里」会误判成需要重新计算
-- **abandon（放弃跟踪）**：kvcm 发起任务后要定期查它完成没有，这叫跟踪。abandon = 不再查了：删掉进程内的核验登记，Ledger 记为 abandoned，凭据从此失效（再查报 KeyError）。它**不是取消任务**——后端没有取消接口，传输可能照常完成；留下的副本要删走 remove
+- **abandon（放弃跟踪）**：kvcm 发起任务后要定期查它完成没有，这叫跟踪。abandon = 不再查了：删掉进程内的核验登记，Ledger 记为 abandoned，凭据从此失效（再查报 KeyError）。它**不是取消任务**——后端没有取消接口，传输可能照常完成。**abandon 之后不会自动删副本**：副本留在池里，按冷热策略自然降层、过期；要立刻删除得显式调 remove（未实现，归释放流程 ReleaseLoop，D1 §6）
 
 **接口演进：KeySet（已定方向，待实施）**
 
@@ -220,7 +220,8 @@ sequenceDiagram
   - 全部操作方法的入参从 `Prefix` 改为 `KeySet`：`exists(ks)` / `copy(ks, target)` / ……编排流程在开头算一次，之后全程复用
   - `Prefix` 保留在入口：intent 载荷、幂等键（前缀 × 实例）、Ledger 记 token_ids 的输入
   - 不选「keys 裸露进编排层」：PoolKey 出现在 L2 违反原则 1；不选「backend 内缓存」：引入缓存增长管理与淘汰语义
-- 影响面：KvOps 全部方法签名 + MooncakeBackend + PrefetchFlow + 测试；rebuild 内部重算路径不变（它本来就从 token_ids 现场算）
+  - 影响面：KvOps 全部方法签名 + MooncakeBackend + PrefetchFlow + 测试；rebuild 内部重算路径不变（它本来就从 token_ids 现场算）
+  - 同步改名：`PrefetchError` → `FlowError`（统一出口异常的名字一般化——SessionEnd/Drain/Retain 等流程实现后也会抛它，不该绑死在 Prefetch 上）
 
 **capability 声明（显式，不藏在接口后面假装统一）**
 
@@ -276,8 +277,8 @@ flowchart LR
   BE --> Led
   BE --> SC["client<br/>StoreClient"]
   BE --> KC["engines.vllm.keys<br/>KeyComputer"]
-  McCap["backends...capability"] --> OCap
-  Seg["backends...topology<br/>SegTopology"] --> Http["http_admin"]
+  McCap["capability.py<br/>（mooncake 两版本能力表）"] --> OCap
+  Seg["topology.py<br/>SegTopology"] --> Http["http_admin"]
 ```
 
 - `engines.vllm.keys`、`engines.vllm.topology`、`client`、`http_admin` 不 import 任何 kvcm 模块（图上没有它们的出边）
@@ -295,16 +296,21 @@ flowchart LR
   Seg["SegTopology"] -->|"HTTP /get_all_segments"| M
 ```
 
-**谁是构造参数**（组装关系）：
+**谁是构造参数**（箭头 = 「作为参数传给」；创建对象时这些依赖从外部给进来，不是对象自己造的）：
 
 ```mermaid
 flowchart LR
-  Flow["PrefetchFlow(ops)"]
-  BE["MooncakeBackend(<br/>client, key_computer,<br/>locate, capability,<br/>ledger 可选<br/>)"]
-  Seg["SegTopology(admin)"]
-  RT["RankTopology(tp_size)"]
+  Ops["KvOps 实现<br/>（实际给的是 MooncakeBackend）"] --> Flow["PrefetchFlow"]
+  SC["StoreClient"] --> BE["MooncakeBackend"]
+  KC["KeyComputer"] --> BE
+  Loc["locate 函数"] --> BE
+  Cap["capability 能力表"] --> BE
+  Led["Ledger（可选）"] --> BE
+  Adm["AdminClient 或 URL"] --> Seg["SegTopology"]
+  TP["tp_size"] --> RT["RankTopology"]
 ```
 
+- `MooncakeBackend` 自己不创建这些依赖——五个参数全从外部给（依赖注入）；换掉其中任何一个（比如换引擎的 KeyComputer），这个类的代码一行不动
 - `locate` 是唯一没有对应 kvcm 模块的参数——它只是一个函数签名，生产环境由实例注册提供数据，demo 环境由 RankTopology 探测提供
 
 ## 失败语义与任务生命周期
@@ -451,7 +457,12 @@ stateDiagram-v2
 
 **重启恢复（`MooncakeBackend.rebuild()`；状态记录规格 = D2 §1）**
 
-key/seg 不落库。输入只有 `status='running'` 的行，输出是进程内的 `_plans` 和 `_watch`。
+key/seg 不落库。输入只有 `status='running'` 的行。输出是内存里的两张登记表（backend 对象里的两个字典）：
+
+- `_plans`：每个任务凭据对应哪个前缀、哪台目标实例、复制计划（哪条 key 发到哪个 seg）——恢复后 `query_task` 靠它继续跟踪
+- `_watch`：哪些凭据处于「等副本」状态（同组里有撞车失败的任务）——恢复后这些凭据只查副本、不再查任务
+
+**恢复范围**：目前只恢复 copy（唯一已实现的操作）。move / promote 实现时要同步补各自的恢复路径——否则重启后这两类任务的跟踪会静默丢失。
 
 ```mermaid
 flowchart TD
