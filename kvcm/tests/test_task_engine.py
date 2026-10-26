@@ -228,6 +228,20 @@ def test_intent_failed_status() -> None:
     while eng.intent_status(k) is IntentStatus.PENDING and time.monotonic() < deadline:
         time.sleep(0.01)
     assert eng.intent_status(k) is IntentStatus.FAILED
+    # 失败回执必须带原因（真机排障教训：空 detail 等于没有回执）
+    assert eng.intent_detail(k)
+    eng.shutdown()
+
+
+def test_intent_detail_empty_when_not_failed() -> None:
+    eng = TaskEngine(FakeOps(seq=[TaskStatus.READY]))
+    k = eng.submit_intent(_P, _T, poll_s=0.01)
+    deadline = time.monotonic() + 5
+    while eng.intent_status(k) is IntentStatus.PENDING and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert eng.intent_status(k) is IntentStatus.READY
+    assert eng.intent_detail(k) == ""
+    assert eng.intent_detail("no-such") == ""
     eng.shutdown()
 
 

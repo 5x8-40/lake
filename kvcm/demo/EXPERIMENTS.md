@@ -119,3 +119,27 @@
 - key 一致性：**已闭环**（#13/#14 单入口 `batch_is_exist` 32/32、36/36 全中）。
 - 多卡 rank↔seg 对号：**已闭环**（`--targets` + admin API/`npu-smi` 手工对号）。
 - 仍待：`run_e2e.sh` 一键真机重跑（同构 TP=2 + 异构双向；10-12 回归走单入口手工分步，一键编排本身未跑）、1-token 翻转根因、MLA（明确不支持）；`tools/test_keys.py` 容器内单跑；resolve.py proctitle 自动匹配的多卡真机验证。
+
+## 实验实录（2026-10-26：kvcm daemon 真机冒烟，E11 进程化首验）
+
+环境：245 本机。master 宿主机 `:50088`（`--client_ttl=120`）；源引擎 = 存活 vLLM TP2（卡 0,1，:8001，tp_mismatch peer=4）；目标 = 两个合成 seg helper（卡 6/7）；kvcm daemon（E11 进程壳）经 gRPC 收 intent 驱动 copy。容器 `vllm-ascend-lake-test`，控制面全程 `PYTHONHASHSEED=0`。
+
+**状态：e2e 全绿（6/6 PASS）**。当日下午 daemon 链路已全通但末轮卡在引擎自身
+put 路径被打伤（见坑 8）；**重启 :8001 引擎（原参数：`TP=2 PEER_TP_SIZE=4`
+经 `cluster/start_worker.sh`，宿主 pid 2924707，~165s READY）后复跑全过**：
+warm 4.3s 落池 → intent ack → 25 块副本 READY → daemon SIGTERM 退出码 0。
+旧引擎 seg 在 TTL（120s）内自动从 master 过期，新引擎 seg 全新注册。
+操作备忘：容器 PidMode 非 host，start_worker.sh 写的 pidfile 是容器命名
+空间 pid，宿主侧操作须用 `pgrep -af vllm.entrypoints` 对照 cmdline 找宿主
+pid。途中根出 8 个坑，全部对代码验证：
+
+### 10-26 踩坑
+
+1. **ascend 协议绑定必须 ACL context**：`mooncake_transfer_engine_npu` 无论 protocol 都装 AscendDirectTransport，无 `torch.npu.set_device()` 建的 ctx 时 setup rc=-600（ctx NULL）。已修：`client.py::connect` 加 `ascend_device` 前置仪式（与 precopy 同对策），daemon `--device` 透传。
+2. **copy 连发打爆目标侧建链（本轮主根因）**：daemon 一次铺开 14 个 `create_copy_task` → 源 worker 向目标 adxl 消息端口的**并发建链失败**（`ConnectToPeer FAILED`，`channel_msg_handler.cc:515`）→ `TRANSFER_FAIL`（`client_service.cpp:2994` 只重试 NO_AVAILABLE_HANDLE）。对照：连发 42 任务 = 24 成 18 败；**窗口 4 节奏化 = 42/42 全成**；简单 0.2s 错峰提交 = 源侧 38 成 0 败。十月 precopy 从不踩是因为严格串行（`create_copy_and_wait`）。止血已落地 `backend.py`（`submit_interval_s`）；按窗口推进的限速器归 E15。
+3. **同物理卡多进程 HCCL 互踩**：两个 helper 同卡（都 `ASCEND_RT_VISIBLE_DEVICES=6`）→ 第二进程 `HcclCommPrepare` 必败（`comm_channel.cc:105`）。合成测试每进程必须独占物理卡。
+4. **同名 seg 客户端更替 + client_ttl=120s 陈旧**：同名重起 helper，copy 解析到死进程握手端口 → `Connection refused` 秒败；更阴的是 `replica_copy_skipped, info=target_replicas_already_exist`（`client_service.cpp:2605`）按陈旧副本记录报**假 SUCCESS**。测试每轮身份必须全新。
+5. **adxl 端口分桶复用 → 断信道缓存中毒**：端口段 = `base + 物理卡×100`（`utils.cpp:227 FindAdxlListenPort`）；新进程复用刚死掉的端口，继承源端 `Channel is unavailable due to a previous transport failure`（`comm_channel.cc:224`）→ 秒败。`ASCEND_BASE_PORT`（`ascend_direct_transport.cpp:202`）每进程分桶隔离。vLLM worker 用 20096/20184（卡 0/1 桶），我们客户端默认 20600 桶。
+6. **seg 名与副本端点是两个命名空间**：P2PHANDSHAKE 下 transfer engine 把 `local_server_name` 重写成 `ip:随机RPC端口`（`transfer_engine_impl.cpp:151-185`）——store 层 seg 名仍是 setup 实参，副本描述 `transport_endpoint` 是重写后的。copy targets 认 seg 名、READY 核验认端点 → 合成 helper 两形态不一致时核验必炸（`VerifyError`）。**正确姿势（vllm-ascend `mooncake_backend.py:122-134` 同款）：先 `TransferEngine.initialize` → `get_rpc_port()` → 以 `ip:rpc_port` 为 local_hostname setup 并传 `engine=`**，两命名空间合一。引擎 worker 天然满足（seg 名 = 端点），产品 `_verify_missing` 契约不变；合成 helper 已照此改造。
+7. **store 退出析构崩溃**：AscendDirectTransport 析构期 `corrupted size vs. prev_size` + ctx NULL unmount 报错，合成客户端 100% 复现；daemon 优雅退出路径目前不受影响（退出码 0）。
+8. **引擎 put 路径可被实验副作用打伤（共享实例警示）**：一下午的僵尸任务重试 + 断信道缓存把存活 worker 的传输子系统拖入降级态——末轮 warm 时引擎**自身 put** 大批量失败（`Transfer failed for key ... TRANSFER_FAIL` + `Failed to revoke put ... OBJECT_NOT_FOUND`，`client_service.cpp:1685/1776`），KV 不落池。kvcm exists 预检正确拦截（`prefix not fully in pool`）。教训：对共享引擎做破坏性探测要控制节奏；引擎重启可复原。

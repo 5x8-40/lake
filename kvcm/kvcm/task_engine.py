@@ -147,6 +147,18 @@ class TaskEngine:
             return IntentStatus.PENDING
         return IntentStatus.READY if fut.exception() is None else IntentStatus.FAILED
 
+    def intent_detail(self, intent_id: str) -> str:
+        """失败原因（回执 detail）：终态 FAILED 时返回异常文本（截断），
+        其余情形空串。真机排障教训：失败不带原因的回执等于没有回执。"""
+        with self._lock:
+            fut = self._intents.get(intent_id)
+        if fut is None or not fut.done():
+            return ""
+        exc = fut.exception()
+        if exc is None:
+            return ""
+        return f"{type(exc).__name__}: {exc}"[:500]
+
     def track(
         self,
         handle: TaskHandle,

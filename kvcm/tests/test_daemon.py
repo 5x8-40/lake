@@ -70,6 +70,7 @@ def _args(tmp: str) -> argparse.Namespace:
         master="127.0.0.1:50088",
         local_hostname="127.0.0.1:13021",
         protocol="tcp",
+        device=0,
         model_name="qwen",
         block_size=128,
         tp_size=2,

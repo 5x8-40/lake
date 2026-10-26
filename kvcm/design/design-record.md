@@ -84,3 +84,32 @@ target}`），便于手工与脚本测试。协议字段、通道（gRPC 候选�
   kvcm 进程壳形态的工业佐证：常驻服务生命周期显式化，与计算进程解耦
 - **mooncake 任务无取消能力**（capability `has_task_cancel=NO`，P9）→ 决策四
   abandon 而非 cancel 的直接依据
+
+## E11 真机冒烟（2026-10-26）发现与对策
+
+冒烟方法与被坑细节全量见 `demo/EXPERIMENTS.md`「2026-10-26」节；此处只记
+影响产品决策的四条：
+
+1. **copy 提交必须限速（止血已落地，窗口化归 E15）**：daemon 一次铺开
+   全部 key 的 `create_copy_task` 会在目标侧形成并发建链风暴（0.3.11
+   ascend 实测约半数 TRANSFER_FAIL）。`MooncakeBackend` 新增
+   `submit_interval_s`（默认 0.2s，顺序错峰提交）——实测源侧 38/38。
+   正式方案是 E15 的按窗口推进限速器（在途数 ≤ N，窗口 4 实测 42/42），
+   届时错峰参数随窗口化一并收编。
+2. **回执必须带失败原因**：冒烟前半程 `GetTask` 失败 detail 为空，排障
+   被迫绕路读源端日志。已修：`TaskEngine.intent_detail`（FAILED 时返回
+   异常文本截断）+ grpc GetTask 透传。首航即立功——直接报出
+   `prefix not fully in pool` 省掉一轮盲查。
+3. **seg 寻址契约（locate 的返回形态）**：P2PHANDSHAKE 下 transfer
+   engine 重写 local_server_name 为 `ip:随机RPC端口`，导致「copy
+   targets 认的 seg 名」与「副本描述里的端点」是两个命名空间。
+   `_verify_missing` 按端点核验——**locate 必须返回端点形态**。生产
+   引擎 worker 两形态天然一致（vllm-ascend 先建引擎取真实端口再
+   setup），E13 InstanceWatcher 照此取；合成 helper 须用同款姿势
+   （`TransferEngine.initialize` → `get_rpc_port` → 以其为
+   local_hostname setup 并传 `engine=`）。
+4. **0.3.11 生产行为备忘（E13/E15 消化）**：目标引擎 worker 重启后
+   `client_ttl`（120s）窗口内 copy 到它会打到陈旧端点秒败；
+   `target_replicas_already_exist` 跳过按陈旧记录可产假 SUCCESS；
+   断信道缓存按端点记忆、无自愈——同名同端口重启的实例在缓存角度
+   等于旧实例。这三点都是 kvcm 重试/保活语义要显式消化的上游现实。

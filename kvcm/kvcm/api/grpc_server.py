@@ -48,7 +48,10 @@ class KvcmIntentServicer(pb_grpc.KvcmIntentServicer):
         status = self._engine.intent_status(request.intent_id)
         if status is None:
             return pb.GetTaskResponse(status=pb.GetTaskResponse.STATUS_UNKNOWN)
-        return pb.GetTaskResponse(status=_STATUS_MAP[status])
+        return pb.GetTaskResponse(
+            status=_STATUS_MAP[status],
+            detail=self._engine.intent_detail(request.intent_id),
+        )
 
 
 class IntentGrpcServer:

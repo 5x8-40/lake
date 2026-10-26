@@ -76,6 +76,7 @@ def run(args: argparse.Namespace, *, stop: threading.Event | None = None) -> int
             local_hostname=args.local_hostname,
             master_server_address=args.master,
             protocol=args.protocol,
+            ascend_device=args.device,
         )
         backend = build_backend(args, client, ledger)
         loop = KeepaliveLoop(
@@ -128,6 +129,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--master", required=True, help="mooncake master 地址 host:port")
     p.add_argument("--local-hostname", required=True, help="本进程 client 身份 host:port")
     p.add_argument("--protocol", default="tcp", help="传输协议（tcp/ascend/rdma…）")
+    p.add_argument(
+        "--device",
+        type=int,
+        default=0,
+        help="ascend 协议的 torch.npu.set_device 卡号（NPU 版绑定前置仪式；tcp 忽略）",
+    )
     p.add_argument("--model-name", required=True)
     p.add_argument("--block-size", type=int, default=128)
     p.add_argument("--tp-size", type=int, default=1)

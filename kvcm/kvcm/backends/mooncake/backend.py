@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import time
 import uuid
 from typing import Callable, Sequence
 
@@ -71,6 +72,7 @@ class MooncakeBackend(KvOps):
         locate: Callable[[InstanceId], Sequence[str]],
         capability: BackendCapability,
         ledger: Ledger | None = None,
+        submit_interval_s: float = 0.2,
     ) -> None:
         """
         client：已 connect 的 StoreClient（控制面身份，global_segment_size=0）。
@@ -79,12 +81,17 @@ class MooncakeBackend(KvOps):
         capability：按连接上的后端版本填充的能力集（必填——能力宣告不
             允许默认冒充，填错版本 = 编排层选错路径）。
         ledger：任务状态记录（可选；不注入则任务状态只留进程内）。
+        submit_interval_s：copy 逐任务提交间隔。连发提交会在目标侧形成
+            并发建链风暴（0.3.11 ascend 实测：14 连发约半数
+            TRANSFER_FAIL；窗口 4 节奏化 42/42 全成）——串行+间隔是
+            止血；按窗口推进的限速器归 E15。
         """
         self._client = client
         self._keys = key_computer
         self._locate = locate
         self._cap = capability
         self._ledger = ledger
+        self._submit_interval_s = submit_interval_s
         # handle → (prefix, target, plan [(key, target_seg), ...], handle_id)：
         # READY 核验与 Ledger 迁移登记；终态即删（防长驻泄漏）。
         # handle_id = 同一次操作发起的一组任务的分组键（uuid），写进
@@ -121,7 +128,9 @@ class MooncakeBackend(KvOps):
         plan = self._keys.build_plan(keys, targets)
         task_ids: list[object] = []
         try:
-            for key, seg in plan:
+            for i, (key, seg) in enumerate(plan):
+                if i and self._submit_interval_s > 0:
+                    time.sleep(self._submit_interval_s)
                 task_ids.append(self._client.create_copy_task(key, [seg]))
         except Exception as e:
             # 已发起的任务必须带在异常上——否则这些任务无句柄可查，
