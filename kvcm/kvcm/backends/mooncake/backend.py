@@ -261,6 +261,12 @@ class MooncakeBackend(KvOps):
             raise QueryError(str(e)) from e
         return len(result) == len(keys) and all(result)
 
+    def prefix_of(self, handle: TaskHandle) -> Prefix | None:
+        """句柄登记的前缀（_plans 第一项）。终态删除登记后为 None——
+        调用方（TaskEngine.track）需在轮询前取。"""
+        entry = self._plans.get(handle)
+        return entry[0] if entry is not None else None
+
     # ------------------------------------------------------------------
     # 任务状态记录（归实现侧，不归编排层）
     #

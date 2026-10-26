@@ -29,10 +29,12 @@ _H = TaskHandle(op=OpKind.COPY, task_ids=((1, 101),))
 
 
 class FakeOps(KvOps):
-    def __init__(self, *, exists=True, seq=(), query_gate: threading.Event | None = None):
+    def __init__(self, *, exists=True, seq=(), query_gate: threading.Event | None = None,
+                 handle_fn=None):
         self._exists = exists
         self._seq = list(seq)
         self._gate = query_gate  # 设置后 query_task 阻塞在此事件上（测并发/在途）
+        self._handle_fn = handle_fn or (lambda _p: _H)
         self.abandoned: list[TaskHandle] = []
         self.copy_count = 0
         self._lock = threading.Lock()
@@ -46,7 +48,7 @@ class FakeOps(KvOps):
     def copy(self, prefix, target) -> TaskHandle:
         with self._lock:
             self.copy_count += 1
-        return _H
+        return self._handle_fn(prefix)
 
     def query_task(self, handle) -> TaskStatus:
         if handle in self.abandoned:
@@ -160,6 +162,24 @@ def test_in_flight_visible_during_run_then_cleared() -> None:
     eng.shutdown()
 
 
+def test_concurrent_intents_distinct_prefixes_no_crosstalk() -> None:
+    """多 intent 并发：不同 prefix 各自跑通、各自注册保活，互不干扰。"""
+    ka = FakeKeepalive()
+    ops = FakeOps(
+        seq=[TaskStatus.READY] * 8,
+        handle_fn=lambda p: TaskHandle(op=OpKind.COPY, task_ids=((p.token_ids[0], 1),)),
+    )
+    eng = TaskEngine(ops, keepalive=ka, max_concurrent=3)
+    prefixes = [Prefix(model_id="qwen", token_ids=(i, i + 1)) for i in range(3)]
+    futs = [eng.submit(p, _T, poll_s=0.01) for p in prefixes]
+    for f in futs:
+        f.result(timeout=5)
+    assert ops.copy_count == 3
+    assert sorted(ka.registered, key=lambda p: p.token_ids) == prefixes
+    assert eng._in_flight == set()
+    eng.shutdown()
+
+
 # ---------------------------------------------------------------------------
 # track（rebuild 恢复收编）
 # ---------------------------------------------------------------------------
@@ -203,6 +223,31 @@ def test_track_keyerror_stops_tracking() -> None:
     eng = TaskEngine(ops)
     eng.track(_H, poll_s=0.01).result(timeout=5)
     assert ops.abandoned == []
+    eng.shutdown()
+
+
+class _PrefixAwareOps(FakeOps):
+    """prefix_of 已接线的后端（恢复 READY 保活注册的来源）。"""
+
+    def prefix_of(self, handle) -> Prefix | None:
+        return _P
+
+
+def test_track_ready_registers_keepalive() -> None:
+    """恢复任务 READY → 注册保活（重启前来不及注册，靠本路径补上）。"""
+    ka = FakeKeepalive()
+    eng = TaskEngine(_PrefixAwareOps(seq=[TaskStatus.READY]), keepalive=ka)
+    eng.track(_H, poll_s=0.01).result(timeout=5)
+    assert ka.registered == [_P]
+    eng.shutdown()
+
+
+def test_track_ready_without_prefix_skips_keepalive() -> None:
+    """后端未接线 prefix_of（None）→ 退化不保活，不报错。"""
+    ka = FakeKeepalive()
+    eng = TaskEngine(FakeOps(seq=[TaskStatus.READY]), keepalive=ka)
+    eng.track(_H, poll_s=0.01).result(timeout=5)
+    assert ka.registered == []
     eng.shutdown()
 
 

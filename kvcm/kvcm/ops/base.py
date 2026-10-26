@@ -191,3 +191,13 @@ class KvOps(ABC):
         查询面，非第九项 KV 操作。注意：读即续租（能力集 has_lease）——
         本检查同时是保活机制的续租通道；预热编排用它做前置检查（warm
         未覆盖前缀或 key 口径漂移时 fail fast，复制无意义）。"""
+
+    def prefix_of(self, handle: TaskHandle) -> Prefix | None:
+        """句柄对应的前缀（句柄由某次 prefix 操作产生，后端持有登记）。
+
+        查询面，非 KV 操作。用途：rebuild 恢复的 handle 被 TaskEngine
+        track 到 READY 后，编排层要拿到 prefix 才能注册保活（恢复路径
+        上没有 submit 的 prefix 入参）。句柄已终态被删除登记后返回
+        None——调用方需在轮询前取。默认 None：适配器未接线时编排层
+        退化为「恢复任务 READY 后不保活」（与重启前未注册同语义）。"""
+        return None

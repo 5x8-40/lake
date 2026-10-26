@@ -27,15 +27,30 @@ class FakeClient:
 
 
 class FakeBackend:
-    """记录 rebuild/stop 调用；恢复 handle 脚本化。"""
+    """记录 rebuild 调用；恢复 handle 脚本化；任务面（query/abandon）
+    支持 track 轮询与退出收口剧本。"""
 
     def __init__(self, restored=()) -> None:
         self._restored = list(restored)
         self.rebuild_calls = 0
+        self.first_query = threading.Event()
+        self.abandoned: list[TaskHandle] = []
 
     def rebuild(self):
         self.rebuild_calls += 1
         return list(self._restored)
+
+    def prefix_of(self, handle):
+        return None
+
+    def query_task(self, handle):
+        self.first_query.set()
+        if handle in self.abandoned:
+            raise KeyError("unknown task handle")  # abandon 后即遗忘
+        return TaskStatus.RUNNING
+
+    def abandon(self, handle) -> None:
+        self.abandoned.append(handle)
 
 
 class FakeKeepalive:
@@ -122,6 +137,27 @@ def test_no_restored_tasks_still_clean_shutdown(monkeypatch, tmp_path) -> None:
     assert backend.rebuild_calls == 1
     assert loop.started and loop.stopped
     assert client.closed
+
+
+def test_graceful_shutdown_abandons_in_flight(monkeypatch, tmp_path) -> None:
+    """优雅退出回归：退出信号到达时恢复跟踪仍在轮询（RUNNING），
+    engine.shutdown 必须在 loop.stop 前把在途 handle abandon 掉。"""
+    backend = FakeBackend(restored=[_H1])
+    client = FakeClient()
+    loop = FakeKeepalive()
+    monkeypatch.setattr(daemon, "StoreClient", lambda: client)
+    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: backend)
+    monkeypatch.setattr(daemon, "KeepaliveLoop", lambda *a, **kw: loop)
+
+    stop = threading.Event()
+    t = threading.Thread(target=daemon.run, args=(_args(tmp_path),), kwargs={"stop": stop})
+    t.start()
+    assert backend.first_query.wait(timeout=5)  # track 已在轮询 ⇒ handle 已在在途集
+    stop.set()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert backend.abandoned == [_H1]  # 在途收口
+    assert loop.stopped and client.closed
 
 
 def test_http_stub_started_when_listen_set(monkeypatch, tmp_path) -> None:

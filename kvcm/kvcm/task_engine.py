@@ -135,6 +135,9 @@ class TaskEngine:
     def _track(self, handle: TaskHandle, poll_s: float, timeout_s: float) -> None:
         with self._lock:
             self._in_flight.add(handle)
+        # 轮询前取 prefix：终态即删核验登记，READY 后再取就是 None。
+        # 恢复路径没有 submit 的 prefix 入参，只能靠后端登记
+        prefix = self._ops.prefix_of(handle)
         try:
             deadline = time.monotonic() + timeout_s
             while True:
@@ -147,6 +150,11 @@ class TaskEngine:
                 except KeyError:
                     return  # 句柄已被收口（shutdown abandon），预期内
                 if status in (TaskStatus.READY, TaskStatus.FAILED):
+                    # READY 接线（恢复侧）：重启前没来得及注册的保活在
+                    # 这里补上——否则副本无续租、到期被驱逐，预热白做
+                    if status is TaskStatus.READY and self._keepalive is not None:
+                        if prefix is not None:
+                            self._keepalive.register(prefix)
                     return  # 终态已记账
                 if time.monotonic() >= deadline:
                     self._ops.abandon(handle)  # 超时收口（与流程同语义）
