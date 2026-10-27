@@ -129,66 +129,49 @@ sequenceDiagram
 
 ## 决策三：保活占位策略（D3 未定项的临时默认）
 
-**固定窗口**：副本 READY 后 KeepaliveLoop 续租一个可配置窗口（默认 10 分钟），
-窗口到即停租注销。选它的理由：三候选（会话期/固定窗口/首流量后停租）里最保
-守、最不容易把副本变相钉死在热层、后改成本最低。D3 正式定型时替换策略实现，Loop 机
-制（注册表驱动的周期 `batch_is_exist`）不变。形态 = 协程定时器（事件循环内
+**固定窗口**：副本 READY 后 KeepaliveLoop 续租一个可配置窗口，窗口到即
+停租注销。选它的理由：三候选里最保守、最不容易把副本变相钉死在热层、
+后改成本最低——**会话期**依赖 E12 的会话信号、**首次命中后停**依赖
+E13/E14 的命中信号，现在都不存在，想做也做不了。窗口时长参数化，默认
+10 分钟只是起步值（真机观察「预热完成到首次流量」的典型间隔后再调）。
+**重复预热同一前缀刷新窗口**：新的 READY 把该前缀的截止时间往后推——
+前缀还在被需要，保活就延续。D3 正式定型时替换策略实现，Loop 机制（注
+册表驱动的周期 `batch_is_exist`）不变。形态 = 协程定时器（事件循环内
 `asyncio.sleep` 周期触发），不是独立线程。
-
-补充（已确认）：
-
-- 窗口时长**参数化**，默认 10 分钟只是起步值——真机观察「预热完成到
-  首次流量」的典型间隔后再调
-- **重复预热同一前缀刷新窗口**：新的 READY 把该前缀的截止时间往后推
-  ——前缀还在被需要，保活就延续
-- 另外两个候选将来信号齐了再评：会话期（依赖 E12 会话信号）、首次命
-  中后停（依赖 E13/E14 命中信号）——现在想做也做不了
 
 ## 决策四：优雅退出语义（协程取消）
 
 SIGTERM/SIGINT → ① 停收 intent（占位入口关闭）→ ② **对在途协程
 `task.cancel()`**——协程在 `await` 点收到 `CancelledError`，flow 捕获后做
 abandon 处理（Ledger 记 abandoned；后端无任务取消能力 P9，传输不取消，副本
-清理归 remove）→ ③ 等在途协程全部退出（有界等待）→ ④ KeepaliveLoop 停止
-→ ⑤ `StoreClient.close()`（demo 已知退出期析构竞态，显式 close 是既有结论）。
+清理归 remove）→ ③ 等在途协程全部退出（有界等待 5 秒——RPC 毫秒级 +
+abandon 记账毫秒级，余量充足；**等满还有协程未退则不再等**，直接走后续步骤，
+泄漏线程随进程消失）→ ④ KeepaliveLoop 停止 → ⑤ `StoreClient.close()`
+（demo 已知退出期析构竞态，显式 close 是既有结论）。
 
 - 协程取消是干净的中断点：`await` 处才生效，不会在 RPC 执行中途切走
-- 重启后遗留的 abandoned 记录由 rebuild 兜底，与既有恢复语义一致
-
-补充（已确认）：
-
-- **有界等待 = 5 秒**（RPC 毫秒级 + abandon 记账毫秒级，余量充足）
-- **等满还有协程未退**（如卡在 RPC 卡死）：不再等，直接走后续步骤——
-  泄漏线程随进程消失；账本已记 abandoned，副本由 rebuild 兜底。这条写
-  死，防止退不出
-- **SIGKILL（强杀）不用处理**：来不及记账、账本停在 running 的任务，
-  重启后 rebuild 当「还在跑」恢复跟踪——行为本来就正确
+- 重启后遗留的 abandoned 记录由 rebuild 兜底；SIGKILL（强杀）来不及记
+  账、账本停在 running 的任务，rebuild 同样当「还在跑」恢复跟踪——两
+  种退出路径的恢复语义一致
 
 ## 决策五：IntentReceiver 占位形态
 
 进程内函数调用 + 一个最小 HTTP 端点（`POST /prefetch {model_id, token_ids,
-target}`），便于手工与脚本测试——占位期用 stdlib `http.server` 经线程池
-执行即可，量上来换 aiohttp（本身就是协程的）。协议字段、通道（gRPC 候选）随 E12
-定型后替换——占位入口只调 TaskEngine 公开方法（`queue.put`），替换不动引擎。
-
-补充（已确认）：
-
-- **保留 HTTP 端点**：真机测试一条 curl 即可发预热，比进 Python 调函
-  数方便；成本只是 stdlib 几十行
-- **响应同步等**：等到 READY / 失败才返回（占位期测试方便；HTTP 线程
-  被占几十秒在占位期无所谓）。可选 `?wait=0` 立即返回任务标识。正式
-  语义随 E12 协议重定
+target}`），便于手工与脚本测试（真机测试一条 curl 即可，比进 Python 调函
+数方便）——占位期用 stdlib `http.server` 经线程池执行即可，量上来换
+aiohttp（本身就是协程的）。**响应同步等**：等到 READY / 失败才返回（占
+位期测试方便；HTTP 线程被占几十秒在占位期无所谓），可选 `?wait=0` 立
+即返回任务标识。协议字段、通道（gRPC 候选）随 E12 定型后替换——占位
+入口只调 TaskEngine 公开方法（`queue.put`），替换不动引擎。
 
 ## 决策六：范围切分
 
 - **本期做**：进程壳（启动/退出/rebuild 接通）+ TaskEngine + **KeepaliveLoop**
-  （唯一常驻循环）+ IntentReceiver 占位
+  （唯一常驻循环）+ IntentReceiver 占位。其中 KeepaliveLoop 走 `exists`
+  通道（`batch_is_exist`，读即续租）——**不依赖** L3 的 `keepalive()`
+  方法（NotImplementedError，留待将来语义更丰富的保活策略）
 - **只留类骨架**：ReleaseLoop、RetainLoop——依赖的 `demote`/`retain`/`remove`
   在 L4 全是 NotImplementedError，能力接通（E10 后续）前无内容可跑
-- **澄清**：KeepaliveLoop 本期能做，不靠 L3 的 `keepalive()` 方法（同为
-  NotImplementedError）——保活的实现通道是定期 `exists`（`batch_is_exist`，
-  读即续租），该通道已具备；L3 的 `keepalive` 抽象方法留待将来语义更丰富
-  的保活策略
 - **不做**：限速器（E15）、重发策略（随 E12）、多模型归属判定（多模型接入前
   置，已登记）、E12/E13/E14 协议
 
