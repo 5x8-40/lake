@@ -72,6 +72,13 @@ sequenceDiagram
 - 网络领域同构（任务跟踪 ≈ 连接管理）：nginx/redis 的事件循环 + 少量
   线程跑阻塞段，是「等待为主的 IO 任务」的标准形态
 
+**与现有同步代码的衔接（实施顺序）**：TaskEngine 先行，**flow/ops 本期
+保持同步阻塞**——协程消费者经 `asyncio.to_thread(flow.run, ...)` 执行现
+有 `PrefetchFlow.run`，TaskEngine 的队列/信号量/保活/退出全部照常成立
+（「协程调度 + 线程池承接阻塞调用」本就是本决策的名称）。接口三批合一
+（见下「接口演进」）后续独立 PR 实施，届时拆掉 to_thread 包装直连——
+不把 TaskEngine 与接口大改绑在一次 PR 里。
+
 ## 决策二：TaskEngine 形态（协程版）
 
 `asyncio.Queue` + 信号量限并发 + 协程消费者，无优先级、不分轻重通道。
@@ -90,6 +97,27 @@ sequenceDiagram
 - **排队超时**：intent 在队列等待的语义（等多久算放弃）随 E12 intent 字
   段一起定；执行超时沿用 flow 现有 `timeout_s`
 - 失败态策略三选（重发 / 放弃清副本 / 源掉线衔接）本期仍只留接口
+
+## 接口演进（三批合一，后续 PR 实施）
+
+KvOps 接口的三项改动共享签名面（全部方法都动），分三次改不如一次改，
+**合为一个后续 PR**；本期 TaskEngine 先以 to_thread 承接同步 flow。
+
+1. **KeySet**：`keys_of(prefix) -> KeySet`（不透明类型），操作方法入参
+   `Prefix` → `KeySet`——长序列下 key 只算一次（现状 exists 与 copy 各
+   算一遍；链式块 hash 逐块串行，长序列不便宜）。Prefix 保留在入口
+   （intent 载荷、幂等键、Ledger 记 token_ids）
+2. **async 化**：KvOps 全部方法 `async def`——等待（轮询 sleep、RPC 阻
+   塞）发生在 ops 内部，只有这层 async 才能让等待挂起；backend 内 RPC
+   走 executor、sleep 用 `asyncio.sleep`
+3. **wait_ready 下沉**：`async def wait_ready(handle, *, timeout_s)` —
+   —「等到 READY」的轮询循环（QueryError 重试 / VerifyError 上抛 / 超时
+   先 abandon 再上抛）从 flow 撤进 ops。它是跨流程通用件（Drain/Retain
+   同样需要等），放 flow 层是实现细节泄漏 + 每个流程重复一遍；flow 瘦
+   成纯编排（exists → copy → wait_ready）
+
+同步改名（同批）：`PrefetchError` → `FlowError`（统一出口异常一般化，
+其他流程实现后共用）。
 
 ## 决策三：保活占位策略（D3 未定项的临时默认）
 
@@ -128,12 +156,17 @@ target}`），便于手工与脚本测试——占位期用 stdlib `http.server`
 
 ## 阶段计划
 
-1. **阶段 1 进程壳 + 状态恢复**：Ledger 加锁 → 启动时 `rebuild()` 接线 →
-   KeepaliveLoop（固定窗口策略）→ 优雅退出四步
-2. **阶段 2 TaskEngine**：intent 占位入口 → 并发执行 → 终态记账 → 超时收口
-   （复用现有 abandon）
-3. **阶段 3 测试**：并发多 intent 单测；重启 e2e（杀进程 → rebuild → READY）；
-   优雅退出回归（退出不崩、账本会收口）；真机冒烟
+1. **阶段 1 进程壳 + 状态恢复**：Ledger 单线程 executor → 启动时
+   `rebuild()` 接线 → KeepaliveLoop（固定窗口策略，协程定时器）→ 优雅退
+   出（协程取消 + abandon 收口）
+2. **阶段 2 TaskEngine**：intent 占位入口 → `asyncio.Queue` + Semaphore(4)
+   → 协程消费者经 `to_thread` 执行同步 `PrefetchFlow.run` → 终态记账 →
+   超时收口（复用现有 abandon）
+3. **阶段 3 测试**：并发多 intent 单测；重启 e2e（杀进程 → rebuild →
+   READY）；优雅退出回归（退出不崩、账本会收口）；真机冒烟
+4. **后续 PR（接口三批合一）**：KeySet + KvOps async 化 + wait_ready 下
+   沉（+ `PrefetchError` → `FlowError`）；拆 to_thread 包装，flow 直连协
+   程消费者
 
 ## 参考实现
 

@@ -226,7 +226,8 @@ sequenceDiagram
   - `Prefix` 保留在入口：intent 载荷、幂等键（前缀 × 实例）、Ledger 记 token_ids 的输入
   - 不选「keys 裸露进编排层」：PoolKey 出现在 L2 违反原则 1；不选「backend 内缓存」：引入缓存增长管理与淘汰语义
   - 影响面：KvOps 全部方法签名 + MooncakeBackend + PrefetchFlow + 测试；rebuild 内部重算路径不变（它本来就从 token_ids 现场算）
-  - 同步改名：`PrefetchError` → `FlowError`（统一出口异常的名字一般化——SessionEnd/Drain/Retain 等流程实现后也会抛它，不该绑死在 Prefetch 上）
+  - **同批实施（共享签名面，一次改完）**：KvOps 全部方法 `async def`（等待挂起，见 design-record 决策一）；`wait_ready` 下沉——「等到 READY」的轮询循环从 flow 撤进 ops（跨流程通用件：Drain/Retain 同样需要等；flow 瘦成纯编排 exists → copy → wait_ready）；`PrefetchError` → `FlowError`（统一出口异常一般化）
+  - **实施顺序**：TaskEngine 先行（flow 保持同步，协程消费者经 `to_thread` 承接）；三批合一后续独立 PR，届时拆包装直连
 
 **capability 声明（显式，不藏在接口后面假装统一）**
 
