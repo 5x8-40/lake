@@ -296,7 +296,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 含义：目标实例的 DRAM 副本已写好、kvcm 核验通过后，上报 Router（D1 §4）
   - 有 READY（3 个）：**copy（预热）、move、promote**
     - 共同点：做完之后，某个实例新具备了「请求发过来就能直接用本机 KV」的条件
-    - 核验方式相同：查 `QueryTask` 确认任务结束，再查 `GetReplicaList` 确认副本状态（F7）
+    - 核验方式：copy / move 查 `QueryTask` 确认任务结束；promote 为触发式（无任务号，见 §3 主动路径一），不走 `QueryTask`，直接以 `GetReplicaList` 轮询副本位置为准；三者最终都以 `GetReplicaList` 确认副本状态（F7）
     - move 多一件事：源副本被删，要同步通知索引「源实例不再有这份 KV」
   - 无 READY（5 个）：
     - keepalive / pin / retain：不动数据，RPC 返回即完成，记台账即可
