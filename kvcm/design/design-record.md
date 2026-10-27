@@ -42,31 +42,37 @@
 sequenceDiagram
     participant R as Router
     participant Recv as IntentReceiver
-    participant Q as intent 队列（asyncio.Queue）
-    participant Sem as 信号量（4）
+    participant Q as 队列+信号量<br/>（TaskEngine）
     participant W as 预热协程
-    participant Ex as executor 线程池
+    participant Ex as RPC 线程池
     participant M as mooncake master
 
     R->>Recv: POST /prefetch
-    Recv->>Q: put（毫秒返回）
-    W->>Q: get（挂起，不占线程）
-    W->>Sem: acquire（挂起，不占线程）
-    Note over W,Ex: 等待期间事件循环照接新活
-    Sem-->>W: 拿到名额
+    Recv->>Q: put 后立即返回
+    Note over W: 协程在「等队列、等信号量、等 sleep」<br/>期间全部挂起，不占任何线程
+    W->>Q: get 拿到任务 → 信号量拿到名额
     W->>Ex: to_thread exists
     Ex->>M: RPC batch_is_exist
     M-->>Ex: 在池
-    W->>Ex: gather 逐 key 提交
-    Ex->>M: create_copy_task ×N
-    loop 轮询到终态
-        W->>W: await asyncio.sleep(0.5)（挂起，不占线程）
+    par 逐 key 并发提交（gather）
+        W->>Ex: create_copy_task key1
+    and
+        W->>Ex: create_copy_task key2
+    and
+        W->>Ex: create_copy_task …
+    end
+    Ex->>M: RPC ×N
+    loop 每 0.5 秒一轮，直到 READY / 失败 / 超时
+        W->>W: asyncio.sleep(0.5)
         W->>Ex: to_thread query_task
         Ex->>M: RPC
     end
     W->>Ex: to_thread 核验副本 + 写 Ledger
-    W-->>Sem: release
+    W->>Q: 归还信号量名额
 ```
+
+- 线程只在 `Ex`（线程池）这一列出现：每个 RPC 执行的几毫秒
+- 协程（W）全程只是一段代码状态，挂起时不占线程——排队 100 个这样的协程也免费
 
 - 不选「有界队列 + 固定 worker 线程池」：copy 任务约 97%
   时间在等（sleep / 等 RPC），线程池模式下等待也把线程占死；协程模式
@@ -75,11 +81,15 @@ sequenceDiagram
   nginx / redis 就是事件循环加少量线程跑阻塞段——「等待为主的 IO 任
   务」的标准形态
 
-**一次走完，不设中间态**：flow/ops 的 async 化与 TaskEngine 同批做
+**一次走完，不分两步**：flow/ops 的 async 化与 TaskEngine 同批做
 （签名 async + RPC 包 `to_thread` + `sleep` 换 `asyncio.sleep`，flow
-轮询循环改 `await`——约一天工作量）。不选「先同步承接、E15 再改写」的
-两步走：E15（gather 并发提交）在路线图上必然到来，两步走 = 承接层
-写一遍再拆一遍 + flow 写两遍。
+轮询循环改 `await`——约一天工作量）。
+
+不选的走法 = 分两步：本期 flow 保持同步代码、整个交给线程池执行；E15
+时再把 flow 改写成异步。不走这条路的原因：E15 要做并发提交
+（`asyncio.gather`），那在同步代码里做不了，flow 到时**必须**改成异
+步——所以本期写的「同步 flow + 线程池承接」就是一份注定要被拆掉重
+写的临时代码，flow 前后要写两遍。既然改写躲不过，不如本期一次改完。
 
 **线程池大小**：
 
