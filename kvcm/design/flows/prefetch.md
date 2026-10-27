@@ -1,8 +1,7 @@
 # PrefetchFlow（预热流程）
 
 预热流程的步骤与数据流。定位、失败语义总表与任务生命周期见
-[../code-architecture.md](../code-architecture.md)（L2 节、失败语义与任务
-生命周期节）；实现 = `kvcm/flows/prefetch.py`。
+[../code-architecture.md](../code-architecture.md)（L2 节、L3 节「失败语义」「任务生命周期」）；实现 = `kvcm/flows/prefetch.py`。
 
 ## 流程步骤
 
@@ -80,7 +79,7 @@ sequenceDiagram
                     BE-->>Flow: FAILED 或 VerifyError
                 else 失败全是撞车
                     BE->>DB: 只把撞车任务记 failed
-                    Note over BE: 进入等副本状态, 对外仍是 RUNNING
+                    Note over BE: 立刻核验副本：齐则本轮 READY；否则进入等副本状态, 对外仍是 RUNNING
                 else 超时
                     Flow->>BE: abandon(handle)
                     BE->>DB: 其余行 abandoned, 撞车任务保持 failed
@@ -103,11 +102,12 @@ sequenceDiagram
   exists 失败和提交失败不写行
 - 图里的「超时」指本次预热的截止时间到了，接下来流程调用
   `abandon`——它不是 `query_task` 的一种返回值
-- 「等副本」状态（代码里叫 `_watch`）：进入后下一轮不再查任务状态——
-  那些任务已经失败（撞车），查了也没意义；改为只定期检查副本是否已经
-  到位（第一遍的任务搬完没有），到位就算这次预热成功。完整语义见
-  [../code-architecture.md](../code-architecture.md)「失败语义与任务生
-  命周期」节
+- 「等副本」状态（代码里叫 `_watch`）：失败全是撞车时先记 failed、立
+  刻核验一轮——副本已齐本轮就 READY；未齐才进入等副本，之后不再查任
+  务状态（那些任务已经失败，查了也没意义），只定期核验副本是否到位
+  （第一遍的任务搬完没有），到位就算这次预热成功。完整语义见
+  [../code-architecture.md](../code-architecture.md) L3 节「失败语义」
+  「任务生命周期」
 
 ## 失败分支
 
@@ -121,6 +121,6 @@ sequenceDiagram
 - **locate**：目标实例 → rank 有序 seg 列表（demo 探测 / 生产实例注册）
 - **StoreClient**：绑定 RPC（exists / copy 提交 / query_task / 副本核验）
 - **Ledger**：任务状态（running → ready/failed/abandoned）
-- **EventPublisher**（待接线）：READY 后按目标实例端点补发 `BlockStored`
-- **keepalive**（待接线）：READY 后注册保活（见
+- **EventPublisher**（待接通）：READY 后按目标实例端点补发 `BlockStored`
+- **keepalive**（待接通）：READY 后注册保活（见
   [../code-architecture.md](../code-architecture.md) 运行时结构节）

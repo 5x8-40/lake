@@ -15,7 +15,7 @@ L2 编排层     PrefetchFlow 已实现；SessionEnd/Drain/Retain 未实现    k
               只调 L3 接口；代码里不出现 seg / lease / client_id / PoolKey / rank
 L3 原子操作层 KvOps：八操作 + query_task / exists / abandon          kvcm/ops/
               抽象接口（语义规格 = D2 §1）+ capability 声明结构
-L4 适配层     MooncakeBackend = StoreClient + SegTopology            kvcm/backends/mooncake/
+L4 适配层     MooncakeBackend = StoreClient（+ locate 注入）         kvcm/backends/mooncake/
               引擎侧子件   = KeyComputer + RankTopology                kvcm/engines/vllm/
 L5 状态层     Ledger（sqlite，四类状态记录）                          kvcm/kvcm/ledger.py
 ```
@@ -145,7 +145,7 @@ flowchart LR
 | EventPublisher | READY 后按目标实例端点补发 `BlockStored`；端点生命周期（每实例一端点、注册给索引） | D1 §2 方案 a 落地、E14 |
 | InstanceWatcher | 实例上线/销毁接入 → 触发预热 / seg 副本处理；「端点→实例」「seg→实例」注册的权威来源（E13；先占位，事件源随 D4） | D1 §3、E13 |
 
-- 三条通道全部单向：intent 进来、事件发出去、实例事件接入——与 D1 §4「两条单向通道」一致
+- IntentReceiver / EventPublisher 两条通道与 D1 §4「两条单向通道」一致（intent 进来、事件发出去）；InstanceWatcher 是第三条接入（实例事件，归 D4/E13）
 
 ## L2 编排层（复合流程）
 
@@ -158,10 +158,11 @@ flowchart LR
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
 | RetainFlow | retain（主路径 = retained client 注册；0.3.11 过渡 = move 到存活节点的 seg） | 未实现（D2 §4） |
 
-- **失败处理**：流程对调用方只抛一种异常（当前叫 `PrefetchError`——这个名字绑死在 Prefetch 上，其他流程没法用，将改为一般化的 `FlowError`，随 KeySet 一起实施）——调用方不用关心失败发生在哪一步，具体原因写在异常消息里。编程错误（KeyError、TypeError 这类代码 bug）不包装，直接向上抛。各分支：
+- **失败处理**：除 exists 的 `QueryError`（不包装、可重试上抛）外，流程对调用方只抛一种异常（当前叫 `PrefetchError`——这个名字绑死在 Prefetch 上，其他流程没法用，将改为一般化的 `FlowError`，随 KeySet 一起实施）——调用方不用关心失败发生在哪一步，具体原因写在异常消息里。编程错误（KeyError、TypeError 这类代码 bug）不包装，直接向上抛。异常类型定义见 L3「失败语义」。各分支：
 
 | 发生了什么 | 流程怎么处理 |
 |-----------|-------------|
+| exists 查询时 RPC 出错（QueryError） | 不包装，直接向上抛（可重试） |
 | 前缀不在池（exists 返回 False） | 报错，不发起复制（复制了也没意义） |
 | 复制提交中途出错（SubmitError） | 报错；异常里带已提交的任务号——那些任务还在池里跑，需要有人跟 |
 | 查任务状态时 RPC 出错（QueryError） | 不报失败，等一会儿重查，直到超时 |
@@ -200,7 +201,7 @@ flowchart LR
 **重复提交不视为失败（等副本状态，代码里叫 `_watch`）**
 
 - 场景：同一个预热请求发了两遍。第二遍的复制任务会全部失败——mooncake 发现同样的 key 已有任务在复制，报错 `OBJECT_HAS_REPLICATION_TASK`
-- 处理：这种失败**不算失败**（语义出处 = D1 §4「在途不当失败」）。这些任务在 Ledger 里如实记 failed（它们确实没跑成），但流程不等它们——改为只定期检查副本到位没有：第一遍的任务正在搬同样的数据，搬完了，第二遍的目的就达到了
+- 处理：这种失败**不算失败**（语义出处 = D1 事实基线 F11：`OBJECT_HAS_REPLICATION_TASK` 按已在途处理，不当失败）。这些任务在 Ledger 里如实记 failed（它们确实没跑成），但流程不等它们——改为只定期检查副本到位没有：第一遍的任务正在搬同样的数据，搬完了，第二遍的目的就达到了
 - 副本没到位时保持「进行中」，不报 VerifyError——这个状态下「缺副本」只意味着第一遍还没搬完
 - 失败原因里混着撞车以外的原因（哪怕只有一条），整组按真失败处理
 
@@ -233,17 +234,6 @@ stateDiagram-v2
 - 等副本状态不再查任务状态，只查副本；缺副本不报 VerifyError
 - `rebuild` 的两个入口看同组任务里有没有失败行：没有则回「进行中」，有（撞车失败的行）则回「等副本」。整组都撞车失败的组没有 running 行，不会出现在这张图的入口
 
-
-**接口演进：KeySet（已定方向，待实施）**
-
-- 问题：exists / copy / keepalive 等操作各自以 Prefix 为入参、各自算一遍 key。长序列下 key 计算不便宜（链式块 hash 逐块串行，块数 × rank 数 个 key 字符串），一次预热算两遍不合理
-- 方案（已定，PR 合入后实施）：
-  - L3 新增 `keys_of(prefix) -> KeySet`；`KeySet` = 不透明类型（内容 = 算好的 key 列表），与 TaskHandle 同一设计哲学——编排层持有、传递、不解释
-  - 全部操作方法的入参从 `Prefix` 改为 `KeySet`：`exists(ks)` / `copy(ks, target)` / ……编排流程在开头算一次，之后全程复用
-  - `Prefix` 保留在入口：intent 载荷、幂等键（前缀 × 实例）、Ledger 记 token_ids 的输入
-  - 不选「keys 裸露进编排层」：PoolKey 出现在 L2 违反原则 1；不选「backend 内缓存」：引入缓存增长管理与淘汰语义
-  - 影响面：KvOps 全部方法签名 + MooncakeBackend + PrefetchFlow + 测试；rebuild 内部重算路径不变（它本来就从 token_ids 现场算）
-  - **同批实施（都动方法签名，一次改完）**：`wait_ready` 挪进 ops——「等到 READY」的轮询循环从 flow 挪进 ops（跨流程通用件：Drain/Retain 同样需要等；flow 只剩编排 exists → copy → wait_ready）；`PrefetchError` → `FlowError`（统一出口异常一般化）。async 化不属于本批——它随 E11 本期完成（见「运行时结构」节）
 
 **capability 声明（显式，不藏在接口后面假装统一）**
 
@@ -279,6 +269,17 @@ stateDiagram-v2
 - L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 的 retained client/DFS 前提，本质就是能力分支——本层把它落成显式声明
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
 
+**接口演进：KeySet（已定方向，待实施）**
+
+- 问题：exists / copy / keepalive 等操作各自以 Prefix 为入参、各自算一遍 key。长序列下 key 计算不便宜（链式块 hash 逐块串行，块数 × rank 数 个 key 字符串），一次预热算两遍不合理
+- 方案（已定，PR 合入后实施）：
+  - L3 新增 `keys_of(prefix) -> KeySet`；`KeySet` = 不透明类型（内容 = 算好的 key 列表），与 TaskHandle 同一设计哲学——编排层持有、传递、不解释
+  - 全部操作方法的入参从 `Prefix` 改为 `KeySet`：`exists(ks)` / `copy(ks, target)` / ……编排流程在开头算一次，之后全程复用
+  - `Prefix` 保留在入口：intent 载荷、幂等键（前缀 × 实例）、Ledger 记 token_ids 的输入
+  - 不选「keys 裸露进编排层」：PoolKey 出现在 L2 违反原则 1；不选「backend 内缓存」：引入缓存增长管理与淘汰语义
+  - 影响面：KvOps 全部方法签名 + MooncakeBackend + PrefetchFlow + 测试；rebuild 内部重算路径不变（它本来就从 token_ids 现场算）
+  - **同批实施（都动方法签名，一次改完）**：`wait_ready` 挪进 ops——「等到 READY」的轮询循环从 flow 挪进 ops（跨流程通用件：Drain/Retain 同样需要等；flow 只剩编排 exists → copy → wait_ready）；`PrefetchError` → `FlowError`（统一出口异常一般化）。async 化不属于本批——它随 E11 本期完成（见「运行时结构」节）
+
 ## L4 适配层（两个正交维度）
 
 适配分两个正交维度：**存储后端**与**推理引擎**——两者各自独立可换。`MooncakeBackend` 的字段是 `StoreClient` 和 `KeyComputer`（算 key、做 `build_plan`）。
@@ -309,7 +310,7 @@ stateDiagram-v2
 #### 三条接入通道（mooncake）
 
 1. **client RPC 面**（`:50088`，coro_rpc）
-   - 控制类操作全在这面（`RegisterRpcService` 注册 67 个方法）
+   - 控制类操作全在这面（`RegisterRpcService` 注册 66 个方法）
    - 调用前必须先注册 client（UUID + 心跳）：控制类 RPC 的语义挂在 client UUID 上——任务校验「谁 Start 谁 End」、副本绑 seg 所在 client 的 liveness、下线清理按 client 走
    - kvcm 的接入方式只有一种：把动态库加载进进程、在进程里创建 client——store_py.so 是官方封装好的，自封装 .so 是自己补的，两者是同一件事。**所以 kvcm 在 master 眼里必然是一个 client**，这与它是否持有存储无关
    - store_py 与自封装 .so 必须共用同一个 client 实例/UUID：各注册一个 = 两份身份两份心跳，D2 §2 的 client_id 问题也会变成两份
@@ -329,7 +330,7 @@ stateDiagram-v2
 - 单 client 保证（约束见上「三条接入通道」节：store_py 与自封装 .so 必须共用同一 client 实例/UUID）：
   - 不能走的写法：自封装 .so 自己 `RealClient::create()` 再建一个 → 两个 UUID 两套心跳
   - **路径 A（首选）：自封装 .so 复用 store_py 已建的 client**
-    - 依据：`MooncakeStorePyWrapper` 的成员 `store_` 是 public（`store_py.cpp:288`，holder 为 `std::shared_ptr<PyClient>`），另有 public 访问器 `get_real_client()`（`:1075`）
+    - 依据：`MooncakeStorePyWrapper` 的成员 `store_` 是 public（`store_py.cpp:535` @1fc27b6，holder 为 `std::shared_ptr<PyClient>`），另有 public 访问器 `get_real_client()`（`:1647`）
     - 做法：自封装 .so 用 pybind11 写，函数参数声明为 `MooncakeStorePyWrapper&`；Python 侧把 store_py 建好的 store 对象传进来，pybind11 跨模块按类型名在全局类型表里找到已注册的类型，还原出 C++ 对象 → 经 `store_` / `get_real_client()` 拿到同一个 `RealClient`，调缺口方法
     - 效果：全进程一个 client 实例、一个 UUID、一套心跳；已有绑定与自封装 .so 缺口方法落在同一 client 上
     - 前提：自封装 .so 编译用的 pybind11 与 wheel 内 store_py 的 internals 版本一致（不一致则跨模块 cast 查不到类型）；RTTI 开启（wheel 默认开）
@@ -372,7 +373,7 @@ stateDiagram-v2
 
 - **记账归实现侧（L4 持有，L2 不直接碰）**：copy / query_task / abandon 时由 MooncakeBackend 经 Ledger 迁移状态——记账需要任务号的持久化编码与状态迁移的时机，两样都只在实现侧手里；编排层记账两头都缺还会漏分支
 - **批量写入单事务**（多任务同迁移不出现半新半旧）；只管新建库（kvcm 未部署，不做老库迁移，旧结构文件删除重建）
-- **单线程约束**：sqlite 连接 check_same_thread——E11 把 TaskEngine 挪进独立线程时第一件事处理（调用侧加锁或每线程一连接），否则第一次跨线程调用即 ProgrammingError
+- **单线程约束**：sqlite 连接 check_same_thread——E11 线程模型已定（见「运行时结构」节）：sqlite 调用全部经 Ledger 专用单线程 executor，天然串行免锁
 - 部署形态：kvcm 单实例跟随 master（D2 §1）；上 HA 时再换 Redis/etcd
 
 **重启恢复（`MooncakeBackend.rebuild()`；状态记录规格 = D2 §1）**
@@ -442,7 +443,7 @@ sequenceDiagram
 
     R->>Recv: POST /prefetch
     Recv->>Q: put 后立即返回
-    Note over W: 协程在「等队列、等传输闸、等 sleep」<br/>期间全部挂起，不占任何线程
+    Note over W: 目标形态（E11）；当前实现为同步 run()、串行提交<br/>协程在「等队列、等传输闸、等 sleep」期间全部挂起，不占线程<br/>对 Router 的响应在 READY 后返回（占位期同步等）
     W->>Q: get 拿到任务
     W->>Ex: to_thread exists（不过闸）
     Ex->>M: RPC batch_is_exist
@@ -467,6 +468,7 @@ sequenceDiagram
 
 - 线程只在 `Ex`（线程池）这一列出现：每个 RPC 执行的几毫秒
 - 协程（W）全程只是一段代码状态，挂起时不占线程——排队 100 个这样的协程也免费
+- 图只画了成功路径；失败 / 超时 / 取消同样在终态归还传输闸名额（release 在 finally 语义位置）
 
 **线程池大小**：
 
@@ -489,7 +491,7 @@ sequenceDiagram
 
 ### KeepaliveLoop
 
-- **为什么要保活**：mooncake 副本租约默认只有 5~10 秒（`types.h` `DEFAULT_DEFAULT_KV_LEASE_TTL`：0.3.11 = 5000ms，main = 10000ms）——预热完成后副本没人碰，10 秒内就可被驱逐；而真实流量晚于这个间隔到达是常态。保活 = 桥接「预热完成 → 首次流量」的空窗，**不是一直保**：窗口到即停租，之后副本冷热由池自己判断
+- **为什么要保活**：mooncake 副本租约默认只有 5~10 秒（`types.h` `DEFAULT_DEFAULT_KV_LEASE_TTL`：0.3.11 = 5000ms，main = 10000ms）——预热完成后副本没人碰，5~10 秒内就可被驱逐；而真实流量晚于这个间隔到达是常态。保活 = 桥接「预热完成 → 首次流量」的空窗，**不是一直保**：窗口到即停租，之后副本冷热由池自己判断
 - **占位策略 = 固定窗口**（READY 后续租一个可配置窗口，窗口到即停租注销）：会话期（依赖 E12 会话信号）与首次命中后停（依赖 E13/E14 命中信号）现在都没有信号，做不了；固定窗口什么都不依赖，且有明确终点（不会把副本变相钉死在热层）。窗口时长参数化，默认 10 分钟只是起步值（真机观察「预热完成到首次流量」的典型间隔后再调）
 - **实现通道**：定期 `exists`（`batch_is_exist`，读即续租）——不依赖 L3 的 `keepalive()` 方法（NotImplementedError，留待将来语义更丰富的保活策略）
 - **形态**：协程定时器（事件循环内 `asyncio.sleep` 周期触发），不是独立线程
@@ -507,7 +509,7 @@ sequenceDiagram
   3. **等在途协程全部退出**——有界等待 5 秒（RPC 毫秒级 + abandon 记账毫秒级，余量充足）；**等满还有协程未退则不再等**，直接走后续步骤，泄漏线程随进程消失
   4. **KeepaliveLoop 停止**
   5. **`StoreClient.close()`**——显式关闭（demo 已知退出期析构竞态）
-- 协程取消只在 `await` 点生效——不会在 RPC 执行中途切走，是干净的中断点。恢复语义两种退出路径一致：优雅退出遗留的 abandoned 记录、SIGKILL（强杀）停在 running 的记录，重启后都由 rebuild 兜底（后者当「还在跑」恢复跟踪）
+- 协程取消只在 `await` 点生效——不会在 RPC 执行中途切走，是干净的中断点。重启恢复只认 `status='running'` 的记录（SIGKILL 强杀场景：rebuild 当「还在跑」恢复跟踪）；abandoned 是终态，不恢复——abandon 的本意就是放弃跟踪
 
 ## 设计原则
 
@@ -533,7 +535,7 @@ sequenceDiagram
 
 ## 参考实现
 
-- **mooncake 三条通道的代码依据**（均 @1fc27b6）：`rpc_service.cpp::RegisterRpcService`（client RPC 面 67 个注册方法，无 `ForAdmin` 系列）；`master_admin_service.cpp`（HTTP admin 面，main；0.3.11 在 `rpc_service.cpp` 内）；`store_c.h`（C 接口）；`store_py.cpp`（pybind 绑定，自封装 .so 的参照）；线协议：`rpc_service.h:8`（coro_rpc）、`rpc_types.h`（`YLT_REFL`）
+- **mooncake 三条通道的代码依据**（均 @1fc27b6）：`rpc_service.cpp::RegisterRpcService`（client RPC 面 66 个注册方法，无 `ForAdmin` 系列）；`master_admin_service.cpp`（HTTP admin 面，main；0.3.11 在 `rpc_service.cpp` 内）；`store_c.h`（C 接口）；`store_py.cpp`（pybind 绑定，自封装 .so 的参照）；线协议：`rpc_service.h:8`（coro_rpc）、`rpc_types.h`（`YLT_REFL`）
 - **UCM 可插拔 KVStore**（[`../docs/research/ucm/architecture.md`](../../docs/research/ucm/architecture.md)）与 **LMCache 多存储后端**（[`../docs/research/lmcache/sharing-and-backends.md`](../../docs/research/lmcache/sharing-and-backends.md)）：后端抽象同构。关键差异：它们的抽象在**数据面**（connector get/put），本架构 L3 在**管理面**（copy/pin/lease/remove 控制操作）——管理语义无跨后端天然对应物，故 capability 必须显式
 - **LMCache controller**（D2 §1 完备性审计同表）：控制面对外 = 命令集——L1 IntentReceiver 对应其命令入口
 - **Dynamo standalone indexer**（`3rdparty/dynamo/lib/kv-router/src/services/indexer/`）：独立进程 + 契约接口的组件形态参照；本架构是 kvcm 单进程内部结构，组件拓扑已定（kvcm 独立控制面、索引归 Router 侧，D1 §4）
