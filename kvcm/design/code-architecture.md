@@ -85,7 +85,7 @@ flowchart TB
 
 | 模块 | 职责 | 出处 |
 |------|------|------|
-| IntentReceiver | 收 Router 预热 intent / 会话结束线索（E12；先占位，协议字段随 D4） | D1 §4 职责边界 |
+| IntentReceiver | 收 Router 预热 intent / 会话结束线索（E12；先占位，协议字段随 D4）。占位形态：进程内函数调用 + 最小 HTTP 端点 `POST /prefetch {model_id, token_ids, target}`（stdlib `http.server` 经线程池执行，量上来换 aiohttp；响应同步等 READY 返回，可选 `?wait=0` 立即返回任务标识）——只调 TaskEngine 公开方法（`queue.put`），E12 正式协议来了只换这层皮 | D1 §4 职责边界 |
 | EventPublisher | READY 后按目标实例端点补发 `BlockStored`；端点生命周期（每实例一端点、注册给索引） | D1 §2 方案 a 落地、E14 |
 | InstanceWatcher | 实例上线/销毁接入 → 触发预热 / seg 副本处理；「端点→实例」「seg→实例」注册的权威来源（E13；先占位，事件源随 D4） | D1 §3、E13 |
 
@@ -113,94 +113,104 @@ flowchart TB
 | 任务失败（FAILED） | 报错 |
 | 超过时限没完成 | 先放弃跟踪（abandon，见 L3 节），再报错 |
 
-### PrefetchFlow.run 数据流
+流程的步骤、数据流与失败分支：**[flows/prefetch.md](flows/prefetch.md)**（每流程一篇，新增流程同目录另立）。
 
-一次预热执行（`run()` 方法）的完整消息顺序。`PrefetchFlow` 只调用 `KvOps` 接口——运行时这个对象是 `MooncakeBackend`。图里的方块是条件分支：标 alt 的是「二选一」（满足哪个条件走哪条），标 opt 的是「可选步骤」（需要才执行）。
+## 运行时结构（E11）
+
+进程内分三层：**事件循环管调度与等待，线程池执行阻塞调用，Ledger 记账**。
+
+### 执行模型
+
+单事件循环 + 全部任务协程化 + `ThreadPoolExecutor` 只执行同步阻塞调用。
+
+- **KvOps 接口 async 化**：`async def exists / copy / query_task / abandon / ……`——等待的源头（轮询 `sleep`、RPC 阻塞）全在 ops 实现内部，只有这一层 async 才能让等待挂起；只在 flow 外层包 async，省不到这些等待
+- **阻塞调用走 executor**：mooncake 同步 RPC、sqlite 读写等，经 `asyncio.to_thread` 交给线程池执行。mooncake 绑定等 RPC 时释放 GIL，executor 内多个 RPC 能真并行
+- **线程池与任务数解耦**：executor 大小按 RPC 执行密度配（4~8），不随传输闸的名额数变。一个 copy 任务 30 秒里 RPC 执行合计约 1 秒，其余是 `await` 挂起——协程化后 100 个任务挂着也只占这几个线程
+- **backend 共享态（`_plans`/`_watch`）无锁**：事件循环单线程，协程只在 `await` 点切换——字典操作不跨 `await` 就天然原子（纪律写进注释：禁止在 `_plans`/`_watch` 读写之间 `await`）
+- **纪律（反例）**：协程里直接调同步阻塞函数 = 整个事件循环停摆（所有协程一起卡住）。所有阻塞调用必须 `to_thread`
+- **RPC 卡死防护**：同步 RPC 在对端无响应时可能永不返回，线程被永久占死。协程侧用 `asyncio.wait_for` 给调用加超时：超时后协程按失败处理（abandon），卡死的线程泄漏一个、由泄漏监控暴露。根治靠 RPC 自带超时参数（mooncake 绑定有无该参数，列入 E6 核对）
+
+**厨房比方**：线程池 = 厨师（就几个，真正下锅的活只有他们炒）；协程 = 点菜单（来一张挂一张，挂一千张也不占厨师）；事件循环 = 前台（收单、叫号，绝不能自己进厨房）；信号量 = 灶台数（同时只炒 4 锅菜，等灶的是单子不是人）。**厨师数决定干活速度，单子数决定能接多少活、等待多便宜**——协程化不是让这批活更快，是让等待与排队免费。
+
+**时序（一次预热，协程视角）**：
 
 ```mermaid
 sequenceDiagram
-    participant Flow as PrefetchFlow
-    participant BE as MooncakeBackend
-    participant KC as KeyComputer
-    participant SC as StoreClient
+    participant R as Router
+    participant Recv as IntentReceiver
+    participant Q as 队列+传输闸<br/>（TaskEngine）
+    participant W as 预热协程
+    participant Ex as RPC 线程池
     participant M as mooncake master
-    participant DB as Ledger
 
-    Flow->>BE: exists(Prefix)
-    BE->>KC: keys_for_tokens(token_ids)
-    KC-->>BE: keys
-    BE->>SC: is_exist(keys)
-    SC->>M: RPC batch_is_exist
-    M-->>SC: 每个 key 在或不在
-    SC-->>BE: list of bool
-    alt 查询失败
-        BE-->>Flow: QueryError, 不写 Ledger
-    else 前缀不在池
-        BE-->>Flow: False
-        Note over Flow: PrefetchError, 不写 Ledger
-    else 前缀在池
-        Flow->>BE: copy(Prefix, target)
-        BE->>KC: keys_for_tokens(token_ids)
-        KC-->>BE: keys
-        Note over BE: locate(target) 得到 segs
-        BE->>KC: build_plan(keys, segs)
-        KC-->>BE: plan（每条 key 配好目标 seg）
-        loop 每个 key 和 seg
-            BE->>SC: create_copy_task(key, seg)
-            SC->>M: RPC
-            M-->>SC: task_id（两个整数）
-            SC-->>BE: task_id
-        end
-        alt 提交中途失败
-            BE-->>Flow: SubmitError, 已发 id 只在异常消息里
-        else 提交成功
-            BE->>DB: upsert status=running
-            BE-->>Flow: TaskHandle
-            loop 轮询到终态或超时
-                Flow->>BE: query_task(handle)
-                alt 不在等副本状态
-                    BE->>SC: query_task(每个 task_id)
-                    SC->>M: RPC
-                    M-->>BE: status 与 message
-                else 已在等副本状态
-                    Note over BE: 不再向 master 查任务
-                end
-                opt 要核验副本
-                    BE->>SC: batch_get_replica_desc
-                    SC->>M: RPC 绑定, 不是 HTTP
-                    M-->>BE: 每个 key 落在哪些 seg
-                end
-                alt 全部成功且副本齐
-                    BE->>DB: status=ready
-                    BE-->>Flow: READY, run 返回
-                else 真失败, 或成功但副本缺
-                    BE->>DB: 全组 status=failed
-                    BE-->>Flow: FAILED 或 VerifyError
-                else 失败全是撞车
-                    BE->>DB: 只把撞车任务记 failed
-                    Note over BE: 进入等副本状态, 对外仍是 RUNNING
-                else 超时
-                    Flow->>BE: abandon(handle)
-                    BE->>DB: 其余行 abandoned, 撞车任务保持 failed
-                    BE-->>Flow: PrefetchError
-                end
-            end
-        end
+    R->>Recv: POST /prefetch
+    Recv->>Q: put 后立即返回
+    Note over W: 协程在「等队列、等传输闸、等 sleep」<br/>期间全部挂起，不占任何线程
+    W->>Q: get 拿到任务
+    W->>Ex: to_thread exists（不过闸）
+    Ex->>M: RPC batch_is_exist
+    M-->>Ex: 在池（且在远端）
+    W->>Q: acquire 传输闸名额（挂起等位）
+    par 逐 key 并发提交（gather）
+        W->>Ex: create_copy_task key1
+    and
+        W->>Ex: create_copy_task key2
+    and
+        W->>Ex: create_copy_task …
     end
+    Ex->>M: RPC ×N
+    loop 每 0.5 秒一轮，直到 READY / 失败 / 超时
+        W->>W: asyncio.sleep(0.5)
+        W->>Ex: to_thread query_task
+        Ex->>M: RPC
+    end
+    W->>Ex: to_thread 核验副本 + 写 Ledger
+    W->>Q: release 归还传输闸名额
 ```
 
-- 数据在各步骤之间怎么变：`Prefix`（模型名 + token 序列）→ 逐块算出 `keys` → 排出 `plan`（复制计划：每条 key 复制到哪个 seg）→ 每条 key 提交后拿回一个任务号（两个整数组成的整数对）→ 写进 Ledger（任务号编码成 `"整数:整数"` 的字符串，连同 handle_id、token_ids）
-- 与 master 的交互这次执行里全是绑定 RPC；HTTP `/batch_query_keys` 还没接通
-- Ledger 只在 copy 成功、到终态、进入等副本状态、abandon 时写。exists 失败和提交失败不写行
-- 图里的「超时」指本次预热的截止时间到了，接下来流程调用 `abandon`——它不是 `query_task` 的一种返回值
-- 「等副本」状态（代码里叫 `_watch`）：进入后下一轮不再查任务状态——那些任务已经失败（撞车），查了也没意义；改为只定期检查副本是否已经到位（第一遍的任务搬完没有），到位就算这次预热成功
+- 线程只在 `Ex`（线程池）这一列出现：每个 RPC 执行的几毫秒
+- 协程（W）全程只是一段代码状态，挂起时不占线程——排队 100 个这样的协程也免费
 
-支撑组件（同进程内的常驻循环，E11 进程化的主体）：
+**线程池大小**：
 
-- **TaskEngine**：任务状态机（排队 / 进行 / READY / 失败）+ 并发上限 + **限速器**——E11 的核心，E15 限速在这里实现（限速输入 = 网卡/RDMA 计数器采样的链路利用率，D1 §5）。**失败态策略（此处只留接口，随 E11 细化）**，失败后的动作三种：① 重发；② 放弃这批任务，事后把留下的副本清掉（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 复制中途源实例下线时的处理（D5）。语义引 D2 §1 与 D5，不新造语义
-- **KeepaliveLoop**：保活注册表驱动的周期续租（D3；机制 D2 F9，策略未定）
-- **ReleaseLoop**：软释放 / demote / 主动 Remove 三级（D1 §6）
-- **RetainLoop**：retain 与计划下线编排（D2 §4）
+- **禁用 `to_thread` 默认池**（`min(32, cpu+4)`，大小不可控）——自建 executor 并显式配置
+- **RPC executor**：按 RPC 执行密度配（4~8），与传输闸的名额数**不绑定**——传输闸限「同时在后端传输的任务数」（保护后端），线程只为 RPC 执行的那一瞬间服务
+- **Ledger 专用单线程 executor**（`max_workers=1`）：sqlite 调用全部 `to_thread` 到它——天然串行，不用加锁
+- **线程泄漏监控**：RPC 卡死会慢性漏线程——定期看各池活跃线程数，持续偏高即告警（根治靠 RPC 超时参数，有无该参数列入 E6 核对）
+
+### TaskEngine
+
+`asyncio.Queue` + 传输闸限并发 + 协程消费者，无优先级、不分轻重通道。
+
+- **队列与拿取**：intent 进 `asyncio.Queue`；K 个协程循环 `get`（K 可以很大，协程便宜——在队列里等、在传输闸上等，都是协程挂起，不占线程）
+- **传输闸 = `asyncio.Semaphore`（默认 4，参数化）**：限「同时在后端传输的任务数」（带宽管控）——**只在确认要发后台传输时拿名额**（copy / move / drain 提交前 acquire，任务终态 release）。**毫秒级操作不过闸**：exists 探测、promote（刷热度）、查询、副本核验、keepalive——它们的瞬时并发由 RPC executor（4~8 线程）天然限制，多余请求协程挂起等线程、毫秒即返，不会被传输任务堵几十秒
+- **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
+- **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；`session_end` 类可延迟任务排队无妨
+- **gather 并发提交**（E15 并行限速接入点）：copy 的逐 key 串行提交改为 `asyncio.gather` + 子信号量——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间；E15 的并发调度与限速器在这一层信号量上实现
+- **排队超时**：intent 在队列等待的语义（等多久算放弃）随 E12 intent 字段一起定；执行超时沿用 flow 现有 `timeout_s`
+- **失败态策略**（只留接口，随 E11 细化）：失败后的动作三种——① 重发；② 放弃这批任务，事后把留下的副本清掉（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 复制中途源实例下线时的处理（D5）。语义引 D2 §1 与 D5，不新造语义
+
+### KeepaliveLoop
+
+- **为什么要保活**：mooncake 副本租约默认只有 5~10 秒（`types.h` `DEFAULT_DEFAULT_KV_LEASE_TTL`：0.3.11 = 5000ms，main = 10000ms）——预热完成后副本没人碰，10 秒内就可被驱逐；而真实流量晚于这个间隔到达是常态。保活 = 桥接「预热完成 → 首次流量」的空窗，**不是一直保**：窗口到即停租，之后副本冷热由池自己判断
+- **占位策略 = 固定窗口**（READY 后续租一个可配置窗口，窗口到即停租注销）：会话期（依赖 E12 会话信号）与首次命中后停（依赖 E13/E14 命中信号）现在都没有信号，做不了；固定窗口什么都不依赖，且有明确终点（不会把副本变相钉死在热层）。窗口时长参数化，默认 10 分钟只是起步值（真机观察「预热完成到首次流量」的典型间隔后再调）
+- **实现通道**：定期 `exists`（`batch_is_exist`，读即续租）——不依赖 L3 的 `keepalive()` 方法（NotImplementedError，留待将来语义更丰富的保活策略）
+- **形态**：协程定时器（事件循环内 `asyncio.sleep` 周期触发），不是独立线程
+
+### ReleaseLoop / RetainLoop
+
+只留类骨架——依赖的 `demote` / `retain` / `remove` 在 L4 全是 NotImplementedError，能力接通（E10 后续）前无内容可跑。职责：ReleaseLoop = 软释放 / demote / 主动 Remove 三级（D1 §6）；RetainLoop = retain 与计划下线编排（D2 §4）。
+
+### 进程生命周期
+
+- **启动**：`rebuild()` 接通——重启后恢复 running 任务的跟踪（见 L5 节）
+- **优雅退出**（SIGTERM/SIGINT）五步：
+  1. **停收 intent**——占位入口关闭，不接新活
+  2. **取消在途协程**（`task.cancel()`）——协程在 `await` 点收到 `CancelledError`；flow 捕获后做 abandon 处理（Ledger 记 abandoned；后端无任务取消能力 P9，传输不取消，副本清理归 remove）
+  3. **等在途协程全部退出**——有界等待 5 秒（RPC 毫秒级 + abandon 记账毫秒级，余量充足）；**等满还有协程未退则不再等**，直接走后续步骤，泄漏线程随进程消失
+  4. **KeepaliveLoop 停止**
+  5. **`StoreClient.close()`**——显式关闭（demo 已知退出期析构竞态）
+- 协程取消只在 `await` 点生效——不会在 RPC 执行中途切走，是干净的中断点。恢复语义两种退出路径一致：优雅退出遗留的 abandoned 记录、SIGKILL（强杀）停在 running 的记录，重启后都由 rebuild 兜底（后者当「还在跑」恢复跟踪）
 
 ## L3 原子操作层（核心抽象）
 
@@ -226,8 +236,7 @@ sequenceDiagram
   - `Prefix` 保留在入口：intent 载荷、幂等键（前缀 × 实例）、Ledger 记 token_ids 的输入
   - 不选「keys 裸露进编排层」：PoolKey 出现在 L2 违反原则 1；不选「backend 内缓存」：引入缓存增长管理与淘汰语义
   - 影响面：KvOps 全部方法签名 + MooncakeBackend + PrefetchFlow + 测试；rebuild 内部重算路径不变（它本来就从 token_ids 现场算）
-  - **同批实施（共享签名面，一次改完）**：KvOps 全部方法 `async def`（等待挂起，见 design-record 决策一）；`wait_ready` 下沉——「等到 READY」的轮询循环从 flow 撤进 ops（跨流程通用件：Drain/Retain 同样需要等；flow 瘦成纯编排 exists → copy → wait_ready）；`PrefetchError` → `FlowError`（统一出口异常一般化）
-  - **实施顺序**：TaskEngine 先行（flow 保持同步，协程消费者经 `to_thread` 承接）；三批合一后续独立 PR，届时拆包装直连
+  - **同批实施（都动方法签名，一次改完）**：`wait_ready` 挪进 ops——「等到 READY」的轮询循环从 flow 挪进 ops（跨流程通用件：Drain/Retain 同样需要等；flow 只剩编排 exists → copy → wait_ready）；`PrefetchError` → `FlowError`（统一出口异常一般化）。async 化不属于本批——它随 E11 本期完成（见「运行时结构」节）
 
 **capability 声明（显式，不藏在接口后面假装统一）**
 
@@ -509,7 +518,15 @@ flowchart TD
 ## 与 E10 / E11 / E15 的对位
 
 - **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，73 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
-- **E11（进程化）**：进程壳 + TaskEngine + Keepalive/Release/Retain 三个 Loop 常驻化；IntentReceiver / InstanceWatcher 占位接口随 E12/E13 填。**前置提醒**：Ledger 线程约束（见 L5）；PrefetchFlow 的同步轮询由 TaskEngine 接管（并发上限 + 限速），流程本体不变
+- **E11（进程化）**：设计 = 本文「运行时结构」节。**范围切分**：
+  - 本期做：进程壳（启动/退出/rebuild 接通）+ TaskEngine + KeepaliveLoop（唯一常驻循环）+ IntentReceiver 占位
+  - 只留类骨架：ReleaseLoop、RetainLoop（依赖的操作全是 NotImplementedError，能力接通前无内容可跑）
+  - 不做：限速器（E15）、重发策略（随 E12）、多模型归属判定（多模型接入前置，已登记）、E12/E13/E14 协议
+- **E11 阶段计划**：
+  1. 进程壳 + 状态恢复：Ledger 单线程 executor → 启动时 `rebuild()` 接通 → KeepaliveLoop（固定窗口，协程定时器）→ 优雅退出（协程取消 + abandon 处理）
+  2. TaskEngine + flow/ops async 化：intent 占位入口 → `asyncio.Queue` + 传输闸（默认 4）→ 协程消费者直接调 async flow；KvOps 全方法 async 化 → 终态记账 → 超时处理（复用现有 abandon）
+  3. 测试：并发多 intent 单测；重启端到端（杀进程 → rebuild → READY）；优雅退出回归；真机冒烟
+  4. 后续 PR（接口演进）：KeySet + wait_ready 挪进 ops + `PrefetchError` → `FlowError`
 - **E15（并行限速）**：TaskEngine 内的并发调度 + 限速器（链路利用率采样，D1 §5）——不独立做
 
 ## 参考实现
