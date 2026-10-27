@@ -50,10 +50,11 @@ sequenceDiagram
     R->>Recv: POST /prefetch
     Recv->>Q: put 后立即返回
     Note over W: 协程在「等队列、等信号量、等 sleep」<br/>期间全部挂起，不占任何线程
-    W->>Q: get 拿到任务 → 信号量拿到名额
-    W->>Ex: to_thread exists
+    W->>Q: get 拿到任务
+    W->>Ex: to_thread exists（不过闸）
     Ex->>M: RPC batch_is_exist
-    M-->>Ex: 在池
+    M-->>Ex: 在池（且在远端）
+    W->>Q: acquire 传输闸名额（挂起等位）
     par 逐 key 并发提交（gather）
         W->>Ex: create_copy_task key1
     and
@@ -68,7 +69,7 @@ sequenceDiagram
         Ex->>M: RPC
     end
     W->>Ex: to_thread 核验副本 + 写 Ledger
-    W->>Q: 归还信号量名额
+    W->>Q: release 归还传输闸名额
 ```
 
 - 线程只在 `Ex`（线程池）这一列出现：每个 RPC 执行的几毫秒
@@ -109,12 +110,16 @@ sequenceDiagram
 
 - **队列与拿取**：intent 进 `asyncio.Queue`；K 个协程循环 `get`（K 可以很
   大，协程便宜——在队列里等、在信号量上等，都是协程挂起，不占线程）
-- **并发上限 = `asyncio.Semaphore`（默认 4，参数化）**：限制的是「同时在
-  mooncake 上跑的任务数」（保护后端与带宽的语义不变），与线程数解耦
+- **传输闸 = `asyncio.Semaphore`（默认 4，参数化）**：限「同时在后端传
+  输的任务数」（带宽管控）——**只在确认要发后台传输时拿名额**
+  （copy / move / drain 提交前 acquire，任务终态 release）。**毫秒级操
+  作不过闸**：exists 探测、promote（刷热度）、查询、副本核验、
+  keepalive——它们的并发由 aux 线程池（4 线程）天然限制，毫秒即返，
+  不会被传输任务堵几十秒
 - **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
 - **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不
-  占线程——不分优先级、不设单独通道（轻任务挂起等 executor 毫秒即返，
-  不会被 copy 堵；`session_end` 类可延迟任务排队无妨）
+  占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；
+  `session_end` 类可延迟任务排队无妨
 - **gather 并发提交**（E15 并行限速接入点）：copy 的逐 key 串行提交改为
   `asyncio.gather` + 子信号量——提交阶段从 N 倍往返时间缩到约 往返时间×(N/并发度)；
   E15 的并发调度与限速器在这一层信号量上实现
