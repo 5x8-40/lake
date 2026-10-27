@@ -20,13 +20,15 @@
 - **线程池与任务数解耦**：executor 大小按 RPC 执行密度配（4~8），不再等于
   并发上限。一个 copy 任务 30 秒里 RPC 执行合计约 1 秒，其余是
   `await` 挂起——协程化后 100 个任务挂着也只占这几个线程
-- **Ledger 专用单线程 executor**（`max_workers=1`）：sqlite 调用全部
-  `to_thread` 到它——天然串行，不用加锁
 - **backend 共享态（`_plans`/`_watch`）无锁**：事件循环单线程，协程只在
   `await` 点切换——字典操作不跨 `await` 就天然原子（纪律写进注释：禁止
   在 `_plans`/`_watch` 读写之间 `await`）
 - **纪律（反例）**：协程里直接调同步阻塞函数 = 前台自己下厨，整个事件循
   环停摆。所有阻塞调用必须 `to_thread`
+- **RPC 卡死防护**：同步 RPC 对端挂死时调用可能永不返回，线程被永久占
+  死——协程侧 `asyncio.wait_for` 精确超时释放（流程按超时收口 abandon；
+  卡死的线程泄漏一个，由泄漏监控暴露）。根治 = RPC 超时参数（有无列入
+  E6 核对）
 
 **厨房比方**：线程池 = 厨师（就几个，真正下锅的活只有他们炒）；协程 =
 点菜单（来一张挂一张，挂一千张也不占厨师）；事件循环 = 前台（收单、
@@ -72,12 +74,23 @@ sequenceDiagram
 - 网络领域同构（任务跟踪 ≈ 连接管理）：nginx/redis 的事件循环 + 少量
   线程跑阻塞段，是「等待为主的 IO 任务」的标准形态
 
-**与现有同步代码的衔接（实施顺序）**：TaskEngine 先行，**flow/ops 本期
-保持同步阻塞**——协程消费者经 `asyncio.to_thread(flow.run, ...)` 执行现
-有 `PrefetchFlow.run`，TaskEngine 的队列/信号量/保活/退出全部照常成立
-（「协程调度 + 线程池承接阻塞调用」本就是本决策的名称）。接口三批合一
-（见下「接口演进」）后续独立 PR 实施，届时拆掉 to_thread 包装直连——
-不把 TaskEngine 与接口大改绑在一次 PR 里。
+**一次走完，不设中间态**：flow/ops 的 async 化与 TaskEngine 同批做
+（签名 async + RPC 包 `to_thread` + `sleep` 换 `asyncio.sleep`，flow
+轮询循环改 `await`——一天量级）。不选「先同步承接、E15 再改写」的
+两步走：E15（gather 并发提交）在路线图上必然到来，两步走 = 承接层
+写一遍再拆一遍 + flow 写两遍。
+
+**线程池 sizing**：
+
+- **禁用 `to_thread` 默认池**（`min(32, cpu+4)`，大小不可控）——自建
+  executor 并显式配置
+- **RPC executor**：按 RPC 执行密度配（4~8），与信号量并发数**解耦**
+  ——信号量限「同时在 mooncake 上跑的任务」（保护后端），线程只为
+  RPC 执行瞬间服务
+- **Ledger 专用单线程 executor**（`max_workers=1`）：sqlite 调用全部
+  `to_thread` 到它——天然串行，不用加锁
+- **线程泄漏监控**：RPC 卡死会慢性漏线程——定期看各池活跃线程数，
+  持续高企即告警（根治靠 RPC 超时参数，有无该参数列入 E6 核对）
 
 ## 决策二：TaskEngine 形态（协程版）
 
@@ -98,26 +111,21 @@ sequenceDiagram
   段一起定；执行超时沿用 flow 现有 `timeout_s`
 - 失败态策略三选（重发 / 放弃清副本 / 源掉线衔接）本期仍只留接口
 
-## 接口演进（三批合一，后续 PR 实施）
+## 接口演进（后续 PR）
 
-KvOps 接口的三项改动共享签名面（全部方法都动），分三次改不如一次改，
-**合为一个后续 PR**；本期 TaskEngine 先以 to_thread 承接同步 flow。
+async 化已随本期（决策一）完成。后续一个 PR 做这三项（共享签名面）：
 
 1. **KeySet**：`keys_of(prefix) -> KeySet`（不透明类型），操作方法入参
    `Prefix` → `KeySet`——长序列下 key 只算一次（现状 exists 与 copy 各
    算一遍；链式块 hash 逐块串行，长序列不便宜）。Prefix 保留在入口
    （intent 载荷、幂等键、Ledger 记 token_ids）
-2. **async 化**：KvOps 全部方法 `async def`——等待（轮询 sleep、RPC 阻
-   塞）发生在 ops 内部，只有这层 async 才能让等待挂起；backend 内 RPC
-   走 executor、sleep 用 `asyncio.sleep`
-3. **wait_ready 下沉**：`async def wait_ready(handle, *, timeout_s)` —
+2. **wait_ready 下沉**：`async def wait_ready(handle, *, timeout_s)` —
    —「等到 READY」的轮询循环（QueryError 重试 / VerifyError 上抛 / 超时
    先 abandon 再上抛）从 flow 撤进 ops。它是跨流程通用件（Drain/Retain
    同样需要等），放 flow 层是实现细节泄漏 + 每个流程重复一遍；flow 瘦
    成纯编排（exists → copy → wait_ready）
-
-同步改名（同批）：`PrefetchError` → `FlowError`（统一出口异常一般化，
-其他流程实现后共用）。
+3. 同步改名：`PrefetchError` → `FlowError`（统一出口异常一般化，
+   其他流程实现后共用）
 
 ## 决策三：保活占位策略（D3 未定项的临时默认）
 
@@ -159,14 +167,14 @@ target}`），便于手工与脚本测试——占位期用 stdlib `http.server`
 1. **阶段 1 进程壳 + 状态恢复**：Ledger 单线程 executor → 启动时
    `rebuild()` 接线 → KeepaliveLoop（固定窗口策略，协程定时器）→ 优雅退
    出（协程取消 + abandon 收口）
-2. **阶段 2 TaskEngine**：intent 占位入口 → `asyncio.Queue` + Semaphore(4)
-   → 协程消费者经 `to_thread` 执行同步 `PrefetchFlow.run` → 终态记账 →
-   超时收口（复用现有 abandon）
+2. **阶段 2 TaskEngine + flow/ops async 化**：intent 占位入口 →
+   `asyncio.Queue` + Semaphore(4) → 协程消费者直接调 async flow；KvOps
+   全方法 async 化（签名 + RPC 包 executor + sleep 换 `asyncio.sleep`）
+   → 终态记账 → 超时收口（复用现有 abandon）
 3. **阶段 3 测试**：并发多 intent 单测；重启 e2e（杀进程 → rebuild →
    READY）；优雅退出回归（退出不崩、账本会收口）；真机冒烟
-4. **后续 PR（接口三批合一）**：KeySet + KvOps async 化 + wait_ready 下
-   沉（+ `PrefetchError` → `FlowError`）；拆 to_thread 包装，flow 直连协
-   程消费者
+4. **后续 PR（接口演进）**：KeySet + wait_ready 下沉 +
+   `PrefetchError` → `FlowError`
 
 ## 参考实现
 
