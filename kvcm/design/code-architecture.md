@@ -183,7 +183,11 @@ flowchart LR
 
 - **接口只强制五个方法**：`capability / copy / query_task / abandon / exists` 为 abstractmethod；其余操作基类默认抛「适配器未接通」（UnsupportedCapabilityError）——第二后端接入时不必把全部操作先写成空实现；编排层判断可用性读 capability()，异常只是兜底
 - **任务凭据（TaskHandle）**：一次 `copy(前缀)` 在 mooncake 上是逐条 key 各发一个复制任务——一个前缀通常对应多条 key（块数 × rank 数），所以一次操作会产生多个任务。凭据里的 `task_ids` 装着这次操作的全部任务号，查询时一起查。任务号的类型对 L3 不透明（`tuple[object, ...]`）：mooncake 的任务号是两个整数组成的整数对，L3 原样保存、原样回传，不做字符串化（`str()` 化后真实绑定的 `query_task` 会报 TypeError）；要写进 Ledger 时由实现侧编码成 `"整数:整数"` 的字符串（`encode_task_id`/`decode_task_id`，重启可还原）
-- **READY 规则**：copy / move / promote 有 READY（任务完成 + 目标侧副本核验通过）；**retain 返回 TaskHandle**——结果必须可观测（「保住了没有」是本操作存在的意义；实现路径 = D2 §4）。主路径 = mooncake 主线版本的 retained client 注册（一次 RPC，无异步工作）返回空凭据 `task_ids=()`，`query_task` 入口直接 READY；0.3.11 过渡 move 返回真凭据。其余方法（keepalive / stop_keepalive / pin / demote / remove）无 READY
+- **READY 规则**（本义 =「可以把请求调度过来」，D2 §1）：
+  - copy / move：任务完成 + 目标侧副本核验通过（任务型，凭据里有任务号）
+  - promote：**核验式 READY**——触发式实现（反复 `GetReplicaList` 刷计数，master 按冷热策略**自主**搬运，kvcm 没有任务号）；READY = 轮询确认副本提回到位。凭据形态（空凭据或触发记录）实现时定；其搬运是池自主行为，**不占传输闸**
+  - **retain 返回 TaskHandle**——结果必须可观测（「保住了没有」是本操作存在的意义；实现路径 = D2 §4）。主路径 = mooncake 主线版本的 retained client 注册（一次 RPC，无异步工作）返回空凭据 `task_ids=()`，`query_task` 入口直接 READY；0.3.11 过渡 move 返回真凭据
+  - 其余方法（keepalive / stop_keepalive / pin / demote / remove）无 READY
 - **exists（查询，不是第九项管理操作）**：实现是 `batch_is_exist`，它有个副作用——被查到的 key 会被续租，所以预热前的存在性检查顺便就起了保活作用。两种结果必须分清：「不在池里」（key 确实没有 → 该预热）和「查询本身失败」（RPC 出错或单 key 返回 -1 → 转成 QueryError 等一会儿重查）——把查询失败当成「不在池里」会误判成需要重新计算
 - **abandon（放弃跟踪）**：kvcm 发起任务后要定期查它完成没有，这叫跟踪。abandon = 不再查了：删掉进程内的核验登记，Ledger 记为 abandoned，凭据从此失效（再查报 KeyError）。它**不是取消任务**——后端没有取消接口，传输可能照常完成。**abandon 之后不会自动删副本**：副本留在池里，按冷热策略自然降层、过期；要立刻删除得显式调 remove（未实现，归释放流程 ReleaseLoop，D1 §6）
 
