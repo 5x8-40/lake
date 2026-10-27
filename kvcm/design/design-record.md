@@ -151,14 +151,14 @@ target}`），便于手工与脚本测试——占位期用 stdlib `http.server`
 
 1. **阶段 1 进程壳 + 状态恢复**：Ledger 单线程 executor → 启动时
    `rebuild()` 接通 → KeepaliveLoop（固定窗口策略，协程定时器）→ 优雅退
-   出（协程取消 + abandon 收口）
+   出（协程取消 + abandon 处理）
 2. **阶段 2 TaskEngine + flow/ops async 化**：intent 占位入口 →
    `asyncio.Queue` + Semaphore(4) → 协程消费者直接调 async flow；KvOps
    全方法 async 化（签名 + RPC 包 executor + sleep 换 `asyncio.sleep`）
    → 终态记账 → 超时处理（复用现有 abandon）
 3. **阶段 3 测试**：并发多 intent 单测；重启端到端（杀进程 → rebuild →
-   READY）；优雅退出回归（退出不崩、账本会收口）；真机冒烟
-4. **后续 PR（接口演进）**：KeySet + wait_ready 下沉 +
+   READY）；优雅退出回归（退出不崩、账本状态正确）；真机冒烟
+4. **后续 PR（接口演进）**：KeySet + wait_ready 挪进 ops +
    `PrefetchError` → `FlowError`
 
 ## 接口演进（后续 PR）
@@ -182,7 +182,7 @@ async 化已随本期（决策一）完成。后续一个 PR 做这三项（都�
 - **SGLang HiCache** `hiradix_cache.py::can_terminate_prefetch` / prefetch 线程：
   prefetch 三策略（best_effort/wait_complete/timeout）与 timeout 预算公式
   （`base + per_ki_token * tokens/1024`）→ 我们 TaskEngine 失败态策略三选与
-  PrefetchFlow 超时收口的语义对照；差异：HiCache 是引擎内 L1/L2 私有、追求
+  PrefetchFlow 超时处理的语义对照；差异：HiCache 是引擎内 L1/L2 私有、追求
   prefill 衔接，kvcm 是池控制面、以副本核验为 READY 依据
 - **TensorCast** Global Store / Store Daemon 分离 + 「CLI 管服务、worker 只
   connect、不持有基础设施进程」（`docs/research/tensorcast/overview.md`）→
