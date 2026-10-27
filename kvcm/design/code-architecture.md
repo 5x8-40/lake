@@ -39,6 +39,8 @@ flowchart TB
     Recv["IntentReceiver<br/>接收"]
     Watch["InstanceWatcher<br/>接收"]
     Pub["EventPublisher<br/>发送"]
+    Eng["TaskEngine<br/>intent 队列 + 并发上限"]
+    Pool["工作线程池"]
     Flow["PrefetchFlow"]
     Ops["KvOps"]
     MB["MooncakeBackend"]
@@ -50,7 +52,9 @@ flowchart TB
   end
 
   Router -.->|"待接通<br/>预热 intent, Prefix + target"| Recv
-  Recv -.->|"待接通<br/>驱动 PrefetchFlow.run"| Flow
+  Recv -.->|"待接通<br/>投进 intent 队列"| Eng
+  Eng -.->|"待接通<br/>按并发上限分派"| Pool
+  Pool -.->|"待接通<br/>执行 PrefetchFlow.run"| Flow
   Ctrl -.->|"待接通<br/>实例上下线事件<br/>实例标识 + TP 配置 + rank 与 seg 对应表"| Watch
   Watch -.->|"待接通<br/>实例拓扑注册<br/>locate 在生产环境的数据来源"| MB
   Flow -->|"已接通<br/>exists / copy / query_task / abandon<br/>Prefix+target / TaskHandle"| Ops
@@ -71,6 +75,7 @@ flowchart TB
 ```
 
 - `IntentReceiver`、`InstanceWatcher` 只接收，箭头从进程外进来。`EventPublisher` 只发送，箭头从进程里出去。三者互不调用
+- **intent 的走法（E11 形态）**：`IntentReceiver` 收到后不直接跑流程，只投进 `TaskEngine` 的队列；TaskEngine 看执行中的任务数低于并发上限，就把任务分给线程池里一个空闲线程，那个线程才跑 `PrefetchFlow.run`。当前代码还没有这两个部件，流程只能被直接调用
 - 已接通的驱动是 `PrefetchFlow` 调 `KvOps`——运行时这个对象就是 `MooncakeBackend`，不是中间再转一跳。它写 `Ledger`，账本落在圈外的 sqlite 文件上；`rebuild` 再把 running 行读回来
 - **实例拓扑的两条来路**：demo 环境没有注册通道，`RankTopology` 用探测法推断「哪个 rank 对应哪个 seg」（见 L4 节）；生产环境由实例启动时把自己的拓扑（TP 配置、rank 与 seg 对应表）经 `InstanceWatcher` 注册进来（D1 §3、E13）——两条来路汇成一个 `locate` 函数注入 backend
 - `StoreClient` 走 master 的 RPC `:50088`。`SegTopology` 自己会打 HTTP `:9003` 的 `/get_all_segments`（查存储池当前挂了哪些 seg）。demo 里把这份名单交给 `RankTopology` 做比对，进程里还没有这条装配
