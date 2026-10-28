@@ -1,4 +1,4 @@
 # 开发/测试依赖（stub 重生成见 scripts/gen_stubs.sh，版本对齐本文件）
 -r requirements.txt
-grpcio-tools>=1.82.1
+grpcio-tools==1.80.0
 pytest

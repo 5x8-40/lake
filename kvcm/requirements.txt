@@ -1,5 +1,21 @@
 # kvcm 运行时依赖（E12 起）
-# 版本与主仓根 pyproject.toml 对齐：stub 生成物校验 protobuf runtime 下限，
-# 跨 python/ 与 kvcm/ 两处必须一致，否则 CI 一边过一边挂。
-grpcio>=1.82.1
-protobuf>=7.35.0
+#
+# **版本由 stub 决定，不要凭主仓 python/ 的口径去"对齐"**——两处 stub 是
+# 不同版本生成的（kvcm/api/pb 是 protobuf 6.31.1 / grpcio 1.80.0；
+# python/lake/pb 是 7.x）。两套互不相关。
+#
+# 实测结论（不要凭直觉改）：
+#   - ValidateProtobufRuntimeVersion 只校验「runtime 不能比 gencode 旧」，
+#     **不要求同 major**（源码：对比 MAJOR/MINOR/PATCH 三级，runtime 更高
+#     即通过）。实测 protobuf 7.36.2 能加载 6.31.1 生成的 stub，grpc 测试
+#     全过。所以「跨 major 必崩」是误判。
+#   - 但 grpcio-tools 与 grpcio 必须版本配套（tools 1.82.1 要求
+#     grpcio>=1.82.1）。改 grpcio 就得同时改 tools。
+#   - 用新版本 tools 重新生成 stub 后，stub 里的 GRPC_GENERATED_VERSION /
+#     Protobuf Python Version 会跟着变，此时旧运行时会**真的**报错。
+#
+# 因此这里用精确版本（==）而不是范围：范围会让 pip 在某天装到未验证的
+# 新版本。要升级：同时改 grpcio / grpcio-tools / protobuf 三个版本，
+# 并跑 scripts/gen_stubs.sh 重新生成 stub（CI 的 stub-drift 会校验）。
+grpcio==1.80.0
+protobuf==6.33.6
