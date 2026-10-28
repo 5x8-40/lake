@@ -93,8 +93,10 @@ class TaskEngine:
         queue_size：队列容量；0 = 不限（排队是协程挂起，不占资源；限容量
         是给入口做背压用的——满了 `submit_intent` 会阻塞 gRPC 线程，这
         正是想要的背压效果）。
-        consumer_count：消费者协程数，默认 = max_concurrent（它们几乎总
-        在挂起等待，多开无益）。
+        consumer_count：消费者协程数，默认 `max(16, max_concurrent × 4)`
+        ——**必须远大于名额数**：消费者出队后先在闸外做存在性检查，再去
+        等名额。若等于名额数，第 N+1 个请求连队列都出不来，它的检查会被
+        在途传输堵住。
         """
         if max_concurrent <= 0:
             raise ValueError("max_concurrent must be positive")
