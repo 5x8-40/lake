@@ -20,8 +20,8 @@
 - 任务 FAILED / 超时——终态上抛；超时先 abandon 收口（删登记 + 记
   abandoned），再抛
 
-任务状态同步轮询是本步形态；进程化后由 TaskEngine 跟踪（并发上限 +
-限速器），流程本体不变。重发 / 弃置清副本 / 源掉线衔接的策略归
+轮询在本流程内（E11 进程化后由 TaskEngine 管并发与限速，流程本体不变）；
+`asyncio.sleep` 让等待不占线程。重发 / 弃置清副本 / 源掉线衔接的策略归
 TaskEngine。
 
 任务状态记录（Ledger）由后端实现侧在 copy / query_task / abandon 时
@@ -31,6 +31,7 @@ TaskEngine。
 
 from __future__ import annotations
 
+import asyncio
 import time
 
 from kvcm.ops.base import KvOps, QueryError, SubmitError, TaskStatus, VerifyError
@@ -47,7 +48,7 @@ class PrefetchFlow:
     def __init__(self, ops: KvOps) -> None:
         self._ops = ops
 
-    def run(
+    async def run(
         self,
         prefix: Prefix,
         target: InstanceId,
@@ -56,7 +57,7 @@ class PrefetchFlow:
         timeout_s: float = 120.0,
         handle_sink=None,
     ) -> None:
-        """同步执行到 READY；失败抛 PrefetchError。
+        """执行到 READY；失败抛 PrefetchError（协程：等待期间不占线程）。
 
         timeout_s 从 exists 通过起算、覆盖 copy 提交——大前缀逐 key 串行
         提交本身可达几十秒，不计入则超时预算失真。
@@ -66,7 +67,7 @@ class PrefetchFlow:
         此前只在流程局部作用域里，进程级收口无从下手）。不改变流程
         语义。
         """
-        if not self._ops.exists(prefix):
+        if not await self._ops.exists(prefix):
             raise PrefetchError(
                 "prefix not fully in pool — warm 未覆盖该前缀、key 口径与引擎漂移，"
                 "或异构前提未满足（源引擎未开 tp_mismatch / PEER_TP_SIZE 两端错位，"
@@ -74,14 +75,14 @@ class PrefetchFlow:
             )
         deadline = time.monotonic() + timeout_s
         try:
-            handle = self._ops.copy(prefix, target)
+            handle = await self._ops.copy(prefix, target)
         except SubmitError as e:
             raise PrefetchError(f"copy submit failed: {e}") from e
         if handle_sink is not None:
             handle_sink(handle)
         while True:
             try:
-                status = self._ops.query_task(handle)
+                status = await self._ops.query_task(handle)
             except VerifyError as e:
                 # 任务完成但副本不到位：终态，带明细
                 raise PrefetchError(f"replica verify failed: {e}") from e
@@ -96,8 +97,8 @@ class PrefetchFlow:
             if time.monotonic() >= deadline:
                 # 超时收口：放弃跟踪（删登记 + 记 abandoned）；后端任务
                 # 可能仍在进行，副本清理由 remove 负责。
-                self._ops.abandon(handle)
+                await self._ops.abandon(handle)
                 raise PrefetchError(
                     f"copy not READY after {timeout_s}s (handle={handle})"
                 )
-            time.sleep(poll_s)
+            await asyncio.sleep(poll_s)

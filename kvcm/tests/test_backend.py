@@ -13,6 +13,8 @@ import types
 
 import pytest
 
+from conftest import run
+
 from kvcm.backends.mooncake.backend import MooncakeBackend, encode_task_id
 from kvcm.backends.mooncake.capability import mooncake_v0311, mooncake_main
 from kvcm.backends.mooncake.client import StoreClient, StoreClientError, entry_exists
@@ -106,10 +108,10 @@ def test_task_id_roundtrip_is_original_pair(fake_store_module, monkeypatch) -> N
     """阻塞回归：任务号禁止字符串化——query_task 必须收到原整数对。"""
     client = FakeClient()
     b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    handle = b.copy(Prefix(model_id="qwen", token_ids=(1, 2, 3)), InstanceId("inst-B"))
+    handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1, 2, 3)), InstanceId("inst-B")))
     assert handle.op is OpKind.COPY
     assert all(isinstance(t, tuple) for t in handle.task_ids)
-    status = b.query_task(handle)
+    status = run(b.query_task(handle))
     assert status is TaskStatus.READY
     # 锁死：查询收到的标识与创建返回的完全一致（未被 str()）
     assert client.queried == list(handle.task_ids)
@@ -120,7 +122,7 @@ def test_task_id_roundtrip_is_original_pair(fake_store_module, monkeypatch) -> N
 def test_plan_rank_mapped_via_backend(fake_store_module, monkeypatch) -> None:
     client = FakeClient()
     b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
     segs = [seg for _, segs in client.created for seg in segs]
     assert segs == ["seg-A", "seg-B"]  # rank0→seg-A, rank1→seg-B
 
@@ -128,8 +130,8 @@ def test_plan_rank_mapped_via_backend(fake_store_module, monkeypatch) -> None:
 def test_task_failed_is_terminal_and_purged(fake_store_module, monkeypatch) -> None:
     client = FakeClient(task_status=_FakeStoreTaskStatus.FAILED)
     b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-    assert b.query_task(handle) is TaskStatus.FAILED
+    handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert run(b.query_task(handle)) is TaskStatus.FAILED
     assert handle not in b._plans
 
 
@@ -143,9 +145,9 @@ def test_verify_failure_raises_with_detail(fake_store_module, monkeypatch) -> No
         b = _backend(
             client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led
         )
-        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
         with pytest.raises(VerifyError, match="missing on seg-A"):
-            b.query_task(handle)
+            run(b.query_task(handle))
         assert handle not in b._plans
         # 核验失败是终态：Ledger 迁 failed
         for tid in handle.task_ids:
@@ -167,7 +169,7 @@ def test_empty_prefix_raises(fake_store_module, monkeypatch) -> None:
         capability=mooncake_v0311(),
     )
     with pytest.raises(ValueError, match="no keys"):
-        b.copy(Prefix(model_id="qwen", token_ids=()), InstanceId("inst-B"))
+        run(b.copy(Prefix(model_id="qwen", token_ids=()), InstanceId("inst-B")))
 
 
 def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> None:
@@ -182,7 +184,7 @@ def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> N
     client = BoomClient()
     b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
     with pytest.raises(SubmitError, match=r"1/2 tasks.*\[\(1, 101\)\]"):
-        b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
 
 
 # ---------------------------------------------------------------------------
@@ -210,20 +212,20 @@ def test_conflict_watch_running_then_ready(fake_store_module, monkeypatch) -> No
     try:
         client = ConflictClient(replicas_on=[])  # 副本还没到位
         b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led)
-        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
         # 第一轮：全部失败且全是在途冲突 → 观测态 RUNNING，句柄保留
-        assert b.query_task(handle) is TaskStatus.RUNNING
+        assert run(b.query_task(handle)) is TaskStatus.RUNNING
         assert handle in b._plans
         # 冲突任务如实记 failed（它们确实失败了，数据是别人搬的）
         for tid in handle.task_ids:
             assert led.get_task(encode_task_id(tid)).status == "failed"  # type: ignore[union-attr]
         # 观测态后续调用不再查任务（任务已死），只核验副本
         n_queried = len(client.queried)
-        assert b.query_task(handle) is TaskStatus.RUNNING
+        assert run(b.query_task(handle)) is TaskStatus.RUNNING
         assert len(client.queried) == n_queried
         # 副本到位（别人的任务传完）→ READY，终态删登记
         client._replicas_on = ["seg-A", "seg-B"]
-        assert b.query_task(handle) is TaskStatus.READY
+        assert run(b.query_task(handle)) is TaskStatus.READY
         assert handle not in b._plans
         assert handle not in b._watch
     finally:
@@ -246,8 +248,8 @@ def test_conflict_mixed_with_real_failure_is_terminal(fake_store_module, monkeyp
             return _FakeTaskResp(_FakeStoreTaskStatus.FAILED, "OBJECT_NOT_FOUND")
 
     b = _backend(MixedClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-    assert b.query_task(handle) is TaskStatus.FAILED
+    handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert run(b.query_task(handle)) is TaskStatus.FAILED
     assert handle not in b._plans
     assert handle not in b._watch
 
@@ -262,9 +264,9 @@ def test_abandon_during_watch_keeps_conflict_ledger(fake_store_module, monkeypat
     try:
         client = ConflictClient(replicas_on=[])
         b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led)
-        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-        assert b.query_task(handle) is TaskStatus.RUNNING  # 进观测态
-        b.abandon(handle)
+        handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+        assert run(b.query_task(handle)) is TaskStatus.RUNNING  # 进观测态
+        run(b.abandon(handle))
         assert handle not in b._plans
         assert handle not in b._watch
         # 本例全部任务都冲突 → 全部保持 failed（无 abandoned 改写）
@@ -294,12 +296,12 @@ def test_exists_checks_length(fake_store_module, monkeypatch) -> None:
 
     kc = KeyComputer(model_name="qwen", tp_size=2)
     b = _backend(ShortClient(), kc, monkeypatch)
-    assert b.exists(Prefix(model_id="qwen", token_ids=(1,))) is False
+    assert run(b.exists(Prefix(model_id="qwen", token_ids=(1,)))) is False
 
 
 def test_exists_all_present(fake_store_module, monkeypatch) -> None:
     b = _backend(FakeClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    assert b.exists(Prefix(model_id="qwen", token_ids=(1,))) is True
+    assert run(b.exists(Prefix(model_id="qwen", token_ids=(1,)))) is True
 
 
 def test_is_exist_per_key_failure_raises() -> None:
@@ -326,7 +328,7 @@ def test_exists_query_failure_is_retryable_query_error(fake_store_module, monkey
 
     b = _backend(BoomClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
     with pytest.raises(QueryError):
-        b.exists(Prefix(model_id="qwen", token_ids=(1,)))
+        run(b.exists(Prefix(model_id="qwen", token_ids=(1,))))
 
 
 # ---------------------------------------------------------------------------
@@ -346,10 +348,10 @@ def test_ledger_transitions(fake_store_module, monkeypatch) -> None:
     try:
         client = FakeClient()
         b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led)
-        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
         for tid in handle.task_ids:
             assert led.get_task(encode_task_id(tid)).status == "running"  # type: ignore[union-attr]
-        b.query_task(handle)
+        run(b.query_task(handle))
         for tid in handle.task_ids:
             rec = led.get_task(encode_task_id(tid))
             assert rec and rec.status == "ready" and rec.op == "copy"
@@ -409,7 +411,7 @@ def test_rebuild_restores_running_handle(fake_store_module, monkeypatch) -> None
             capability=mooncake_v0311(),
             ledger=led,
         )
-        b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        run(b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
         assert len(led.list_running_tasks()) == 2  # 两 key 两任务
 
         # 模拟重启：全新 backend（空 _plans），同一 Ledger、同一 master
@@ -429,7 +431,7 @@ def test_rebuild_restores_running_handle(fake_store_module, monkeypatch) -> None
         # 任务号解码回整数对（与创建时同形态）
         assert all(isinstance(t, tuple) for t in handle.task_ids)
         # 继续 query_task → 核验通过 → READY；Ledger 迁移 ready
-        assert b2.query_task(handle) is TaskStatus.READY
+        assert run(b2.query_task(handle)) is TaskStatus.READY
         for tid in handle.task_ids:
             assert led.get_task(encode_task_id(tid)).status == "ready"  # type: ignore[union-attr]
     finally:
@@ -498,8 +500,8 @@ def test_rebuild_restores_watch_state(fake_store_module, monkeypatch) -> None:
             locate=lambda _inst: ["seg-A", "seg-B"],
             capability=mooncake_v0311(), ledger=led,
         )
-        h1 = b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-        assert b1.query_task(h1) is TaskStatus.RUNNING  # 观测态等副本
+        h1 = run(b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+        assert run(b1.query_task(h1)) is TaskStatus.RUNNING  # 观测态等副本
         assert h1 in b1._watch
 
         # 重启：副本未到位 → RUNNING（不得 VerifyError）；冲突行保持 failed
@@ -514,11 +516,11 @@ def test_rebuild_restores_watch_state(fake_store_module, monkeypatch) -> None:
         assert len(b2.rebuild()) == 1
         h2 = next(iter(b2._plans))
         assert h2 in b2._watch  # 观测态恢复了
-        assert b2.query_task(h2) is TaskStatus.RUNNING  # 缺 seg-B 副本：等，不是终态
+        assert run(b2.query_task(h2)) is TaskStatus.RUNNING  # 缺 seg-B 副本：等，不是终态
 
         # 副本全部到位 → READY；冲突行保持 failed，其余 ready
         client2._replicas_on = ["seg-A", "seg-B"]
-        assert b2.query_task(h2) is TaskStatus.READY
+        assert run(b2.query_task(h2)) is TaskStatus.READY
         assert led.get_task(encode_task_id((1, 101))).status == "failed"  # type: ignore[union-attr]
         assert led.get_task(encode_task_id((2, 102))).status == "ready"  # type: ignore[union-attr]
     finally:
@@ -538,7 +540,7 @@ def test_empty_handle_is_immediately_ready(fake_store_module) -> None:
     from kvcm.ops.base import TaskHandle
 
     empty = TaskHandle(op=OpKind.COPY, task_ids=())
-    assert b.query_task(empty) is TaskStatus.READY
+    assert run(b.query_task(empty)) is TaskStatus.READY
 
 
 def test_rebuild_skips_unresolvable(fake_store_module, monkeypatch) -> None:
@@ -558,7 +560,7 @@ def test_rebuild_skips_unresolvable(fake_store_module, monkeypatch) -> None:
             capability=mooncake_v0311(),
             ledger=led,
         )
-        b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        run(b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
 
         def dead_locate(_inst):
             raise RuntimeError("instance gone")
@@ -590,16 +592,16 @@ def test_abandon_purges_and_marks(fake_store_module, monkeypatch) -> None:
         b = _backend(
             FakeClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led
         )
-        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-        b.abandon(handle)
+        handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+        run(b.abandon(handle))
         assert handle not in b._plans
         for tid in handle.task_ids:
             assert led.get_task(encode_task_id(tid)).status == "abandoned"  # type: ignore[union-attr]
         # 放弃后句柄失效
         with pytest.raises(KeyError):
-            b.query_task(handle)
+            run(b.query_task(handle))
         with pytest.raises(KeyError):
-            b.abandon(handle)
+            run(b.abandon(handle))
     finally:
         led.close()
         import os
@@ -625,13 +627,13 @@ def _pin_backend(monkeypatch, cap) -> MooncakeBackend:
 def test_pin_soft_unsupported_when_channel_no(fake_store_module, monkeypatch) -> None:
     b = _pin_backend(monkeypatch, mooncake_v0311())  # soft 通道 NO
     with pytest.raises(UnsupportedCapabilityError, match="soft pin"):
-        b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT)
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
 
 
 def test_pin_hard_always_unsupported(fake_store_module, monkeypatch) -> None:
     b = _pin_backend(monkeypatch, mooncake_main())  # hard 通道 NO（全版本）
     with pytest.raises(UnsupportedCapabilityError, match="hard pin"):
-        b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD)
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD))
 
 
 def test_pin_soft_not_implemented_when_channel_yes(fake_store_module, monkeypatch) -> None:
@@ -645,7 +647,7 @@ def test_pin_soft_not_implemented_when_channel_yes(fake_store_module, monkeypatc
     )
     b = _pin_backend(monkeypatch, cap_yes)
     with pytest.raises(NotImplementedError):
-        b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT)
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
 
 
 # ---------------------------------------------------------------------------

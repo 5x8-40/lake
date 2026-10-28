@@ -15,9 +15,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import functools
+import os
 import time
 import uuid
-from typing import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Callable, Sequence
 
 from kvcm.backends.mooncake.client import StoreClient, StoreClientError
 from kvcm.engines.vllm.keys import KeyComputer
@@ -73,6 +77,7 @@ class MooncakeBackend(KvOps):
         capability: BackendCapability,
         ledger: Ledger | None = None,
         submit_interval_s: float = 0.2,
+        executor: ThreadPoolExecutor | None = None,
     ) -> None:
         """
         client：已 connect 的 StoreClient（控制面身份，global_segment_size=0）。
@@ -81,6 +86,10 @@ class MooncakeBackend(KvOps):
         capability：按连接上的后端版本填充的能力集（必填——能力宣告不
             允许默认冒充，填错版本 = 编排层选错路径）。
         ledger：任务状态记录（可选；不注入则任务状态只留进程内）。
+        executor：执行同步阻塞调用的线程池（mooncake 同步 RPC）。不传则
+            按 RPC 执行密度自建（4~8，E11 定稿）——**不用
+            asyncio.to_thread 默认池**（大小不可控）。Ledger 自己有专用
+            单线程池，与本池分开。
         submit_interval_s：copy 逐任务提交间隔。连发提交会在目标侧形成
             并发建链风暴（0.3.11 ascend 实测：14 连发约半数
             TRANSFER_FAIL；窗口 4 节奏化 42/42 全成）——串行+间隔是
@@ -92,6 +101,10 @@ class MooncakeBackend(KvOps):
         self._cap = capability
         self._ledger = ledger
         self._submit_interval_s = submit_interval_s
+        self._executor = executor or ThreadPoolExecutor(
+            max_workers=min(8, (os.cpu_count() or 4)), thread_name_prefix="kvcm-rpc"
+        )
+        self._owns_executor = executor is None
         # handle → (prefix, target, plan [(key, target_seg), ...], handle_id)：
         # READY 核验与 Ledger 迁移登记；终态即删（防长驻泄漏）。
         # handle_id = 同一次操作发起的一组任务的分组键（uuid），写进
@@ -109,10 +122,36 @@ class MooncakeBackend(KvOps):
         return self._cap
 
     # ------------------------------------------------------------------
+    # 阻塞调用的协程包装
+    # ------------------------------------------------------------------
+
+    async def _rpc(self, fn: Callable[..., Any], *args: Any) -> Any:
+        """在 RPC executor 里执行同步调用（mooncake 绑定），协程挂起等
+        结果——等待期间不占事件循环。"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, fn, *args)
+
+    async def _in_ledger(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """在 RPC executor 里调 Ledger（其内部会经自己的单线程池串行化）。
+
+        Ledger 的公共方法是「submit().result()」的同步阻塞形态——直接在
+        协程里调会卡住整个事件循环，所以同样要扔进线程池。
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, functools.partial(fn, *args, **kwargs)
+        )
+
+    def close(self) -> None:
+        """释放自建的 executor（外部注入的由调用方管）。"""
+        if self._owns_executor:
+            self._executor.shutdown(wait=False)
+
+    # ------------------------------------------------------------------
     # copy（已落地）
     # ------------------------------------------------------------------
 
-    def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
+    async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机 seg 为前缀 KV 建副本（发起式；READY 经 query_task）。
 
         内部展开：前缀 → key 列表（引擎侧）→ 目标实例 seg 列表（locate）
@@ -130,8 +169,12 @@ class MooncakeBackend(KvOps):
         try:
             for i, (key, seg) in enumerate(plan):
                 if i and self._submit_interval_s > 0:
-                    time.sleep(self._submit_interval_s)
-                task_ids.append(self._client.create_copy_task(key, [seg]))
+                    # 提交间隔用协程 sleep：等待期间事件循环照常服务其他
+                    # 任务（真机止血用的节奏，E15 由 gather + 信号量取代）
+                    await asyncio.sleep(self._submit_interval_s)
+                task_ids.append(
+                    await self._rpc(self._client.create_copy_task, key, [seg])
+                )
         except Exception as e:
             # 已发起的任务必须带在异常上——否则这些任务无句柄可查，
             # 成为池里没人跟踪的在途传输。
@@ -141,10 +184,10 @@ class MooncakeBackend(KvOps):
             ) from e
         handle = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
         self._plans[handle] = (prefix, target, plan, uuid.uuid4().hex)
-        self._record(handle, "running")
+        await self._record(handle, "running")
         return handle
 
-    def query_task(self, handle: TaskHandle) -> TaskStatus:
+    async def query_task(self, handle: TaskHandle) -> TaskStatus:
         """聚合判定：任一任务失败 → FAILED（终态）；全部成功且副本核验
         通过 → READY（终态）；否则 RUNNING。终态即删核验登记。
 
@@ -168,9 +211,12 @@ class MooncakeBackend(KvOps):
         _, _, plan, _ = entry
         if handle in self._watch:
             # 在途冲突观测态：任务已死（冲突失败，账已记），只等副本到位
-            return self._verify_watch(handle, plan)
+            return await self._verify_watch(handle, plan)
         try:
-            resps = [self._client.query_task(tid) for tid in handle.task_ids]
+            resps = [
+                await self._rpc(self._client.query_task, tid)
+                for tid in handle.task_ids
+            ]
         except StoreClientError as e:
             raise QueryError(str(e)) from e
         failed = [r for r in resps if r.status == StoreTaskStatus.FAILED]
@@ -185,25 +231,25 @@ class MooncakeBackend(KvOps):
                 # 全部失败都是在途冲突：别的任务在复制同 key（典型 = 同
                 # intent 重发）。按 D1 §4 不当失败——冲突任务如实记
                 # failed，转副本观测态，立刻核一轮。
-                self._record(handle, "failed", tids=list(conflicted))
+                await self._record(handle, "failed", tids=list(conflicted))
                 self._watch[handle] = conflicted
-                return self._verify_watch(handle, plan)
-            self._finish(handle, "failed")
+                return await self._verify_watch(handle, plan)
+            await self._finish(handle, "failed")
             return TaskStatus.FAILED
         if not all(r.status == StoreTaskStatus.SUCCESS for r in resps):
             return TaskStatus.RUNNING
         # READY 核验：每个 key 在其映射目标上有内存副本（不是每个 seg）
-        missing = self._verify_missing(plan)
+        missing = await self._verify_missing(plan)
         if missing:
-            self._finish(handle, "failed")
+            await self._finish(handle, "failed")
             raise VerifyError(
                 "task(s) succeeded but replica verify failed:\n  "
                 + "\n  ".join(missing)
             )
-        self._finish(handle, "ready")
+        await self._finish(handle, "ready")
         return TaskStatus.READY
 
-    def _verify_missing(self, plan: list[tuple[str, str]]) -> list[str]:
+    async def _verify_missing(self, plan: list[tuple[str, str]]) -> list[str]:
         """副本核验：每个 key 在其映射目标 seg 上有内存副本；返回缺失明细
         （空 = 通过）。核验 RPC 失败抛 QueryError（可重试）。
 
@@ -214,14 +260,17 @@ class MooncakeBackend(KvOps):
         missing: list[str] = []
         for key, seg in plan:
             try:
-                endpoints = self._client.batch_memory_replica_endpoints([key]).get(key, [])
+                descs = await self._rpc(
+                    self._client.batch_memory_replica_endpoints, [key]
+                )
+                endpoints = descs.get(key, [])
             except StoreClientError as e:
                 raise QueryError(str(e)) from e
             if seg not in endpoints:
                 missing.append(f"{key} missing on {seg} (have={sorted(endpoints)})")
         return missing
 
-    def _verify_watch(
+    async def _verify_watch(
         self, handle: TaskHandle, plan: list[tuple[str, str]]
     ) -> TaskStatus:
         """在途冲突观测：副本全部到位 → READY；否则 RUNNING 继续等。
@@ -230,7 +279,7 @@ class MooncakeBackend(KvOps):
         intent）——等不到由编排层超时兜底（abandon）。核验失败不抛
         VerifyError：本模式不保证「任务成功过」，缺失只意味着还没传完。
         """
-        missing = self._verify_missing(plan)
+        missing = await self._verify_missing(plan)
         if missing:
             return TaskStatus.RUNNING
         # 目的达成（副本核验为准）：非冲突任务记 ready；冲突任务保持
@@ -238,11 +287,11 @@ class MooncakeBackend(KvOps):
         conflicted = set(self._watch.pop(handle, ()))
         rest = [t for t in handle.task_ids if t not in conflicted]
         if rest:
-            self._record(handle, "ready", tids=rest)
+            await self._record(handle, "ready", tids=rest)
         self._plans.pop(handle, None)
         return TaskStatus.READY
 
-    def abandon(self, handle: TaskHandle) -> None:
+    async def abandon(self, handle: TaskHandle) -> None:
         """放弃跟踪：Ledger 记 abandoned 并删登记（不取消后端任务——后
         端无任务取消能力，在途传输可能仍完成；副本清理由 remove 负责）。
         观测态的冲突任务保持 failed 不改写。"""
@@ -251,10 +300,10 @@ class MooncakeBackend(KvOps):
         conflicted = set(self._watch.pop(handle, ()))
         rest = [t for t in handle.task_ids if t not in conflicted]
         if rest:
-            self._record(handle, "abandoned", tids=rest)
+            await self._record(handle, "abandoned", tids=rest)
         self._plans.pop(handle, None)
 
-    def exists(self, prefix: Prefix) -> bool:
+    async def exists(self, prefix: Prefix) -> bool:
         """全部 key 在池才为真（batch_is_exist；读即续租）。
 
         查询本身失败（RPC/单 key -1）抛 QueryError——「查不出来」与
@@ -265,7 +314,7 @@ class MooncakeBackend(KvOps):
         if not keys:
             return False
         try:
-            result = self._client.is_exist(keys)
+            result = await self._rpc(self._client.is_exist, keys)
         except StoreClientError as e:
             raise QueryError(str(e)) from e
         return len(result) == len(keys) and all(result)
@@ -287,7 +336,7 @@ class MooncakeBackend(KvOps):
     # 从 master 重查；跟踪关系由 rebuild() 用可重算输入现场重算重建）
     # ------------------------------------------------------------------
 
-    def _record(
+    async def _record(
         self, handle: TaskHandle, status: str, tids: list[object] | None = None
     ) -> None:
         if self._ledger is None:
@@ -296,7 +345,8 @@ class MooncakeBackend(KvOps):
         if entry is None:
             return
         prefix, target, _, handle_id = entry
-        self._ledger.upsert_tasks(
+        await self._in_ledger(
+            self._ledger.upsert_tasks,
             [encode_task_id(tid) for tid in (tids if tids is not None else handle.task_ids)],
             handle_id=handle_id,
             op=handle.op.value,
@@ -371,9 +421,9 @@ class MooncakeBackend(KvOps):
             restored.append(handle)
         return restored
 
-    def _finish(self, handle: TaskHandle, status: str) -> None:
+    async def _finish(self, handle: TaskHandle, status: str) -> None:
         """终态处理：Ledger 迁移 + 删核验登记（防长驻进程泄漏）。"""
-        self._record(handle, status)
+        await self._record(handle, status)
         self._watch.pop(handle, None)
         self._plans.pop(handle, None)
 
@@ -381,7 +431,7 @@ class MooncakeBackend(KvOps):
     # 以下操作随能力接线逐个落地
     # ------------------------------------------------------------------
 
-    def move(
+    async def move(
         self,
         prefix: Prefix,
         target: InstanceId,
@@ -389,13 +439,13 @@ class MooncakeBackend(KvOps):
     ) -> TaskHandle:
         raise NotImplementedError("move：随保留/搬迁流程落地")
 
-    def keepalive(self, prefix: Prefix) -> None:
+    async def keepalive(self, prefix: Prefix) -> None:
         raise NotImplementedError("keepalive：随保活注册表落地")
 
-    def stop_keepalive(self, prefix: Prefix) -> None:
+    async def stop_keepalive(self, prefix: Prefix) -> None:
         raise NotImplementedError("stop_keepalive：随保活注册表落地")
 
-    def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
+    async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
         if kind is PinKind.HARD:
             if self._cap.hard_pin_after.channel is not Support.YES:
                 raise UnsupportedCapabilityError(
@@ -408,14 +458,14 @@ class MooncakeBackend(KvOps):
             )
         raise NotImplementedError("soft pin：通道具备但尚未接线")
 
-    def demote(self, prefix: Prefix) -> None:
+    async def demote(self, prefix: Prefix) -> None:
         raise NotImplementedError("demote：随释放流程落地")
 
-    def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
+    async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         raise NotImplementedError("promote：随提回流程落地")
 
-    def retain(self, prefix: Prefix) -> TaskHandle:
+    async def retain(self, prefix: Prefix) -> TaskHandle:
         raise NotImplementedError("retain：随保留流程落地（能力集 has_retained_client）")
 
-    def remove(self, prefix: Prefix) -> None:
+    async def remove(self, prefix: Prefix) -> None:
         raise NotImplementedError("remove：随删除流程落地")

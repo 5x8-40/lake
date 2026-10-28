@@ -1,17 +1,21 @@
 """kvcm 进程壳（E11）：常驻服务入口。
 
-启动序列：
-1. 参数解析 → Ledger → StoreClient.connect → MooncakeBackend 组装
-2. `backend.rebuild()`：重启恢复 running 任务的跟踪登记（D-4），恢复
-   的 handle 交 TaskEngine.track 收编（轮询到终态，不重跑流程）
-3. KeepaliveLoop 启动（固定窗口占位策略）；TaskEngine 就绪（READY 后
-   经 KeepaliveLoop.register 接线保活）
-4. IntentReceiver gRPC 服务（--listen，E12 协议见 proto/）启动
-5. 主线程等 SIGTERM/SIGINT
+执行形态（code-architecture.md「运行时结构」定稿）：**单事件循环 + 协程**。
+阻塞调用（mooncake 同步 RPC、sqlite）交给 executor，等待期间协程挂起。
 
-优雅退出（决策四）：入口停收 → TaskEngine.shutdown（在途 abandon，
-记账不等待）→ KeepaliveLoop 停 → StoreClient.close()（demo 已知退出
-期析构竞态，显式 close 是既有结论）。
+启动序列（事件循环内）：
+1. Ledger → StoreClient.connect → MooncakeBackend 组装
+2. `backend.rebuild()`：重启恢复 running 任务的跟踪登记，恢复的 handle
+   交 TaskEngine.track 收编（只轮询到终态，不重跑流程）
+3. KeepaliveLoop 启动（协程定时器，固定窗口占位策略）；TaskEngine 就绪
+   （READY 后经 KeepaliveLoop.register 接线保活）
+4. IntentReceiver gRPC 服务（--listen，E12 协议见 proto/）启动
+   —— gRPC 用普通版（自己的线程池接请求），servicer 只做「入队即返」，
+   不阻塞；任务执行全在事件循环里
+5. 等 SIGTERM / SIGINT
+
+优雅退出五步：停收 intent → 取消在途协程 → 有界等待（5 秒）→
+KeepaliveLoop 停 → StoreClient.close()。
 
 locate 本期静态注入（`--segs`，单实例冒烟形态）；生产 locate =
 L1 InstanceWatcher 注册，归 E13。
@@ -27,8 +31,8 @@ L1 InstanceWatcher 注册，归 E13。
 from __future__ import annotations
 
 import argparse
+import asyncio
 import signal
-import threading
 
 from kvcm.api.grpc_server import IntentGrpcServer
 from kvcm.backends.mooncake.backend import MooncakeBackend
@@ -64,12 +68,13 @@ def build_backend(
     )
 
 
-def run(args: argparse.Namespace, *, stop: threading.Event | None = None) -> int:
-    """进程主流程（stop 注入便于测试不发信号；None = 自己装 signal handler）。"""
+async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
+    """事件循环内的主流程。"""
     ledger = Ledger(args.ledger)
     client = StoreClient()
     loop: KeepaliveLoop | None = None
     engine: TaskEngine | None = None
+    backend: MooncakeBackend | None = None
     grpc_server: IntentGrpcServer | None = None
     try:
         client.connect(
@@ -85,43 +90,57 @@ def run(args: argparse.Namespace, *, stop: threading.Event | None = None) -> int
             interval_s=args.keepalive_interval_s,
             window_s=args.keepalive_window_s,
         )
-        engine = TaskEngine(
-            backend, keepalive=loop, max_concurrent=args.max_concurrent
-        )
+        engine = TaskEngine(backend, keepalive=loop, max_concurrent=args.max_concurrent)
         # 2. 重启恢复：running 任务重建跟踪，收编进 TaskEngine
         for handle in backend.rebuild():
-            engine.track(handle)
-        # 3. 常驻组件启动
+            asyncio.create_task(engine.track(handle), name="kvcm-recover")
+        # 3. 常驻组件启动（协程）
         loop.start()
+        engine.start()
         if args.listen:
             host, _, port = args.listen.rpartition(":")
             grpc_server = IntentGrpcServer((host or "127.0.0.1", int(port)), engine)
             grpc_server.start()
 
         # 4. 等退出信号
-        if stop is None:
-            stop = threading.Event()
+        await stop.wait()
 
-            def _handler(_sig, _frame):
-                stop.set()
-
-            signal.signal(signal.SIGTERM, _handler)
-            signal.signal(signal.SIGINT, _handler)
-        stop.wait()
-
-        # 优雅退出（决策四）
+        # 优雅退出（五步）
         # ① 停收入口
         if grpc_server is not None:
             grpc_server.stop()
-        # ② 在途 abandon（记账不等待；后端无取消能力，副本清理归 remove）
-        engine.shutdown()
-        # ③ Loop 停
-        loop.stop()
+        # ② 取消在途协程 + ③ 有界等待（TaskEngine.shutdown 内部做）
+        await engine.shutdown(timeout_s=args.shutdown_timeout_s)
+        # ④ Loop 停
+        await loop.stop()
         return 0
     finally:
-        # ④ client close（有序收尾，不靠退出期 GC/atexit）
+        # ⑤ client close（有序收尾，不靠退出期 GC/atexit）
         client.close()
+        if backend is not None:
+            backend.close()
+        if loop is not None:
+            loop.close()
         ledger.close()
+
+
+def run(args: argparse.Namespace, *, stop: asyncio.Event | None = None) -> int:
+    """进程主流程（stop 注入便于测试；None = 自己装 signal handler）。"""
+
+    async def _main() -> int:
+        ev = stop or asyncio.Event()
+        if stop is None:
+            loop = asyncio.get_running_loop()
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                try:
+                    loop.add_signal_handler(sig, ev.set)
+                except NotImplementedError:
+                    # 非 POSIX 主线程：退化为 signal.signal（测试/CI 通常
+                    # 走注入的 stop，不进这里）
+                    signal.signal(sig, lambda *_: ev.set())
+        return await _serve(args, ev)
+
+    return asyncio.run(_main())
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -157,7 +176,7 @@ def main(argv: list[str] | None = None) -> int:
         "--max-concurrent",
         type=int,
         default=4,
-        help="TaskEngine 并发上限（同时执行的预热 intent 数）",
+        help="传输闸名额数（同时在后端传输的任务数）",
     )
     p.add_argument(
         "--listen",
@@ -175,6 +194,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=600.0,
         help="保活固定窗口（D3 占位策略：READY 后续租这么久即停租）",
+    )
+    p.add_argument(
+        "--shutdown-timeout-s",
+        type=float,
+        default=5.0,
+        help="优雅退出时等待在途协程的上限（等满不再等）",
     )
     return run(p.parse_args(argv))
 

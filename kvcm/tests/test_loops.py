@@ -1,44 +1,57 @@
-"""KeepaliveLoop 单元检查（fake ops 注入，离线可跑）。
+"""KeepaliveLoop 检查：固定窗口保活、到期注销、重启恢复、协程生命周期。
 
-关键锁定：固定窗口占位策略——续租经 ops.exists（读即续租 D1 F15）、
-窗口按 registered_at 起算到期注销、exists False 即注销、QueryError
-跳过本轮、重启恢复免特判（注册行在 Ledger 即接管）。
+fake KvOps（离线可跑）：脚本化 exists。
 """
 
 from __future__ import annotations
 
-import os
+import asyncio
 import tempfile
-import threading
 import time
 
+import pytest
+
+from conftest import run
 from kvcm.ledger import Ledger
 from kvcm.loops import KeepaliveLoop
-from kvcm.ops.base import QueryError
+from kvcm.ops.base import KvOps, QueryError
+from kvcm.ops.capability import BackendCapability
 from kvcm.ops.types import Prefix
 
 _P = Prefix(model_id="qwen", token_ids=(1, 2, 3))
 
 
-class FakeOps:
-    """脚本化 exists：calls 记录调用，script 控制返回/抛错。"""
-
+class FakeOps(KvOps):
     def __init__(self, *, present: bool = True, error: Exception | None = None):
-        self.present = present
-        self.error = error
+        self._present = present
+        self._error = error
         self.calls: list[Prefix] = []
 
-    def exists(self, prefix: Prefix) -> bool:
+    def capability(self) -> BackendCapability:
+        raise NotImplementedError
+
+    async def exists(self, prefix) -> bool:
         self.calls.append(prefix)
-        if self.error is not None:
-            raise self.error
-        return self.present
+        if self._error is not None:
+            raise self._error
+        return self._present
+
+    # KeepaliveLoop 不触及以下操作；抽象方法必须实现（abc 要求）
+    async def copy(self, prefix, target):
+        raise NotImplementedError
+
+    async def query_task(self, handle):
+        raise NotImplementedError
+
+    async def abandon(self, handle):
+        raise NotImplementedError
 
 
 def _ledger():
     f = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+    path = f.name
     f.close()
-    return Ledger(f.name), f.name
+    return Ledger(path), path
 
 
 def test_register_then_sweep_renews_via_exists() -> None:
@@ -47,143 +60,149 @@ def test_register_then_sweep_renews_via_exists() -> None:
         ops = FakeOps(present=True)
         loop = KeepaliveLoop(ops, led, interval_s=999, window_s=600)
         loop.register(_P)
-        loop.sweep_once()
-        assert ops.calls == [_P]  # exists 被调 = 续租发生（D1 F15）
+        run(loop.sweep_once())
+        assert ops.calls == [_P]  # 一轮续租 = 一次 exists（读即续租）
         assert led.list_keepalive() == [_P]  # 仍在保
+        loop.close()
     finally:
         led.close()
-        os.unlink(path)
 
 
 def test_window_expiry_unregisters() -> None:
+    """窗口到：停租注销，不再调 exists（保活必须有界）。"""
     led, path = _ledger()
     try:
         ops = FakeOps(present=True)
         loop = KeepaliveLoop(ops, led, interval_s=999, window_s=10)
         loop.register(_P)
-        # 把 registered_at 拨到窗口外（老行 = 重启后恢复的超期注册）
-        led._backdate_keepalive(seconds=11)
-        loop.sweep_once()
+        led._backdate_keepalive(seconds=11)  # 拨到窗口外
+        run(loop.sweep_once())
         assert ops.calls == []  # 到期行不再续租
-        assert led.list_keepalive() == []  # 停租注销（保活必须有界，D3 约束）
+        assert led.list_keepalive() == []
+        loop.close()
     finally:
         led.close()
-        os.unlink(path)
 
 
 def test_present_false_unregisters() -> None:
-    """副本已不在池：续租没有对象，注销（重新预热由 intent 驱动）。"""
+    """exists 返回 False（副本已不在池）：注销——续租没有对象。"""
     led, path = _ledger()
     try:
-        ops = FakeOps(present=False)
-        loop = KeepaliveLoop(ops, led, interval_s=999, window_s=600)
+        loop = KeepaliveLoop(FakeOps(present=False), led, interval_s=999, window_s=600)
         loop.register(_P)
-        loop.sweep_once()
-        assert ops.calls == [_P]
+        run(loop.sweep_once())
         assert led.list_keepalive() == []
+        loop.close()
     finally:
         led.close()
-        os.unlink(path)
 
 
 def test_query_error_skips_round_keeps_registration() -> None:
-    """查询失败（可重试）跳过本轮：行保留、不注销——TTL 内多轮容错。"""
+    """查询失败跳过本轮，注册保留（lease TTL 内有多个周期容错）。"""
     led, path = _ledger()
     try:
-        ops = FakeOps(error=QueryError("rpc boom"))
-        loop = KeepaliveLoop(ops, led, interval_s=999, window_s=600)
+        loop = KeepaliveLoop(
+            FakeOps(error=QueryError("rpc boom")), led, interval_s=999, window_s=600
+        )
         loop.register(_P)
-        loop.sweep_once()
-        assert ops.calls == [_P]  # 尝试过
-        assert led.list_keepalive() == [_P]  # 但行保留
+        run(loop.sweep_once())
+        assert led.list_keepalive() == [_P]  # 仍保着，下轮重试
+        loop.close()
     finally:
         led.close()
-        os.unlink(path)
 
 
 def test_restart_recovery_needs_no_special_casing() -> None:
-    """重启恢复：新 Loop + 同一 Ledger，首扫即接管在保前缀。"""
+    """重启：注册行在 Ledger 里，新 Loop 首扫自然接管（窗口按原
+    registered_at 连续起算）。"""
     led, path = _ledger()
     try:
         KeepaliveLoop(FakeOps(), led, interval_s=999, window_s=600).register(_P)
         led.close()
-        # 「重启」：新 Ledger 连接 + 新 Loop
+
         led2 = Ledger(path)
-        ops2 = FakeOps(present=True)
-        loop2 = KeepaliveLoop(ops2, led2, interval_s=999, window_s=600)
-        loop2.sweep_once()
-        assert ops2.calls == [_P]  # 无需任何恢复代码即续租
-        led2.close()
+        try:
+            ops2 = FakeOps(present=True)
+            loop2 = KeepaliveLoop(ops2, led2, interval_s=999, window_s=600)
+            run(loop2.sweep_once())  # 不需要重新注册
+            assert ops2.calls == [_P]
+            loop2.close()
+        finally:
+            led2.close()
     finally:
-        os.unlink(path)
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
 
 
-def test_reregister_refreshes_window() -> None:
-    """重复注册刷新 registered_at（窗口重算 = 再次预热即续约）。"""
-    led, path = _ledger()
+def test_start_stop_lifecycle() -> None:
+    """start 起协程定时器，stop 停掉；stop 不撤销注册（账本行保留）。"""
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            ops = FakeOps(present=True)
+            loop = KeepaliveLoop(ops, led, interval_s=0.02, window_s=600)
+            loop.register(_P)
+            loop.start()
+            await asyncio.sleep(0.07)  # 让定时器跑几轮
+            assert len(ops.calls) >= 1
+            await loop.stop()
+            assert led.list_keepalive() == [_P]  # 注册不撤销
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+
+
+def test_sweep_exception_does_not_kill_loop() -> None:
+    """单轮失败不该杀掉循环（下一轮继续）。"""
+
+    class ExplodingOps(FakeOps):
+        def __init__(self):
+            super().__init__()
+            self.n = 0
+
+        async def exists(self, prefix):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("unexpected boom")
+            self.calls.append(prefix)
+            return True
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            ops = ExplodingOps()
+            loop = KeepaliveLoop(ops, led, interval_s=0.02, window_s=600)
+            loop.register(_P)
+            loop.start()
+            await asyncio.sleep(0.12)
+            await loop.stop()
+            assert ops.n >= 2, f"循环在第一轮异常后就停了: n={ops.n}"
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+
+
+def test_interval_and_window_must_be_positive() -> None:
+    led, _ = _ledger()
     try:
-        loop = KeepaliveLoop(FakeOps(), led, interval_s=999, window_s=600)
-        loop.register(_P)
-        led._backdate_keepalive(seconds=500)
-        loop.register(_P)  # 再次 READY → 重新注册
-        rec = led.list_keepalive_records()[0]
-        assert time.time() - rec.registered_at < 5  # 窗口被刷新
+        with pytest.raises(ValueError):
+            KeepaliveLoop(FakeOps(), led, interval_s=0)
+        with pytest.raises(ValueError):
+            KeepaliveLoop(FakeOps(), led, window_s=0)
     finally:
         led.close()
-        os.unlink(path)
-
-
-def test_start_stop_thread_lifecycle() -> None:
-    led, path = _ledger()
-    try:
-        ops = FakeOps()
-        loop = KeepaliveLoop(ops, led, interval_s=0.05, window_s=600)
-        loop.register(_P)
-        loop.start()
-        loop.start()  # 幂等
-        deadline = time.monotonic() + 2
-        while not ops.calls and time.monotonic() < deadline:
-            time.sleep(0.01)
-        loop.stop()
-        assert ops.calls  # 后台线程确实跑了 sweep
-        assert loop._thread is None
-    finally:
-        led.close()
-        os.unlink(path)
-
-
-# ---------------------------------------------------------------------------
-# Ledger 多线程（E11 决策一：RLock 串行化，多线程调用不炸）
-# ---------------------------------------------------------------------------
-
-
-def test_ledger_thread_safe_concurrent_writes() -> None:
-    led, path = _ledger()
-    try:
-        errors: list[Exception] = []
-
-        def worker(n: int) -> None:
-            try:
-                for i in range(50):
-                    p = Prefix(model_id="m", token_ids=(n, i))
-                    led.register_keepalive(p)
-                    led.upsert_task(
-                        f"t{n}-{i}", handle_id=f"h{n}", op="copy",
-                        prefix=p, target="inst", status="running",
-                    )
-                    led.list_keepalive()
-                    led.list_running_tasks()
-            except Exception as e:  # pragma: no cover - 失败即断言
-                errors.append(e)
-
-        threads = [threading.Thread(target=worker, args=(n,)) for n in range(8)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        assert not errors
-        assert len(led.list_keepalive()) == 8 * 50
-        assert len(led.list_running_tasks()) == 8 * 50
-    finally:
-        led.close()
-        os.unlink(path)

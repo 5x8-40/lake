@@ -105,16 +105,28 @@ class KvOps(ABC):
             f"{op}：后端适配器未接线本操作"
         )
 
+    # ------------------------------------------------------------------
+    # 同步 / 异步的分界：**会等待的方法一律 async**
+    #
+    # async（会等待后端 / 网络 / 时间）：copy / move / keepalive /
+    # stop_keepalive / pin / demote / promote / retain / remove /
+    # query_task / abandon / exists
+    #   —— 实现内部把阻塞调用（同步 RPC、sqlite）交给 executor，等待期
+    #      间协程挂起、不占线程（E11 执行模型）
+    # 同步（纯内存查询，无等待）：capability / prefix_of
+    #   —— 给它们加 async 只会平白多一次调度，调用方还得 await
+    # ------------------------------------------------------------------
+
     @abstractmethod
     def capability(self) -> BackendCapability:
         """后端能力声明，初始化时按后端版本填充。编排层按 channel 列选路径。"""
 
     @abstractmethod
-    def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
+    async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机层级为前缀 KV 建副本；源副本由池侧选择。
         READY：任务完成 + 目标侧副本核验通过。"""
 
-    def move(
+    async def move(
         self,
         prefix: Prefix,
         target: InstanceId,
@@ -124,33 +136,33 @@ class KvOps(ABC):
         （复制无此能力，移动才有）。READY 同 copy。"""
         raise self._unsupported("move")
 
-    def keepalive(self, prefix: Prefix) -> None:
+    async def keepalive(self, prefix: Prefix) -> None:
         """注册保活：对前缀 KV 周期续租防驱逐。停止经 stop_keepalive。
         无 READY。"""
         raise self._unsupported("keepalive")
 
-    def stop_keepalive(self, prefix: Prefix) -> None:
+    async def stop_keepalive(self, prefix: Prefix) -> None:
         """注销保活。不是第九项操作——是 keepalive 注册的管理面。"""
         raise self._unsupported("stop_keepalive")
 
-    def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
+    async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
         """元数据标记防驱逐：对已存在的 KV 生效，不写数据。
         SOFT 可解；HARD 写入时固化、不可解，已存在的 KV 无法事后补标
         （能力集 hard_pin_after）。无 READY。"""
         raise self._unsupported("pin")
 
-    def demote(self, prefix: Prefix) -> None:
+    async def demote(self, prefix: Prefix) -> None:
         """放弃前缀 KV 的热层位置。本接口不指定目标层——去向由池的冷热
         策略决定；是否立即生效取决于后端能力（has_per_key_demote 全版本
         均无，实际为停止保活后的自然降层）。无 READY。"""
         raise self._unsupported("demote")
 
-    def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
+    async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """把前缀 KV 提回指定实例本机层级（调度意图，与 demote 的
         「放弃位置」不对称是刻意的）。READY 同 copy。"""
         raise self._unsupported("promote")
 
-    def retain(self, prefix: Prefix) -> TaskHandle:
+    async def retain(self, prefix: Prefix) -> TaskHandle:
         """目的型：让前缀 KV 在源引擎下线后仍存活。目标基线 = 后端主线
         能力：主路径 = 保留身份注册（mooncake main 的 retained client，
         一次注册 RPC 即完成，无异步工作）——返回空句柄 task_ids=()，
@@ -162,12 +174,12 @@ class KvOps(ABC):
         """
         raise self._unsupported("retain")
 
-    def remove(self, prefix: Prefix) -> None:
+    async def remove(self, prefix: Prefix) -> None:
         """删除前缀 KV 的全部副本，全局生效。无 READY。"""
         raise self._unsupported("remove")
 
     @abstractmethod
-    def query_task(self, handle: TaskHandle) -> TaskStatus:
+    async def query_task(self, handle: TaskHandle) -> TaskStatus:
         """查询任务状态。任务管理面，非第九项 KV 操作。
 
         失败语义：核验失败抛 VerifyError（终态）；查询本身失败抛
@@ -175,7 +187,7 @@ class KvOps(ABC):
         """
 
     @abstractmethod
-    def abandon(self, handle: TaskHandle) -> None:
+    async def abandon(self, handle: TaskHandle) -> None:
         """放弃跟踪：删除核验登记，任务状态记为 abandoned。
 
         不是任务取消——后端没有任务取消能力，已发起的传输可能仍在进
@@ -185,7 +197,7 @@ class KvOps(ABC):
         """
 
     @abstractmethod
-    def exists(self, prefix: Prefix) -> bool:
+    async def exists(self, prefix: Prefix) -> bool:
         """前缀 KV 是否完整在池（全部 key 都在）。
 
         查询面，非第九项 KV 操作。注意：读即续租（能力集 has_lease）——

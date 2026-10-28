@@ -19,6 +19,8 @@ import types
 
 import pytest
 
+from conftest import run
+
 from kvcm.backends.mooncake.backend import MooncakeBackend, encode_task_id
 from kvcm.backends.mooncake.capability import mooncake_v0311
 from kvcm.backends.mooncake.client import StoreClient
@@ -109,7 +111,7 @@ def _first_life(path: str, kc: KeyComputer) -> None:
         kc,
         led,
     )
-    b1.copy(_P, _T)
+    run(b1.copy(_P, _T))
     assert len(led.list_running_tasks()) == 2  # 两 key 两任务
     led.close()  # 进程死亡：backend 对象随进程消失，无任何退出序列
 
@@ -136,8 +138,8 @@ def test_restart_recovers_to_ready_and_registers_keepalive(
     restored = b2.rebuild()
     assert len(restored) == 1
     for h in restored:
-        eng.track(h, poll_s=0.01).result(timeout=5)
-    eng.shutdown()
+        run(eng.track(h, poll_s=0.01))
+    run(eng.shutdown())
 
     assert ka.registered == [_P]  # 重启后来不及注册的保活在 track READY 补上
     assert led2.list_running_tasks() == []
@@ -163,8 +165,8 @@ def test_restart_terminal_failure_does_not_register(
     eng = TaskEngine(b2, keepalive=ka)
     restored = b2.rebuild()
     for h in restored:
-        eng.track(h, poll_s=0.01).result(timeout=5)
-    eng.shutdown()
+        run(eng.track(h, poll_s=0.01))
+    run(eng.shutdown())
 
     assert ka.registered == []  # 失败终态不保活
     assert led2.list_running_tasks() == []
