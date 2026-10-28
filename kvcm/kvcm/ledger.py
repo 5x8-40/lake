@@ -13,7 +13,6 @@
 
 from __future__ import annotations
 
-import functools
 import hashlib
 import json
 import sqlite3
@@ -117,16 +116,28 @@ class Ledger:
         self._path = path
         self._conn: sqlite3.Connection | None = None
         self._closed = False
+        self._worker_ident: int | None = None
         # 建连接与建表在 executor 线程内完成（连接归属该线程）
-        self._run(self._open)
+        try:
+            self._run(self._open)
+        except BaseException:
+            # 建库失败：不留悬空的 executor 线程
+            self._executor.shutdown(wait=False)
+            raise
 
     def _open(self) -> None:
+        self._worker_ident = threading.get_ident()
         self._conn = sqlite3.connect(self._path)
         self._conn.executescript(_SCHEMA)
 
     def _run(self, fn, *args, **kwargs):
-        """在 executor 线程内执行 fn；已在该线程时就地执行（防自死锁）。"""
-        if threading.current_thread().name.startswith("kvcm-ledger"):
+        """在 executor 线程内执行 fn；已在该线程时就地执行（防自死锁）。
+
+        用线程 ident 判定（不是线程名前缀）：进程里可能有多个 Ledger，
+        各自的 worker 线程名相同——按名字判定会让「A 的 worker 调 B」
+        被误判成就地执行，把 B 的连接用在错误线程上。
+        """
+        if self._worker_ident is not None and threading.get_ident() == self._worker_ident:
             return fn(*args, **kwargs)
         return self._executor.submit(fn, *args, **kwargs).result()
 
