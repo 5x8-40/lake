@@ -363,8 +363,7 @@ class TaskEngine:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
         try:
-            await self._track_loop(handle, prefix, loop, deadline, poll_s,
-                                   timeout_s)
+            await self._track_loop(handle, prefix, loop, deadline, poll_s)
         except asyncio.CancelledError:
             # 进程退出取消：断开跟踪并记账（否则账本留 running，重启又
             # 被 rebuild 捞回来跟）。后端任务不取消（无此能力）。
@@ -374,12 +373,19 @@ class TaskEngine:
                 pass
             raise
 
-    async def _track_loop(self, handle, prefix, loop, deadline, poll_s, timeout_s):
+    async def _track_loop(self, handle, prefix, loop, deadline, poll_s):
+        """轮询恢复的句柄到终态。
+
+        三种「非终态」的处理各有明确语义：
+        - `QueryError` → 本轮无结论（可重试），继续轮询到 deadline
+        - `VerifyError` → 终态（核验失败已由 backend 记账），停止跟踪
+        - `KeyError` → 句柄已被 abandon（账本已记 abandoned），停止跟踪
+        """
         while True:
             try:
                 status = await self._ops.query_task(handle)
             except QueryError:
-                status = None  # 可重试，超时兜底
+                status = None  # 本轮无结论：继续轮询（不是终态）
             except VerifyError:
                 return  # 终态（核验失败已记账），不再跟踪
             except KeyError:

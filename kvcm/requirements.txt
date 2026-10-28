@@ -1,3 +1,5 @@
 # kvcm 运行时依赖（E12 起）
-grpcio==1.80.0
-protobuf==6.33.6
+# 版本与主仓根 pyproject.toml 对齐：stub 生成物校验 protobuf runtime 下限，
+# 跨 python/ 与 kvcm/ 两处必须一致，否则 CI 一边过一边挂。
+grpcio>=1.82.1
+protobuf>=7.35.0
