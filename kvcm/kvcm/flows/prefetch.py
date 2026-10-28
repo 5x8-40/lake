@@ -62,10 +62,10 @@ class PrefetchFlow:
         timeout_s 从 exists 通过起算、覆盖 copy 提交——大前缀逐 key 串行
         提交本身可达几十秒，不计入则超时预算失真。
 
-        handle_sink：可选回调，copy 提交成功即带上句柄调用一次（在途
-        句柄上报——TaskEngine 退出收口（abandon）需要拿到句柄，句柄
-        此前只在流程局部作用域里，进程级收口无从下手）。不改变流程
-        语义。
+        handle_sink：可选回调，copy 提交成功即带上句柄调用一次。**退出
+        收口不靠它**——取消（`CancelledError`）由 `run_after_exists` 自
+        己 abandon，见那里的说明。保留此参数是为了让调用方能观测到在途
+        句柄（调试、脚本），不改变流程语义。
         """
         if not await self._ops.exists(prefix):
             raise PrefetchError(
@@ -73,6 +73,25 @@ class PrefetchFlow:
                 "或异构前提未满足（源引擎未开 tp_mismatch / PEER_TP_SIZE 两端错位，"
                 "则 effective 空间 key 全 miss）"
             )
+        await self.run_after_exists(
+            prefix, target, poll_s=poll_s, timeout_s=timeout_s, handle_sink=handle_sink
+        )
+
+    async def run_after_exists(
+        self,
+        prefix: Prefix,
+        target: InstanceId,
+        *,
+        poll_s: float = 0.5,
+        timeout_s: float = 120.0,
+        handle_sink=None,
+    ) -> None:
+        """存在性检查已通过之后的步骤：copy 提交 → 轮询到终态。
+
+        单独成方法是为了让编排层决定**传输闸的范围**：exists 是毫秒级
+        探测、不该占传输名额；「提交 → 等终态」才是真正占用后端带宽的
+        那一段。见 `TaskEngine._run_prefetch`。
+        """
         deadline = time.monotonic() + timeout_s
         try:
             handle = await self._ops.copy(prefix, target)
@@ -80,25 +99,35 @@ class PrefetchFlow:
             raise PrefetchError(f"copy submit failed: {e}") from e
         if handle_sink is not None:
             handle_sink(handle)
-        while True:
+        try:
+            while True:
+                try:
+                    status = await self._ops.query_task(handle)
+                except VerifyError as e:
+                    # 任务完成但副本不到位：终态，带明细
+                    raise PrefetchError(f"replica verify failed: {e}") from e
+                except QueryError:
+                    # 查询 RPC 失败：可重试，超时兜底。只捕获 QueryError——
+                    # 编程错误（KeyError/TypeError 等）直接传播，不得吞成超时。
+                    status = None
+                if status is TaskStatus.READY:
+                    return
+                if status is TaskStatus.FAILED:
+                    raise PrefetchError(f"copy task failed (handle={handle})")
+                if time.monotonic() >= deadline:
+                    # 超时收口：放弃跟踪（删登记 + 记 abandoned）；后端任务
+                    # 可能仍在进行，副本清理由 remove 负责。
+                    await self._ops.abandon(handle)
+                    raise PrefetchError(
+                        f"copy not READY after {timeout_s}s (handle={handle})"
+                    )
+                await asyncio.sleep(poll_s)
+        except asyncio.CancelledError:
+            # 进程退出取消：断开跟踪并记账（Ledger 记 abandoned）。
+            # 不这样做的话账本会留 running，重启又被 rebuild 捞回来跟。
+            # 后端任务本身不取消（无此能力），副本清理由 remove 负责。
             try:
-                status = await self._ops.query_task(handle)
-            except VerifyError as e:
-                # 任务完成但副本不到位：终态，带明细
-                raise PrefetchError(f"replica verify failed: {e}") from e
-            except QueryError:
-                # 查询 RPC 失败：可重试，超时兜底。只捕获 QueryError——
-                # 编程错误（KeyError/TypeError 等）直接传播，不得吞成超时。
-                status = None
-            if status is TaskStatus.READY:
-                return
-            if status is TaskStatus.FAILED:
-                raise PrefetchError(f"copy task failed (handle={handle})")
-            if time.monotonic() >= deadline:
-                # 超时收口：放弃跟踪（删登记 + 记 abandoned）；后端任务
-                # 可能仍在进行，副本清理由 remove 负责。
                 await self._ops.abandon(handle)
-                raise PrefetchError(
-                    f"copy not READY after {timeout_s}s (handle={handle})"
-                )
-            await asyncio.sleep(poll_s)
+            except KeyError:
+                pass  # 已终态被移除登记
+            raise

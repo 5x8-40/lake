@@ -6,12 +6,18 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import enum
 import sys
 import tempfile
+import threading
+import time
 import types
 
 import pytest
+
+from conftest import run
 
 from conftest import run
 
@@ -763,3 +769,158 @@ def test_ledger_gc_tasks() -> None:
             assert led.get_task("new-ready") is not None
     finally:
         os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# drain（退出时等 RPC 线程真正退完）
+# ---------------------------------------------------------------------------
+
+
+def test_rpc_timeout_raises_query_error(fake_store_module, monkeypatch) -> None:
+    """RPC 卡住超过 rpc_timeout_s → 抛 QueryError（可重试语义）。
+
+    线程不会被打断（Python 无法中断 C++ 调用）——它继续跑到自然结束，
+    由退出时 `close()` 的有界等待兜底。调用方按可重试处理，不会无限等。
+    """
+
+    class HangingClient(FakeClient):
+        def is_exist(self, keys):
+            time.sleep(1.0)
+            return [True] * len(keys)
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    _backend_with_timeout = MooncakeBackend(
+        client=HangingClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        rpc_timeout_s=0.1,
+    )
+    from kvcm.ops.base import QueryError
+
+    async def scenario():
+        with pytest.raises(QueryError, match="RPC timeout"):
+            await _backend_with_timeout.exists(Prefix(model_id="qwen", token_ids=(1,)))
+
+    run(scenario())
+    _backend_with_timeout.close()
+
+
+def test_rpc_timeout_disabled_when_zero(fake_store_module, monkeypatch) -> None:
+    """rpc_timeout_s <= 0 表示不设超时（离线/调试场景）。"""
+
+    class FastClient(FakeClient):
+        def is_exist(self, keys):
+            return [True] * len(keys)
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=FastClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        rpc_timeout_s=0,
+    )
+
+    async def scenario():
+        assert await b.exists(Prefix(model_id="qwen", token_ids=(1,))) is True
+
+    run(scenario())
+    b.close()
+
+
+def test_copy_submit_timeout_is_submit_error(fake_store_module, monkeypatch) -> None:
+    """copy 提交超时 → SubmitError（不是 QueryError）——提交阶段的失败
+    语义归 SubmitError，异常消息带已发任务号。"""
+
+    class SlowSubmitClient(FakeClient):
+        def create_copy_task(self, key, targets):
+            time.sleep(1.0)
+            return super().create_copy_task(key, targets)
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=SlowSubmitClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        rpc_timeout_s=0.1,
+    )
+    from kvcm.ops.base import SubmitError
+
+    async def scenario():
+        with pytest.raises(SubmitError):
+            await b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+
+    run(scenario())
+    b.close()
+
+
+
+def test_close_waits_bounded_for_inflight_rpc(fake_store_module, monkeypatch) -> None:
+    """close() 有界等线程：慢 RPC 会被等到，卡死的不会永远拖住退出。"""
+    from kvcm.ops.base import QueryError
+
+    class SlowClient(FakeClient):
+        def is_exist(self, keys):
+            time.sleep(0.2)
+            return [True] * len(keys)
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=SlowClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        rpc_timeout_s=0.05,
+    )
+    p = Prefix(model_id="qwen", token_ids=(1,))
+
+    async def scenario():
+        with pytest.raises(QueryError):
+            await b.exists(p)  # 超时返回，但线程还在跑
+
+    run(scenario())
+    # close 会等这个线程（0.2s 内跑完，5s 上限足够）
+    import time as _t
+
+    start = _t.monotonic()
+    b.close(wait_timeout_s=5.0)
+    elapsed = _t.monotonic() - start
+    # 关键：close 等了那个慢线程（≥0.15s），不是立刻返回
+    assert elapsed >= 0.1, f"close 没等慢 RPC（{elapsed:.2f}s）"
+
+
+def test_close_bounded_when_rpc_hangs(fake_store_module, monkeypatch) -> None:
+    """RPC 卡死：close 不会永远挂住（有界）。"""
+    import time as _time
+
+    class HangingClient(FakeClient):
+        def is_exist(self, keys):
+            _time.sleep(3)
+            return [True] * len(keys)
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=HangingClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        rpc_timeout_s=0.05,
+    )
+    p = Prefix(model_id="qwen", token_ids=(1,))
+
+    async def scenario():
+        with pytest.raises(Exception):
+            await b.exists(p)
+
+    run(scenario())
+    start = _time.monotonic()
+    b.close(wait_timeout_s=0.3)  # 远小于 RPC 的 3s
+    elapsed = _time.monotonic() - start
+    assert elapsed < 1.5, f"close 没有有界返回（用了 {elapsed:.2f}s）"

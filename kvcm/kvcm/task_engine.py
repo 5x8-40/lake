@@ -107,7 +107,11 @@ class TaskEngine:
         self._records: dict[str, _IntentRecord] = {}
         self._accepting = True
         self._consumers: list[asyncio.Task] = []
-        self._consumer_count = consumer_count or max_concurrent
+        self._recover_tasks: list[asyncio.Task] = []
+        # 消费者数默认远大于闸名额：出队后先做 exists（闸外），再在
+        # 闸上挂起。若等于名额数，第 N+1 个 intent 连队列都出不来，
+        # 它的 exists 会被在途传输堵住（定稿要避免的）
+        self._consumer_count = consumer_count or max(16, max_concurrent * 4)
         self._loop: asyncio.AbstractEventLoop | None = None
 
     # ------------------------------------------------------------------
@@ -123,20 +127,33 @@ class TaskEngine:
             )
 
     async def shutdown(self, *, timeout_s: float = 5.0) -> None:
-        """优雅退出：停收 → 取消消费者 → 等它们退出（有界）→ 取消在途。
+        """优雅退出：停收 → 取消协程 → 有界等待协程退出。
 
-        消费者被取消时，正在执行的 intent 任务收到 `CancelledError`，由
-        flow 收口（Ledger 记 abandoned）。取消**不是**取消后端任务（后端
-        无此能力），只断开跟踪；副本清理由 remove 负责。等满 5 秒仍有未
-        退出的，不再等——泄漏随进程消失（账本已记 abandoned，重启由
-        rebuild 兜底）。
+        两步，缺一不可：
+
+        1. **取消协程**：在途 intent 收到 `CancelledError`，flow 收口
+           （Ledger 记 abandoned）。取消**不是**取消后端任务（后端无此
+           能力），只断开跟踪；副本清理由 remove 负责。
+        等 RPC 线程真正结束**不在这里**：池由 daemon 创建并注入，等待写在
+        daemon 的退出收尾（`_wait_executor`）——因为 `backend.close()` 对
+        注入的池会直接 return，等不到。本方法只管协程侧（取消 + 有界等待）。
+        分成两处的原因：协程的取消与线程的结束是两件事，
+        `run_in_executor` 取消时不会结束线程。
         """
         self._accepting = False
-        for c in self._consumers:
-            c.cancel()
-        if self._consumers:
-            await asyncio.wait(self._consumers, timeout=timeout_s)
+        # ① 取消范围：消费者 + 恢复跟踪任务（后者由 daemon 经
+        #    track_in_background 起）
+        targets = list(self._consumers) + list(self._recover_tasks)
+        for t in targets:
+            t.cancel()
+        if targets:
+            await asyncio.wait(targets, timeout=timeout_s)
         self._consumers.clear()
+        self._recover_tasks.clear()
+        # ② 注意：取消协程**不会**结束线程里的 RPC（run_in_executor 的取消
+        #    只是不再等结果）。等线程的事归 daemon 的 `_wait_executor`——
+        #    池由 daemon 创建并注入，`backend.close()` 对注入的池会直接
+        #    return（`_owns_executor` 为假），等不到。这里不做。
         # 队列里还没被取走的：标记失败，别让调用方永远等一个 PENDING
         while not self._queue.empty():
             rec = self._queue.get_nowait()
@@ -164,12 +181,55 @@ class TaskEngine:
 
         线程安全：可从任意线程调用（经 `call_soon_threadsafe` 入队）。
         """
+        # 停收检查放这里（同步、立即失败）：`_accepting` 是简单布尔读，
+        # 跨线程读安全。最坏情况是关闭瞬间放行一个 intent——`_admit` 在
+        # 循环线程里还会再判一次，双重保险。让调用方明确收到 UNAVAILABLE
+        # 比「拿到的 key 永远查不到状态」好得多。
         if not self._accepting:
             raise RuntimeError("task engine is shutting down")
+        loop = self._loop
+        if loop is None:
+            raise RuntimeError("task engine not started (call start() first)")
         key = intent_id_of(prefix, target)
+        # 去重与入队都投递到事件循环线程内完成——gRPC 用多线程接请求，
+        # 「先查 _records 再写」在这里跨线程会重复执行（两个线程同时看
+        # 到无记录，各入队一次）
+        loop.call_soon_threadsafe(
+            self._admit, key, prefix, target, poll_s, timeout_s
+        )
+        return key
+
+    def _admit(
+        self,
+        key: str,
+        prefix: Prefix,
+        target: InstanceId,
+        poll_s: float,
+        timeout_s: float,
+    ) -> None:
+        """在事件循环线程内做去重判定与入队（submit_intent 的投递目标）。"""
+        if not self._accepting:
+            # 停收：已有记录时**不能覆盖**（正在跑的那条还在改旧对象，
+            # 覆盖会让 GetTask 看到 "rejected" 而实际还在执行）
+            if key in self._records:
+                return
+            # 无记录：记一条 FAILED 而不是丢弃——调用方已经拿到 key
+            # （同步检查与这里之间有空隙），丢弃会让它的 GetTask 永远 UNKNOWN
+            rec = _IntentRecord(
+                intent_id=key,
+                prefix=prefix,
+                target=target,
+                poll_s=poll_s,
+                timeout_s=timeout_s,
+            )
+            rec.status = IntentStatus.FAILED
+            rec.detail = "rejected (shutting down)"
+            rec.done.set()
+            self._records[key] = rec
+            return
         existing = self._records.get(key)
         if existing is not None and existing.status is IntentStatus.PENDING:
-            return key  # 在途去重
+            return  # 在途去重
         rec = _IntentRecord(
             intent_id=key,
             prefix=prefix,
@@ -178,11 +238,12 @@ class TaskEngine:
             timeout_s=timeout_s,
         )
         self._records[key] = rec
-        loop = self._loop
-        if loop is None:
-            raise RuntimeError("task engine not started (call start() first)")
-        loop.call_soon_threadsafe(self._enqueue, rec)
-        return key
+        try:
+            self._queue.put_nowait(rec)
+        except asyncio.QueueFull:
+            rec.status = IntentStatus.FAILED
+            rec.detail = "rejected (queue full)"
+            rec.done.set()
 
     def intent_status(self, intent_id: str) -> IntentStatus | None:
         """查询 intent 执行状态（回执通道）。None = 未知 intent_id。"""
@@ -220,18 +281,20 @@ class TaskEngine:
         """rebuild 恢复的 handle 收编：只轮询到终态（不重跑流程）。"""
         await self._track(handle, poll_s, timeout_s)
 
+    def track_in_background(
+        self, handle: TaskHandle, *, poll_s: float = 1.0, timeout_s: float = 300.0
+    ) -> None:
+        """起一个后台 task 收编恢复的 handle，并**登记**它——shutdown 要
+        能取消并等待它（否则退出时它可能还停在 query_task 里，调用方随
+        即关 client）。"""
+        t = asyncio.create_task(
+            self._track(handle, poll_s, timeout_s), name="kvcm-recover"
+        )
+        self._recover_tasks.append(t)
+
     # ------------------------------------------------------------------
     # 内部
     # ------------------------------------------------------------------
-
-    def _enqueue(self, rec: _IntentRecord) -> None:
-        """在事件循环线程内入队（由 call_soon_threadsafe 投递）。"""
-        try:
-            self._queue.put_nowait(rec)
-        except asyncio.QueueFull:
-            rec.status = IntentStatus.FAILED
-            rec.detail = "rejected (queue full)"
-            rec.done.set()
 
     async def _consume_loop(self) -> None:
         """消费者：出队 → 过闸 → 执行 → 记终态。"""
@@ -250,6 +313,12 @@ class TaskEngine:
             except PrefetchError as e:
                 rec.status = IntentStatus.FAILED
                 rec.detail = f"{type(e).__name__}: {e}"[:500]
+            except QueryError as e:
+                # exists 的查询失败（不包成 PrefetchError）只该判定这次
+                # intent 失败——**不能向上抛**，否则消费者协程退出，几次
+                # 抖动后全部消费者死光、新 intent 永远 PENDING
+                rec.status = IntentStatus.FAILED
+                rec.detail = f"{type(e).__name__}: {e}"[:500]
             except Exception as e:  # 编程错误也留原因，再往上抛（不吞）
                 rec.status = IntentStatus.FAILED
                 rec.detail = f"{type(e).__name__}: {e}"[:500]
@@ -265,10 +334,24 @@ class TaskEngine:
         poll_s: float,
         timeout_s: float,
     ) -> None:
-        """跑一次预热：限速 → 过传输闸 → flow.run → 释放；成功后注册保活。"""
+        """跑一次预热。
+
+        传输闸的范围（定稿）：**exists 探测在闸外**（毫秒级操作不该被
+        传输堵），只有「提交后台传输 → 等到终态」这一段占名额——名额
+        的语义是「后端还在为这个前缀搬数据」，轮询期间确实如此。
+        """
         await self._throttle()
+        # 闸外：存在性检查（毫秒级 RPC，读即续租）
+        if not await self._ops.exists(prefix):
+            raise PrefetchError(
+                "prefix not fully in pool — warm 未覆盖该前缀、key 口径与引擎漂移，"
+                "或异构前提未满足（源引擎未开 tp_mismatch / PEER_TP_SIZE 两端错位，"
+                "则 effective 空间 key 全 miss）"
+            )
         async with self._gate:
-            await self._flow.run(prefix, target, poll_s=poll_s, timeout_s=timeout_s)
+            await self._flow.run_after_exists(
+                prefix, target, poll_s=poll_s, timeout_s=timeout_s
+            )
         # READY 接线：副本已核验到位 → 注册保活（窗口策略归 Loop）
         if self._keepalive is not None:
             self._keepalive.register(prefix)
@@ -279,6 +362,19 @@ class TaskEngine:
         prefix = self._ops.prefix_of(handle)
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
+        try:
+            await self._track_loop(handle, prefix, loop, deadline, poll_s,
+                                   timeout_s)
+        except asyncio.CancelledError:
+            # 进程退出取消：断开跟踪并记账（否则账本留 running，重启又
+            # 被 rebuild 捞回来跟）。后端任务不取消（无此能力）。
+            try:
+                await self._ops.abandon(handle)
+            except KeyError:
+                pass
+            raise
+
+    async def _track_loop(self, handle, prefix, loop, deadline, poll_s, timeout_s):
         while True:
             try:
                 status = await self._ops.query_task(handle)

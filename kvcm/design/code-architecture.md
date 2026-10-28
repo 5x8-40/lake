@@ -481,7 +481,10 @@ sequenceDiagram
 - **禁用 `to_thread` 默认池**（`min(32, cpu+4)`，大小不可控）——自建 executor 并显式配置
 - **RPC executor**：按 RPC 执行密度配（4~8），与传输闸的名额数**不绑定**——传输闸限「同时在后端传输的任务数」（保护后端），线程只为 RPC 执行的那一瞬间服务
 - **Ledger 专用单线程 executor**（`max_workers=1`）：sqlite 调用全部 `to_thread` 到它——天然串行，不用加锁
-- **线程泄漏监控**：RPC 卡死会慢性漏线程——定期看各池活跃线程数，持续偏高即告警（根治靠 RPC 超时参数，有无该参数列入 E6 核对）
+- **线程卡死监控（未实现，登记 E6）**：线程池的线程数固定，恶化的是「可用线程」——线程卡在无响应的 RPC 里出不来，池的实际并发逐次递减，卡满即服务假死。监控要看的是「在飞调用持续多久没结束」而不是线程总数——需要按调用记开始时间（当前无此数据）。
+  - 当前用 `_rpc` 的 30 秒 `wait_for` 兜底：协程侧最多等 30 秒就报错，**服务不会假死**（任务失败，但池继续接活）；慢性的线程占用仍在
+  - 根治靠 mooncake 自带 RPC 超时（0.3.11 无；main 有 `MC_RPC_TIMEOUT_MS` / `MC_RPC_CONNECT_TIMEOUT_MS`）——升级并配置后这个问题自然消失，届时不需额外监控代码
+- **启动期 connect 借默认池的例外已消除**：RPC 池在 `connect` 之前创建，`connect` 用同一个池（借一个线程、用完即还，启动期无其他任务争用）
 
 ### TaskEngine
 
@@ -512,9 +515,9 @@ sequenceDiagram
 - **优雅退出**（SIGTERM/SIGINT）五步：
   1. **停收 intent**——占位入口关闭，不接新活
   2. **取消在途协程**（`task.cancel()`）——协程在 `await` 点收到 `CancelledError`；flow 捕获后做 abandon 处理（Ledger 记 abandoned；后端无任务取消能力 P9，传输不取消，副本清理归 remove）
-  3. **等在途协程全部退出**——有界等待 5 秒（RPC 毫秒级 + abandon 记账毫秒级，余量充足）；**等满还有协程未退则不再等**，直接走后续步骤，泄漏线程随进程消失
+  3. **等在途协程全部退出**——有界等待 5 秒（RPC 毫秒级 + abandon 记账毫秒级，余量充足）；**等满还有协程未退则不再等**，直接走后续步骤（未退的协程随进程消失——这与 RPC **线程**不同，见第 5 步）
   4. **KeepaliveLoop 停止**
-  5. **`StoreClient.close()`**——显式关闭（demo 已知退出期析构竞态）
+  5. **等 RPC 线程结束，再 `StoreClient.close()`**——顺序不能反：`run_in_executor` 取消不等线程函数结束，先关 client 会与在途 RPC 并发（demo 踩过的退出期崩溃正是这个形状）。等待有界（`shutdown_timeout_s`，默认 5 秒）；**超时则 client 和 ledger 都不关**——因为 worker 是非 daemon 线程（CPython 硬编码），解释器退出会 join 它们，进程本来就要靠 SIGKILL，此时拆资源只会多制造一次崩溃。
 - 协程取消只在 `await` 点生效——不会在 RPC 执行中途切走，是干净的中断点。重启恢复只认 `status='running'` 的记录（SIGKILL 强杀场景：rebuild 当「还在跑」恢复跟踪）；abandoned 是终态，不恢复——abandon 的本意就是放弃跟踪
 
 ## 设计原则

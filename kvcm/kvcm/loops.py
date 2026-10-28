@@ -63,6 +63,7 @@ class KeepaliveLoop:
         self._owns_executor = executor is None
         self._task: asyncio.Task | None = None
         self._stop = False
+        self._register_failures = 0
         self._loop: asyncio.AbstractEventLoop | None = None
 
     # ------------------------------------------------------------------
@@ -75,22 +76,62 @@ class KeepaliveLoop:
         调用场景：TaskEngine 在副本 READY 后注册。**同一前缀 × 同一实例
         不会重复预热**（幂等键挡住），所以刷新窗口是防御性的，不是常态
         路径。
+
+        **不抛异常**：保活失败只意味着副本可能提前变冷，不是预热失败。
+        这里吞掉并计数（`register_failures`），避免把已经 READY 的 intent
+        误记成 FAILED。
         """
         self._submit_ledger(self._ledger.register_keepalive, prefix)
 
     def unregister(self, prefix: Prefix) -> None:
         self._submit_ledger(self._ledger.unregister_keepalive, prefix)
 
+    @property
+    def register_failures(self) -> int:
+        """保活写入失败累计数（监控用；>0 说明副本可能提前变冷）。"""
+        return self._register_failures
+
     def _submit_ledger(self, fn, *args) -> None:
-        """Ledger 写入投递到事件循环线程（它自己再转给 Ledger 专用线程）。
-        若事件循环还没起（daemon 启动早期），就地同步执行。"""
+        """把 Ledger 写入交给 executor 执行（不阻塞调用方）。
+
+        三条避坑（都是并发/退出期会踩到的）：
+
+        1. **绝不抛到调用方**：调用方是 `_run_prefetch` 的末尾——那里抛
+           异常会把已经 READY 的 intent 记成 FAILED。失败只计数。
+        2. **不在调用线程直接跑 sqlite**：调用方可能就是事件循环线程
+           （协程里调 register），就地执行会卡住整个循环。
+        3. **持有 task 并观察结果**：`ensure_future` 的返回值丢弃的话，
+           写入失败会变成「exception was never retrieved」，注册方看不到。
+        """
         loop = self._loop
         if loop is None or not loop.is_running():
-            fn(*args)
+            # 事件循环未起（daemon 启动早期）：交给 executor 直接跑，
+            # 不在调用线程做 sqlite
+            try:
+                self._executor.submit(fn, *args)
+            except RuntimeError:
+                self._note_failure()  # 池已关（退出期）
             return
-        loop.call_soon_threadsafe(
-            lambda: asyncio.ensure_future(self._ledger_call(fn, *args))
-        )
+        try:
+            loop.call_soon_threadsafe(self._schedule_ledger_write, fn, args)
+        except RuntimeError:
+            # 循环正在关闭（is_running() 为真但已不可投递）
+            self._note_failure()
+
+    def _schedule_ledger_write(self, fn, args) -> None:
+        """在事件循环线程内建 task 并挂观察者（由 call_soon_threadsafe 投递）。"""
+        task = asyncio.ensure_future(self._ledger_call(fn, *args))
+        task.add_done_callback(self._on_ledger_write_done)
+
+    def _on_ledger_write_done(self, task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            self._note_failure(exc)
+
+    def _note_failure(self, exc: BaseException | None = None) -> None:
+        self._register_failures += 1
 
     async def _ledger_call(self, fn, *args):
         loop = asyncio.get_running_loop()

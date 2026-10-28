@@ -14,8 +14,12 @@
    不阻塞；任务执行全在事件循环里
 5. 等 SIGTERM / SIGINT
 
-优雅退出五步：停收 intent → 取消在途协程 → 有界等待（5 秒）→
-KeepaliveLoop 停 → StoreClient.close()。
+优雅退出：停收 intent → 取消在途协程 → 有界等待协程（5 秒）→
+KeepaliveLoop 停 → **等 RPC 线程结束** → StoreClient.close() + ledger.close()。
+
+最后一步有前提：RPC 线程等满仍未结束（RPC 卡死）时，**client 和 ledger
+都不关**——worker 是非 daemon 线程，解释器退出会 join 它们，进程本来就
+要靠 SIGKILL；此时拆资源只会多制造一次并发崩溃。
 
 locate 本期静态注入（`--segs`，单实例冒烟形态）；生产 locate =
 L1 InstanceWatcher 注册，归 E13。
@@ -32,7 +36,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import signal
+import sys
+from concurrent.futures import ThreadPoolExecutor
 
 from kvcm.api.grpc_server import IntentGrpcServer
 from kvcm.backends.mooncake.backend import MooncakeBackend
@@ -45,7 +52,10 @@ from kvcm.task_engine import TaskEngine
 
 
 def build_backend(
-    args: argparse.Namespace, client: StoreClient, ledger: Ledger
+    args: argparse.Namespace,
+    client: StoreClient,
+    ledger: Ledger,
+    executor: ThreadPoolExecutor | None = None,
 ) -> MooncakeBackend:
     """按参数组装 backend。独立成函数便于测试注入（fake client +
     静态 locate 即可起进程壳）。"""
@@ -65,37 +75,84 @@ def build_backend(
         locate=lambda _inst: list(segs),  # 静态注入；生产 = InstanceWatcher（E13）
         capability=capability,
         ledger=ledger,
+        rpc_timeout_s=args.rpc_timeout_s,
+        executor=executor,
     )
+
+
+def _wait_executor(executor: ThreadPoolExecutor, timeout_s: float) -> bool:
+    """有界等线程池全部 worker 结束；**返回是否真的等完了**。
+
+    为什么要等：`run_in_executor` 取消时不等线程函数结束——协程结束了，
+    mooncake 绑定可能还在跑。关 client 前必须等线程。
+
+    **超时意味着什么**（必须说清，别写成「线程随进程消失」）：
+    `ThreadPoolExecutor` 的 worker 是**非 daemon** 线程（CPython 硬编码），
+    解释器退出时会 `join` 它们。所以 RPC 卡死时：
+      - 本函数超时返回 False，但进程仍然退不出去（挂在解释器退出）
+      - 只能靠外部 SIGKILL
+    调用方据此**跳过 client.close()**：反正要强杀，不必再去拆一个正被
+    使用的 client（那只会多制造一次崩溃）。
+    """
+    import threading
+
+    done = threading.Event()
+
+    def _shutdown() -> None:
+        try:
+            executor.shutdown(wait=True)
+        finally:
+            done.set()
+
+    threading.Thread(target=_shutdown, name="kvcm-rpc-wait", daemon=True).start()
+    return done.wait(timeout=timeout_s)
 
 
 async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
     """事件循环内的主流程。"""
     ledger = Ledger(args.ledger)
     client = StoreClient()
-    loop: KeepaliveLoop | None = None
+    # RPC 池在 connect 之前建：connect 也是同步阻塞调用，用它才符合
+    # 「不使用默认池」的定稿（connect 借一个线程、用完即还；启动期没有
+    # 其他任务争用）。池大小 = max(4, min(8, cpu))，与 backend 内部默认一致。
+    executor = ThreadPoolExecutor(
+        max_workers=max(4, min(8, (os.cpu_count() or 4))),
+        thread_name_prefix="kvcm-rpc",
+    )
+    keepalive: KeepaliveLoop | None = None
     engine: TaskEngine | None = None
     backend: MooncakeBackend | None = None
     grpc_server: IntentGrpcServer | None = None
     try:
-        client.connect(
-            local_hostname=args.local_hostname,
-            master_server_address=args.master,
-            protocol=args.protocol,
-            ascend_device=args.device,
+        loop = asyncio.get_running_loop()
+        # connect / rebuild 都是同步阻塞调用（connect 含 TCP 握手+注册，
+        # rebuild 内含 Ledger 的 submit().result()）——不能占事件循环线程，
+        # 否则启动期信号处理都要等它们返回
+        await loop.run_in_executor(
+            executor,
+            lambda: client.connect(
+                local_hostname=args.local_hostname,
+                master_server_address=args.master,
+                protocol=args.protocol,
+                ascend_device=args.device,
+            ),
         )
-        backend = build_backend(args, client, ledger)
-        loop = KeepaliveLoop(
+        backend = build_backend(args, client, ledger, executor=executor)
+        keepalive = KeepaliveLoop(
             backend,
             ledger,
             interval_s=args.keepalive_interval_s,
             window_s=args.keepalive_window_s,
+            executor=backend.executor,
         )
-        engine = TaskEngine(backend, keepalive=loop, max_concurrent=args.max_concurrent)
+        engine = TaskEngine(backend, keepalive=keepalive, max_concurrent=args.max_concurrent)
         # 2. 重启恢复：running 任务重建跟踪，收编进 TaskEngine
-        for handle in backend.rebuild():
-            asyncio.create_task(engine.track(handle), name="kvcm-recover")
+        #    （rebuild 内部有 Ledger 同步阻塞调用，同样走 executor）
+        restored = await loop.run_in_executor(backend.executor, backend.rebuild)
+        for handle in restored:
+            engine.track_in_background(handle)
         # 3. 常驻组件启动（协程）
-        loop.start()
+        keepalive.start()
         engine.start()
         if args.listen:
             host, _, port = args.listen.rpartition(":")
@@ -111,17 +168,40 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
             grpc_server.stop()
         # ② 取消在途协程 + ③ 有界等待（TaskEngine.shutdown 内部做）
         await engine.shutdown(timeout_s=args.shutdown_timeout_s)
-        # ④ Loop 停
-        await loop.stop()
+        # ④ Loop 停（可能还有一轮 sweep 停在 exists 里）
+        await keepalive.stop()
         return 0
     finally:
-        # ⑤ client close（有序收尾，不靠退出期 GC/atexit）
-        client.close()
+        # ⑤ 收尾顺序：**先等 RPC 线程结束，再关 client**（反了就会 close 与
+        #    在途 RPC 并发——demo 踩过的退出期崩溃正是这个形状）。
+        #
+        #    executor 是本进程建的（connect 时就在），所以由这里负责等：
+        #    `shutdown(wait=True)` 会 join 全部 worker；它没有超时参数，用
+        #    「另起线程 + Event.wait(有界)」包住。
+        #
+        #    不把这个等待放进 backend.close()：池是注入的，backend 不拥有它
+        #    （`_owns_executor` 为假时会直接 return，等待会被静默跳过）。
+        drained = _wait_executor(executor, args.shutdown_timeout_s)
         if backend is not None:
             backend.close()
-        if loop is not None:
-            loop.close()
-        ledger.close()
+        if keepalive is not None:
+            keepalive.close()
+        if drained:
+            # 安全：所有 RPC 线程已结束，可以拆 client、收 sqlite
+            client.close()
+            ledger.close()
+        else:
+            # 有线程卡在 mooncake 绑定或 Ledger 的 submit().result() 里：
+            # 进程退不出去（worker 非 daemon，解释器退出会 join），只能
+            # 靠外部 SIGKILL。此时**什么都不拆**：
+            #   - 拆 client 会与在途 RPC 并发崩溃（demo 踩过的形状）
+            #   - 关 ledger 的 shutdown(wait=True) 无上界，会再撑开超时
+            print(
+                f"[kvcm] shutdown: worker threads still running after "
+                f"{args.shutdown_timeout_s}s — skipping client/ledger close "
+                f"(process will not exit until they return; expect SIGKILL)",
+                file=sys.stderr,
+            )
 
 
 def run(args: argparse.Namespace, *, stop: asyncio.Event | None = None) -> int:
@@ -194,6 +274,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=600.0,
         help="保活固定窗口（D3 占位策略：READY 后续租这么久即停租）",
+    )
+    p.add_argument(
+        "--rpc-timeout-s",
+        type=float,
+        default=30.0,
+        help="协程侧 RPC 超时秒数（0.3.11 绑定无超时配置；<=0 关闭）",
     )
     p.add_argument(
         "--shutdown-timeout-s",

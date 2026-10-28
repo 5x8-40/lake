@@ -17,7 +17,9 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import os
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +40,13 @@ from kvcm.ops.base import (
 )
 from kvcm.ops.capability import BackendCapability, Support
 from kvcm.ops.types import InstanceId, PinKind, Prefix
+
+logger = logging.getLogger(__name__)
+
+
+def _name_of(fn: Any) -> str:
+    """函数的可读名（日志用）。"""
+    return getattr(fn, "__qualname__", None) or getattr(fn, "__name__", repr(fn))
 
 
 def encode_task_id(task_id: object) -> str:
@@ -78,6 +87,7 @@ class MooncakeBackend(KvOps):
         ledger: Ledger | None = None,
         submit_interval_s: float = 0.2,
         executor: ThreadPoolExecutor | None = None,
+        rpc_timeout_s: float = 30.0,
     ) -> None:
         """
         client：已 connect 的 StoreClient（控制面身份，global_segment_size=0）。
@@ -101,10 +111,26 @@ class MooncakeBackend(KvOps):
         self._cap = capability
         self._ledger = ledger
         self._submit_interval_s = submit_interval_s
+        # 协程侧 RPC 超时（0.3.11 的绑定没有超时参数；main 有
+        # MC_RPC_TIMEOUT_MS，届时可与此对齐）。<=0 表示不设超时。
+        self._rpc_timeout_s = rpc_timeout_s
         self._executor = executor or ThreadPoolExecutor(
-            max_workers=min(8, (os.cpu_count() or 4)), thread_name_prefix="kvcm-rpc"
+            max_workers=max(4, min(8, (os.cpu_count() or 4))), thread_name_prefix="kvcm-rpc"
         )
         self._owns_executor = executor is None
+        # ── 共享态纪律（E11 定稿，务必遵守）─────────────────────────
+        # `_plans` / `_watch` 无锁，靠「事件循环单线程 + 每个 handle 同一
+        # 时刻只有一个协程操作」保证正确性。因此：
+        #
+        #   **禁止在读写这两个字典之间 await。**
+        #
+        # 现在 `query_task` 里有一处跨 await 的读→写（读 entry → await
+        # RPC → 写 _watch）。它安全的前提是「同一 handle 只有一条协程在
+        # 推进」——取消也是在同一条协程里抛 CancelledError 直接跳去
+        # abandon，不会另起一条。**如果要新增「另起协程对同一 handle 做
+        # abandon/查询」的路径，必须先给这两个字典加锁**，否则会出现
+        # 孤儿条目（entry 被删后又写回 _watch）。
+        #
         # handle → (prefix, target, plan [(key, target_seg), ...], handle_id)：
         # READY 核验与 Ledger 迁移登记；终态即删（防长驻泄漏）。
         # handle_id = 同一次操作发起的一组任务的分组键（uuid），写进
@@ -121,15 +147,45 @@ class MooncakeBackend(KvOps):
     def capability(self) -> BackendCapability:
         return self._cap
 
+    @property
+    def executor(self) -> ThreadPoolExecutor:
+        """RPC executor（供其他组件复用，避免再建线程池——定稿只要两个
+        池：RPC 池 + Ledger 单线程池）。"""
+        return self._executor
+
     # ------------------------------------------------------------------
     # 阻塞调用的协程包装
     # ------------------------------------------------------------------
 
     async def _rpc(self, fn: Callable[..., Any], *args: Any) -> Any:
         """在 RPC executor 里执行同步调用（mooncake 绑定），协程挂起等
-        结果——等待期间不占事件循环。"""
+        结果——等待期间不占事件循环。
+
+        超时只放弃等待，**不中断线程**（Python 无法中断 C++ 调用）：线程
+        会继续跑到自然结束。所以超时后仍占着一个 RPC 线程，退出时由
+        `close()` 的有界等待兜底（见那里的说明）。
+        """
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, fn, *args)
+
+        def _call():
+            try:
+                return fn(*args)
+            except BaseException as e:
+                # 调用方可能已超时离开（wait_for 取消了 future），异常到不了
+                # 它手上——记一条，避免「绑定随后的失败」静默丢失。
+                if isinstance(e, Exception):
+                    logger.warning("RPC %s failed in worker: %s", _name_of(fn), e)
+                raise
+
+        fut = loop.run_in_executor(self._executor, _call)
+        if self._rpc_timeout_s <= 0:
+            return await fut
+        try:
+            return await asyncio.wait_for(fut, timeout=self._rpc_timeout_s)
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            raise QueryError(
+                f"RPC timeout after {self._rpc_timeout_s}s: {_name_of(fn)}"
+            ) from e
 
     async def _in_ledger(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         """在 RPC executor 里调 Ledger（其内部会经自己的单线程池串行化）。
@@ -142,10 +198,36 @@ class MooncakeBackend(KvOps):
             self._executor, functools.partial(fn, *args, **kwargs)
         )
 
-    def close(self) -> None:
-        """释放自建的 executor（外部注入的由调用方管）。"""
-        if self._owns_executor:
-            self._executor.shutdown(wait=False)
+    def close(self, *, wait_timeout_s: float = 5.0) -> None:
+        """释放自建的 executor（外部注入的由调用方管）。
+
+        **有界等待在途 RPC**：`shutdown(wait=True)` 会等所有线程结束——但
+        它没有超时参数，卡死的 RPC 会让退出永远挂着。所以在另一个线程里
+        跑它、外层设 5 秒上限：超时就返回（不阻塞调用方）。**注意**：卡死
+        的线程不会「随进程消失」——worker 是非 daemon 线程，解释器退出会
+        join 它们，进程要靠 SIGKILL（见 daemon 的退出说明）。
+
+        为什么不能只 `shutdown(wait=False)`：那会立刻返回，调用方接着
+        `client.close()`，与还在 mooncake 绑定里的 RPC 并发（demo 踩过的
+        退出期崩溃正是这个形状）。
+
+        超时说明：worker 是非 daemon 线程，解释器退出会 join 它们——所以
+        卡死时**不是**「线程随进程消失」，而是进程退不出去、要靠 SIGKILL。
+        本函数只是不阻塞调用方。
+        """
+        if not self._owns_executor:
+            return
+
+        done = threading.Event()
+
+        def _shutdown() -> None:
+            try:
+                self._executor.shutdown(wait=True)
+            finally:
+                done.set()
+
+        threading.Thread(target=_shutdown, name="kvcm-rpc-drain", daemon=True).start()
+        done.wait(timeout=wait_timeout_s)
 
     # ------------------------------------------------------------------
     # copy（已落地）
@@ -231,8 +313,15 @@ class MooncakeBackend(KvOps):
                 # 全部失败都是在途冲突：别的任务在复制同 key（典型 = 同
                 # intent 重发）。按 D1 §4 不当失败——冲突任务如实记
                 # failed，转副本观测态，立刻核一轮。
-                await self._record(handle, "failed", tids=list(conflicted))
+                #
+                # 写回 `_watch` 与校验放在同一个不跨 await 的块里：上面跨
+                # 了 await（query_task 的 RPC），若期间该 handle 已被
+                # abandon（entry 删除），再写会留下孤儿条目。先校验+写回，
+                # 再记账（记账本身是 await，必须放在字典操作之后）。
+                if handle not in self._plans:
+                    raise KeyError(f"task handle abandoned concurrently: {handle}")
                 self._watch[handle] = conflicted
+                await self._record(handle, "failed", tids=list(conflicted))
                 return await self._verify_watch(handle, plan)
             await self._finish(handle, "failed")
             return TaskStatus.FAILED
@@ -284,9 +373,15 @@ class MooncakeBackend(KvOps):
             return TaskStatus.RUNNING
         # 目的达成（副本核验为准）：非冲突任务记 ready；冲突任务保持
         # failed（如实——它们确实失败了，数据是别人搬的）。
+        # 字典读取集中在 await 之前（`_watch` 取出即删，之后不再依赖它）
         conflicted = set(self._watch.pop(handle, ()))
         rest = [t for t in handle.task_ids if t not in conflicted]
+        # entry 已不在册（并发 abandon）：账已由对方处理，不再记
+        if self._plans.get(handle) is None:
+            return TaskStatus.READY
         if rest:
+            # 记账需要 entry（_record 内部从 _plans 取），所以 entry 必须
+            # 留到记账之后再删——见下方 pop。
             await self._record(handle, "ready", tids=rest)
         self._plans.pop(handle, None)
         return TaskStatus.READY
@@ -294,7 +389,11 @@ class MooncakeBackend(KvOps):
     async def abandon(self, handle: TaskHandle) -> None:
         """放弃跟踪：Ledger 记 abandoned 并删登记（不取消后端任务——后
         端无任务取消能力，在途传输可能仍完成；副本清理由 remove 负责）。
-        观测态的冲突任务保持 failed 不改写。"""
+        观测态的冲突任务保持 failed 不改写。
+
+        **调用约束**：必须在「推进该 handle 的那条协程」里调用（超时收口
+        就是这样）。不得另起一条协程对同一 handle 调它——那会与还停在
+        `query_task` 里的字典更新交错（见 `_plans` 定义处的纪律说明）。"""
         if handle not in self._plans:
             raise KeyError(f"unknown task handle: {handle}")
         conflicted = set(self._watch.pop(handle, ()))

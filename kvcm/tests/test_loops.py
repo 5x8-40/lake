@@ -206,3 +206,134 @@ def test_interval_and_window_must_be_positive() -> None:
             KeepaliveLoop(FakeOps(), led, window_s=0)
     finally:
         led.close()
+
+
+# ---------------------------------------------------------------------------
+# 投递健壮性（grok 建议三条）
+# ---------------------------------------------------------------------------
+
+
+def test_register_before_start_does_not_block_caller() -> None:
+    """事件循环未起时 register 不在调用线程跑 sqlite（交给 executor）。
+
+    用**慢 Ledger** 锁住：若 register 同步执行 sqlite，它会阻塞到写完
+    （≥0.3s）；异步投递则立即返回（<0.1s）。
+    """
+    import time as _t
+
+    class SlowLedger:
+        """register_keepalive 故意慢 0.3 秒。"""
+
+        def __init__(self, real) -> None:
+            self._real = real
+            self.written = 0
+
+        def register_keepalive(self, prefix) -> None:
+            _t.sleep(0.3)
+            self._real.register_keepalive(prefix)
+            self.written += 1
+
+        def unregister_keepalive(self, prefix) -> None:
+            self._real.unregister_keepalive(prefix)
+
+        def list_keepalive_records(self):
+            return self._real.list_keepalive_records()
+
+    led, path = _ledger()
+    try:
+        slow = SlowLedger(led)
+        loop = KeepaliveLoop(FakeOps(), slow, interval_s=999, window_s=600)
+        # 未 start()：_loop 为 None
+        start_t = _t.monotonic()
+        loop.register(_P)
+        elapsed = _t.monotonic() - start_t
+        # 关键：必须立即返回（若同步跑 sqlite，会卡 0.3s）
+        assert elapsed < 0.1, f"register 阻塞了 {elapsed:.2f}s（在调用线程跑了 sqlite）"
+        assert slow.written == 0, "register 返回时写入不该已完成（应异步）"
+        # 等投递生效
+        for _ in range(100):
+            if slow.written:
+                break
+            _t.sleep(0.01)
+        assert slow.written == 1, "慢 Ledger 的写入最终没发生"
+        loop.close()
+    finally:
+        led.close()
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_register_does_not_raise_when_loop_closed() -> None:
+    """事件循环已关闭时 register **不抛异常**（否则已 READY 的 intent 会被
+    误记成 FAILED）。
+
+    已关闭的循环 `is_running()` 为假 → 走「直接交 executor」分支，写入仍
+    能成功——这是对的：此时不该因为事件循环死了就丢保活。
+    """
+
+    led, path = _ledger()
+    try:
+        loop_obj = KeepaliveLoop(FakeOps(), led, interval_s=999, window_s=600)
+
+        # 起一个真循环、记下它、然后关掉——模拟「循环已死但 register 仍被调」
+        import asyncio as _aio
+
+        async def _start_then_stop():
+            loop_obj.start()
+            return _aio.get_running_loop()
+
+        closed_loop = run(_start_then_stop())
+        closed_loop.close()  # 真的关掉
+
+        # 现在 register：闭掉循环上如果直接 call_soon_threadsafe 会抛
+        # RuntimeError。断言它不抛（能吞掉并走 executor 分支）。
+        loop_obj.register(_P)  # 不应抛
+        # 写入仍应成功（不因循环死了就丢保活）
+        for _ in range(100):
+            if led.list_keepalive():
+                break
+            import time as _t
+
+            _t.sleep(0.01)
+        assert led.list_keepalive() == [_P], "循环关闭后保活注册丢了"
+        assert loop_obj.register_failures == 0, f"不该计失败: {loop_obj.register_failures}"
+        loop_obj.close()
+    finally:
+        led.close()
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_register_failure_is_counted_not_raised() -> None:
+    """Ledger 写入失败：计数 +1，不抛给调用方。"""
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            class BrokenLedger(type(led)):
+                def register_keepalive(self, prefix):
+                    raise RuntimeError("db gone")
+
+            broken = BrokenLedger.__new__(BrokenLedger)
+            broken.__dict__.update(led.__dict__)
+            loop = KeepaliveLoop(FakeOps(), broken, interval_s=999, window_s=600)
+            loop.start()
+            loop.register(_P)  # 不抛
+            for _ in range(100):
+                if loop.register_failures > 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert loop.register_failures >= 1, "失败没有被计数"
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())

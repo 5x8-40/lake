@@ -119,8 +119,15 @@ def test_dedup_in_flight_same_intent_id(rpc) -> None:
     ops = FakeOps(seq=[TaskStatus.READY] * 4, query_gate=gate)
     stub = start(ops)
     r1 = stub.SubmitIntent(_req())
+    # 等第一次真的开始执行
+    deadline = time.monotonic() + 3
+    while ops.copy_count == 0 and time.monotonic() < deadline:
+        time.sleep(0.02)
     r2 = stub.SubmitIntent(_req())  # 在途重复 → 去重
     assert r1.intent_id == r2.intent_id
+    time.sleep(0.1)
+    # 关键：去重 = 没有第二次执行（id 相同是纯函数保证的，不能作证据）
+    assert ops.copy_count == 1, f"在途重复提交导致重复执行: {ops.copy_count}"
     gate.set()
     assert _wait_status(stub, r1.intent_id, pb.GetTaskResponse.READY) == (
         pb.GetTaskResponse.READY
