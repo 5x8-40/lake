@@ -448,8 +448,7 @@ def test_rebuild_skips_empty_inputs(fake_store_module, monkeypatch) -> None:
         # 模拟数据残缺行：handle_id 空、token_ids 空（upsert 走正常通道后手工改空）
         p = Prefix(model_id="qwen", token_ids=(1,))
         led.upsert_task("t-old", handle_id="h-old", op="copy", prefix=p, target="i", status="running")
-        led._conn.execute("UPDATE tasks SET handle_id = '', token_ids = ''")
-        led._conn.commit()
+        led._corrupt_task_row("t-old")
         kc = KeyComputer(model_name="qwen", tp_size=2)
         monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
         b = MooncakeBackend(
@@ -751,11 +750,7 @@ def test_ledger_gc_tasks() -> None:
             led.upsert_task("old-running", handle_id="h4", op="copy", prefix=p, target="i", status="running")
             led.upsert_task("new-ready", handle_id="h5", op="copy", prefix=p, target="i", status="ready")
             # 手工把四行的 updated_at 拨到 8 天前
-            old = time.time() - 8 * 24 * 3600
-            led._conn.execute(
-                "UPDATE tasks SET updated_at = ? WHERE task_id != 'new-ready'", (old,)
-            )
-            led._conn.commit()
+            led._backdate_tasks(days=8, exclude=("new-ready",))
             assert led.gc_tasks() == 3  # old-ready + old-failed + old-abandoned
             assert led.get_task("old-ready") is None
             assert led.get_task("old-failed") is None

@@ -62,8 +62,7 @@ def test_window_expiry_unregisters() -> None:
         loop = KeepaliveLoop(ops, led, interval_s=999, window_s=10)
         loop.register(_P)
         # 把 registered_at 拨到窗口外（老行 = 重启后恢复的超期注册）
-        led._conn.execute("UPDATE keepalive SET registered_at = ?", (time.time() - 11,))
-        led._conn.commit()
+        led._backdate_keepalive(seconds=11)
         loop.sweep_once()
         assert ops.calls == []  # 到期行不再续租
         assert led.list_keepalive() == []  # 停租注销（保活必须有界，D3 约束）
@@ -125,8 +124,7 @@ def test_reregister_refreshes_window() -> None:
     try:
         loop = KeepaliveLoop(FakeOps(), led, interval_s=999, window_s=600)
         loop.register(_P)
-        led._conn.execute("UPDATE keepalive SET registered_at = ?", (time.time() - 500,))
-        led._conn.commit()
+        led._backdate_keepalive(seconds=500)
         loop.register(_P)  # 再次 READY → 重新注册
         rec = led.list_keepalive_records()[0]
         assert time.time() - rec.registered_at < 5  # 窗口被刷新
