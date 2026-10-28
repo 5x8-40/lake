@@ -376,10 +376,10 @@ class TaskEngine:
     async def _track_loop(self, handle, prefix, loop, deadline, poll_s):
         """轮询恢复的句柄到终态。
 
-        三种「非终态」的处理各有明确语义：
-        - `QueryError` → 本轮无结论（可重试），继续轮询到 deadline
-        - `VerifyError` → 终态（核验失败已由 backend 记账），停止跟踪
-        - `KeyError` → 句柄已被 abandon（账本已记 abandoned），停止跟踪
+        三种异常各有明确结局（前一种是「继续」，后两种是「停止」）：
+        - `QueryError` → 本轮无结论（可重试），**继续轮询**到 deadline
+        - `VerifyError` → **终态**（核验失败已由 backend 记账），停止跟踪
+        - `KeyError` → **终态**（句柄已被 abandon，账本已记 abandoned），停止跟踪
         """
         while True:
             try:

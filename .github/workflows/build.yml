@@ -93,8 +93,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      # E12 起 kvcm 有 gRPC 运行时依赖（grpcio/protobuf），不再是「只装 pytest」；
-      # 版本口径与主仓根 pyproject.toml 对齐（见 kvcm/requirements.txt 注释）。
+      # E12 起 kvcm 有 gRPC 运行时依赖（grpcio/protobuf），不再是「只装 pytest」。
+      # 版本由 kvcm 自己的 stub 决定（见 kvcm/requirements.txt 注释）——
+      # **不要**按主仓根 pyproject.toml 的 python/ 口径对齐：两处 stub 生成
+      # 版本不同，是两套独立环境。
       - run: pip install -r requirements-dev.txt
       - run: python -m pytest tests/ -q
 

@@ -15,7 +15,12 @@
 #     Protobuf Python Version 会跟着变，此时旧运行时会**真的**报错。
 #
 # 因此这里用精确版本（==）而不是范围：范围会让 pip 在某天装到未验证的
-# 新版本。要升级：同时改 grpcio / grpcio-tools / protobuf 三个版本，
-# 并跑 scripts/gen_stubs.sh 重新生成 stub（CI 的 stub-drift 会校验）。
+# 新版本。
+#
+# **升级流程**：同时改 grpcio / grpcio-tools / protobuf 三个版本 → 跑
+# `kvcm/scripts/gen_stubs.sh` 重新生成 kvcm/api/pb/ 下的 stub → 提交。
+# 注意：CI 的 `stub-drift` job 只覆盖仓库根 scripts/gen_stubs.sh（生成
+# python/ 与 go/ 的 stub），**不检查 kvcm 这套**——kvcm stub 与依赖是否
+# 配套只能靠这个流程和 code review 保证。
 grpcio==1.80.0
 protobuf==6.33.6
