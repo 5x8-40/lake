@@ -40,7 +40,7 @@ flowchart TB
     Recv["IntentReceiver<br/>接收"]
     Watch["InstanceWatcher<br/>接收"]
     Pub["EventPublisher<br/>发送"]
-    Eng["TaskEngine<br/>intent 队列 + 并发上限"]
+    Eng["TaskEngine<br/>队列 + 前缀闸<br/>终态才还"]
     Cons["消费者协程 ×N"]
     Flow["PrefetchFlow"]
     Ops["KvOps"]
@@ -54,7 +54,7 @@ flowchart TB
 
   Router -->|"已接通 gRPC<br/>SubmitIntent / GetTask<br/>Prefix + target"| Recv
   Recv -->|"已接通<br/>submit_intent 入队即返"| Eng
-  Eng -->|"已接通<br/>消费者出队后过传输闸"| Cons
+  Eng -->|"已接通<br/>出队后过前缀闸"| Cons
   Cons -->|"已接通<br/>执行 run_after_exists"| Flow
   Ctrl -.->|"待接通<br/>实例上下线事件<br/>实例标识 + TP 配置 + rank 与 seg 对应表"| Watch
   Watch -.->|"待接通<br/>实例拓扑注册<br/>locate 在生产环境的数据来源"| MB
@@ -76,7 +76,7 @@ flowchart TB
 ```
 
 - `IntentReceiver`、`InstanceWatcher` 只接收，箭头从进程外进来。`EventPublisher` 只发送，箭头从进程里出去。三者互不调用
-- **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`（闸外），再在传输闸上挂起等名额，拿到名额才跑 `PrefetchFlow.run_after_exists`。回执由调用方 `GetTask` 主动查
+- **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`（前缀闸外），再占一个前缀闸名额跑 `PrefetchFlow.run_after_exists`，终态才还。`copy` 里每个 key 另过进程级提交信号量，`create_copy_task` 返回即还。回执由调用方 `GetTask` 主动查
 - 已接通的驱动是 `PrefetchFlow` 调 `KvOps`——运行时这个对象就是 `MooncakeBackend`，不是中间再转一跳。它写 `Ledger`，账本落在圈外的 sqlite 文件上；`rebuild` 再把 running 行读回来
 - **实例拓扑的两条来路**：demo 环境没有注册通道，`RankTopology` 用探测法推断「哪个 rank 对应哪个 seg」（见 L4 节）；生产环境由实例启动时把自己的拓扑（TP 配置、rank 与 seg 对应表）经 `InstanceWatcher` 注册进来（D1 §3、E13）——两条来路汇成一个 `locate` 函数注入 backend
 - `StoreClient` 走 master 的 RPC `:50088`。`SegTopology` 自己会打 HTTP `:9003` 的 `/get_all_segments`（查存储池当前挂了哪些 seg）。demo 里把这份名单交给 `RankTopology` 做比对，进程里还没有这条装配
@@ -434,7 +434,7 @@ flowchart TD
 - **RPC 卡死防护**：同步 RPC 在对端无响应时可能永不返回，线程被永久占死。协程侧用 `asyncio.wait_for` 给调用加超时：超时只**放弃等待**并抛 `QueryError`，不中断线程（Python 无法中断 C++ 调用），也不 `abandon`——由上层决定：`query_task` 的 `QueryError` 在 `PrefetchFlow` 里继续轮询到流程超时，`exists` 的直接记为这次 intent 失败。卡死的线程泄漏一个、由泄漏监控暴露。根治靠 RPC 自带超时参数（0.3.11 无，main 有 `MC_RPC_TIMEOUT_MS`，列入 E6）
 - **async 化与 TaskEngine 同批做，不分两步**：签名 async + RPC 包 `to_thread` + `sleep` 换 `asyncio.sleep`、flow 轮询循环改 `await`——约一天工作量。不选「本期 flow 保持同步、并行提交留到以后」：并发提交（`asyncio.gather`）在同步代码里做不了，flow 到时**必须**改成异步——本期写的同步承接就是一份注定被拆掉重写的临时代码，flow 前后写两遍。既然改写躲不过，一次改完（并行提交已随本期落地，见「TaskEngine」节）
 
-**厨房比方**：线程池 = 厨师（就几个，真正下锅的活只有他们炒）；协程 = 点菜单（来一张挂一张，挂一千张也不占厨师）；事件循环 = 前台（收单、叫号，绝不能自己进厨房）；信号量 = 灶台数（同时只炒 4 锅菜，等灶的是单子不是人）。**厨师数决定干活速度，单子数决定能接多少活、等待多便宜**——协程化不是让这批活更快，是让等待与排队免费。
+**厨房比方**：线程池 = 厨师（就几个，真正下锅的活只有他们炒）；协程 = 点菜单（来一张挂一张，挂一千张也不占厨师）；事件循环 = 前台（收单、叫号，绝不能自己进厨房）。两把闸：前缀闸 = 同时几桌在做（从下单占到上菜）；提交信号量 = 同时几口在点火（点着就让出）。**厨师数决定干活速度，单子数决定能接多少活、等待多便宜**——协程化不是让这批活更快，是让等待与排队免费。
 
 **时序（一次预热，协程视角）**：
 
@@ -442,36 +442,43 @@ flowchart TD
 sequenceDiagram
     participant R as Router
     participant Recv as IntentReceiver
-    participant Q as 队列+传输闸<br/>（TaskEngine）
+    participant Q as 队列 + 前缀闸<br/>终态才还
     participant W as 预热协程
+    participant S as 提交信号量<br/>返回即还
     participant Ex as RPC 线程池
     participant M as mooncake master
 
     R->>Recv: SubmitIntent(prefix, target)
-    Recv->>Q: submit_intent 入队后立即返回 intent_id
-    Note over W: 协程在「等队列、等传输闸、等 sleep」期间全部挂起，不占线程<br/>Router 拿到 intent_id 即返回，不等 READY（回执走 GetTask）
-    W->>Q: get 拿到任务
-    W->>Ex: to_thread exists（不过闸）
-    Ex->>M: RPC batch_is_exist
-    M-->>Ex: 在池（且在远端）
-    W->>Q: acquire 传输闸名额（挂起等位）
-    par 逐 key 并发提交（`asyncio.Semaphore` 窗口，默认 4）
-        W->>Ex: create_copy_task key_i
+    Recv->>Q: 入队后立即返回 intent_id
+    Note over W: 等队列、等前缀闸、等 sleep 时挂起，不占线程<br/>Router 拿到 intent_id 即返回，不等 READY
+    W->>Q: get
+    W->>Ex: exists（不过前缀闸）
+    Ex->>M: batch_is_exist
+    M-->>Ex: 在池
+    W->>Q: acquire 前缀闸
+    rect rgb(232, 240, 254)
+        Note over W,S: 每个 key 拿一次。同时在飞不超过 4。RPC 返回就 release。前缀闸在这整段都不还
+        loop 逐 key
+            W->>S: acquire
+            W->>Ex: create_copy_task
+            Ex->>M: RPC
+            W->>S: release
+        end
+    end
+    Note over W,Q: 本前缀的 key 已全部提交。前缀闸仍占着
+    W->>W: 写 Ledger running
+    loop 直到 READY、失败或超时
+        W->>Ex: query_task
         Ex->>M: RPC
     end
-    W->>W: 写 Ledger running（提交成功后，走 Ledger 自己的单线程池）
-    loop 每 0.5 秒一轮，直到 READY / 失败 / 超时
-        W->>W: asyncio.sleep(0.5)
-        W->>Ex: to_thread query_task（含副本核验）
-        Ex->>M: RPC
-    end
-    W->>W: 写 Ledger 终态（走 Ledger 自己的单线程池）
-    W->>Q: release 归还传输闸名额
+    W->>W: 写 Ledger 终态
+    W->>Q: release 前缀闸
 ```
 
 - 线程只在 `Ex`（线程池）这一列出现：每个 RPC 执行的几毫秒
 - 协程（W）全程只是一段代码状态，挂起时不占线程——排队 100 个这样的协程也免费
-- 图只画了成功路径；失败 / 超时 / 取消同样在终态归还传输闸名额（release 在 finally 语义位置）
+- `loop 逐 key` 画的是提交信号量的拿还，不是「key 必须一个个串行」。同时在飞的 `create_copy_task` 不超过 4，多出来的 key 在 `S` 上等
+- 图只画了成功路径。失败 / 超时 / 取消同样在终态归还前缀闸。提交信号量在每次 `create_copy_task` 返回时已经还过，不跟前缀闸一起还
 
 **线程池大小**：
 
@@ -556,7 +563,7 @@ sequenceDiagram
   - 不做：链路利用率限速器（E15 剩余部分）、重发策略、多模型归属判定（多模型接入前置，已登记）、E13/E14 协议
 - **E11 阶段计划**：
   1. 进程壳 + 状态恢复：Ledger 单线程 executor → 启动时 `rebuild()` 接通 → KeepaliveLoop（固定窗口，协程定时器）→ 优雅退出（协程取消 + abandon 处理）
-  2. TaskEngine + flow/ops async 化：intent 占位入口 → `asyncio.Queue` + 传输闸（默认 4）→ 协程消费者直接调 async flow；KvOps 全方法 async 化 → 终态记账 → 超时处理（复用现有 abandon）
+  2. TaskEngine + flow/ops async 化：intent 占位入口 → `asyncio.Queue` + 前缀闸（默认 4，终态才还）→ 协程消费者直接调 async flow；copy 提交另过进程级提交信号量（返回即还）；KvOps 全方法 async 化 → 终态记账 → 超时处理（复用现有 abandon）
   3. 测试：并发多 intent 单测；重启端到端（杀进程 → rebuild → READY）；优雅退出回归；真机冒烟
   4. 后续 PR（接口演进）：KeySet + wait_ready 挪进 ops + `PrefetchError` → `FlowError`
 - **E15（并行限速）**：并行提交已随 E11 落地（信号量窗口 + `--copy-submit-concurrency`）；本节剩余 = 链路利用率感知的限速器（D1 §5），接在同一个信号量上，不独立做
