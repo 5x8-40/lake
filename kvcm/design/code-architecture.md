@@ -41,7 +41,7 @@ flowchart TB
     Watch["InstanceWatcher<br/>接收"]
     Pub["EventPublisher<br/>发送"]
     Eng["TaskEngine<br/>intent 队列 + 并发上限"]
-    Pool["工作线程池"]
+    Cons["消费者协程 ×N"]
     Flow["PrefetchFlow"]
     Ops["KvOps"]
     MB["MooncakeBackend"]
@@ -52,10 +52,10 @@ flowchart TB
     Led["Ledger"]
   end
 
-  Router -.->|"待接通<br/>预热 intent, Prefix + target"| Recv
-  Recv -.->|"待接通<br/>投进 intent 队列"| Eng
-  Eng -.->|"待接通<br/>按并发上限分派"| Pool
-  Pool -.->|"待接通<br/>执行 PrefetchFlow.run"| Flow
+  Router -->|"已接通 gRPC<br/>SubmitIntent / GetTask<br/>Prefix + target"| Recv
+  Recv -->|"已接通<br/>submit_intent 入队即返"| Eng
+  Eng -->|"已接通<br/>消费者出队后过传输闸"| Cons
+  Cons -->|"已接通<br/>执行 run_after_exists"| Flow
   Ctrl -.->|"待接通<br/>实例上下线事件<br/>实例标识 + TP 配置 + rank 与 seg 对应表"| Watch
   Watch -.->|"待接通<br/>实例拓扑注册<br/>locate 在生产环境的数据来源"| MB
   Flow -->|"已接通<br/>exists / copy / query_task / abandon<br/>Prefix+target / TaskHandle"| Ops
@@ -76,11 +76,11 @@ flowchart TB
 ```
 
 - `IntentReceiver`、`InstanceWatcher` 只接收，箭头从进程外进来。`EventPublisher` 只发送，箭头从进程里出去。三者互不调用
-- **intent 的走法（E11 形态）**：`IntentReceiver` 收到后不直接跑流程，只投进 `TaskEngine` 的队列；TaskEngine 看执行中的任务数低于并发上限，就把任务分给线程池里一个空闲线程，那个线程才跑 `PrefetchFlow.run`。当前代码还没有这两个部件，流程只能被直接调用
+- **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`（闸外），再在传输闸上挂起等名额，拿到名额才跑 `PrefetchFlow.run_after_exists`。回执由调用方 `GetTask` 主动查
 - 已接通的驱动是 `PrefetchFlow` 调 `KvOps`——运行时这个对象就是 `MooncakeBackend`，不是中间再转一跳。它写 `Ledger`，账本落在圈外的 sqlite 文件上；`rebuild` 再把 running 行读回来
 - **实例拓扑的两条来路**：demo 环境没有注册通道，`RankTopology` 用探测法推断「哪个 rank 对应哪个 seg」（见 L4 节）；生产环境由实例启动时把自己的拓扑（TP 配置、rank 与 seg 对应表）经 `InstanceWatcher` 注册进来（D1 §3、E13）——两条来路汇成一个 `locate` 函数注入 backend
 - `StoreClient` 走 master 的 RPC `:50088`。`SegTopology` 自己会打 HTTP `:9003` 的 `/get_all_segments`（查存储池当前挂了哪些 seg）。demo 里把这份名单交给 `RankTopology` 做比对，进程里还没有这条装配
-- 虚线都是类已建、调用未接通：Router 到接收器、控制面到实例监听、`EventPublisher` 到索引、`/batch_query_keys` 核验
+- 虚线都是类已建、调用未接通：控制面到实例监听、`EventPublisher` 到索引、`/batch_query_keys` 核验
 
 ### 模块依赖（参考）
 
@@ -485,6 +485,7 @@ sequenceDiagram
 - **线程卡死监控（未实现，登记 E6）**：线程池的线程数固定，恶化的是「可用线程」——线程卡在无响应的 RPC 里出不来，池的实际并发逐次递减，卡满即服务假死。要监控的是「某次 RPC 调用已经跑了多久还没返回」，而不是线程总数——需要按每次调用记下开始时间（当前没有这份数据）。
   - 当前用 `_rpc` 的 30 秒 `wait_for` 限制等待时间：协程侧最多等 30 秒就报错，**服务不会假死**（任务失败，但池继续接活）；慢性的线程占用仍在
   - 根治靠 mooncake 自带 RPC 超时（0.3.11 无；main 有 `MC_RPC_TIMEOUT_MS` / `MC_RPC_CONNECT_TIMEOUT_MS`）——升级并配置后这个问题自然消失，届时不需额外监控代码
+- **取消落在 `create_copy_task` 上时，那个任务号会丢**（未修，登记）：`copy` 的提交是 `task_ids.append(await self._rpc(...))`，`append` 在 `await` 之后。取消若打中这一次等待，线程稍后返回的号没有变量接着，既不进 `_plans` 也不进 Ledger——重启的 `rebuild` 捞不到它。代价上限是「一次 copy 里最多丢一个还没返回的号」；已经 append 过的照旧落账。不修的理由：`_rpc` 是所有 RPC 的唯一入口，为一个调用点加回调或出参等于改整条通道。与 `_rpc` 超时后线程继续跑是同一个形状（放弃等待 ≠ 取消线程）
 - **启动期 connect 借默认池的例外已消除**：RPC 池在 `connect` 之前创建，`connect` 用同一个池（借一个线程、用完即还，启动期无其他任务争用）
 
 ### TaskEngine
