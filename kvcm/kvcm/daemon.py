@@ -81,6 +81,7 @@ def build_backend(
         locate=lambda _inst: list(segs),  # 静态注入；生产 = InstanceWatcher（E13）
         capability=capability,
         ledger=ledger,
+        submit_concurrency=args.copy_submit_concurrency,
         rpc_timeout_s=args.rpc_timeout_s,
         executor=executor,
     )
@@ -410,6 +411,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=30.0,
         help="启动时 connect master 的超时秒数（0.3.11 绑定无连接超时）",
+    )
+    p.add_argument(
+        "--copy-submit-concurrency",
+        type=int,
+        default=4,
+        help="单次 copy 内并发的 create_copy_task 上限（0.3.11 实测窗口 4 全成）",
     )
     p.add_argument(
         "--rpc-timeout-s",

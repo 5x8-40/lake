@@ -455,7 +455,7 @@ sequenceDiagram
     Ex->>M: RPC batch_is_exist
     M-->>Ex: 在池（且在远端）
     W->>Q: acquire 传输闸名额（挂起等位）
-    loop 逐 key 串行提交（间隔 submit_interval_s，默认 0.2 秒）
+    par 逐 key 并发提交（`asyncio.Semaphore` 窗口，默认 4）
         W->>Ex: create_copy_task key_i
         Ex->>M: RPC
     end
@@ -465,7 +465,7 @@ sequenceDiagram
         W->>Ex: to_thread query_task（含副本核验）
         Ex->>M: RPC
     end
-    W->>Ex: to_thread 写 Ledger 终态
+    W->>W: 写 Ledger 终态（走 Ledger 自己的单线程池）
     W->>Q: release 归还传输闸名额
 ```
 
@@ -481,7 +481,7 @@ sequenceDiagram
 - **线程卡死监控（未实现，登记 E6）**：线程池的线程数固定，恶化的是「可用线程」——线程卡在无响应的 RPC 里出不来，池的实际并发逐次递减，卡满即服务假死。要监控的是「某次 RPC 调用已经跑了多久还没返回」，而不是线程总数——需要按每次调用记下开始时间（当前没有这份数据）。
   - 当前用 `_rpc` 的 30 秒 `wait_for` 限制等待时间：协程侧最多等 30 秒就报错，**服务不会假死**（任务失败，但池继续接活）；慢性的线程占用仍在
   - 根治靠 mooncake 自带 RPC 超时（0.3.11 无；main 有 `MC_RPC_TIMEOUT_MS` / `MC_RPC_CONNECT_TIMEOUT_MS`）——升级并配置后这个问题自然消失，届时不需额外监控代码
-- **取消落在 `create_copy_task` 上时，那个任务号会丢**（未修，登记）：`copy` 的提交是 `task_ids.append(await self._rpc(...))`，`append` 在 `await` 之后。取消若打中这一次等待，线程稍后返回的号没有变量接着，既不进 `_plans` 也不进 Ledger——重启的 `rebuild` 捞不到它。代价上限是「一次 copy 里最多丢一个还没返回的号」；已经 append 过的照旧落账。不修的理由：`_rpc` 是所有 RPC 的唯一入口，为一个调用点加回调或出参等于改整条通道。与 `_rpc` 超时后线程继续跑是同一个形状（放弃等待 ≠ 取消线程）
+- **取消落在并发提交上时，在飞的那批号会丢**（未修，登记）：`copy` 现在按信号量窗口并发提交（`submit_concurrency`，默认 4），父协程在第一下 `gather` 上被取消时，窗口内所有还在 `await _rpc` 的子任务会一起被取消——它们稍后返回的号没有变量接着，既不进 `_plans` 也不进 Ledger，重启的 `rebuild` 捞不到。代价上限是「一次 copy 里最多丢一个窗口的号」（默认 4 个）；已经写进 `slots` 的照旧落账，失败后等其余在飞提交时再被取消也照常落账（第二次排空吞下取消、先记账再抛）。不修的理由：`_rpc` 是所有 RPC 的唯一入口，为一个调用点加回调或出参等于改整条通道。与 `_rpc` 超时后线程继续跑是同一个形状（放弃等待 ≠ 取消线程）
 - **同键双开靠 `setdefault` 装槽**：`submit_intent` 写入的唯一前置条件是槽为空——「先 `get` 再赋值」之间有空隙，两个 gRPC 线程同时提交同一键时，输家会覆盖赢家已入队的 PENDING，两个 `_admit` 各入队一次，同一前缀执行两遍。回归测试 `test_install_does_not_overwrite_queued_record` 把 `_records` 换成会停拍的字典来固定时序（`get` 在屏障放开后返回空槽；第二次 `__setitem__` 等 A 已 `queued` 再放行）；裸撞线程撞不出来，窗口只隔几条字节码
 - **启动期 connect 借默认池的例外已消除**：RPC 池在 `connect` 之前创建，`connect` 用同一个池（借一个线程、用完即还，启动期无其他任务争用）
 
@@ -493,7 +493,7 @@ sequenceDiagram
 - **传输闸 = `asyncio.Semaphore`（默认 4，参数化）**：限「同时在后端传输的任务数」（带宽管控）——**只在确认要发后台传输时拿名额**（copy / move / drain 提交前 acquire，任务终态 release）。**毫秒级操作不过闸**：exists 探测、查询、副本核验、keepalive——它们的瞬时并发由 RPC executor（4~8 线程）天然限制，多余请求协程挂起等线程、毫秒即返，不会被传输任务堵几十秒。promote 的触发 RPC 同为毫秒级（不过闸），但其 READY 是核验式轮询（时长由池的提回进度决定，**不是毫秒即返**）；D2 §3 的另一条主动路径（读删写，数据经 kvcm）若启用，则属 kvcm 发起的传输，要占闸
 - **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
 - **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；`session_end` 类可延迟任务排队无妨
-- **gather 并发提交**（E15 并行限速接入点）：copy 的逐 key 串行提交改为 `asyncio.gather` + 子信号量——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间；E15 的并发调度与限速器在这一层信号量上实现
+- **并发提交（已落地）**：copy 的逐 key 提交用 `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。窗口上限是 0.3.11 真机实测的结论（14 连发约半数 `TRANSFER_FAIL`，窗口 4 节奏化 42/42 全成），不是拍的数。链路利用率感知的限速器（网卡计数器采样）仍归 E15，接在同一层信号量上
 - **排队超时**：intent 在队列等待的语义（等多久算放弃）随 E12 intent 字段一起定；执行超时沿用 flow 现有 `timeout_s`
 - **失败态策略**（只留接口，随 E11 细化）：失败后的动作三种——① 重发；② 放弃这批任务，事后把留下的副本清掉（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 复制中途源实例下线时的处理（D5）。语义引 D2 §1 与 D5，不新造语义
 
@@ -541,16 +541,16 @@ sequenceDiagram
 ## 与 E10 / E11 / E15 的对位
 
 - **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，73 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
-- **E11（进程化）**：设计 = 本文「运行时结构」节。**范围切分**：
-  - 本期做：进程壳（启动/退出/rebuild 接通）+ TaskEngine + KeepaliveLoop（唯一常驻循环）+ IntentReceiver（gRPC，E12）
+- **E11（进程化）🔁 实施中**（[PR #70](https://github.com/5x8-40/lake/pull/70)）：设计 = 本文「运行时结构」节。**范围切分**：
+  - 本期做：进程壳（启动/退出/rebuild 接通）+ TaskEngine + KeepaliveLoop（唯一常驻循环）+ IntentReceiver（gRPC，E12）+ **copy 并发提交**（信号量窗口，见 TaskEngine 节）
   - 只留类骨架：ReleaseLoop、RetainLoop（依赖的操作全是 NotImplementedError，能力接通前无内容可跑）
-  - 不做：限速器（E15）、重发策略、多模型归属判定（多模型接入前置，已登记）、E13/E14 协议
+  - 不做：链路利用率限速器（E15 剩余部分）、重发策略、多模型归属判定（多模型接入前置，已登记）、E13/E14 协议
 - **E11 阶段计划**：
   1. 进程壳 + 状态恢复：Ledger 单线程 executor → 启动时 `rebuild()` 接通 → KeepaliveLoop（固定窗口，协程定时器）→ 优雅退出（协程取消 + abandon 处理）
   2. TaskEngine + flow/ops async 化：intent 占位入口 → `asyncio.Queue` + 传输闸（默认 4）→ 协程消费者直接调 async flow；KvOps 全方法 async 化 → 终态记账 → 超时处理（复用现有 abandon）
   3. 测试：并发多 intent 单测；重启端到端（杀进程 → rebuild → READY）；优雅退出回归；真机冒烟
   4. 后续 PR（接口演进）：KeySet + wait_ready 挪进 ops + `PrefetchError` → `FlowError`
-- **E15（并行限速）**：TaskEngine 内的并发调度 + 限速器（链路利用率采样，D1 §5）——不独立做
+- **E15（并行限速）**：并行提交已随 E11 落地（信号量窗口 + `--copy-submit-concurrency`）；本节剩余 = 链路利用率感知的限速器（D1 §5），接在同一个信号量上，不独立做
 
 ## 参考实现
 

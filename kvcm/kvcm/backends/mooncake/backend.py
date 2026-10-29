@@ -85,7 +85,7 @@ class MooncakeBackend(KvOps):
         locate: Callable[[InstanceId], Sequence[str]],
         capability: BackendCapability,
         ledger: Ledger | None = None,
-        submit_interval_s: float = 0.2,
+        submit_concurrency: int = 4,
         executor: ThreadPoolExecutor | None = None,
         rpc_timeout_s: float = 30.0,
     ) -> None:
@@ -100,17 +100,19 @@ class MooncakeBackend(KvOps):
             按 RPC 执行密度自建（4~8，E11 定稿）——**不用
             asyncio.to_thread 默认池**（大小不可控）。Ledger 自己有专用
             单线程池，与本池分开。
-        submit_interval_s：copy 逐任务提交间隔。连发提交会在目标侧形成
-            并发建链风暴（0.3.11 ascend 实测：14 连发约半数
-            TRANSFER_FAIL；窗口 4 节奏化 42/42 全成）——串行+间隔是
-            止血；按窗口推进的限速器归 E15。
+        submit_concurrency：单次 copy 内同时在飞的 create_copy_task 上限
+            （`asyncio.Semaphore` + `gather`）。连发无上限会在目标侧形成
+            建链风暴（0.3.11 ascend 实测：14 连发约半数 TRANSFER_FAIL；
+            窗口 4 节奏化 42/42 全成）。链路利用率限速器仍归 E15。
         """
+        if submit_concurrency <= 0:
+            raise ValueError("submit_concurrency must be positive")
         self._client = client
         self._keys = key_computer
         self._locate = locate
         self._cap = capability
         self._ledger = ledger
-        self._submit_interval_s = submit_interval_s
+        self._submit_concurrency = submit_concurrency
         # 协程侧 RPC 超时（0.3.11 的绑定没有超时参数；main 有
         # MC_RPC_TIMEOUT_MS，届时可与此对齐）。<=0 表示不设超时。
         self._rpc_timeout_s = rpc_timeout_s
@@ -247,42 +249,73 @@ class MooncakeBackend(KvOps):
             )
         targets = list(self._locate(target))
         plan = self._keys.build_plan(keys, targets)
-        task_ids: list[object] = []
+        # 下标槽：并发完成顺序不定，按 plan 下标落号，失败时筛出已发出的。
+        slots: list[object | None] = [None] * len(plan)
+        sem = asyncio.Semaphore(self._submit_concurrency)
+        stop = asyncio.Event()
+
+        async def _submit_one(i: int, key: str, seg: str) -> None:
+            async with sem:
+                # 失败/取消后不再发新的：排队中的拿到名额就直接返回，在飞
+                # 的照常收号（号必须落账，见下方 except）。
+                if stop.is_set():
+                    return
+                slots[i] = await self._rpc(self._client.create_copy_task, key, [seg])
+
+        tasks = [
+            asyncio.create_task(_submit_one(i, key, seg))
+            for i, (key, seg) in enumerate(plan)
+        ]
         try:
-            for i, (key, seg) in enumerate(plan):
-                if i and self._submit_interval_s > 0:
-                    # 提交间隔用协程 sleep：等待期间事件循环照常服务其他
-                    # 任务（真机止血用的节奏，E15 由 gather + 信号量取代）
-                    await asyncio.sleep(self._submit_interval_s)
-                task_ids.append(
-                    await self._rpc(self._client.create_copy_task, key, [seg])
-                )
+            if tasks:
+                await asyncio.gather(*tasks)
         except BaseException as e:
             # CancelledError 不是 Exception 子类；已发出的任务号必须落账，
             # 否则重启的 rebuild 捞不到这些在途传输。
+            stop.set()
+            # 排空：排队的子任务见到 `stop` 直接返回，不再发起；已经在
+            # `_rpc` 里的会跑完并写槽。
+            #
+            # **这次排空自己也可能被取消**：`gather` 被取消时会把还没结束的
+            # 子任务一起取消——它们的号（上限 `submit_concurrency`）就此丢掉，
+            # 只有已经写进 `slots` 的能落账（口径见 design/code-architecture.md
+            # 「E11 已知遗留」）。这里不 shield 子任务：那会把最长
+            # `rpc_timeout_s`（30 秒）的等待带进退出路径。
+            #
+            # 要保证的是**记账不被跳过**：先有 key 失败 → 进到这里等其余
+            # 在飞调用 → 退出信号到达。若让 CancelledError 直接冒出，读槽和
+            # 记账都不跑，已拿到的号也会丢。所以吞下它、把异常换成取消，
+            # 照常落账后再抛出去。
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                e = asyncio.CancelledError()
+            task_ids = [t for t in slots if t is not None]
+            partial_plan = [plan[i] for i, t in enumerate(slots) if t is not None]
             if task_ids:
                 partial = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
                 self._plans[partial] = (
                     prefix,
                     target,
-                    plan[: len(task_ids)],
+                    partial_plan,
                     uuid.uuid4().hex,
                 )
                 try:
+                    # 记账必须完成：已发出的号不落账 = 重启后没人跟踪。
+                    # 若这次 shield 也被取消（第二次取消），记账会中断——
+                    # 那是「取消两次」的极端场景，接受丢账（见设计文档）。
                     await asyncio.shield(self._record(partial, "running"))
                 except asyncio.CancelledError:
-                    # 记账途中又来一次取消：照常传播。原来的异常可能是普通
-                    # Exception，此时若吞掉取消，调用方会收到 SubmitError，
-                    # 消费者当成预热失败继续拿下一个而不是退出。
                     raise
                 except BaseException:
                     pass  # 记账失败不再掩盖原始异常
             if isinstance(e, asyncio.CancelledError):
-                raise
+                raise e
             raise SubmitError(
                 f"copy submit failed after {len(task_ids)}/{len(plan)} tasks "
                 f"(submitted ids: {task_ids}): {e}"
             ) from e
+        task_ids = [t for t in slots if t is not None]
         handle = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
         self._plans[handle] = (prefix, target, plan, uuid.uuid4().hex)
         await self._record(handle, "running")

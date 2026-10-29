@@ -74,11 +74,15 @@ class FakeClient(StoreClient):
         self.created: list[tuple[str, list[str]]] = []
         self.queried: list[object] = []
         self._next = 0
+        self._id_lock = threading.Lock()
 
     def create_copy_task(self, key, targets):
-        self.created.append((key, list(targets)))
-        self._next += 1
-        return (self._next, 100 + self._next)  # 整数对，模仿绑定 UUID
+        # 并发提交时 `_next += 1` 是读改写，需保护（真实绑定在 C++ 侧发号）
+        with self._id_lock:
+            self.created.append((key, list(targets)))
+            self._next += 1
+            tid = (self._next, 100 + self._next)  # 整数对，模仿绑定 UUID
+        return tid
 
     def query_task(self, task_id):
         self.queried.append(task_id)
@@ -100,7 +104,7 @@ def _backend(
     monkeypatch,
     ledger=None,
     segs=("seg-A", "seg-B"),
-    submit_interval_s=0.0,
+    submit_concurrency=4,
 ) -> MooncakeBackend:
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
     return MooncakeBackend(
@@ -109,7 +113,7 @@ def _backend(
         locate=lambda _inst: list(segs),
         capability=mooncake_v0311(),
         ledger=ledger,
-        submit_interval_s=submit_interval_s,
+        submit_concurrency=submit_concurrency,
     )
 
 
@@ -193,16 +197,23 @@ def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) ->
     时取消落在提交循环里，已发出的号就丢了——`rebuild` 只认
     `status='running'` 的行，这些在途传输重启后再也没人跟踪。
 
-    必须是多 key 的 plan：单个 key 时提交循环里没有 `await`，取消点落不到
-    「第 1 个已发出、第 2 个还没发」的窗口上，测试会假通过。
+    必须是多 key 的 plan，且第 2 个提交卡住：取消点才落得到「第 1 个已
+    发出、第 2 个还没回」的窗口上，否则测试会假通过。
     """
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
         path = f.name
     import os
 
     led = Ledger(path)
+    gate = threading.Event()
     try:
-        client = FakeClient()
+        class SlowSecondClient(FakeClient):
+            def create_copy_task(self, key, targets):
+                if self.created:  # 第 2 个起：卡住，制造在飞窗口
+                    gate.wait(5.0)
+                return super().create_copy_task(key, targets)
+
+        client = SlowSecondClient()
         kc = KeyComputer(model_name="qwen", tp_size=2)
         monkeypatch.setattr(
             kc, "keys_for_tokens", lambda ids: kc.expand(["h0", "h1"])
@@ -213,7 +224,7 @@ def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) ->
             locate=lambda _inst: ["seg-A", "seg-B"],
             capability=mooncake_v0311(),
             ledger=led,
-            submit_interval_s=5.0,  # 第 2 次提交前挂 5 秒，足够取消
+            submit_concurrency=1,  # 串行：第 2 个必然在取消点之后才发出
         )
 
         async def scenario():
@@ -237,8 +248,127 @@ def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) ->
 
         assert decode_task_id(running[0].task_id) == (1, 101)
     finally:
+        gate.set()
         led.close()
         os.unlink(path)
+
+
+def test_cancel_during_drain_after_submit_failure_still_records(
+    fake_store_module, monkeypatch
+) -> None:
+    """某 key 提交失败后，等其余在飞提交时被取消：已拿到的号仍要落账。
+
+    退出路径的最坏形状：先有一个提交抛普通异常 → 进 `except` 排空其余在飞
+    调用 → 这时退出信号到达。若让 `CancelledError` 直接从排空那一步冒出，
+    后面读槽和记账都不跑，已经拿到的号全丢（重启的 `rebuild` 捞不到）。
+    排空可以放弃等待，但**记账不能跳过**。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    gate = threading.Event()
+    calls = 0
+    lock = threading.Lock()
+    try:
+        class MixedClient(FakeClient):
+            def create_copy_task(self, key, targets):
+                nonlocal calls
+                with lock:
+                    calls += 1
+                    nth = calls
+                if nth == 2:
+                    time.sleep(0.05)  # 让第 1 个先拿到号并写槽
+                    raise RuntimeError("submit boom")
+                if nth == 3:
+                    gate.wait(5.0)  # 卡住：排空阶段会停在这里
+                return super().create_copy_task(key, targets)
+
+        client = MixedClient()
+        kc = KeyComputer(model_name="qwen", tp_size=1)
+        monkeypatch.setattr(
+            kc, "keys_for_tokens", lambda ids: kc.expand(["h0", "h1", "h2"])
+        )
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A"],
+            capability=mooncake_v0311(),
+            ledger=led,
+            submit_concurrency=3,  # 三个一起在飞：失败与在飞并存
+        )
+
+        async def scenario():
+            task = asyncio.create_task(
+                b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+            )
+            deadline = time.monotonic() + 5
+            while calls < 3 and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert calls == 3, f"三个提交没都在飞: {calls}"
+            await asyncio.sleep(0.15)  # 让它进到排空（卡在第 3 个上）
+            assert not task.done(), "复制已经结束了，取消点不在排空阶段"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # 取消可以不等在飞的提交，但已拿到的号必须落账。
+            assert [r.task_id for r in led.list_running_tasks()] == ["1:101"], (
+                "排空阶段被取消，已拿到的号没落账"
+            )
+
+        run(scenario())
+    finally:
+        gate.set()
+        led.close()
+        os.unlink(path)
+
+
+def test_copy_submits_concurrently_up_to_cap(fake_store_module, monkeypatch) -> None:
+    """一次 copy 内多 key 并发提交，但在飞数不超过 `submit_concurrency`。
+
+    串行提交时提交阶段是 N 倍往返（大批量预热慢得不可用）；不限并发则
+    在目标侧形成建链风暴（0.3.11 实测 14 连发约半数 TRANSFER_FAIL）。
+    两个方向都要锁：**并发度 > 1** 证明并行，**不超上限** 证明没失控。
+    """
+    inflight = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class SlowClient(FakeClient):
+        def create_copy_task(self, key, targets):
+            nonlocal inflight, peak
+            with lock:
+                inflight += 1
+                peak = max(peak, inflight)
+            try:
+                # 短暂占用：并发的提交必然重叠（peak 到上限），串行的
+                # 不会。0.1 秒远大于调度抖动，不需要任何事件/门槛。
+                time.sleep(0.1)
+                return super().create_copy_task(key, targets)
+            finally:
+                with lock:
+                    inflight -= 1
+
+    client = SlowClient()
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(
+        kc,
+        "keys_for_tokens",
+        lambda ids: kc.expand(["h0", "h1", "h2", "h3", "h4", "h5"]),
+    )
+    b = MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        submit_concurrency=3,
+    )
+    handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert len(handle.task_ids) == 6
+    assert peak == 3, f"并发度不对: peak={peak}"
+    # 并发完成顺序不定，号本身是乱序发放的；但六个数一个不能少。
+    assert sorted(handle.task_ids) == sorted((i, 100 + i) for i in range(1, 7))
 
 
 def test_ledger_write_uses_ledger_pool_not_rpc_pool(
@@ -319,7 +449,7 @@ def test_cancel_during_ledger_write_after_failure_propagates(
             locate=lambda _inst: ["seg-A", "seg-B"],
             capability=mooncake_v0311(),
             ledger=led,
-            submit_interval_s=0.0,
+            submit_concurrency=1,  # 逐 key：第 2 个必失败，取消点确定
         )
         entered = threading.Event()
         orig_record = b._record
@@ -343,6 +473,20 @@ def test_cancel_during_ledger_write_after_failure_propagates(
             # 关键：必须是 CancelledError，不是 SubmitError
             with pytest.raises(asyncio.CancelledError):
                 await task
+            # 取消只打断调用方；被 shield 的记账要在同一事件循环里跑完。
+            # 断言那条已发出的 task id 在 Ledger 里是 running——去掉 shield
+            # 时取消直接从 `_record` 冒出，行没写上，而调用方照样收到
+            # CancelledError，只有这条断言能抓住。
+            deadline = time.monotonic() + 3
+            rows = []
+            while time.monotonic() < deadline:
+                rows = led.list_running_tasks()
+                if rows:
+                    break
+                await asyncio.sleep(0.01)
+            assert [r.task_id for r in rows] == ["1:101"], (
+                f"取消时已发出的任务号没落账成 running: {rows}"
+            )
 
         run(scenario())
     finally:
