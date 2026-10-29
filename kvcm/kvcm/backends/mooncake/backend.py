@@ -251,13 +251,15 @@ class MooncakeBackend(KvOps):
         同时提交，每 copy 各限 4 就会变成 16 个并发建链（0.3.11 实测
         14 连发就打爆）。
 
-        延迟创建：`Semaphore()` 构造时不绑循环，但**首次有人排队等名额**
-        时会 `_get_loop()`。把创建放到首次使用（协程里），绑定的自然是
-        当前这个循环。`_submit_gate` 本身不含 `await`，事件循环线程上
-        两次调用不会各建一把。
+        延迟创建：`Semaphore()` 构造时不绑循环（`daemon.py:_serve` 里
+        `build_backend` 执行时循环已经在跑，构造绑不绑都不影响），但
+        **首次有人排队等名额**时会 `_get_loop()`。所以「什么时候创建」
+        不是正确性的关键——它既不造成、也不挡住跨循环的问题；只是把
+        创建推迟到真正用得着的时候。`_submit_gate` 本身不含 `await`，
+        事件循环线程上两次调用不会各建一把。
 
-        **它不解决跨循环复用**：同一个 backend 先在循环 A 里排过队、又在
-        循环 B 里排队，仍会 `RuntimeError: bound to a different event
+        **跨循环复用会炸**：同一个 backend 先在循环 A 里排过队、又在
+        循环 B 里排队，会 `RuntimeError: bound to a different event
         loop`（名额没用完时不会——那种情况根本不去取循环）。当前不构成
         问题：生产只有一个循环，测试里同一个 backend 也只在一个 `run()`
         内用这把信号量。真要跨循环用，得按循环各建一把。
