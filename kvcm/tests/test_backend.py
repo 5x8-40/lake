@@ -287,6 +287,69 @@ def test_ledger_write_uses_ledger_pool_not_rpc_pool(
         os.unlink(path)
 
 
+def test_cancel_during_ledger_write_after_failure_propagates(
+    fake_store_module, monkeypatch
+) -> None:
+    """提交失败后的记账途中被取消：`CancelledError` 原样抛，不包成 `SubmitError`。
+
+    原始异常是普通 `Exception`（比如第 2 个 key 提交失败）；此时若把记账途中的
+    取消吞掉，调用方会收到 `SubmitError`——取消没传出去，消费者会当成预热失败
+    继续拿下一个而不是退出。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        class BoomClient(FakeClient):
+            def create_copy_task(self, key, targets):
+                if len(self.created) >= 1:
+                    raise RuntimeError("submit boom")
+                return super().create_copy_task(key, targets)
+
+        client = BoomClient()
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(
+            kc, "keys_for_tokens", lambda ids: kc.expand(["h0", "h1"])
+        )
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+            submit_interval_s=0.0,
+        )
+        entered = threading.Event()
+        orig_record = b._record
+
+        async def slow_record(handle, status, tids=None):
+            entered.set()
+            await asyncio.sleep(0.5)  # 留出取消窗口
+            await orig_record(handle, status, tids)
+
+        b._record = slow_record
+
+        async def scenario():
+            task = asyncio.create_task(
+                b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+            )
+            deadline = time.monotonic() + 3
+            while not entered.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert entered.is_set(), "没进到记账，前提不成立"
+            task.cancel()
+            # 关键：必须是 CancelledError，不是 SubmitError
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        run(scenario())
+    finally:
+        led.close()
+        os.unlink(path)
+
+
 def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> None:
     """生成器中途失败：已发起的任务号必须附在异常上（否则无人跟踪）。"""
 

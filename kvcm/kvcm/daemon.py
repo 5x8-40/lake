@@ -259,8 +259,10 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
         # ② 取消在途协程 + ③ 有界等待（TaskEngine.shutdown 内部做）
         await engine.shutdown(timeout_s=args.shutdown_timeout_s)
         engine_shutdown_done = True
-        # ④ Loop 停（可能还有一轮 sweep 停在 exists 里）
-        await keepalive.stop()
+        # ④ Loop 停（可能还有一轮 sweep 停在 exists 里）。
+        #    超时用同一个旋钮：`stop()` 自己的默认是 10 秒，比
+        #    `--shutdown-timeout-s` 长，会让总退出时间翻倍。
+        await keepalive.stop(timeout_s=args.shutdown_timeout_s)
         return 0
     finally:
         # ⑥ 兜底取消协程：正常路径已在上面 `engine.shutdown` 过（幂等，

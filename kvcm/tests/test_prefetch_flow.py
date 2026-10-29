@@ -131,6 +131,35 @@ def test_programming_error_propagates_not_swallowed() -> None:
         run(PrefetchFlow(ops).run(_P, _T, poll_s=0, timeout_s=60))
 
 
+def test_cancel_during_poll_abandons_handle() -> None:
+    """轮询中被取消：先 `abandon` 收口，再把 `CancelledError` 抛出去。
+
+    退出时取消协程，若不断开跟踪，Ledger 里那行会留 `running`，重启又被
+    `rebuild` 捞回来跟——而进程已经在退出，没人会再轮询它。
+    """
+
+    async def scenario():
+        import asyncio as _aio
+
+        ops = FakeOps(exists=True, seq=[TaskStatus.RUNNING] * 50)
+        flow = PrefetchFlow(ops)
+        task = _aio.create_task(
+            flow.run(_P, _T, poll_s=0.05, timeout_s=10.0)
+        )
+        # 等它进入轮询（query_task 被调过至少一次）
+        deadline = _aio.get_running_loop().time() + 2
+        while ops.calls.count("query_task") == 0:
+            if _aio.get_running_loop().time() > deadline:
+                raise AssertionError("没进入轮询，前提不成立")
+            await _aio.sleep(0.01)
+        task.cancel()
+        with pytest.raises(_aio.CancelledError):
+            await task
+        assert "abandon" in ops.calls, f"取消时没 abandon: {ops.calls}"
+
+    run(scenario())
+
+
 def test_timeout_abandons_handle() -> None:
     """超时收口：放弃跟踪（abandon），再抛 PrefetchError。"""
     ops = FakeOps(exists=True, seq=[])  # 永远 RUNNING

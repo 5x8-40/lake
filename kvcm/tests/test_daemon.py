@@ -87,8 +87,9 @@ class FakeKeepalive:
     def start(self) -> None:
         self.started = True
 
-    async def stop(self) -> None:
+    async def stop(self, *, timeout_s: float = 10.0) -> None:
         self.stopped = True
+        self.stop_timeout_s = timeout_s
 
     def close(self) -> None:
         self.closed = True
@@ -299,6 +300,11 @@ def test_no_restored_tasks_still_clean_shutdown(monkeypatch, tmp_path) -> None:
     t.join(timeout=5)
     assert backend.rebuild_calls == 1
     assert ka.started and ka.stopped and ka.closed
+    # keepalive 的等待超时跟 --shutdown-timeout-s 走，不用它自己的默认 10 秒
+    # （否则退出总时长会变成 shutdown + 10 + shutdown）
+    assert ka.stop_timeout_s == _args(tmp_path).shutdown_timeout_s, (
+        f"keepalive.stop 没用统一的超时: {ka.stop_timeout_s}"
+    )
     assert client.closed
     assert backend.closed
 
@@ -669,7 +675,7 @@ def test_connect_timeout_branch_hard_exits(monkeypatch, tmp_path) -> None:
 
 
 
-def test_shutdown_signal_interrupts_connect_wait(monkeypatch, tmp_path) -> None:
+def test_shutdown_signal_interrupts_connect_wait(monkeypatch, tmp_path, capsys) -> None:
     """SIGTERM 打在 connect 等待期间：立即退出，不等满 connect_timeout_s。
 
     connect 超时默认 30 秒——若信号要等它才生效，停机就慢得不合理。
@@ -705,4 +711,10 @@ def test_shutdown_signal_interrupts_connect_wait(monkeypatch, tmp_path) -> None:
     assert hard_exits, "没有硬退出"
     assert hard_exits[0] < 5.0, (
         f"等了 {hard_exits[0]:.1f}s 才退（connect_timeout 是 30s，说明信号没打断）"
+    )
+    # 关键：必须是**信号分支**退出的，不是超时分支。两者都硬退出、都很快，
+    # 只看「退出快」分不出来——靠 stderr 文案区分。
+    err = capsys.readouterr().err
+    assert "got shutdown signal during connect" in err, (
+        f"走的是超时分支而不是信号分支: {err!r}"
     )

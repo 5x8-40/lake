@@ -294,7 +294,9 @@ class Ledger:
         """清理终态老任务（ready/failed/abandoned 且 updated_at 超龄），
         返回删除行数。running 行不动（在途或孤儿，处置归恢复策略）。
 
-        调用归 E11 的周期循环；本表此前只增不删，长跑必胀。"""
+        调用点：`daemon` 启动时调一次（`rebuild` 之后）。没有周期循环——
+        kvcm 是 daemon，重启是常态；不做的原因是不想为此加一个只为一件事
+        服务的定期任务。长跑不重启的进程里，表仍会只增不删。"""
         return self._run(self._gc_tasks_sync, max_age_s)
 
     def _gc_tasks_sync(self, max_age_s: float) -> int:

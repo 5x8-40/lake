@@ -431,7 +431,7 @@ flowchart TD
 - **线程池与任务数解耦**：executor 大小按 RPC 执行密度配（4~8），不随传输闸的名额数变。一个 copy 任务 30 秒里 RPC 执行合计约 1 秒，其余是 `await` 挂起——协程化后 100 个任务挂着也只占这几个线程
 - **backend 共享态（`_plans`/`_watch`）无锁**：事件循环单线程，协程只在 `await` 点切换——字典操作不跨 `await` 就天然原子（纪律写进注释：禁止在 `_plans`/`_watch` 读写之间 `await`）
 - **纪律（反例）**：协程里直接调同步阻塞函数 = 整个事件循环停摆（所有协程一起卡住）。所有阻塞调用必须 `to_thread`
-- **RPC 卡死防护**：同步 RPC 在对端无响应时可能永不返回，线程被永久占死。协程侧用 `asyncio.wait_for` 给调用加超时：超时后协程按失败处理（abandon），卡死的线程泄漏一个、由泄漏监控暴露。根治靠 RPC 自带超时参数（mooncake 绑定有无该参数，列入 E6 核对）
+- **RPC 卡死防护**：同步 RPC 在对端无响应时可能永不返回，线程被永久占死。协程侧用 `asyncio.wait_for` 给调用加超时：超时只**放弃等待**并抛 `QueryError`，不中断线程（Python 无法中断 C++ 调用），也不 `abandon`——由上层决定：`query_task` 的 `QueryError` 在 `PrefetchFlow` 里继续轮询到流程超时，`exists` 的直接记为这次 intent 失败。卡死的线程泄漏一个、由泄漏监控暴露。根治靠 RPC 自带超时参数（0.3.11 无，main 有 `MC_RPC_TIMEOUT_MS`，列入 E6）
 - **async 化与 TaskEngine 同批做，不分两步**：签名 async + RPC 包 `to_thread` + `sleep` 换 `asyncio.sleep`、flow 轮询循环改 `await`——约一天工作量。不选「本期 flow 保持同步、E15 再改写」：E15 要做并发提交（`asyncio.gather`），同步代码里做不了，flow 到时**必须**改成异步——本期写的同步承接就是一份注定被拆掉重写的临时代码，flow 前后写两遍。既然改写躲不过，一次改完
 
 **厨房比方**：线程池 = 厨师（就几个，真正下锅的活只有他们炒）；协程 = 点菜单（来一张挂一张，挂一千张也不占厨师）；事件循环 = 前台（收单、叫号，绝不能自己进厨房）；信号量 = 灶台数（同时只炒 4 锅菜，等灶的是单子不是人）。**厨师数决定干活速度，单子数决定能接多少活、等待多便宜**——协程化不是让这批活更快，是让等待与排队免费。
@@ -455,15 +455,11 @@ sequenceDiagram
     Ex->>M: RPC batch_is_exist
     M-->>Ex: 在池（且在远端）
     W->>Q: acquire 传输闸名额（挂起等位）
-    par 逐 key 并发提交（gather）
-        W->>Ex: create_copy_task key1
-    and
-        W->>Ex: create_copy_task key2
-    and
-        W->>Ex: create_copy_task …
+    loop 逐 key 串行提交（间隔 submit_interval_s，默认 0.2 秒）
+        W->>Ex: create_copy_task key_i
+        Ex->>M: RPC
     end
-    Ex->>M: RPC ×N
-    W->>Ex: to_thread 写 Ledger running（提交成功后）
+    W->>W: 写 Ledger running（提交成功后，走 Ledger 自己的单线程池）
     loop 每 0.5 秒一轮，直到 READY / 失败 / 超时
         W->>W: asyncio.sleep(0.5)
         W->>Ex: to_thread query_task（含副本核验）

@@ -78,7 +78,8 @@ jobs:
           python-version: "3.12"
       - run: python scripts/check_doc_links.py
 
-  # kvcm 产品单测:kvcm/kvcm 与 kvcm/tests 改动才触发（pytest，无第三方依赖）。
+  # kvcm 产品单测:kvcm/kvcm 与 kvcm/tests 改动才触发（pytest；E12 起有
+  # grpcio/protobuf 运行时依赖，见下方 pip install）。
   kvcm:
     needs: filter
     if: needs.filter.outputs.kvcm_pkg == 'true'
