@@ -6,12 +6,21 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import enum
 import sys
 import tempfile
+import threading
+import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+
+from conftest import run
+
+from conftest import run
 
 from kvcm.backends.mooncake.backend import MooncakeBackend, encode_task_id
 from kvcm.backends.mooncake.capability import mooncake_v0311, mooncake_main
@@ -66,11 +75,15 @@ class FakeClient(StoreClient):
         self.created: list[tuple[str, list[str]]] = []
         self.queried: list[object] = []
         self._next = 0
+        self._id_lock = threading.Lock()
 
     def create_copy_task(self, key, targets):
-        self.created.append((key, list(targets)))
-        self._next += 1
-        return (self._next, 100 + self._next)  # 整数对，模仿绑定 UUID
+        # 并发提交时 `_next += 1` 是读改写，需保护（真实绑定在 C++ 侧发号）
+        with self._id_lock:
+            self.created.append((key, list(targets)))
+            self._next += 1
+            tid = (self._next, 100 + self._next)  # 整数对，模仿绑定 UUID
+        return tid
 
     def query_task(self, task_id):
         self.queried.append(task_id)
@@ -86,7 +99,14 @@ class FakeClient(StoreClient):
         return {k: list(on) for k in keys}
 
 
-def _backend(client, kc: KeyComputer, monkeypatch, ledger=None, segs=("seg-A", "seg-B")) -> MooncakeBackend:
+def _backend(
+    client,
+    kc: KeyComputer,
+    monkeypatch,
+    ledger=None,
+    segs=("seg-A", "seg-B"),
+    submit_concurrency=4,
+) -> MooncakeBackend:
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
     return MooncakeBackend(
         client=client,
@@ -94,6 +114,7 @@ def _backend(client, kc: KeyComputer, monkeypatch, ledger=None, segs=("seg-A", "
         locate=lambda _inst: list(segs),
         capability=mooncake_v0311(),
         ledger=ledger,
+        submit_concurrency=submit_concurrency,
     )
 
 
@@ -106,10 +127,10 @@ def test_task_id_roundtrip_is_original_pair(fake_store_module, monkeypatch) -> N
     """阻塞回归：任务号禁止字符串化——query_task 必须收到原整数对。"""
     client = FakeClient()
     b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    handle = b.copy(Prefix(model_id="qwen", token_ids=(1, 2, 3)), InstanceId("inst-B"))
+    handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1, 2, 3)), InstanceId("inst-B")))
     assert handle.op is OpKind.COPY
     assert all(isinstance(t, tuple) for t in handle.task_ids)
-    status = b.query_task(handle)
+    status = run(b.query_task(handle))
     assert status is TaskStatus.READY
     # 锁死：查询收到的标识与创建返回的完全一致（未被 str()）
     assert client.queried == list(handle.task_ids)
@@ -120,7 +141,7 @@ def test_task_id_roundtrip_is_original_pair(fake_store_module, monkeypatch) -> N
 def test_plan_rank_mapped_via_backend(fake_store_module, monkeypatch) -> None:
     client = FakeClient()
     b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
     segs = [seg for _, segs in client.created for seg in segs]
     assert segs == ["seg-A", "seg-B"]  # rank0→seg-A, rank1→seg-B
 
@@ -128,8 +149,8 @@ def test_plan_rank_mapped_via_backend(fake_store_module, monkeypatch) -> None:
 def test_task_failed_is_terminal_and_purged(fake_store_module, monkeypatch) -> None:
     client = FakeClient(task_status=_FakeStoreTaskStatus.FAILED)
     b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-    assert b.query_task(handle) is TaskStatus.FAILED
+    handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert run(b.query_task(handle)) is TaskStatus.FAILED
     assert handle not in b._plans
 
 
@@ -143,9 +164,9 @@ def test_verify_failure_raises_with_detail(fake_store_module, monkeypatch) -> No
         b = _backend(
             client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led
         )
-        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
         with pytest.raises(VerifyError, match="missing on seg-A"):
-            b.query_task(handle)
+            run(b.query_task(handle))
         assert handle not in b._plans
         # 核验失败是终态：Ledger 迁 failed
         for tid in handle.task_ids:
@@ -167,7 +188,413 @@ def test_empty_prefix_raises(fake_store_module, monkeypatch) -> None:
         capability=mooncake_v0311(),
     )
     with pytest.raises(ValueError, match="no keys"):
-        b.copy(Prefix(model_id="qwen", token_ids=()), InstanceId("inst-B"))
+        run(b.copy(Prefix(model_id="qwen", token_ids=()), InstanceId("inst-B")))
+
+
+def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) -> None:
+    """提交中途被取消：已发出的任务号必须落账成 running。
+
+    `CancelledError` 不是 `Exception` 的子类。只捕 `Exception` 的话，退出
+    时取消落在提交循环里，已发出的号就丢了——`rebuild` 只认
+    `status='running'` 的行，这些在途传输重启后再也没人跟踪。
+
+    必须是多 key 的 plan，且第 2 个提交卡住：取消点才落得到「第 1 个已
+    发出、第 2 个还没回」的窗口上，否则测试会假通过。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    gate = threading.Event()
+    try:
+        class SlowSecondClient(FakeClient):
+            def create_copy_task(self, key, targets):
+                if self.created:  # 第 2 个起：卡住，制造在飞窗口
+                    gate.wait(5.0)
+                return super().create_copy_task(key, targets)
+
+        client = SlowSecondClient()
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(
+            kc, "keys_for_tokens", lambda ids: kc.expand(["h0", "h1"])
+        )
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+            submit_concurrency=1,  # 串行：第 2 个必然在取消点之后才发出
+        )
+
+        async def scenario():
+            task = asyncio.create_task(
+                b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+            )
+            deadline = time.monotonic() + 5
+            while not client.created and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert client.created, "第 1 个任务都没发出，前提不成立"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task  # 取消必须照常传播，不能被包成 SubmitError
+
+        run(scenario())
+        # 前提校验：取消时确实只发出了 1 个，测的才是「提交中途」
+        assert len(client.created) == 1, f"取消点不在提交循环内: {client.created}"
+        running = led.list_running_tasks()
+        assert len(running) == 1, f"取消时已发出的任务号没入账: {running}"
+        from kvcm.backends.mooncake.backend import decode_task_id
+
+        assert decode_task_id(running[0].task_id) == (1, 101)
+    finally:
+        gate.set()
+        led.close()
+        os.unlink(path)
+
+
+def test_cancel_during_drain_after_submit_failure_still_records(
+    fake_store_module, monkeypatch
+) -> None:
+    """某 key 提交失败后，等其余在飞提交时被取消：已拿到的号仍要落账。
+
+    退出路径的最坏形状：先有一个提交抛普通异常 → 进 `except` 排空其余在飞
+    调用 → 这时退出信号到达。若让 `CancelledError` 直接从排空那一步冒出，
+    后面读槽和记账都不跑，已经拿到的号全丢（重启的 `rebuild` 捞不到）。
+    排空可以放弃等待，但**记账不能跳过**。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    gate = threading.Event()
+    calls = 0
+    lock = threading.Lock()
+    try:
+        class MixedClient(FakeClient):
+            def create_copy_task(self, key, targets):
+                nonlocal calls
+                with lock:
+                    calls += 1
+                    nth = calls
+                if nth == 2:
+                    time.sleep(0.05)  # 让第 1 个先拿到号并写槽
+                    raise RuntimeError("submit boom")
+                if nth == 3:
+                    gate.wait(5.0)  # 卡住：排空阶段会停在这里
+                return super().create_copy_task(key, targets)
+
+        client = MixedClient()
+        kc = KeyComputer(model_name="qwen", tp_size=1)
+        monkeypatch.setattr(
+            kc, "keys_for_tokens", lambda ids: kc.expand(["h0", "h1", "h2"])
+        )
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A"],
+            capability=mooncake_v0311(),
+            ledger=led,
+            submit_concurrency=3,  # 三个一起在飞：失败与在飞并存
+        )
+
+        async def scenario():
+            task = asyncio.create_task(
+                b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+            )
+            deadline = time.monotonic() + 5
+            while calls < 3 and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert calls == 3, f"三个提交没都在飞: {calls}"
+            await asyncio.sleep(0.15)  # 让它进到排空（卡在第 3 个上）
+            assert not task.done(), "复制已经结束了，取消点不在排空阶段"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # 取消可以不等在飞的提交，但已拿到的号必须落账。
+            assert [r.task_id for r in led.list_running_tasks()] == ["1:101"], (
+                "排空阶段被取消，已拿到的号没落账"
+            )
+
+        run(scenario())
+    finally:
+        gate.set()
+        led.close()
+        os.unlink(path)
+
+
+def test_submit_cap_is_process_wide_across_concurrent_copies(
+    fake_store_module, monkeypatch
+) -> None:
+    """上限是**进程级**的：两个 copy 同时跑，在飞总数仍不超过上限。
+
+    为什么必须锁这条：传输闸（TaskEngine `max_concurrent`，默认 4）允许
+    4 个 copy 同时提交。若每个 copy 各持一把默认 4 的窗口，在飞建链就是
+    4×4=16——正好踩过 0.3.11 实测打爆建链的点（14 连发约半数
+    TRANSFER_FAIL）。信号量必须是所有 copy 共用的一把。
+
+    用 8 线程的池：默认池在小机器上只有 4 个 worker，会把峰值挡在 4，
+    实现改回「每 copy 一把」也照样绿（假通过）。
+    """
+    inflight = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class SlowClient(FakeClient):
+        def create_copy_task(self, key, targets):
+            nonlocal inflight, peak
+            with lock:
+                inflight += 1
+                peak = max(peak, inflight)
+            try:
+                time.sleep(0.1)  # 占住，制造重叠
+                return super().create_copy_task(key, targets)
+            finally:
+                with lock:
+                    inflight -= 1
+
+    client = SlowClient()
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(
+        kc,
+        "keys_for_tokens",
+        lambda ids: kc.expand(["h0", "h1", "h2", "h3"]),
+    )
+    pool = ThreadPoolExecutor(max_workers=8)  # 默认池只有 4 线程，会挡住峰值
+    try:
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A"],
+            capability=mooncake_v0311(),
+            submit_concurrency=4,
+            executor=pool,
+        )
+
+        async def scenario():
+            # 两个 copy 同时跑：每个 4 key，合计 8 个提交
+            await asyncio.gather(
+                b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")),
+                b.copy(Prefix(model_id="qwen", token_ids=(2,)), InstanceId("inst-B")),
+            )
+
+        run(scenario())
+        assert peak == 4, (
+            f"跨 copy 的在飞数没被进程级信号量压住: peak={peak}（应为 4）"
+        )
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
+    """`--copy-submit-concurrency` 真的传到 backend。
+
+    不锁的话，`build_backend` 里少写一行参数，单测全绿（默认值恰好是 4），
+    生产里调参就是空转。
+    """
+    from kvcm import daemon
+    import argparse
+
+    seen: dict = {}
+
+    def fake_backend(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(daemon, "MooncakeBackend", fake_backend)
+    monkeypatch.setattr(
+        daemon,
+        "KeyComputer",
+        lambda **kw: object(),
+    )
+    args = argparse.Namespace(
+        model_name="qwen",
+        block_size=128,
+        tp_size=1,
+        peer_tp_size=None,
+        put_step=1,
+        hash_algo="sha256",
+        segs="seg-A",
+        capability="v0311",
+        rpc_timeout_s=30.0,
+        copy_submit_concurrency=7,  # 非默认值，才能证明真的传了
+    )
+    daemon.build_backend(args, client=object(), ledger=object())
+    assert seen["submit_concurrency"] == 7, (
+        f"--copy-submit-concurrency 没传下去: {seen.get('submit_concurrency')}"
+    )
+
+
+def test_copy_submits_concurrently_up_to_cap(fake_store_module, monkeypatch) -> None:
+    """一次 copy 内多 key 并发提交，但在飞数不超过 `submit_concurrency`。
+
+    串行提交时提交阶段是 N 倍往返（大批量预热慢得不可用）；不限并发则
+    在目标侧形成建链风暴（0.3.11 实测 14 连发约半数 TRANSFER_FAIL）。
+    两个方向都要锁：**并发度 > 1** 证明并行，**不超上限** 证明没失控。
+    """
+    inflight = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class SlowClient(FakeClient):
+        def create_copy_task(self, key, targets):
+            nonlocal inflight, peak
+            with lock:
+                inflight += 1
+                peak = max(peak, inflight)
+            try:
+                # 短暂占用：并发的提交必然重叠（peak 到上限），串行的
+                # 不会。0.1 秒远大于调度抖动，不需要任何事件/门槛。
+                time.sleep(0.1)
+                return super().create_copy_task(key, targets)
+            finally:
+                with lock:
+                    inflight -= 1
+
+    client = SlowClient()
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(
+        kc,
+        "keys_for_tokens",
+        lambda ids: kc.expand(["h0", "h1", "h2", "h3", "h4", "h5"]),
+    )
+    b = MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        submit_concurrency=3,
+    )
+    handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert len(handle.task_ids) == 6
+    assert peak == 3, f"并发度不对: peak={peak}"
+    # 并发完成顺序不定，号本身是乱序发放的；但六个数一个不能少。
+    assert sorted(handle.task_ids) == sorted((i, 100 + i) for i in range(1, 7))
+
+
+def test_ledger_write_uses_ledger_pool_not_rpc_pool(
+    fake_store_module, monkeypatch
+) -> None:
+    """Ledger 写入走 Ledger 自己的池，不占 RPC 池。
+
+    用 RPC 池有两个害处：占掉传输名额；退出时池已关，`abandon` 若恰好落在
+    那个窗口，会抛 `cannot schedule new futures after shutdown`，账本留
+    `running`。
+
+    测法：copy 正常跑完（RPC 池还活着），然后关掉 RPC 池，再调 `abandon`
+    —— 它只写 ledger，不该需要 RPC 池。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    led = Ledger(path)
+    rpc_pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        client = FakeClient()
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+            executor=rpc_pool,
+        )
+        handle = run(
+            b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        )
+        rows = led.list_running_tasks()
+        assert rows, "copy 后没有 running 行"
+        handle_id = rows[0].handle_id
+        rpc_pool.shutdown(wait=True)  # 模拟退出期那一瞬
+        run(b.abandon(handle))  # 只写 ledger，不该需要 RPC 池
+        statuses = {r.status for r in led.list_tasks_by_handle(handle_id)}
+        assert "abandoned" in statuses, f"abandon 没记账: {statuses}"
+    finally:
+        led.close()
+        os.unlink(path)
+
+
+def test_cancel_during_ledger_write_after_failure_propagates(
+    fake_store_module, monkeypatch
+) -> None:
+    """提交失败后的记账途中被取消：`CancelledError` 原样抛，不包成 `SubmitError`。
+
+    原始异常是普通 `Exception`（比如第 2 个 key 提交失败）；此时若把记账途中的
+    取消吞掉，调用方会收到 `SubmitError`——取消没传出去，消费者会当成预热失败
+    继续拿下一个而不是退出。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        class BoomClient(FakeClient):
+            def create_copy_task(self, key, targets):
+                if len(self.created) >= 1:
+                    raise RuntimeError("submit boom")
+                return super().create_copy_task(key, targets)
+
+        client = BoomClient()
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(
+            kc, "keys_for_tokens", lambda ids: kc.expand(["h0", "h1"])
+        )
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+            submit_concurrency=1,  # 逐 key：第 2 个必失败，取消点确定
+        )
+        entered = threading.Event()
+        orig_record = b._record
+
+        async def slow_record(handle, status, tids=None):
+            entered.set()
+            await asyncio.sleep(0.5)  # 留出取消窗口
+            await orig_record(handle, status, tids)
+
+        b._record = slow_record
+
+        async def scenario():
+            task = asyncio.create_task(
+                b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+            )
+            deadline = time.monotonic() + 3
+            while not entered.is_set() and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert entered.is_set(), "没进到记账，前提不成立"
+            task.cancel()
+            # 关键：必须是 CancelledError，不是 SubmitError
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            # 取消只打断调用方；被 shield 的记账要在同一事件循环里跑完。
+            # 断言那条已发出的 task id 在 Ledger 里是 running——去掉 shield
+            # 时取消直接从 `_record` 冒出，行没写上，而调用方照样收到
+            # CancelledError，只有这条断言能抓住。
+            deadline = time.monotonic() + 3
+            rows = []
+            while time.monotonic() < deadline:
+                rows = led.list_running_tasks()
+                if rows:
+                    break
+                await asyncio.sleep(0.01)
+            assert [r.task_id for r in rows] == ["1:101"], (
+                f"取消时已发出的任务号没落账成 running: {rows}"
+            )
+
+        run(scenario())
+    finally:
+        led.close()
+        os.unlink(path)
 
 
 def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> None:
@@ -175,14 +602,21 @@ def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> N
 
     class BoomClient(FakeClient):
         def create_copy_task(self, key, targets):
-            if len(self.created) >= 1:
+            with self._id_lock:
+                already = len(self.created)
+            if already >= 1:
                 raise RuntimeError("submit boom")
             return super().create_copy_task(key, targets)
 
     client = BoomClient()
-    b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
+    b = _backend(
+        client,
+        KeyComputer(model_name="qwen", tp_size=2),
+        monkeypatch,
+        submit_concurrency=1,  # 逐 key：第 2 个必失败，不靠撞时序
+    )
     with pytest.raises(SubmitError, match=r"1/2 tasks.*\[\(1, 101\)\]"):
-        b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
 
 
 # ---------------------------------------------------------------------------
@@ -210,20 +644,20 @@ def test_conflict_watch_running_then_ready(fake_store_module, monkeypatch) -> No
     try:
         client = ConflictClient(replicas_on=[])  # 副本还没到位
         b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led)
-        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
         # 第一轮：全部失败且全是在途冲突 → 观测态 RUNNING，句柄保留
-        assert b.query_task(handle) is TaskStatus.RUNNING
+        assert run(b.query_task(handle)) is TaskStatus.RUNNING
         assert handle in b._plans
         # 冲突任务如实记 failed（它们确实失败了，数据是别人搬的）
         for tid in handle.task_ids:
             assert led.get_task(encode_task_id(tid)).status == "failed"  # type: ignore[union-attr]
         # 观测态后续调用不再查任务（任务已死），只核验副本
         n_queried = len(client.queried)
-        assert b.query_task(handle) is TaskStatus.RUNNING
+        assert run(b.query_task(handle)) is TaskStatus.RUNNING
         assert len(client.queried) == n_queried
         # 副本到位（别人的任务传完）→ READY，终态删登记
         client._replicas_on = ["seg-A", "seg-B"]
-        assert b.query_task(handle) is TaskStatus.READY
+        assert run(b.query_task(handle)) is TaskStatus.READY
         assert handle not in b._plans
         assert handle not in b._watch
     finally:
@@ -246,8 +680,8 @@ def test_conflict_mixed_with_real_failure_is_terminal(fake_store_module, monkeyp
             return _FakeTaskResp(_FakeStoreTaskStatus.FAILED, "OBJECT_NOT_FOUND")
 
     b = _backend(MixedClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-    assert b.query_task(handle) is TaskStatus.FAILED
+    handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert run(b.query_task(handle)) is TaskStatus.FAILED
     assert handle not in b._plans
     assert handle not in b._watch
 
@@ -262,9 +696,9 @@ def test_abandon_during_watch_keeps_conflict_ledger(fake_store_module, monkeypat
     try:
         client = ConflictClient(replicas_on=[])
         b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led)
-        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-        assert b.query_task(handle) is TaskStatus.RUNNING  # 进观测态
-        b.abandon(handle)
+        handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+        assert run(b.query_task(handle)) is TaskStatus.RUNNING  # 进观测态
+        run(b.abandon(handle))
         assert handle not in b._plans
         assert handle not in b._watch
         # 本例全部任务都冲突 → 全部保持 failed（无 abandoned 改写）
@@ -294,12 +728,12 @@ def test_exists_checks_length(fake_store_module, monkeypatch) -> None:
 
     kc = KeyComputer(model_name="qwen", tp_size=2)
     b = _backend(ShortClient(), kc, monkeypatch)
-    assert b.exists(Prefix(model_id="qwen", token_ids=(1,))) is False
+    assert run(b.exists(Prefix(model_id="qwen", token_ids=(1,)))) is False
 
 
 def test_exists_all_present(fake_store_module, monkeypatch) -> None:
     b = _backend(FakeClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
-    assert b.exists(Prefix(model_id="qwen", token_ids=(1,))) is True
+    assert run(b.exists(Prefix(model_id="qwen", token_ids=(1,)))) is True
 
 
 def test_is_exist_per_key_failure_raises() -> None:
@@ -326,7 +760,7 @@ def test_exists_query_failure_is_retryable_query_error(fake_store_module, monkey
 
     b = _backend(BoomClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
     with pytest.raises(QueryError):
-        b.exists(Prefix(model_id="qwen", token_ids=(1,)))
+        run(b.exists(Prefix(model_id="qwen", token_ids=(1,))))
 
 
 # ---------------------------------------------------------------------------
@@ -346,10 +780,10 @@ def test_ledger_transitions(fake_store_module, monkeypatch) -> None:
     try:
         client = FakeClient()
         b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led)
-        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
         for tid in handle.task_ids:
             assert led.get_task(encode_task_id(tid)).status == "running"  # type: ignore[union-attr]
-        b.query_task(handle)
+        run(b.query_task(handle))
         for tid in handle.task_ids:
             rec = led.get_task(encode_task_id(tid))
             assert rec and rec.status == "ready" and rec.op == "copy"
@@ -409,7 +843,7 @@ def test_rebuild_restores_running_handle(fake_store_module, monkeypatch) -> None
             capability=mooncake_v0311(),
             ledger=led,
         )
-        b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        run(b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
         assert len(led.list_running_tasks()) == 2  # 两 key 两任务
 
         # 模拟重启：全新 backend（空 _plans），同一 Ledger、同一 master
@@ -424,12 +858,12 @@ def test_rebuild_restores_running_handle(fake_store_module, monkeypatch) -> None
             capability=mooncake_v0311(),
             ledger=led,
         )
-        assert b2.rebuild() == 1  # 一个 handle（两任务一组）
+        assert len(b2.rebuild()) == 1  # 一个 handle（两任务一组）
         handle = next(iter(b2._plans))
         # 任务号解码回整数对（与创建时同形态）
         assert all(isinstance(t, tuple) for t in handle.task_ids)
         # 继续 query_task → 核验通过 → READY；Ledger 迁移 ready
-        assert b2.query_task(handle) is TaskStatus.READY
+        assert run(b2.query_task(handle)) is TaskStatus.READY
         for tid in handle.task_ids:
             assert led.get_task(encode_task_id(tid)).status == "ready"  # type: ignore[union-attr]
     finally:
@@ -448,8 +882,7 @@ def test_rebuild_skips_empty_inputs(fake_store_module, monkeypatch) -> None:
         # 模拟数据残缺行：handle_id 空、token_ids 空（upsert 走正常通道后手工改空）
         p = Prefix(model_id="qwen", token_ids=(1,))
         led.upsert_task("t-old", handle_id="h-old", op="copy", prefix=p, target="i", status="running")
-        led._conn.execute("UPDATE tasks SET handle_id = '', token_ids = ''")
-        led._conn.commit()
+        led._corrupt_task_row("t-old")
         kc = KeyComputer(model_name="qwen", tp_size=2)
         monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
         b = MooncakeBackend(
@@ -459,7 +892,7 @@ def test_rebuild_skips_empty_inputs(fake_store_module, monkeypatch) -> None:
             capability=mooncake_v0311(),
             ledger=led,
         )
-        assert b.rebuild() == 0
+        assert b.rebuild() == []
         assert not b._plans
     finally:
         led.close()
@@ -499,8 +932,8 @@ def test_rebuild_restores_watch_state(fake_store_module, monkeypatch) -> None:
             locate=lambda _inst: ["seg-A", "seg-B"],
             capability=mooncake_v0311(), ledger=led,
         )
-        h1 = b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-        assert b1.query_task(h1) is TaskStatus.RUNNING  # 观测态等副本
+        h1 = run(b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+        assert run(b1.query_task(h1)) is TaskStatus.RUNNING  # 观测态等副本
         assert h1 in b1._watch
 
         # 重启：副本未到位 → RUNNING（不得 VerifyError）；冲突行保持 failed
@@ -512,14 +945,14 @@ def test_rebuild_restores_watch_state(fake_store_module, monkeypatch) -> None:
             locate=lambda _inst: ["seg-A", "seg-B"],
             capability=mooncake_v0311(), ledger=led,
         )
-        assert b2.rebuild() == 1
+        assert len(b2.rebuild()) == 1
         h2 = next(iter(b2._plans))
         assert h2 in b2._watch  # 观测态恢复了
-        assert b2.query_task(h2) is TaskStatus.RUNNING  # 缺 seg-B 副本：等，不是终态
+        assert run(b2.query_task(h2)) is TaskStatus.RUNNING  # 缺 seg-B 副本：等，不是终态
 
         # 副本全部到位 → READY；冲突行保持 failed，其余 ready
         client2._replicas_on = ["seg-A", "seg-B"]
-        assert b2.query_task(h2) is TaskStatus.READY
+        assert run(b2.query_task(h2)) is TaskStatus.READY
         assert led.get_task(encode_task_id((1, 101))).status == "failed"  # type: ignore[union-attr]
         assert led.get_task(encode_task_id((2, 102))).status == "ready"  # type: ignore[union-attr]
     finally:
@@ -539,7 +972,7 @@ def test_empty_handle_is_immediately_ready(fake_store_module) -> None:
     from kvcm.ops.base import TaskHandle
 
     empty = TaskHandle(op=OpKind.COPY, task_ids=())
-    assert b.query_task(empty) is TaskStatus.READY
+    assert run(b.query_task(empty)) is TaskStatus.READY
 
 
 def test_rebuild_skips_unresolvable(fake_store_module, monkeypatch) -> None:
@@ -559,7 +992,7 @@ def test_rebuild_skips_unresolvable(fake_store_module, monkeypatch) -> None:
             capability=mooncake_v0311(),
             ledger=led,
         )
-        b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        run(b1.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
 
         def dead_locate(_inst):
             raise RuntimeError("instance gone")
@@ -571,7 +1004,7 @@ def test_rebuild_skips_unresolvable(fake_store_module, monkeypatch) -> None:
             capability=mooncake_v0311(),
             ledger=led,
         )
-        assert b2.rebuild() == 0
+        assert b2.rebuild() == []
         assert not b2._plans
     finally:
         led.close()
@@ -591,16 +1024,16 @@ def test_abandon_purges_and_marks(fake_store_module, monkeypatch) -> None:
         b = _backend(
             FakeClient(), KeyComputer(model_name="qwen", tp_size=2), monkeypatch, ledger=led
         )
-        handle = b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
-        b.abandon(handle)
+        handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+        run(b.abandon(handle))
         assert handle not in b._plans
         for tid in handle.task_ids:
             assert led.get_task(encode_task_id(tid)).status == "abandoned"  # type: ignore[union-attr]
         # 放弃后句柄失效
         with pytest.raises(KeyError):
-            b.query_task(handle)
+            run(b.query_task(handle))
         with pytest.raises(KeyError):
-            b.abandon(handle)
+            run(b.abandon(handle))
     finally:
         led.close()
         import os
@@ -626,13 +1059,13 @@ def _pin_backend(monkeypatch, cap) -> MooncakeBackend:
 def test_pin_soft_unsupported_when_channel_no(fake_store_module, monkeypatch) -> None:
     b = _pin_backend(monkeypatch, mooncake_v0311())  # soft 通道 NO
     with pytest.raises(UnsupportedCapabilityError, match="soft pin"):
-        b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT)
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
 
 
 def test_pin_hard_always_unsupported(fake_store_module, monkeypatch) -> None:
     b = _pin_backend(monkeypatch, mooncake_main())  # hard 通道 NO（全版本）
     with pytest.raises(UnsupportedCapabilityError, match="hard pin"):
-        b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD)
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD))
 
 
 def test_pin_soft_not_implemented_when_channel_yes(fake_store_module, monkeypatch) -> None:
@@ -646,7 +1079,7 @@ def test_pin_soft_not_implemented_when_channel_yes(fake_store_module, monkeypatc
     )
     b = _pin_backend(monkeypatch, cap_yes)
     with pytest.raises(NotImplementedError):
-        b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT)
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
 
 
 # ---------------------------------------------------------------------------
@@ -751,11 +1184,7 @@ def test_ledger_gc_tasks() -> None:
             led.upsert_task("old-running", handle_id="h4", op="copy", prefix=p, target="i", status="running")
             led.upsert_task("new-ready", handle_id="h5", op="copy", prefix=p, target="i", status="ready")
             # 手工把四行的 updated_at 拨到 8 天前
-            old = time.time() - 8 * 24 * 3600
-            led._conn.execute(
-                "UPDATE tasks SET updated_at = ? WHERE task_id != 'new-ready'", (old,)
-            )
-            led._conn.commit()
+            led._backdate_tasks(days=8, exclude=("new-ready",))
             assert led.gc_tasks() == 3  # old-ready + old-failed + old-abandoned
             assert led.get_task("old-ready") is None
             assert led.get_task("old-failed") is None
@@ -766,3 +1195,163 @@ def test_ledger_gc_tasks() -> None:
             assert led.get_task("new-ready") is not None
     finally:
         os.unlink(path)
+
+
+# ---------------------------------------------------------------------------
+# drain（退出时等 RPC 线程真正退完）
+# ---------------------------------------------------------------------------
+
+
+def test_rpc_timeout_raises_query_error(fake_store_module, monkeypatch) -> None:
+    """RPC 卡住超过 rpc_timeout_s → 抛 QueryError（可重试语义）。
+
+    线程不会被打断（Python 无法中断 C++ 调用）——它继续跑到自然结束，
+    由退出时 `close()` 的有界等待兜底。调用方按可重试处理，不会无限等。
+    """
+
+    class HangingClient(FakeClient):
+        def is_exist(self, keys):
+            time.sleep(1.0)
+            return [True] * len(keys)
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    _backend_with_timeout = MooncakeBackend(
+        client=HangingClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        rpc_timeout_s=0.1,
+    )
+    from kvcm.ops.base import QueryError
+
+    async def scenario():
+        with pytest.raises(QueryError, match="RPC timeout"):
+            await _backend_with_timeout.exists(Prefix(model_id="qwen", token_ids=(1,)))
+
+    run(scenario())
+    _backend_with_timeout.close()
+
+
+def test_rpc_timeout_disabled_when_zero(fake_store_module, monkeypatch) -> None:
+    """rpc_timeout_s <= 0 表示不设超时（离线/调试场景）。"""
+
+    class FastClient(FakeClient):
+        def is_exist(self, keys):
+            return [True] * len(keys)
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=FastClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        rpc_timeout_s=0,
+    )
+
+    async def scenario():
+        assert await b.exists(Prefix(model_id="qwen", token_ids=(1,))) is True
+
+    run(scenario())
+    b.close()
+
+
+def test_copy_submit_timeout_is_submit_error(fake_store_module, monkeypatch) -> None:
+    """copy 提交超时 → SubmitError（不是 QueryError）——提交阶段的失败
+    语义归 SubmitError，异常消息带已发任务号。"""
+
+    class SlowSubmitClient(FakeClient):
+        def create_copy_task(self, key, targets):
+            time.sleep(1.0)
+            return super().create_copy_task(key, targets)
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=SlowSubmitClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        rpc_timeout_s=0.1,
+    )
+    from kvcm.ops.base import SubmitError
+
+    async def scenario():
+        with pytest.raises(SubmitError):
+            await b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+
+    run(scenario())
+    b.close()
+
+
+
+def test_close_waits_bounded_for_inflight_rpc(fake_store_module, monkeypatch) -> None:
+    """close() 有界等线程：慢 RPC 会被等到，卡死的不会永远拖住退出。"""
+    from kvcm.ops.base import QueryError
+
+    class SlowClient(FakeClient):
+        def is_exist(self, keys):
+            time.sleep(0.2)
+            return [True] * len(keys)
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=SlowClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        rpc_timeout_s=0.05,
+    )
+    p = Prefix(model_id="qwen", token_ids=(1,))
+
+    async def scenario():
+        with pytest.raises(QueryError):
+            await b.exists(p)  # 超时返回，但线程还在跑
+
+    run(scenario())
+    # close 会等这个线程（0.2s 内跑完，5s 上限足够）
+    import time as _t
+
+    start = _t.monotonic()
+    got = b.close(wait_timeout_s=5.0)
+    elapsed = _t.monotonic() - start
+    # 关键：close 等了那个慢线程（≥0.15s），不是立刻返回
+    assert elapsed >= 0.1, f"close 没等慢 RPC（{elapsed:.2f}s）"
+    # 等完了要如实返回 True——调用方靠这个值决定要不要硬退出
+    assert got is True, f"线程等完了却报没等完（返回 {got!r}）"
+
+
+def test_close_bounded_when_rpc_hangs(fake_store_module, monkeypatch) -> None:
+    """RPC 卡死：close 不会永远挂住（有界）。"""
+    import time as _time
+
+    class HangingClient(FakeClient):
+        def is_exist(self, keys):
+            _time.sleep(3)
+            return [True] * len(keys)
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=HangingClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        rpc_timeout_s=0.05,
+    )
+    p = Prefix(model_id="qwen", token_ids=(1,))
+
+    async def scenario():
+        with pytest.raises(Exception):
+            await b.exists(p)
+
+    run(scenario())
+    start = _time.monotonic()
+    got = b.close(wait_timeout_s=0.3)  # 远小于 RPC 的 3s
+    elapsed = _time.monotonic() - start
+    assert elapsed < 1.5, f"close 没有有界返回（用了 {elapsed:.2f}s）"
+    # 超时必须如实报 False：调用方正是靠它触发 os._exit(1)。
+    # 原实现无返回值（隐式 None），这个信号被静默丢掉。
+    assert got is False, f"超时没报 False（返回 {got!r}），调用方无从判断"

@@ -78,7 +78,8 @@ jobs:
           python-version: "3.12"
       - run: python scripts/check_doc_links.py
 
-  # kvcm 产品单测:kvcm/kvcm 与 kvcm/tests 改动才触发（pytest，无第三方依赖）。
+  # kvcm 产品单测:kvcm/kvcm 与 kvcm/tests 改动才触发（pytest；E12 起有
+  # grpcio/protobuf 运行时依赖，见下方 pip install）。
   kvcm:
     needs: filter
     if: needs.filter.outputs.kvcm_pkg == 'true'
@@ -93,7 +94,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pytest
+      # E12 起 kvcm 有 gRPC 运行时依赖（grpcio/protobuf），不再是「只装 pytest」。
+      # 版本由 kvcm 自己的 stub 决定（见 kvcm/requirements.txt 注释）——
+      # **不要**按主仓根 pyproject.toml 的 python/ 口径对齐：两处 stub 生成
+      # 版本不同，是两套独立环境。
+      - run: pip install -r requirements-dev.txt
       - run: python -m pytest tests/ -q
 
   # kvcm demo 冒烟(PR #53 review §四.B):仅 kvcm/demo 改动触发——无 NPU 依赖的离线检查:
