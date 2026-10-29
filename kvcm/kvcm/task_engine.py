@@ -11,13 +11,15 @@
 无优先级、不分轻重通道——轻任务本来就不经此队列（保活走
 KeepaliveLoop，查询由各自调用方直接 await）。
 
-**为什么是协程而非线程池**：一个 copy 任务 30 秒里 RPC 执行合计约 1
-秒，其余在等（轮询 sleep、等 RPC 返回）。线程池下等待也把线程占死；
-协程下等待只是挂起——100 个任务挂着也只占 RPC executor 那几个线程。
+**为什么是协程而非线程池**：一个 copy 任务的生命周期以十秒计，其中 RPC
+真正在执行的时间只占很小一部分，其余在等（轮询 sleep、等 RPC 返回）。
+线程池下等待也把线程占死；协程下等待只是挂起——100 个任务挂着也只占
+RPC executor 那几个线程。
 
 **传输闸的语义**：只在确认要发后台传输时拿名额（copy 提交前 acquire，
-终态 release）——保护 mooncake 与 RDMA 带宽。毫秒级操作（exists 探测 /
-查询 / 副本核验）不过闸，其瞬时并发由 RPC executor 天然限制。
+终态 release）——保护 mooncake 与 RDMA 带宽。闸外只有 exists 探测
+（预热的前置检查，毫秒级 RPC）；`run_after_exists` 整段（提交、轮询、
+副本核验）在闸内，因为它们同属「后端还在为这个前缀搬数据」这一件事。
 
 **线程边界**：`submit_intent` / `intent_status` 是**同步方法**，供 gRPC
 servicer（在其线程池线程里）调用——入队经 `call_soon_threadsafe` 投递
