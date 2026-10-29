@@ -258,18 +258,29 @@ def test_rebuild_hang_times_out(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: backend)
     monkeypatch.setattr(daemon, "KeepaliveLoop", FakeKeepalive)
 
-    exits: list[int] = []
-    monkeypatch.setattr(daemon, "_hard_exit", lambda: exits.append(1))
+    exits: list[float] = []
+    t0 = time.monotonic()
+    # **不放行 rebuild 线程**：生产里 os._exit 之后不会再有代码跑。若在 mock
+    # 里放行，finally 的 drain 会超时并再调一次 _hard_exit——那样 rebuild
+    # 分支被删掉时测试一样绿。
+    monkeypatch.setattr(
+        daemon, "_hard_exit", lambda: exits.append(time.monotonic() - t0)
+    )
 
     args = _args(tmp_path)
-    args.connect_timeout_s = 0.2  # 别等 30 秒
+    args.connect_timeout_s = 0.2  # rebuild 的超时
+    args.shutdown_timeout_s = 3.0  # 远大于它：别让 finally 抢先
     t, stop = _run_daemon_in_thread(args)
     deadline = time.monotonic() + 5
     while not exits and time.monotonic() < deadline:
         time.sleep(0.01)
+    assert exits, "rebuild 卡住没有硬退出"
+    # 只该有一次且来得早（来自 rebuild 分支）。若那个分支被删成 raise，
+    # finally 要等满 shutdown_timeout_s 才硬退出，这里等不到。
+    assert len(exits) == 1, f"硬退出次数不对: {exits}"
+    assert exits[0] < 1.0, f"硬退出来得太晚（{exits[0]:.1f}s），可能来自 finally"
     hang.set()
     t.join(timeout=5)
-    assert exits == [1], f"rebuild 卡住没有硬退出: {exits}"
 
 
 def test_no_restored_tasks_still_clean_shutdown(monkeypatch, tmp_path) -> None:
@@ -631,8 +642,10 @@ def test_connect_timeout_branch_hard_exits(monkeypatch, tmp_path) -> None:
             events.append(("ledger.close", time.monotonic() - t0))
 
     def _hard_exit() -> None:
+        # **不放行 connect 线程**：生产里 os._exit 之后不会再有任何代码跑，
+        # 所以线程永远卡着。如果在 mock 里放行，finally 的 drain 就会超时
+        # 并再调一次 _hard_exit——那样 connect 分支被删掉时测试一样绿。
         hard_exits.append(time.monotonic() - t0)
-        release.set()
 
     monkeypatch.setattr(daemon, "StoreClient", HangingClient)
     monkeypatch.setattr(daemon, "Ledger", lambda path: FakeLedger())
@@ -640,18 +653,19 @@ def test_connect_timeout_branch_hard_exits(monkeypatch, tmp_path) -> None:
 
     args = _args(tmp_path)
     args.connect_timeout_s = 0.2
+    args.shutdown_timeout_s = 3.0  # 远大于 0.2s 的 connect 超时：别让 finally 抢先
     t, stop = _run_daemon_in_thread(args)
+    # 等到硬退出出现（connect 超时是 0.2s，5 秒足够）
+    deadline = time.monotonic() + 5
+    while not hard_exits and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert hard_exits, "connect 超时后没硬退出"
+    # 关键：此刻只该有 **一次**，且来自 connect 分支。若那个分支被删成
+    # raise，finally 要等满 shutdown_timeout_s 才会硬退出——等待窗口内等不到。
+    assert len(hard_exits) == 1, f"硬退出次数不对: {hard_exits}"
+    assert hard_exits[0] < 1.0, f"硬退出来得太晚（{hard_exits[0]:.1f}s），可能来自 finally"
+    release.set()  # 放行，让 finally 能收尾
     t.join(timeout=5)
-    assert not t.is_alive(), "connect 卡住时进程没退出"
-    # 恰好一次：来自 connect 的超时分支。若 connect 分支被删，线程被放行后
-    # finally 会正常 close，硬退出次数为 0 → 失败
-    assert len(hard_exits) == 1, f"硬退出次数不对（应为 connect 分支那一次）: {hard_exits}"
-    # 关键：硬退出发生在 close 之前（生产里 os._exit 后不会有 close）
-    first_close = min((t for _, t in events), default=float("inf"))
-    assert hard_exits[0] <= first_close, (
-        f"close 发生在硬退出之前: hard_exit={hard_exits[0]:.2f} "
-        f"events={[(n, round(t, 2)) for n, t in events]}"
-    )
 
 
 

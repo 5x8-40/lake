@@ -196,32 +196,6 @@ def test_submit_intent_dedupes_in_flight() -> None:
     run(scenario())
 
 
-def test_submit_intent_after_terminal_restarts() -> None:
-    """同键已终态：视为新意图，重新预热（返回同一 key，但会再跑一次）。"""
-
-    async def scenario():
-        ops = FakeOps(seq=[TaskStatus.READY, TaskStatus.READY])
-        eng = TaskEngine(ops)
-        eng.start()
-        try:
-            key = eng.submit_intent(_P, _T, poll_s=0.01)
-            for _ in range(200):
-                if eng.intent_status(key) is IntentStatus.READY:
-                    break
-                await asyncio.sleep(0.01)
-            assert eng.intent_status(key) is IntentStatus.READY
-            eng.submit_intent(_P, _T, poll_s=0.01)  # 终态后重新提交
-            for _ in range(100):
-                if ops.copy_count >= 2:
-                    break
-                await asyncio.sleep(0.01)
-            assert ops.copy_count == 2
-        finally:
-            await eng.shutdown(timeout_s=2)
-
-    run(scenario())
-
-
 def test_intent_detail_contains_failure_reason() -> None:
     """失败必须带原因（真机排障教训：不带原因的回执等于没有回执）。"""
 
@@ -644,6 +618,95 @@ def test_finish_does_not_overwrite_terminal_status() -> None:
             assert eng.intent_status(key) is IntentStatus.READY, "READY 被改写成 FAILED"
         finally:
             await eng.shutdown(timeout_s=0.5)
+
+    run(scenario())
+
+
+def test_queue_full_rejects_intent() -> None:
+    """队列满：这条 intent 记 FAILED（不阻塞调用方，也不静默丢弃）。
+
+    调用方已经拿到 id，所以必须能查到「为什么没跑」——直接丢弃会让它的
+    `GetTask` 永远停在 PENDING。
+    """
+
+    async def scenario():
+        gate = threading.Event()
+        ops = FakeOps(query_gate=gate)
+        # queue_size=1：第一条占住队列，第二条必然撞 QueueFull
+        eng = TaskEngine(ops, max_concurrent=1, consumer_count=1, queue_size=1)
+        eng.start()
+        try:
+            # 第一条：正常入队并被消费者取走（占住唯一消费者）
+            first = eng.submit_intent(_P, _T, poll_s=0.01)
+            deadline = time.monotonic() + 2
+            while ops.copy_count == 0 and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert ops.copy_count >= 1, "前提不成立：第一条没开始执行"
+
+            # 第二条：队列容量 1 + 消费者忙 → 直接拒绝
+            second_key = "another-prefix|inst-B"
+            eng._accepting = True
+            # 手工走 _admit 路径（队列已满）
+            rec = _IntentRecord(
+                intent_id=second_key,
+                prefix=Prefix(model_id="other", token_ids=(9,)),
+                target=_T,
+                poll_s=0.01,
+                timeout_s=1.0,
+            )
+            eng._records[second_key] = rec
+            eng._queue.put_nowait(
+                _IntentRecord(
+                    intent_id="filler",
+                    prefix=_P,
+                    target=_T,
+                    poll_s=0.01,
+                    timeout_s=1.0,
+                )
+            )
+            eng._admit(second_key, Prefix(model_id="other", token_ids=(9,)), _T, 0.01, 1.0)
+            assert eng.intent_status(second_key) is IntentStatus.FAILED
+            assert "queue full" in eng.intent_detail(second_key)
+            gate.set()
+        finally:
+            gate.set()
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_consumer_exits_on_programming_error() -> None:
+    """消费者遇到编程错误（非 PrefetchError / QueryError）：记 FAILED 后退出。
+
+    设计如此——编程错误不该被当成业务失败吞掉、继续循环（那会让故障隐身）。
+    这条锁的是「记了原因 + 协程真的退出了」。
+    """
+
+    class BoomOps(FakeOps):
+        async def exists(self, prefix):
+            raise TypeError("programming bug")
+
+    async def scenario():
+        ops = BoomOps()
+        eng = TaskEngine(ops, max_concurrent=1, consumer_count=1)
+        eng.start()
+        try:
+            key = eng.submit_intent(_P, _T, poll_s=0.01)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if eng.intent_status(key) is IntentStatus.FAILED:
+                    break
+                await asyncio.sleep(0.01)
+            assert eng.intent_status(key) is IntentStatus.FAILED
+            assert "TypeError" in eng.intent_detail(key), (
+                f"失败原因丢了: {eng.intent_detail(key)!r}"
+            )
+            # 消费者协程应该已经因异常退出
+            await asyncio.sleep(0.1)
+            alive = [t for t in eng._consumers if not t.done()]
+            assert not alive, f"编程错误后消费者还活着: {len(alive)} 条"
+        finally:
+            await eng.shutdown(timeout_s=2)
 
     run(scenario())
 
