@@ -252,9 +252,15 @@ class MooncakeBackend(KvOps):
         14 连发就打爆）。
 
         延迟创建：`Semaphore()` 构造时不绑循环，但**首次有人排队等名额**
-        时会 `_get_loop()`。把创建放到首次使用（协程里），保证绑定发生在
-        真正使用它的那个循环上。`_submit_gate` 本身不含 `await`，事件循环
-        线程上两次调用不会各建一把。
+        时会 `_get_loop()`。把创建放到首次使用（协程里），绑定的自然是
+        当前这个循环。`_submit_gate` 本身不含 `await`，事件循环线程上
+        两次调用不会各建一把。
+
+        **它不解决跨循环复用**：同一个 backend 先在循环 A 里排过队、又在
+        循环 B 里排队，仍会 `RuntimeError: bound to a different event
+        loop`（名额没用完时不会——那种情况根本不去取循环）。当前不构成
+        问题：生产只有一个循环，测试里同一个 backend 也只在一个 `run()`
+        内用这把信号量。真要跨循环用，得按循环各建一把。
         """
         if self._submit_sem is None:
             self._submit_sem = asyncio.Semaphore(self._submit_concurrency)
