@@ -117,8 +117,8 @@ class MooncakeBackend(KvOps):
         self._cap = capability
         self._ledger = ledger
         self._submit_concurrency = submit_concurrency
-        # 进程级提交信号量：延迟创建。`Semaphore()` 构造时不绑循环，首次
-        # 排队等名额才绑——放到首次使用，绑的就是真正用它那个循环。
+        # 进程级提交信号量：延迟创建（首次 copy 时建）。Semaphore() 构造
+        # 不绑循环，首次排队等名额才绑；什么时候创建不是正确性的关键。
         self._submit_sem: asyncio.Semaphore | None = None
         # 协程侧 RPC 超时（0.3.11 的绑定没有超时参数；main 有
         # MC_RPC_TIMEOUT_MS，届时可与此对齐）。<=0 表示不设超时。
