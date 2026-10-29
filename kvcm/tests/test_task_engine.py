@@ -476,6 +476,121 @@ def test_shutdown_drain_pairs_task_done() -> None:
     run(scenario())
 
 
+class _RacingRecords(dict):
+    """逼两个线程都带着「空槽」这个观察结果去装槽。
+
+    两个关键点（错一处就撞不出来）：
+    - `get` 在屏障放开后**返回进屏障前的空槽结果**（`default`），不能再
+      `super().get()` 重读——否则后一个线程会看到先装上的记录、走「已有
+      PENDING」直接返回，根本不会覆盖
+    - 第一次 `__setitem__` 立刻放行（A 装槽后马上去 `call_soon`）；第二次
+      等 `allow_overwrite`，让 A 先入队再覆盖
+
+    `setdefault` 不走 `get` / `__setitem__`，现实现不会进这些钩子。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.miss = threading.Barrier(2, timeout=2)
+        self.writes = 0
+        self._lock = threading.Lock()
+        self.first_installed = threading.Event()
+        self.allow_overwrite = threading.Event()
+
+    def get(self, key, default=None):
+        if key not in self:
+            try:
+                self.miss.wait()
+            except threading.BrokenBarrierError:
+                pass
+            return default
+        return super().get(key, default)
+
+    def __setitem__(self, key, value):
+        with self._lock:
+            n = self.writes
+            self.writes += 1
+        if n == 0:
+            super().__setitem__(key, value)
+            self.first_installed.set()
+            return
+        self.allow_overwrite.wait(timeout=3)
+        super().__setitem__(key, value)
+
+
+def test_install_does_not_overwrite_queued_record() -> None:
+    """装槽不能覆盖已入队的记录——同键双开的根源。
+
+    旧实现 `self._records[key] = rec` 是覆盖。窗口：
+
+    1. A、B 的 `get` 都看到空槽
+    2. A 装槽，`_admit` 把它置 `queued=True` 并入队
+    3. B 这时才赋值覆盖 → 新记录 `queued=False`
+    4. B 的 `_admit` 再入队一次 → 同一前缀执行两遍（`copy_count == 2`）
+
+    `setdefault` 让插入本身决定归属：槽非空时返回既有记录，自己的写不生效，
+    也就不再投递 `_admit`。
+
+    时序靠 `_RacingRecords` 固定，不靠线程调度。实测：旧实现 `writes=2,
+    copy_count=2`；现实现 `writes=0, copy_count=1`。
+    """
+
+    async def scenario():
+        gate = threading.Event()
+        ops = FakeOps(query_gate=gate)
+        eng = TaskEngine(ops, max_concurrent=2, consumer_count=2)
+        eng.start()
+        rd = _RacingRecords()
+        eng._records = rd
+        key = intent_id_of(_P, _T)
+        try:
+            threads = [
+                threading.Thread(
+                    target=lambda: eng.submit_intent(_P, _T, poll_s=0.01)
+                )
+                for _ in range(2)
+            ]
+            for t in threads:
+                t.start()
+
+            if not rd.first_installed.wait(timeout=1):
+                # setdefault：没人走 __setitem__，不会覆盖
+                for t in threads:
+                    t.join(timeout=2)
+                gate.set()
+                deadline = time.monotonic() + 2
+                while ops.copy_count < 1 and time.monotonic() < deadline:
+                    await asyncio.sleep(0.01)
+                assert rd.writes == 0, f"setdefault 不该走 __setitem__（{rd.writes} 次）"
+                assert ops.copy_count == 1
+                return
+
+            # 旧实现：等 A 入队（只等 rec.queued，不等队列长度——消费者可能
+            # 已经把 A 取走，队列为空但 A 已在跑），再放行 B 的覆盖
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                rec = dict.get(rd, key)  # 避开子类 get 上的屏障
+                if rec is not None and rec.queued:
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                raise AssertionError("A 没有入队，前提不成立")
+            rd.allow_overwrite.set()
+            for t in threads:
+                t.join(timeout=2)
+            gate.set()
+            await asyncio.sleep(0.4)
+            assert ops.copy_count == 1, (
+                f"同键双开: copy 被调 {ops.copy_count} 次（覆盖了已入队的记录）"
+            )
+        finally:
+            rd.allow_overwrite.set()
+            gate.set()
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
 def test_stale_finish_does_not_evict_new_generation() -> None:
     """迟到的一代收口不能删掉后一代的 PENDING。
 

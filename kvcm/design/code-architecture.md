@@ -486,6 +486,7 @@ sequenceDiagram
   - 当前用 `_rpc` 的 30 秒 `wait_for` 限制等待时间：协程侧最多等 30 秒就报错，**服务不会假死**（任务失败，但池继续接活）；慢性的线程占用仍在
   - 根治靠 mooncake 自带 RPC 超时（0.3.11 无；main 有 `MC_RPC_TIMEOUT_MS` / `MC_RPC_CONNECT_TIMEOUT_MS`）——升级并配置后这个问题自然消失，届时不需额外监控代码
 - **取消落在 `create_copy_task` 上时，那个任务号会丢**（未修，登记）：`copy` 的提交是 `task_ids.append(await self._rpc(...))`，`append` 在 `await` 之后。取消若打中这一次等待，线程稍后返回的号没有变量接着，既不进 `_plans` 也不进 Ledger——重启的 `rebuild` 捞不到它。代价上限是「一次 copy 里最多丢一个还没返回的号」；已经 append 过的照旧落账。不修的理由：`_rpc` 是所有 RPC 的唯一入口，为一个调用点加回调或出参等于改整条通道。与 `_rpc` 超时后线程继续跑是同一个形状（放弃等待 ≠ 取消线程）
+- **同键双开靠 `setdefault` 装槽**：`submit_intent` 写入的唯一前置条件是槽为空——「先 `get` 再赋值」之间有空隙，两个 gRPC 线程同时提交同一键时，输家会覆盖赢家已入队的 PENDING，两个 `_admit` 各入队一次，同一前缀执行两遍。回归测试 `test_install_does_not_overwrite_queued_record` 把 `_records` 换成会停拍的字典来固定时序（`get` 在屏障放开后返回空槽；第二次 `__setitem__` 等 A 已 `queued` 再放行）；裸撞线程撞不出来，窗口只隔几条字节码
 - **启动期 connect 借默认池的例外已消除**：RPC 池在 `connect` 之前创建，`connect` 用同一个池（借一个线程、用完即还，启动期无其他任务争用）
 
 ### TaskEngine
