@@ -201,19 +201,16 @@ class MooncakeBackend(KvOps):
     def close(self, *, wait_timeout_s: float = 5.0) -> None:
         """释放自建的 executor（外部注入的由调用方管）。
 
-        **有界等待在途 RPC**：`shutdown(wait=True)` 会等所有线程结束——但
-        它没有超时参数，卡死的 RPC 会让退出永远挂着。所以在另一个线程里
-        跑它、外层设 5 秒上限：超时就返回（不阻塞调用方）。**注意**：卡死
-        的线程不会「随进程消失」——worker 是非 daemon 线程，解释器退出会
-        join 它们，进程要靠 SIGKILL（见 daemon 的退出说明）。
+        `shutdown(wait=True)` 会等在途 RPC 结束，但它没有超时参数，卡死的
+        调用会让退出永远挂着。所以在另一个线程里跑它、外层设 5 秒上限。
 
         为什么不能只 `shutdown(wait=False)`：那会立刻返回，调用方接着
-        `client.close()`，与还在 mooncake 绑定里的 RPC 并发（demo 踩过的
+        `client.close()`，与还在 mooncake 绑定里的 RPC 并发（demo 实测的
         退出期崩溃正是这个形状）。
 
-        超时说明：worker 是非 daemon 线程，解释器退出会 join 它们——所以
-        卡死时**不是**「线程随进程消失」，而是进程退不出去、要靠 SIGKILL。
-        本函数只是不阻塞调用方。
+        超时（返回 False）时调用方的责任：**立即 `os._exit(1)`**，不能只
+        跳过 close 然后返回——见 daemon 的退出说明（返回会触发
+        `~RealClient` 在在途 RPC 上 teardown）。
         """
         if not self._owns_executor:
             return

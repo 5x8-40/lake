@@ -110,6 +110,7 @@ def _args(tmp: str) -> argparse.Namespace:
         keepalive_window_s=600.0,
         shutdown_timeout_s=2.0,
         rpc_timeout_s=30.0,
+        connect_timeout_s=30.0,
     )
 
 
@@ -389,30 +390,26 @@ def test_exit_waits_rpc_threads_before_client_close(monkeypatch, tmp_path) -> No
     assert close_t >= shutdown_t, "client.close 在 shutdown 之前"
 
 
-def test_drain_timeout_skips_close_real_flow(monkeypatch, tmp_path) -> None:
-    """真跑 daemon 流程：等线程超时时，client 和 ledger 都不被关闭。
+def test_drain_timeout_hard_exits_without_close(monkeypatch, tmp_path) -> None:
+    """等线程超时（RPC 卡死）：进程立即退出，且**不调用**任何 close。
 
-    之前的版本只调 `_wait_executor` 再断言 `"client.close" not in events`
-    ——没有任何代码往 events 写，断言恒真（假测试）。
+    为什么必须硬退出而不是「跳过 close 再 return」：
+    `client` 是局部变量，函数返回会丢掉 Python 包装的最后一份引用 →
+    `~RealClient` 立刻 `tearDownAll_internal()`，此时 RPC 线程还在绑定里
+    ——正是 demo 实测的 teardown 竞态（abort RC=134 / 挂住）。
+    它发生在解释器收尾之前，也不经过 mooncake 的 `std::atexit`。
     """
     events: list[str] = []
+    hard_exits: list[int] = []
 
     class FakeClient:
-        def __init__(self) -> None:
-            self.connected = False
-
-        def connect(self, **kw) -> None:
-            self.connected = True
+        def connect(self, **kw) -> None: ...
 
         def close(self) -> None:
             events.append("client.close")
 
     class FakeBackend:
-        def __init__(self) -> None:
-            self.rebuild_calls = 0
-
         def rebuild(self):
-            self.rebuild_calls += 1
             return []
 
         def prefix_of(self, handle):
@@ -425,12 +422,14 @@ def test_drain_timeout_skips_close_real_flow(monkeypatch, tmp_path) -> None:
         def executor(self):
             from concurrent.futures import ThreadPoolExecutor
 
-            if not hasattr(self, "_exec"):
-                self._exec = ThreadPoolExecutor(max_workers=1)
-            return self._exec
+            return ThreadPoolExecutor(max_workers=1)
+
+    class FakeLedger:
+        def close(self) -> None:
+            events.append("ledger.close")
 
     class HangingExecutor:
-        """shutdown(wait=True) 永远不返回（模拟卡死的 RPC）。"""
+        """shutdown(wait=True) 永不返回（模拟卡死的 RPC）。"""
 
         def shutdown(self, wait=True, **kw) -> None:
             while wait:
@@ -440,26 +439,16 @@ def test_drain_timeout_skips_close_real_flow(monkeypatch, tmp_path) -> None:
             from concurrent.futures import Future
 
             f: Future = Future()
-            f.set_result(None)  # connect 走这条路，立即完成
+            f.set_result(None)
             return f
 
-    class FakeLedger:
-        def __init__(self) -> None:
-            self.closed = False
-
-        def close(self) -> None:
-            self.closed = True
-            events.append("ledger.close")
-
-    fake_ledger = FakeLedger()
-
-    client = FakeClient()
-    backend = FakeBackend()
     monkeypatch.setattr(daemon, "ThreadPoolExecutor", lambda *a, **kw: HangingExecutor())
-    monkeypatch.setattr(daemon, "StoreClient", lambda: client)
-    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: backend)
+    monkeypatch.setattr(daemon, "StoreClient", FakeClient)
+    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: FakeBackend())
     monkeypatch.setattr(daemon, "KeepaliveLoop", FakeKeepalive)
-    monkeypatch.setattr(daemon, "Ledger", lambda path: fake_ledger)
+    monkeypatch.setattr(daemon, "Ledger", lambda path: FakeLedger())
+    # 替换硬退出（测试进程不能被真的杀掉）
+    monkeypatch.setattr(daemon, "_hard_exit", lambda: hard_exits.append(1))
 
     args = _args(tmp_path)
     args.shutdown_timeout_s = 0.2
@@ -467,6 +456,103 @@ def test_drain_timeout_skips_close_real_flow(monkeypatch, tmp_path) -> None:
     time.sleep(0.2)
     stop()
     t.join(timeout=5)
-    # 关键断言：超时后 client 和 ledger 都没被关（都是真事件，不是恒真）
+    assert not t.is_alive()
+    # 关键 1：硬退出被调用（不是「跳过 close 后安静返回」）
+    assert hard_exits == [1], f"超时后没有硬退出: hard_exits={hard_exits}"
+    # 关键 2：client 和 ledger 都没被 close（不能主动在在途 RPC 上 teardown）
     assert "client.close" not in events, f"超时后居然关了 client: {events}"
     assert "ledger.close" not in events, f"超时后居然关了 ledger: {events}"
+
+
+
+def test_connect_timeout_branch_hard_exits(monkeypatch, tmp_path) -> None:
+    """connect 超时**分支本身**触发硬退出（不是靠 finally 兜的）。
+
+    测试要点：连接线程必须在超时后**立刻结束**——否则 `finally` 里的
+    `_wait_executor` 也会超时并再调一次 `_hard_exit`，那样即使删掉
+    connect 的超时分支，测试也会因为 finally 的硬退出而通过（锁不住）。
+
+    关于 close：测试里 `_hard_exit` 是 mock（不能真杀 pytest 进程），
+    所以 `finally` 仍会跑完并 close——生产的 `os._exit` 不会。因此这里
+    只断言「硬退出恰好一次，且事件序列里它出现在所有 close 之前」。
+    """
+    hard_exits: list[float] = []
+    events: list[tuple[str, float]] = []
+    release = threading.Event()
+    t0 = time.monotonic()
+
+    class HangingClient:
+        def connect(self, **kw) -> None:
+            # **永不自行返回**（只有超时分支放行才结束）——否则删掉超时分支后
+            # 线程会自己跑完，测试就区分不出「靠超时分支」还是「靠 finally」
+            release.wait()
+
+        def close(self) -> None:
+            events.append(("client.close", time.monotonic() - t0))
+
+    class FakeLedger:
+        def close(self) -> None:
+            events.append(("ledger.close", time.monotonic() - t0))
+
+    def _hard_exit() -> None:
+        hard_exits.append(time.monotonic() - t0)
+        release.set()
+
+    monkeypatch.setattr(daemon, "StoreClient", HangingClient)
+    monkeypatch.setattr(daemon, "Ledger", lambda path: FakeLedger())
+    monkeypatch.setattr(daemon, "_hard_exit", _hard_exit)
+
+    args = _args(tmp_path)
+    args.connect_timeout_s = 0.2
+    t, stop = _run_daemon_in_thread(args)
+    t.join(timeout=5)
+    assert not t.is_alive(), "connect 卡住时进程没退出"
+    # 恰好一次：来自 connect 的超时分支。若 connect 分支被删，线程被放行后
+    # finally 会正常 close，硬退出次数为 0 → 失败
+    assert len(hard_exits) == 1, f"硬退出次数不对（应为 connect 分支那一次）: {hard_exits}"
+    # 关键：硬退出发生在 close 之前（生产里 os._exit 后不会有 close）
+    first_close = min((t for _, t in events), default=float("inf"))
+    assert hard_exits[0] <= first_close, (
+        f"close 发生在硬退出之前: hard_exit={hard_exits[0]:.2f} "
+        f"events={[(n, round(t, 2)) for n, t in events]}"
+    )
+
+
+
+def test_shutdown_signal_interrupts_connect_wait(monkeypatch, tmp_path) -> None:
+    """SIGTERM 打在 connect 等待期间：立即退出，不等满 connect_timeout_s。
+
+    connect 超时默认 30 秒——若信号要等它才生效，停机就慢得不合理。
+    """
+    hard_exits: list[float] = []
+    release = threading.Event()
+    t0 = time.monotonic()
+
+    class HangingClient:
+        def connect(self, **kw) -> None:
+            release.wait()  # 永不自行返回
+
+        def close(self) -> None: ...
+
+    class FakeLedger:
+        def close(self) -> None: ...
+
+    def _hard_exit() -> None:
+        hard_exits.append(time.monotonic() - t0)
+        release.set()
+
+    monkeypatch.setattr(daemon, "StoreClient", HangingClient)
+    monkeypatch.setattr(daemon, "Ledger", lambda path: FakeLedger())
+    monkeypatch.setattr(daemon, "_hard_exit", _hard_exit)
+
+    args = _args(tmp_path)
+    args.connect_timeout_s = 30.0  # 很长——靠信号打断，不该等满
+    t, stop = _run_daemon_in_thread(args)
+    time.sleep(0.2)  # 让 connect 开始等
+    stop()  # 模拟 SIGTERM
+    t.join(timeout=5)
+    assert not t.is_alive(), "信号没打断 connect 等待"
+    assert hard_exits, "没有硬退出"
+    assert hard_exits[0] < 5.0, (
+        f"等了 {hard_exits[0]:.1f}s 才退（connect_timeout 是 30s，说明信号没打断）"
+    )

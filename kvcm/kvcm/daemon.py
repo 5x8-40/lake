@@ -17,9 +17,15 @@
 优雅退出：停收 intent → 取消在途协程 → 有界等待协程（5 秒）→
 KeepaliveLoop 停 → **等 RPC 线程结束** → StoreClient.close() + ledger.close()。
 
-最后一步有前提：RPC 线程等满仍未结束（RPC 卡死）时，**client 和 ledger
-都不关**——worker 是非 daemon 线程，解释器退出会 join 它们，进程本来就
-要靠 SIGKILL；此时拆资源只会多制造一次并发崩溃。
+最后一步有前提：RPC 线程等满仍未结束（RPC 卡死）时，**立即 `os._exit(1)`**，
+不走任何清理。
+
+- 不能只「跳过 close 再返回」：`client` 是局部变量，函数返回会丢掉 Python
+  包装的最后一份引用，`~RealClient` 立刻 `tearDownAll_internal()`——此时
+  RPC 线程还在绑定里，是 demo 实测过的 teardown 竞态（abort RC=134 / 挂住）
+- 也不能主动 `client.close()`：那等于在在途 RPC 上 teardown
+- `os._exit` 跳过 GC / `__del__` / atexit：已提交的 ledger 行还在（正在写的
+  那条丢掉，靠 rebuild 重建 running 任务）；mooncake 侧靠 client TTL 回收
 
 locate 本期静态注入（`--segs`，单实例冒烟形态）；生产 locate =
 L1 InstanceWatcher 注册，归 E13。
@@ -86,13 +92,10 @@ def _wait_executor(executor: ThreadPoolExecutor, timeout_s: float) -> bool:
     为什么要等：`run_in_executor` 取消时不等线程函数结束——协程结束了，
     mooncake 绑定可能还在跑。关 client 前必须等线程。
 
-    **超时意味着什么**（必须说清，别写成「线程随进程消失」）：
-    `ThreadPoolExecutor` 的 worker 是**非 daemon** 线程（CPython 硬编码），
-    解释器退出时会 `join` 它们。所以 RPC 卡死时：
-      - 本函数超时返回 False，但进程仍然退不出去（挂在解释器退出）
-      - 只能靠外部 SIGKILL
-    调用方据此**跳过 client.close()**：反正要强杀，不必再去拆一个正被
-    使用的 client（那只会多制造一次崩溃）。
+    **超时（返回 False）意味着什么**：还有调用停在 mooncake 绑定里。
+    调用方**必须立即 `os._exit(1)`**，不能只跳过 close 然后返回——
+    返回会丢掉 Python 包装对 client 的引用，`~RealClient` 随即在在途
+    RPC 上 teardown（demo 实测的 abort/挂住形状）。
     """
     import threading
 
@@ -106,6 +109,15 @@ def _wait_executor(executor: ThreadPoolExecutor, timeout_s: float) -> bool:
 
     threading.Thread(target=_shutdown, name="kvcm-rpc-wait", daemon=True).start()
     return done.wait(timeout=timeout_s)
+
+
+def _hard_exit() -> None:
+    """进程立即消失，不跑 finally / GC / __del__ / atexit。
+
+    用于「RPC 卡住、teardown 会与在途线程冲突」的退出分支。
+    单独成函数是为了测试能替换它（测试进程不能被真的杀掉）。
+    """
+    os._exit(1)
 
 
 async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
@@ -127,16 +139,59 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
         loop = asyncio.get_running_loop()
         # connect / rebuild 都是同步阻塞调用（connect 含 TCP 握手+注册，
         # rebuild 内含 Ledger 的 submit().result()）——不能占事件循环线程，
-        # 否则启动期信号处理都要等它们返回
-        await loop.run_in_executor(
-            executor,
-            lambda: client.connect(
-                local_hostname=args.local_hostname,
-                master_server_address=args.master,
-                protocol=args.protocol,
-                ascend_device=args.device,
-            ),
-        )
+        # 否则启动期信号处理都要等它们返回。
+        #
+        # 必须带超时：0.3.11 的绑定没有连接超时，master 不可达时可能挂很久。
+        # 卡在这里时 `finally` 进不去（await 不返回），整个退出逻辑都不会跑。
+        try:
+            # 等待 connect 的同时也监听退出信号：SIGTERM 打在 connect 期间时
+            # 不该硬等满 connect_timeout_s（默认 30 秒）。
+            connect_task = asyncio.ensure_future(
+                loop.run_in_executor(
+                    executor,
+                    lambda: client.connect(
+                        local_hostname=args.local_hostname,
+                        master_server_address=args.master,
+                        protocol=args.protocol,
+                        ascend_device=args.device,
+                    ),
+                )
+            )
+            stop_task = asyncio.ensure_future(stop.wait())
+            done, _ = await asyncio.wait(
+                {connect_task, stop_task},
+                timeout=args.connect_timeout_s,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if stop_task in done:
+                # 启动期收到退出信号：connect 可能还在跑，做与退出超时相同的
+                # 处理（不 close、等线程会卡住 → 直接消失）
+                print(
+                    "[kvcm] startup: got shutdown signal during connect — "
+                    "exiting immediately",
+                    file=sys.stderr,
+                )
+                sys.stderr.flush()
+                _hard_exit()
+                return 1
+            if connect_task not in done:
+                raise asyncio.TimeoutError
+            # connect 完成：让异常按原路径传播
+            connect_task.result()
+        except (asyncio.TimeoutError, TimeoutError) as e:
+            # 连接线程还在跑（取消不会中断 C++ 调用）——与退出超时同一处理：
+            # 立即 `os._exit(1)`，不跑析构、不走 atexit。
+            print(
+                f"[kvcm] startup: connect did not return in "
+                f"{args.connect_timeout_s}s — exiting immediately",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
+            _hard_exit()
+            return 1
+        except Exception as e:
+            print(f"[kvcm] startup: connect failed: {e}", file=sys.stderr)
+            raise
         backend = build_backend(args, client, ledger, executor=executor)
         keepalive = KeepaliveLoop(
             backend,
@@ -182,26 +237,52 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
         #    不把这个等待放进 backend.close()：池是注入的，backend 不拥有它
         #    （`_owns_executor` 为假时会直接 return，等待会被静默跳过）。
         drained = _wait_executor(executor, args.shutdown_timeout_s)
-        if backend is not None:
-            backend.close()
         if keepalive is not None:
             keepalive.close()
-        if drained:
-            # 安全：所有 RPC 线程已结束，可以拆 client、收 sqlite
-            client.close()
-            ledger.close()
-        else:
-            # 有线程卡在 mooncake 绑定或 Ledger 的 submit().result() 里：
-            # 进程退不出去（worker 非 daemon，解释器退出会 join），只能
-            # 靠外部 SIGKILL。此时**什么都不拆**：
-            #   - 拆 client 会与在途 RPC 并发崩溃（demo 踩过的形状）
-            #   - 关 ledger 的 shutdown(wait=True) 无上界，会再撑开超时
+        if not drained:
+            # 有线程卡在 mooncake 绑定或 Ledger 的 submit().result() 里。
+            #
+            # **为什么这里不调 client.close()**：
+            # 「必须 close」这条经验来自 demo，指的是「能正常收尾时」——
+            # 不 close 会让清理推迟到退出期的 GC/atexit，而那条路径会与
+            # 还在跑的传输线程撞车（demo 实测：abort RC=134 或挂住，
+            # 上游 #3909/#3943）。也就是说 close 的作用是**避开 atexit**，
+            # 不是「不 close 就漏了资源」。
+            #
+            # 但在本分支里，close 的前提不成立：RPC 还停在绑定里，
+            # 无论主动 close 还是让它走 GC，都是在在途调用上做 teardown
+            # ——正是那个会崩的形状。
+            #
+            # **为什么 os._exit 反而安全**：它连 atexit 都不跑，进程直接
+            # 消失，没有任何 teardown 发生在在途线程上。三种选择里只有它
+            # 不会崩：
+            #   - 跳过 close 后正常返回 → ~RealClient 在在途 RPC 上 teardown
+            #     （发生在 Py_FinalizeEx 之前，不经过 std::atexit）
+            #   - 主动 client.close()      → 同一形状
+            #   - os._exit(1)              → 什么都不跑，不崩
+            #
+            # 代价（都可接受）：
+            #   - kvcm 是主侧身份（global_segment_size=0，不挂 seg、不持存储），
+            #     名下没有副本会因它消失而丢；master 靠 client TTL 回收这个 UUID
+            #   - 已提交的 ledger 行还在，正在写的那条丢掉；重启后 rebuild
+            #     从 status='running' 重建跟踪
             print(
                 f"[kvcm] shutdown: worker threads still running after "
-                f"{args.shutdown_timeout_s}s — skipping client/ledger close "
-                f"(process will not exit until they return; expect SIGKILL)",
+                f"{args.shutdown_timeout_s}s — exiting immediately "
+                f"(skip teardown to avoid the known race)",
                 file=sys.stderr,
             )
+            sys.stderr.flush()
+            _hard_exit()
+            return 1  # 走到这里说明 _hard_exit 被替换（测试），按失败返回
+        # 安全：所有 RPC 线程已结束，可以拆 client、收 sqlite。
+        # `backend.close()` 也放这里（不是硬退出分支）——今天对注入的池是
+        # 空操作，但万一以后让它去碰 store，超时路径会在 os._exit 之前拆
+        # client，正是要避免的形状。
+        if backend is not None:
+            backend.close()
+        client.close()
+        ledger.close()
 
 
 def run(args: argparse.Namespace, *, stop: asyncio.Event | None = None) -> int:
@@ -274,6 +355,12 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=600.0,
         help="保活固定窗口（D3 占位策略：READY 后续租这么久即停租）",
+    )
+    p.add_argument(
+        "--connect-timeout-s",
+        type=float,
+        default=30.0,
+        help="启动时 connect master 的超时秒数（0.3.11 绑定无连接超时）",
     )
     p.add_argument(
         "--rpc-timeout-s",

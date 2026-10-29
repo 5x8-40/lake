@@ -14,14 +14,14 @@
 | 4 | 10/08 | 单机 TP=2 | 对照：不开 A2 RoCE | **未通过**（`HcclBatchPut=4`）——跨卡 copy 必须开 A2 RoCE | 同上 |
 | 5 | 10/09 午 | 单机 245：A=TP2(卡0,1)→B=TP4(卡2-5)，`prefill_tp_size=2 decode_tp_size=4` | 异构正向 e2e | 首跑死于 collect（上游 put 死代码）→ **补丁后通过**：24/24、**95.9%**、零 invalid、输出逐字一致 | 见「实验实录 · 单机正向」 |
 | 6 | 10/09 午 | 单机 245：A=TP4(卡0-3)→B=TP2(卡4,5)，B `LOAD_ASYNC=1` | 异构反向 e2e | 通过：24/24、**95.9%**、零 invalid、输出一致；踩坑：`decode_tp_size` 对 kv_both 是 **peer** size | 见「实验实录 · 反向」 |
-| 7 | 10/09 | 容器内 `vllm_ascend` 源码 | 上游 bug 修复实验：`pool_worker.py::_start_kv_transfer_threads` 构造 `KVCacheStore{Sending,Recving}Thread` 漏传 `worker=self` → `kv_transfer.py` tp_mismatch put/get 分支双双死代码 | `patch_tp_mismatch_worker.py` 幂等补丁，put 通路打通（#5 的 24/24 即补丁效果）；get 通路靠 #6 异步路径 | `patch_tp_mismatch_worker.py`、`config_data.py::infer_tp_mismatch_info` |
+| 7 | 10/09 | 容器内 `vllm_ascend` 源码 | 上游 bug 修复实验：`pool_worker.py::_start_kv_transfer_threads` 构造 `KVCacheStore{Sending,Recving}Thread` 漏传 `worker=self` → `kv_transfer.py` tp_mismatch put/get 分支双双死代码 | `patch_tp_mismatch_worker.py` 幂等补丁，put 通路可用（#5 的 24/24 即补丁效果）；get 通路靠 #6 异步路径 | `patch_tp_mismatch_worker.py`、`config_data.py::infer_tp_mismatch_info` |
 | 8 | 10/09 晚 | 跨机 245→217：A=TP2(卡0,1)→B=TP4(卡0-3) | 异构跨机 e2e（三轮 precopy 验证稳定性） | **通过**：24/24 跨机 sub-key put、24/24 `replica_copy_success`、副本对号落 217 四 seg、B 首中 **95.9%** 零 invalid、输出逐字一致 | 见「实验实录 · 跨机」 |
 | 9 | 10/09 晚 | 245 宿主机 RoCE 网卡打点（`ip -s link enp67s0f5` 前后差值） | **读本机副本判定**（单次 B 命中 16 token） | ~~TX **+0.47 MB** / RX +0.13 MB；若读远端应 ~44 MB ⇒ get 读的是 217 本机 seg 副本~~ **10/09 深夜撤回：阳性对照实测 netdev 计数器不统计昇腾 RoCE RDMA 流量（24 keys ~43 MB 真实跨机传输，两侧计数器增量均 <2 MB），本行证据方法论作废**。读本机副本改由 #12 杀源实例法确证。注：worker 日志里的 `Connected to segment: 245` 是 precopy copy-task 收尾连接（与 get 同秒重叠），非读取证据 | 本次会话打点记录；`/tmp/nic_before.txt`/`after.txt`（245） |
 | 10 | 10/09 | B(217) 重复请求确定性观察 | 同 prompt 反复打 B（16/64 token × 多次）+ 冷 prompt 对照 | 旧非 DEBUG 实例：**奇数次输出与 A 一致、偶数次近平局 token 处 1-token 翻转**（"warmup. va" → "warmup.  va"）；A 3×64 token 稳定；B 冷 prompt 3× 稳定；0.3.11+DEBUG 新实例 3 连跑未复现。疑外部加载路径交替的数值扰动，非字节错乱（纯外部读首请求与 A 逐字一致） | 本会话输出记录；根因待复现 |
 | 11 | 10/09 晚 | 217 容器 wheel 升级 `0.3.13.post1` | 尝试升级 mooncake（上游 1fc27b6 已有 `SelectCompleteMemoryReplica` 本机优先） | **失败**：mount 4 seg 后 EngineCore 挂起 15+ 分钟（APIServer `Waiting for 1 local core engine proc`），疑与旧 master 兼容性；回退 `0.3.11.post1` 后恢复正常（#8/#9 即回退后所测） | master 日志、`worker_B.log`（17:03-17:18） |
 | 12 | 10/09 深夜 | 跨机 245→217 异构重验（全新 prompt ×2：961/801 tok）+ **杀源实例终判** | **通过** + **杀源实例法确证读本机副本**（仅剩 217 副本时 B 首中全部外部 get 成功、零 invalid、输出与 A 逐字一致）。两认知：判定须用**全新 prompt 首中**（第二次被内部 HBM cache 接住，外部 get=0）；netdev 不计 RDMA（#9 撤回依据） | 见「实验实录 · 跨机」；判定方法 [REPRODUCE.md](REPRODUCE.md) §3 |
-| 13 | 10/12 上午 | 跨机 245→217 异构，**bc6b5be 单入口控制面 + 两端 #15835 完整补丁** | 正向回归（升级后首测）：warm A → 单入口 precopy（32 keys=8 满块×4 eff）READY → B 首中 external **88.2%**（滚动累计口径，非单请求）、零 invalid、16-tok ×6 + 64-tok ×2 **8/8 逐字一致**（1-token 翻转未复现）。B 机容器无 `ss`：用 admin `:9003/get_all_segments` + 显式 `--targets` | 本次会话记录；见「实验实录 · 10-12 回归 · 正向」 |
-| 14 | 10/12 下午 | 跨机 **反向 217(TP4)→245(TP2)，A 同步 load（无 LOAD_ASYNC）** | **通过**：36/36 key 对号入 A 两 seg（18+18）；每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 证 hunk3 同步分发生效；8/8 token 与 B(TP4) 参考逐字一致；external hit 74.6→79.7%、零 invalid。踩坑：首跑 A 侧 peer 误配成 2（=自身 TP）→ mismatch 静默禁用 → `-800`（指纹 `Failed to get 9 keys`=每块 1 key）；改回 `PEER=4` 即通——同步 load mismatch 由此闭环 | 见「实验实录 · 10-12 回归 · 反向（同步 load）」 |
+| 13 | 10/12 上午 | 跨机 245→217 异构，**bc6b5be 单入口控制面 + 两端 #15835 完整补丁** | 正向回归（升级后首测）：warm A → 单入口 precopy（32 keys=8 满块×4 eff）READY → B 首中 external **88.2%**（从实例启动起累计，不是单请求）、零 invalid、16-tok ×6 + 64-tok ×2 **8/8 逐字一致**（1-token 翻转未复现）。B 机容器无 `ss`：用 admin `:9003/get_all_segments` + 显式 `--targets` | 本次会话记录；见「实验实录 · 10-12 回归 · 正向」 |
+| 14 | 10/12 下午 | 跨机 **反向 217(TP4)→245(TP2)，A 同步 load（无 LOAD_ASYNC）** | **通过**：36/36 key 对号入 A 两 seg（18+18）；每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 证 hunk3 同步分发生效；8/8 token 与 B(TP4) 参考逐字一致；external hit 74.6→79.7%、零 invalid。踩坑：首跑 A 侧 peer 误配成 2（=自身 TP）→ mismatch 静默禁用 → `-800`（指纹 `Failed to get 9 keys`=每块 1 key）；改回 `PEER=4` 即通——同步 load 的 mismatch 路径由此验证通过 | 见「实验实录 · 10-12 回归 · 反向（同步 load）」 |
 | 15 | 10/20 | 跨机正向 keys（#13 的 32 keys）不动，**kill 写入者 A 全进程树 → 等 client TTL 过期 → 复验** | **「副本随属主消失」不成立（纠正踩坑 3 早期误判）**：基线 32/32 → kill（17:06:51）→ 17:08:57 master `client_expired` + unmount A 两 seg（**零驱逐零 remove**）→ `batch_is_exist` **32/32**、副本全在 B 四 seg → 裸 client 跨机 `get` **3/3 字节级读回**（各 4.5MB）→ A 复活后终态仍 32/32。结论：副本存亡绑定 seg 所在 client，key 的 client_id 下线只清其 seg 内副本，远端副本保留 | master 日志切片（本机 `va-precopy/logs/`，不入仓）；见踩坑 3 |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
@@ -97,14 +97,14 @@
 ### 正向：245(TP2)→217(TP4)（总表 #13）
 
 - 流程：warm A（`"va-precopy v53 regression hetero cross-machine prompt. "×80` = 1041 tok，8 满块）→ 单入口 `precopy.py --role B --tp-size 4 --peer-tp-size 2`（32 keys READY；eff0→16051, 1→16258, 2→16276, 3→16787）→ 打 B。
-- 结果：B 首中外部 get ×4 rank 成功（复命中走 vLLM 内部 HBM cache，预期）、external hit **88.2%**（滚动累计口径：实例启动以来所有请求，非本请求单值；故低于 95.9% 单请求口径）、零 invalid；16-tok ×6 + 64-tok ×2 **8/8 与 A 逐字一致，1-token 翻转未复现**（与 #10「新 DEBUG 实例未复现」一致）。
+- 结果：B 首中外部 get ×4 rank 成功（复命中走 vLLM 内部 HBM cache，预期）、external hit **88.2%**（从实例启动起累计所有请求，不是单请求的值；所以低于 95.9% 的单请求值）、零 invalid；16-tok ×6 + 64-tok ×2 **8/8 与 A 逐字一致，1-token 翻转未复现**（与 #10「新 DEBUG 实例未复现」一致）。
 - B 机探测路径：容器无 `ss`、pidfile 亦 stale——改用 master admin API `GET :9003/get_all_segments`（TTL 已自动注销旧 seg，名单干净）+ 显式 `--targets`。
 
 ### 反向：217(TP4)→245(TP2)，同步 load（总表 #14）
 
 - 首跑失败（配置坑）：把 A env 按方向误翻成 `PREFILL_TP_SIZE=4 DECODE_TP_SIZE=2` → kv_both 读 peer=`decode_tp_size`=2=自身 → mismatch **静默禁用** → plain get 按本地 4-head 尺寸读 2-head eff key → `mooncake -800`，日志形状 `Failed to get 9 keys out of 9`（=9 块×1 key/rank，即「每块 1 key」指纹；正确 mismatch 应为每 rank 18 keys）→ 500。**#6 的坑 1 在新单入口下复踩**，规则固化为：两台同配（README「env 配置」+ `start_worker.sh` 整除校验）。
 - 修正后：A 重启（无 `LOAD_ASYNC`）；B 不动（plain put 名字与字节恒等于 eff key）→ warm B 全新前缀（`"...reverse sync prompt. "×80` = 1201 tok，9 满块）→ 单入口 `precopy.py --role A --tp-size 2 --peer-tp-size 4 --targets <A 两 seg>`（36/36 exist；反向自动展开 eff i → targets[i//2]；rank↔seg 经 `ss` 端口→pid + `npu-smi` 卡→pid 对号）→ 打 A。
-- 结果：**每 rank `MooncakeBackend.get enter keys=18`**（TP0 读 @0…、TP1 读 @3…，9 块 × 2 sub-key 拼回本地）、`prepare get ... load_async=False` ×2 rank（hunk3 同步分发生效）、external hit 74.6→79.7%、零 invalid、16×6 + 64×2 **8/8 与 B(TP4) 参考逐字一致** → **`_load_kv_tp_mismatch` 拼回 + 同步分发两条空白路径首次真机闭环**。
+- 结果：**每 rank `MooncakeBackend.get enter keys=18`**（TP0 读 @0…、TP1 读 @3…，9 块 × 2 sub-key 拼回本地）、`prepare get ... load_async=False` ×2 rank（hunk3 同步分发生效）、external hit 74.6→79.7%、零 invalid、16×6 + 64×2 **8/8 与 B(TP4) 参考逐字一致** → **`_load_kv_tp_mismatch` 拼回 + 同步分发两条空白路径首次在真机验证通过**。
 
 ### 10-12 踩坑（新）
 
@@ -115,9 +115,9 @@
 
 ### 10-12 对既有结论的影响
 
-- 同步 load mismatch：**已闭环**（#14，A 同步 load 36/36）。
-- key 一致性：**已闭环**（#13/#14 单入口 `batch_is_exist` 32/32、36/36 全中）。
-- 多卡 rank↔seg 对号：**已闭环**（`--targets` + admin API/`npu-smi` 手工对号）。
+- 同步 load mismatch：**已验证**（#14，A 同步 load 36/36）。
+- key 一致性：**已验证**（#13/#14 单入口 `batch_is_exist` 32/32、36/36 全中）。
+- 多卡 rank↔seg 对号：**已验证**（`--targets` + admin API/`npu-smi` 手工对号）。
 - 仍待：`run_e2e.sh` 一键真机重跑（同构 TP=2 + 异构双向；10-12 回归走单入口手工分步，一键编排本身未跑）、1-token 翻转根因、MLA（明确不支持）；`tools/test_keys.py` 容器内单跑；resolve.py proctitle 自动匹配的多卡真机验证。
 
 ## 实验实录（2026-10-26：kvcm daemon 真机冒烟，E11 进程化首验）
@@ -136,7 +136,7 @@ pid。途中根出 8 个坑，全部对代码验证：
 ### 10-26 踩坑
 
 1. **ascend 协议绑定必须 ACL context**：`mooncake_transfer_engine_npu` 无论 protocol 都装 AscendDirectTransport，无 `torch.npu.set_device()` 建的 ctx 时 setup rc=-600（ctx NULL）。已修：`client.py::connect` 加 `ascend_device` 前置仪式（与 precopy 同对策），daemon `--device` 透传。
-2. **copy 连发打爆目标侧建链（本轮主根因）**：daemon 一次铺开 14 个 `create_copy_task` → 源 worker 向目标 adxl 消息端口的**并发建链失败**（`ConnectToPeer FAILED`，`channel_msg_handler.cc:515`）→ `TRANSFER_FAIL`（`client_service.cpp:2994` 只重试 NO_AVAILABLE_HANDLE）。对照：连发 42 任务 = 24 成 18 败；**窗口 4 节奏化 = 42/42 全成**；简单 0.2s 错峰提交 = 源侧 38 成 0 败。十月 precopy 从不踩是因为严格串行（`create_copy_and_wait`）。止血已落地 `backend.py`（`submit_interval_s`）；按窗口推进的限速器归 E15。
+2. **copy 连发打爆目标侧建链（本轮主根因）**：daemon 一次铺开 14 个 `create_copy_task` → 源 worker 向目标 adxl 消息端口的**并发建链失败**（`ConnectToPeer FAILED`，`channel_msg_handler.cc:515`）→ `TRANSFER_FAIL`（`client_service.cpp:2994` 只重试 NO_AVAILABLE_HANDLE）。对照：连发 42 任务 = 24 成 18 败；**窗口 4 节奏化 = 42/42 全成**；简单 0.2s 错峰提交 = 源侧 38 成 0 败。十月 precopy 从不踩是因为严格串行（`create_copy_and_wait`）。已加临时措施 `backend.py`（`submit_interval_s`）；按窗口推进的限速器归 E15。
 3. **同物理卡多进程 HCCL 互踩**：两个 helper 同卡（都 `ASCEND_RT_VISIBLE_DEVICES=6`）→ 第二进程 `HcclCommPrepare` 必败（`comm_channel.cc:105`）。合成测试每进程必须独占物理卡。
 4. **同名 seg 客户端更替 + client_ttl=120s 陈旧**：同名重起 helper，copy 解析到死进程握手端口 → `Connection refused` 秒败；更阴的是 `replica_copy_skipped, info=target_replicas_already_exist`（`client_service.cpp:2605`）按陈旧副本记录报**假 SUCCESS**。测试每轮身份必须全新。
 5. **adxl 端口分桶复用 → 断信道缓存中毒**：端口段 = `base + 物理卡×100`（`utils.cpp:227 FindAdxlListenPort`）；新进程复用刚死掉的端口，继承源端 `Channel is unavailable due to a previous transport failure`（`comm_channel.cc:224`）→ 秒败。`ASCEND_BASE_PORT`（`ascend_direct_transport.cpp:202`）每进程分桶隔离。vLLM worker 用 20096/20184（卡 0/1 桶），我们客户端默认 20600 桶。

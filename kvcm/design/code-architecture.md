@@ -142,7 +142,7 @@ flowchart LR
 | 模块 | 职责 | 出处 |
 |------|------|------|
 | IntentReceiver | 收 Router 预热 intent / 会话结束线索（E12；先占位，协议字段随 D4）。占位形态：进程内函数调用 + 最小 HTTP 端点 `POST /prefetch {model_id, token_ids, target}`（stdlib `http.server` 经线程池执行，量上来换 aiohttp；响应同步等 READY 返回，可选 `?wait=0` 立即返回任务标识）——只调 TaskEngine 公开方法（`queue.put`），E12 正式协议来了只换这层皮 | D1 §4 职责边界 |
-| EventPublisher | READY 后按目标实例端点补发 `BlockStored`；端点生命周期（每实例一端点、注册给索引） | D1 §2 方案 a 落地、E14 |
+| EventPublisher | READY 后按目标实例端点补发 `BlockStored`；端点生命周期（每实例一端点、注册给索引） | D1 §2 方案 a、E14 |
 | InstanceWatcher | 实例上线/销毁接入 → 触发预热 / seg 副本处理；「端点→实例」「seg→实例」注册的权威来源（E13；先占位，事件源随 D4） | D1 §3、E13 |
 
 - IntentReceiver / EventPublisher 两条通道与 D1 §4「两条单向通道」一致（intent 进来、事件发出去）；InstanceWatcher 是第三条接入（实例事件，归 D4/E13）
@@ -181,7 +181,7 @@ flowchart LR
 
 **接口形态（`kvcm/ops/`）**
 
-- **接口只强制五个方法**：`capability / copy / query_task / abandon / exists` 为 abstractmethod；其余操作基类默认抛「适配器未接通」（UnsupportedCapabilityError）——第二后端接入时不必把全部操作先写成空实现；编排层判断可用性读 capability()，异常只是兜底
+- **接口只强制五个方法**：`capability / copy / query_task / abandon / exists` 为 abstractmethod；其余操作基类默认抛「适配器未接通」（UnsupportedCapabilityError）——第二后端接入时不必把全部操作先写成空实现；编排层判断可用性读 capability()，异常只是最后一道防线
 - **任务凭据（TaskHandle）**：一次 `copy(前缀)` 在 mooncake 上是逐条 key 各发一个复制任务——一个前缀通常对应多条 key（块数 × rank 数），所以一次操作会产生多个任务。凭据里的 `task_ids` 装着这次操作的全部任务号，查询时一起查。任务号的类型对 L3 不透明（`tuple[object, ...]`）：mooncake 的任务号是两个整数组成的整数对，L3 原样保存、原样回传，不做字符串化（`str()` 化后真实绑定的 `query_task` 会报 TypeError）；要写进 Ledger 时由实现侧编码成 `"整数:整数"` 的字符串（`encode_task_id`/`decode_task_id`，重启可还原）
 - **READY 规则**（本义 =「可以把请求调度过来」，D2 §1）：
   - copy / move：任务完成 + 目标侧副本核验通过（任务型，凭据里有任务号）
@@ -254,7 +254,7 @@ stateDiagram-v2
   - RPC ✓ 而通道 ✗ 时的处理顺序：
     1. **自封装 .so**：照 `store_py.cpp` 的写法自写封装，link wheel 的 C++ 库，不改 mooncake 源码（两个断点待 E6 验证，见下）
     2. **替代实现**：原则 5
-    3. **自研协议客户端**：仅兜底
+    3. **自研协议客户端**：最后手段
   - △ = 待 E6 核对
 
 | 能力 | mooncake 0.3.11（部署现状） | mooncake main（目标基线） | 出处 |
@@ -355,7 +355,7 @@ stateDiagram-v2
 
 | 子件 | 职责 | 包路径 |
 |------|------|--------|
-| KeyComputer | 前缀 → hash 链 → PoolKey。key 格式直接从 vllm-ascend 库导入（两个版本的导入路径都试），保证和引擎算得一致；容器外没有库时回退到内置的格式副本并警告可能和引擎不一致，容器内有测试逐字节比对兜底。`build_plan`：每条 key 映射到目标 seg（源和目标 TP 不同时按倍数归并）。PYTHONHASHSEED 必须为 0 的检查 | `engines/vllm/keys.py` |
+| KeyComputer | 前缀 → hash 链 → PoolKey。key 格式直接从 vllm-ascend 库导入（两个版本的导入路径都试），保证和引擎算得一致；容器外没有库时回退到内置的格式副本并警告可能和引擎不一致，容器内有测试逐字节比对，用来兜住这个风险。`build_plan`：每条 key 映射到目标 seg（源和目标 TP 不同时按倍数归并）。PYTHONHASHSEED 必须为 0 的检查 | `engines/vllm/keys.py` |
 | RankTopology | rank 与 KV 切片的对应关系（TP/PP/DP 切分；源和目标 TP 不同时，kvcm `peer_tp_size` 必须与引擎环境变量 `PEER_TP_SIZE` 同值）；rank 与 seg 对号（探测：pidfile/进程树/ss//proc，跨机时把脚本源码经 ssh 送到目标机执行，ss/ssh 带超时） | `engines/vllm/topology.py` |
 | 事件格式 | 引擎 KV 事件（`BlockStored` 等）schema 的生成/解析 | 待做（EventPublisher 补发时按本格式构造） |
 | engine config | block_size / num_kv_heads / head_size / 层数读取（KV 大小估算，E14 容量规划输入） | 待做 |
@@ -481,8 +481,8 @@ sequenceDiagram
 - **禁用 `to_thread` 默认池**（`min(32, cpu+4)`，大小不可控）——自建 executor 并显式配置
 - **RPC executor**：按 RPC 执行密度配（4~8），与传输闸的名额数**不绑定**——传输闸限「同时在后端传输的任务数」（保护后端），线程只为 RPC 执行的那一瞬间服务
 - **Ledger 专用单线程 executor**（`max_workers=1`）：sqlite 调用全部 `to_thread` 到它——天然串行，不用加锁
-- **线程卡死监控（未实现，登记 E6）**：线程池的线程数固定，恶化的是「可用线程」——线程卡在无响应的 RPC 里出不来，池的实际并发逐次递减，卡满即服务假死。监控要看的是「在飞调用持续多久没结束」而不是线程总数——需要按调用记开始时间（当前无此数据）。
-  - 当前用 `_rpc` 的 30 秒 `wait_for` 兜底：协程侧最多等 30 秒就报错，**服务不会假死**（任务失败，但池继续接活）；慢性的线程占用仍在
+- **线程卡死监控（未实现，登记 E6）**：线程池的线程数固定，恶化的是「可用线程」——线程卡在无响应的 RPC 里出不来，池的实际并发逐次递减，卡满即服务假死。要监控的是「某次 RPC 调用已经跑了多久还没返回」，而不是线程总数——需要按每次调用记下开始时间（当前没有这份数据）。
+  - 当前用 `_rpc` 的 30 秒 `wait_for` 限制等待时间：协程侧最多等 30 秒就报错，**服务不会假死**（任务失败，但池继续接活）；慢性的线程占用仍在
   - 根治靠 mooncake 自带 RPC 超时（0.3.11 无；main 有 `MC_RPC_TIMEOUT_MS` / `MC_RPC_CONNECT_TIMEOUT_MS`）——升级并配置后这个问题自然消失，届时不需额外监控代码
 - **启动期 connect 借默认池的例外已消除**：RPC 池在 `connect` 之前创建，`connect` 用同一个池（借一个线程、用完即还，启动期无其他任务争用）
 
@@ -517,7 +517,18 @@ sequenceDiagram
   2. **取消在途协程**（`task.cancel()`）——协程在 `await` 点收到 `CancelledError`；flow 捕获后做 abandon 处理（Ledger 记 abandoned；后端无任务取消能力 P9，传输不取消，副本清理归 remove）
   3. **等在途协程全部退出**——有界等待 5 秒（RPC 毫秒级 + abandon 记账毫秒级，余量充足）；**等满还有协程未退则不再等**，直接走后续步骤（未退的协程随进程消失——这与 RPC **线程**不同，见第 5 步）
   4. **KeepaliveLoop 停止**
-  5. **等 RPC 线程结束，再 `StoreClient.close()`**——顺序不能反：`run_in_executor` 取消不等线程函数结束，先关 client 会与在途 RPC 并发（demo 踩过的退出期崩溃正是这个形状）。等待有界（`shutdown_timeout_s`，默认 5 秒）；**超时则 client 和 ledger 都不关**——因为 worker 是非 daemon 线程（CPython 硬编码），解释器退出会 join 它们，进程本来就要靠 SIGKILL，此时拆资源只会多制造一次崩溃。
+  5. **等 RPC 线程结束，再 `StoreClient.close()`**——顺序不能反：`run_in_executor` 取消不等线程函数结束，先关 client 会与在途 RPC 并发（demo 实测的退出期崩溃正是这个形状）。等待有界（`shutdown_timeout_s`，默认 5 秒）。
+
+     超时（RPC 卡住）时的处理：**立即 `os._exit(1)`，不走任何清理**。
+
+     - 不能「跳过 close 然后正常返回」：`client` 是局部变量，函数返回会丢掉 Python 包装的最后一份引用，`~RealClient` 立刻调 `tearDownAll_internal()`——此时 RPC 线程还在绑定里，就是 demo 实测过的 teardown 竞态（abort RC=134 或挂住）
+     - 这个析构发生在解释器收尾之前，也**不经过** mooncake 的 `std::atexit`，所以「反正要走 atexit」的假设是错的
+     - 也不能主动 `client.close()`：那等于在在途 RPC 上 teardown
+     - `os._exit` 跳过 GC / `__del__` / atexit，进程立即消失
+
+     **为什么不在这里调 `close()`**：「退出前必须 close」这条经验针对的是「能正常收尾」的场合——不 close 会让清理推迟到退出期的 GC/atexit，而那条路径会与还在跑的传输线程冲突（demo 实测：abort RC=134 或挂住）。也就是说 close 的价值是**避开 atexit**，不是「不 close 会漏资源」。RPC 还停在绑定里时这个前提不成立：主动 close 和交给 GC 都是在在途调用上做 teardown，同一种崩溃。只有 `os._exit` 什么都不跑，不会崩。
+
+     代价（都可接受）：kvcm 是主侧身份（`global_segment_size=0`，不挂 seg、不持存储），名下没有副本会因它消失而丢，master 靠 client TTL 回收；已提交的 ledger 行还在，正在写的那条丢掉，重启后 `rebuild` 从 `status='running'` 重建跟踪。
 - 协程取消只在 `await` 点生效——不会在 RPC 执行中途切走，是干净的中断点。重启恢复只认 `status='running'` 的记录（SIGKILL 强杀场景：rebuild 当「还在跑」恢复跟踪）；abandoned 是终态，不恢复——abandon 的本意就是放弃跟踪
 
 ## 设计原则
@@ -526,7 +537,7 @@ sequenceDiagram
 2. **能力显式，不假装统一**：后端差异走 capability 声明，L2 按能力分支；不在接口里塞进只有 mooncake 有的概念
 3. **只建一层抽象**：L3 接口服务当前唯一后端（mooncake），第二后端（MemCache）接入时再修——不预判假想需求
 4. **语义规格以 D1/D2 为准**：本文任何接口定义与 D1/D2 冲突时，改本文
-5. **多实现方式：先落地一种，其余登记**：一个操作有多种实现方式时（D2 已有实例：retain = retained client / DFS 副本 / move 到存活节点的 seg / 自挂 SSD 兜底，§4；降层写穿 vs 写回分支，§3；copy 无指定源能力时以 move 替代，F7），**优先实现一种**，其余作为已知替代方式登记在 API 文档（能力前提、语义差异、补齐条件），后续按 capability 补齐——不同时实现多个
+5. **多实现方式：先实现一种，其余登记**：一个操作有多种实现方式时（D2 已有实例：retain = retained client / DFS 副本 / move 到存活节点的 seg / 自挂 SSD 作最后手段，§4；降层写穿 vs 写回分支，§3；copy 无指定源能力时以 move 替代，F7），**优先实现一种**，其余作为已知替代方式登记在 API 文档（能力前提、语义差异、补齐条件），后续按 capability 逐个补——不同时实现多个
 
 ## 与 E10 / E11 / E15 的对位
 
