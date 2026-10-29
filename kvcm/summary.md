@@ -282,7 +282,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 ### C. 性能与生产化
 
-- **E15. copy 并行与限速**——🟡 并行已落地（E11 内：`asyncio.Semaphore` 窗口，默认 4，`--copy-submit-concurrency`）；剩余是链路利用率感知的限速器（网卡计数器采样 → 传输忙时预热避让/降速），接在同一层信号量上，不独立做。带宽控制的输入还包括网卡繁忙感知（参考 vLLM-Ascend AI-QoS 的流量冲突问题定义；Router 侧用同一信号打分归 D1 §5）。
+- **E15. copy 并行与限速**——🟡 **限速仍阻塞（2026-10-29 #17）**：并行窗口已落地（E11：`asyncio.Semaphore`，默认 4，`--copy-submit-concurrency`）。但跨机双引擎床上 **42 条 `create_copy_task` 即便窗口 4 仍约半挂**（`NO_AVAILABLE_HANDLE`→硬失败，不是变慢；14 条全成）——闸本身不够，还需链路利用率感知的限速/背压（网卡计数器采样 → 传输忙时避让/降速），接在同一层信号量上。Router 侧用同一信号打分归 D1 §5。实录：[demo/EXPERIMENTS.md](demo/EXPERIMENTS.md) #16 坑 2 / **#17**。
 - **E16. 生产化缺口**——EP 拓扑实测、master HA、监控指标（READY 延迟、copy 失败率、external hit；命中率归因口径与 P8 耦合）。
 
 ## 参考锚点
