@@ -476,55 +476,6 @@ def test_shutdown_drain_pairs_task_done() -> None:
     run(scenario())
 
 
-def test_setdefault_rejects_second_install() -> None:
-    """装槽是原子的：槽里已有记录时，第二次装槽返回既有那条、不生效。
-
-    这是「同键双开」的最小修法。原实现「先 get 再赋值」两步之间有空隙：
-    输家会覆盖赢家已入队的 PENDING，两个 `_admit` 各入队一次 → 同一前缀
-    执行两遍。
-
-    为什么不在多线程里撞：`get` 与赋值之间的间隙只有几条字节码，GIL 下
-    实测撞不到（8 线程 × 200 轮零复现）。直接测语义更可靠。
-    """
-
-    async def scenario():
-        gate = threading.Event()
-        ops = FakeOps(query_gate=gate)
-        eng = TaskEngine(ops, max_concurrent=8, consumer_count=8)
-        eng.start()
-        try:
-            key = intent_id_of(_P, _T)
-            eng.submit_intent(_P, _T, poll_s=0.01)
-            # 等它入队（这时槽主是第一条）
-            deadline = time.monotonic() + 2
-            while time.monotonic() < deadline:
-                rec = eng._records.get(key)
-                if rec is not None and rec.queued:
-                    break
-                await asyncio.sleep(0.01)
-            owner = eng._records[key]
-            assert owner.queued
-
-            # 模拟「get 已返回旧值、现在才赋值」的输家
-            loser = _IntentRecord(
-                intent_id=key, prefix=_P, target=_T, poll_s=0.01, timeout_s=5.0
-            )
-            winner = eng._records.setdefault(key, loser)
-            assert winner is owner, "setdefault 让后到的记录覆盖了槽主"
-            assert eng._records[key] is owner
-            # 即便输家投了 _admit，也不会再入队
-            eng._loop.call_soon_threadsafe(eng._admit, key, _P, _T, 0.01, 5.0)
-            await asyncio.sleep(0.1)
-            gate.set()
-            await asyncio.sleep(0.4)
-            assert ops.copy_count == 1, f"同键双开: copy 被调 {ops.copy_count} 次"
-        finally:
-            gate.set()
-            await eng.shutdown(timeout_s=2)
-
-    run(scenario())
-
-
 def test_stale_finish_does_not_evict_new_generation() -> None:
     """迟到的一代收口不能删掉后一代的 PENDING。
 

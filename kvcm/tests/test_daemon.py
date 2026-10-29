@@ -556,42 +556,6 @@ def test_drain_timeout_hard_exits_without_close(monkeypatch, tmp_path) -> None:
 
 
 
-def test_injected_pool_busy_hard_exits_without_close(monkeypatch, tmp_path) -> None:
-    """注入池的 `close()` 报 False（还有调用在跑）：硬退出，且不调 client.close。
-
-    `_hard_exit()` 之后必须 `return`。生产路径 `os._exit` 不返回，但测试替身
-    会——少了 return 就会继续拆 client，与卡在绑定里的 RPC 并发。
-    """
-    events: list[str] = []
-    exits: list[int] = []
-
-    class FakeClient:
-        def connect(self, **kw) -> None: ...
-
-        def close(self) -> None:
-            events.append("client.close")
-
-    class BusyBackend(FakeBackend):
-        def close(self) -> bool:
-            events.append("backend.close")
-            return False  # 注入池仍有调用
-
-    backend = BusyBackend()
-    monkeypatch.setattr(daemon, "StoreClient", lambda: FakeClient())
-    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: backend)
-    monkeypatch.setattr(daemon, "KeepaliveLoop", FakeKeepalive)
-    monkeypatch.setattr(daemon, "_hard_exit", lambda: exits.append(1))
-
-    t, stop = _run_daemon_in_thread(_args(tmp_path))
-    deadline = time.monotonic() + 5
-    while backend.rebuild_calls == 0 and time.monotonic() < deadline:
-        time.sleep(0.01)
-    stop()
-    t.join(timeout=5)
-    assert exits == [1], f"没硬退出: {exits}"
-    assert "client.close" not in events, f"硬退出后还拆了 client: {events}"
-
-
 def test_connect_timeout_branch_hard_exits(monkeypatch, tmp_path) -> None:
     """connect 超时**分支本身**触发硬退出（不是靠 finally 兜的）。
 

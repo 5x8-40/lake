@@ -269,6 +269,11 @@ class MooncakeBackend(KvOps):
                 )
                 try:
                     await asyncio.shield(self._record(partial, "running"))
+                except asyncio.CancelledError:
+                    # 记账途中又来一次取消：照常传播。原来的异常可能是普通
+                    # Exception，此时若吞掉取消，调用方会收到 SubmitError，
+                    # 消费者当成预热失败继续拿下一个而不是退出。
+                    raise
                 except BaseException:
                     pass  # 记账失败不再掩盖原始异常
             if isinstance(e, asyncio.CancelledError):

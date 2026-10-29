@@ -313,18 +313,11 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
         # `backend.close()` 也放这里（不是硬退出分支）——今天对注入的池是
         # 空操作，但万一以后让它去碰 store，超时路径会在 os._exit 之前拆
         # client，正是要避免的形状。
-        # backend.close() 在硬退出分支之后：这里线程已排空，可以安全拆。
-        # 它返回 False 说明注入的池仍有调用在跑——按 same 规则硬退出，
-        # 不能继续 client.close()。
-        if backend is not None and not backend.close():
-            print(
-                "[kvcm] shutdown: injected pool still has in-flight RPC — "
-                "exiting immediately",
-                file=sys.stderr,
-            )
-            sys.stderr.flush()
-            _hard_exit()
-            return 1  # 走到这里说明 _hard_exit 被替换（测试），不能再拆 client
+        # backend.close() 对**注入的**池无事可等（daemon 自建并注入，
+        # `_owns_executor` 为假），排空由前面的 `_wait_executor` 负责。
+        # 这里只调用、不看返回值——那支 `if` 在生产路径永远进不去。
+        if backend is not None:
+            backend.close()
         client.close()
         ledger.close()
 
