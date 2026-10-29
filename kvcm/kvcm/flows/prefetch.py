@@ -90,8 +90,8 @@ class PrefetchFlow:
         """存在性检查已通过之后的步骤：copy 提交 → 轮询到终态。
 
         单独成方法是为了让编排层决定**传输闸的范围**：exists 是毫秒级
-        探测、不该占传输名额；「提交 → 等终态」才是真正占用后端带宽的
-        那一段。见 `TaskEngine._run_prefetch`。
+        探测、不该占名额；这段「提交 → 等终态」占一个前缀名额，直到
+        终态才还。见 `TaskEngine._run_prefetch`。
         """
         deadline = time.monotonic() + timeout_s
         try:

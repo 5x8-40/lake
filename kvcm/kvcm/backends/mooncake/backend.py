@@ -101,13 +101,15 @@ class MooncakeBackend(KvOps):
             asyncio.to_thread 默认池**（大小不可控）。Ledger 自己有专用
             单线程池，与本池分开。
         submit_concurrency：**整个 backend 内**同时在飞的 create_copy_task
-            上限（`asyncio.Semaphore`，所有 copy 共用一把）。它不是「单次
-            copy 的窗口」——传输闸（TaskEngine `max_concurrent`，默认 4）
-            允许 4 个 copy 同时跑，若每个 copy 各持一把默认 4 的窗口，在飞
-            建链就是 4×4=16，正好超过 0.3.11 实测打爆的量（ascend 上 14
-            连发约半数 TRANSFER_FAIL；窗口 4 节奏化 42/42 全成）。所以上限
-            必须是**进程级**的，与有几个 copy 在跑无关。链路利用率限速器
-            仍归 E15。
+            上限（`asyncio.Semaphore`，所有 copy 共用一把）。名额在这次
+            RPC 返回时就还，任务已经被 master 接受——它限建链速率，不限
+            「还没传完的前缀」。后者是传输闸（TaskEngine `max_concurrent`，
+            一个名额 = 一个前缀从提交占到终态）。两把不重复：只有本信号量
+            时，排队前缀会以每次 4 个 RPC 的速度全部提交完。它也不是「单次
+            copy 的窗口」——传输闸允许 4 个前缀同时提交，若每个 copy 各持
+            一把默认 4 的窗口，在飞建链就是 4×4=16，正好超过 0.3.11 实测
+            打爆的量（ascend 上 14 连发约半数 TRANSFER_FAIL；窗口 4 节奏化
+            42/42 全成）。所以上限必须是**进程级**的。链路利用率限速器仍归 E15。
         """
         if submit_concurrency <= 0:
             raise ValueError("submit_concurrency must be positive")
@@ -245,11 +247,12 @@ class MooncakeBackend(KvOps):
     def _submit_gate(self) -> asyncio.Semaphore:
         """进程级提交信号量（所有 copy 共用）。
 
-        与传输闸（TaskEngine `max_concurrent`）的分工：传输闸限「同时在
-        后端传输的任务数」，一个 copy 从头占到尾；本信号量只限「同时在飞
-        的 create_copy_task」——它是**进程级**的，因为闸允许 4 个 copy
-        同时提交，每 copy 各限 4 就会变成 16 个并发建链（0.3.11 实测
-        14 连发就打爆）。
+        与传输闸（TaskEngine `max_concurrent`）的分工：传输闸一个名额
+        是一个前缀，从 copy 提交占到该前缀终态；本信号量只包住
+        `create_copy_task` 这一次 RPC，返回即还。前者挡住「还没传完就
+        继续提交下一个前缀」，后者限建链速率。本信号量是**进程级**的，
+        因为闸允许 4 个前缀同时提交，每 copy 各限 4 就会变成 16 个并发
+        建链（0.3.11 实测 14 连发就打爆）。
 
         延迟创建：`Semaphore()` 构造时不绑循环（`daemon.py:_serve` 里
         `build_backend` 执行时循环已经在跑，构造绑不绑都不影响），但

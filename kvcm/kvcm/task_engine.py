@@ -4,7 +4,7 @@
 
     intent 入队（asyncio.Queue）
         → 协程消费者出队
-        → 过传输闸（Semaphore，限同时在后端传输的任务数）
+        → 过传输闸（Semaphore，限同时没做完的预热前缀数）
         → 执行 PrefetchFlow.run
         → 终态记账 + READY 后注册保活
 
@@ -16,10 +16,18 @@ KeepaliveLoop，查询由各自调用方直接 await）。
 线程池下等待也把线程占死；协程下等待只是挂起——100 个任务挂着也只占
 RPC executor 那几个线程。
 
-**传输闸的语义**：只在确认要发后台传输时拿名额（copy 提交前 acquire，
-终态 release）——保护 mooncake 与 RDMA 带宽。闸外只有 exists 探测
-（预热的前置检查，毫秒级 RPC）；`run_after_exists` 整段（提交、轮询、
-副本核验）在闸内，因为它们同属「后端还在为这个前缀搬数据」这一件事。
+**传输闸的语义**：一个名额 = 一个前缀正停在 `run_after_exists`
+（copy 提交 + 轮询 + 副本核验），终态才 release。默认 4。闸满时在传的
+不是 4 个任务：每个前缀的全部 key 都会交给 master（32K token、tp=2
+时大约 512 个 key，4 个满额前缀大约 4×512）。闸外只有 exists；keepalive
+注册在 release 之后。不按 key 计，也不是带宽管控（带宽归还没做的 E15）。
+
+它和进程级 `submit_concurrency`（默认 4）不重复。那把只包住
+`create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受——
+管的是建链速率（0.3.11 上 14 连发会 `ConnectToPeer FAILED`）。没有
+这把前缀闸的话，排队的前缀会以每次 4 个建链 RPC 的速度全部提交完：
+master 上叠着所有 plan，并且每个 handle 每轮 `query_task` 都要按 key
+顺序各查一次。前缀闸把「还没终态的预热前缀」卡在 `max_concurrent`。
 
 **线程边界**：`submit_intent` / `intent_status` 是**同步方法**，供 gRPC
 servicer（在其线程池线程里）调用——入队经 `call_soon_threadsafe` 投递
@@ -105,18 +113,23 @@ class TaskEngine:
         finished_max: int = 25600,
     ) -> None:
         """
-        max_concurrent：**传输闸名额数**（同时在后端传输的任务数，保护
-        mooncake 与带宽），不是线程数。
+        max_concurrent：传输闸名额。一个名额 = 一个前缀正停在
+        `run_after_exists`（提交 + 轮询 + 核验），终态才还。不是线程数，
+        也不按 key 计：闸满时 master 上是这几个前缀的全部 key（32K、tp=2
+        大约 4×512），不是 4 个任务。与 `submit_concurrency` 不重复——
+        那把在 `create_copy_task` 返回时就还，只限建链速率；没有这把闸，
+        排队前缀会以每次 4 个 RPC 的速度全部提交完。
         limiter：限速器钩子（E15 接入点）；False 时等待后重试。
         queue_size：队列容量；0 = 不限（排队是协程挂起，不占资源）。限容量
         时满了**不阻塞**——`_admit` 用 `put_nowait`，`QueueFull` 直接把这条
         intent 记成 FAILED（`rejected (queue full)`）；调用方已经拿到 id，
         状态经 `GetTask` 查。若要做入口背压，应由 gateway 侧限并发，不在
         这里阻塞 gRPC 线程。
-        consumer_count：消费者协程数，默认 `max(16, max_concurrent × 4)`
-        ——**必须远大于名额数**：消费者出队后先在闸外做存在性检查，再去
-        等名额。若等于名额数，第 N+1 个请求连队列都出不来，它的检查会被
-        在途传输堵住。
+        consumer_count：消费者协程数，默认 `max(16, max_concurrent × 4)`。
+        这是下界，不是容量上限：消费者 `get()` 之后一直持有记录，先在闸外
+        做 exists，再去等名额。若等于名额数，下一条连队列都出不来，exists
+        会被在途传输堵住。`×4` 和 16 的下限没有实测，只是给 exists 留几条
+        流水线；K 可以更大（等闸时协程只是挂起）。队列长度不是背压信号。
         finished_max：终态回执保留条数。`_records` 只存在途；进终态后
         换成瘦记录（只剩 intent_id / status / detail）放进定长环，超出
         按插入顺序丢最旧的。默认 25600 ≈ 16 MB 量级（空 detail 单条约
@@ -142,9 +155,9 @@ class TaskEngine:
         self._accepting = True
         self._consumers: list[asyncio.Task] = []
         self._recover_tasks: list[asyncio.Task] = []
-        # 消费者数默认远大于闸名额：出队后先做 exists（闸外），再在
-        # 闸上挂起。若等于名额数，第 N+1 个 intent 连队列都出不来，
-        # 它的 exists 会被在途传输堵住（定稿要避免的）
+        # 下界，不是容量上限：出队后先做 exists（闸外），再在闸上挂起。
+        # 若等于名额数，第 N+1 个 intent 连队列都出不来，exists 会被
+        # 在途传输堵住。×4 / 16 没有实测。队列长度不是背压信号。
         self._consumer_count = consumer_count or max(16, max_concurrent * 4)
         self._loop: asyncio.AbstractEventLoop | None = None
 
@@ -441,8 +454,9 @@ class TaskEngine:
         """跑一次预热。
 
         传输闸的范围（定稿）：**exists 探测在闸外**（毫秒级操作不该被
-        传输堵），只有「提交后台传输 → 等到终态」这一段占名额——名额
-        的语义是「后端还在为这个前缀搬数据」，轮询期间确实如此。
+        堵住）。名额从 copy 提交前占到该前缀终态——这段时间 master 上
+        有这个前缀的全部 key，轮询也占着名额。`submit_concurrency`
+        在建链 RPC 返回时就还，替不了这一段。
         """
         await self._throttle()
         # 闸外：存在性检查（毫秒级 RPC，读即续租）
@@ -461,7 +475,7 @@ class TaskEngine:
             self._keepalive.register(prefix)
 
     async def _track(self, handle: TaskHandle, poll_s: float, timeout_s: float) -> None:
-        """轮询恢复的句柄到终态。"""
+        """轮询恢复的句柄到终态。不占传输闸（已知窗口，见设计文档）。"""
         # 轮询前取 prefix：终态即删核验登记，READY 后再取就是 None
         prefix = self._ops.prefix_of(handle)
         loop = asyncio.get_running_loop()

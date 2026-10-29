@@ -387,7 +387,7 @@ def main(argv: list[str] | None = None) -> int:
         "--max-concurrent",
         type=int,
         default=4,
-        help="传输闸名额数（同时在后端传输的任务数）",
+        help="传输闸名额（同时没做完的预热前缀数，不按 key 计）",
     )
     p.add_argument(
         "--listen",

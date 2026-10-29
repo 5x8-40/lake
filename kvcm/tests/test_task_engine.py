@@ -123,10 +123,10 @@ def test_run_once_failure_does_not_register() -> None:
 
 
 def test_transfer_gate_limits_concurrency() -> None:
-    """传输闸限制同时执行的任务数（max_concurrent=2，跑 5 个）。
+    """传输闸限制同时处于预热中的前缀数（max_concurrent=2，跑 5 个）。
 
-    度量方式：任务在 flow 内的「进入 copy → 离开 run」这一段区间里，
-    并发数不得超过闸名额。用计数器的进入/离开配对来测。
+    度量的是同时有几个前缀进了 copy、还没离开这次 run，不是 key 数，
+    也不是 create_copy_task 的在飞数。
     """
     active = {"now": 0, "peak": 0}
 
