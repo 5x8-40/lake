@@ -10,8 +10,11 @@
 query_task 立即 READY；其余方法（keepalive / stop_keepalive / pin /
 demote / remove）无 READY。任务状态经 query_task 查询。
 
-幂等：以（前缀 × 目标实例）为幂等键——在途不重复发、完成不重复发；
-后端幂等兜底。
+幂等：**本层不去重**——`copy` 每次调用都发起任务，同一前缀重复调用会产生
+重复传输。去重归编排层（TaskEngine 以 intent_id = 前缀 × 目标实例 为键：
+同键在途返回既有 id，不重复执行；同键已终态视为新意图、重新预热）。池侧对
+同 key 的并发复制以 `OBJECT_HAS_REPLICATION_TASK` 拒绝，实现侧把它当「在途」
+观测态处理（核验副本，不算失败）。
 
 编排层只调本接口；后端 key、段、租约、client 身份、rank 等概念不允
 许出现在签名里——那些归适配层。

@@ -94,7 +94,14 @@ class FakeClient(StoreClient):
         return {k: list(on) for k in keys}
 
 
-def _backend(client, kc: KeyComputer, monkeypatch, ledger=None, segs=("seg-A", "seg-B")) -> MooncakeBackend:
+def _backend(
+    client,
+    kc: KeyComputer,
+    monkeypatch,
+    ledger=None,
+    segs=("seg-A", "seg-B"),
+    submit_interval_s=0.0,
+) -> MooncakeBackend:
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
     return MooncakeBackend(
         client=client,
@@ -102,6 +109,7 @@ def _backend(client, kc: KeyComputer, monkeypatch, ledger=None, segs=("seg-A", "
         locate=lambda _inst: list(segs),
         capability=mooncake_v0311(),
         ledger=ledger,
+        submit_interval_s=submit_interval_s,
     )
 
 
@@ -176,6 +184,107 @@ def test_empty_prefix_raises(fake_store_module, monkeypatch) -> None:
     )
     with pytest.raises(ValueError, match="no keys"):
         run(b.copy(Prefix(model_id="qwen", token_ids=()), InstanceId("inst-B")))
+
+
+def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) -> None:
+    """提交中途被取消：已发出的任务号必须落账成 running。
+
+    `CancelledError` 不是 `Exception` 的子类。只捕 `Exception` 的话，退出
+    时取消落在提交循环里，已发出的号就丢了——`rebuild` 只认
+    `status='running'` 的行，这些在途传输重启后再也没人跟踪。
+
+    必须是多 key 的 plan：单个 key 时提交循环里没有 `await`，取消点落不到
+    「第 1 个已发出、第 2 个还没发」的窗口上，测试会假通过。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        client = FakeClient()
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(
+            kc, "keys_for_tokens", lambda ids: kc.expand(["h0", "h1"])
+        )
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+            submit_interval_s=5.0,  # 第 2 次提交前挂 5 秒，足够取消
+        )
+
+        async def scenario():
+            task = asyncio.create_task(
+                b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+            )
+            deadline = time.monotonic() + 5
+            while not client.created and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert client.created, "第 1 个任务都没发出，前提不成立"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task  # 取消必须照常传播，不能被包成 SubmitError
+
+        run(scenario())
+        # 前提校验：取消时确实只发出了 1 个，测的才是「提交中途」
+        assert len(client.created) == 1, f"取消点不在提交循环内: {client.created}"
+        running = led.list_running_tasks()
+        assert len(running) == 1, f"取消时已发出的任务号没入账: {running}"
+        from kvcm.backends.mooncake.backend import decode_task_id
+
+        assert decode_task_id(running[0].task_id) == (1, 101)
+    finally:
+        led.close()
+        os.unlink(path)
+
+
+def test_ledger_write_uses_ledger_pool_not_rpc_pool(
+    fake_store_module, monkeypatch
+) -> None:
+    """Ledger 写入走 Ledger 自己的池，不占 RPC 池。
+
+    用 RPC 池有两个害处：占掉传输名额；退出时池已关，`abandon` 若恰好落在
+    那个窗口，会抛 `cannot schedule new futures after shutdown`，账本留
+    `running`。
+
+    测法：copy 正常跑完（RPC 池还活着），然后关掉 RPC 池，再调 `abandon`
+    —— 它只写 ledger，不该需要 RPC 池。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+    from concurrent.futures import ThreadPoolExecutor
+
+    led = Ledger(path)
+    rpc_pool = ThreadPoolExecutor(max_workers=2)
+    try:
+        client = FakeClient()
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+            executor=rpc_pool,
+        )
+        handle = run(
+            b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+        )
+        rows = led.list_running_tasks()
+        assert rows, "copy 后没有 running 行"
+        handle_id = rows[0].handle_id
+        rpc_pool.shutdown(wait=True)  # 模拟退出期那一瞬
+        run(b.abandon(handle))  # 只写 ledger，不该需要 RPC 池
+        statuses = {r.status for r in led.list_tasks_by_handle(handle_id)}
+        assert "abandoned" in statuses, f"abandon 没记账: {statuses}"
+    finally:
+        led.close()
+        os.unlink(path)
 
 
 def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> None:
@@ -889,10 +998,12 @@ def test_close_waits_bounded_for_inflight_rpc(fake_store_module, monkeypatch) ->
     import time as _t
 
     start = _t.monotonic()
-    b.close(wait_timeout_s=5.0)
+    got = b.close(wait_timeout_s=5.0)
     elapsed = _t.monotonic() - start
     # 关键：close 等了那个慢线程（≥0.15s），不是立刻返回
     assert elapsed >= 0.1, f"close 没等慢 RPC（{elapsed:.2f}s）"
+    # 等完了要如实返回 True——调用方靠这个值决定要不要硬退出
+    assert got is True, f"线程等完了却报没等完（返回 {got!r}）"
 
 
 def test_close_bounded_when_rpc_hangs(fake_store_module, monkeypatch) -> None:
@@ -921,6 +1032,9 @@ def test_close_bounded_when_rpc_hangs(fake_store_module, monkeypatch) -> None:
 
     run(scenario())
     start = _time.monotonic()
-    b.close(wait_timeout_s=0.3)  # 远小于 RPC 的 3s
+    got = b.close(wait_timeout_s=0.3)  # 远小于 RPC 的 3s
     elapsed = _time.monotonic() - start
     assert elapsed < 1.5, f"close 没有有界返回（用了 {elapsed:.2f}s）"
+    # 超时必须如实报 False：调用方正是靠它触发 os._exit(1)。
+    # 原实现无返回值（隐式 None），这个信号被静默丢掉。
+    assert got is False, f"超时没报 False（返回 {got!r}），调用方无从判断"

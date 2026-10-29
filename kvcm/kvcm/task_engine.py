@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -61,7 +62,11 @@ def intent_id_of(prefix: Prefix, target: InstanceId) -> str:
 
 @dataclass
 class _IntentRecord:
-    """一次 intent 的执行记录（进程内）。"""
+    """一次 intent 的执行记录（进程内，只在途用它）。
+
+    进终态后会被换成 `_Finished`（只剩 intent_id / status / detail），
+    大字段（`prefix` 里的 token 序列）随之释放。
+    """
 
     intent_id: str
     prefix: Prefix
@@ -70,7 +75,17 @@ class _IntentRecord:
     timeout_s: float
     status: IntentStatus = IntentStatus.PENDING
     detail: str = ""
-    done: asyncio.Event = field(default_factory=asyncio.Event)
+    # 是否已投进队列（区分 submit_intent 刚建的占位与已在途）
+    queued: bool = False
+
+
+@dataclass(frozen=True)
+class _Finished:
+    """终态回执（瘦记录）。"""
+
+    intent_id: str
+    status: IntentStatus
+    detail: str = ""
 
 
 class TaskEngine:
@@ -85,6 +100,7 @@ class TaskEngine:
         limiter: RateLimiter | None = None,
         queue_size: int = 0,
         consumer_count: int | None = None,
+        finished_max: int = 25600,
     ) -> None:
         """
         max_concurrent：**传输闸名额数**（同时在后端传输的任务数，保护
@@ -97,6 +113,9 @@ class TaskEngine:
         ——**必须远大于名额数**：消费者出队后先在闸外做存在性检查，再去
         等名额。若等于名额数，第 N+1 个请求连队列都出不来，它的检查会被
         在途传输堵住。
+        finished_max：终态回执保留条数。`_records` 只存在途；进终态后
+        换成瘦记录（只剩 intent_id / status / detail）放进定长环，超出
+        按插入顺序丢最旧的。默认 25600 ≈ 16 MB（一条约 650 B）。
         """
         if max_concurrent <= 0:
             raise ValueError("max_concurrent must be positive")
@@ -106,7 +125,14 @@ class TaskEngine:
         self._limiter = limiter
         self._queue: asyncio.Queue[_IntentRecord] = asyncio.Queue(maxsize=queue_size)
         self._gate = asyncio.Semaphore(max_concurrent)
+        # 只存在途（PENDING）。这是去重表：同键有 PENDING 记录就返回既有
+        # id 不重复执行——**淘汰 PENDING 会让同键执行两次**，所以这里
+        # 永不淘汰，终态即移走。
         self._records: dict[str, _IntentRecord] = {}
+        # 终态回执：有界表（按插入顺序淘汰最旧的）。查表与淘汰都是 O(1)。
+        # 只有 GetTask 读，观测面用。
+        self._finished: OrderedDict[str, _Finished] = OrderedDict()
+        self._finished_max = max(1, finished_max)
         self._accepting = True
         self._consumers: list[asyncio.Task] = []
         self._recover_tasks: list[asyncio.Task] = []
@@ -156,12 +182,28 @@ class TaskEngine:
         #    只是不再等结果）。等线程的事归 daemon 的 `_wait_executor`——
         #    池由 daemon 创建并注入，`backend.close()` 对注入的池会直接
         #    return（`_owns_executor` 为假），等不到。这里不做。
-        # 队列里还没被取走的：标记失败，别让调用方永远等一个 PENDING
-        while not self._queue.empty():
-            rec = self._queue.get_nowait()
-            rec.status = IntentStatus.FAILED
-            rec.detail = "cancelled (shutdown, never started)"
-            rec.done.set()
+        # 队列里还没被取走的：标记失败，别让调用方永远等一个 PENDING。
+        # `get_nowait` 与 `task_done` 必须配对，否则 `_unfinished_tasks`
+        # 泄漏（将来有人 `await queue.join()` 会永久挂住）。
+        while True:
+            try:
+                rec = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                self._finish(
+                    rec, IntentStatus.FAILED, "cancelled (shutdown, never started)"
+                )
+            finally:
+                self._queue.task_done()
+        # 已建占位但 _admit 还没跑到的（不在队列里）：同样标失败。
+        # 必须先用 `list(...)` 快照——`_finish` 会从 `_records` 删条目，
+        # 边迭代边删会抛 `RuntimeError: dictionary changed size`。
+        for rec in list(self._records.values()):
+            if rec.status is IntentStatus.PENDING and not rec.queued:
+                self._finish(
+                    rec, IntentStatus.FAILED, "cancelled (shutdown, never started)"
+                )
 
     # ------------------------------------------------------------------
     # intent 入口（同步，供 gRPC servicer 线程调用）
@@ -193,9 +235,22 @@ class TaskEngine:
         if loop is None:
             raise RuntimeError("task engine not started (call start() first)")
         key = intent_id_of(prefix, target)
-        # 去重与入队都投递到事件循环线程内完成——gRPC 用多线程接请求，
-        # 「先查 _records 再写」在这里跨线程会重复执行（两个线程同时看
-        # 到无记录，各入队一次）
+        rec = _IntentRecord(
+            intent_id=key,
+            prefix=prefix,
+            target=target,
+            poll_s=poll_s,
+            timeout_s=timeout_s,
+        )
+        # `setdefault` 是一次原子插入：槽里已有记录时返回它，自己的写不生效。
+        # 「先 get 再赋值」之间有空隙——两个 gRPC 线程同时提交同一键时，输家
+        # 会把赢家已入队的 PENDING 覆盖成自己的新记录，两个 `_admit` 各入队
+        # 一次，同一前缀执行两遍。这里让插入本身决定归属，输家直接返回。
+        #
+        # `_records` 里只有 PENDING（终态已移到 `_finished`），所以「槽非空」
+        # 等价于「在途」；终态同键再提交时槽是空的，正常走新意图。
+        if self._records.setdefault(key, rec) is not rec:
+            return key
         loop.call_soon_threadsafe(
             self._admit, key, prefix, target, poll_s, timeout_s
         )
@@ -211,12 +266,28 @@ class TaskEngine:
     ) -> None:
         """在事件循环线程内做去重判定与入队（submit_intent 的投递目标）。"""
         if not self._accepting:
-            # 停收：已有记录时**不能覆盖**（正在跑的那条还在改旧对象，
-            # 覆盖会让 GetTask 看到 "rejected" 而实际还在执行）
-            if key in self._records:
-                return
-            # 无记录：记一条 FAILED 而不是丢弃——调用方已经拿到 key
-            # （同步检查与这里之间有空隙），丢弃会让它的 GetTask 永远 UNKNOWN
+            rec = self._records.get(key)
+            if rec is None:
+                rec = _IntentRecord(
+                    intent_id=key,
+                    prefix=prefix,
+                    target=target,
+                    poll_s=poll_s,
+                    timeout_s=timeout_s,
+                )
+                # 同样不覆盖：槽已被占说明别人刚提交，交给 shutdown 收口
+                if self._records.setdefault(key, rec) is not rec:
+                    return
+            if rec.queued or rec.status is not IntentStatus.PENDING:
+                return  # 已在途：交给 shutdown 的取消/清队收口，不覆盖
+            self._finish(
+                rec, IntentStatus.FAILED, "cancelled (shutdown, never started)"
+            )
+            return
+        rec = self._records.get(key)
+        if rec is None:
+            # 正常走不到：占位由 `submit_intent` 的 setdefault 装好才投递。
+            # 只有测试会直接调 `_admit`。补一条，但同样不覆盖已有记录。
             rec = _IntentRecord(
                 intent_id=key,
                 prefix=prefix,
@@ -224,39 +295,70 @@ class TaskEngine:
                 poll_s=poll_s,
                 timeout_s=timeout_s,
             )
-            rec.status = IntentStatus.FAILED
-            rec.detail = "rejected (shutting down)"
-            rec.done.set()
-            self._records[key] = rec
-            return
-        existing = self._records.get(key)
-        if existing is not None and existing.status is IntentStatus.PENDING:
+            if self._records.setdefault(key, rec) is not rec:
+                return
+            rec.queued = True
+        elif rec.queued:
             return  # 在途去重
-        rec = _IntentRecord(
-            intent_id=key,
-            prefix=prefix,
-            target=target,
-            poll_s=poll_s,
-            timeout_s=timeout_s,
-        )
-        self._records[key] = rec
+        else:
+            rec.queued = True  # submit_intent 建的占位：入队
         try:
             self._queue.put_nowait(rec)
         except asyncio.QueueFull:
-            rec.status = IntentStatus.FAILED
-            rec.detail = "rejected (queue full)"
-            rec.done.set()
+            self._finish(rec, IntentStatus.FAILED, "rejected (queue full)")
+
+    def _finish(
+        self, rec: _IntentRecord, status: IntentStatus, detail: str = ""
+    ) -> None:
+        """置终态：从在途表移走，换成瘦记录放进终态环。
+
+        两道判据缺一不可：
+        - **身份**：只有当前槽主能收口。后一代已顶替时，本次是迟到的收口，
+          直接丢弃（否则会把新一代的 PENDING 删掉）。
+        - **状态**：已终态的幂等——drain 与 sweep 可能同时收口同一条，第二次
+          不能把 READY 改写成 FAILED。
+
+        写入顺序是承重的：先改记录状态，再写回执，最后才移出槽。读侧先查
+        `_records` 再查 `_finished`，按此顺序任意交错都读到真值，不会出现
+        「两边都空」的 UNKNOWN 窗口。
+        """
+        if self._records.get(rec.intent_id) is not rec:
+            return
+        if rec.status is not IntentStatus.PENDING:
+            return
+        rec.status = status
+        rec.detail = detail
+        # 同键重提会覆盖旧代，并把这条移到最新（不占两个位置）
+        self._finished[rec.intent_id] = _Finished(
+            intent_id=rec.intent_id, status=status, detail=detail
+        )
+        self._finished.move_to_end(rec.intent_id)
+        while len(self._finished) > self._finished_max:
+            self._finished.popitem(last=False)
+        del self._records[rec.intent_id]
 
     def intent_status(self, intent_id: str) -> IntentStatus | None:
-        """查询 intent 执行状态（回执通道）。None = 未知 intent_id。"""
+        """查询 intent 执行状态（回执通道）。None = 未知 intent_id。
+
+        两处查：在途表（`_records`）→ 终态环（`_finished`）。都没有说明
+        这条回执已随终态环淘汰、或进程重启过——两者同义（观测面可丢）。
+        """
         rec = self._records.get(intent_id)
-        return rec.status if rec is not None else None
+        if rec is not None:
+            return rec.status
+        fin = self._finished.get(intent_id)
+        return fin.status if fin is not None else None
 
     def intent_detail(self, intent_id: str) -> str:
-        """失败原因（回执 detail）：终态 FAILED 时返回异常文本（截断），
-        其余情形空串。失败不带原因的回执等于没有回执。"""
+        """失败原因（回执 detail）：终态 FAILED 时返回异常文本，其余空串。
+
+        失败不带原因的回执等于没有回执。
+        """
         rec = self._records.get(intent_id)
-        return rec.detail if rec is not None else ""
+        if rec is not None:
+            return rec.detail
+        fin = self._finished.get(intent_id)
+        return fin.detail if fin is not None else ""
 
     # ------------------------------------------------------------------
     # 直接调用（脚本 / 调试 / 测试）
@@ -306,27 +408,21 @@ class TaskEngine:
                 await self._run_prefetch(
                     rec.prefix, rec.target, rec.poll_s, rec.timeout_s
                 )
-                rec.status = IntentStatus.READY
+                self._finish(rec, IntentStatus.READY)
             except asyncio.CancelledError:
-                rec.status = IntentStatus.FAILED
-                rec.detail = "cancelled (shutdown)"
-                rec.done.set()
+                self._finish(rec, IntentStatus.FAILED, "cancelled (shutdown)")
                 raise
             except PrefetchError as e:
-                rec.status = IntentStatus.FAILED
-                rec.detail = f"{type(e).__name__}: {e}"[:500]
+                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
             except QueryError as e:
                 # exists 的查询失败（不包成 PrefetchError）只该判定这次
                 # intent 失败——**不能向上抛**，否则消费者协程退出，几次
                 # 抖动后全部消费者死光、新 intent 永远 PENDING
-                rec.status = IntentStatus.FAILED
-                rec.detail = f"{type(e).__name__}: {e}"[:500]
+                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
             except Exception as e:  # 编程错误也留原因，再往上抛（不吞）
-                rec.status = IntentStatus.FAILED
-                rec.detail = f"{type(e).__name__}: {e}"[:500]
+                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
                 raise
             finally:
-                rec.done.set()
                 self._queue.task_done()
 
     async def _run_prefetch(

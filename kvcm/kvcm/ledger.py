@@ -141,6 +141,11 @@ class Ledger:
             return fn(*args, **kwargs)
         return self._executor.submit(fn, *args, **kwargs).result()
 
+    @property
+    def executor(self) -> ThreadPoolExecutor:
+        """Ledger 自己的单线程池（供 asyncio 侧 await 用，不占 RPC 池）。"""
+        return self._executor
+
     def __enter__(self) -> "Ledger":
         return self
 

@@ -23,7 +23,7 @@ from kvcm.ops.base import (
 )
 from kvcm.ops.capability import BackendCapability
 from kvcm.ops.types import InstanceId, PinKind, Prefix
-from kvcm.task_engine import IntentStatus, TaskEngine, intent_id_of
+from kvcm.task_engine import IntentStatus, TaskEngine, _IntentRecord, intent_id_of
 
 _P = Prefix(model_id="qwen", token_ids=(1, 2, 3))
 _T = InstanceId("inst-B")
@@ -248,6 +248,31 @@ def test_intent_status_unknown_returns_none() -> None:
     assert eng.intent_detail("nope") == ""
 
 
+def test_intent_status_visible_before_admit_runs() -> None:
+    """`submit_intent` 返回后同一个 tick 内查状态，必须能查到。
+
+    原实现用 `call_soon_threadsafe` 把 `_admit` 排队，返回时循环还没跑到
+    它，`_records` 里没记录；`grpc_server.py` 把「查不到」映射成
+    STATUS_UNKNOWN，语义是「没有这个 id」——而调用方手里刚拿到这个 id。
+
+    在引擎层测而不是走 gRPC：一次 RPC 往返足够让事件循环跑完 `_admit`，
+    缝会被吃掉（实测改回旧实现走 gRPC 仍然全绿）。这里不 await。
+    """
+
+    async def scenario():
+        eng = TaskEngine(FakeOps())
+        eng.start()
+        try:
+            key = eng.submit_intent(_P, _T, poll_s=0.01)
+            assert eng.intent_status(key) is IntentStatus.PENDING, (
+                "submit_intent 已返回 id，但同 tick 内查不到记录"
+            )
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
 def test_intent_id_is_prefix_times_target() -> None:
     """幂等键 = 前缀 × 目标实例（D1 §4）。"""
     a = intent_id_of(_P, InstanceId("inst-A"))
@@ -395,6 +420,168 @@ def test_shutdown_cancels_queued_intents() -> None:
     run(scenario())
 
 
+def test_shutdown_sweeps_placeholders_without_runtime_error() -> None:
+    """shutdown 扫描未入队占位：不能边迭代边删（会抛 RuntimeError）。
+
+    `_finish` 会从 `_records` 删条目；直接迭代 `values()` 是「边迭代边改
+    大小」，CPython 抛 `RuntimeError: dictionary changed size during
+    iteration`。一条占位就够触发。
+    """
+
+    async def scenario():
+        eng = TaskEngine(FakeOps())
+        eng.start()
+        # 直接塞占位（模拟 submit_intent 已写、_admit 还没跑）
+        for i in range(3):
+            k = f"k{i}"
+            eng._records[k] = _IntentRecord(
+                intent_id=k, prefix=_P, target=_T, poll_s=0.01, timeout_s=1.0
+            )
+        await eng.shutdown(timeout_s=0.05)  # 不抛
+        assert len(eng._records) == 0
+        for i in range(3):
+            assert eng.intent_status(f"k{i}") is IntentStatus.FAILED
+            assert "never started" in eng.intent_detail(f"k{i}")
+
+    run(scenario())
+
+
+def test_shutdown_drain_pairs_task_done() -> None:
+    """清队时 `get_nowait` 必须配 `task_done`。
+
+    不配对会让 `_unfinished_tasks` 泄漏——将来有人 `await queue.join()`
+    就永久挂住。
+    """
+
+    async def scenario():
+        eng = TaskEngine(FakeOps())
+        # 不起消费者，手工把记录塞进队列——确保 shutdown 时队列非空
+        for i in range(3):
+            k = f"q{i}"
+            rec = _IntentRecord(
+                intent_id=k, prefix=_P, target=_T, poll_s=0.01, timeout_s=1.0
+            )
+            rec.queued = True
+            eng._records[k] = rec
+            eng._queue.put_nowait(rec)
+        assert eng._queue.qsize() == 3
+        await eng.shutdown(timeout_s=0.05)
+        assert eng._queue._unfinished_tasks == 0, (
+            f"task_done 没配对，剩 {eng._queue._unfinished_tasks} 条未完成"
+        )
+        assert eng._queue.qsize() == 0
+        for i in range(3):
+            assert eng.intent_status(f"q{i}") is IntentStatus.FAILED
+
+    run(scenario())
+
+
+def test_setdefault_rejects_second_install() -> None:
+    """装槽是原子的：槽里已有记录时，第二次装槽返回既有那条、不生效。
+
+    这是「同键双开」的最小修法。原实现「先 get 再赋值」两步之间有空隙：
+    输家会覆盖赢家已入队的 PENDING，两个 `_admit` 各入队一次 → 同一前缀
+    执行两遍。
+
+    为什么不在多线程里撞：`get` 与赋值之间的间隙只有几条字节码，GIL 下
+    实测撞不到（8 线程 × 200 轮零复现）。直接测语义更可靠。
+    """
+
+    async def scenario():
+        gate = threading.Event()
+        ops = FakeOps(query_gate=gate)
+        eng = TaskEngine(ops, max_concurrent=8, consumer_count=8)
+        eng.start()
+        try:
+            key = intent_id_of(_P, _T)
+            eng.submit_intent(_P, _T, poll_s=0.01)
+            # 等它入队（这时槽主是第一条）
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                rec = eng._records.get(key)
+                if rec is not None and rec.queued:
+                    break
+                await asyncio.sleep(0.01)
+            owner = eng._records[key]
+            assert owner.queued
+
+            # 模拟「get 已返回旧值、现在才赋值」的输家
+            loser = _IntentRecord(
+                intent_id=key, prefix=_P, target=_T, poll_s=0.01, timeout_s=5.0
+            )
+            winner = eng._records.setdefault(key, loser)
+            assert winner is owner, "setdefault 让后到的记录覆盖了槽主"
+            assert eng._records[key] is owner
+            # 即便输家投了 _admit，也不会再入队
+            eng._loop.call_soon_threadsafe(eng._admit, key, _P, _T, 0.01, 5.0)
+            await asyncio.sleep(0.1)
+            gate.set()
+            await asyncio.sleep(0.4)
+            assert ops.copy_count == 1, f"同键双开: copy 被调 {ops.copy_count} 次"
+        finally:
+            gate.set()
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_stale_finish_does_not_evict_new_generation() -> None:
+    """迟到的一代收口不能删掉后一代的 PENDING。
+
+    `_finish` 若按 intent_id 无条件删，先结束的那代会把新一代的记录删掉，
+    新一代还在跑却查不到，第三次提交还能再开一轮。
+    """
+
+    async def scenario():
+        eng = TaskEngine(FakeOps())
+        eng.start()
+        try:
+            key = "same-key"
+            old = _IntentRecord(
+                intent_id=key, prefix=_P, target=_T, poll_s=0.01, timeout_s=1.0
+            )
+            new = _IntentRecord(
+                intent_id=key, prefix=_P, target=_T, poll_s=0.01, timeout_s=1.0
+            )
+            eng._records[key] = new  # 新一代占着槽
+            # 老一代迟到的收口
+            eng._finish(old, IntentStatus.FAILED, "late")
+            assert eng._records.get(key) is new, "老一代把新一代删掉了"
+            assert eng.intent_status(key) is IntentStatus.PENDING
+        finally:
+            await eng.shutdown(timeout_s=0.5)
+
+    run(scenario())
+
+
+def test_finish_does_not_overwrite_terminal_status() -> None:
+    """已终态的记录再被收口：不把状态改写成后来的值。
+
+    drain 与 sweep 可能同时收口同一条。没有状态判据时，第二次会把
+    READY 改写成 FAILED。
+    """
+
+    async def scenario():
+        eng = TaskEngine(FakeOps())
+        eng.start()
+        try:
+            key = "k"
+            rec = _IntentRecord(
+                intent_id=key, prefix=_P, target=_T, poll_s=0.01, timeout_s=1.0
+            )
+            # 先手工标成 READY，但**仍留在槽里**（模拟消费者刚写完状态、
+            # 还没走完 _finish 的中间态）
+            eng._records[key] = rec
+            rec.status = IntentStatus.READY
+            # 此刻另一条收口路径进来
+            eng._finish(rec, IntentStatus.FAILED, "late drain")
+            assert eng.intent_status(key) is IntentStatus.READY, "READY 被改写成 FAILED"
+        finally:
+            await eng.shutdown(timeout_s=0.5)
+
+    run(scenario())
+
+
 def test_max_concurrent_must_be_positive() -> None:
     with pytest.raises(ValueError):
         TaskEngine(FakeOps(), max_concurrent=0)
@@ -507,7 +694,160 @@ def test_admit_after_shutdown_records_failed_not_dropped() -> None:
         # 模拟「已经通过同步检查、但 _admit 才执行」的那条 intent
         eng._admit("k-late", _P, _T, 0.01, 1.0)
         assert eng.intent_status("k-late") is IntentStatus.FAILED
-        assert "shutting down" in eng.intent_detail("k-late")
+        assert "shutdown" in eng.intent_detail("k-late")
+
+    run(scenario())
+
+
+def test_finished_record_survives_without_prefix() -> None:
+    """终态后可查（READY / detail），但大字段已释放。
+
+    `_records` 只存在途：终态即移走，换成瘦记录。否则每条记录都挂着
+    `prefix.token_ids`（几千个 int，约 115 KB），进程长跑一直涨。
+    """
+
+    async def scenario():
+        eng = TaskEngine(FakeOps(seq=[TaskStatus.READY]))
+        eng.start()
+        try:
+            key = eng.submit_intent(_P, _T, poll_s=0.01)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if eng.intent_status(key) is IntentStatus.READY:
+                    break
+                await asyncio.sleep(0.01)
+            assert eng.intent_status(key) is IntentStatus.READY
+            # 关键：在途表里已经没有它了（大字段随之释放）
+            assert key not in eng._records, "终态没从在途表移走，prefix 还挂着"
+            # 但回执仍可查
+            assert key in eng._finished
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_failed_detail_survives_in_finished() -> None:
+    """失败原因在终态之后仍可查（detail 是回执的全部价值）。"""
+
+    async def scenario():
+        eng = TaskEngine(FakeOps(exists=False))
+        eng.start()
+        try:
+            key = eng.submit_intent(_P, _T, poll_s=0.01)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if eng.intent_status(key) is IntentStatus.FAILED:
+                    break
+                await asyncio.sleep(0.01)
+            assert eng.intent_status(key) is IntentStatus.FAILED
+            detail = eng.intent_detail(key)
+            assert "PrefetchError" in detail, f"detail 丢了: {detail!r}"
+            assert "not fully in pool" in detail
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_pending_records_never_evicted() -> None:
+    """在途记录不会被终态环的容量限制挤掉。
+
+    `_records` 同时是去重表：PENDING 被淘汰，同键会再执行一次。终态环
+    再多也不该影响在途表。
+    """
+
+    async def scenario():
+        gate = threading.Event()
+        ops = FakeOps(query_gate=gate)
+        # 终态上限设成 1：跑满之后仍在途的那条必须还在
+        eng = TaskEngine(ops, max_concurrent=8, consumer_count=8, finished_max=1)
+        eng.start()
+        try:
+            stuck = eng.submit_intent(_P, _T, poll_s=0.01)
+            # 等它真的开始执行（卡在 query 上）
+            deadline = time.monotonic() + 3
+            while ops.copy_count == 0 and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert ops.copy_count >= 1
+            # 再提交一批别的键，把终态环塞满
+            for i in range(5):
+                eng.submit_intent(
+                    Prefix(model_id="other", token_ids=(i,)), _T, poll_s=0.01
+                )
+            await asyncio.sleep(0.2)
+            # 关键：在途那条仍在，且仍是 PENDING
+            assert stuck in eng._records, "在途记录被终态环挤掉了"
+            assert eng.intent_status(stuck) is IntentStatus.PENDING
+            assert len(eng._finished) <= 1
+            gate.set()
+        finally:
+            gate.set()
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_finished_ring_evicts_oldest() -> None:
+    """终态环满后淘汰最旧的，被淘汰的查不到（UNKNOWN）。"""
+
+    async def scenario():
+        eng = TaskEngine(FakeOps(seq=[TaskStatus.READY] * 10), finished_max=2)
+        eng.start()
+        try:
+            keys = []
+            for i in range(4):
+                k = eng.submit_intent(
+                    Prefix(model_id="m", token_ids=(i,)), _T, poll_s=0.01
+                )
+                keys.append(k)
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if eng.intent_status(k) is IntentStatus.READY:
+                        break
+                    await asyncio.sleep(0.01)
+            assert len(eng._finished) == 2, f"环没界: {len(eng._finished)}"
+            # 最早两个已被淘汰
+            assert eng.intent_status(keys[0]) is None
+            assert eng.intent_status(keys[1]) is None
+            # 最近两个还在
+            assert eng.intent_status(keys[2]) is IntentStatus.READY
+            assert eng.intent_status(keys[3]) is IntentStatus.READY
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_resubmit_same_key_after_terminal_restarts() -> None:
+    """终态后同键再提交 = 新意图（重新预热），旧回执被新一代覆盖。"""
+
+    async def scenario():
+        ops = FakeOps(seq=[TaskStatus.READY] * 2)
+        eng = TaskEngine(ops)
+        eng.start()
+        try:
+            k1 = eng.submit_intent(_P, _T, poll_s=0.01)
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if eng.intent_status(k1) is IntentStatus.READY:
+                    break
+                await asyncio.sleep(0.01)
+            assert ops.copy_count == 1
+            k2 = eng.submit_intent(_P, _T, poll_s=0.01)
+            assert k1 == k2  # 幂等键相同
+            # 提交后立刻是 PENDING（占位）
+            assert eng.intent_status(k2) is IntentStatus.PENDING
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if ops.copy_count == 2:
+                    break
+                await asyncio.sleep(0.01)
+            assert ops.copy_count == 2, "终态后同键提交没有重新执行"
+            # 环里只有一条（新代覆盖旧代）
+            assert len(eng._finished) == 1
+        finally:
+            await eng.shutdown(timeout_s=2)
 
     run(scenario())
 
@@ -531,11 +871,19 @@ def test_admit_shutdown_does_not_overwrite_existing() -> None:
         eng.start()
         key = eng.submit_intent(_P, _T, poll_s=0.01)
         assert await _wait_registered(eng, key)
+        # 等它真的入队（queued 由 _admit 置位）
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            rec = eng._records.get(key)
+            if rec is not None and rec.queued:
+                break
+            await asyncio.sleep(0.01)
         original = eng._records[key]
+        assert original.queued, "前提不成立：intent 还没入队"
         eng._accepting = False  # 模拟停收
         eng._admit(key, _P, _T, 0.01, 1.0)  # 迟到的 _admit
         assert eng._records[key] is original, "已有记录被覆盖了"
-        assert eng.intent_status(key) is IntentStatus.PENDING  # 仍在跑
+        assert eng.intent_status(key) is IntentStatus.PENDING  # 仍在跑，没被标失败
         gate.set()
         await eng.shutdown(timeout_s=2)
 

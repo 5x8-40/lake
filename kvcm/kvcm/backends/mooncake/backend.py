@@ -188,17 +188,20 @@ class MooncakeBackend(KvOps):
             ) from e
 
     async def _in_ledger(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-        """在 RPC executor 里调 Ledger（其内部会经自己的单线程池串行化）。
+        """在 Ledger 自己的单线程池里调 Ledger。
 
-        Ledger 的公共方法是「submit().result()」的同步阻塞形态——直接在
-        协程里调会卡住整个事件循环，所以同样要扔进线程池。
+        **不用 RPC 池**：Ledger 的公共方法是「submit().result()」的同步
+        阻塞形态，本来就要进线程；投到 Ledger 池只套一层。用 RPC 池还有
+        两个害处：占掉传输名额，以及退出时池已关（`abandon` 恰好在那个
+        窗口落账，会抛 `cannot schedule new futures after shutdown`，
+        账本留 `running`）。
         """
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            self._executor, functools.partial(fn, *args, **kwargs)
+            self._ledger.executor, functools.partial(fn, *args, **kwargs)
         )
 
-    def close(self, *, wait_timeout_s: float = 5.0) -> None:
+    def close(self, *, wait_timeout_s: float = 5.0) -> bool:
         """释放自建的 executor（外部注入的由调用方管）。
 
         `shutdown(wait=True)` 会等在途 RPC 结束，但它没有超时参数，卡死的
@@ -208,12 +211,11 @@ class MooncakeBackend(KvOps):
         `client.close()`，与还在 mooncake 绑定里的 RPC 并发（demo 实测的
         退出期崩溃正是这个形状）。
 
-        超时（返回 False）时调用方的责任：**立即 `os._exit(1)`**，不能只
-        跳过 close 然后返回——见 daemon 的退出说明（返回会触发
-        `~RealClient` 在在途 RPC 上 teardown）。
+        **返回值**：`True` = 线程全部结束；`False` = 还有调用停在绑定里（调用方
+        须立即 `os._exit(1)`，见 daemon 退出说明）。池是外部注入时无事可等。
         """
         if not self._owns_executor:
-            return
+            return True
 
         done = threading.Event()
 
@@ -224,7 +226,7 @@ class MooncakeBackend(KvOps):
                 done.set()
 
         threading.Thread(target=_shutdown, name="kvcm-rpc-drain", daemon=True).start()
-        done.wait(timeout=wait_timeout_s)
+        return done.wait(timeout=wait_timeout_s)
 
     # ------------------------------------------------------------------
     # copy（已落地）
@@ -254,9 +256,23 @@ class MooncakeBackend(KvOps):
                 task_ids.append(
                     await self._rpc(self._client.create_copy_task, key, [seg])
                 )
-        except Exception as e:
-            # 已发起的任务必须带在异常上——否则这些任务无句柄可查，
-            # 成为池里没人跟踪的在途传输。
+        except BaseException as e:
+            # CancelledError 不是 Exception 子类；已发出的任务号必须落账，
+            # 否则重启的 rebuild 捞不到这些在途传输。
+            if task_ids:
+                partial = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
+                self._plans[partial] = (
+                    prefix,
+                    target,
+                    plan[: len(task_ids)],
+                    uuid.uuid4().hex,
+                )
+                try:
+                    await asyncio.shield(self._record(partial, "running"))
+                except BaseException:
+                    pass  # 记账失败不再掩盖原始异常
+            if isinstance(e, asyncio.CancelledError):
+                raise
             raise SubmitError(
                 f"copy submit failed after {len(task_ids)}/{len(plan)} tasks "
                 f"(submitted ids: {task_ids}): {e}"

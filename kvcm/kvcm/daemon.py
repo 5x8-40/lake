@@ -143,6 +143,8 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
         #
         # 必须带超时：0.3.11 的绑定没有连接超时，master 不可达时可能挂很久。
         # 卡在这里时 `finally` 进不去（await 不返回），整个退出逻辑都不会跑。
+        # 退出信号只在启动期等一次，connect 与 rebuild 共用同一个任务。
+        stop_task = asyncio.ensure_future(stop.wait())
         try:
             # 等待 connect 的同时也监听退出信号：SIGTERM 打在 connect 期间时
             # 不该硬等满 connect_timeout_s（默认 30 秒）。
@@ -157,7 +159,6 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
                     ),
                 )
             )
-            stop_task = asyncio.ensure_future(stop.wait())
             done, _ = await asyncio.wait(
                 {connect_task, stop_task},
                 timeout=args.connect_timeout_s,
@@ -203,9 +204,42 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
         engine = TaskEngine(backend, keepalive=keepalive, max_concurrent=args.max_concurrent)
         # 2. 重启恢复：running 任务重建跟踪，收编进 TaskEngine
         #    （rebuild 内部有 Ledger 同步阻塞调用，同样走 executor）
-        restored = await loop.run_in_executor(backend.executor, backend.rebuild)
+        #    和 connect 一样带超时并监听信号：裸 await 会让 sqlite 卡住时
+        #    finally 进不去，退出逻辑整个不跑。
+        rebuild_task = asyncio.ensure_future(
+            loop.run_in_executor(executor, backend.rebuild)
+        )
+        done, _ = await asyncio.wait(
+            {rebuild_task, stop_task},
+            timeout=args.connect_timeout_s,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if stop_task in done:
+            print(
+                "[kvcm] startup: got shutdown signal during rebuild — "
+                "exiting immediately",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
+            _hard_exit()
+            return 1
+        if rebuild_task not in done:
+            print(
+                f"[kvcm] startup: rebuild did not return in "
+                f"{args.connect_timeout_s}s — exiting immediately",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
+            _hard_exit()
+            return 1
+        restored = rebuild_task.result()
         for handle in restored:
             engine.track_in_background(handle)
+        # 清一次超龄终态行（tasks 表只增不删）。放启动期：不加周期逻辑，
+        # 而 kvcm 是 daemon，重启是常态。
+        gone = await loop.run_in_executor(executor, ledger.gc_tasks)
+        if gone:
+            print(f"[kvcm] startup: gc removed {gone} stale task rows", file=sys.stderr)
         # 3. 常驻组件启动（协程）
         keepalive.start()
         engine.start()
@@ -279,8 +313,18 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
         # `backend.close()` 也放这里（不是硬退出分支）——今天对注入的池是
         # 空操作，但万一以后让它去碰 store，超时路径会在 os._exit 之前拆
         # client，正是要避免的形状。
-        if backend is not None:
-            backend.close()
+        # backend.close() 在硬退出分支之后：这里线程已排空，可以安全拆。
+        # 它返回 False 说明注入的池仍有调用在跑——按 same 规则硬退出，
+        # 不能继续 client.close()。
+        if backend is not None and not backend.close():
+            print(
+                "[kvcm] shutdown: injected pool still has in-flight RPC — "
+                "exiting immediately",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
+            _hard_exit()
+            return 1  # 走到这里说明 _hard_exit 被替换（测试），不能再拆 client
         client.close()
         ledger.close()
 

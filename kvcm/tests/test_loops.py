@@ -197,6 +197,67 @@ def test_sweep_exception_does_not_kill_loop() -> None:
     run(scenario())
 
 
+def test_sweep_failure_is_logged(capsys) -> None:
+    """续租失败必须留痕。
+
+    静默的后果：每轮都抛的故障（master 不可达）会让租约到期、副本提前变冷，
+    而外部看不到任何信号。原实现 `except Exception: continue` 什么都不留。
+    """
+
+    class ExplodingOps(FakeOps):
+        async def exists(self, prefix):
+            raise RuntimeError("backend gone")
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            loop = KeepaliveLoop(ExplodingOps(), led, interval_s=0.02, window_s=600)
+            loop.register(_P)
+            loop.start()
+            await asyncio.sleep(0.1)
+            await loop.stop()
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+    err = capsys.readouterr().err
+    assert "keepalive sweep failed" in err, f"失败没打日志: {err!r}"
+    assert "backend gone" in err, f"日志里没有根因: {err!r}"
+
+
+def test_exists_query_error_is_logged(capsys) -> None:
+    """`exists` 抛 QueryError（RPC 失败）同样要留痕，不能静默跳过。"""
+
+    class QueryFailingOps(FakeOps):
+        async def exists(self, prefix):
+            raise QueryError("rpc timeout")
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            loop = KeepaliveLoop(QueryFailingOps(), led, interval_s=0.02, window_s=600)
+            loop.register(_P)
+            loop.start()
+            await asyncio.sleep(0.1)
+            await loop.stop()
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+    err = capsys.readouterr().err
+    assert "keepalive exists failed" in err, f"QueryError 没打日志: {err!r}"
+
+
 def test_interval_and_window_must_be_positive() -> None:
     led, _ = _ledger()
     try:

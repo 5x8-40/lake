@@ -12,7 +12,9 @@ import threading
 import time
 
 from kvcm import daemon
+from kvcm.ledger import Ledger
 from kvcm.ops.base import OpKind, TaskHandle, TaskStatus
+from kvcm.ops.types import Prefix
 
 _H1 = TaskHandle(op=OpKind.COPY, task_ids=((1, 2),))
 
@@ -60,8 +62,9 @@ class FakeBackend:
     async def abandon(self, handle) -> None:
         self.abandoned.append(handle)
 
-    def close(self) -> None:
+    def close(self) -> bool:
         self.closed = True
+        return True
 
     @property
     def executor(self):
@@ -177,6 +180,94 @@ def test_startup_rebuild_loop_shutdown_sequence(monkeypatch, tmp_path) -> None:
     t.join(timeout=5)
     assert not t.is_alive()
     assert client.connected and client.closed
+
+
+def test_startup_gc_removes_stale_rows(monkeypatch, tmp_path) -> None:
+    """启动时清一次超龄终态行（tasks 表只增不删）。
+
+    不接线的话 gc_tasks 永远没人调，表在长跑进程里一直涨。
+    """
+    ledger_path = f"{tmp_path}/ledger.sqlite"
+    # 先塞一行「很久以前完成」的任务
+    pre = Ledger(ledger_path)
+    try:
+        pre.upsert_tasks(
+            ["old-task"],
+            handle_id="h-old",
+            op="copy",
+            prefix=Prefix(model_id="qwen", token_ids=(1,)),
+            target="inst-B",
+            status="ready",
+        )
+        # 把 updated_at 改成 30 天前（必须走 _run，连接只在它自己的线程上用）
+        def _age():
+            pre._conn.execute(
+                "UPDATE tasks SET updated_at = ? WHERE task_id = 'old-task'",
+                (time.time() - 30 * 24 * 3600,),
+            )
+            pre._conn.commit()
+
+        pre._run(_age)
+        assert pre.get_task("old-task") is not None
+    finally:
+        pre.close()
+
+    backend = FakeBackend()
+    client = FakeClient()
+    monkeypatch.setattr(daemon, "StoreClient", lambda: client)
+    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: backend)
+    monkeypatch.setattr(daemon, "KeepaliveLoop", FakeKeepalive)
+
+    t, stop = _run_daemon_in_thread(_args(tmp_path))
+    deadline = time.monotonic() + 5
+    while backend.rebuild_calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    # 等 GC 跑完（它排在 rebuild 之后）
+    post = Ledger(ledger_path)
+    try:
+        for _ in range(200):
+            if post.get_task("old-task") is None:
+                break
+            time.sleep(0.01)
+        assert post.get_task("old-task") is None, "超龄行没被清"
+    finally:
+        post.close()
+    stop()
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+
+def test_rebuild_hang_times_out(monkeypatch, tmp_path) -> None:
+    """rebuild 卡住时按 connect 同样的规则硬退出（不裸等）。
+
+    裸 await 会让 sqlite 卡死时 finally 进不去，退出逻辑整个不跑。
+    """
+    hang = threading.Event()
+
+    class HangingBackend(FakeBackend):
+        def rebuild(self):
+            self.rebuild_calls += 1
+            hang.wait(30)  # 卡住
+            return []
+
+    backend = HangingBackend()
+    client = FakeClient()
+    monkeypatch.setattr(daemon, "StoreClient", lambda: client)
+    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: backend)
+    monkeypatch.setattr(daemon, "KeepaliveLoop", FakeKeepalive)
+
+    exits: list[int] = []
+    monkeypatch.setattr(daemon, "_hard_exit", lambda: exits.append(1))
+
+    args = _args(tmp_path)
+    args.connect_timeout_s = 0.2  # 别等 30 秒
+    t, stop = _run_daemon_in_thread(args)
+    deadline = time.monotonic() + 5
+    while not exits and time.monotonic() < deadline:
+        time.sleep(0.01)
+    hang.set()
+    t.join(timeout=5)
+    assert exits == [1], f"rebuild 卡住没有硬退出: {exits}"
 
 
 def test_no_restored_tasks_still_clean_shutdown(monkeypatch, tmp_path) -> None:
@@ -463,6 +554,42 @@ def test_drain_timeout_hard_exits_without_close(monkeypatch, tmp_path) -> None:
     assert "client.close" not in events, f"超时后居然关了 client: {events}"
     assert "ledger.close" not in events, f"超时后居然关了 ledger: {events}"
 
+
+
+def test_injected_pool_busy_hard_exits_without_close(monkeypatch, tmp_path) -> None:
+    """注入池的 `close()` 报 False（还有调用在跑）：硬退出，且不调 client.close。
+
+    `_hard_exit()` 之后必须 `return`。生产路径 `os._exit` 不返回，但测试替身
+    会——少了 return 就会继续拆 client，与卡在绑定里的 RPC 并发。
+    """
+    events: list[str] = []
+    exits: list[int] = []
+
+    class FakeClient:
+        def connect(self, **kw) -> None: ...
+
+        def close(self) -> None:
+            events.append("client.close")
+
+    class BusyBackend(FakeBackend):
+        def close(self) -> bool:
+            events.append("backend.close")
+            return False  # 注入池仍有调用
+
+    backend = BusyBackend()
+    monkeypatch.setattr(daemon, "StoreClient", lambda: FakeClient())
+    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: backend)
+    monkeypatch.setattr(daemon, "KeepaliveLoop", FakeKeepalive)
+    monkeypatch.setattr(daemon, "_hard_exit", lambda: exits.append(1))
+
+    t, stop = _run_daemon_in_thread(_args(tmp_path))
+    deadline = time.monotonic() + 5
+    while backend.rebuild_calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    stop()
+    t.join(timeout=5)
+    assert exits == [1], f"没硬退出: {exits}"
+    assert "client.close" not in events, f"硬退出后还拆了 client: {events}"
 
 
 def test_connect_timeout_branch_hard_exits(monkeypatch, tmp_path) -> None:

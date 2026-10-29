@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 
@@ -178,8 +179,13 @@ class KeepaliveLoop:
                 await self.sweep_once()
             except asyncio.CancelledError:
                 raise
-            except Exception:
-                # 单轮失败不该杀掉整个循环（下一轮继续）；根因诊断归日志/监控
+            except Exception as e:
+                # 单轮失败不杀循环，但必须留痕：静默时租约会悄悄过期
+                print(
+                    f"[kvcm] keepalive sweep failed: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+                sys.stderr.flush()
                 continue
 
     # ------------------------------------------------------------------
@@ -198,9 +204,13 @@ class KeepaliveLoop:
                 continue
             try:
                 present = await self._ops.exists(rec.prefix)
-            except QueryError:
-                # 查询失败跳过本轮——lease TTL 内有多个周期容错；连续失败
-                # 说明后端/master 故障，归进程级监控，不在 Loop 内特判
+            except QueryError as e:
+                # 查询失败跳过本轮（lease TTL 内有多个周期容错），但要留痕
+                print(
+                    f"[kvcm] keepalive exists failed: {type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+                sys.stderr.flush()
                 continue
             if not present:
                 # 副本已不在池：续租没有对象，注销
