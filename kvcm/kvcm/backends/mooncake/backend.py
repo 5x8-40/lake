@@ -117,8 +117,8 @@ class MooncakeBackend(KvOps):
         self._cap = capability
         self._ledger = ledger
         self._submit_concurrency = submit_concurrency
-        # 进程级提交信号量：延迟创建（Semaphore 要绑事件循环，构造
-        # backend 时还没有 loop）。见 _submit_gate。
+        # 进程级提交信号量：延迟创建。`Semaphore()` 构造时不绑循环，首次
+        # 排队等名额才绑——放到首次使用，绑的就是真正用它那个循环。
         self._submit_sem: asyncio.Semaphore | None = None
         # 协程侧 RPC 超时（0.3.11 的绑定没有超时参数；main 有
         # MC_RPC_TIMEOUT_MS，届时可与此对齐）。<=0 表示不设超时。
@@ -248,11 +248,13 @@ class MooncakeBackend(KvOps):
         与传输闸（TaskEngine `max_concurrent`）的分工：传输闸限「同时在
         后端传输的任务数」，一个 copy 从头占到尾；本信号量只限「同时在飞
         的 create_copy_task」——它是**进程级**的，因为闸允许 4 个 copy
-        同时提交，每 copy 各限 4 就会变成 16 个并发建链。
+        同时提交，每 copy 各限 4 就会变成 16 个并发建链（0.3.11 实测
+        14 连发就打爆）。
 
-        延迟创建的原因：`asyncio.Semaphore` 在 3.10+ 会绑事件循环，而
-        backend 是在事件循环外构造的（daemon 先 connect 再进 run）。
-        首次调用发生在协程里，此后一直复用它——同一进程只有一个循环。
+        延迟创建：`Semaphore()` 构造时不绑循环，但**首次有人排队等名额**
+        时会 `_get_loop()`。把创建放到首次使用（协程里），保证绑定发生在
+        真正使用它的那个循环上。`_submit_gate` 本身不含 `await`，事件循环
+        线程上两次调用不会各建一把。
         """
         if self._submit_sem is None:
             self._submit_sem = asyncio.Semaphore(self._submit_concurrency)
