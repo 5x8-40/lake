@@ -133,6 +133,7 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
     )
     keepalive: KeepaliveLoop | None = None
     engine: TaskEngine | None = None
+    engine_shutdown_done = False
     backend: MooncakeBackend | None = None
     grpc_server: IntentGrpcServer | None = None
     try:
@@ -257,10 +258,19 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
             grpc_server.stop()
         # ② 取消在途协程 + ③ 有界等待（TaskEngine.shutdown 内部做）
         await engine.shutdown(timeout_s=args.shutdown_timeout_s)
+        engine_shutdown_done = True
         # ④ Loop 停（可能还有一轮 sweep 停在 exists 里）
         await keepalive.stop()
         return 0
     finally:
+        # ⑥ 兜底取消协程：正常路径已在上面 `engine.shutdown` 过（幂等，
+        #    列表已清空）。这条兜的是**启动中途失败**——`track_in_background`
+        #    在 `rebuild` 之后就起了恢复轮询，若之后 `gc_tasks`、`keepalive.start`
+        #    或 gRPC 绑定抛错，正常路径根本没走到，协程会一直挂着到
+        #    `asyncio.run` 收尾；那时 client 已经关了，`abandon` 会撞上去。
+        if engine is not None and not engine_shutdown_done:
+            await engine.shutdown(timeout_s=args.shutdown_timeout_s)
+            engine_shutdown_done = True
         # ⑤ 收尾顺序：**先等 RPC 线程结束，再关 client**（反了就会 close 与
         #    在途 RPC 并发——demo 踩过的退出期崩溃正是这个形状）。
         #

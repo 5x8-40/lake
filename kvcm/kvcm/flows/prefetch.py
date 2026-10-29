@@ -5,8 +5,8 @@
    复制无意义）
 2. copy 发起（返回任务句柄）
 3. query_task 轮询到 READY
-4. 保活注册与 READY 事件补发随后续接线（保活落地后注册；补发归接口
-   层 EventPublisher）
+4. 保活注册与 READY 事件补发归上层：保活由 `TaskEngine` 在本流程返回
+   后注册；补发归接口层 EventPublisher（未接通）
 
 失败分类（统一出口 = PrefetchError；编程错误除外，直接传播）：
 - 前置检查不过（前缀确实不在池）/ copy 提交失败（SubmitError，带

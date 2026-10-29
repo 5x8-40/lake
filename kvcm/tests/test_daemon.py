@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import threading
+
+import pytest
 import time
 
 from kvcm import daemon
@@ -554,6 +556,49 @@ def test_drain_timeout_hard_exits_without_close(monkeypatch, tmp_path) -> None:
     assert "client.close" not in events, f"超时后居然关了 client: {events}"
     assert "ledger.close" not in events, f"超时后居然关了 ledger: {events}"
 
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_startup_failure_still_cancels_recovery_tasks(monkeypatch, tmp_path) -> None:
+    """启动中途失败（rebuild 之后、正常退出路径之前）：恢复协程也要被取消。
+
+    `track_in_background` 在 rebuild 之后就把恢复轮询跑起来了。若之后
+    `gc_tasks`、`keepalive.start` 或 gRPC 绑定抛错，正常路径的
+    `engine.shutdown` 根本没走到——协程会挂到 `asyncio.run` 收尾，那时
+    client 已经关了，`abandon` 会投到已关闭的池上。
+    """
+    events: list[str] = []
+    shut: list[int] = []
+
+    class RecordingEngine(daemon.TaskEngine):
+        async def shutdown(self, *, timeout_s: float = 5.0) -> None:
+            shut.append(1)
+            events.append("engine.shutdown")
+            await super().shutdown(timeout_s=timeout_s)
+
+    backend = FakeBackend(restored=[_H1])
+    client = FakeClient(events)
+    monkeypatch.setattr(daemon, "TaskEngine", RecordingEngine)
+    monkeypatch.setattr(daemon, "StoreClient", lambda: client)
+    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: backend)
+
+    # 让 keepalive.start() 抛错：这在 rebuild 之后、正常退出路径之前，
+    # 且抛在协程里（不是 executor 线程），daemon 会进 finally。
+    class BoomKeepalive(FakeKeepalive):
+        def start(self) -> None:
+            raise RuntimeError("keepalive boom")
+
+    monkeypatch.setattr(daemon, "KeepaliveLoop", lambda *a, **kw: BoomKeepalive())
+
+    t, stop = _run_daemon_in_thread(_args(tmp_path))
+    t.join(timeout=5)
+    assert not t.is_alive()
+    # 关键：失败路径也调了 engine.shutdown，且发生在 client.close 之前
+    assert shut, "启动失败时恢复协程没被取消"
+    assert "client.close" in events
+    assert events.index("engine.shutdown") < events.index("client.close"), (
+        f"shutdown 晚于 client.close: {events}"
+    )
 
 
 def test_connect_timeout_branch_hard_exits(monkeypatch, tmp_path) -> None:

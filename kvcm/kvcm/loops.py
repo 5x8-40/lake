@@ -134,6 +134,14 @@ class KeepaliveLoop:
 
     def _note_failure(self, exc: BaseException | None = None) -> None:
         self._register_failures += 1
+        if exc is not None:
+            # 登记写入失败：这条前缀**没有**保活行，副本会按租约自然变冷。
+            # 不打印的话外部看不到任何信号（`register_failures` 没有读者）。
+            print(
+                f"[kvcm] keepalive register failed: {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            sys.stderr.flush()
 
     async def _ledger_call(self, fn, *args):
         loop = asyncio.get_running_loop()

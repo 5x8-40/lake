@@ -162,8 +162,9 @@ class MooncakeBackend(KvOps):
         结果——等待期间不占事件循环。
 
         超时只放弃等待，**不中断线程**（Python 无法中断 C++ 调用）：线程
-        会继续跑到自然结束。所以超时后仍占着一个 RPC 线程，退出时由
-        `close()` 的有界等待兜底（见那里的说明）。
+        会继续跑到自然结束。所以超时后仍占着一个 RPC 线程——退出时等它的
+        是 daemon 的 `_wait_executor`（池由 daemon 建并注入，`close()` 对
+        注入池无事可等）。
         """
         loop = asyncio.get_running_loop()
 

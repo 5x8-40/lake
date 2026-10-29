@@ -106,9 +106,11 @@ class TaskEngine:
         max_concurrent：**传输闸名额数**（同时在后端传输的任务数，保护
         mooncake 与带宽），不是线程数。
         limiter：限速器钩子（E15 接入点）；False 时等待后重试。
-        queue_size：队列容量；0 = 不限（排队是协程挂起，不占资源；限容量
-        是给入口做背压用的——满了 `submit_intent` 会阻塞 gRPC 线程，这
-        正是想要的背压效果）。
+        queue_size：队列容量；0 = 不限（排队是协程挂起，不占资源）。限容量
+        时满了**不阻塞**——`_admit` 用 `put_nowait`，`QueueFull` 直接把这条
+        intent 记成 FAILED（`rejected (queue full)`）；调用方已经拿到 id，
+        状态经 `GetTask` 查。若要做入口背压，应由 gateway 侧限并发，不在
+        这里阻塞 gRPC 线程。
         consumer_count：消费者协程数，默认 `max(16, max_concurrent × 4)`
         ——**必须远大于名额数**：消费者出队后先在闸外做存在性检查，再去
         等名额。若等于名额数，第 N+1 个请求连队列都出不来，它的检查会被

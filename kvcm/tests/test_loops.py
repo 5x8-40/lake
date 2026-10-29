@@ -369,6 +369,43 @@ def test_register_does_not_raise_when_loop_closed() -> None:
             os.unlink(path)
 
 
+def test_register_failure_is_logged(capsys) -> None:
+    """Ledger 写入失败：打日志。
+
+    `register_failures` 这个计数没有读者；不打日志的话外部看不到任何信号，
+    而这条前缀**没有**保活行，副本会按租约自然变冷。
+    """
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            class BrokenLedger(type(led)):
+                def register_keepalive(self, prefix):
+                    raise RuntimeError("db gone")
+
+            broken = BrokenLedger.__new__(BrokenLedger)
+            broken.__dict__.update(led.__dict__)
+            loop = KeepaliveLoop(FakeOps(), broken, interval_s=999, window_s=600)
+            loop.start()
+            loop.register(_P)
+            for _ in range(100):
+                if loop.register_failures > 0:
+                    break
+                await asyncio.sleep(0.01)
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+    err = capsys.readouterr().err
+    assert "keepalive register failed" in err, f"没打日志: {err!r}"
+    assert "db gone" in err, f"日志没根因: {err!r}"
+
+
 def test_register_failure_is_counted_not_raised() -> None:
     """Ledger 写入失败：计数 +1，不抛给调用方。"""
 
