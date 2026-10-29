@@ -10,7 +10,8 @@
 
 ```text
 L1 接口层     IntentReceiver / EventPublisher / InstanceWatcher      kvcm/api/
-              进程对外通道；不含任何存储概念（空骨架，协议随 D4/E12/E13）
+              进程对外通道；不含任何存储概念（IntentReceiver 已实现 gRPC；
+              EventPublisher 空骨架，协议随 E14；InstanceWatcher 随 E13）
 L2 编排层     PrefetchFlow 已实现；SessionEnd/Drain/Retain 未实现    kvcm/flows/
               只调 L3 接口；代码里不出现 seg / lease / client_id / PoolKey / rank
 L3 原子操作层 KvOps：八操作 + query_task / exists / abandon          kvcm/ops/
@@ -24,7 +25,7 @@ L5 状态层     Ledger（sqlite，四类状态记录）                        
 
 ### 运行时数据流
 
-谁把什么交给谁。实线是已接通的调用，虚线是设计要走、进程里还没接通的边（E11/E12/E13）。
+谁把什么交给谁。实线是已接通的调用，虚线是设计要走、进程里还没接通的边（E13/E14）。
 
 ```mermaid
 flowchart TB
@@ -141,7 +142,7 @@ flowchart LR
 
 | 模块 | 职责 | 出处 |
 |------|------|------|
-| IntentReceiver | 收 Router 预热 intent / 会话结束线索（E12；先占位，协议字段随 D4）。占位形态：进程内函数调用 + 最小 HTTP 端点 `POST /prefetch {model_id, token_ids, target}`（stdlib `http.server` 经线程池执行，量上来换 aiohttp；响应同步等 READY 返回，可选 `?wait=0` 立即返回任务标识）——只调 TaskEngine 公开方法（`queue.put`），E12 正式协议来了只换这层皮 | D1 §4 职责边界 |
+| IntentReceiver | 收 Router 预热 intent（E12 已实现）。**协议**：gRPC `KvcmIntent.SubmitIntent { prefix{model_id, token_ids}, target }`，入队后立即返回 `intent_id`；执行状态由调用方 `GetTask(intent_id)` 查（PENDING / READY / FAILED / UNKNOWN）。intent ≠ command：kvcm 按池现状决定做不做、何时做，调用方不得假设执行时机。servicer 只调 `TaskEngine` 公开方法，不含存储概念 | D1 §4 职责边界、`proto/kvcm_intent.proto` |
 | EventPublisher | READY 后按目标实例端点补发 `BlockStored`；端点生命周期（每实例一端点、注册给索引） | D1 §2 方案 a、E14 |
 | InstanceWatcher | 实例上线/销毁接入 → 触发预热 / seg 副本处理；「端点→实例」「seg→实例」注册的权威来源（E13；先占位，事件源随 D4） | D1 §3、E13 |
 
@@ -153,7 +154,7 @@ flowchart LR
 
 | 流程 | 编排 | 状态 |
 |------|------|------|
-| PrefetchFlow | exists 前置检查 → copy → query_task 轮询到 READY（keepalive 注册与 READY 补发待接通） | 已实现（`flows/prefetch.py`） |
+| PrefetchFlow | exists 前置检查 → copy → query_task 轮询到 READY（keepalive 注册已接通，由 `TaskEngine` 在 flow 返回后做；READY 补发 `BlockStored` 待 E14） | 已实现（`flows/prefetch.py`） |
 | SessionEndFlow | 停 keepalive + demote | 未实现（D1 §6） |
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
 | RetainFlow | retain（主路径 = retained client 注册；0.3.11 过渡 = move 到存活节点的 seg） | 未实现（D2 §4） |
@@ -446,9 +447,9 @@ sequenceDiagram
     participant Ex as RPC 线程池
     participant M as mooncake master
 
-    R->>Recv: POST /prefetch
-    Recv->>Q: put 后立即返回
-    Note over W: 目标形态（E11）；当前实现为同步 run()、串行提交<br/>协程在「等队列、等传输闸、等 sleep」期间全部挂起，不占线程<br/>对 Router 的响应在 READY 后返回（占位期同步等）
+    R->>Recv: SubmitIntent(prefix, target)
+    Recv->>Q: submit_intent 入队后立即返回 intent_id
+    Note over W: 协程在「等队列、等传输闸、等 sleep」期间全部挂起，不占线程<br/>Router 拿到 intent_id 即返回，不等 READY（回执走 GetTask）
     W->>Q: get 拿到任务
     W->>Ex: to_thread exists（不过闸）
     Ex->>M: RPC batch_is_exist
@@ -513,9 +514,9 @@ sequenceDiagram
 
 - **启动**：`rebuild()` 接通——重启后恢复 running 任务的跟踪（见 L5 节）
 - **优雅退出**（SIGTERM/SIGINT）五步：
-  1. **停收 intent**——占位入口关闭，不接新活
+  1. **停收 intent**——gRPC 入口关闭（`IntentGrpcServer.stop()`），`TaskEngine._accepting` 置假，`SubmitIntent` 返回 UNAVAILABLE
   2. **取消在途协程**（`task.cancel()`）——协程在 `await` 点收到 `CancelledError`；flow 捕获后做 abandon 处理（Ledger 记 abandoned；后端无任务取消能力 P9，传输不取消，副本清理归 remove）
-  3. **等在途协程全部退出**——有界等待 5 秒（RPC 毫秒级 + abandon 记账毫秒级，余量充足）；**等满还有协程未退则不再等**，直接走后续步骤（未退的协程随进程消失——这与 RPC **线程**不同，见第 5 步）
+  3. **等在途协程全部退出**——有界等待 5 秒（RPC 毫秒级 + abandon 记账毫秒级，余量充足）；**等满还有协程未退则不再等**，直接走后续步骤。未退的协程**不是**「随进程消失」：`run_in_executor` 的取消立刻生效（返回 `asyncio.Future`，不等线程函数结束），真正堵住它的是第 5 步那次同步 `Event.wait`——事件循环线程被它占住，被取消的协程在这段时间里一个都跑不了
   4. **KeepaliveLoop 停止**
   5. **等 RPC 线程结束，再 `StoreClient.close()`**——顺序不能反：`run_in_executor` 取消不等线程函数结束，先关 client 会与在途 RPC 并发（demo 实测的退出期崩溃正是这个形状）。等待有界（`shutdown_timeout_s`，默认 5 秒）。
 
@@ -543,9 +544,9 @@ sequenceDiagram
 
 - **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，73 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
 - **E11（进程化）**：设计 = 本文「运行时结构」节。**范围切分**：
-  - 本期做：进程壳（启动/退出/rebuild 接通）+ TaskEngine + KeepaliveLoop（唯一常驻循环）+ IntentReceiver 占位
+  - 本期做：进程壳（启动/退出/rebuild 接通）+ TaskEngine + KeepaliveLoop（唯一常驻循环）+ IntentReceiver（gRPC，E12）
   - 只留类骨架：ReleaseLoop、RetainLoop（依赖的操作全是 NotImplementedError，能力接通前无内容可跑）
-  - 不做：限速器（E15）、重发策略（随 E12）、多模型归属判定（多模型接入前置，已登记）、E12/E13/E14 协议
+  - 不做：限速器（E15）、重发策略、多模型归属判定（多模型接入前置，已登记）、E13/E14 协议
 - **E11 阶段计划**：
   1. 进程壳 + 状态恢复：Ledger 单线程 executor → 启动时 `rebuild()` 接通 → KeepaliveLoop（固定窗口，协程定时器）→ 优雅退出（协程取消 + abandon 处理）
   2. TaskEngine + flow/ops async 化：intent 占位入口 → `asyncio.Queue` + 传输闸（默认 4）→ 协程消费者直接调 async flow；KvOps 全方法 async 化 → 终态记账 → 超时处理（复用现有 abandon）
