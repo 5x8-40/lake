@@ -58,10 +58,17 @@ class IntentGrpcServer:
     """gRPC 服务包装：start/stop 生命周期归进程壳。"""
 
     def __init__(self, addr: tuple[str, int], engine: TaskEngine) -> None:
-        self._server = grpc.server(futures.ThreadPoolExecutor(max_workers=4))
+        # 池由本类持有并负责关闭：`grpc.server()` 收到外部池只借用，
+        # `stop()` 不会关它。池线程是非 daemon，`stop()` 之后仍会存活
+        # （实测 4 个 `grpc-worker_*`），占着直到进程退出。
+        self._pool = futures.ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="kvcm-grpc"
+        )
+        self._server = grpc.server(self._pool)
         pb_grpc.add_KvcmIntentServicer_to_server(KvcmIntentServicer(engine), self._server)
         self._port = self._server.add_insecure_port(f"{addr[0]}:{addr[1]}")
         if self._port == 0:
+            self._pool.shutdown(wait=False)
             raise RuntimeError(f"gRPC 端口绑定失败：{addr[0]}:{addr[1]}")
 
     @property
@@ -80,3 +87,6 @@ class IntentGrpcServer:
         在途任务收口归 engine.shutdown，不在本层等）。"""
         self._server.stop(grace_s)
         self._server.wait_for_termination(timeout=grace_s + 1)
+        # 池是本类建的，必须自己关：grpc 只借用外部传入的 executor，
+        # `stop()` 不碰它。不关的话这几个非 daemon 线程会活到进程退出。
+        self._pool.shutdown(wait=False)

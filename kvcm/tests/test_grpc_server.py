@@ -145,6 +145,38 @@ def test_failed_status_and_detail(rpc) -> None:
     assert "PrefetchError" in detail  # 失败必须带原因
 
 
+def test_stop_closes_worker_pool() -> None:
+    """`stop()` 要关掉自己的 worker 池。
+
+    `grpc.server()` 收到外部传入的 executor 只借用，`stop()` 不关它。实测：
+    不关的话 4 个 `grpc-worker_*` 是非 daemon 线程，会活到进程退出。
+    """
+    import threading
+
+    eng = TaskEngine(FakeOps())
+    before = {t.name for t in threading.enumerate()}
+    server = IntentGrpcServer(("127.0.0.1", 0), eng)
+    server.start()
+    # 逼池创建线程：直接投任务进去
+    futs = [server._pool.submit(time.sleep, 0.02) for _ in range(4)]
+    for f in futs:
+        f.result()
+    time.sleep(0.05)
+    spawned = {t.name for t in threading.enumerate()} - before
+    assert any(n.startswith("kvcm-grpc") for n in spawned), (
+        f"池没创建线程: {spawned}"
+    )
+
+    server.stop()
+    time.sleep(0.2)
+    leaked = {
+        t.name
+        for t in threading.enumerate()
+        if t.name.startswith("kvcm-grpc") and t.is_alive()
+    }
+    assert not leaked, f"stop 后 worker 线程还活着: {leaked}"
+
+
 def test_unknown_intent_id(rpc) -> None:
     start, holder = rpc
     stub = start(FakeOps())

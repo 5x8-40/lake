@@ -78,6 +78,19 @@ class FakeBackend:
         return self._exec
 
 
+class FakeLedgerCloser:
+    """只记 close 调用的 Ledger 替身。"""
+
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+
+    def close(self) -> None:
+        self._events.append("ledger.close")
+
+    def gc_tasks(self, **kw) -> int:
+        return 0
+
+
 class FakeKeepalive:
     def __init__(self, *a, **kw) -> None:
         self.started = False
@@ -615,6 +628,82 @@ def test_startup_failure_still_cancels_recovery_tasks(monkeypatch, tmp_path) -> 
     assert "client.close" in events
     assert events.index("engine.shutdown") < events.index("client.close"), (
         f"shutdown 晚于 client.close: {events}"
+    )
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_connect_plain_error_closes_cleanly(monkeypatch, tmp_path, capsys) -> None:
+    """connect 抛普通异常（不是超时）：不硬退出，走 finally 正常收尾。
+
+    与超时分支的区别：线程已经返回，没有卡住的调用，可以安全 close。
+    若误把它当超时处理（硬退出），会白杀进程、且跳过 client.close。
+    """
+    events: list[str] = []
+
+    class BoomClient:
+        def connect(self, **kw) -> None:
+            raise RuntimeError("handshake rejected")
+
+        def close(self) -> None:
+            events.append("client.close")
+
+    monkeypatch.setattr(daemon, "StoreClient", BoomClient)
+    monkeypatch.setattr(daemon, "Ledger", lambda path: FakeLedgerCloser(events))
+    exits: list[int] = []
+    monkeypatch.setattr(daemon, "_hard_exit", lambda: exits.append(1))
+
+    t, stop = _run_daemon_in_thread(_args(tmp_path))
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert not exits, f"普通异常不该硬退出: {exits}"
+    assert "client.close" in events, f"没正常收尾: {events}"
+    err = capsys.readouterr().err
+    assert "connect failed" in err, f"没打日志: {err!r}"
+    assert "handshake rejected" in err, f"日志没根因: {err!r}"
+
+
+def test_shutdown_signal_interrupts_rebuild_wait(monkeypatch, tmp_path, capsys) -> None:
+    """SIGTERM 打在 rebuild 等待期间：立即退出，不等满 connect_timeout_s。
+
+    与 connect 上的信号测试同理——超时分支也会硬退出、也很快，只看「退出快」
+    分不出来。靠 stderr 文案区分。
+    """
+    hang = threading.Event()
+    hard_exits: list[float] = []
+    t0 = time.monotonic()
+
+    class HangingBackend(FakeBackend):
+        def rebuild(self):
+            self.rebuild_calls += 1
+            hang.wait(30)
+            return []
+
+    backend = HangingBackend()
+    monkeypatch.setattr(daemon, "StoreClient", lambda: FakeClient())
+    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: backend)
+    monkeypatch.setattr(daemon, "KeepaliveLoop", FakeKeepalive)
+    monkeypatch.setattr(
+        daemon, "_hard_exit", lambda: hard_exits.append(time.monotonic() - t0)
+    )
+
+    args = _args(tmp_path)
+    args.connect_timeout_s = 30.0  # 很长——靠信号打断，不该等满
+    t, stop = _run_daemon_in_thread(args)
+    deadline = time.monotonic() + 5
+    while backend.rebuild_calls == 0 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert backend.rebuild_calls == 1, "rebuild 没开始，前提不成立"
+    stop()  # 模拟 SIGTERM
+    deadline = time.monotonic() + 5
+    while not hard_exits and time.monotonic() < deadline:
+        time.sleep(0.01)
+    hang.set()
+    t.join(timeout=5)
+    assert hard_exits, "信号没打断 rebuild 等待"
+    assert hard_exits[0] < 5.0, f"等了 {hard_exits[0]:.1f}s 才退"
+    err = capsys.readouterr().err
+    assert "got shutdown signal during rebuild" in err, (
+        f"走的是超时分支而不是信号分支: {err!r}"
     )
 
 
