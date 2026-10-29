@@ -100,10 +100,14 @@ class MooncakeBackend(KvOps):
             按 RPC 执行密度自建（4~8，E11 定稿）——**不用
             asyncio.to_thread 默认池**（大小不可控）。Ledger 自己有专用
             单线程池，与本池分开。
-        submit_concurrency：单次 copy 内同时在飞的 create_copy_task 上限
-            （`asyncio.Semaphore` + `gather`）。连发无上限会在目标侧形成
-            建链风暴（0.3.11 ascend 实测：14 连发约半数 TRANSFER_FAIL；
-            窗口 4 节奏化 42/42 全成）。链路利用率限速器仍归 E15。
+        submit_concurrency：**整个 backend 内**同时在飞的 create_copy_task
+            上限（`asyncio.Semaphore`，所有 copy 共用一把）。它不是「单次
+            copy 的窗口」——传输闸（TaskEngine `max_concurrent`，默认 4）
+            允许 4 个 copy 同时跑，若每个 copy 各持一把默认 4 的窗口，在飞
+            建链就是 4×4=16，正好超过 0.3.11 实测打爆的量（ascend 上 14
+            连发约半数 TRANSFER_FAIL；窗口 4 节奏化 42/42 全成）。所以上限
+            必须是**进程级**的，与有几个 copy 在跑无关。链路利用率限速器
+            仍归 E15。
         """
         if submit_concurrency <= 0:
             raise ValueError("submit_concurrency must be positive")
@@ -113,6 +117,9 @@ class MooncakeBackend(KvOps):
         self._cap = capability
         self._ledger = ledger
         self._submit_concurrency = submit_concurrency
+        # 进程级提交信号量：延迟创建（Semaphore 要绑事件循环，构造
+        # backend 时还没有 loop）。见 _submit_gate。
+        self._submit_sem: asyncio.Semaphore | None = None
         # 协程侧 RPC 超时（0.3.11 的绑定没有超时参数；main 有
         # MC_RPC_TIMEOUT_MS，届时可与此对齐）。<=0 表示不设超时。
         self._rpc_timeout_s = rpc_timeout_s
@@ -235,6 +242,22 @@ class MooncakeBackend(KvOps):
     # copy（已落地）
     # ------------------------------------------------------------------
 
+    def _submit_gate(self) -> asyncio.Semaphore:
+        """进程级提交信号量（所有 copy 共用）。
+
+        与传输闸（TaskEngine `max_concurrent`）的分工：传输闸限「同时在
+        后端传输的任务数」，一个 copy 从头占到尾；本信号量只限「同时在飞
+        的 create_copy_task」——它是**进程级**的，因为闸允许 4 个 copy
+        同时提交，每 copy 各限 4 就会变成 16 个并发建链。
+
+        延迟创建的原因：`asyncio.Semaphore` 在 3.10+ 会绑事件循环，而
+        backend 是在事件循环外构造的（daemon 先 connect 再进 run）。
+        首次调用发生在协程里，此后一直复用它——同一进程只有一个循环。
+        """
+        if self._submit_sem is None:
+            self._submit_sem = asyncio.Semaphore(self._submit_concurrency)
+        return self._submit_sem
+
     async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机 seg 为前缀 KV 建副本（发起式；READY 经 query_task）。
 
@@ -251,7 +274,8 @@ class MooncakeBackend(KvOps):
         plan = self._keys.build_plan(keys, targets)
         # 下标槽：并发完成顺序不定，按 plan 下标落号，失败时筛出已发出的。
         slots: list[object | None] = [None] * len(plan)
-        sem = asyncio.Semaphore(self._submit_concurrency)
+        # 进程级信号量（所有 copy 共用），不是本次 copy 独有的窗口。
+        sem = self._submit_gate()
         stop = asyncio.Event()
 
         async def _submit_one(i: int, key: str, seg: str) -> None:
@@ -273,14 +297,13 @@ class MooncakeBackend(KvOps):
             # CancelledError 不是 Exception 子类；已发出的任务号必须落账，
             # 否则重启的 rebuild 捞不到这些在途传输。
             stop.set()
-            # 排空：排队的子任务见到 `stop` 直接返回，不再发起；已经在
-            # `_rpc` 里的会跑完并写槽。
-            #
-            # **这次排空自己也可能被取消**：`gather` 被取消时会把还没结束的
-            # 子任务一起取消——它们的号（上限 `submit_concurrency`）就此丢掉，
-            # 只有已经写进 `slots` 的能落账（口径见 design/code-architecture.md
-            # 「E11 已知遗留」）。这里不 shield 子任务：那会把最长
-            # `rpc_timeout_s`（30 秒）的等待带进退出路径。
+            # 排空：排队的子任务见到 `stop` 直接返回，不再发起。
+            # 排空若跑完，已经在 `_rpc` 里的会写槽；排空**自己**被取消时，
+            # `gather` 会把没结束的子任务一起取消，它们的号（这一次还在
+            # `await _rpc` 的那些）就此丢掉——只有已经写进 `slots` 的能落账
+            # （口径见 design/code-architecture.md「E11 已知遗留」）。
+            # 这里不 shield 子任务：那会把最长 `rpc_timeout_s`（30 秒）的
+            # 等待带进退出路径。
             #
             # 要保证的是**记账不被跳过**：先有 key 失败 → 进到这里等其余
             # 在飞调用 → 退出信号到达。若让 CancelledError 直接冒出，读槽和
@@ -303,7 +326,8 @@ class MooncakeBackend(KvOps):
                 try:
                     # 记账必须完成：已发出的号不落账 = 重启后没人跟踪。
                     # 若这次 shield 也被取消（第二次取消），记账会中断——
-                    # 那是「取消两次」的极端场景，接受丢账（见设计文档）。
+                    # 那是「取消两次」的极端场景，接受丢账（登记在
+                    # code-architecture.md「E11 已知遗留」）。
                     await asyncio.shield(self._record(partial, "running"))
                 except asyncio.CancelledError:
                     raise

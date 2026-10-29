@@ -416,7 +416,7 @@ def main(argv: list[str] | None = None) -> int:
         "--copy-submit-concurrency",
         type=int,
         default=4,
-        help="单次 copy 内并发的 create_copy_task 上限（0.3.11 实测窗口 4 全成）",
+        help="进程内同时在飞的 create_copy_task 上限（所有 copy 共用；0.3.11 实测窗口 4 全成）",
     )
     p.add_argument(
         "--rpc-timeout-s",

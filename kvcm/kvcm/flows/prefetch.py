@@ -59,8 +59,9 @@ class PrefetchFlow:
     ) -> None:
         """执行到 READY；失败抛 PrefetchError（协程：等待期间不占线程）。
 
-        timeout_s 从 exists 通过起算、覆盖 copy 提交——大前缀逐 key 串行
-        提交本身可达几十秒，不计入则超时预算失真。
+        timeout_s 从 exists 通过起算、覆盖 copy 提交——大前缀的提交本身
+        可达几十秒（并发窗口已把这段从 N 倍往返压到约 N÷并发度 倍），
+        不计入则超时预算失真。
 
         handle_sink：可选回调，copy 提交成功即带上句柄调用一次。**退出
         收口不靠它**——取消（`CancelledError`）由 `run_after_exists` 自

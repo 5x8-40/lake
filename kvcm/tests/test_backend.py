@@ -14,6 +14,7 @@ import tempfile
 import threading
 import time
 import types
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -324,6 +325,108 @@ def test_cancel_during_drain_after_submit_failure_still_records(
         os.unlink(path)
 
 
+def test_submit_cap_is_process_wide_across_concurrent_copies(
+    fake_store_module, monkeypatch
+) -> None:
+    """上限是**进程级**的：两个 copy 同时跑，在飞总数仍不超过上限。
+
+    为什么必须锁这条：传输闸（TaskEngine `max_concurrent`，默认 4）允许
+    4 个 copy 同时提交。若每个 copy 各持一把默认 4 的窗口，在飞建链就是
+    4×4=16——正好踩过 0.3.11 实测打爆建链的点（14 连发约半数
+    TRANSFER_FAIL）。信号量必须是所有 copy 共用的一把。
+
+    用 8 线程的池：默认池在小机器上只有 4 个 worker，会把峰值挡在 4，
+    实现改回「每 copy 一把」也照样绿（假通过）。
+    """
+    inflight = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class SlowClient(FakeClient):
+        def create_copy_task(self, key, targets):
+            nonlocal inflight, peak
+            with lock:
+                inflight += 1
+                peak = max(peak, inflight)
+            try:
+                time.sleep(0.1)  # 占住，制造重叠
+                return super().create_copy_task(key, targets)
+            finally:
+                with lock:
+                    inflight -= 1
+
+    client = SlowClient()
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(
+        kc,
+        "keys_for_tokens",
+        lambda ids: kc.expand(["h0", "h1", "h2", "h3"]),
+    )
+    pool = ThreadPoolExecutor(max_workers=8)  # 默认池只有 4 线程，会挡住峰值
+    try:
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A"],
+            capability=mooncake_v0311(),
+            submit_concurrency=4,
+            executor=pool,
+        )
+
+        async def scenario():
+            # 两个 copy 同时跑：每个 4 key，合计 8 个提交
+            await asyncio.gather(
+                b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")),
+                b.copy(Prefix(model_id="qwen", token_ids=(2,)), InstanceId("inst-B")),
+            )
+
+        run(scenario())
+        assert peak == 4, (
+            f"跨 copy 的在飞数没被进程级信号量压住: peak={peak}（应为 4）"
+        )
+    finally:
+        pool.shutdown(wait=True)
+
+
+def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
+    """`--copy-submit-concurrency` 真的传到 backend。
+
+    不锁的话，`build_backend` 里少写一行参数，单测全绿（默认值恰好是 4），
+    生产里调参就是空转。
+    """
+    from kvcm import daemon
+    import argparse
+
+    seen: dict = {}
+
+    def fake_backend(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(daemon, "MooncakeBackend", fake_backend)
+    monkeypatch.setattr(
+        daemon,
+        "KeyComputer",
+        lambda **kw: object(),
+    )
+    args = argparse.Namespace(
+        model_name="qwen",
+        block_size=128,
+        tp_size=1,
+        peer_tp_size=None,
+        put_step=1,
+        hash_algo="sha256",
+        segs="seg-A",
+        capability="v0311",
+        rpc_timeout_s=30.0,
+        copy_submit_concurrency=7,  # 非默认值，才能证明真的传了
+    )
+    daemon.build_backend(args, client=object(), ledger=object())
+    assert seen["submit_concurrency"] == 7, (
+        f"--copy-submit-concurrency 没传下去: {seen.get('submit_concurrency')}"
+    )
+
+
 def test_copy_submits_concurrently_up_to_cap(fake_store_module, monkeypatch) -> None:
     """一次 copy 内多 key 并发提交，但在飞数不超过 `submit_concurrency`。
 
@@ -499,12 +602,19 @@ def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> N
 
     class BoomClient(FakeClient):
         def create_copy_task(self, key, targets):
-            if len(self.created) >= 1:
+            with self._id_lock:
+                already = len(self.created)
+            if already >= 1:
                 raise RuntimeError("submit boom")
             return super().create_copy_task(key, targets)
 
     client = BoomClient()
-    b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
+    b = _backend(
+        client,
+        KeyComputer(model_name="qwen", tp_size=2),
+        monkeypatch,
+        submit_concurrency=1,  # 逐 key：第 2 个必失败，不靠撞时序
+    )
     with pytest.raises(SubmitError, match=r"1/2 tasks.*\[\(1, 101\)\]"):
         run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
 
