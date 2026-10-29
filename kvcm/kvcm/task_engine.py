@@ -119,7 +119,9 @@ class TaskEngine:
         在途传输堵住。
         finished_max：终态回执保留条数。`_records` 只存在途；进终态后
         换成瘦记录（只剩 intent_id / status / detail）放进定长环，超出
-        按插入顺序丢最旧的。默认 25600 ≈ 16 MB（一条约 650 B）。
+        按插入顺序丢最旧的。默认 25600 ≈ 16 MB 量级（空 detail 单条约
+        650 B）——**不是内存上限**：失败路径的 detail 截到 500 字后单条
+        约 1 KB，环实际可以明显大于 16 MB。
         """
         if max_concurrent <= 0:
             raise ValueError("max_concurrent must be positive")

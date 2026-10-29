@@ -428,7 +428,7 @@ flowchart TD
 
 - **KvOps 接口 async 化**：`async def exists / copy / query_task / abandon / ……`——等待的源头（轮询 `sleep`、RPC 阻塞）全在 ops 实现内部，只有这一层 async 才能让等待挂起；只在 flow 外层包 async，省不到这些等待
 - **阻塞调用走 executor**：mooncake 同步 RPC、sqlite 读写等，经 `asyncio.to_thread` 交给线程池执行。mooncake 绑定等 RPC 时释放 GIL，executor 内多个 RPC 能真并行
-- **线程池与任务数解耦**：executor 大小按 RPC 执行密度配（4~8），不随传输闸的名额数变。一个 copy 任务 30 秒里 RPC 执行合计约 1 秒，其余是 `await` 挂起——协程化后 100 个任务挂着也只占这几个线程
+- **线程池与任务数解耦**：executor 大小按 RPC 执行密度配（4~8），不随传输闸的名额数变。一个 copy 任务的生命周期以十秒计，其中 RPC 真正在执行的时间只占很小一部分，其余是 `await` 挂起——协程化后 100 个任务挂着也只占这几个线程
 - **backend 共享态（`_plans`/`_watch`）无锁**：事件循环单线程，协程只在 `await` 点切换——字典操作不跨 `await` 就天然原子（纪律写进注释：禁止在 `_plans`/`_watch` 读写之间 `await`）
 - **纪律（反例）**：协程里直接调同步阻塞函数 = 整个事件循环停摆（所有协程一起卡住）。所有阻塞调用必须 `to_thread`
 - **RPC 卡死防护**：同步 RPC 在对端无响应时可能永不返回，线程被永久占死。协程侧用 `asyncio.wait_for` 给调用加超时：超时只**放弃等待**并抛 `QueryError`，不中断线程（Python 无法中断 C++ 调用），也不 `abandon`——由上层决定：`query_task` 的 `QueryError` 在 `PrefetchFlow` 里继续轮询到流程超时，`exists` 的直接记为这次 intent 失败。卡死的线程泄漏一个、由泄漏监控暴露。根治靠 RPC 自带超时参数（0.3.11 无，main 有 `MC_RPC_TIMEOUT_MS`，列入 E6）
