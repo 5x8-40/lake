@@ -154,6 +154,17 @@ def test_task_failed_is_terminal_and_purged(fake_store_module, monkeypatch) -> N
     assert handle not in b._plans
 
 
+def test_target_of_until_registration_dropped(fake_store_module, monkeypatch) -> None:
+    """登记还在时 target_of 返回目标实例；终态删登记后返回 None。"""
+    client = FakeClient(task_status=_FakeStoreTaskStatus.FAILED)
+    b = _backend(client, KeyComputer(model_name="qwen", tp_size=2), monkeypatch)
+    target = InstanceId("inst-B")
+    handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), target))
+    assert b.target_of(handle) == target
+    assert run(b.query_task(handle)) is TaskStatus.FAILED
+    assert b.target_of(handle) is None
+
+
 def test_verify_failure_raises_with_detail(fake_store_module, monkeypatch) -> None:
     """任务全部成功但副本不到位：VerifyError 带明细（非静默 FAILED）。"""
     client = FakeClient(replicas_on=["seg-ELSEWHERE"])
