@@ -59,9 +59,9 @@ class PrefetchFlow:
     ) -> None:
         """执行到 READY；失败抛 PrefetchError（协程：等待期间不占线程）。
 
-        timeout_s 从 exists 通过起算、覆盖 copy 提交——大前缀的提交本身
-        可达几十秒（并发窗口已把这段从 N 倍往返压到约 N÷并发度 倍），
-        不计入则超时预算失真。
+        timeout_s 从 run_after_exists 起算，同一段预算覆盖等空间、copy
+        提交和轮询，不是两段相加。大前缀的提交本身可达几十秒（并发窗口
+        已把这段从 N 倍往返压到约 N÷并发度 倍），不计入则超时预算失真。
 
         handle_sink：可选回调，copy 提交成功即带上句柄调用一次。**退出
         收口不靠它**——取消（`CancelledError`）由 `run_after_exists` 自
@@ -87,17 +87,38 @@ class PrefetchFlow:
         timeout_s: float = 120.0,
         handle_sink=None,
     ) -> None:
-        """存在性检查已通过之后的步骤：copy 提交 → 轮询到终态。
+        """存在性检查已通过之后的步骤：等空间 → copy 提交 → 轮询到终态。
 
         单独成方法是为了让编排层决定**传输闸的范围**：exists 是毫秒级
         探测、不该占名额；这段「提交 → 等终态」占一个前缀名额，直到
         终态才还。见 `TaskEngine._run_prefetch`。
+
+        同一个 timeout_s 从这里开始。copy 里等目标段放得下的时间算在
+        这笔预算里。copy 还没返回时到点，取消等待：那时还没有任务号，
+        不按「提交失败之后的部分落账」再记一笔。若取消时已经发出一部分
+        create_copy_task，落账仍由 copy 自己的取消路径负责。
         """
         deadline = time.monotonic() + timeout_s
+        copy_task = asyncio.create_task(self._ops.copy(prefix, target))
         try:
-            handle = await self._ops.copy(prefix, target)
+            remaining = deadline - time.monotonic()
+            handle = await asyncio.wait_for(copy_task, timeout=remaining)
         except SubmitError as e:
             raise PrefetchError(f"copy submit failed: {e}") from e
+        except TimeoutError:
+            # wait_for 已经取消了 copy。再等它收尾：没发出任务则没有号；
+            # 已经发出一部分则 copy 里现有的落账会记下那些号。这里不另记。
+            try:
+                await _drain_copy(copy_task)
+            except SubmitError as e:
+                raise PrefetchError(f"copy submit failed: {e}") from e
+            raise PrefetchError(
+                f"copy not READY after {timeout_s}s (cancelled before handle)"
+            )
+        except asyncio.CancelledError:
+            # 外层取消（进程退出）。copy 自己的取消路径负责已发出的号。
+            await _drain_copy(copy_task)
+            raise
         if handle_sink is not None:
             handle_sink(handle)
         try:
@@ -132,3 +153,16 @@ class PrefetchFlow:
             except KeyError:
                 pass  # 已终态被移除登记
             raise
+
+
+async def _drain_copy(copy_task: asyncio.Task) -> None:
+    """等 copy 的取消路径跑完。没跑完就取消再等。
+
+    copy 在还没有任务号时被取消，不会落账；已经写出的号由它自己记下。
+    """
+    if not copy_task.done():
+        copy_task.cancel()
+    try:
+        await copy_task
+    except asyncio.CancelledError:
+        pass

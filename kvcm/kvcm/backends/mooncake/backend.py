@@ -26,6 +26,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Sequence
 
 from kvcm.backends.mooncake.client import StoreClient, StoreClientError
+from kvcm.backends.mooncake.http_admin import AdminClient, AdminError, SegmentNotFound
 from kvcm.engines.vllm.keys import KeyComputer
 from kvcm.ledger import Ledger
 from kvcm.ops.base import (
@@ -47,6 +48,22 @@ logger = logging.getLogger(__name__)
 def _name_of(fn: Any) -> str:
     """函数的可读名（日志用）。"""
     return getattr(fn, "__qualname__", None) or getattr(fn, "__name__", repr(fn))
+
+
+def _replica_row(row: object) -> tuple[str, int | None, tuple[str, ...]]:
+    """(端点, 字节数或 None, 拿不到大小时的属性名)。"""
+    if not isinstance(row, tuple) or len(row) < 2:
+        raise QueryError(f"unexpected replica size row: {row!r}")
+    ep = str(row[0]) if row[0] else ""
+    sz = row[1]
+    if sz is None or isinstance(sz, bool) or not isinstance(sz, int) or sz < 0:
+        sz = None
+    else:
+        sz = int(sz)
+    attrs: tuple[str, ...] = ()
+    if len(row) > 2 and row[2] is not None:
+        attrs = tuple(str(a) for a in row[2])
+    return ep, sz, attrs
 
 
 def encode_task_id(task_id: object) -> str:
@@ -88,9 +105,12 @@ class MooncakeBackend(KvOps):
         submit_concurrency: int = 4,
         executor: ThreadPoolExecutor | None = None,
         rpc_timeout_s: float = 30.0,
+        admin: AdminClient | None = None,
     ) -> None:
         """
         client：已 connect 的 StoreClient（控制面身份，global_segment_size=0）。
+        admin：master 管理端口（查目标段剩余）。不传则 _admit_new_bytes
+            抛 QueryError，不盲提交。
         key_computer：引擎侧 key 计算器（持展开配置与 rank 映射知识）。
         locate：实例 → rank 有序 seg 列表（targets[i] = rank i 的本机 seg）。
         capability：按连接上的后端版本填充的能力集（必填——能力宣告不
@@ -125,6 +145,11 @@ class MooncakeBackend(KvOps):
         # 协程侧 RPC 超时（0.3.11 的绑定没有超时参数；main 有
         # MC_RPC_TIMEOUT_MS，届时可与此对齐）。<=0 表示不设超时。
         self._rpc_timeout_s = rpc_timeout_s
+        # 管理端口：查目标段 allocator 的 used/capacity。没有它就不知道
+        # 剩余，准入直接拒绝，不许盲提交。
+        self._admin = admin
+        # 放不下时的重查间隔。调用方超时靠取消本协程，不另加一段预算。
+        self._admit_interval_s = 0.5
         self._executor = executor or ThreadPoolExecutor(
             max_workers=max(4, min(8, (os.cpu_count() or 4))), thread_name_prefix="kvcm-rpc"
         )
@@ -271,6 +296,121 @@ class MooncakeBackend(KvOps):
             self._submit_sem = asyncio.Semaphore(self._submit_concurrency)
         return self._submit_sem
 
+    async def _admit_new_bytes(self, plan: list[tuple[str, str]]) -> None:
+        """提交前判断每个目标段还放不放得下。
+
+        plan 是 (key, 目标段名)。按目标段分组：只把「该段上还没有内存
+        副本」的 key 算进新占用量（段名出现在该 key 的内存副本
+        transport_endpoint 里即算已在，与副本核验同一判定）。某一段上
+        新占用量大于该段剩余，整批不发 create_copy_task，睡
+        ``_admit_interval_s``（默认 0.5 秒）再查，直到放得下、被取消、
+        或调用方取消这次等待。
+
+        段名找不到立即 SubmitError，不空等。管理端口连不上或暂时 5xx
+        记日志后按同一间隔重查，不盲提交。没有 admin 客户端抛 QueryError。
+
+        查完到真正占上之间，别的请求仍可能先占。这里不加锁、不向 master
+        预留——只能少失败，不能保证提交时空间还在。
+        """
+        if not plan:
+            return
+        if self._admin is None:
+            raise QueryError("没有 admin 客户端，无法知道目标段剩余，拒绝提交")
+        while True:
+            need = await self._new_bytes_by_segment(plan)
+            if not need:
+                return
+            blocked = False
+            for seg, nbytes in need.items():
+                try:
+                    used, capacity = await self._rpc(self._admin.query_segment, seg)
+                except SegmentNotFound as e:
+                    raise SubmitError(f"段不存在: {seg}") from e
+                except AdminError as e:
+                    if e.status is None or e.status >= 500:
+                        logger.warning(
+                            "准入：查询段 %s 失败（%s），稍后重试", seg, e
+                        )
+                        blocked = True
+                        continue
+                    raise QueryError(str(e)) from e
+                # query_segment 已把容量 0 当成找不到。这里再挡一层，
+                # 避免桩或旧返回把「没有这段」说成剩余 0。
+                if capacity == 0:
+                    raise SubmitError(f"段不存在: {seg}")
+                remaining = capacity - used
+                if nbytes > remaining:
+                    logger.info(
+                        "准入等待：段 %s 需要 %d 字节，剩余 %d 字节",
+                        seg,
+                        nbytes,
+                        remaining,
+                    )
+                    blocked = True
+            if not blocked:
+                return
+            await asyncio.sleep(self._admit_interval_s)
+
+    async def _new_bytes_by_segment(
+        self, plan: list[tuple[str, str]]
+    ) -> dict[str, int]:
+        """按目标段汇总「尚未在该段上」的 key 的字节数。空字典 = 没有新占用。"""
+        keys = list(dict.fromkeys(key for key, _seg in plan))
+        try:
+            layout = await self._rpc(self._client.batch_memory_replica_sizes, keys)
+        except StoreClientError as e:
+            raise QueryError(str(e)) from e
+        placed: dict[str, set[str]] = {}
+        known: dict[str, int] = {}
+        missing_attrs: list[str] = []
+        sample_key: str | None = None
+        sample_size: int | None = None
+        for key in keys:
+            endpoints: set[str] = set()
+            size: int | None = None
+            for row in layout.get(key, []):
+                ep, sz, attrs = _replica_row(row)
+                if ep:
+                    endpoints.add(ep)
+                if sz is not None and size is None:
+                    size = sz
+                if sz is None:
+                    missing_attrs.extend(attrs)
+            placed[key] = endpoints
+            if size is not None:
+                known[key] = size
+                if sample_size is None:
+                    sample_key = key
+                    sample_size = size
+        need: dict[str, int] = {}
+        missing_n = 0
+        seen: set[tuple[str, str]] = set()
+        for key, seg in plan:
+            if (key, seg) in seen:
+                continue
+            seen.add((key, seg))
+            if seg in placed.get(key, ()):
+                continue
+            size = known.get(key)
+            if size is None:
+                if sample_size is None:
+                    names = ", ".join(sorted(set(missing_attrs))) or "(无描述对象)"
+                    raise QueryError(
+                        "整批没有可读的副本大小，拒绝用 0 或常数顶上；"
+                        f"描述属性: {names}"
+                    )
+                size = sample_size
+                missing_n += 1
+            need[seg] = need.get(seg, 0) + size
+        if missing_n:
+            logger.info(
+                "准入：%d 个 key 缺副本大小，按本批 key %s 的 %d 字节估算",
+                missing_n,
+                sample_key,
+                sample_size,
+            )
+        return need
+
     async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机 seg 为前缀 KV 建副本（发起式；READY 经 query_task）。
 
@@ -285,6 +425,9 @@ class MooncakeBackend(KvOps):
             )
         targets = list(self._locate(target))
         plan = self._keys.build_plan(keys, targets)
+        # 会在目标段上新占内存，先走同一处判断。取消落在这里时还没有
+        # 任务号，不进下面的部分落账。
+        await self._admit_new_bytes(plan)
         # 下标槽：并发完成顺序不定，按 plan 下标落号，失败时筛出已发出的。
         slots: list[object | None] = [None] * len(plan)
         # 进程级信号量（所有 copy 共用），不是本次 copy 独有的窗口。

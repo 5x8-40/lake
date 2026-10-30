@@ -62,6 +62,20 @@ def fake_store_module(monkeypatch):
     pkg = types.ModuleType("mooncake")
     monkeypatch.setitem(sys.modules, "mooncake", pkg)
     monkeypatch.setitem(sys.modules, "mooncake.store", mod)
+
+    # copy 现在提交前要问管理端口。旧用例不测准入，缺省给一个放得下的
+    # 假客户端；显式传入 admin（含 None）不被覆盖。
+    class _RoomyAdmin:
+        def query_segment(self, segment):
+            return (0, 1 << 62)
+
+    orig_init = MooncakeBackend.__init__
+
+    def _init(self, *args, **kwargs):
+        kwargs.setdefault("admin", _RoomyAdmin())
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(MooncakeBackend, "__init__", _init)
     return mod
 
 
@@ -97,6 +111,17 @@ class FakeClient(StoreClient):
             seg for _, segs in self.created for seg in segs
         ]
         return {k: list(on) for k in keys}
+
+    def batch_memory_replica_sizes(self, keys):
+        # 提交前还没有目标副本。没有端点时仍给出源副本大小，旧用例才能
+        # 放行；端点是目标段时，准入不计这份新占用。
+        if self._replicas_on is None:
+            eps: list[str] = []
+        else:
+            eps = list(self._replicas_on)
+        if not eps:
+            return {k: [("__source__", 1024, ())] for k in keys}
+        return {k: [(ep, 1024, ()) for ep in eps] for k in keys}
 
 
 def _backend(
@@ -420,11 +445,14 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
         capability="v0311",
         rpc_timeout_s=30.0,
         copy_submit_concurrency=7,  # 非默认值，才能证明真的传了
+        master="127.0.0.1:50088",
+        admin=None,
     )
     daemon.build_backend(args, client=object(), ledger=object())
     assert seen["submit_concurrency"] == 7, (
         f"--copy-submit-concurrency 没传下去: {seen.get('submit_concurrency')}"
     )
+    assert seen["admin"]._base == "http://127.0.0.1:9003"
 
 
 def test_copy_submits_concurrently_up_to_cap(fake_store_module, monkeypatch) -> None:
@@ -1355,3 +1383,435 @@ def test_close_bounded_when_rpc_hangs(fake_store_module, monkeypatch) -> None:
     # 超时必须如实报 False：调用方正是靠它触发 os._exit(1)。
     # 原实现无返回值（隐式 None），这个信号被静默丢掉。
     assert got is False, f"超时没报 False（返回 {got!r}），调用方无从判断"
+
+
+# ---------------------------------------------------------------------------
+# 提交前准入：目标段还放不放得下
+# ---------------------------------------------------------------------------
+
+
+def _rank_key(name: str, rank: int) -> str:
+    return f"{name}@head_or_tp_rank:{rank}@"
+
+
+class _LayoutClient(FakeClient):
+    """按测试给定的 (端点, 字节数, 属性名) 回答一次 batch 查询。"""
+
+    def __init__(self, layout: dict) -> None:
+        super().__init__()
+        self.layout = layout
+
+    def batch_memory_replica_sizes(self, keys):
+        return {k: list(self.layout.get(k, [])) for k in keys}
+
+
+class _TableAdmin:
+    def __init__(self, table: dict) -> None:
+        self.table = dict(table)
+        self.calls: list[str] = []
+
+    def query_segment(self, segment: str):
+        self.calls.append(segment)
+        spec = self.table[segment]
+        if isinstance(spec, Exception):
+            raise spec
+        return spec
+
+
+def _admit_backend(client, monkeypatch, *, admin, segs, keys):
+    kc = KeyComputer(model_name="qwen", tp_size=max(len(segs), 1))
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda _ids: list(keys))
+    return MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=lambda _inst: list(segs),
+        capability=mooncake_v0311(),
+        admin=admin,
+    )
+
+
+def _forbid_wait(monkeypatch) -> None:
+    async def _sleep(_seconds):
+        raise AssertionError("不该等待")
+
+    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
+
+
+def test_admit_submits_when_segment_has_room(fake_store_module, monkeypatch) -> None:
+    """放得下才发。"""
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    admin = _TableAdmin({"seg-A": (0, 1000)})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert [k for k, _segs in client.created] == [key]
+
+
+def test_admit_holds_whole_batch_until_space(fake_store_module, monkeypatch) -> None:
+    """放不下整批不发；空间下来后再发。"""
+    keys = [_rank_key("a", 0), _rank_key("b", 0)]
+    client = _LayoutClient({k: [("__source__", 100, ())] for k in keys})
+    admin = _TableAdmin({"seg-A": (0, 10)})  # 两个 key 共 200，剩余 10
+
+    async def _sleep(seconds):
+        assert seconds == 0.5
+        assert client.created == []
+        admin.table["seg-A"] = (0, 10**9)
+
+    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=keys)
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert [k for k, _segs in client.created] == keys
+
+
+def test_admit_ignores_keys_already_on_target(fake_store_module, monkeypatch) -> None:
+    """已在目标段上的 key 不计入新占用。
+
+    两个 key 各 1000。若都计入，2000 > 剩余 1500，整批不该发。已在段上
+    的那份不计，只剩 1000，放得下，两个 key 都照常提交。
+    """
+    on_seg = _rank_key("on", 0)
+    fresh = _rank_key("fresh", 0)
+    client = _LayoutClient(
+        {
+            on_seg: [("seg-A", 1000, ())],
+            fresh: [("__source__", 1000, ())],
+        }
+    )
+    admin = _TableAdmin({"seg-A": (0, 1500)})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(
+        client, monkeypatch, admin=admin, segs=["seg-A"], keys=[on_seg, fresh]
+    )
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert [k for k, _segs in client.created] == [on_seg, fresh]
+
+
+def test_admit_groups_by_segment(fake_store_module, monkeypatch) -> None:
+    """按段分组。A 放得下、B 放不下时整批不发；不能因为 A 够就把 B 也发出去。
+
+    空间下来后两个段上的 key 一起发。
+    """
+    key_a = _rank_key("a", 0)
+    key_b = _rank_key("b", 1)
+    client = _LayoutClient(
+        {
+            key_a: [("__source__", 100, ())],
+            key_b: [("__source__", 100, ())],
+        }
+    )
+    admin = _TableAdmin({"seg-A": (0, 1000), "seg-B": (0, 50)})
+
+    async def _sleep(_seconds):
+        assert client.created == []
+        admin.table["seg-B"] = (0, 1000)
+
+    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
+    b = _admit_backend(
+        client,
+        monkeypatch,
+        admin=admin,
+        segs=["seg-A", "seg-B"],
+        keys=[key_a, key_b],
+    )
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert {seg for _k, segs in client.created for seg in segs} == {"seg-A", "seg-B"}
+    assert len(client.created) == 2
+
+
+def test_admit_does_not_compare_batch_sum_to_one_segment(
+    fake_store_module, monkeypatch
+) -> None:
+    """两段各剩余 150、各需 100。整批 200 大于任一段剩余，但分段后放得下，应直接发。"""
+    key_a = _rank_key("a", 0)
+    key_b = _rank_key("b", 1)
+    client = _LayoutClient(
+        {
+            key_a: [("__source__", 100, ())],
+            key_b: [("__source__", 100, ())],
+        }
+    )
+    admin = _TableAdmin({"seg-A": (0, 150), "seg-B": (0, 150)})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(
+        client,
+        monkeypatch,
+        admin=admin,
+        segs=["seg-A", "seg-B"],
+        keys=[key_a, key_b],
+    )
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert len(client.created) == 2
+
+
+def test_admit_estimates_missing_sizes(fake_store_module, monkeypatch, caplog) -> None:
+    """缺大小时用本批已拿到的一个 key 的大小估算，日志里能看到。
+
+    一个 100、两个没有。若丢掉没大小的，100 ≤ 剩余 250 会直接发。估算后
+    是 300，必须先等。
+    """
+    import logging
+
+    known = _rank_key("known", 0)
+    miss_a = _rank_key("ma", 0)
+    miss_b = _rank_key("mb", 0)
+    attrs = ("transport_endpoint", "buffer_address")
+    client = _LayoutClient(
+        {
+            known: [("__source__", 100, ())],
+            miss_a: [("__source__", None, attrs)],
+            miss_b: [("__source__", None, attrs)],
+        }
+    )
+    admin = _TableAdmin({"seg-A": (0, 250)})
+
+    async def _sleep(_seconds):
+        assert client.created == []
+        admin.table["seg-A"] = (0, 10**9)
+
+    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
+    caplog.set_level(logging.INFO, logger="kvcm.backends.mooncake.backend")
+    b = _admit_backend(
+        client,
+        monkeypatch,
+        admin=admin,
+        segs=["seg-A"],
+        keys=[known, miss_a, miss_b],
+    )
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert len(client.created) == 3
+    assert "估算" in caplog.text
+
+
+def test_admit_missing_segment_fails_immediately(fake_store_module, monkeypatch) -> None:
+    """段名找不到：立即 SubmitError，不空等。容量为 0 同样当找不到。"""
+    from kvcm.backends.mooncake.http_admin import SegmentNotFound
+
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    _forbid_wait(monkeypatch)
+
+    missing = _TableAdmin({"seg-A": SegmentNotFound("gone")})
+    b = _admit_backend(client, monkeypatch, admin=missing, segs=["seg-A"], keys=[key])
+    with pytest.raises(SubmitError, match="段不存在"):
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client.created == []
+
+    client2 = _LayoutClient({key: [("__source__", 100, ())]})
+    zero = _TableAdmin({"seg-A": (0, 0)})
+    b2 = _admit_backend(client2, monkeypatch, admin=zero, segs=["seg-A"], keys=[key])
+    with pytest.raises(SubmitError, match="段不存在"):
+        run(b2.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client2.created == []
+
+
+def test_admit_retries_transient_admin_error(fake_store_module, monkeypatch, caplog) -> None:
+    """管理端口暂时 5xx：记日志并重查，不盲提交。"""
+    import logging
+
+    from kvcm.backends.mooncake.http_admin import AdminError
+
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+
+    class _Flaky:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def query_segment(self, segment):
+            self.n += 1
+            if self.n == 1:
+                raise AdminError("unavailable", status=503, body="later")
+            return (0, 10**9)
+
+    async def _sleep(_seconds):
+        assert client.created == []
+
+    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
+    caplog.set_level(logging.WARNING, logger="kvcm.backends.mooncake.backend")
+    admin = _Flaky()
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert admin.n >= 2
+    assert len(client.created) == 1
+    assert "重试" in caplog.text
+
+
+def test_admit_refuses_when_batch_has_no_size(fake_store_module, monkeypatch) -> None:
+    """整批一个大小都没有：报出描述上的属性名，不用 0，也不提交。"""
+    key = _rank_key("a", 0)
+    client = _LayoutClient(
+        {key: [("__source__", None, ("transport_endpoint", "buffer_address"))]}
+    )
+    admin = _TableAdmin({"seg-A": (0, 10**9)})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
+    with pytest.raises(QueryError, match="buffer_address"):
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client.created == []
+
+
+def test_buffer_size_reads_pybind_name() -> None:
+    """绑定把 C++ size_ 暴露成 size；两个名字都能读，读不到就带上属性名。"""
+    from kvcm.backends.mooncake.client import _buffer_size
+
+    class _Sized:
+        size = 128
+        transport_endpoint = "seg-A"
+
+    class _SizedCpp:
+        size_ = 64
+
+    class _NoSize:
+        transport_endpoint = "seg-A"
+        buffer_address = 1
+
+    assert _buffer_size(_Sized()) == (128, ())
+    assert _buffer_size(_SizedCpp()) == (64, ())
+    size, attrs = _buffer_size(_NoSize())
+    assert size is None
+    assert "transport_endpoint" in attrs
+    assert "buffer_address" in attrs
+
+
+def test_admit_without_admin_refuses(fake_store_module, monkeypatch) -> None:
+    """没有管理端口就不知道剩余，拒绝提交。"""
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(client, monkeypatch, admin=None, segs=["seg-A"], keys=[key])
+    with pytest.raises(QueryError, match="admin"):
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client.created == []
+
+
+def test_admit_cancel_before_submit_records_nothing(
+    fake_store_module, monkeypatch
+) -> None:
+    """取消落在等空间时：还没有任务号，不落账。"""
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    admin = _TableAdmin({"seg-A": (100, 100)})  # 剩余 0，一直等
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
+        b._ledger = led
+
+        async def scenario():
+            task = asyncio.create_task(
+                b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+            )
+            deadline = time.monotonic() + 2
+            while not admin.calls and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert admin.calls, "还没开始查段"
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        run(scenario())
+        assert client.created == []
+        assert led.list_running_tasks() == []
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_admin_url_explicit_overrides_master(monkeypatch) -> None:
+    """显式 --admin 用显式值；缺省从 --master 的 host 推出 :9003。"""
+    import argparse
+
+    from kvcm import daemon
+
+    seen: dict = {}
+
+    def fake_backend(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(daemon, "MooncakeBackend", fake_backend)
+    monkeypatch.setattr(daemon, "KeyComputer", lambda **kw: object())
+    args = argparse.Namespace(
+        model_name="qwen",
+        block_size=128,
+        tp_size=1,
+        peer_tp_size=None,
+        put_step=1,
+        hash_algo="sha256",
+        segs="seg-A",
+        capability="v0311",
+        rpc_timeout_s=30.0,
+        copy_submit_concurrency=4,
+        master="master.internal:50088",
+        admin="http://10.1.2.3:9999",
+    )
+    daemon.build_backend(args, client=object(), ledger=object())
+    assert seen["admin"]._base == "http://10.1.2.3:9999"
+
+
+def test_query_segment_parses_capacity_space_and_not_found(monkeypatch) -> None:
+    """Capacity 冒号前有空格；段不存在是接口失败，不是剩余 0。"""
+    import email
+    import io
+    import urllib.error
+    import urllib.request
+
+    from kvcm.backends.mooncake.http_admin import (
+        AdminClient,
+        AdminError,
+        SegmentNotFound,
+    )
+
+    body = "seg-A\nUsed(bytes): 10\nCapacity(bytes) : 100\n"
+
+    class _Resp:
+        def __init__(self, text: str, status: int = 200) -> None:
+            self._text = text.encode()
+            self._status = status
+
+        def read(self):
+            return self._text
+
+        def getcode(self):
+            return self._status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def _ok(url, timeout=0):
+        assert "segment=seg-A" in url
+        return _Resp(body)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _ok)
+    assert AdminClient("http://127.0.0.1:9003").query_segment("seg-A") == (10, 100)
+
+    def _missing(url, timeout=0):
+        hdrs = email.message.EmailMessage()
+        raise urllib.error.HTTPError(
+            url,
+            500,
+            "err",
+            hdrs,
+            io.BytesIO(b"Failed to query segment"),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _missing)
+    with pytest.raises(SegmentNotFound):
+        AdminClient("http://127.0.0.1:9003").query_segment("no-such")
+
+    def _down(url, timeout=0):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _down)
+    with pytest.raises(AdminError) as ei:
+        AdminClient("http://127.0.0.1:9003").query_segment("seg-A")
+    assert ei.value.status is None
+    assert not isinstance(ei.value, SegmentNotFound)
