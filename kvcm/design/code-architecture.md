@@ -269,7 +269,8 @@ stateDiagram-v2
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
 | has_retained_client（保留身份注册） | ✗ | RPC ✓ 通道 ✗（绑定、HTTP 均无；自封装 .so 候选；替代 = move 到存活节点的 seg） | D2 F13② |
 | has_dfs_replica（共享 3FS 副本） | ✗ | RPC ✓ 通道 △（写入路径待 E6 核对） | D2 F13② |
-| has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**（`/batch_query_keys` 零副作用） | D2 F11b |
+| has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**（`/batch_query_keys`）。通道记录的是主线有这个端点，本次不把核验调用换过去；换包之后也不会自动接上 | D2 F11b |
+| has_tenant_quota（租户配额读） | ✗（channel NO；不是段剩余空间） | HTTP ✓（GET `/api/v1/tenant_quotas`）。租户配额记账，不能当段剩余空间用 | D2 F13 |
 
 - L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 的 retained client/DFS 前提，本质就是能力分支——本层把它落成显式声明
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
@@ -301,7 +302,7 @@ stateDiagram-v2
 
 | 子件 | 职责 | 包路径 |
 |------|------|--------|
-| StoreClient | store 绑定生命周期（lazy import；connect/close，setup 失败先 close）+ **双通道**：控制类走绑定（create_copy_task / query_task / is_exist / remove…）；查询/观测走 HTTP admin。副本核验当前走绑定通道（有续租副作用）；main 的零副作用核验（`/batch_query_keys`）等升级到 mooncake 主线后接通（has_admin_query） | `client.py` + `http_admin.py` |
+| StoreClient | store 绑定生命周期（lazy import；connect/close，setup 失败先 close）+ **双通道**：控制类走绑定（create_copy_task / create_move_task / batch_remove / query_task / is_exist）；查询/观测走 HTTP admin。副本核验仍走绑定 `batch_get_replica_desc`（有续租副作用）。主线 `/batch_query_keys` 与 `/api/v1/tenant_quotas` 的只读客户端在 `admin_main.py`，不接进核验；换包后也不会自动接上 | `client.py` + `http_admin.py` + `admin_main.py` |
 | SegTopology | 查 master 的 seg 名单（见上）；seg、client_id、lease 语义归这里 | `topology.py` |
 | capability 填充 | 按连接上的版本填充（**构造必填**——不许默认冒充 main；目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | `capability.py` |
 
@@ -388,13 +389,13 @@ key/seg 不落库。输入只有 `status='running'` 的行。输出是内存里�
 - `_plans`：每个任务凭据对应哪个前缀、哪台目标实例、复制计划（哪条 key 发到哪个 seg）——恢复后 `query_task` 靠它继续跟踪
 - `_watch`：哪些凭据处于「等副本」状态（同组里有撞车失败的任务）——恢复后这些凭据只查副本、不再查任务
 
-**恢复范围**：目前只恢复 copy（唯一已实现的操作）。move / promote 实现时要同步补各自的恢复路径——否则重启后这两类任务的跟踪会静默丢失。
+**恢复范围**：恢复 copy 与 move。promote 仍跳过。源段不落库，恢复只重算目标侧 plan。
 
 ```mermaid
 flowchart TD
     In["list_running_tasks<br/>列: task_id, handle_id, op<br/>model_id, token_ids, target"]
     Group["按 handle_id 分组<br/>用 rows 的第一行代表整组"]
-    Gate1{"handle_id 空<br/>或 op 不是 copy<br/>或 token_ids 空"}
+    Gate1{"handle_id 空<br/>或 op 不是 copy/move<br/>或 token_ids 空"}
     Skip1["跳过这组"]
     Calc["Prefix + locate + KeyComputer<br/>keys_for_tokens 然后 build_plan"]
     Gate2{"locate 抛错<br/>或 plan 为空"}
@@ -522,7 +523,7 @@ sequenceDiagram
 
 ### ReleaseLoop / RetainLoop
 
-只留类骨架——依赖的 `demote` / `retain` / `remove` 在 L4 全是 NotImplementedError，能力接通（E10 后续）前无内容可跑。职责：ReleaseLoop = 软释放 / demote / 主动 Remove 三级（D1 §6）；RetainLoop = retain 与计划下线编排（D2 §4）。
+只留类骨架——不调用已落地的 move / remove。`demote` / `retain` 在 L4 仍是 NotImplementedError。职责：ReleaseLoop = 软释放 / demote / 主动 Remove 三级（D1 §6）；RetainLoop = retain 与计划下线编排（D2 §4）。
 
 ### 进程生命周期
 
@@ -559,7 +560,7 @@ sequenceDiagram
 - **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，73 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
 - **E11（进程化）🔁 实施中**（[PR #70](https://github.com/5x8-40/lake/pull/70)）：设计 = 本文「运行时结构」节。**范围切分**：
   - 本期做：进程壳（启动/退出/rebuild 接通）+ TaskEngine + KeepaliveLoop（唯一常驻循环）+ IntentReceiver（gRPC，E12）+ **copy 并发提交**（信号量窗口，见 TaskEngine 节）
-  - 只留类骨架：ReleaseLoop、RetainLoop（依赖的操作全是 NotImplementedError，能力接通前无内容可跑）
+  - 只留类骨架：ReleaseLoop、RetainLoop（不调用已落地的 move/remove；demote/retain 仍是 NotImplementedError）
   - 不做：链路利用率限速器（E15 剩余部分）、重发策略、多模型归属判定（多模型接入前置，已登记）、E13/E14 协议
 - **E11 阶段计划**：
   1. 进程壳 + 状态恢复：Ledger 单线程 executor → 启动时 `rebuild()` 接通 → KeepaliveLoop（固定窗口，协程定时器）→ 优雅退出（协程取消 + abandon 处理）

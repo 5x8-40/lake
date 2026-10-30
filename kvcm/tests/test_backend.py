@@ -1355,3 +1355,222 @@ def test_close_bounded_when_rpc_hangs(fake_store_module, monkeypatch) -> None:
     # 超时必须如实报 False：调用方正是靠它触发 os._exit(1)。
     # 原实现无返回值（隐式 None），这个信号被静默丢掉。
     assert got is False, f"超时没报 False（返回 {got!r}），调用方无从判断"
+
+
+# ---------------------------------------------------------------------------
+# move / remove（绑定 create_move_task、batch_remove；容量判断只在 move）
+# ---------------------------------------------------------------------------
+
+
+def _locate_move(inst):
+    if inst == "src":
+        return ["seg-S0", "seg-S1"]
+    return ["seg-T0", "seg-T1"]
+
+
+class MoveClient(FakeClient):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.moves: list[tuple[str, str, str]] = []
+
+    def create_move_task(self, key, source, target):
+        with self._id_lock:
+            self.moves.append((key, source, target))
+            self._next += 1
+            tid = (self._next, 100 + self._next)
+        return tid
+
+
+class RemoveClient(FakeClient):
+    def __init__(self):
+        super().__init__()
+        self.removed: list[tuple[list[str], bool]] = []
+
+    def batch_remove(self, keys, force=False):
+        self.removed.append((list(keys), force))
+        return [0] * len(keys)
+
+
+def _move_backend(client, monkeypatch, ledger=None, capability=None):
+    from kvcm.backends.mooncake.capability import mooncake_v0311
+
+    kc = KeyComputer(model_name="qwen", tp_size=2)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    return MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=_locate_move,
+        capability=capability or mooncake_v0311(),
+        ledger=ledger,
+    )
+
+
+def test_move_admits_then_submits_one_task_per_key(fake_store_module, monkeypatch) -> None:
+    """提交前做容量判断，然后按 rank 逐 key 调 create_move_task。"""
+    client = MoveClient()
+    b = _move_backend(client, monkeypatch)
+    log: list[tuple] = []
+    original = client.create_move_task
+
+    def record_move(key, source, target):
+        log.append(("move", source, target))
+        return original(key, source, target)
+
+    client.create_move_task = record_move
+
+    async def admit(plan):
+        log.append(("admit", [(k, seg) for k, seg in plan]))
+
+    b._admit_new_bytes = admit
+    prefix = Prefix(model_id="qwen", token_ids=(1, 2, 3))
+    handle = run(b.move(prefix, InstanceId("tgt"), InstanceId("src")))
+    assert handle.op is OpKind.MOVE
+    assert log[0][0] == "admit"
+    assert [seg for _, seg in log[0][1]] == ["seg-T0", "seg-T1"]
+    assert [(src, tgt) for _, src, tgt in client.moves] == [
+        ("seg-S0", "seg-T0"),
+        ("seg-S1", "seg-T1"),
+    ]
+    # 容量判断整次 move 只走一遍，且在任何移动任务之前
+    assert [kind for kind, *_ in log] == ["admit", "move", "move"]
+    assert len(client.moves) == len(handle.task_ids) == 2
+    assert all(isinstance(t, tuple) for t in handle.task_ids)
+
+
+def test_move_does_not_submit_when_admit_rejects(fake_store_module, monkeypatch) -> None:
+    client = MoveClient()
+    b = _move_backend(client, monkeypatch)
+
+    async def admit(plan):
+        raise RuntimeError("no room")
+
+    b._admit_new_bytes = admit
+    with pytest.raises(RuntimeError, match="no room"):
+        run(b.move(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("tgt"), InstanceId("src")))
+    assert client.moves == []
+
+
+def test_move_requires_source_instance(fake_store_module, monkeypatch) -> None:
+    client = MoveClient()
+    b = _move_backend(client, monkeypatch)
+    called = []
+
+    async def admit(plan):
+        called.append(plan)
+
+    b._admit_new_bytes = admit
+    with pytest.raises(ValueError, match="源实例"):
+        run(b.move(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("tgt")))
+    assert called == []
+    assert client.moves == []
+
+
+def test_remove_deletes_expanded_keys_without_admit(fake_store_module, monkeypatch) -> None:
+    client = RemoveClient()
+    b = _move_backend(client, monkeypatch)
+    called = []
+
+    async def admit(plan):
+        called.append(plan)
+
+    b._admit_new_bytes = admit
+    kc = b._keys
+    expected = kc.expand(["h0"])
+    run(b.remove(Prefix(model_id="qwen", token_ids=(1, 2))))
+    assert client.removed == [(expected, False)]
+    assert called == []
+
+
+def test_client_move_and_remove_use_binding_symbols() -> None:
+    """包装层把参数原样交给绑定符号，不改名、不加目标列表。"""
+
+    class Bound:
+        def __init__(self):
+            self.calls = []
+
+        def create_move_task(self, key, source, target):
+            self.calls.append(("create_move_task", key, source, target))
+            return ((7, 8), 0)
+
+        def batch_remove(self, keys, force=False):
+            self.calls.append(("batch_remove", list(keys), force))
+            return [0] * len(keys)
+
+    store = Bound()
+    client = StoreClient()
+    client._store = store
+    assert client.create_move_task("k", "seg-src", "seg-tgt") == (7, 8)
+    assert client.batch_remove(["a", "b"]) == [0, 0]
+    assert store.calls == [
+        ("create_move_task", "k", "seg-src", "seg-tgt"),
+        ("batch_remove", ["a", "b"], False),
+    ]
+    store.calls.clear()
+    store.create_move_task = lambda key, source, target: ((0, 0), 5)  # type: ignore[method-assign]
+    with pytest.raises(StoreClientError, match="create_move_task failed"):
+        client.create_move_task("k", "s", "t")
+    store.batch_remove = lambda keys, force=False: [0, -1]  # type: ignore[method-assign]
+    with pytest.raises(StoreClientError, match="batch_remove failed"):
+        client.batch_remove(["a", "b"])
+
+
+def test_main_capability_verify_stays_on_binding(fake_store_module, monkeypatch) -> None:
+    """--capability main 也不把核验换到 HTTP。"""
+    client = MoveClient()
+    b = _move_backend(client, monkeypatch, capability=mooncake_main())
+    seen = {"n": 0}
+    original = client.batch_memory_replica_endpoints
+
+    def wrapped(keys):
+        seen["n"] += 1
+        return original(keys)
+
+    client.batch_memory_replica_endpoints = wrapped
+    handle = run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("tgt")))
+    assert run(b.query_task(handle)) is TaskStatus.READY
+    assert seen["n"] == 2  # 每个 key 一次 batch_get_replica_desc 通道
+
+
+def test_rebuild_restores_move(fake_store_module, monkeypatch) -> None:
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        client = MoveClient(task_status=_FakeStoreTaskStatus.RUNNING)
+        b1 = _move_backend(client, monkeypatch, ledger=led)
+
+        async def admit(plan):
+            return None
+
+        b1._admit_new_bytes = admit
+        run(b1.move(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("tgt"), InstanceId("src")))
+        assert len(led.list_running_tasks()) == 2
+
+        client2 = FakeClient(
+            task_status=_FakeStoreTaskStatus.SUCCESS,
+            replicas_on=["seg-T0", "seg-T1"],
+        )
+        b2 = _move_backend(client2, monkeypatch, ledger=led)
+        restored = b2.rebuild()
+        assert len(restored) == 1
+        assert restored[0].op is OpKind.MOVE
+        assert run(b2.query_task(restored[0])) is TaskStatus.READY
+    finally:
+        led.close()
+        os.unlink(path)
+
+
+def test_unwired_ops_stay_unimplemented(fake_store_module, monkeypatch) -> None:
+    b = _backend(FakeClient(), KeyComputer(model_name="qwen", tp_size=1), monkeypatch)
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    for coro in (
+        b.keepalive(prefix),
+        b.stop_keepalive(prefix),
+        b.demote(prefix),
+        b.promote(prefix, InstanceId("tgt")),
+        b.retain(prefix),
+    ):
+        with pytest.raises(NotImplementedError):
+            run(coro)

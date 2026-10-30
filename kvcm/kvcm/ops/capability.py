@@ -45,3 +45,4 @@ class BackendCapability:
     has_retained_client: Capability  # 保留身份注册（源下线后身份存续）
     has_dfs_replica: Capability  # 共享文件系统副本
     has_admin_query: Capability  # 零副作用副本核验
+    has_tenant_quota: Capability  # 租户配额读接口（不是段剩余空间）

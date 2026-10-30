@@ -40,6 +40,11 @@ def mooncake_v0311() -> BackendCapability:
         has_admin_query=Capability(
             Support.NO, Support.NO, "HTTP 查询有副作用（续租 + 计命中）"
         ),
+        has_tenant_quota=Capability(
+            Support.NO,
+            Support.NO,
+            "0.3.11 无租户配额接口；不是段剩余空间",
+        ),
     )
 
 
@@ -70,8 +75,13 @@ def mooncake_main() -> BackendCapability:
         has_admin_query=Capability(
             Support.YES,
             Support.YES,
-            "HTTP /batch_query_keys 走零副作用核验路径；消费点 = "
-            "MooncakeBackend._verify_missing 的 TODO（当前写死绑定通道，"
-            "本版本接线后切 HTTP）",
+            "通道记录的是主线有 HTTP GET /batch_query_keys 这个端点，"
+            "本次不把核验调用换过去；换包之后也不会自动接上",
+        ),
+        has_tenant_quota=Capability(
+            Support.YES,
+            Support.YES,
+            "HTTP GET /api/v1/tenant_quotas 读租户配额"
+            "（requested/effective/charged）；不是段剩余空间，不能拿来当段剩余容量",
         ),
     )

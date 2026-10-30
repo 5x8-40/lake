@@ -151,6 +151,44 @@ class StoreClient:
             )
         return task_id
 
+    def create_move_task(self, key: str, source: str, target: str) -> object:
+        """发起移动：把 key 从源 seg 挪到目标 seg，完成后源副本删除。返回任务 id。
+
+        绑定 `create_move_task(key, source, target) -> (UUID, err)`。一次一个
+        key、一个源段、一个目标段——没有 targets 列表，也没有「省略 source
+        让 master 挑源」的重载（那是 copy 的行为）。
+        """
+        task_id, err = self._s().create_move_task(key, source, target)
+        if err != 0:
+            raise StoreClientError(
+                f"create_move_task failed err={err} key={key!r} "
+                f"source={source!r} target={target!r}"
+            )
+        return task_id
+
+    def batch_remove(self, keys: Sequence[str], force: bool = False) -> list[int]:
+        """按 key 批量删除，每个 key 的全部副本一起删（全局生效）。
+
+        绑定 `batch_remove(keys, force=False) -> list[int]`：0 成功，负数是
+        错误码。长度不符或任一非 0 都当失败抛出，不把「删了一半」报成成功。
+        force 默认 false：lease 未过期或复制任务在途时 master 拒删。
+        删除不占新内存，调用方不要为此做容量判断。
+        """
+        keys = list(keys)
+        raw = list(self._s().batch_remove(keys, force))
+        if len(raw) != len(keys):
+            raise StoreClientError(
+                f"batch_remove size mismatch keys={len(keys)} results={len(raw)}"
+            )
+        failed = [(k, rc) for k, rc in zip(keys, raw) if rc != 0]
+        if failed:
+            shown = failed[:4]
+            tail = "..." if len(failed) > 4 else ""
+            raise StoreClientError(
+                f"batch_remove failed {len(failed)}/{len(keys)}: {shown}{tail}"
+            )
+        return raw
+
     def query_task(self, task_id: object) -> object:
         """查询任务状态（QueryTaskResponse）。"""
         resp, err = self._s().query_task(task_id)

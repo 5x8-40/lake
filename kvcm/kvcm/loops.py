@@ -1,8 +1,8 @@
 """常驻循环（E11 进程化的支撑组件，L2）。
 
-KeepaliveLoop 本期落地；ReleaseLoop / RetainLoop 只留骨架——依赖的
-demote/retain/remove 在 L4 尚未接线（MooncakeBackend 均
-NotImplementedError），能力接线完成前没有可执行内容。
+KeepaliveLoop 本期落地；ReleaseLoop / RetainLoop 只留骨架，不调用
+move / remove（后端方法已接线，这里仍没有调用方）。demote / retain
+在 L4 仍是 NotImplementedError。
 
 形态：**协程定时器**（事件循环内 `asyncio.sleep` 周期触发），不是独立
 线程——E11 执行模型。
@@ -228,11 +228,11 @@ class KeepaliveLoop:
 
 
 class ReleaseLoop:
-    """软释放 / demote / 主动 Remove 三级（D1 §6）。骨架——依赖的
-    demote/remove 在 L4 未接线，capability 具备并接线后再常驻化。"""
+    """软释放 / demote / 主动 Remove 三级（D1 §6）。骨架——不调用
+    已落地的 remove；demote 在 L4 仍是 NotImplementedError。"""
 
 
 class RetainLoop:
-    """retain 与计划下线编排（D2 §4）。骨架——依赖的 retain/move 在
-    L4 未接线（retain 契约已定为返回 TaskHandle，主路径 retained
-    client 注册待 mooncake 版本升级），能力接线后再常驻化。"""
+    """retain 与计划下线编排（D2 §4）。骨架——不调用已落地的 move。
+    retain 在 L4 仍是 NotImplementedError（主路径 retained client
+    注册没有绑定入口）。"""

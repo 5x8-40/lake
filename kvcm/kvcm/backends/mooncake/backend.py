@@ -9,8 +9,9 @@
 任务标识（mooncake 为整数对）在本实现内原样透传，不做字符串化；需要
 写入 Ledger 时由本实现做可逆编码（"hi:lo"）。
 
-本步落地 copy / exists / query_task；其余操作随能力接线逐个落地，未落
-地的抛 NotImplementedError，通道不具备的抛 UnsupportedCapabilityError。
+本步落地 copy / move / remove / exists / query_task；其余操作随能力接线
+逐个落地，未落地的抛 NotImplementedError，通道不具备的抛
+UnsupportedCapabilityError。
 """
 
 from __future__ import annotations
@@ -252,7 +253,8 @@ class MooncakeBackend(KvOps):
         `create_copy_task` 这一次 RPC，返回即还。前者挡住「还没传完就
         继续提交下一个前缀」，后者限建链速率。本信号量是**进程级**的，
         因为闸允许 4 个前缀同时提交，每 copy 各限 4 就会变成 16 个并发
-        建链（0.3.11 实测 14 连发就打爆）。
+        建链（0.3.11 实测 14 连发就打爆）。move 的 `create_move_task`
+        走同一把：两种建链都计入进程级在飞数。
 
         延迟创建：`Semaphore()` 构造时不绑循环（`daemon.py:_serve` 里
         `build_backend` 执行时循环已经在跑，构造绑不绑都不影响），但
@@ -550,7 +552,8 @@ class MooncakeBackend(KvOps):
         复轮询以返回值为输入；长度 = 恢复数）。
 
         规则：
-        - 仅恢复 copy（唯一已落地操作）
+        - 恢复 copy 与 move（已落地的任务型操作）；promote 仍跳过。
+          源段不落库，恢复只重算目标侧 plan，供 query_task 核验目标副本
         - 空 handle_id / 空 token_ids / 重算出空 plan：跳过（数据残缺行
           或口径漂移——登记空 plan 会在任务成功后假 READY）
         - 重算失败（实例已不在）：跳过，交由 gc_tasks / 下一次预热
@@ -582,7 +585,7 @@ class MooncakeBackend(KvOps):
             if not handle_id:
                 continue
             r0 = rows[0]
-            if r0.op != OpKind.COPY.value or not r0.token_ids:
+            if r0.op not in (OpKind.COPY.value, OpKind.MOVE.value) or not r0.token_ids:
                 continue
             prefix = Prefix(model_id=r0.model_id, token_ids=r0.token_ids)
             target = InstanceId(r0.target)
@@ -594,7 +597,7 @@ class MooncakeBackend(KvOps):
             if not plan:
                 continue
             handle = TaskHandle(
-                op=OpKind.COPY,
+                op=OpKind(r0.op),
                 task_ids=tuple(decode_task_id(r.task_id) for r in rows),
             )
             self._plans[handle] = (prefix, target, plan, handle_id)
@@ -625,7 +628,91 @@ class MooncakeBackend(KvOps):
         target: InstanceId,
         source: InstanceId | None = None,
     ) -> TaskHandle:
-        raise NotImplementedError("move：随保留/搬迁流程落地")
+        """把前缀 KV 从源实例的 seg 挪到目标实例的 seg（一次一个 key）。
+
+        与 copy 同形：前缀展开 → rank 映射计划 → 进程级信号量逐 key 提交
+        → 句柄登记，READY 仍走 query_task 的目标侧副本核验。差别是绑定
+        ``create_move_task(key, source, target)`` 的 source 是段名且必填，
+        所以源实例不能省——按与目标相同的 rank 映射换成源段。
+
+        提交前 ``await self._admit_new_bytes(plan)``。plan 与 copy 同形，
+        是 ``(key, 目标 seg)`` 列表：目标段要新占一份。这个方法由外部赋到
+        实例上，本类不实现。删除不占新内存，不走这里。
+
+        没有实例销毁事件，本方法不被 daemon / TaskEngine 调用。
+        """
+        if source is None:
+            raise ValueError(
+                "move 需要源实例：绑定 create_move_task 的 source 是段名，不能省略"
+            )
+        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        if not keys:
+            raise ValueError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        plan = self._keys.build_plan(keys, list(self._locate(target)))
+        source_plan = self._keys.build_plan(keys, list(self._locate(source)))
+        if [k for k, _ in source_plan] != [k for k, _ in plan]:
+            raise ValueError("move source/target plans are not key-aligned")
+        # 容量判断在任何 create_move_task 之前。拒绝则一个任务都不发。
+        await self._admit_new_bytes(plan)
+        moves = [
+            (key, src_seg, tgt_seg)
+            for (key, tgt_seg), (_, src_seg) in zip(plan, source_plan)
+        ]
+        slots: list[object | None] = [None] * len(moves)
+        sem = self._submit_gate()
+        stop = asyncio.Event()
+
+        async def _submit_one(i: int, key: str, src_seg: str, tgt_seg: str) -> None:
+            async with sem:
+                if stop.is_set():
+                    return
+                slots[i] = await self._rpc(
+                    self._client.create_move_task, key, src_seg, tgt_seg
+                )
+
+        tasks = [
+            asyncio.create_task(_submit_one(i, key, src_seg, tgt_seg))
+            for i, (key, src_seg, tgt_seg) in enumerate(moves)
+        ]
+        try:
+            if tasks:
+                await asyncio.gather(*tasks)
+        except BaseException as e:
+            # 与 copy 相同：已发出的任务号必须落账，取消不能把它们丢掉。
+            stop.set()
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                e = asyncio.CancelledError()
+            task_ids = [t for t in slots if t is not None]
+            partial_plan = [plan[i] for i, t in enumerate(slots) if t is not None]
+            if task_ids:
+                partial = TaskHandle(op=OpKind.MOVE, task_ids=tuple(task_ids))
+                self._plans[partial] = (
+                    prefix,
+                    target,
+                    partial_plan,
+                    uuid.uuid4().hex,
+                )
+                try:
+                    await asyncio.shield(self._record(partial, "running"))
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    pass
+            if isinstance(e, asyncio.CancelledError):
+                raise e
+            raise SubmitError(
+                f"move submit failed after {len(task_ids)}/{len(plan)} tasks "
+                f"(submitted ids: {task_ids}): {e}"
+            ) from e
+        task_ids = [t for t in slots if t is not None]
+        handle = TaskHandle(op=OpKind.MOVE, task_ids=tuple(task_ids))
+        self._plans[handle] = (prefix, target, plan, uuid.uuid4().hex)
+        await self._record(handle, "running")
+        return handle
 
     async def keepalive(self, prefix: Prefix) -> None:
         raise NotImplementedError("keepalive：随保活注册表落地")
@@ -656,4 +743,14 @@ class MooncakeBackend(KvOps):
         raise NotImplementedError("retain：随保留流程落地（能力集 has_retained_client）")
 
     async def remove(self, prefix: Prefix) -> None:
-        raise NotImplementedError("remove：随删除流程落地")
+        """删除该前缀展开出的全部 key，每个 key 的全部副本一起删（全局生效）。
+
+        绑定 ``batch_remove(keys, force=False)``。不占新内存，不调用
+        ``_admit_new_bytes``。没有调用方：ReleaseLoop 仍不调它。
+        """
+        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        if not keys:
+            raise ValueError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        await self._rpc(self._client.batch_remove, keys)
