@@ -71,6 +71,7 @@
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
 - 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
+- 遗留：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
 - pin：READY 后防驱逐——🟡 候选已列出，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
   - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert 一个方案：

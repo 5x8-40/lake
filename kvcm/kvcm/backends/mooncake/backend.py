@@ -640,6 +640,8 @@ class MooncakeBackend(KvOps):
         实例上，本类不实现。删除不占新内存，不走这里。
 
         没有实例销毁事件，本方法不被 daemon / TaskEngine 调用。
+        移动成功后，源实例上这份 KV 没有了，要发 BlockRemoved；目标实例要发
+        BlockStored。发布端在 E14 分支。两分支合入后再接。本次 move 不发事件。
         """
         if source is None:
             raise ValueError(
