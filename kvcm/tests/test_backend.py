@@ -1505,18 +1505,17 @@ def test_admit_ignores_keys_already_on_target(fake_store_module, monkeypatch) ->
 
 
 def test_admit_queries_segment_once(fake_store_module, monkeypatch) -> None:
-    """同一组目标段只打一次 /query_segment。任一段新占用大于这份剩余，整批不发。"""
+    """只查计划里的第一个目标段，一次 /query_segment。这一段放不下，整批不发。"""
     from kvcm.ops.base import AdmissionWait
 
     key_a = _rank_key("a", 0)
     key_b = _rank_key("b", 1)
     client = _LayoutClient(
         {
-            key_a: [("__source__", 100, ())],
-            key_b: [("__source__", 300, ())],
+            key_a: [("__source__", 300, ())],
+            key_b: [("__source__", 1, ())],
         }
     )
-    # 只应查到计划里的第一个目标段。B 的 300 大于这份剩余 150，整批不发。
     admin = _TableAdmin({"seg-A": (0, 150), "seg-B": (0, 10**9)})
     _forbid_wait(monkeypatch)
     b = _admit_backend(
@@ -1532,19 +1531,19 @@ def test_admit_queries_segment_once(fake_store_module, monkeypatch) -> None:
     assert admin.calls == ["seg-A"]
 
 
-def test_admit_does_not_compare_batch_sum_to_one_segment(
+def test_admit_ignores_bytes_on_other_segments(
     fake_store_module, monkeypatch
 ) -> None:
-    """两段各需 100，只查到的一份剩余是 150。整批 200 大于这份剩余，但按段都放得下，应发，且只查一次。"""
+    """别的段上的 key 再大也不参加比较。第一个段放得下就发，且只查一次。"""
     key_a = _rank_key("a", 0)
     key_b = _rank_key("b", 1)
     client = _LayoutClient(
         {
             key_a: [("__source__", 100, ())],
-            key_b: [("__source__", 100, ())],
+            key_b: [("__source__", 10**9, ())],
         }
     )
-    admin = _TableAdmin({"seg-A": (0, 150), "seg-B": (0, 150)})
+    admin = _TableAdmin({"seg-A": (0, 150), "seg-B": (0, 1)})
     _forbid_wait(monkeypatch)
     b = _admit_backend(
         client,

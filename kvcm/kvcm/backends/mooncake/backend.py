@@ -332,9 +332,10 @@ class MooncakeBackend(KvOps):
     async def _admit_new_bytes(self, plan: list[tuple[str, str]]) -> None:
         """判断这一批现在放不放得下。不 sleep，函数里没有提交。
 
-        plan 是 (key, 目标段名)。字节需求在一轮等待开始时用一次
-        batch_get_replica_desc 取齐，之后每轮只打一次
-        GET /query_segment（同一组目标段剩余相同），不再重查大小。
+        plan 是 (key, 目标段名)。只看计划里的第一个目标段：新占用只加
+        落在这个段上、且副本端点里还没有它的 key。字节需求在一轮等待开始时
+        用一次 batch_get_replica_desc 取齐，之后每轮只对这个段打一次
+        GET /query_segment，不再重查大小。
 
         放不下或管理端口暂时连不上：AdmissionWait（闸外再等）。
         段名在 master 上不存在：AdmissionStop（这次预热停止）。
@@ -354,12 +355,14 @@ class MooncakeBackend(KvOps):
             need = await self._new_bytes_by_segment(plan)
         if not need:
             return
-        # 计划里的目标段取一个名字。同一组剩余相同，不要每段各查一次。
-        probe = next(seg for _key, seg in plan)
-        await self._check_segments(need, probe)
+        probe, nbytes = next(iter(need.items()))
+        await self._check_segments(probe, nbytes)
 
-    async def _check_segments(self, need: dict[str, int], probe: str) -> None:
-        """打一次 /query_segment。任一段的新占用大于这一份剩余，整批不发。"""
+    async def _check_segments(self, probe: str, nbytes: int) -> None:
+        """只对计划里的第一个目标段打一次 /query_segment。
+
+        这一段的新占用大于这份剩余，整批不发。不查其他段。
+        """
         if self._admin is None:
             raise QueryError("没有 admin 客户端，无法知道目标段剩余，拒绝提交")
         try:
@@ -375,25 +378,21 @@ class MooncakeBackend(KvOps):
         if capacity == 0:
             raise AdmissionStop(f"段不存在: {probe}")
         remaining = capacity - used
-        short = [
-            seg for seg, nbytes in need.items() if nbytes > remaining
-        ]
-        for seg in short:
+        if nbytes > remaining:
             logger.info(
                 "准入等待：段 %s 需要 %d 字节，剩余 %d 字节",
-                seg,
-                need[seg],
+                probe,
+                nbytes,
                 remaining,
             )
-        if short:
             raise AdmissionWait(
-                "段放不下: " + ",".join(short) + f" remaining={remaining}"
+                f"段放不下: {probe} need={nbytes} remaining={remaining}"
             )
 
     async def _new_bytes_by_segment(
         self, plan: list[tuple[str, str]]
     ) -> dict[str, int]:
-        """按目标段汇总「尚未在该段上」的 key 的字节数。空字典 = 没有新占用。"""
+        """只算计划里第一个目标段上、还没有该段副本的 key。空字典 = 没有新占用。"""
         keys = list(dict.fromkeys(key for key, _seg in plan))
         try:
             layout = await self._rpc(self._client.batch_memory_replica_sizes, keys)
@@ -421,14 +420,15 @@ class MooncakeBackend(KvOps):
                 if sample_size is None:
                     sample_key = key
                     sample_size = size
-        need: dict[str, int] = {}
+        probe = plan[0][1]
+        total = 0
         missing_n = 0
-        seen: set[tuple[str, str]] = set()
+        seen: set[str] = set()
         for key, seg in plan:
-            if (key, seg) in seen:
+            if seg != probe or key in seen:
                 continue
-            seen.add((key, seg))
-            # 已在该段上的 key 不计入，也不参加后面的估算乘法。
+            seen.add(key)
+            # 已经有这个段的不计入，也不参加估算乘法。
             if seg in placed.get(key, ()):
                 continue
             size = known.get(key)
@@ -441,7 +441,7 @@ class MooncakeBackend(KvOps):
                     )
                 size = sample_size
                 missing_n += 1
-            need[seg] = need.get(seg, 0) + size
+            total += size
         if missing_n:
             logger.info(
                 "准入：%d 个 key 缺副本大小，按本批 key %s 的 %d 字节估算",
@@ -449,7 +449,9 @@ class MooncakeBackend(KvOps):
                 sample_key,
                 sample_size,
             )
-        return need
+        if total <= 0:
+            return {}
+        return {probe: total}
 
     async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机 seg 为前缀 KV 建副本（发起式；READY 经 query_task）。
