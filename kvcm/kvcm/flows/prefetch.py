@@ -59,9 +59,9 @@ class PrefetchFlow:
     ) -> None:
         """执行到 READY；失败抛 PrefetchError（协程：等待期间不占线程）。
 
-        timeout_s 从 run_after_exists 起算，同一段预算覆盖等空间、copy
-        提交和轮询，不是两段相加。大前缀的提交本身可达几十秒（并发窗口
-        已把这段从 N 倍往返压到约 N÷并发度 倍），不计入则超时预算失真。
+        timeout_s 覆盖本次调用里的提交和轮询。等目标段空间在 TaskEngine
+        闸外，用的是同一段预算的剩余时间，不是再加一段。大前缀的提交本身
+        可达几十秒，不计入则超时预算失真。
 
         handle_sink：可选回调，copy 提交成功即带上句柄调用一次。**退出
         收口不靠它**——取消（`CancelledError`）由 `run_after_exists` 自
@@ -87,16 +87,17 @@ class PrefetchFlow:
         timeout_s: float = 120.0,
         handle_sink=None,
     ) -> None:
-        """存在性检查已通过之后的步骤：等空间 → copy 提交 → 轮询到终态。
+        """存在性检查已通过之后的步骤：copy 提交 → 轮询到终态。
 
-        单独成方法是为了让编排层决定**传输闸的范围**：exists 是毫秒级
-        探测、不该占名额；这段「提交 → 等终态」占一个前缀名额，直到
-        终态才还。见 `TaskEngine._run_prefetch`。
+        单独成方法是为了让编排层决定**传输闸的范围**：exists 和等空间
+        在闸外；这段「提交 → 等终态」占一个前缀名额，直到终态才还。
+        见 `TaskEngine._run_prefetch`。
 
-        同一个 timeout_s 从这里开始。copy 里等目标段放得下的时间算在
-        这笔预算里。copy 还没返回时到点，取消等待：那时还没有任务号，
-        不按「提交失败之后的部分落账」再记一笔。若取消时已经发出一部分
-        create_copy_task，落账仍由 copy 自己的取消路径负责。
+        timeout_s 是调用方给的剩余预算（从等空间开始的那一段里还剩多少）。
+        copy 还没返回时到点，取消等待：那时还没有任务号，不按「提交失败
+        之后的部分落账」再记一笔。若取消时已经发出一部分 create_copy_task，
+        落账仍由 copy 自己的取消路径负责。放不下（AdmissionWait）和段不存在
+        （AdmissionStop）原样抛出，由闸外决定再等还是停止。
         """
         deadline = time.monotonic() + timeout_s
         copy_task = asyncio.create_task(self._ops.copy(prefix, target))
