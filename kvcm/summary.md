@@ -267,9 +267,10 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 - **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自己产生引擎格式的事件
   - **发布端（pub）**：
     - 直接 import 上游 `ZmqEventPublisher`（`kv_events.py:304`）
-    - 事件字段取自 keys.py 的中间产物（hash 链 / token ids）
+    - 事件字段取自 keys.py 的中间产物（hash 链 / token ids）。token 只到满块，个数 = len(block_hashes) × block_size，与命中长度一致（D1 §3）
+    - 操作对应：复制、移动的目标、主动提回 → `BlockStored`；移动的源、删除 → `BlockRemoved`；保活、钉住、停保活不发。本次代码只在预热 READY 发 `BlockStored`，移动和删除在另一分支，合入后再接
     - READY 核验后按目标实例各发一条 `BlockStored`
-    - 每个目标实例一个发布端点；「端点 → 实例」注册归 D4/E13
+    - 每个目标实例一个发布端点。发布路径不调用 `/register`；把地址交给索引仍归 D4/E13
   - **删除信号（升级 mooncake 后）**：
     - 首选：索引侧直接订阅 master publisher、解析 object_key（Conductor 现成，D1 §2 方案 b）
     - 备选：kvcm 加订阅端 + 翻译——订阅 master publisher（F14），从 PoolKey 解析出 block hash、按 rank 去重，重发 `BlockRemoved` / `AllBlocksCleared`；解析对照 mooncake-conductor `object_key_parser.cpp:160-276`（`ParseVllmObjectKey`，已覆盖 vLLM-Ascend key 布局）
@@ -277,8 +278,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
   - **端点生命周期**：
     - 何时为实例开补发端点（实例上线随 E13 事件 / 首次预热该实例时）、实例下线时回收
     - 端口分配与上报编排（与 E12/E13 同通道）
-    - 补发事件 `data_parallel_rank` 字段的取值与消费侧归组行为（目标实例 DP>1 时）；上游 DP 端口偏移先例 `offset_endpoint_port`（`kv_events.py:528`）
-  - 发布端骨架可直接开工
+    - 补发事件 `data_parallel_rank` 固定 0（当前 DP=1）。上游 `offset_endpoint_port`（`kv_events.py:528`）：秩 0 端口不动，秩 k 则基端口 + k。本次不做端口偏移；目标实例 DP>1 时的消费侧归组仍未做
 
 ### C. 性能与生产化
 
