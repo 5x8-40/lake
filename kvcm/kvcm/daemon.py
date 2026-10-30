@@ -51,6 +51,7 @@ from concurrent.futures import ThreadPoolExecutor
 from kvcm.api.grpc_server import IntentGrpcServer
 from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.capability import mooncake_main, mooncake_v0311
+from kvcm.backends.mooncake.http_admin import AdminClient
 from kvcm.backends.mooncake.client import StoreClient
 from kvcm.engines.vllm.keys import KeyComputer
 from kvcm.api.events import EventPublisher, parse_kv_event_endpoints
@@ -77,6 +78,13 @@ def build_backend(
     )
     segs = [s for s in args.segs.split(",") if s]
     capability = mooncake_main() if args.capability == "main" else mooncake_v0311()
+    # 显式 --admin 优先；缺省从 --master 的 host 推出管理端口（默认 9003）。
+    explicit_admin = getattr(args, "admin", None)
+    if explicit_admin:
+        admin_base = explicit_admin
+    else:
+        host = args.master.rsplit(":", 1)[0]
+        admin_base = f"http://{host}:9003"
     return MooncakeBackend(
         client=client,
         key_computer=keys,
@@ -86,6 +94,7 @@ def build_backend(
         submit_concurrency=args.copy_submit_concurrency,
         rpc_timeout_s=args.rpc_timeout_s,
         executor=executor,
+        admin=AdminClient(admin_base),
     )
 
 
@@ -452,6 +461,14 @@ def main(argv: list[str] | None = None) -> int:
             "每个实例一个地址，与引擎自己的端口分开；第一次补发时才绑定，"
             "进程退出才关，实例下线不关。"
             "没有端点或发送失败只记日志，预热仍成功"
+        ),
+    )
+    p.add_argument(
+        "--admin",
+        default=None,
+        help=(
+            "master 管理端口 base URL；缺省从 --master 的 host 推出 "
+            "http://{host}:9003（master 形如 host:50088）"
         ),
     )
     return run(p.parse_args(argv))

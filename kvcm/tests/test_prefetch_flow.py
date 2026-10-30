@@ -166,3 +166,52 @@ def test_timeout_abandons_handle() -> None:
     with pytest.raises(PrefetchError, match="not READY"):
         run(PrefetchFlow(ops).run(_P, _T, poll_s=0, timeout_s=0.01))
     assert "abandon" in ops.calls
+
+
+def test_timeout_cancels_copy_before_handle() -> None:
+    """copy 还没返回时超时：取消等待。没有句柄，不 abandon，也不另记一笔。"""
+    import asyncio
+
+    class _Hang(FakeOps):
+        async def copy(self, prefix, target):
+            self.calls.append("copy")
+            await asyncio.sleep(30)
+            self.calls.append("copy_returned")
+            return TaskHandle(op=OpKind.COPY, task_ids=((1, 2),))
+
+    async def scenario():
+        ops = _Hang(exists=True, seq=[])
+        with pytest.raises(PrefetchError, match="cancelled before handle"):
+            await PrefetchFlow(ops).run_after_exists(
+                _P, _T, poll_s=0.01, timeout_s=0.05
+            )
+        assert "abandon" not in ops.calls
+        assert "copy_returned" not in ops.calls
+
+    run(scenario())
+
+
+def test_timeout_budget_covers_copy_and_poll() -> None:
+    """同一段 timeout_s 覆盖提交和轮询，不是两段相加。"""
+    import asyncio
+    import time
+
+    class _SlowCopy(FakeOps):
+        async def copy(self, prefix, target):
+            self.calls.append("copy")
+            await asyncio.sleep(0.3)
+            return TaskHandle(op=OpKind.COPY, task_ids=((1, 2),))
+
+    async def scenario():
+        ops = _SlowCopy(exists=True, seq=[])  # 轮询永远 RUNNING
+        start = time.monotonic()
+        with pytest.raises(PrefetchError, match="not READY"):
+            await PrefetchFlow(ops).run_after_exists(
+                _P, _T, poll_s=0.05, timeout_s=0.45
+            )
+        elapsed = time.monotonic() - start
+        # 分段相加至少是 0.3+0.45。同一段预算应靠近 0.45。
+        assert elapsed < 0.7, f"超时被加成两段: {elapsed:.2f}s"
+        assert "abandon" in ops.calls
+
+    run(scenario())
