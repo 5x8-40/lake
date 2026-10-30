@@ -1448,21 +1448,37 @@ def test_admit_submits_when_segment_has_room(fake_store_module, monkeypatch) -> 
     assert [k for k, _segs in client.created] == [key]
 
 
-def test_admit_holds_whole_batch_until_space(fake_store_module, monkeypatch) -> None:
-    """放不下整批不发；空间下来后再发。"""
+def test_admit_waits_outside_the_prefix_gate(fake_store_module, monkeypatch) -> None:
+    """放不下时在前缀闸外等：睡眠时闸是空的，整批还没发；空间下来再进闸提交。
+
+    大小只在等待开始时取一次，之后每轮只打 /query_segment。
+    """
+    from kvcm.task_engine import TaskEngine
+
     keys = [_rank_key("a", 0), _rank_key("b", 0)]
     client = _LayoutClient({k: [("__source__", 100, ())] for k in keys})
+    client.measure_calls = 0
+    orig = client.batch_memory_replica_sizes
+
+    def _counting(keys_):
+        client.measure_calls += 1
+        return orig(keys_)
+
+    client.batch_memory_replica_sizes = _counting
     admin = _TableAdmin({"seg-A": (0, 10)})  # 两个 key 共 200，剩余 10
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=keys)
+    eng = TaskEngine(b, max_concurrent=1)
 
     async def _sleep(seconds):
         assert seconds == 0.5
         assert client.created == []
+        assert not eng._gate.locked()
         admin.table["seg-A"] = (0, 10**9)
 
-    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
-    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=keys)
-    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    monkeypatch.setattr("kvcm.task_engine.asyncio.sleep", _sleep)
+    run(eng.run_once(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
     assert [k for k, _segs in client.created] == keys
+    assert client.measure_calls == 1
 
 
 def test_admit_ignores_keys_already_on_target(fake_store_module, monkeypatch) -> None:
@@ -1488,26 +1504,21 @@ def test_admit_ignores_keys_already_on_target(fake_store_module, monkeypatch) ->
     assert [k for k, _segs in client.created] == [on_seg, fresh]
 
 
-def test_admit_groups_by_segment(fake_store_module, monkeypatch) -> None:
-    """按段分组。A 放得下、B 放不下时整批不发；不能因为 A 够就把 B 也发出去。
+def test_admit_queries_segment_once(fake_store_module, monkeypatch) -> None:
+    """同一组目标段只打一次 /query_segment。任一段新占用大于这份剩余，整批不发。"""
+    from kvcm.ops.base import AdmissionWait
 
-    空间下来后两个段上的 key 一起发。
-    """
     key_a = _rank_key("a", 0)
     key_b = _rank_key("b", 1)
     client = _LayoutClient(
         {
             key_a: [("__source__", 100, ())],
-            key_b: [("__source__", 100, ())],
+            key_b: [("__source__", 300, ())],
         }
     )
-    admin = _TableAdmin({"seg-A": (0, 1000), "seg-B": (0, 50)})
-
-    async def _sleep(_seconds):
-        assert client.created == []
-        admin.table["seg-B"] = (0, 1000)
-
-    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
+    # 只应查到计划里的第一个目标段。B 的 300 大于这份剩余 150，整批不发。
+    admin = _TableAdmin({"seg-A": (0, 150), "seg-B": (0, 10**9)})
+    _forbid_wait(monkeypatch)
     b = _admit_backend(
         client,
         monkeypatch,
@@ -1515,15 +1526,16 @@ def test_admit_groups_by_segment(fake_store_module, monkeypatch) -> None:
         segs=["seg-A", "seg-B"],
         keys=[key_a, key_b],
     )
-    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
-    assert {seg for _k, segs in client.created for seg in segs} == {"seg-A", "seg-B"}
-    assert len(client.created) == 2
+    with pytest.raises(AdmissionWait):
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client.created == []
+    assert admin.calls == ["seg-A"]
 
 
 def test_admit_does_not_compare_batch_sum_to_one_segment(
     fake_store_module, monkeypatch
 ) -> None:
-    """两段各剩余 150、各需 100。整批 200 大于任一段剩余，但分段后放得下，应直接发。"""
+    """两段各需 100，只查到的一份剩余是 150。整批 200 大于这份剩余，但按段都放得下，应发，且只查一次。"""
     key_a = _rank_key("a", 0)
     key_b = _rank_key("b", 1)
     client = _LayoutClient(
@@ -1543,6 +1555,7 @@ def test_admit_does_not_compare_batch_sum_to_one_segment(
     )
     run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
     assert len(client.created) == 2
+    assert admin.calls == ["seg-A"]
 
 
 def test_admit_estimates_missing_sizes(fake_store_module, monkeypatch, caplog) -> None:
@@ -1564,13 +1577,10 @@ def test_admit_estimates_missing_sizes(fake_store_module, monkeypatch, caplog) -
             miss_b: [("__source__", None, attrs)],
         }
     )
+    from kvcm.ops.base import AdmissionWait
+
     admin = _TableAdmin({"seg-A": (0, 250)})
-
-    async def _sleep(_seconds):
-        assert client.created == []
-        admin.table["seg-A"] = (0, 10**9)
-
-    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
+    _forbid_wait(monkeypatch)
     caplog.set_level(logging.INFO, logger="kvcm.backends.mooncake.backend")
     b = _admit_backend(
         client,
@@ -1579,14 +1589,16 @@ def test_admit_estimates_missing_sizes(fake_store_module, monkeypatch, caplog) -
         segs=["seg-A"],
         keys=[known, miss_a, miss_b],
     )
-    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
-    assert len(client.created) == 3
+    with pytest.raises(AdmissionWait):
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client.created == []
     assert "估算" in caplog.text
 
 
 def test_admit_missing_segment_fails_immediately(fake_store_module, monkeypatch) -> None:
-    """段名找不到：立即 SubmitError，不空等。容量为 0 同样当找不到。"""
+    """段名找不到：立即停，不空等。容量为 0 同样当找不到。不是复制失败。"""
     from kvcm.backends.mooncake.http_admin import SegmentNotFound
+    from kvcm.ops.base import AdmissionStop
 
     key = _rank_key("a", 0)
     client = _LayoutClient({key: [("__source__", 100, ())]})
@@ -1594,26 +1606,35 @@ def test_admit_missing_segment_fails_immediately(fake_store_module, monkeypatch)
 
     missing = _TableAdmin({"seg-A": SegmentNotFound("gone")})
     b = _admit_backend(client, monkeypatch, admin=missing, segs=["seg-A"], keys=[key])
-    with pytest.raises(SubmitError, match="段不存在"):
+    with pytest.raises(AdmissionStop, match="段不存在"):
         run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
     assert client.created == []
 
     client2 = _LayoutClient({key: [("__source__", 100, ())]})
     zero = _TableAdmin({"seg-A": (0, 0)})
     b2 = _admit_backend(client2, monkeypatch, admin=zero, segs=["seg-A"], keys=[key])
-    with pytest.raises(SubmitError, match="段不存在"):
+    with pytest.raises(AdmissionStop, match="段不存在"):
         run(b2.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
     assert client2.created == []
 
 
 def test_admit_retries_transient_admin_error(fake_store_module, monkeypatch, caplog) -> None:
-    """管理端口暂时 5xx：记日志并重查，不盲提交。"""
+    """管理端口暂时 5xx：闸外等待后重查，不盲提交。大小不随每轮重取。"""
     import logging
 
     from kvcm.backends.mooncake.http_admin import AdminError
+    from kvcm.task_engine import TaskEngine
 
     key = _rank_key("a", 0)
     client = _LayoutClient({key: [("__source__", 100, ())]})
+    client.measure_calls = 0
+    orig = client.batch_memory_replica_sizes
+
+    def _counting(keys_):
+        client.measure_calls += 1
+        return orig(keys_)
+
+    client.batch_memory_replica_sizes = _counting
 
     class _Flaky:
         def __init__(self) -> None:
@@ -1628,13 +1649,16 @@ def test_admit_retries_transient_admin_error(fake_store_module, monkeypatch, cap
     async def _sleep(_seconds):
         assert client.created == []
 
-    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
+    monkeypatch.setattr("kvcm.task_engine.asyncio.sleep", _sleep)
     caplog.set_level(logging.WARNING, logger="kvcm.backends.mooncake.backend")
     admin = _Flaky()
     b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
-    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    run(TaskEngine(b, max_concurrent=1).run_once(
+        Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")
+    ))
     assert admin.n >= 2
     assert len(client.created) == 1
+    assert client.measure_calls == 1
     assert "重试" in caplog.text
 
 
@@ -1689,7 +1713,9 @@ def test_admit_without_admin_refuses(fake_store_module, monkeypatch) -> None:
 def test_admit_cancel_before_submit_records_nothing(
     fake_store_module, monkeypatch
 ) -> None:
-    """取消落在等空间时：还没有任务号，不落账。"""
+    """闸外等空间时被取消：还没有任务号，不记成复制失败。"""
+    from kvcm.task_engine import TaskEngine
+
     key = _rank_key("a", 0)
     client = _LayoutClient({key: [("__source__", 100, ())]})
     admin = _TableAdmin({"seg-A": (100, 100)})  # 剩余 0，一直等
@@ -1699,15 +1725,19 @@ def test_admit_cancel_before_submit_records_nothing(
     try:
         b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
         b._ledger = led
+        eng = TaskEngine(b, max_concurrent=1)
 
         async def scenario():
             task = asyncio.create_task(
-                b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B"))
+                eng.run_once(
+                    Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")
+                )
             )
             deadline = time.monotonic() + 2
             while not admin.calls and time.monotonic() < deadline:
                 await asyncio.sleep(0.01)
             assert admin.calls, "还没开始查段"
+            assert not eng._gate.locked()
             task.cancel()
             with pytest.raises(asyncio.CancelledError):
                 await task

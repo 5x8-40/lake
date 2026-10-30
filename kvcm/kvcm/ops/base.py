@@ -91,6 +91,20 @@ class SubmitError(RuntimeError):
     """
 
 
+class AdmissionWait(Exception):
+    """这一轮目标段放不下，或管理端口暂时连不上。
+
+    调用方在前缀闸外等待后再查。不是复制失败，没有任务号。
+    """
+
+
+class AdmissionStop(Exception):
+    """目标段在 master 上不存在。
+
+    不等待。这次预热停止，不记成复制失败。
+    """
+
+
 class KvOps(ABC):
     """原子操作接口。实现由存储后端适配器提供（如 mooncake 后端）。
 

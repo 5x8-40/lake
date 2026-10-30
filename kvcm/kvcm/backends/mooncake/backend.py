@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import functools
 import logging
 import os
@@ -33,6 +34,8 @@ from kvcm.ops.base import (
     KvOps,
     OpKind,
     QueryError,
+    AdmissionStop,
+    AdmissionWait,
     SubmitError,
     TaskHandle,
     TaskStatus,
@@ -43,6 +46,18 @@ from kvcm.ops.capability import BackendCapability, Support
 from kvcm.ops.types import InstanceId, PinKind, Prefix
 
 logger = logging.getLogger(__name__)
+
+# 一轮预热等待的字节需求。只在该协程里有效，并发的前缀各持各的。
+# None = 还没取大小；缺省 _UNSET = 不在 TaskEngine 的等待里（直接 copy）。
+class _AdmissionSlot:
+    def __init__(self) -> None:
+        self.need: dict[str, int] | None = None
+
+
+_UNSET = object()
+_admission_need: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "kvcm_admission_need", default=_UNSET
+)
 
 
 def _name_of(fn: Any) -> str:
@@ -145,11 +160,9 @@ class MooncakeBackend(KvOps):
         # 协程侧 RPC 超时（0.3.11 的绑定没有超时参数；main 有
         # MC_RPC_TIMEOUT_MS，届时可与此对齐）。<=0 表示不设超时。
         self._rpc_timeout_s = rpc_timeout_s
-        # 管理端口：查目标段 allocator 的 used/capacity。没有它就不知道
-        # 剩余，准入直接拒绝，不许盲提交。
+        # 管理端口：同一组目标段剩余相同，每轮只打一次 /query_segment。
+        # 没有它就不知道剩余，准入直接拒绝，不许盲提交。
         self._admin = admin
-        # 放不下时的重查间隔。调用方超时靠取消本协程，不另加一段预算。
-        self._admit_interval_s = 0.5
         self._executor = executor or ThreadPoolExecutor(
             max_workers=max(4, min(8, (os.cpu_count() or 4))), thread_name_prefix="kvcm-rpc"
         )
@@ -296,60 +309,86 @@ class MooncakeBackend(KvOps):
             self._submit_sem = asyncio.Semaphore(self._submit_concurrency)
         return self._submit_sem
 
+    def open_copy_admission(self) -> contextvars.Token:
+        """一轮预热等待开始。大小留到第一次判断时再取。"""
+        return _admission_need.set(_AdmissionSlot())
+
+    def close_copy_admission(self, token: contextvars.Token) -> None:
+        _admission_need.reset(token)
+
+    def _copy_plan(self, prefix: Prefix, target: InstanceId) -> list[tuple[str, str]]:
+        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        if not keys:
+            return []
+        return self._keys.build_plan(keys, list(self._locate(target)))
+
+    async def admit_planned_copy(self, prefix: Prefix, target: InstanceId) -> None:
+        """闸外判断。放不下抛 AdmissionWait，段不存在抛 AdmissionStop。
+
+        不在这里等。等待循环在 TaskEngine，而且在前缀闸外面。
+        """
+        await self._admit_new_bytes(self._copy_plan(prefix, target))
+
     async def _admit_new_bytes(self, plan: list[tuple[str, str]]) -> None:
-        """提交前判断每个目标段还放不放得下。
+        """判断这一批现在放不放得下。不 sleep，函数里没有提交。
 
-        plan 是 (key, 目标段名)。按目标段分组：只把「该段上还没有内存
-        副本」的 key 算进新占用量（段名出现在该 key 的内存副本
-        transport_endpoint 里即算已在，与副本核验同一判定）。某一段上
-        新占用量大于该段剩余，整批不发 create_copy_task，睡
-        ``_admit_interval_s``（默认 0.5 秒）再查，直到放得下、被取消、
-        或调用方取消这次等待。
+        plan 是 (key, 目标段名)。字节需求在一轮等待开始时用一次
+        batch_get_replica_desc 取齐，之后每轮只打一次
+        GET /query_segment（同一组目标段剩余相同），不再重查大小。
 
-        段名找不到立即 SubmitError，不空等。管理端口连不上或暂时 5xx
-        记日志后按同一间隔重查，不盲提交。没有 admin 客户端抛 QueryError。
+        放不下或管理端口暂时连不上：AdmissionWait（闸外再等）。
+        段名在 master 上不存在：AdmissionStop（这次预热停止）。
+        没有 admin、或整批一个大小都没有：QueryError，拒绝提交。
 
         查完到真正占上之间，别的请求仍可能先占。这里不加锁、不向 master
         预留——只能少失败，不能保证提交时空间还在。
         """
         if not plan:
             return
+        slot = _admission_need.get()
+        if isinstance(slot, _AdmissionSlot):
+            if slot.need is None:
+                slot.need = await self._new_bytes_by_segment(plan)
+            need = slot.need
+        else:
+            need = await self._new_bytes_by_segment(plan)
+        if not need:
+            return
+        # 计划里的目标段取一个名字。同一组剩余相同，不要每段各查一次。
+        probe = next(seg for _key, seg in plan)
+        await self._check_segments(need, probe)
+
+    async def _check_segments(self, need: dict[str, int], probe: str) -> None:
+        """打一次 /query_segment。任一段的新占用大于这一份剩余，整批不发。"""
         if self._admin is None:
             raise QueryError("没有 admin 客户端，无法知道目标段剩余，拒绝提交")
-        while True:
-            need = await self._new_bytes_by_segment(plan)
-            if not need:
-                return
-            blocked = False
-            for seg, nbytes in need.items():
-                try:
-                    used, capacity = await self._rpc(self._admin.query_segment, seg)
-                except SegmentNotFound as e:
-                    raise SubmitError(f"段不存在: {seg}") from e
-                except AdminError as e:
-                    if e.status is None or e.status >= 500:
-                        logger.warning(
-                            "准入：查询段 %s 失败（%s），稍后重试", seg, e
-                        )
-                        blocked = True
-                        continue
-                    raise QueryError(str(e)) from e
-                # query_segment 已把容量 0 当成找不到。这里再挡一层，
-                # 避免桩或旧返回把「没有这段」说成剩余 0。
-                if capacity == 0:
-                    raise SubmitError(f"段不存在: {seg}")
-                remaining = capacity - used
-                if nbytes > remaining:
-                    logger.info(
-                        "准入等待：段 %s 需要 %d 字节，剩余 %d 字节",
-                        seg,
-                        nbytes,
-                        remaining,
-                    )
-                    blocked = True
-            if not blocked:
-                return
-            await asyncio.sleep(self._admit_interval_s)
+        try:
+            used, capacity = await self._rpc(self._admin.query_segment, probe)
+        except SegmentNotFound as e:
+            raise AdmissionStop(f"段不存在: {probe}") from e
+        except AdminError as e:
+            if e.status is None or (e.status is not None and e.status >= 500):
+                logger.warning("准入：查询段 %s 失败（%s），闸外稍后重试", probe, e)
+                raise AdmissionWait(f"管理端口暂时不可用: {probe}") from e
+            raise QueryError(str(e)) from e
+        # 容量为 0 是段不存在（QuerySegments），不当成剩余 0 去等。
+        if capacity == 0:
+            raise AdmissionStop(f"段不存在: {probe}")
+        remaining = capacity - used
+        short = [
+            seg for seg, nbytes in need.items() if nbytes > remaining
+        ]
+        for seg in short:
+            logger.info(
+                "准入等待：段 %s 需要 %d 字节，剩余 %d 字节",
+                seg,
+                need[seg],
+                remaining,
+            )
+        if short:
+            raise AdmissionWait(
+                "段放不下: " + ",".join(short) + f" remaining={remaining}"
+            )
 
     async def _new_bytes_by_segment(
         self, plan: list[tuple[str, str]]
@@ -389,6 +428,7 @@ class MooncakeBackend(KvOps):
             if (key, seg) in seen:
                 continue
             seen.add((key, seg))
+            # 已在该段上的 key 不计入，也不参加后面的估算乘法。
             if seg in placed.get(key, ()):
                 continue
             size = known.get(key)
@@ -425,8 +465,9 @@ class MooncakeBackend(KvOps):
             )
         targets = list(self._locate(target))
         plan = self._keys.build_plan(keys, targets)
-        # 会在目标段上新占内存，先走同一处判断。取消落在这里时还没有
-        # 任务号，不进下面的部分落账。
+        # 进闸之后、真正提交之前再查一次。不在这里等：放不下抛
+        # AdmissionWait，调用方立刻出闸。取消落在这里时还没有任务号，
+        # 不进下面的部分落账。
         await self._admit_new_bytes(plan)
         # 下标槽：并发完成顺序不定，按 plan 下标落号，失败时筛出已发出的。
         slots: list[object | None] = [None] * len(plan)
