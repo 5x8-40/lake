@@ -758,8 +758,11 @@ def test_abandon_during_watch_keeps_conflict_ledger(fake_store_module, monkeypat
 
 
 def test_entry_exists_truth_table() -> None:
-    assert entry_exists(1) and entry_exists(True) and entry_exists(2)
-    assert not entry_exists(0) and not entry_exists(False) and not entry_exists(-1)
+    assert entry_exists(1) and entry_exists(True)
+    assert not entry_exists(0) and not entry_exists(False)
+    for code in (2, -1, -900):
+        with pytest.raises(StoreClientError, match=str(code)):
+            entry_exists(code)
 
 
 def test_exists_checks_length(fake_store_module, monkeypatch) -> None:
@@ -780,17 +783,53 @@ def test_exists_all_present(fake_store_module, monkeypatch) -> None:
 
 
 def test_is_exist_per_key_failure_raises() -> None:
-    """batch_is_exist 单 key 返 -1（查询失败）→ StoreClientError，
-    不得吞成「不存在」。"""
+    """查询失败是 ErrorCode 原值，不只是 -1。不得吞成「不存在」。"""
 
     class FakeBinding:
+        def __init__(self, raw):
+            self._raw = raw
+
         def batch_is_exist(self, keys):
-            return [1, -1]
+            return self._raw
 
     client = StoreClient()
-    client._store = FakeBinding()
-    with pytest.raises(StoreClientError, match=r"per-key query failed \(1/2\)"):
+    client._store = FakeBinding([1, -1])
+    with pytest.raises(StoreClientError, match=r"-1"):
         client.is_exist(["k0", "k1"])
+    client._store = FakeBinding([-900])
+    with pytest.raises(StoreClientError, match=r"-900"):
+        client.is_exist(["k0"])
+
+
+def test_keepalive_keeps_row_when_is_exist_returns_rpc_fail(
+    fake_store_module, monkeypatch
+) -> None:
+    """-900 是查失败，不是不在池。保活行不能因此注销。"""
+    from kvcm.loops import KeepaliveLoop
+
+    class Binding:
+        def batch_is_exist(self, keys):
+            return [-900] * len(keys)
+
+    client = StoreClient()
+    client._store = Binding()
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        kc = KeyComputer(model_name="qwen", tp_size=1)
+        b = _backend(client, kc, monkeypatch, ledger=led)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        loop = KeepaliveLoop(b, led, interval_s=999, window_s=600)
+        loop.register(prefix)
+        run(loop.sweep_once())
+        assert led.list_keepalive() == [prefix]
+        loop.close()
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
 
 
 def test_exists_query_failure_is_retryable_query_error(fake_store_module, monkeypatch) -> None:

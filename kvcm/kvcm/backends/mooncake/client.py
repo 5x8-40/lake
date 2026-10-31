@@ -39,9 +39,16 @@ def is_memory_replica(desc: object) -> bool:
 
 
 def entry_exists(e) -> bool:
-    """batch_is_exist 返回项的_truthy 判定——唯一的判定定义，所有
-    「key 是否在池」的调用共用（错误项 -1 不到这里，is_exist 先抛）。"""
-    return e == 1 or e is True or (isinstance(e, int) and e > 0)
+    """batch_is_exist 的成功码：0 = 不存在，1 或 True = 存在。
+
+    其它整数是 ErrorCode（``RPC_FAIL=-900`` 等），不是「存在」。
+    调用方应先拒绝这些码；这里也不把任意正数当成存在。
+    """
+    if e is True or e == 1:
+        return True
+    if e is False or e == 0:
+        return False
+    raise StoreClientError(f"batch_is_exist unexpected code {e!r}")
 
 
 class StoreClientError(RuntimeError):
@@ -125,17 +132,24 @@ class StoreClient:
     def is_exist(self, keys: Sequence[str]) -> list[bool]:
         """batch_is_exist → bool 列表（读即续租——保活机制利用这一点）。
 
-        单 key 查询失败（返回 -1）不吞成「不存在」——抛
-        StoreClientError，由调用方按可重试错误处理（吞掉会让
-        「查询失败」被当成「缓存不存在」，误触发重算/预热）。
+        成功只认 0（不存在）、1 或 True（存在）。其它整数是 ErrorCode
+        原值（``INTERNAL_ERROR=-1``、``RPC_FAIL=-900``、``RPC_TIMEOUT=-901``），
+        抛 StoreClientError，信息里带实际返回值。吞成 False 会让
+        「查失败」变成「不在池」：预热终态失败，保活还会把行注销。
         """
         keys = list(keys)
-        raw = self._s().batch_is_exist(keys)
-        failed = [k for k, e in zip(keys, raw) if e == -1]
+        raw = list(self._s().batch_is_exist(keys))
+        failed = [
+            (k, e)
+            for k, e in zip(keys, raw)
+            if e is not True and e is not False and e not in (0, 1)
+        ]
         if failed:
+            shown = failed[:4]
+            tail = "..." if len(failed) > 4 else ""
             raise StoreClientError(
                 f"batch_is_exist per-key query failed ({len(failed)}/{len(keys)}): "
-                f"{failed[:4]}{'...' if len(failed) > 4 else ''}"
+                f"{shown}{tail}"
             )
         return [entry_exists(e) for e in raw]
 

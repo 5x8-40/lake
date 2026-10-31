@@ -212,8 +212,7 @@ class KeepaliveLoop:
                     self._ledger.unregister_keepalive, rec.prefix
                 )
                 continue
-            live = await self._ledger_call(self._ledger.list_keepalive)
-            if rec.prefix not in live:
+            if not await self._ledger_call(self._ledger.has_keepalive, rec.prefix):
                 # 快照之后 stop_keepalive 已删行。再 exists 会把刚停的租约授满。
                 continue
             try:

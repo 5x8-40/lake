@@ -369,6 +369,17 @@ class Ledger:
             )
         return out
 
+    def has_keepalive(self, prefix: Prefix) -> bool:
+        """这一行还在不在。按 prefix_key 查一行，不读整表。"""
+        return self._run(self._has_keepalive_sync, prefix)
+
+    def _has_keepalive_sync(self, prefix: Prefix) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM keepalive WHERE prefix_key = ?",
+            (prefix_key(prefix),),
+        ).fetchone()
+        return row is not None
+
     def list_keepalive(self) -> list[Prefix]:
         """全部在保前缀（只还原 Prefix；需要 registered_at 的调用方用
         list_keepalive_records）。"""

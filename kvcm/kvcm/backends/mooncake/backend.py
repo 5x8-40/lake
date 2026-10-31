@@ -551,7 +551,7 @@ class MooncakeBackend(KvOps):
     async def exists(self, prefix: Prefix) -> bool:
         """全部 key 在池才为真（batch_is_exist；读即续租）。
 
-        查询本身失败（RPC/单 key -1）抛 QueryError——「查不出来」与
+        查询本身失败（返回值不是 0/1/True）抛 QueryError——「查不出来」与
         「不存在」语义不同：前者调用方可重试，后者才触发重算/预热。
         返回列表长度与 key 数不一致视为不存在（绑定异常时可能短回）。
         """

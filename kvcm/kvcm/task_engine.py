@@ -161,6 +161,7 @@ class TaskEngine:
         self._finished: OrderedDict[str, _Finished] = OrderedDict()
         self._finished_max = max(1, finished_max)
         self._accepting = True
+        self._programming_errors = 0
         self._consumers: list[asyncio.Task] = []
         self._recover_tasks: list[asyncio.Task] = []
         # 下界，不是容量上限：出队后先做 exists（闸外），再在闸上挂起。
@@ -436,6 +437,7 @@ class TaskEngine:
                     rec.prefix, rec.target, rec.poll_s, rec.timeout_s
                 )
                 self._finish(rec, IntentStatus.READY)
+                self._programming_errors = 0
             except asyncio.CancelledError:
                 self._finish(rec, IntentStatus.FAILED, "cancelled (shutdown)")
                 raise
@@ -445,9 +447,14 @@ class TaskEngine:
                 # QueryError 是 exists 查询失败，不包成 PrefetchError。
                 # IntentInputError 是未登记实例、前缀不足一块、段名单和
                 # TP 对不上、PYTHONHASHSEED 未设。
+                self._programming_errors = 0
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
             except Exception as e:  # 编程错误也留原因，再往上抛（不吞）
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
+                self._programming_errors += 1
+                if self._programming_errors >= 3:
+                    # 消费者会退出。停收，避免新 intent 永远 PENDING。
+                    self._accepting = False
                 raise
             finally:
                 self._queue.task_done()

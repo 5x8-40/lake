@@ -706,6 +706,45 @@ def test_consumer_exits_on_programming_error() -> None:
             await asyncio.sleep(0.1)
             alive = [t for t in eng._consumers if not t.done()]
             assert not alive, f"编程错误后消费者还活着: {len(alive)} 条"
+            assert eng._accepting is True
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_three_programming_errors_stop_accepting() -> None:
+    """连续 3 次编程错误后停收。错误仍然抛出，不吞掉继续循环。"""
+
+    class BoomOps(FakeOps):
+        async def exists(self, prefix):
+            raise TypeError("programming bug")
+
+    async def scenario():
+        eng = TaskEngine(BoomOps(), max_concurrent=1, consumer_count=3)
+        eng.start()
+        try:
+            keys = [
+                eng.submit_intent(
+                    Prefix(model_id="q", token_ids=(i,)), _T, poll_s=0.01
+                )
+                for i in range(3)
+            ]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if not eng._accepting and all(
+                    eng.intent_status(k) is IntentStatus.FAILED for k in keys
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            assert eng._accepting is False
+            for key in keys:
+                assert eng.intent_status(key) is IntentStatus.FAILED
+                assert "TypeError" in eng.intent_detail(key)
+            alive = [t for t in eng._consumers if not t.done()]
+            assert not alive
+            with pytest.raises(RuntimeError, match="shutting down"):
+                eng.submit_intent(Prefix(model_id="q", token_ids=(9,)), _T)
         finally:
             await eng.shutdown(timeout_s=2)
 
