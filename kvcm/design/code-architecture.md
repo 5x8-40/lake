@@ -264,7 +264,7 @@ stateDiagram-v2
 | soft pin 事后加（用 upsert 空写的方式） | RPC ✓ 通道 ✗（能力集仍按部署版本填写；空写扩展对着主线 `SoftPinAction`） | RPC ✓ 通道 ✓。`_get_pyclient_capsule` 拿回已建 client，扩展调 `MasterClient::UpsertStart` / `UpsertEnd`，不 `TransferWrite`，不第二次 `create` | D2 F1/F12 |
 | hard pin 事后改标记 | ✗（创建时固化。`pin(HARD)` 登记保活，不设置这个位。lease 是 master 的 `default_kv_lease_ttl`，kvcm 不改） | ✗ | D2 §2 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源） | ✗ | D2 F7 |
-| has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活、等满一个 lease TTL、再用 `GET /batch_query_keys` 确认盘副本，没有就失败；不用 `GetReplicaList`，那会续租。提回 = GetReplicaList 累计命中，默认 2 次） | 同左 | D2 §3 |
+| has_offload / has_promotion（池通道降层/提回） | 降层通道 ✗（`/batch_query_keys` 没有 `disk_values` / `local_disk_values`，主线 #2685 才加）。提回通道 ✓（GetReplicaList 累计命中，默认 2 次） | 降层通道 ✓（停保活、等满一个 lease TTL、再用 `GET /batch_query_keys` 确认盘副本；不用 `GetReplicaList`，那会续租）。提回同左 | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
 | has_retained_client（保留身份注册） | ✗ | 先不做。这份主线树没有 `AddReplicaForRetainedClient`；`kRetained` 是外部 buffer 引用计数，不是引擎死后 KV 还在 | D2 F13② |
@@ -306,7 +306,7 @@ stateDiagram-v2
 | SegTopology | 查 master 的 seg 名单（见上）；seg、client_id、lease 语义归这里 | `topology.py` |
 | capability 填充 | 按连接上的版本填充（**构造必填**——不许默认冒充 main；目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | `capability.py` |
 
-- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger?)`——`locate`（实例 → rank 有序 seg 列表）以可调用注入。当前 daemon 用 `InstanceDirectory`（`--instance-segs`）。`RankTopology` 仍是 demo 探测，不是现在的进程入口。生产环境的上下线仍是 L1 InstanceWatcher。backend 不关心来源，本类不 import `SegTopology` / `RankTopology` / `AdminClient`，这三件不是它的字段
+- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger=None, submit_concurrency=4, executor=None, rpc_timeout_s=30, admin=None, promote_hits=2, lease_ttl_s=10)`。`locate`（实例 → rank 有序 seg 列表）以可调用注入。`admin` 是主线 `GET /batch_query_keys` 客户端，副本核验和降层查盘用它。当前 daemon 用 `InstanceDirectory`（`--instance-segs`）。`RankTopology` 仍是 demo 探测，不是现在的进程入口。生产环境的上下线仍是 L1 InstanceWatcher。backend 不关心来源，本类不 import `SegTopology` / `RankTopology` / `AdminClient`，这三件不是它的字段
 - **copy 实现**（发起式）：前缀 → KeyComputer 算 key → locate 得 seg → `KeyComputer.build_plan` 做 rank 映射（异构 TP 反向展开）→ 逐 key 提交；`query_task` 聚合判定 READY。**rank 映射归引擎侧**——存储适配零 key 格式依赖（换引擎本类不动）
 - **exists 与 copy 目前各自独立算 key**：两个操作在接口上相互独立，同一前缀在一次预热里算两遍。短序列时成本可忽略，但长序列下不是——链式块 hash 逐块串行（token 数 ÷ block_size 次，不能并行），外加 块数 × rank 数 个 key 字符串。不设缓存（长驻进程的缓存增长管理问题更大）；正解见下「接口演进：KeySet」
 - **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——放通用层会把后端概念带进通用接口
@@ -529,7 +529,7 @@ sequenceDiagram
 
 ### 进程生命周期
 
-- **启动**：`rebuild()` 接通——重启后恢复 running 任务的跟踪（见 L5 节）
+- **启动**：`--admin` 必填，空则在进服务循环前返回 1。`--capability` 默认 `main`（核验走主线零副作用 `GET /batch_query_keys`）；显式 `v0311` 同样在进服务循环前返回 1，那个端点有续租副作用，能力集对不上。然后 `rebuild()` 接通——重启后恢复 running 任务的跟踪（见 L5 节）
 - **优雅退出**（SIGTERM/SIGINT）五步：
   1. **停收 intent**——gRPC 入口关闭（`IntentGrpcServer.stop()`），`TaskEngine._accepting` 置假，`SubmitIntent` 返回 UNAVAILABLE
   2. **取消在途协程**（`task.cancel()`）——协程在 `await` 点收到 `CancelledError`；flow 捕获后做 abandon 处理（Ledger 记 abandoned；后端无任务取消能力 P9，传输不取消，副本清理归 remove）
@@ -559,7 +559,7 @@ sequenceDiagram
 
 ## 与 E10 / E11 / E15 的对位
 
-- **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，73 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
+- **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，192 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
 - **E11（进程化）🔁 实施中**（[PR #70](https://github.com/5x8-40/lake/pull/70)）：设计 = 本文「运行时结构」节。**范围切分**：
   - 本期做：进程壳（启动/退出/rebuild 接通）+ TaskEngine + KeepaliveLoop（唯一常驻循环）+ IntentReceiver（gRPC，E12）+ **copy 并发提交**（信号量窗口，见 TaskEngine 节）
   - 只留类骨架：ReleaseLoop、RetainLoop（不调用已落地的 move / remove / demote；retain 通道关闭，不登记）

@@ -9,7 +9,7 @@
    口径与引擎漂移，直接失败（复制了也没意义）
 2. **copy 发起**：前缀 → key 列表 → rank 映射计划 → 逐 key 提交复制任务
 3. **query_task 轮询到 READY**：任务全部完成 + 副本核验通过
-4. （待接通）keepalive 注册、READY 事件补发（`BlockStored`）
+4. 保活由 `TaskEngine._run_prefetch` 在流程返回后注册。READY 事件补发（`BlockStored`）仍未接通
 
 ## 数据流
 
@@ -53,7 +53,8 @@ sequenceDiagram
             SC-->>BE: task_id
         end
         alt 提交中途失败
-            BE-->>Flow: SubmitError, 已发 id 只在异常消息里
+            BE-->>Flow: SubmitError（带已落账句柄）
+            Flow->>BE: abandon(句柄)，池里的传输不取消
         else 提交成功
             BE->>DB: upsert status=running
             BE-->>Flow: TaskHandle
@@ -67,9 +68,8 @@ sequenceDiagram
                     Note over BE: 不再向 master 查任务
                 end
                 opt 要核验副本
-                    BE->>SC: batch_get_replica_desc
-                    SC->>M: RPC 绑定, 不是 HTTP
-                    M-->>BE: 每个 key 落在哪些 seg
+                    BE->>M: GET /batch_query_keys（admin，不是 batch_get_replica_desc）
+                    M-->>BE: 每个 key 的传输端点
                 end
                 alt 全部成功且副本齐
                     BE->>DB: status=ready
@@ -96,8 +96,8 @@ sequenceDiagram
   `keys` → 排出 `plan`（复制计划：每条 key 复制到哪个 seg）→ 每条
   key 提交后拿回一个任务号（两个整数组成的整数对）→ 写进 Ledger（任务
   号编码成 `"整数:整数"` 的字符串，连同 handle_id、token_ids）
-- 与 master 的交互这次执行里全是绑定 RPC；HTTP `/batch_query_keys` 还
-  没接通
+- 任务查询走绑定 RPC。副本核验走 admin 的 `GET /batch_query_keys`，
+  不用 `batch_get_replica_desc`
 - Ledger 只在 copy 成功、到终态、进入等副本状态、abandon 时写。
   exists 失败和提交失败不写行
 - 图里的「超时」指本次预热的截止时间到了，接下来流程调用
@@ -122,5 +122,5 @@ sequenceDiagram
 - **StoreClient**：绑定 RPC（exists / copy 提交 / query_task / 副本核验）
 - **Ledger**：任务状态（running → ready/failed/abandoned）
 - **EventPublisher**（待接通）：READY 后按目标实例端点补发 `BlockStored`
-- **keepalive**（待接通）：READY 后注册保活（见
+- **keepalive**：`TaskEngine._run_prefetch` 在流程返回 READY 后注册保活（见
   [../code-architecture.md](../code-architecture.md) 运行时结构节）

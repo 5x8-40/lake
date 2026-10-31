@@ -658,8 +658,10 @@ def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> N
         monkeypatch,
         submit_concurrency=1,  # 逐 key：第 2 个必失败，不靠撞时序
     )
-    with pytest.raises(SubmitError, match=r"1/2 tasks.*\[\(1, 101\)\]"):
+    with pytest.raises(SubmitError, match=r"1/2 tasks.*\[\(1, 101\)\]") as ei:
         run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert ei.value.handle is not None
+    assert ei.value.handle.task_ids == ((1, 101),)
 
 
 # ---------------------------------------------------------------------------
@@ -1120,6 +1122,28 @@ def test_pin_soft_calls_client(fake_store_module, monkeypatch) -> None:
     run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
     assert seen["enable"] is True
     assert seen["keys"] == ["k0"]
+
+
+def test_pin_soft_disable_calls_empty_write(fake_store_module, monkeypatch) -> None:
+    seen = {}
+
+    class Client(FakeClient):
+        def soft_pin(self, keys, *, enable=True):
+            seen["keys"] = list(keys)
+            seen["enable"] = enable
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+    )
+    run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT, enable=False))
+    assert seen == {"keys": ["k0"], "enable": False}
+    with pytest.raises(ValueError, match="enable=False"):
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD, enable=False))
 
 
 def test_pin_hard_registers_keepalive(fake_store_module, monkeypatch) -> None:
@@ -1864,11 +1888,35 @@ def _demote_backend(monkeypatch, led, admin, *, lease_ttl_s: float):
         client=client,
         key_computer=kc,
         locate=lambda _inst: ["seg-A"],
-        capability=mooncake_v0311(),
+        capability=mooncake_main(),
         ledger=led,
         admin=admin,
         lease_ttl_s=lease_ttl_s,
     )
+
+
+def test_demote_v0311_refuses_before_stop_keepalive(
+    fake_store_module, monkeypatch
+) -> None:
+    """0.3.11 查不到盘副本字段。通道 NO，停保活之前就拒绝。"""
+    assert mooncake_v0311().has_offload.channel is Support.NO
+    assert mooncake_main().has_offload.channel is Support.YES
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, object(), lease_ttl_s=0)
+        b._cap = mooncake_v0311()
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.keepalive(prefix))
+        with pytest.raises(UnsupportedCapabilityError, match="盘副本"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
 
 
 def test_demote_fails_without_disk_replica(fake_store_module, monkeypatch) -> None:
@@ -1894,7 +1942,7 @@ def test_demote_fails_without_disk_replica(fake_store_module, monkeypatch) -> No
         b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
         prefix = Prefix(model_id="qwen", token_ids=(1,))
         run(b.keepalive(prefix))
-        with pytest.raises(RuntimeError, match="还没有盘副本"):
+        with pytest.raises(VerifyError, match="还没有盘副本"):
             run(b.demote(prefix))
         assert led.list_keepalive() == []
         assert steps == [("sleep", 0, []), ("query", ["k0"])]
@@ -1997,7 +2045,7 @@ def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> 
     assert run(b.query_task(handle)) is TaskStatus.READY
 
     client._replicas_on = ["seg-ELSE"]
-    with pytest.raises(RuntimeError, match="没有提回成功"):
+    with pytest.raises(VerifyError, match="没有提回成功"):
         run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
 
 

@@ -86,10 +86,15 @@ class QueryError(RuntimeError):
 class SubmitError(RuntimeError):
     """操作提交失败（copy/move/promote 的发起阶段）。
 
-    异常消息携带明细（如已发起的任务号——中途失败时那些任务需要跟踪）。
+    已经落账的句柄放在 ``handle`` 上，交给流程 ``abandon``（账本记
+    abandoned）。池里的传输不取消。没有任务号时 ``handle`` 为 None。
     与 QueryError（查询可重试）、VerifyError（核验终态）区分：提交失败
     的重试策略归编排层（幂等键 + 后端幂等兜底）。
     """
+
+    def __init__(self, message: str = "", *args, handle: TaskHandle | None = None):
+        super().__init__(message, *args)
+        self.handle = handle
 
 
 class KvOps(ABC):
@@ -149,9 +154,11 @@ class KvOps(ABC):
         """注销保活。不是第九项操作——是 keepalive 注册的管理面。"""
         raise self._unsupported("stop_keepalive")
 
-    async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
-        """防驱逐。SOFT 是事后 soft pin，不写数据。
-        HARD 标记创建时固化，能力集 hard_pin_after 表示不能事后改这个位。
+    async def pin(
+        self, prefix: Prefix, kind: PinKind = PinKind.SOFT, *, enable: bool = True
+    ) -> None:
+        """防驱逐。SOFT 是事后 soft pin，不写数据。``enable=False`` 走空写关闭。
+        HARD 标记创建时固化，不接受 ``enable=False``。
         mooncake 上 pin(HARD) 的控制效果是登记保活，不是设置这个位。无 READY。"""
         raise self._unsupported("pin")
 

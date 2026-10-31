@@ -31,11 +31,11 @@ def mooncake_v0311() -> BackendCapability:
         ),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
         has_offload=Capability(
-            Support.YES,
-            Support.YES,
-            "降层 = 先停保活，等满一个 lease TTL，再用 GET /batch_query_keys "
-            "查 disk / local_disk；没有盘副本就失败。"
-            "不用 GetReplicaList（会续租）",
+            Support.NO,
+            Support.NO,
+            "0.3.11 的 /batch_query_keys 只有内存副本，没有 disk_values / "
+            "local_disk_values（主线 #2685 才加）。按它查盘会定判成没有盘副本。"
+            "通道不具备，demote 在停保活前拒绝",
         ),
         has_promotion=Capability(
             Support.YES,

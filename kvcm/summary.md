@@ -76,7 +76,7 @@
 - locate：进程内「实例 → rank 有序段名单」。intent 和操作入参没有 segment。没登记的实例报错。
 - remove：`force=False` 不停保活，`batch_remove(..., force=False)`；`force=True` 先停这份前缀的保活，再 `force=True`。
 - 保活续租用 BatchExistKey（`exists` → `batch_is_exist`），不用 ProbeKey。`keepalive` / `stop_keepalive` 只登记或注销 Ledger 里的同一张表。
-- 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回不用这条，用会累计命中的 GetReplicaList（默认 2 次）。
+- 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回不用这条，用会累计命中的 GetReplicaList（默认 2 次）。daemon `--admin` 必填；`--capability` 默认 `main`。`v0311` 启动直接失败：那个端点有续租副作用，也没有盘副本字段。
 - 软钉空写：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。wheel 不带 C++ 头文件，扩展只链 `store.so`。`get_real_client()` 是退路：只有以后真实调用失败，才包含 `pyclient.h`，在对象还原成 `MooncakeStorePyWrapper` 之后取出已建 client。现在不走这条。client_id 用方案一：`UpsertStart` 发出的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时副本留在 PROCESSING。扫任务记录再补 End/Revoke 的崩溃恢复暂时不做，这次不写（D2 F5）。保留身份先不动。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
 - pin：READY 后防驱逐——硬钉走候选 ①，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2

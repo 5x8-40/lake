@@ -213,7 +213,6 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
             ledger,
             interval_s=args.keepalive_interval_s,
             window_s=args.keepalive_window_s,
-            executor=backend.executor,
         )
         engine = TaskEngine(backend, keepalive=keepalive, max_concurrent=args.max_concurrent)
         # 2. 重启恢复：running 任务重建跟踪，收编进 TaskEngine
@@ -358,6 +357,14 @@ def run(args: argparse.Namespace, *, stop: asyncio.Event | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    if getattr(args, "capability", "main") == "v0311":
+        print(
+            "[kvcm] startup: --capability v0311 不能用来核验。"
+            "副本核验要主线的零副作用 GET /batch_query_keys。"
+            "0.3.11 的这个端点有续租副作用，能力集对不上。不进入服务循环。",
+            file=sys.stderr,
+        )
+        return 1
 
     async def _main() -> int:
         ev = stop or asyncio.Event()
@@ -412,8 +419,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--capability",
         choices=["v0311", "main"],
-        default="v0311",
-        help="后端版本能力集（填错 = 编排选错路径）",
+        default="main",
+        help="后端版本能力集。默认 main：核验走主线零副作用 GET /batch_query_keys。"
+        "v0311 启动直接失败，那个端点有续租副作用，能力集对不上",
     )
     p.add_argument("--ledger", required=True, help="Ledger sqlite 路径")
     p.add_argument(

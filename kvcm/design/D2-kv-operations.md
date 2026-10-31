@@ -207,7 +207,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 - **F12 空写的发送通道**
   - master 协议层：`UpsertStart` / `UpsertEnd` 是公开 RPC（`master_service.h:331/:338` @0.3.11）
   - 官方 Python 绑定只有「带数据、一次完成」的 `upsert_tensor`，没有把 start/end 拆开的接口
-  - kvcm 的空写是单独的 `_empty_pin.so`。它只链已安装 wheel 里的 `store.so`（`mooncake-transfer-engine==0.3.13.post1`）。这个 wheel 不带 C++ 头文件。扩展用本地 `kvcm/native/mooncake_pin_api.h` 声明要用的类型，调用 `client->master_client_.UpsertStart` / `UpsertEnd`，成员地址由编译器计算。链接这一步读的是 `store.so` 的导出符号，不读 mooncake 的头文件
+  - kvcm 的空写是单独的 `_empty_pin.so`。它只链已安装 wheel 里的 `store.so`（`mooncake-transfer-engine==0.3.13.post1`）。这个 wheel 不带 C++ 头文件。扩展用本地 `kvcm/kvcm/native/mooncake_pin_api.h` 声明要用的类型，调用 `client->master_client_.UpsertStart` / `UpsertEnd`，成员地址由编译器计算。链接这一步读的是 `store.so` 的导出符号，不读 mooncake 的头文件
   - `get_real_client()` 是退路，不是当前实现。只有以后真实的 `UpsertStart` 调用失败，才改为包含 `pyclient.h`，在 Python 对象还原成 `MooncakeStorePyWrapper` 之后用 `get_real_client()` 取出已建 client。拿到对象之后，这个函数只是返回成员。现在不走这条，也不把 pybind 跨模块转换写进当前扩展
   - `MasterClient::UpsertStart` 发出的是这个 client 自己的 UUID。当前路径是方案一：空写会把 key 的 client_id 写成 kvcm 的 UUID。借名（方案二）这条 API 做不到，不是当前路径（§2）
 

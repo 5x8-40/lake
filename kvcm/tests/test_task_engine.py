@@ -765,6 +765,59 @@ def test_unregistered_instance_does_not_cancel_consumer() -> None:
     run(scenario())
 
 
+def test_plan_mismatch_does_not_cancel_consumer() -> None:
+    """段名单和 TP 对不上只失败这一次，消费者继续。"""
+
+    messages = (
+        "key rank max=3 but only 1 targets",
+        "all keys are rank 0 but 2 targets given",
+        "ranks out of range for targets: [4]",
+    )
+
+    class Ops(FakeOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.boom: str | None = messages[0]
+
+        async def copy(self, prefix, target):
+            if self.boom:
+                raise ValueError(self.boom)
+            return await super().copy(prefix, target)
+
+    async def scenario():
+        ops = Ops()
+        eng = TaskEngine(ops, max_concurrent=1, consumer_count=1)
+        eng.start()
+        try:
+            for i, message in enumerate(messages):
+                ops.boom = message
+                prefix = Prefix(model_id=f"plan{i}", token_ids=(i + 1,))
+                key = eng.submit_intent(prefix, _T, poll_s=0.01, timeout_s=2)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if eng.intent_status(key) is IntentStatus.FAILED:
+                        break
+                    await asyncio.sleep(0.01)
+                assert eng.intent_status(key) is IntentStatus.FAILED
+                assert message in eng.intent_detail(key)
+                assert any(not t.done() for t in eng._consumers)
+                assert not any(t.cancelled() for t in eng._consumers)
+            ops.boom = None
+            key = eng.submit_intent(
+                Prefix(model_id="ok", token_ids=(9,)), _T, poll_s=0.01, timeout_s=2
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if eng.intent_status(key) is IntentStatus.READY:
+                    break
+                await asyncio.sleep(0.01)
+            assert eng.intent_status(key) is IntentStatus.READY
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
 def test_max_concurrent_must_be_positive() -> None:
     with pytest.raises(ValueError):
         TaskEngine(FakeOps(), max_concurrent=0)

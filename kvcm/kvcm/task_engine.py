@@ -43,7 +43,7 @@ from __future__ import annotations
 import asyncio
 import enum
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
@@ -63,6 +63,20 @@ class IntentStatus(enum.Enum):
     PENDING = 1  # 排队或执行中
     READY = 2
     FAILED = 3
+
+
+# 这一次 intent 的失败，不是编程错误。消费者记 FAILED 后继续。
+_INTENT_VALUE_ERRORS = (
+    "shorter than one block",
+    "key rank max=",
+    "all keys are rank 0 but",
+    "ranks out of range for targets",
+)
+
+
+def _is_intent_value_error(exc: ValueError) -> bool:
+    text = str(exc)
+    return any(part in text for part in _INTENT_VALUE_ERRORS)
 
 
 def intent_id_of(prefix: Prefix, target: InstanceId) -> str:
@@ -445,9 +459,10 @@ class TaskEngine:
                 if "not registered" not in str(e):
                     raise
             except ValueError as e:
-                # 前缀不足一块。其它 ValueError 仍是编程错误。
+                # 前缀不足一块，或段名单和 TP 对不上（build_plan）。
+                # 其它 ValueError 仍是编程错误。
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
-                if "shorter than one block" not in str(e):
+                if not _is_intent_value_error(e):
                     raise
             except RuntimeError as e:
                 # PYTHONHASHSEED 没设。其它 RuntimeError（含已单独接住的

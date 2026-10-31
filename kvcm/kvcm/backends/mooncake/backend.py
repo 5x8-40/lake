@@ -21,7 +21,6 @@ import functools
 import logging
 import os
 import threading
-import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Sequence
@@ -181,6 +180,13 @@ class MooncakeBackend(KvOps):
         池：RPC 池 + Ledger 单线程池）。"""
         return self._executor
 
+    async def _expand_keys(self, token_ids: tuple[int, ...]) -> list[str]:
+        """算 key 走已有 RPC 池，不占事件循环。不新建线程池。"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, self._keys.keys_for_tokens, token_ids
+        )
+
     # ------------------------------------------------------------------
     # 阻塞调用的协程包装
     # ------------------------------------------------------------------
@@ -297,7 +303,7 @@ class MooncakeBackend(KvOps):
         → rank 映射计划（引擎侧）→ 逐 key 发起复制任务。「复制前确认
         warm 已覆盖前缀」的存在性检查归编排层，不在本操作内。
         """
-        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        keys = await self._expand_keys(prefix.token_ids)
         if not keys:
             raise ValueError(
                 "prefix expands to no keys (shorter than one block?)"
@@ -333,7 +339,8 @@ class MooncakeBackend(KvOps):
             # 排空若跑完，已经在 `_rpc` 里的会写槽；排空**自己**被取消时，
             # `gather` 会把没结束的子任务一起取消，它们的号（这一次还在
             # `await _rpc` 的那些）就此丢掉——只有已经写进 `slots` 的能落账
-            # （口径见 design/code-architecture.md「E11 已知遗留」）。
+            # （口径见 design/code-architecture.md 运行时结构
+            # 「取消落在并发提交上」）。
             # 这里不 shield 子任务：那会把最长 `rpc_timeout_s`（30 秒）的
             # 等待带进退出路径。
             #
@@ -347,8 +354,10 @@ class MooncakeBackend(KvOps):
                 e = asyncio.CancelledError()
             task_ids = [t for t in slots if t is not None]
             partial_plan = [plan[i] for i, t in enumerate(slots) if t is not None]
+            handed: TaskHandle | None = None
             if task_ids:
                 partial = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
+                handed = partial
                 self._plans[partial] = (
                     prefix,
                     target,
@@ -359,7 +368,7 @@ class MooncakeBackend(KvOps):
                     # 记账必须完成：已发出的号不落账 = 重启后没人跟踪。
                     # 若这次 shield 也被取消（第二次取消），记账会中断——
                     # 那是「取消两次」的极端场景，接受丢账（登记在
-                    # code-architecture.md「E11 已知遗留」）。
+                    # code-architecture.md 运行时结构「取消落在并发提交上」）。
                     await asyncio.shield(self._record(partial, "running"))
                 except asyncio.CancelledError:
                     raise
@@ -369,7 +378,8 @@ class MooncakeBackend(KvOps):
                 raise e
             raise SubmitError(
                 f"copy submit failed after {len(task_ids)}/{len(plan)} tasks "
-                f"(submitted ids: {task_ids}): {e}"
+                f"(submitted ids: {task_ids}): {e}",
+                handle=handed,
             ) from e
         task_ids = [t for t in slots if t is not None]
         handle = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
@@ -525,7 +535,7 @@ class MooncakeBackend(KvOps):
         「不存在」语义不同：前者调用方可重试，后者才触发重算/预热。
         返回列表长度与 key 数不一致视为不存在（绑定异常时可能短回）。
         """
-        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        keys = await self._expand_keys(prefix.token_ids)
         if not keys:
             return False
         try:
@@ -677,7 +687,7 @@ class MooncakeBackend(KvOps):
             raise ValueError(
                 "move 需要源实例：绑定 create_move_task 的 source 是段名，不能省略"
             )
-        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        keys = await self._expand_keys(prefix.token_ids)
         if not keys:
             raise ValueError(
                 "prefix expands to no keys (shorter than one block?)"
@@ -728,8 +738,10 @@ class MooncakeBackend(KvOps):
                 e = asyncio.CancelledError()
             task_ids = [t for t in slots if t is not None]
             partial_plan = [plan[i] for i, t in enumerate(slots) if t is not None]
+            handed: TaskHandle | None = None
             if task_ids:
                 partial = TaskHandle(op=OpKind.MOVE, task_ids=tuple(task_ids))
+                handed = partial
                 self._plans[partial] = (
                     prefix,
                     target,
@@ -746,7 +758,8 @@ class MooncakeBackend(KvOps):
                 raise e
             raise SubmitError(
                 f"move submit failed after {len(task_ids)}/{len(plan)} tasks "
-                f"(submitted ids: {task_ids}): {e}"
+                f"(submitted ids: {task_ids}): {e}",
+                handle=handed,
             ) from e
         task_ids = [t for t in slots if t is not None]
         handle = TaskHandle(op=OpKind.MOVE, task_ids=tuple(task_ids))
@@ -772,8 +785,12 @@ class MooncakeBackend(KvOps):
         await self._require_ledger()
         await self._in_ledger(self._ledger.unregister_keepalive, prefix)
 
-    async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
+    async def pin(
+        self, prefix: Prefix, kind: PinKind = PinKind.SOFT, *, enable: bool = True
+    ) -> None:
         if kind is PinKind.HARD:
+            if not enable:
+                raise ValueError("hard pin 不接受 enable=False")
             # 标记创建时固化，这里不设置 hard pin 位。
             # 控制效果是登记保活（同一张 Ledger 表）。不读数据、不 Remove、
             # 不重 put、不走空写。lease 时长是 master 的 default_kv_lease_ttl，
@@ -789,7 +806,9 @@ class MooncakeBackend(KvOps):
             raise ValueError(
                 "prefix expands to no keys (shorter than one block?)"
             )
-        await self._rpc(functools.partial(self._client.soft_pin, keys, enable=True))
+        await self._rpc(
+            functools.partial(self._client.soft_pin, keys, enable=enable)
+        )
 
     async def demote(self, prefix: Prefix) -> None:
         """先确认能展开成 key、并且 admin 已配置，再停保活。
@@ -810,6 +829,10 @@ class MooncakeBackend(KvOps):
             )
         if self._admin is None:
             raise QueryError("降层查盘副本需要主线 GET /batch_query_keys")
+        if self._cap.has_offload.channel is not Support.YES:
+            raise UnsupportedCapabilityError(
+                "0.3.11 的 /batch_query_keys 没有盘副本字段，不能降层"
+            )
         await self.stop_keepalive(prefix)
         await asyncio.sleep(self._lease_ttl_s)
         try:
@@ -824,7 +847,7 @@ class MooncakeBackend(KvOps):
             or parsed[key].disk_replicas < 1
         ]
         if missing:
-            raise RuntimeError(
+            raise VerifyError(
                 "demote: 还没有盘副本，没有降层成功: " + ", ".join(missing[:4])
             )
 
@@ -852,7 +875,7 @@ class MooncakeBackend(KvOps):
             if seg not in last.get(key, [])
         ]
         if missing:
-            raise RuntimeError(
+            raise VerifyError(
                 "promote: 命中次数已过线，目标上还没有内存副本，没有提回成功:\n  "
                 + "\n  ".join(missing)
             )

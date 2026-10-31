@@ -300,6 +300,10 @@ def test_register_before_start_does_not_block_caller() -> None:
         def list_keepalive_records(self):
             return self._real.list_keepalive_records()
 
+        @property
+        def executor(self):
+            return self._real.executor
+
     led, path = _ledger()
     try:
         slow = SlowLedger(led)

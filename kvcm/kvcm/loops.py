@@ -18,7 +18,6 @@ import asyncio
 import functools
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 from kvcm.ledger import Ledger
 from kvcm.ops.base import KvOps, QueryError
@@ -47,7 +46,6 @@ class KeepaliveLoop:
         *,
         interval_s: float = 5.0,
         window_s: float = 600.0,
-        executor: ThreadPoolExecutor | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -57,10 +55,6 @@ class KeepaliveLoop:
         self._ledger = ledger
         self._interval = interval_s
         self._window = window_s
-        self._executor = executor or ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="kvcm-keepalive"
-        )
-        self._owns_executor = executor is None
         self._task: asyncio.Task | None = None
         self._stop = False
         self._register_failures = 0
@@ -106,12 +100,14 @@ class KeepaliveLoop:
         """
         loop = self._loop
         if loop is None or not loop.is_running():
-            # 事件循环未起（daemon 启动早期）：交给 executor 直接跑，
-            # 不在调用线程做 sqlite
+            # 事件循环未起：交给 Ledger 自己的 executor，不在调用线程做 sqlite。
+            # Future 必须观察，否则写入失败变成「exception was never retrieved」。
             try:
-                self._executor.submit(fn, *args)
+                fut = self._ledger.executor.submit(fn, *args)
             except RuntimeError:
                 self._note_failure()  # 池已关（退出期）
+                return
+            fut.add_done_callback(self._observe_ledger_future)
             return
         try:
             loop.call_soon_threadsafe(self._schedule_ledger_write, fn, args)
@@ -125,9 +121,16 @@ class KeepaliveLoop:
         task.add_done_callback(self._on_ledger_write_done)
 
     def _on_ledger_write_done(self, task: asyncio.Task) -> None:
-        if task.cancelled():
+        self._observe_ledger_future(task)
+
+    def _observe_ledger_future(self, fut) -> None:
+        if fut.cancelled():
             return
-        exc = task.exception()
+        try:
+            exc = fut.exception()
+        except Exception as e:
+            self._note_failure(e)
+            return
         if exc is not None:
             self._note_failure(exc)
 
@@ -145,7 +148,7 @@ class KeepaliveLoop:
     async def _ledger_call(self, fn, *args):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            self._executor, functools.partial(fn, *args)
+            self._ledger.executor, functools.partial(fn, *args)
         )
 
     # ------------------------------------------------------------------
@@ -173,9 +176,7 @@ class KeepaliveLoop:
                 self._task = None
 
     def close(self) -> None:
-        """释放自建 executor（外部注入的由调用方管）。"""
-        if self._owns_executor:
-            self._executor.shutdown(wait=False)
+        """不关 Ledger 的 executor。那是 Ledger 自己的池。"""
 
     async def _run(self) -> None:
         while not self._stop:

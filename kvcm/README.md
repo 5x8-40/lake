@@ -21,7 +21,9 @@ kvcm/
 ├── design/     # 生产化设计文档（八项操作全集）
 │   └── flows/  # 流程文档（每流程一篇）
 ├── demo/       # precopy demo：只验证 copy 一项；文档+代码+测试床自包含
+├── kvcm/       # 服务代码（daemon、后端、流程、Ledger）
+├── tests/      # 服务代码的 pytest
 └── summary.md  # 登记处（D/P/E 编号总表）
 ```
 
-未来生产代码（E10 kvcm 服务）落地时新建顶层代码目录，与 `demo/` 平级；`demo/` 保持自包含、可独立交付。
+`demo/` 保持自包含、可独立交付。服务代码在 `kvcm/kvcm/`。

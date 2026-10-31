@@ -32,10 +32,20 @@ TaskEngine。
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
-from kvcm.ops.base import KvOps, QueryError, SubmitError, TaskStatus, VerifyError
+from kvcm.ops.base import (
+    KvOps,
+    QueryError,
+    SubmitError,
+    TaskHandle,
+    TaskStatus,
+    VerifyError,
+)
 from kvcm.ops.types import InstanceId, Prefix
+
+logger = logging.getLogger(__name__)
 
 
 class PrefetchError(RuntimeError):
@@ -97,6 +107,7 @@ class PrefetchFlow:
         try:
             handle = await self._ops.copy(prefix, target)
         except SubmitError as e:
+            await self._abandon(e.handle)
             raise PrefetchError(f"copy submit failed: {e}") from e
         if handle_sink is not None:
             handle_sink(handle)
@@ -127,8 +138,22 @@ class PrefetchFlow:
             # 进程退出取消：断开跟踪并记账（Ledger 记 abandoned）。
             # 不这样做的话账本会留 running，重启又被 rebuild 捞回来跟。
             # 后端任务本身不取消（无此能力），副本清理由 remove 负责。
-            try:
-                await self._ops.abandon(handle)
-            except KeyError:
-                pass  # 已终态被移除登记
+            await self._abandon(handle)
             raise
+
+    async def _abandon(self, handle: TaskHandle | None) -> None:
+        """放弃跟踪。池里的传输不取消。
+
+        句柄已经不在（KeyError）忽略。账本写失败记日志后返回，
+        不盖掉调用方原来的提交失败。``CancelledError`` 继续抛。
+        """
+        if handle is None:
+            return
+        try:
+            await self._ops.abandon(handle)
+        except asyncio.CancelledError:
+            raise
+        except KeyError:
+            pass
+        except Exception:
+            logger.exception("abandon ledger write failed (handle=%s)", handle)
