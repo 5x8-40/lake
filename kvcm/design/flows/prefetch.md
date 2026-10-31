@@ -7,7 +7,9 @@
 
 1. **exists 前置检查**：前缀完整在池才继续——warm 未覆盖该前缀，或 key
    口径与引擎漂移，直接失败（复制了也没意义）
-2. **copy 发起**：前缀 → key 列表 → rank 映射计划 → 逐 key 提交复制任务
+2. **copy 发起**：前缀 → key 列表 → rank 映射计划 → 先取大小，再只查
+   计划第一条的目标段还放不放得下 → 放得下才逐 key 提交复制任务。等剩余
+   的循环在 TaskEngine、前缀闸外面；进闸后再查一次，不够就回到闸外
 3. **query_task 轮询到 READY**：任务全部完成 + 副本核验通过
 4. （待接通）keepalive 注册、READY 事件补发（`BlockStored`）
 
@@ -46,18 +48,39 @@ sequenceDiagram
         Note over BE: locate(target) 得到 segs
         BE->>KC: build_plan(keys, segs)
         KC-->>BE: plan（每条 key 配好目标 seg）
-        loop 每个 key 和 seg
-            BE->>SC: create_copy_task(key, seg)
-            SC->>M: RPC
-            M-->>SC: task_id（两个整数）
-            SC-->>BE: task_id
-        end
-        alt 提交中途失败
-            BE-->>Flow: SubmitError, 已发 id 只在异常消息里
-        else 提交成功
-            BE->>DB: upsert status=running
-            BE-->>Flow: TaskHandle
-            loop 轮询到终态或超时
+        BE->>SC: batch_get_replica_desc（取大小，一轮只一次）
+        SC->>M: RPC
+        M-->>BE: 每个 key 的副本大小
+        BE->>M: GET /query_segment（只查计划第一条的目标段）
+        alt 这一段放不下，或管理端口暂时连不上
+            BE-->>Flow: AdmissionWait
+            Note over Flow: TaskEngine 在前缀闸外等。还没有任务号，不记复制失败，不提交
+        else 段不存在
+            BE-->>Flow: AdmissionStop
+            Note over Flow: TaskEngine 包成 PrefetchError，立即停止
+        else 放得下
+            Note over Flow: acquire 前缀闸
+            BE->>M: 进闸后再查一次 /query_segment
+            alt 仍然不够
+                Note over Flow: release，回到闸外继续等
+            else 复查通过
+                loop 每个 key 和 seg
+                    BE->>SC: create_copy_task(key, seg)
+                    SC->>M: RPC
+                    M-->>SC: task_id（两个整数）
+                    SC-->>BE: task_id
+                end
+                alt 提交中途失败，或提交中途超时且已有任务号
+                    Note over BE: 句柄交给 run_after_exists。池里的传输不取消
+                    Flow->>BE: abandon(handle)
+                    BE->>DB: status=abandoned
+                    BE-->>Flow: PrefetchError, handle=...
+                else 没有任务号就超时
+                    BE-->>Flow: PrefetchError, cancelled before handle, 不写 Ledger
+                else 提交成功
+                    BE->>DB: upsert status=running
+                    BE-->>Flow: TaskHandle
+                    loop 轮询到终态或超时
                 Flow->>BE: query_task(handle)
                 alt 不在等副本状态
                     BE->>SC: query_task(每个 task_id)
@@ -85,6 +108,8 @@ sequenceDiagram
                     BE->>DB: 其余行 abandoned, 撞车任务保持 failed
                     BE-->>Flow: PrefetchError
                 end
+                    end
+                end
             end
         end
     end
@@ -96,10 +121,12 @@ sequenceDiagram
   `keys` → 排出 `plan`（复制计划：每条 key 复制到哪个 seg）→ 每条
   key 提交后拿回一个任务号（两个整数组成的整数对）→ 写进 Ledger（任务
   号编码成 `"整数:整数"` 的字符串，连同 handle_id、token_ids）
-- 与 master 的交互这次执行里全是绑定 RPC；HTTP `/batch_query_keys` 还
-  没接通
-- Ledger 只在 copy 成功、到终态、进入等副本状态、abandon 时写。
-  exists 失败和提交失败不写行
+- 与 master 的交互里，复制和核验仍是绑定 RPC。提交前多一次管理端口
+  `GET /query_segment`（明文 Used / Capacity），不用 `/get_segments_detail`，
+  也不用 `/batch_query_keys`（零副作用核验还没接通）
+- Ledger 在 copy 落账、到终态、进入等副本状态、abandon 时写。
+  exists 失败，以及还没有任务号的提交失败，不写行。已经落账的号由
+  `abandon` 记成 abandoned；池里的传输不取消
 - 图里的「超时」指本次预热的截止时间到了，接下来流程调用
   `abandon`——它不是 `query_task` 的一种返回值
 - 「等副本」状态（代码里叫 `_watch`）：失败全是撞车时先记 failed、立
@@ -113,7 +140,18 @@ sequenceDiagram
 
 失败处理总表（每种情况怎么处理）见
 [../code-architecture.md](../code-architecture.md) L2 节。本流程特有的
-一点：「前缀不在池」在 exists 阶段直接失败，不发起复制。
+一点：「前缀不在池」在 exists 阶段直接失败，不发起复制。预检只查
+计划第一条的目标段，只加落在这一段上的新字节；其它段的剩余和字节
+都不参与。这一段不够就一个 key 都不发。代码认的是计划第一条，不是
+写死的 rank 0。没查的段仍可能在 `CopyStart` 时 `NO_AVAILABLE_HANDLE`。
+段不存在同样立即停止（`AdmissionStop` 在 TaskEngine 里包成
+PrefetchError）。段上暂时放不下（`AdmissionWait`）则在闸外等到预热
+超时；还没有任务号就停止，不记成复制失败。`AdmissionWait` 只在
+TaskEngine 的等待循环里出现。`PrefetchFlow.run` 没有等待循环，直接
+调用会把 `AdmissionWait` 抛出进程外。生产路径走 TaskEngine。另一条
+前缀已经提交、但目标段还没划出缓冲区时，剩余里看不见它，两条都可能
+放行。彻底避开代价高，接受这个窗口。详见
+[../code-architecture.md](../code-architecture.md) 传输闸一节。
 
 ## 与其他部件的衔接
 

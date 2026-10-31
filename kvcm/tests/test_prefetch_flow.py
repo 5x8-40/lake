@@ -105,6 +105,73 @@ def test_submit_error_wrapped_as_prefetch_error() -> None:
         run(PrefetchFlow(ops).run(_P, _T, poll_s=0))
 
 
+_PARTIAL = TaskHandle(op=OpKind.COPY, task_ids=((1, 101),))
+
+
+def test_submit_abandon_attribute_error_propagates() -> None:
+    """abandon 的编程错误要冒出去，不要变成 PrefetchError。"""
+
+    class _Ops(FakeOps):
+        async def abandon(self, handle: TaskHandle) -> None:
+            raise AttributeError("bug")
+
+    ops = _Ops(
+        exists=True,
+        seq=[],
+        copy_error=SubmitError("submit boom", handle=_PARTIAL),
+    )
+    with pytest.raises(AttributeError, match="bug"):
+        run(PrefetchFlow(ops).run_after_exists(_P, _T, poll_s=0, timeout_s=5))
+
+
+def test_submit_abandon_sqlite_error_stays_prefetch_error() -> None:
+    """账本写失败只记日志。提交失败仍是 PrefetchError，原因是原来的 SubmitError。"""
+    import sqlite3
+
+    cause = SubmitError("submit boom", handle=_PARTIAL)
+
+    class _Ops(FakeOps):
+        async def abandon(self, handle: TaskHandle) -> None:
+            raise sqlite3.OperationalError("disk I/O error")
+
+    ops = _Ops(exists=True, seq=[], copy_error=cause)
+    with pytest.raises(PrefetchError, match="copy submit failed") as ei:
+        run(PrefetchFlow(ops).run_after_exists(_P, _T, poll_s=0, timeout_s=5))
+    assert ei.value.__cause__ is cause
+
+
+def test_submit_abandon_interpreter_shutdown_stays_prefetch_error() -> None:
+    """解释器退出那句也是账本写失败，不要当成编程错误抛出去。"""
+    cause = SubmitError("submit boom", handle=_PARTIAL)
+
+    class _Ops(FakeOps):
+        async def abandon(self, handle: TaskHandle) -> None:
+            raise RuntimeError(
+                "cannot schedule new futures after interpreter shutdown"
+            )
+
+    ops = _Ops(exists=True, seq=[], copy_error=cause)
+    with pytest.raises(PrefetchError, match="copy submit failed") as ei:
+        run(PrefetchFlow(ops).run_after_exists(_P, _T, poll_s=0, timeout_s=5))
+    assert ei.value.__cause__ is cause
+
+
+def test_submit_abandon_other_runtime_error_propagates() -> None:
+    """其它 RuntimeError 仍是编程错误。"""
+
+    class _Ops(FakeOps):
+        async def abandon(self, handle: TaskHandle) -> None:
+            raise RuntimeError("bug")
+
+    ops = _Ops(
+        exists=True,
+        seq=[],
+        copy_error=SubmitError("submit boom", handle=_PARTIAL),
+    )
+    with pytest.raises(RuntimeError, match="bug"):
+        run(PrefetchFlow(ops).run_after_exists(_P, _T, poll_s=0, timeout_s=5))
+
+
 def test_task_failed_raises() -> None:
     ops = FakeOps(exists=True, seq=[TaskStatus.FAILED])
     with pytest.raises(PrefetchError, match="copy task failed"):
@@ -166,3 +233,83 @@ def test_timeout_abandons_handle() -> None:
     with pytest.raises(PrefetchError, match="not READY"):
         run(PrefetchFlow(ops).run(_P, _T, poll_s=0, timeout_s=0.01))
     assert "abandon" in ops.calls
+
+
+def test_timeout_cancels_copy_before_handle() -> None:
+    """copy 还没返回时超时：取消等待。没有句柄，不 abandon，也不另记一笔。"""
+    import asyncio
+
+    class _Hang(FakeOps):
+        async def copy(self, prefix, target):
+            self.calls.append("copy")
+            await asyncio.sleep(30)
+            self.calls.append("copy_returned")
+            return TaskHandle(op=OpKind.COPY, task_ids=((1, 2),))
+
+    async def scenario():
+        ops = _Hang(exists=True, seq=[])
+        with pytest.raises(PrefetchError, match="cancelled before handle"):
+            await PrefetchFlow(ops).run_after_exists(
+                _P, _T, poll_s=0.01, timeout_s=0.05
+            )
+        assert "abandon" not in ops.calls
+        assert "copy_returned" not in ops.calls
+
+    run(scenario())
+
+
+def test_shutdown_during_drain_is_cancelled_error() -> None:
+    """排空进行中当前任务被取消：CancelledError 冒出去，不变成 PrefetchError。"""
+    import asyncio
+
+    entered_drain = asyncio.Event()
+
+    class _SlowCancel(FakeOps):
+        async def copy(self, prefix, target):
+            self.calls.append("copy")
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                entered_drain.set()
+                await asyncio.sleep(30)
+                raise
+
+    async def scenario():
+        ops = _SlowCancel(exists=True, seq=[])
+        task = asyncio.create_task(
+            PrefetchFlow(ops).run_after_exists(
+                _P, _T, poll_s=0.01, timeout_s=0.05
+            )
+        )
+        await asyncio.wait_for(entered_drain.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(scenario())
+
+
+def test_timeout_budget_covers_copy_and_poll() -> None:
+    """同一段 timeout_s 覆盖提交和轮询，不是两段相加。"""
+    import asyncio
+    import time
+
+    class _SlowCopy(FakeOps):
+        async def copy(self, prefix, target):
+            self.calls.append("copy")
+            await asyncio.sleep(0.3)
+            return TaskHandle(op=OpKind.COPY, task_ids=((1, 2),))
+
+    async def scenario():
+        ops = _SlowCopy(exists=True, seq=[])  # 轮询永远 RUNNING
+        start = time.monotonic()
+        with pytest.raises(PrefetchError, match="not READY"):
+            await PrefetchFlow(ops).run_after_exists(
+                _P, _T, poll_s=0.05, timeout_s=0.45
+            )
+        elapsed = time.monotonic() - start
+        # 分段相加至少是 0.3+0.45。同一段预算应靠近 0.45。
+        assert elapsed < 0.7, f"超时被加成两段: {elapsed:.2f}s"
+        assert "abandon" in ops.calls
+
+    run(scenario())

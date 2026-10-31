@@ -85,9 +85,28 @@ class QueryError(RuntimeError):
 class SubmitError(RuntimeError):
     """操作提交失败（copy/move/promote 的发起阶段）。
 
-    异常消息携带明细（如已发起的任务号——中途失败时那些任务需要跟踪）。
+    已经落账的句柄放在 `handle` 上，交给流程 `abandon`（账本记
+    abandoned）。池里的传输不取消。没有任务号时 `handle` 为 None。
     与 QueryError（查询可重试）、VerifyError（核验终态）区分：提交失败
     的重试策略归编排层（幂等键 + 后端幂等兜底）。
+    """
+
+    def __init__(self, message: str = "", *args, handle: TaskHandle | None = None):
+        super().__init__(message, *args)
+        self.handle = handle
+
+
+class AdmissionWait(Exception):
+    """这一轮目标段放不下，或管理端口暂时连不上。
+
+    调用方在前缀闸外等待后再查。不是复制失败，没有任务号。
+    """
+
+
+class AdmissionStop(Exception):
+    """目标段在 master 上不存在。
+
+    不等待。这次预热停止，不记成复制失败。
     """
 
 
@@ -128,6 +147,31 @@ class KvOps(ABC):
     async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机层级为前缀 KV 建副本；源副本由池侧选择。
         READY：任务完成 + 目标侧副本核验通过。"""
+
+    def open_copy_admission(self) -> object | None:
+        """一轮预热等待开始。占目标段的后端在这里记下本轮字节需求。
+
+        默认不占新段，返回 None。编排层总是调用，不探测具体后端有没有这个方法。
+        """
+        return None
+
+    def close_copy_admission(self, token: object | None) -> None:
+        """结束一轮预热等待。默认无事可做。"""
+        return None
+
+    async def admit_planned_copy(
+        self,
+        prefix: Prefix,
+        target: InstanceId,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
+        """闸外判断这一批现在放不放得下。放不下由子类抛 AdmissionWait。
+
+        默认不占目标段，直接通过。第二个后端不 override 就不会静默漏掉调用，
+        只是没有段容量这一步。timeout_s 是剩余预算；默认实现不查询，忽略它。
+        """
+        return None
 
     async def move(
         self,

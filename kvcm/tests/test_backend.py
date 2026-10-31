@@ -62,6 +62,20 @@ def fake_store_module(monkeypatch):
     pkg = types.ModuleType("mooncake")
     monkeypatch.setitem(sys.modules, "mooncake", pkg)
     monkeypatch.setitem(sys.modules, "mooncake.store", mod)
+
+    # copy 现在提交前要问管理端口。旧用例不测准入，缺省给一个放得下的
+    # 假客户端；显式传入 admin（含 None）不被覆盖。
+    class _RoomyAdmin:
+        def query_segment(self, segment):
+            return (0, 1 << 62)
+
+    orig_init = MooncakeBackend.__init__
+
+    def _init(self, *args, **kwargs):
+        kwargs.setdefault("admin", _RoomyAdmin())
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(MooncakeBackend, "__init__", _init)
     return mod
 
 
@@ -97,6 +111,17 @@ class FakeClient(StoreClient):
             seg for _, segs in self.created for seg in segs
         ]
         return {k: list(on) for k in keys}
+
+    def batch_memory_replica_sizes(self, keys):
+        # 提交前还没有目标副本。没有端点时仍给出源副本大小，旧用例才能
+        # 放行；端点是目标段时，准入不计这份新占用。
+        if self._replicas_on is None:
+            eps: list[str] = []
+        else:
+            eps = list(self._replicas_on)
+        if not eps:
+            return {k: [("__source__", 1024, ())] for k in keys}
+        return {k: [(ep, 1024, ()) for ep in eps] for k in keys}
 
 
 def _backend(
@@ -192,11 +217,14 @@ def test_empty_prefix_raises(fake_store_module, monkeypatch) -> None:
 
 
 def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) -> None:
-    """提交中途被取消：已发出的任务号必须落账成 running。
+    """提交中途被取消：已发出的任务号必须落账成 running，并把句柄交回来。
 
     `CancelledError` 不是 `Exception` 的子类。只捕 `Exception` 的话，退出
     时取消落在提交循环里，已发出的号就丢了——`rebuild` 只认
     `status='running'` 的行，这些在途传输重启后再也没人跟踪。
+
+    已经有任务号时不把 CancelledError 再抛出去，否则 await 拿不到句柄，
+    调用方无法 abandon。本测试不 abandon，所以行仍是 running。
 
     必须是多 key 的 plan，且第 2 个提交卡住：取消点才落得到「第 1 个已
     发出、第 2 个还没回」的窗口上，否则测试会假通过。
@@ -237,8 +265,11 @@ def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) ->
                 await asyncio.sleep(0.01)
             assert client.created, "第 1 个任务都没发出，前提不成立"
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task  # 取消必须照常传播，不能被包成 SubmitError
+            # 已经有任务号时 copy 把句柄交回来，不抛 CancelledError，
+            # 否则调用方拿不到句柄、无法 abandon。这里不 abandon，
+            # 所以账本仍是 running。
+            handle = await task
+            assert handle.task_ids
 
         run(scenario())
         # 前提校验：取消时确实只发出了 1 个，测的才是「提交中途」
@@ -248,6 +279,65 @@ def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) ->
         from kvcm.backends.mooncake.backend import decode_task_id
 
         assert decode_task_id(running[0].task_id) == (1, 101)
+    finally:
+        gate.set()
+        led.close()
+        os.unlink(path)
+
+
+def test_prefetch_timeout_mid_submit_abandons_partial(
+    fake_store_module, monkeypatch
+) -> None:
+    """第一个 create_copy_task 已返回、第二个卡住：预热超时后账本是 abandoned。
+
+    句柄在超时分支交回来之后必须 abandon。否则意图已经失败，账本却留
+    running，要等重启 rebuild 才捞得到。
+    """
+    from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    gate = threading.Event()
+    try:
+        class SlowSecondClient(FakeClient):
+            def create_copy_task(self, key, targets):
+                if self.created:
+                    gate.wait(30.0)
+                return super().create_copy_task(key, targets)
+
+        client = SlowSecondClient()
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(
+            kc, "keys_for_tokens", lambda ids: kc.expand(["h0", "h1"])
+        )
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+            submit_concurrency=1,
+        )
+
+        with pytest.raises(PrefetchError, match=r"not READY after 0\.8s \(handle="):
+            run(
+                PrefetchFlow(b).run_after_exists(
+                    Prefix(model_id="qwen", token_ids=(1,)),
+                    InstanceId("inst-B"),
+                    poll_s=0.01,
+                    timeout_s=0.8,
+                )
+            )
+        assert client.created, "第一个任务没发出，前提不成立"
+        assert led.list_running_tasks() == []
+        from kvcm.backends.mooncake.backend import decode_task_id
+
+        row = led.get_task(encode_task_id((1, 101)))
+        assert row is not None and row.status == "abandoned", row
+        assert decode_task_id(row.task_id) == (1, 101)
     finally:
         gate.set()
         led.close()
@@ -311,8 +401,9 @@ def test_cancel_during_drain_after_submit_failure_still_records(
             await asyncio.sleep(0.15)  # 让它进到排空（卡在第 3 个上）
             assert not task.done(), "复制已经结束了，取消点不在排空阶段"
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            # 排空时被取消、且已经有号：句柄交回来，账本是 running。
+            handle = await task
+            assert handle.task_ids
             # 取消可以不等在飞的提交，但已拿到的号必须落账。
             assert [r.task_id for r in led.list_running_tasks()] == ["1:101"], (
                 "排空阶段被取消，已拿到的号没落账"
@@ -332,8 +423,8 @@ def test_submit_cap_is_process_wide_across_concurrent_copies(
 
     为什么必须锁这条：传输闸（TaskEngine `max_concurrent`，默认 4）允许
     4 个 copy 同时提交。若每个 copy 各持一把默认 4 的窗口，在飞建链就是
-    4×4=16——正好踩过 0.3.11 实测打爆建链的点（14 连发约半数
-    TRANSFER_FAIL）。信号量必须是所有 copy 共用的一把。
+    4×4=16——正好踩过 #16 打爆建链的点（14 连发是 TRANSFER_FAIL，
+    不是 #17 的 NO_AVAILABLE_HANDLE）。信号量必须是所有 copy 共用的一把。
 
     用 8 线程的池：默认池在小机器上只有 4 个 worker，会把峰值挡在 4，
     实现改回「每 copy 一把」也照样绿（假通过）。
@@ -420,18 +511,21 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
         capability="v0311",
         rpc_timeout_s=30.0,
         copy_submit_concurrency=7,  # 非默认值，才能证明真的传了
+        master="127.0.0.1:50088",
+        admin=None,
     )
     daemon.build_backend(args, client=object(), ledger=object())
     assert seen["submit_concurrency"] == 7, (
         f"--copy-submit-concurrency 没传下去: {seen.get('submit_concurrency')}"
     )
+    assert seen["admin"]._base == "http://127.0.0.1:9003"
 
 
 def test_copy_submits_concurrently_up_to_cap(fake_store_module, monkeypatch) -> None:
     """一次 copy 内多 key 并发提交，但在飞数不超过 `submit_concurrency`。
 
     串行提交时提交阶段是 N 倍往返（大批量预热慢得不可用）；不限并发则
-    在目标侧形成建链风暴（0.3.11 实测 14 连发约半数 TRANSFER_FAIL）。
+    在目标侧形成建链风暴（#16：14 连发 TRANSFER_FAIL，不是 #17）。
     两个方向都要锁：**并发度 > 1** 证明并行，**不超上限** 证明没失控。
     """
     inflight = 0
@@ -619,9 +713,52 @@ def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> N
         run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
 
 
-# ---------------------------------------------------------------------------
-# 在途冲突观测态（OBJECT_HAS_REPLICATION_TASK → 不当失败，只核验副本）
-# ---------------------------------------------------------------------------
+def test_prefetch_abandons_ledger_on_submit_error(
+    fake_store_module, monkeypatch
+) -> None:
+    """第二个 key 提交失败：走 PrefetchFlow，账本是 abandoned，不是 running。
+
+    只调 MooncakeBackend.copy 会停在 SubmitError，没人 abandon。
+    """
+    import os
+
+    from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
+
+    class BoomClient(FakeClient):
+        def create_copy_task(self, key, targets):
+            with self._id_lock:
+                already = len(self.created)
+            if already >= 1:
+                raise RuntimeError("submit boom")
+            return super().create_copy_task(key, targets)
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        client = BoomClient()
+        b = _backend(
+            client,
+            KeyComputer(model_name="qwen", tp_size=2),
+            monkeypatch,
+            ledger=led,
+            submit_concurrency=1,
+        )
+        with pytest.raises(PrefetchError, match="copy submit failed"):
+            run(
+                PrefetchFlow(b).run_after_exists(
+                    Prefix(model_id="qwen", token_ids=(1,)),
+                    InstanceId("inst-B"),
+                    poll_s=0.01,
+                    timeout_s=5,
+                )
+            )
+        assert led.list_running_tasks() == []
+        row = led.get_task(encode_task_id((1, 101)))
+        assert row is not None and row.status == "abandoned", row
+    finally:
+        led.close()
+        os.unlink(path)
 
 _CONFLICT_MSG = "OBJECT_HAS_REPLICATION_TASK (max retries reached: 3)"
 
@@ -1355,3 +1492,532 @@ def test_close_bounded_when_rpc_hangs(fake_store_module, monkeypatch) -> None:
     # 超时必须如实报 False：调用方正是靠它触发 os._exit(1)。
     # 原实现无返回值（隐式 None），这个信号被静默丢掉。
     assert got is False, f"超时没报 False（返回 {got!r}），调用方无从判断"
+
+
+# ---------------------------------------------------------------------------
+# 提交前准入：目标段还放不放得下
+# ---------------------------------------------------------------------------
+
+
+def _rank_key(name: str, rank: int) -> str:
+    return f"{name}@head_or_tp_rank:{rank}@"
+
+
+class _LayoutClient(FakeClient):
+    """按测试给定的 (端点, 字节数, 属性名) 回答一次 batch 查询。"""
+
+    def __init__(self, layout: dict) -> None:
+        super().__init__()
+        self.layout = layout
+
+    def batch_memory_replica_sizes(self, keys):
+        return {k: list(self.layout.get(k, [])) for k in keys}
+
+
+class _TableAdmin:
+    def __init__(self, table: dict) -> None:
+        self.table = dict(table)
+        self.calls: list[str] = []
+
+    def query_segment(self, segment: str):
+        self.calls.append(segment)
+        spec = self.table[segment]
+        if isinstance(spec, Exception):
+            raise spec
+        return spec
+
+
+def _admit_backend(client, monkeypatch, *, admin, segs, keys):
+    kc = KeyComputer(model_name="qwen", tp_size=max(len(segs), 1))
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda _ids: list(keys))
+    return MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=lambda _inst: list(segs),
+        capability=mooncake_v0311(),
+        admin=admin,
+    )
+
+
+def _forbid_wait(monkeypatch) -> None:
+    async def _sleep(_seconds):
+        raise AssertionError("不该等待")
+
+    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
+
+
+def test_admit_submits_when_segment_has_room(fake_store_module, monkeypatch) -> None:
+    """放得下才发。"""
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    admin = _TableAdmin({"seg-A": (0, 1000)})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert [k for k, _segs in client.created] == [key]
+
+
+def test_admit_waits_outside_the_prefix_gate(fake_store_module, monkeypatch) -> None:
+    """放不下时在前缀闸外等：睡眠时闸是空的，整批还没发；空间下来再进闸提交。
+
+    大小只在等待开始时取一次，之后每轮只打 /query_segment。
+    """
+    from kvcm.task_engine import TaskEngine
+
+    keys = [_rank_key("a", 0), _rank_key("b", 0)]
+    client = _LayoutClient({k: [("__source__", 100, ())] for k in keys})
+    client.measure_calls = 0
+    orig = client.batch_memory_replica_sizes
+
+    def _counting(keys_):
+        client.measure_calls += 1
+        return orig(keys_)
+
+    client.batch_memory_replica_sizes = _counting
+    admin = _TableAdmin({"seg-A": (0, 10)})  # 两个 key 共 200，剩余 10
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=keys)
+    eng = TaskEngine(b, max_concurrent=1)
+
+    async def _sleep(seconds):
+        assert seconds == 0.5
+        assert client.created == []
+        assert not eng._gate.locked()
+        admin.table["seg-A"] = (0, 10**9)
+
+    monkeypatch.setattr("kvcm.task_engine.asyncio.sleep", _sleep)
+    run(eng.run_once(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert [k for k, _segs in client.created] == keys
+    assert client.measure_calls == 1
+
+
+def test_admit_ignores_keys_already_on_target(fake_store_module, monkeypatch) -> None:
+    """已在目标段上的 key 不计入新占用。
+
+    两个 key 各 1000。若都计入，2000 > 剩余 1500，整批不该发。已在段上
+    的那份不计，只剩 1000，放得下，两个 key 都照常提交。
+    """
+    on_seg = _rank_key("on", 0)
+    fresh = _rank_key("fresh", 0)
+    client = _LayoutClient(
+        {
+            on_seg: [("seg-A", 1000, ())],
+            fresh: [("__source__", 1000, ())],
+        }
+    )
+    admin = _TableAdmin({"seg-A": (0, 1500)})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(
+        client, monkeypatch, admin=admin, segs=["seg-A"], keys=[on_seg, fresh]
+    )
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert [k for k, _segs in client.created] == [on_seg, fresh]
+
+
+def test_admit_queries_segment_once(fake_store_module, monkeypatch) -> None:
+    """只查计划里的第一个目标段，一次 /query_segment。这一段放不下，整批不发。"""
+    from kvcm.ops.base import AdmissionWait
+
+    key_a = _rank_key("a", 0)
+    key_b = _rank_key("b", 1)
+    client = _LayoutClient(
+        {
+            key_a: [("__source__", 300, ())],
+            key_b: [("__source__", 1, ())],
+        }
+    )
+    admin = _TableAdmin({"seg-A": (0, 150), "seg-B": (0, 10**9)})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(
+        client,
+        monkeypatch,
+        admin=admin,
+        segs=["seg-A", "seg-B"],
+        keys=[key_a, key_b],
+    )
+    with pytest.raises(AdmissionWait):
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client.created == []
+    assert admin.calls == ["seg-A"]
+
+
+def test_admit_ignores_bytes_on_other_segments(
+    fake_store_module, monkeypatch
+) -> None:
+    """别的段上的 key 再大也不参加比较。第一个段放得下就发，且只查一次。"""
+    key_a = _rank_key("a", 0)
+    key_b = _rank_key("b", 1)
+    client = _LayoutClient(
+        {
+            key_a: [("__source__", 100, ())],
+            key_b: [("__source__", 10**9, ())],
+        }
+    )
+    admin = _TableAdmin({"seg-A": (0, 150), "seg-B": (0, 1)})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(
+        client,
+        monkeypatch,
+        admin=admin,
+        segs=["seg-A", "seg-B"],
+        keys=[key_a, key_b],
+    )
+    run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert len(client.created) == 2
+    assert admin.calls == ["seg-A"]
+
+
+def test_admit_estimates_missing_sizes(fake_store_module, monkeypatch, caplog) -> None:
+    """缺大小时用本批已拿到的一个 key 的大小估算，日志里能看到。
+
+    一个 100、两个没有。若丢掉没大小的，100 ≤ 剩余 250 会直接发。估算后
+    是 300，必须先等。
+    """
+    import logging
+
+    known = _rank_key("known", 0)
+    miss_a = _rank_key("ma", 0)
+    miss_b = _rank_key("mb", 0)
+    attrs = ("transport_endpoint", "buffer_address")
+    client = _LayoutClient(
+        {
+            known: [("__source__", 100, ())],
+            miss_a: [("__source__", None, attrs)],
+            miss_b: [("__source__", None, attrs)],
+        }
+    )
+    from kvcm.ops.base import AdmissionWait
+
+    admin = _TableAdmin({"seg-A": (0, 250)})
+    _forbid_wait(monkeypatch)
+    caplog.set_level(logging.INFO, logger="kvcm.backends.mooncake.backend")
+    b = _admit_backend(
+        client,
+        monkeypatch,
+        admin=admin,
+        segs=["seg-A"],
+        keys=[known, miss_a, miss_b],
+    )
+    with pytest.raises(AdmissionWait):
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client.created == []
+    assert "估算" in caplog.text
+
+
+def test_admit_missing_segment_fails_immediately(fake_store_module, monkeypatch) -> None:
+    """段名找不到：立即停，不空等。容量为 0 同样当找不到。不是复制失败。"""
+    from kvcm.backends.mooncake.http_admin import SegmentNotFound
+    from kvcm.ops.base import AdmissionStop
+
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    _forbid_wait(monkeypatch)
+
+    missing = _TableAdmin({"seg-A": SegmentNotFound("gone")})
+    b = _admit_backend(client, monkeypatch, admin=missing, segs=["seg-A"], keys=[key])
+    with pytest.raises(AdmissionStop, match="段不存在"):
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client.created == []
+
+    client2 = _LayoutClient({key: [("__source__", 100, ())]})
+    zero = _TableAdmin({"seg-A": (0, 0)})
+    b2 = _admit_backend(client2, monkeypatch, admin=zero, segs=["seg-A"], keys=[key])
+    with pytest.raises(AdmissionStop, match="段不存在"):
+        run(b2.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client2.created == []
+
+
+def test_admit_retries_transient_admin_error(fake_store_module, monkeypatch, caplog) -> None:
+    """管理端口暂时 5xx：闸外等待后重查，不盲提交。大小不随每轮重取。"""
+    import logging
+
+    from kvcm.backends.mooncake.http_admin import AdminError
+    from kvcm.task_engine import TaskEngine
+
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    client.measure_calls = 0
+    orig = client.batch_memory_replica_sizes
+
+    def _counting(keys_):
+        client.measure_calls += 1
+        return orig(keys_)
+
+    client.batch_memory_replica_sizes = _counting
+
+    class _Flaky:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def query_segment(self, segment):
+            self.n += 1
+            if self.n == 1:
+                raise AdminError("unavailable", status=503, body="later")
+            return (0, 10**9)
+
+    async def _sleep(_seconds):
+        assert client.created == []
+
+    monkeypatch.setattr("kvcm.task_engine.asyncio.sleep", _sleep)
+    caplog.set_level(logging.WARNING, logger="kvcm.backends.mooncake.backend")
+    admin = _Flaky()
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
+    run(TaskEngine(b, max_concurrent=1).run_once(
+        Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")
+    ))
+    assert admin.n >= 2
+    assert len(client.created) == 1
+    assert client.measure_calls == 1
+    assert "重试" in caplog.text
+
+
+def test_admit_refuses_when_batch_has_no_size(fake_store_module, monkeypatch) -> None:
+    """整批一个大小都没有：报出描述上的属性名，不用 0，也不提交。"""
+    key = _rank_key("a", 0)
+    client = _LayoutClient(
+        {key: [("__source__", None, ("transport_endpoint", "buffer_address"))]}
+    )
+    admin = _TableAdmin({"seg-A": (0, 10**9)})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
+    with pytest.raises(QueryError, match="buffer_address"):
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client.created == []
+
+
+def test_buffer_size_reads_pybind_name() -> None:
+    """绑定把 C++ size_ 暴露成 size；两个名字都能读，读不到就带上属性名。"""
+    from kvcm.backends.mooncake.client import _buffer_size
+
+    class _Sized:
+        size = 128
+        transport_endpoint = "seg-A"
+
+    class _SizedCpp:
+        size_ = 64
+
+    class _NoSize:
+        transport_endpoint = "seg-A"
+        buffer_address = 1
+
+    assert _buffer_size(_Sized()) == (128, ())
+    assert _buffer_size(_SizedCpp()) == (64, ())
+    size, attrs = _buffer_size(_NoSize())
+    assert size is None
+    assert "transport_endpoint" in attrs
+    assert "buffer_address" in attrs
+
+
+def test_admit_without_admin_refuses(fake_store_module, monkeypatch) -> None:
+    """没有管理端口就不知道剩余，拒绝提交。"""
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    _forbid_wait(monkeypatch)
+    b = _admit_backend(client, monkeypatch, admin=None, segs=["seg-A"], keys=[key])
+    with pytest.raises(QueryError, match="admin"):
+        run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
+    assert client.created == []
+
+
+def test_admit_timeout_covers_gate_wait(fake_store_module, monkeypatch) -> None:
+    """等前缀闸也吃从开始等待算起的预算。到点还没有任务号就停，不提交。
+
+    名额被占住超过 timeout 时必须停。停完把占住的名额还回去，闸仍是满的
+    （取消等待不能把名额弄丢，也不能多还一个）。
+    """
+    from kvcm.flows.prefetch import PrefetchError
+    from kvcm.task_engine import TaskEngine
+
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    admin = _TableAdmin({"seg-A": (0, 10**9)})
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
+    eng = TaskEngine(b, max_concurrent=1)
+
+    async def scenario():
+        await eng._gate.acquire()
+        task = asyncio.create_task(
+            eng.run_once(
+                Prefix(model_id="qwen", token_ids=(1,)),
+                InstanceId("inst-B"),
+                timeout_s=0.3,
+            )
+        )
+        try:
+            with pytest.raises(PrefetchError, match="stopped before submit"):
+                await task
+            assert eng._gate.locked()
+        finally:
+            if not task.done():
+                task.cancel()
+            eng._gate.release()
+
+    run(scenario())
+    assert client.created == []
+
+
+def test_admit_slow_query_does_not_extend_timeout(
+    fake_store_module, monkeypatch
+) -> None:
+    """查剩余本身花掉的时间也算预算。查完已经到点就停，不再提交。"""
+    from kvcm.flows.prefetch import PrefetchError
+    from kvcm.task_engine import TaskEngine
+
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+
+    class _Slow:
+        def query_segment(self, segment):
+            time.sleep(0.4)
+            return (0, 10**9)
+
+    b = _admit_backend(client, monkeypatch, admin=_Slow(), segs=["seg-A"], keys=[key])
+    eng = TaskEngine(b, max_concurrent=1)
+    start = time.monotonic()
+    with pytest.raises(PrefetchError, match="stopped before submit"):
+        run(
+            eng.run_once(
+                Prefix(model_id="qwen", token_ids=(1,)),
+                InstanceId("inst-B"),
+                timeout_s=0.15,
+            )
+        )
+    elapsed = time.monotonic() - start
+    assert client.created == []
+    assert elapsed < 2.0, f"到点之后还在等: {elapsed:.2f}s"
+
+
+def test_admit_cancel_before_submit_records_nothing(
+    fake_store_module, monkeypatch
+) -> None:
+    """闸外等空间时被取消：还没有任务号，不记成复制失败。"""
+    from kvcm.task_engine import TaskEngine
+
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    admin = _TableAdmin({"seg-A": (100, 100)})  # 剩余 0，一直等
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
+        b._ledger = led
+        eng = TaskEngine(b, max_concurrent=1)
+
+        async def scenario():
+            task = asyncio.create_task(
+                eng.run_once(
+                    Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")
+                )
+            )
+            deadline = time.monotonic() + 2
+            while not admin.calls and time.monotonic() < deadline:
+                await asyncio.sleep(0.01)
+            assert admin.calls, "还没开始查段"
+            assert not eng._gate.locked()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        run(scenario())
+        assert client.created == []
+        assert led.list_running_tasks() == []
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_admin_url_explicit_overrides_master(monkeypatch) -> None:
+    """显式 --admin 用显式值；缺省从 --master 的 host 推出 :9003。"""
+    import argparse
+
+    from kvcm import daemon
+
+    seen: dict = {}
+
+    def fake_backend(**kwargs):
+        seen.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(daemon, "MooncakeBackend", fake_backend)
+    monkeypatch.setattr(daemon, "KeyComputer", lambda **kw: object())
+    args = argparse.Namespace(
+        model_name="qwen",
+        block_size=128,
+        tp_size=1,
+        peer_tp_size=None,
+        put_step=1,
+        hash_algo="sha256",
+        segs="seg-A",
+        capability="v0311",
+        rpc_timeout_s=30.0,
+        copy_submit_concurrency=4,
+        master="master.internal:50088",
+        admin="http://10.1.2.3:9999",
+    )
+    daemon.build_backend(args, client=object(), ledger=object())
+    assert seen["admin"]._base == "http://10.1.2.3:9999"
+
+
+def test_query_segment_parses_capacity_space_and_not_found(monkeypatch) -> None:
+    """Capacity 冒号前有空格；段不存在是接口失败，不是剩余 0。"""
+    import email
+    import io
+    import urllib.error
+    import urllib.request
+
+    from kvcm.backends.mooncake.http_admin import (
+        AdminClient,
+        AdminError,
+        SegmentNotFound,
+    )
+
+    body = "seg-A\nUsed(bytes): 10\nCapacity(bytes) : 100\n"
+
+    class _Resp:
+        def __init__(self, text: str, status: int = 200) -> None:
+            self._text = text.encode()
+            self._status = status
+
+        def read(self):
+            return self._text
+
+        def getcode(self):
+            return self._status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    def _ok(url, timeout=0):
+        assert "segment=seg-A" in url
+        return _Resp(body)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _ok)
+    assert AdminClient("http://127.0.0.1:9003").query_segment("seg-A") == (10, 100)
+
+    def _missing(url, timeout=0):
+        hdrs = email.message.EmailMessage()
+        raise urllib.error.HTTPError(
+            url,
+            500,
+            "err",
+            hdrs,
+            io.BytesIO(b"Failed to query segment"),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _missing)
+    with pytest.raises(SegmentNotFound):
+        AdminClient("http://127.0.0.1:9003").query_segment("no-such")
+
+    def _down(url, timeout=0):
+        raise urllib.error.URLError("connection refused")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _down)
+    with pytest.raises(AdminError) as ei:
+        AdminClient("http://127.0.0.1:9003").query_segment("seg-A")
+    assert ei.value.status is None
+    assert not isinstance(ei.value, SegmentNotFound)

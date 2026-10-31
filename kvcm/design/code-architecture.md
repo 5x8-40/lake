@@ -76,7 +76,7 @@ flowchart TB
 ```
 
 - `IntentReceiver`、`InstanceWatcher` 只接收，箭头从进程外进来。`EventPublisher` 只发送，箭头从进程里出去。三者互不调用
-- **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`（前缀闸外），再占一个前缀闸名额跑 `PrefetchFlow.run_after_exists`，终态才还。`copy` 里每个 key 另过进程级提交信号量，`create_copy_task` 返回即还。回执由调用方 `GetTask` 主动查
+- **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`，再在闸外等目标段放得下，放得下才占一个前缀闸名额跑 `PrefetchFlow.run_after_exists`，终态才还。`copy` 里每个 key 另过进程级提交信号量，`create_copy_task` 返回即还。回执由调用方 `GetTask` 主动查
 - 已接通的驱动是 `PrefetchFlow` 调 `KvOps`——运行时这个对象就是 `MooncakeBackend`，不是中间再转一跳。它写 `Ledger`，账本落在圈外的 sqlite 文件上；`rebuild` 再把 running 行读回来
 - **实例拓扑的两条来路**：demo 环境没有注册通道，`RankTopology` 用探测法推断「哪个 rank 对应哪个 seg」（见 L4 节）；生产环境由实例启动时把自己的拓扑（TP 配置、rank 与 seg 对应表）经 `InstanceWatcher` 注册进来（D1 §3、E13）——两条来路汇成一个 `locate` 函数注入 backend
 - `StoreClient` 走 master 的 RPC `:50088`。`SegTopology` 自己会打 HTTP `:9003` 的 `/get_all_segments`（查存储池当前挂了哪些 seg）。demo 里把这份名单交给 `RankTopology` 做比对，进程里还没有这条装配
@@ -159,17 +159,19 @@ flowchart LR
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
 | RetainFlow | retain（主路径 = retained client 注册；0.3.11 过渡 = move 到存活节点的 seg） | 未实现（D2 §4） |
 
-- **失败处理**：除 exists 的 `QueryError`（不包装、可重试上抛）外，流程对调用方只抛一种异常（当前叫 `PrefetchError`——这个名字绑死在 Prefetch 上，其他流程没法用，将改为一般化的 `FlowError`，随 KeySet 一起实施）——调用方不用关心失败发生在哪一步，具体原因写在异常消息里。编程错误（KeyError、TypeError 这类代码 bug）不包装，直接向上抛。异常类型定义见 L3「失败语义」。各分支：
+- **失败处理**：生产路径走 `TaskEngine`，对外是 `PrefetchError`；`PrefetchFlow.run` 没有等待循环，直接调用会把 `AdmissionWait` 抛出去。exists 的 `QueryError` 不包装、可重试上抛。编程错误（KeyError、TypeError 这类代码 bug）不包装，直接向上抛。异常类型定义见 L3「失败语义」。各分支：
 
 | 发生了什么 | 流程怎么处理 |
 |-----------|-------------|
 | exists 查询时 RPC 出错（QueryError） | 不包装，直接向上抛（可重试） |
 | 前缀不在池（exists 返回 False） | 报错，不发起复制（复制了也没意义） |
-| 复制提交中途出错（SubmitError） | 报错；异常里带已提交的任务号——那些任务还在池里跑，需要有人跟 |
+| 复制提交中途出错（SubmitError） | 报错；已经落账的号由流程 `abandon`，账本是 abandoned；池里的传输不取消 |
 | 查任务状态时 RPC 出错（QueryError） | 不报失败，等一会儿重查，直到超时 |
 | 任务全部完成、但副本核验缺（VerifyError） | 报错，带缺哪些副本的明细 |
 | 任务失败（FAILED） | 报错 |
 | 超过时限没完成 | 先放弃跟踪（abandon，见 L3 节），再报错 |
+| 目标段暂时放不下（AdmissionWait） | TaskEngine 在闸外再等，不记复制失败 |
+| 段不存在（AdmissionStop） | TaskEngine 里包成 PrefetchError，这次预热停止 |
 
 流程的步骤、数据流与失败分支：**[flows/prefetch.md](flows/prefetch.md)**（每流程一篇，新增流程同目录另立）。
 
@@ -195,11 +197,11 @@ flowchart LR
 
 ### 失败语义
 
-异常分三类（`kvcm/ops/base.py`；除 exists 的 QueryError 直接上抛外，流程对调用方统一只抛 PrefetchError）：
+异常分三类（`kvcm/ops/base.py`）。生产路径走 `TaskEngine`，对外是 `PrefetchError`；`PrefetchFlow.run` 没有等待循环，直接调用会把 `AdmissionWait` 抛出去。exists 的 `QueryError` 不包装：
 
 | 异常 | 什么时候抛 | 调用方怎么办 |
 |------|-----------|-------------|
-| SubmitError | 提交任务的中途出错。异常消息带已提交的任务号——那些任务还在池里跑，需要有人跟 | 视为失败；重试与否由编排层决定（重复提交有幂等保护，见下） |
+| SubmitError | 提交任务的中途出错。已经落账的号由流程 `abandon`，账本是 abandoned；池里的传输不取消 | 视为失败；重试与否由编排层决定（重复提交有幂等保护，见下） |
 | QueryError | 查任务状态、查副本时 RPC 出错（网络抖动这类临时问题） | 轮询阶段：等一会儿重查，不算失败；exists 阶段：不包装，直接上抛给调用方 |
 | VerifyError | 任务全部显示完成、但副本核验缺副本。异常带明细 | 视为失败 |
 
@@ -455,7 +457,20 @@ sequenceDiagram
     W->>Ex: exists（不过前缀闸）
     Ex->>M: batch_is_exist
     M-->>Ex: 在池
-    W->>Q: acquire 前缀闸
+    loop 闸外，直到计划第一条的目标段放得下或超时
+        Note over W: 大小用 batch_get_replica_desc，一轮只取一次
+        W->>M: GET /query_segment（只查计划第一条的目标段）
+        alt 放不下，或管理端口暂时连不上
+            Note over W: 睡 0.5 秒。不占前缀闸。大小不再重查
+        else 段不存在，或预算到了还没有任务号
+            Note over W: 停止这次预热，不记成复制失败
+        end
+    end
+    W->>Q: acquire 前缀闸（不超过剩余预算）
+    W->>M: 进闸后再查一次 /query_segment
+    alt 仍然放不下
+        W->>Q: release，回到闸外等
+    else 复查通过
     rect rgb(232, 240, 254)
         Note over W,S: 每个 key 拿一次。同时在飞不超过 4。RPC 返回就 release。前缀闸在这整段都不还
         loop 逐 key
@@ -473,12 +488,14 @@ sequenceDiagram
     end
     W->>W: 写 Ledger 终态
     W->>Q: release 前缀闸
+    end
 ```
 
 - 线程只在 `Ex`（线程池）这一列出现：每个 RPC 执行的几毫秒
 - 协程（W）全程只是一段代码状态，挂起时不占线程——排队 100 个这样的协程也免费
 - `loop 逐 key` 画的是提交信号量的拿还，不是「key 必须一个个串行」。同时在飞的 `create_copy_task` 不超过 4，多出来的 key 在 `S` 上等
-- 图只画了成功路径。失败 / 超时 / 取消同样在终态归还前缀闸。提交信号量在每次 `create_copy_task` 返回时已经还过，不跟前缀闸一起还
+- 等段剩余在 acquire 之前。进闸后、`create_copy_task` 之前再查一次；不够就 release，回到闸外。等闸也吃从开始等待算起的预算：到点还没有任务号就停，不提交。`admit_planned_copy` 在 `KvOps` 上有默认实现（不占新段，直接通过）；占段的后端 override。编排层总是调用，不探测具体类有没有这个方法。
+- 图的提交和轮询画的是放得下之后的成功路径。失败 / 超时 / 取消同样在终态归还前缀闸。提交信号量在每次 `create_copy_task` 返回时已经还过，不跟前缀闸一起还
 
 **线程池大小**：
 
@@ -505,11 +522,11 @@ sequenceDiagram
 `asyncio.Queue` + 传输闸限并发 + 协程消费者，无优先级、不分轻重通道。
 
 - **队列与拿取**：intent 进 `asyncio.Queue`；K 个协程循环 `get`（K 可以很大，协程便宜——在队列里等、在传输闸上等，都是协程挂起，不占线程）
-- **传输闸 = `asyncio.Semaphore`（默认 4，参数化）**：一个名额 = 一个前缀正停在 `run_after_exists`（提交 + 轮询 + 副本核验），终态才 release。闸满时在传的不是 4 个任务：该前缀的全部 key 都会交给 master（32K token、tp=2 时大约 512 个 key，4 个满额前缀大约 4×512）。**不按 key 计，也不是带宽管控**（带宽归 E15）。它和进程级 `submit_concurrency` 不重复：那把信号量只包住 `create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受。没有前缀闸的话，排队前缀会以每次 4 个建链 RPC 的速度全部提交完——master 上叠着所有 plan，并且每个 handle 每轮 `query_task` 都要按 key 顺序各查一次（RPC 池只有 4~8 个线程）。前缀闸把「还没终态的预热前缀」卡在 `max_concurrent`。**闸外的只有 exists 探测**（预热的前置检查，毫秒级 RPC，读即续租）：它在 `_run_prefetch` 里排在 `async with self._gate` 之前。**闸内是 `run_after_exists` 整段**——提交流、轮询、副本核验都在里面；keepalive 注册在 `release` 之后，也在闸外。轮询占着名额，但不额外发建链。promote 的触发 RPC 是毫秒级（不过闸），但其 READY 是核验式轮询（时长由池的提回进度决定，**不是毫秒即返**）；D2 §3 的另一条主动路径（读删写，数据经 kvcm）若启用，则属 kvcm 发起的传输，要占闸
+- **传输闸 = `asyncio.Semaphore`（默认 4，参数化）**：一个名额在复查之前就 `acquire`；复查失败就 `release`，复查通过则占到该前缀终态（提交 + 轮询 + 副本核验）。闸满时在传的不是 4 个任务：该前缀的全部 key 都会交给 master（32K token、tp=2 时大约 512 个 key，4 个满额前缀大约 4×512）。**不按 key 计，也不是带宽管控**（带宽归 E15）。它和进程级 `submit_concurrency` 不重复：那把信号量只包住 `create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受。没有前缀闸的话，排队前缀会以每次 4 个建链 RPC 的速度全部提交完——master 上叠着所有 plan，并且每个 handle 每轮 `query_task` 都要按 key 顺序各查一次（RPC 池只有 4~8 个线程）。前缀闸把「已经决定提交、还没终态的预热前缀」卡在 `max_concurrent`。**闸外**有两件：`exists` 探测（预热的前置检查，毫秒级 RPC，读即续租），以及等目标段放得下。等待在 `TaskEngine._wait_then_run`，闸是显式 `acquire` / `release`。等空间只查计划第一条的目标段，一次 `GET /query_segment`（0.3.11 在 `rpc_service.cpp`，主线同文在 `master_admin_service.cpp::HandleQuerySegment`；不使用 `/get_segments_detail`）。剩余 = 这一段的容量 − 已用。只加落在这一段上、且副本端点里还没有这一段的新字节；其它段的剩余和字节都不参与。这一段不够就一个 key 都不发。没查的段仍可能在 `CopyStart` 时 `NO_AVAILABLE_HANDLE`。代码认的是计划第一条，不是写死的 rank 0。闸外这一次查询也吃剩余预算，到点就返回。缺大小时用本批已经读到的一个大小乘以缺的个数，日志标明估算；一个大小都没有就停止，不填假数字。这一段的新占用大于这份剩余，整批不发，闸外 0.5 秒后再查——每轮只重查这一次 `/query_segment`，不重查大小。放得下才去等前缀闸（等闸吃同一段预算，到点还没提交就停）。进闸后、`create_copy_task` 之前再查一次，不够就出闸继续等。超时从开始等待算；还没有任务号就停止这次预热，不记成复制失败。段不存在立即停止。管理端口暂时连不上则等到超时。自己这一批的 key 在放行前已经加进需求，不会漏。另一条前缀如果已经提交、但 master 还没在目标段划出缓冲区，`/query_segment` 的已用还没加上，这条剩余看不见它，两条都可能放行。彻底避开要在 master 上预留，或把复制串成一条，代价高，接受这个窗口：不加锁、不预留，判断只能少失败。这不是 E15 的网卡限速，网卡利用率限速仍不做。名额在复查之前就 `acquire`；复查不够就 `release`，回到闸外。复查通过之后名额占到终态（提交流、轮询、副本核验）。keepalive 注册在 `release` 之后，也在闸外。轮询占着名额，但不额外发建链。promote 的触发 RPC 是毫秒级（不过闸），但其 READY 是核验式轮询（时长由池的提回进度决定，**不是毫秒即返**）；D2 §3 的另一条主动路径（读删写，数据经 kvcm）若启用，则属 kvcm 发起的传输，要占闸
 - **重启恢复不占闸（已知窗口）**：`TaskEngine._track` 只轮询 `rebuild` 捞回的 handle，不 acquire 传输闸。重启后旧前缀全部仍在 master 上搬，新预热仍可占满名额。接受这个叠加——让恢复任务去等闸，轮询会被串行化
 - **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
 - **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；`session_end` 类可延迟任务排队无妨
-- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。窗口上限是 0.3.11 真机实测的结论（14 连发约半数 `TRANSFER_FAIL`，窗口 4 节奏化 42/42 全成），不是拍的数。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过实测打爆的点。链路利用率感知的限速器（网卡计数器采样）仍归 E15，接在同一层信号量上
+- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。窗口上限来自两次分开的真机实验，不是一件事（[../demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md) #16、#17）。10 月 26 日单机（#16）：连不上是 `TRANSFER_FAIL`；窗口 4 节奏化 42/42 全成。10 月 29 日跨机（#17）：主错误是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），master 留内存失败；14 条全成，42 条大约一半失败。这次实验的错误是 master 留内存失败；段剩余预检对得上这个错误类型；它不代替 E15；实验当时也没跑这条预检。#16 的 `TRANSFER_FAIL` 与 #17 不是同一种失败。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过实测打爆的点。网卡利用率限速（网卡计数器采样）仍归 E15，仍不做，接在同一层信号量上
 - **排队超时**：intent 在队列等待的语义（等多久算放弃）随 E12 intent 字段一起定；执行超时沿用 flow 现有 `timeout_s`
 - **失败态策略**（只留接口，随 E11 细化）：失败后的动作三种——① 重发；② 放弃这批任务，事后把留下的副本清掉（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 复制中途源实例下线时的处理（D5）。语义引 D2 §1 与 D5，不新造语义
 
@@ -566,7 +583,7 @@ sequenceDiagram
   2. TaskEngine + flow/ops async 化：intent 占位入口 → `asyncio.Queue` + 前缀闸（默认 4，终态才还）→ 协程消费者直接调 async flow；copy 提交另过进程级提交信号量（返回即还）；KvOps 全方法 async 化 → 终态记账 → 超时处理（复用现有 abandon）
   3. 测试：并发多 intent 单测；重启端到端（杀进程 → rebuild → READY）；优雅退出回归；真机冒烟
   4. 后续 PR（接口演进）：KeySet + wait_ready 挪进 ops + `PrefetchError` → `FlowError`
-- **E15（并行限速）**：并行提交已随 E11 落地（信号量窗口 + `--copy-submit-concurrency`）；本节剩余 = 链路利用率感知的限速器（D1 §5），接在同一个信号量上，不独立做
+- **E15（并行限速）**：并行提交已随 E11 落地（信号量窗口 + `--copy-submit-concurrency`）。提交前按一个目标段的剩余决定整批发不发，已经在本分支落地；它不代替 E15，也不做网卡采样。本节剩余 = 链路利用率感知的限速器（D1 §5），仍不做，接在同一个信号量上，不独立做
 
 ## 参考实现
 
