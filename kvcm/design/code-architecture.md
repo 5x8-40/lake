@@ -456,7 +456,19 @@ sequenceDiagram
     W->>Ex: exists（不过前缀闸）
     Ex->>M: batch_is_exist
     M-->>Ex: 在池
-    W->>Q: acquire 前缀闸
+    loop 闸外，直到第一个目标段放得下或超时
+        W->>M: GET /query_segment（只查 rank 0 那一段）
+        alt 放不下，或管理端口暂时连不上
+            Note over W: 睡 0.5 秒。不占前缀闸。大小不再重查
+        else 段不存在，或预算到了还没有任务号
+            Note over W: 停止这次预热，不记成复制失败
+        end
+    end
+    W->>Q: acquire 前缀闸（不超过剩余预算）
+    W->>M: 进闸后再查一次 /query_segment
+    alt 仍然放不下
+        W->>Q: release，回到闸外等
+    else 复查通过
     rect rgb(232, 240, 254)
         Note over W,S: 每个 key 拿一次。同时在飞不超过 4。RPC 返回就 release。前缀闸在这整段都不还
         loop 逐 key
@@ -474,13 +486,15 @@ sequenceDiagram
     end
     W->>W: 写 Ledger 终态
     W->>Q: release 前缀闸
+    end
     W->>W: 闸外：注册保活，补发一条 BlockStored（失败只记日志）
 ```
 
 - 线程只在 `Ex`（线程池）这一列出现：每个 RPC 执行的几毫秒
 - 协程（W）全程只是一段代码状态，挂起时不占线程——排队 100 个这样的协程也免费
 - `loop 逐 key` 画的是提交信号量的拿还，不是「key 必须一个个串行」。同时在飞的 `create_copy_task` 不超过 4，多出来的 key 在 `S` 上等
-- 图只画了成功路径。失败 / 超时 / 取消同样在终态归还前缀闸。提交信号量在每次 `create_copy_task` 返回时已经还过，不跟前缀闸一起还
+- 等段剩余在 acquire 之前。进闸后、`create_copy_task` 之前再查一次；不够就 release，回到闸外。等闸也吃从开始等待算起的预算：到点还没有任务号就停，不提交
+- 图的提交和轮询画的是放得下之后的成功路径。失败 / 超时 / 取消同样在终态归还前缀闸。提交信号量在每次 `create_copy_task` 返回时已经还过，不跟前缀闸一起还
 
 **线程池大小**：
 
