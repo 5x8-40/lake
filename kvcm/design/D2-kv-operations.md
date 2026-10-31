@@ -389,7 +389,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 | pin | LMCache `pin`/`unpin`（后端接口级）；KVCR `claim/pin`/`release_pin`（**传输窗口专用**，`FETCHABLE` 须等 pin 成功才确定）；TensorCast `pinned` policy（必须驻留 + 溢出**拒绝写入**）；HiCache `lock_ref`（`protected_size_` vs `evictable_size_`，dec 到 0 ≠ 释放、仍可命中） | mooncake 三件套（lease/soft/hard）比多数系统细。差异：TensorCast `pinned` 溢出拒绝写入，mooncake hard pin 无此语义（创建时固化、之后改不了，F1）；KVCR 的传输窗口 pin 在 mooncake 由「copy 任务在途拒 upsert」覆盖（F2） |
 | demote | §3 专节（FlexKV/LMCache/UCM/KVBM/MemCache 对照 + HiCache 写穿/写回） | —— |
 | promote | HiCache `load_back`（L2→L1 提回）；FlexKV SSD→GPU 的 H2D 回填；KVCR `fetch`；mooncake `promotion_on_hit`（命中达阈值自动提回） | 被动提升（读命中驱动）是各家主路径；kvcm 另有主动两条：反复调 `GetReplicaList` 至命中计数过线触发 / 读删写自搬（§3） |
-| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择。kvcm 的做法相同：死前把副本放到一个还活着的 client 上（另一台引擎的段，或 kvcm 自己的 client），或写成 DFS 副本（§4）。没有保留身份注册。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：client_id 管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是 key 的 client_id |
+| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择。kvcm 现在的做法是死前把副本搬到另一台还活着的引擎的段上。DFS 另编。没有保留身份注册。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：client_id 管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是 key 的 client_id |
 | remove | LMCache `remove`/`clear`；SGLang 分层放弃（`block-lifecycle.md`）：无 L3 时 `evict` 删叶 = 彻底；**有 L3 时引擎永不主动放弃**——删除下放 L3 后端独立 LRU/TTL，引擎看不到 | SGLang 的「释放 = 逐层剥离」（L1 摘节点降层 → L2 摘除 → L3 后端自决）对应 kvcm 三级（软释放 / demote / remove）。「L3 删除引擎不可见」提醒：kvcm remove 后索引侧条目需同步清（D1 已知：池副本删除事件通道缺失） |
 
 - **总观察**
@@ -628,13 +628,7 @@ sequenceDiagram
     end
 
     rect rgb(222, 235, 247)
-    Note over K,KS: 远期方案：kvcm 自己挂 SSD（确定性，与 §4 retain 兜底同形态）
-    K->>M: ① MountLocalDiskSegment（挂盘，与引擎同样的挂法）
-    K->>E: ② 读 DRAM 数据
-    E-->>K: 数据（RDMA）
-    K->>KS: ③ 写 kvcm 本机盘文件
-    K->>M: ④ NotifyOffloadSuccess 上报登记（无在途任务也登记，F1）
-    Note over M: 盘副本绑 kvcm——引擎读它要经 kvcm 转发，<br/>kvcm 从控制面变成数据面一环
+    Note over K,KS: 现有通道做不到：kvcm 挂 SSD 再卸引擎上的副本（§4）<br/>OffloadObjects 只认本机内存，没有「卸到我的盘」的 RPC
     end
 ```
 
@@ -697,7 +691,7 @@ sequenceDiagram
 
     rect rgb(223, 242, 223)
     Note over E,DFS: 做法①（两版本）：死前 move / copy 到还活着的段
-    K->>M: CreateMoveTask 或 CreateCopyTask（目标是他机段，或 kvcm 自己挂的内存段）
+    K->>M: CreateMoveTask 或 CreateCopyTask（目标是另一台还活着的引擎的段）
     E--xM: 源引擎死
     Note over M: 副本所在 client 已换成目标段的 client（F6b）→ 留着
     end
@@ -885,8 +879,8 @@ sequenceDiagram
   - **DRAM 压力冷热分级**：DRAM 快满时把冷的挤到 SSD，热的留 DRAM——存储分层的标准用法
   - 实例计划下线：下线前把 KV 降层保存
 - demote/promote 与 keepalive 是**独立操作**，但写回模式下有一处机制依赖：落盘由驱逐触发，而保活中的 key（lease 未过期）被驱逐硬过滤跳过（F8）——所以写回模式下 demote 想生效，须先停保活并等 lease 过期，否则驱逐永远轮不到它。写穿模式（put 时已落盘）和 promote（读盘写 DRAM，不经驱逐）都不受保活影响。「停保活」不等于「降层」，它是策略层的动作，不是 demote 语义的一部分
-- **存储形态：mooncake 统一管理**——引擎实例挂本机 SSD（`MountLocalDiskSegment`），DRAM + SSD 构成多级 tier；**kvcm 不持存储**（主路径），只发控制指令；远期 kvcm 也可挂本机 SSD（与引擎同样的挂法）把空闲资源用满——挂后 kvcm 名下盘副本可作 retain 的兜底（§4）
-- **copy/move 对两个方向都用不上**（F7 介质边界，两版本一致）：disk 不在 seg 名字空间——demote 拿 disk 当不了 copy/move 的**目标**；SSD 副本没有 seg 名——promote 拿它当不了 copy/move 的**源**。跨介质只有三条路：池通道（offload / promotion）、kvcm 读写组合（读删写）、（远期）kvcm 自己挂 SSD 登记
+- **存储形态：mooncake 统一管理**——引擎实例挂本机 SSD（`MountLocalDiskSegment`），DRAM + SSD 构成多级 tier；**kvcm 不持存储**，只发控制指令。kvcm 挂自己的盘再卸引擎上的副本，现有通道做不到（§4）
+- **copy/move 对两个方向都用不上**（F7 介质边界，两版本一致）：disk 不在 seg 名字空间——demote 拿 disk 当不了 copy/move 的**目标**；SSD 副本没有 seg 名——promote 拿它当不了 copy/move 的**源**。跨介质现在是池通道（offload / promotion）和 kvcm 读写组合（读删写）。kvcm 挂 SSD 再登记，见 §4，现有通道做不到
 - **版本说明**：本节的机制结论（介质边界、offload/promotion 通道、无立即降层入口）0.3.11 与 main 一致（main 增量全清单见 F13，均不改变本节主路径）
 
 ### 存储领域的冷热分级对照

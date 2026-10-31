@@ -3,7 +3,7 @@
 八项操作分三类：
 - 原子动作：copy / move / keepalive / demote / promote / remove
 - 元数据标记：pin
-- 目的型：retain——由其他操作组合实现，对外仍呈现单步语义
+- 目的型：retain——目前只以 move/copy 表达，对外仍呈现单步语义
 
 完成信号：copy / move / promote 有 READY（任务状态完成 + 目标侧副本
 核验通过）。retain 只表达 move/copy，返回任务号，不产生「把请求调回
