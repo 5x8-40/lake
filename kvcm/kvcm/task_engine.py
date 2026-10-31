@@ -452,8 +452,13 @@ class TaskEngine:
             except Exception as e:  # 编程错误也留原因，再往上抛（不吞）
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
                 self._programming_errors += 1
-                if self._programming_errors >= 3:
-                    # 消费者会退出。停收，避免新 intent 永远 PENDING。
+                current = asyncio.current_task()
+                others_done = all(
+                    t.done() for t in self._consumers if t is not current
+                )
+                # 3 次门槛，或这是最后一条活着的消费者。好坏交替会把计数清零，
+                # 但消费者仍会一条条死光，不在这里停收的话新 intent 永远 PENDING。
+                if self._programming_errors >= 3 or others_done:
                     self._accepting = False
                 raise
             finally:

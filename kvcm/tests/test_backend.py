@@ -766,7 +766,7 @@ def test_entry_exists_truth_table() -> None:
 
 
 def test_exists_checks_length(fake_store_module, monkeypatch) -> None:
-    """绑定短回（异常）不得误判为全部存在。"""
+    """绑定短回是查询失败，不是「不在池」。"""
 
     class ShortClient(FakeClient):
         def is_exist(self, keys):
@@ -774,7 +774,37 @@ def test_exists_checks_length(fake_store_module, monkeypatch) -> None:
 
     kc = KeyComputer(model_name="qwen", tp_size=2)
     b = _backend(ShortClient(), kc, monkeypatch)
-    assert run(b.exists(Prefix(model_id="qwen", token_ids=(1,)))) is False
+    with pytest.raises(QueryError, match="size mismatch"):
+        run(b.exists(Prefix(model_id="qwen", token_ids=(1,))))
+
+
+def test_keepalive_keeps_row_when_is_exist_short(
+    fake_store_module, monkeypatch
+) -> None:
+    """短回是 QueryError。保活跳过本轮，不注销。"""
+    from kvcm.loops import KeepaliveLoop
+
+    class ShortClient(FakeClient):
+        def is_exist(self, keys):
+            return [True]
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        b = _backend(ShortClient(), kc, monkeypatch, ledger=led)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        loop = KeepaliveLoop(b, led, interval_s=999, window_s=600)
+        loop.register(prefix)
+        run(loop.sweep_once())
+        assert led.list_keepalive() == [prefix]
+        loop.close()
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
 
 
 def test_exists_all_present(fake_store_module, monkeypatch) -> None:
@@ -2186,6 +2216,40 @@ def test_demote_fails_without_disk_replica(fake_store_module, monkeypatch) -> No
             run(b.demote(prefix))
         assert led.list_keepalive() == [prefix]
         assert steps == [("sleep", 0, []), ("query", ["k0"])]
+        kept = led.list_keepalive_records()[0].registered_at
+        led._backdate_keepalive(seconds=50)
+        old = led.list_keepalive_records()[0].registered_at
+        assert old != kept
+        with pytest.raises(VerifyError, match="还没有盘副本"):
+            run(b.demote(prefix))
+        assert led.list_keepalive_records()[0].registered_at == old
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_without_prior_keepalive_does_not_create_row(
+    fake_store_module, monkeypatch
+) -> None:
+    """原本没有保活行，失败后不新建。"""
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {k: KeyReplicaQuery(key=k, ok=True, disk_replicas=0) for k in keys}
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        assert led.list_keepalive() == []
+        with pytest.raises(VerifyError, match="还没有盘副本"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == []
     finally:
         led.close()
         import os

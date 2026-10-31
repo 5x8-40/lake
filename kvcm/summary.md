@@ -85,7 +85,7 @@
     - 代价：官方绑定没有拆开的 upsert。空写走单独的 `_empty_pin.so`（只链 `store.so`，见上）。client_id 用方案一
   - hard pin 级：选定候选 ①。`pin(HARD)` 登记保活（同一张 Ledger 表），不读数据、不 Remove、不重 put、不空写、不改 hard pin 位。`hard_pin_after` 仍表示不能事后改 hard pin 标记。lease 时长是 master 的 `default_kv_lease_ttl`，不是 kvcm 对单个 key 改标记；kvcm 不改这个配置
   - 候选 ② 读删写代价太大，这次不做
-  - 取消：停续租，等满一个 lease TTL。没有马上撤销 lease 的调用，也不查剩余租约。空写 soft pin 的取消仍是传 false 或 `SoftPinAction::DISABLE`
+  - 取消：停续租，等满一个 lease TTL。没有马上撤销 lease 的调用，也不查剩余租约。空写 soft pin 的取消是主线 `SoftPinAction::DISABLE`。扩展只对着主线，0.3.11 的 soft_pin 通道是 NO
   - 读锁方案已否决：refcnt 是任务级保护，两个版本都没有读者引用 RPC
   - client_id：方案一是当前路径（空写写成 kvcm 的 UUID，目前没感受到权限影响）。方案二借名仍做不到，不是当前路径；机制说明留在 D2 §2
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）
@@ -98,7 +98,7 @@
   - 长期未命中 → demote 到 SSD，由策略层定
 - demote / promote：结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
   - 框架：语义是原子的，实现是组合动作（池通道或 kvcm 读写组合 + 核验）；存储统一归 mooncake（引擎实例挂本机 SSD 做分层，kvcm 自己不持存储）
-  - demote：先确认前缀能展开成 key、并且 admin 已配置，再 `stop_keepalive`。然后等满一个 lease TTL（`--lease-ttl-s`，默认 10，须与 master 的 `default_kv_lease_ttl` 一致；测试床实配过 11s；0.3.11 代码默认 5s，main 默认 10s）。kvcm 不改 master 的这个值。再用 `GET /batch_query_keys` 确认每个 key 的 disk / local_disk。不用 `GetReplicaList`（会续租）。没有立刻搬到盘上的 RPC。写回且池不满时仍失败。不读数据落盘，不调 `MountLocalDiskSegment`
+  - demote：先确认前缀能展开成 key、并且 admin 已配置，再 `stop_keepalive`。然后等满一个 lease TTL（`--lease-ttl-s`，默认 10，须与 master 的 `default_kv_lease_ttl` 一致；测试床实配过 11s；0.3.11 代码默认 5s，main 默认 10s）。kvcm 不改 master 的这个值。再用 `GET /batch_query_keys` 确认每个 key 的 disk / local_disk。不用 `GetReplicaList`（会续租）。没有立刻搬到盘上的 RPC。写回且池不满时仍失败。不读数据落盘，不调 `MountLocalDiskSegment`。失败或取消只恢复原本就有的保活行，且不重置窗口；原来没有保活行不会新建。成功不加回
   - 池侧前提仍是 `enable_offload`：
     - 写穿 / 写回两模式（≈ HiCache write_through / write_back）
   - promote 三条路：

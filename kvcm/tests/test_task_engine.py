@@ -706,7 +706,72 @@ def test_consumer_exits_on_programming_error() -> None:
             await asyncio.sleep(0.1)
             alive = [t for t in eng._consumers if not t.done()]
             assert not alive, f"编程错误后消费者还活着: {len(alive)} 条"
+            assert eng._accepting is False
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_alternating_errors_stop_when_last_consumer_dies() -> None:
+    """好坏交替清掉 3 次计数。两条消费者都死后不再接受新 intent。"""
+
+    class Alt(FakeOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mode = "bad"
+
+        async def exists(self, prefix):
+            if self.mode == "bad":
+                raise TypeError("programming bug")
+            return True
+
+    async def scenario():
+        ops = Alt()
+        eng = TaskEngine(ops, max_concurrent=1, consumer_count=2)
+        eng.start()
+        try:
+            first = eng.submit_intent(
+                Prefix(model_id="q", token_ids=(1,)), _T, poll_s=0.01
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                dead = sum(t.done() for t in eng._consumers)
+                if dead == 1 and eng.intent_status(first) is IntentStatus.FAILED:
+                    break
+                await asyncio.sleep(0.01)
             assert eng._accepting is True
+            assert eng._programming_errors == 1
+
+            ops.mode = "good"
+            second = eng.submit_intent(
+                Prefix(model_id="q", token_ids=(2,)), _T, poll_s=0.01
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if eng.intent_status(second) is IntentStatus.READY:
+                    break
+                await asyncio.sleep(0.01)
+            assert eng.intent_status(second) is IntentStatus.READY
+            assert eng._programming_errors == 0
+            assert sum(t.done() for t in eng._consumers) == 1
+
+            ops.mode = "bad"
+            third = eng.submit_intent(
+                Prefix(model_id="q", token_ids=(3,)), _T, poll_s=0.01
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if not eng._accepting and eng.intent_status(third) is IntentStatus.FAILED:
+                    break
+                await asyncio.sleep(0.01)
+            assert eng.intent_status(third) is IntentStatus.FAILED
+            assert "TypeError" in eng.intent_detail(third)
+            assert eng._programming_errors == 1
+            assert not eng._accepting
+            assert not any(not t.done() for t in eng._consumers)
+            with pytest.raises(RuntimeError, match="shutting down"):
+                eng.submit_intent(Prefix(model_id="q", token_ids=(4,)), _T)
         finally:
             await eng.shutdown(timeout_s=2)
 

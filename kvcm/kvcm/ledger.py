@@ -369,6 +369,36 @@ class Ledger:
             )
         return out
 
+    def keepalive_registered_at(self, prefix: Prefix) -> float | None:
+        """这一行的 registered_at。没有行返回 None。不改窗口。"""
+        return self._run(self._keepalive_registered_at_sync, prefix)
+
+    def _keepalive_registered_at_sync(self, prefix: Prefix) -> float | None:
+        row = self._conn.execute(
+            "SELECT registered_at FROM keepalive WHERE prefix_key = ?",
+            (prefix_key(prefix),),
+        ).fetchone()
+        return None if row is None else float(row[0])
+
+    def restore_keepalive(self, prefix: Prefix, registered_at: float) -> None:
+        """按原来的 registered_at 把保活行插回去。不用现在的时间。"""
+        self._run(self._restore_keepalive_sync, prefix, registered_at)
+
+    def _restore_keepalive_sync(self, prefix: Prefix, registered_at: float) -> None:
+        self._conn.execute(
+            "INSERT INTO keepalive (prefix_key, model_id, token_ids, registered_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(prefix_key) DO UPDATE SET"
+            " registered_at = excluded.registered_at",
+            (
+                prefix_key(prefix),
+                prefix.model_id,
+                json.dumps(list(prefix.token_ids)),
+                registered_at,
+            ),
+        )
+        self._conn.commit()
+
     def has_keepalive(self, prefix: Prefix) -> bool:
         """这一行还在不在。按 prefix_key 查一行，不读整表。"""
         return self._run(self._has_keepalive_sync, prefix)

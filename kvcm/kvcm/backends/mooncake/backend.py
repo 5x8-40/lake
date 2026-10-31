@@ -551,9 +551,9 @@ class MooncakeBackend(KvOps):
     async def exists(self, prefix: Prefix) -> bool:
         """全部 key 在池才为真（batch_is_exist；读即续租）。
 
-        查询本身失败（返回值不是 0/1/True）抛 QueryError——「查不出来」与
-        「不存在」语义不同：前者调用方可重试，后者才触发重算/预热。
-        返回列表长度与 key 数不一致视为不存在（绑定异常时可能短回）。
+        查询本身失败（返回值不是 0/1/True/False，或列表长度和 key 数
+        不一致）抛 QueryError——「查不出来」与「不存在」语义不同：
+        前者调用方可重试，后者才触发重算/预热。短回不当成不在池。
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
@@ -562,7 +562,11 @@ class MooncakeBackend(KvOps):
             result = await self._rpc(self._client.is_exist, keys)
         except StoreClientError as e:
             raise QueryError(str(e)) from e
-        return len(result) == len(keys) and all(result)
+        if len(result) != len(keys):
+            raise QueryError(
+                f"batch_is_exist size mismatch keys={len(keys)} results={len(result)}"
+            )
+        return all(result)
 
     def prefix_of(self, handle: TaskHandle) -> Prefix | None:
         """句柄登记的前缀（_plans 第一项）。终态删除登记后为 None——
@@ -873,6 +877,8 @@ class MooncakeBackend(KvOps):
         把刚停的保活又续上。每个 key 都有盘副本才算成功。
         写回且池不满时仍会失败：不读数据落盘，不调 ``MountLocalDiskSegment``。
         展开不出 key、或没配 admin，在停保活之前就失败。
+        失败或取消只恢复原本就有的保活行，并写回原来的
+        ``registered_at``。原来没有行不新建。成功不加回。
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
@@ -885,6 +891,10 @@ class MooncakeBackend(KvOps):
             raise UnsupportedCapabilityError(
                 "0.3.11 的 /batch_query_keys 没有盘副本字段，不能降层"
             )
+        await self._require_ledger()
+        registered_at = await self._in_ledger(
+            self._ledger.keepalive_registered_at, prefix
+        )
         await self.stop_keepalive(prefix)
         try:
             await asyncio.sleep(self._lease_ttl_s)
@@ -904,11 +914,24 @@ class MooncakeBackend(KvOps):
                     "demote: 还没有盘副本，没有降层成功: " + ", ".join(missing[:4])
                 )
         except asyncio.CancelledError:
-            await self.keepalive(prefix)
+            try:
+                await self._restore_demote_keepalive(prefix, registered_at)
+            except BaseException:
+                pass
             raise
         except (QueryError, VerifyError):
-            await self.keepalive(prefix)
+            await self._restore_demote_keepalive(prefix, registered_at)
             raise
+
+    async def _restore_demote_keepalive(
+        self, prefix: Prefix, registered_at: float | None
+    ) -> None:
+        """只把停之前就有的保活行按原 registered_at 插回去。"""
+        if registered_at is None:
+            return
+        await self._in_ledger(
+            self._ledger.restore_keepalive, prefix, registered_at
+        )
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """把前缀 KV 提回到 target。
