@@ -2,6 +2,8 @@ Backport of vllm-ascend #15835 (merge commit 9f8773ea, 2026-09-09, main only;
 NOT in v0.26.0rc1/rc2): restore TP-mismatch transfer wiring for
 AscendStoreConnector. Fixes vllm-ascend #15842.
 
+不再需要本文件：引擎树已包含 9f8773ea。v0.26.0rc1 与 rc2 不含该提交，仍要打。
+
   1. pass worker=self if self.tp_mismatch else None to
      KVCacheStoreSendingThread / KVCacheStoreRecvingThread
      (None for same-TP keeps the regular path untouched);

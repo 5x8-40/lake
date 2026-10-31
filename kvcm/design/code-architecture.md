@@ -364,6 +364,12 @@ stateDiagram-v2
 - **KeyComputer 归引擎侧，不归存储侧**——PoolKey 的权威定义在**引擎**（引擎写 KV 时用的就是这个 key；kvcm 不定自己的格式，只是按同样的规则把 key 再算出来）；mooncake 对 key 无格式要求（不透明字符串），后端不掺和 key 语义
 - **引擎之间 key 计算不一样**：vLLM 是链式 block hash（`vllm/v1/core/kv_cache_utils.py::hash_block_tokens`，`prefix_caching_hash_algo` + `init_none_hash` 的初始种子参与计算、block_size、Mamba/MLA 模型类型均影响结果）；SGLang 是 `RadixKey` = token id 序列本身（`sglang/srt/mem_cache/radix_cache.py`）——连 key 形态都不同（hash 值 vs token 序列）。KeyComputer 放通用层或存储侧都是放错了层
 - **引擎强关联物全归本层**：key 计算、rank 拓扑、事件 schema、engine config——换引擎（如 SGLangAdapter）时 StoreBackend 一行不动
+- **异构 TP 的引擎前置**（源 TP 与目标 TP 不同时才有；同构不用）
+  - kvcm 只按 `effective_tp = max(本机 TP, 对端 TP)` 展开 key，并要求 `--peer-tp-size` 与引擎环境变量 `PEER_TP_SIZE` 同值（`KeyComputer` 的异构前提链）
+  - 源引擎必须真的按这个口径写 key。vllm-ascend 在 `pool_worker.py` 的 `_start_kv_transfer_threads` 里构造收发线程时要传入 `worker=self`，同步 load 也要走 `_load_kv_tp_mismatch`。漏了的话，put 仍用本地 rank 名和全本地 head 切片；大 TP 一侧按 eff-rank 找 key，有的撞名读到错字节，有的直接 miss。kvcm 的 `exists` 预检报 `prefix not fully in pool`
+  - 上游修复是 [vllm-ascend #15835](https://github.com/vllm-project/vllm-ascend/pull/15835)（2026-09-09 合入 main，merge commit `9f8773ea`）。实验镜像 `quay.io/ascend/vllm-ascend:v0.26.0rc1` 和 rc2 都不含这次提交
+  - 这两版镜像用 `kvcm/demo/patch_tp_mismatch_worker.patch`（#15835 的 rc1 backport）。引擎树已经含 `9f8773ea` 之后不再打。kvcm 进程里做不到这件事：`KVPoolWorker` 在引擎进程内，不在 kvcm 里
+  - 现象与用法细节在 [demo/README.md](../demo/README.md)「异构 TP」
 
 ## L5 状态层
 

@@ -368,7 +368,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model-name", required=True)
     p.add_argument("--block-size", type=int, default=128)
     p.add_argument("--tp-size", type=int, default=1)
-    p.add_argument("--peer-tp-size", type=int, default=None)
+    p.add_argument(
+        "--peer-tp-size",
+        type=int,
+        default=None,
+        help="对端 TP。与 --tp-size 不同时，源引擎须已含 vllm-ascend #15835"
+        "（v0.26.0rc1/rc2 用 demo/patch_tp_mismatch_worker.patch），"
+        "且两端 PEER_TP_SIZE 配成对端 TP。见 KeyComputer 异构前提链",
+    )
     p.add_argument("--put-step", type=int, default=1)
     p.add_argument("--hash-algo", default="sha256")
     p.add_argument(
