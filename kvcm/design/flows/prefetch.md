@@ -7,7 +7,9 @@
 
 1. **exists 前置检查**：前缀完整在池才继续——warm 未覆盖该前缀，或 key
    口径与引擎漂移，直接失败（复制了也没意义）
-2. **copy 发起**：前缀 → key 列表 → rank 映射计划 → 逐 key 提交复制任务
+2. **copy 发起**：前缀 → key 列表 → rank 映射计划 → 先看第一个目标段还
+   放不放得下 → 放得下才逐 key 提交复制任务。等剩余的循环在 TaskEngine、
+   前缀闸外面；进闸后、`create_copy_task` 之前再查一次
 3. **query_task 轮询到 READY**：任务全部完成 + 副本核验通过
 4. （待接通）keepalive 注册、READY 事件补发（`BlockStored`）
 
@@ -46,7 +48,16 @@ sequenceDiagram
         Note over BE: locate(target) 得到 segs
         BE->>KC: build_plan(keys, segs)
         KC-->>BE: plan（每条 key 配好目标 seg）
-        loop 每个 key 和 seg
+        BE->>M: GET /query_segment（只查计划里的第一个目标段）
+        alt 这一段放不下，或管理端口暂时连不上
+            BE-->>Flow: AdmissionWait
+            Note over Flow: TaskEngine 在前缀闸外等。还没有任务号，不记复制失败
+        else 段不存在
+            BE-->>Flow: AdmissionStop
+            Note over Flow: 立即停止，不空等
+        else 放得下
+            Note over BE: 同一轮等待里大小只取一次 batch_get_replica_desc，之后只重查剩余
+            loop 每个 key 和 seg
             BE->>SC: create_copy_task(key, seg)
             SC->>M: RPC
             M-->>SC: task_id（两个整数）
@@ -87,6 +98,7 @@ sequenceDiagram
                 end
             end
         end
+        end
     end
 ```
 
@@ -96,8 +108,9 @@ sequenceDiagram
   `keys` → 排出 `plan`（复制计划：每条 key 复制到哪个 seg）→ 每条
   key 提交后拿回一个任务号（两个整数组成的整数对）→ 写进 Ledger（任务
   号编码成 `"整数:整数"` 的字符串，连同 handle_id、token_ids）
-- 与 master 的交互这次执行里全是绑定 RPC；HTTP `/batch_query_keys` 还
-  没接通
+- 与 master 的交互里，复制和核验仍是绑定 RPC。提交前多一次管理端口
+  `GET /query_segment`（明文 Used / Capacity），不用 `/get_segments_detail`，
+  也不用 `/batch_query_keys`（零副作用核验还没接通）
 - Ledger 只在 copy 成功、到终态、进入等副本状态、abandon 时写。
   exists 失败和提交失败不写行
 - 图里的「超时」指本次预热的截止时间到了，接下来流程调用
@@ -113,7 +126,9 @@ sequenceDiagram
 
 失败处理总表（每种情况怎么处理）见
 [../code-architecture.md](../code-architecture.md) L2 节。本流程特有的
-一点：「前缀不在池」在 exists 阶段直接失败，不发起复制。
+一点：「前缀不在池」在 exists 阶段直接失败，不发起复制。段不存在
+同样立即停止。段上暂时放不下则在闸外等到预热超时；还没有任务号就
+停止，不记成复制失败。
 
 ## 与其他部件的衔接
 

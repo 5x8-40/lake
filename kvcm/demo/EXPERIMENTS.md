@@ -23,7 +23,7 @@
 | 13 | 10/12 上午 | 跨机 245→217 异构，**bc6b5be 单入口控制面 + 两端 #15835 完整补丁** | 正向回归（升级后首测）：warm A → 单入口 precopy（32 keys=8 满块×4 eff）READY → B 首中 external **88.2%**（从实例启动起累计，不是单请求）、零 invalid、16-tok ×6 + 64-tok ×2 **8/8 逐字一致**（1-token 翻转未复现）。B 机容器无 `ss`：用 admin `:9003/get_all_segments` + 显式 `--targets` | 本次会话记录；见「实验实录 · 10-12 回归 · 正向」 |
 | 14 | 10/12 下午 | 跨机 **反向 217(TP4)→245(TP2)，A 同步 load（无 LOAD_ASYNC）** | **通过**：36/36 key 对号入 A 两 seg（18+18）；每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 证 hunk3 同步分发生效；8/8 token 与 B(TP4) 参考逐字一致；external hit 74.6→79.7%、零 invalid。踩坑：首跑 A 侧 peer 误配成 2（=自身 TP）→ mismatch 静默禁用 → `-800`（指纹 `Failed to get 9 keys`=每块 1 key）；改回 `PEER=4` 即通——同步 load 的 mismatch 路径由此验证通过 | 见「实验实录 · 10-12 回归 · 反向（同步 load）」 |
 | 15 | 10/20 | 跨机正向 keys（#13 的 32 keys）不动，**kill 写入者 A 全进程树 → 等 client TTL 过期 → 复验** | **「副本随属主消失」不成立（纠正踩坑 3 早期误判）**：基线 32/32 → kill（17:06:51）→ 17:08:57 master `client_expired` + unmount A 两 seg（**零驱逐零 remove**）→ `batch_is_exist` **32/32**、副本全在 B 四 seg → 裸 client 跨机 `get` **3/3 字节级读回**（各 4.5MB）→ A 复活后终态仍 32/32。结论：副本存亡绑定 seg 所在 client，key 的 client_id 下线只清其 seg 内副本，远端副本保留 | master 日志切片（本机 `va-precopy/logs/`，不入仓）；见踩坑 3 |
-| 16 | 10/26 | 单机 245：源引擎 TP2 + 合成目标 seg + **kvcm daemon（E11/E12）** | PR70 进程化首验：**e2e 全绿**（warm → SubmitIntent → READY）；踩出 copy 连发打爆 adxl 建链（坑 2：14 连发半挂、窗口 4 节奏化 42/42） | 见「实验实录 · 2026-10-26」 |
+| 16 | 10/26 | 单机 245：源引擎 TP2 + 合成目标 seg + **kvcm daemon（E11/E12）** | PR70 进程化首验：**e2e 全绿**（warm → SubmitIntent → READY）；踩出 copy 连发打爆 adxl 建链（坑 2：14 连发是 `TRANSFER_FAIL`，窗口 4 节奏化 42/42）。与 #17 的 `NO_AVAILABLE_HANDLE` 不是同一次失败 | 见「实验实录 · 2026-10-26」 |
 | 17 | 10/29 | 跨机 **45↔225**，Qwen3.8-27B（hybrid，`--block-size 1536`），**同构 TP2↔TP2**（异构 TP2↔TP4 被 hybrid gate 关掉），PR70 daemon | **主链路通过**（SubmitIntent ~11s READY，B External prefix hit 59.1%）；**并发度压力：14 `create_copy_task` 全成，42 约半挂**——窗口 4+0.2s 节奏在 42 规模仍扛不住；工程风险高，E15 限速为刚需 | 见「实验实录 · 2026-10-29」 |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
@@ -183,17 +183,17 @@ pid。途中根出 8 个坑，全部对代码验证：
 
 失败形态（42 规模主导）：
 
-- **`NO_AVAILABLE_HANDLE (max retries reached: 10)`** → 最终 `TRANSFER_FAIL`：源 worker 向目标 adxl **并发建链**资源不够；store 只对这类错误重试有限次，**不是排队变慢，是硬失败终态**。
+- **`NO_AVAILABLE_HANDLE (max retries reached: 10)`**：master 留内存失败，不是 #16 那种建链连不上（`ConnectToPeer FAILED` → `TRANSFER_FAIL`）。store 对这个错误有限次重试，**不是排队变慢，是硬失败终态**。
 - 偶发 **`OBJECT_NOT_FOUND`**：master `--default_kv_lease_ttl 11000`（≈11s）；大批量跑久了 key 过期（与建链风暴叠加）。
 - 方法陷阱：同一批 key 先跑窗口 4 再跑窗口 14 → 第二轮大量 `replica_copy_skipped` 假全成；**对比必须用互不重叠的 fresh key**。
 - 风暴后遗症：即便改回串行，仍可能半挂（信道缓存中毒，同 #16 坑 5/8）；需**重启源引擎**才能复原。
 
-对照 #16 坑 2（单机、合成目标 seg）：当时「窗口 4 节奏化 = 42/42 全成」。**本次跨机双真实引擎 TP2 床上，同样 42 任务 + 窗口 4+0.2s 仍约半挂**——说明「闸=4」不是跨拓扑的充分条件，E15 正式限速 / 背压仍缺。
+对照 #16 坑 2（单机、合成目标 seg）：当时连不上是 `TRANSFER_FAIL`，窗口 4 节奏化 42/42 全成。**本次跨机是另一件事**：主错误是 `NO_AVAILABLE_HANDLE`（master 留内存失败）；同样 42 任务 + 窗口 4+0.2s 仍约半挂。「闸=4」限的是在飞建链，不看目标段剩余。E15 的网卡限速仍然不做。
 
 ### 工程含义（供 PR70 reviewer）
 
 1. **异步编排 ≠ 无限并发安全**。`asyncio` 只让调用方不堵；Mooncake/Ascend 路径在句柄耗尽时直接 `FAILED`，不会自动排队到成功。
-2. **公开 wheel 未暴露「建链上限 = N」配置**；能确定的是：kvcm 软闸默认 **4**；底层对 `NO_AVAILABLE_HANDLE` **最多重试 10 次**；有效安全区靠实测——本床 **14 任务全成、42 任务不可靠**。
+2. 本床 **14 任务全成、42 任务不可靠**。42 的主错误是 `NO_AVAILABLE_HANDLE`（master 留内存失败，最多重试 10 次），不是 #16 的建链 `TRANSFER_FAIL`。软闸默认 4 限的是在飞建链 RPC，不看段剩余。
 3. **生产风险**：一个稍长前缀在 TP≥2 时很容易展开到数十 key；若 Router 突发多个 prefetch intent，或单 intent 内一次铺开全部 key，会稳定踩到本崖。PR70 现状（`max_concurrent=4` + `submit_interval_s=0.2`）是止血，**不是**可承诺的 SLO 级吞吐。
 4. **E15 为阻塞项**：需要按窗口推进的限速器 + 明确背压/重试语义；仅靠协程多开会把传输子系统打进降级态（连带打伤引擎自身 put，见 #16 坑 8）。
 5. **异构 TP2↔TP4 本轮未测**：Qwen3.8-27B hybrid 被 gate；要复验异构需换非 hybrid 模型（或上游解除 gate）。

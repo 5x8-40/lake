@@ -357,8 +357,8 @@ def test_submit_cap_is_process_wide_across_concurrent_copies(
 
     为什么必须锁这条：传输闸（TaskEngine `max_concurrent`，默认 4）允许
     4 个 copy 同时提交。若每个 copy 各持一把默认 4 的窗口，在飞建链就是
-    4×4=16——正好踩过 0.3.11 实测打爆建链的点（14 连发约半数
-    TRANSFER_FAIL）。信号量必须是所有 copy 共用的一把。
+    4×4=16——正好踩过 #16 打爆建链的点（14 连发是 TRANSFER_FAIL，
+    不是 #17 的 NO_AVAILABLE_HANDLE）。信号量必须是所有 copy 共用的一把。
 
     用 8 线程的池：默认池在小机器上只有 4 个 worker，会把峰值挡在 4，
     实现改回「每 copy 一把」也照样绿（假通过）。
@@ -459,7 +459,7 @@ def test_copy_submits_concurrently_up_to_cap(fake_store_module, monkeypatch) -> 
     """一次 copy 内多 key 并发提交，但在飞数不超过 `submit_concurrency`。
 
     串行提交时提交阶段是 N 倍往返（大批量预热慢得不可用）；不限并发则
-    在目标侧形成建链风暴（0.3.11 实测 14 连发约半数 TRANSFER_FAIL）。
+    在目标侧形成建链风暴（#16：14 连发 TRANSFER_FAIL，不是 #17）。
     两个方向都要锁：**并发度 > 1** 证明并行，**不超上限** 证明没失控。
     """
     inflight = 0
@@ -1707,6 +1707,74 @@ def test_admit_without_admin_refuses(fake_store_module, monkeypatch) -> None:
     with pytest.raises(QueryError, match="admin"):
         run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
     assert client.created == []
+
+
+def test_admit_timeout_covers_gate_wait(fake_store_module, monkeypatch) -> None:
+    """等前缀闸也吃从开始等待算起的预算。到点还没有任务号就停，不提交。
+
+    名额被占住超过 timeout 时必须停。停完把占住的名额还回去，闸仍是满的
+    （取消等待不能把名额弄丢，也不能多还一个）。
+    """
+    from kvcm.flows.prefetch import PrefetchError
+    from kvcm.task_engine import TaskEngine
+
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+    admin = _TableAdmin({"seg-A": (0, 10**9)})
+    b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
+    eng = TaskEngine(b, max_concurrent=1)
+
+    async def scenario():
+        await eng._gate.acquire()
+        task = asyncio.create_task(
+            eng.run_once(
+                Prefix(model_id="qwen", token_ids=(1,)),
+                InstanceId("inst-B"),
+                timeout_s=0.3,
+            )
+        )
+        try:
+            with pytest.raises(PrefetchError, match="stopped before submit"):
+                await task
+            assert eng._gate.locked()
+        finally:
+            if not task.done():
+                task.cancel()
+            eng._gate.release()
+
+    run(scenario())
+    assert client.created == []
+
+
+def test_admit_slow_query_does_not_extend_timeout(
+    fake_store_module, monkeypatch
+) -> None:
+    """查剩余本身花掉的时间也算预算。查完已经到点就停，不再提交。"""
+    from kvcm.flows.prefetch import PrefetchError
+    from kvcm.task_engine import TaskEngine
+
+    key = _rank_key("a", 0)
+    client = _LayoutClient({key: [("__source__", 100, ())]})
+
+    class _Slow:
+        def query_segment(self, segment):
+            time.sleep(0.4)
+            return (0, 10**9)
+
+    b = _admit_backend(client, monkeypatch, admin=_Slow(), segs=["seg-A"], keys=[key])
+    eng = TaskEngine(b, max_concurrent=1)
+    start = time.monotonic()
+    with pytest.raises(PrefetchError, match="stopped before submit"):
+        run(
+            eng.run_once(
+                Prefix(model_id="qwen", token_ids=(1,)),
+                InstanceId("inst-B"),
+                timeout_s=0.15,
+            )
+        )
+    elapsed = time.monotonic() - start
+    assert client.created == []
+    assert elapsed < 2.0, f"到点之后还在等: {elapsed:.2f}s"
 
 
 def test_admit_cancel_before_submit_records_nothing(

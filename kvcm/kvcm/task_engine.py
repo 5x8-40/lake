@@ -469,8 +469,8 @@ class TaskEngine:
         进闸后、真正提交前再查一次；仍然不够立刻出闸，回到闸外继续等。
         `submit_concurrency` 在建链 RPC 返回时就还，替不了这一段。
 
-        timeout_s 从这里开始，覆盖等空间、提交和轮询。还没有任务号就
-        到点：这次预热停止，不记成复制失败。
+        timeout_s 从这里开始，覆盖等空间、等前缀闸、提交和轮询。还没有
+        任务号就到点：这次预热停止，不记成复制失败。
         """
         await self._throttle()
         # 闸外：存在性检查（毫秒级 RPC，读即续租）
@@ -492,46 +492,71 @@ class TaskEngine:
         poll_s: float,
         timeout_s: float,
     ) -> None:
-        """闸外等到放得下，再进闸提交并轮询。"""
+        """闸外等到放得下，再进闸提交并轮询。
+
+        预算从进入本函数起算。查剩余、排队等前缀闸都吃这段时间：到点还
+        没有任务号就停，不进 `create_copy_task`。
+        """
         deadline = time.monotonic() + timeout_s
         admit = getattr(self._ops, "admit_planned_copy", None)
         opener = getattr(self._ops, "open_copy_admission", None)
         closer = getattr(self._ops, "close_copy_admission", None)
         token = opener() if opener is not None else None
+
+        def _stopped() -> PrefetchError:
+            return PrefetchError(
+                f"prefetch stopped before submit after {timeout_s}s"
+            )
+
         try:
             while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise PrefetchError(
-                        f"prefetch stopped before submit after {timeout_s}s"
-                    )
+                if deadline - time.monotonic() <= 0:
+                    raise _stopped()
                 if admit is not None:
                     try:
                         await admit(prefix, target)
                     except AdmissionWait:
                         # 闸外等。0.5 秒，但不超过剩余预算。
-                        await asyncio.sleep(min(0.5, remaining))
+                        # 剩余按查完之后重算：慢查询不能把预算又加回去。
+                        left = deadline - time.monotonic()
+                        if left <= 0:
+                            raise _stopped()
+                        await asyncio.sleep(min(0.5, left))
                         continue
                     except AdmissionStop as e:
                         raise PrefetchError(
                             f"segment missing, prefetch stopped: {e}"
                         ) from e
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise _stopped()
+                # 等名额也不能越过截止时间。取消正在等的 acquire 时，
+                # Semaphore 自己把名额交回去，这里不再 release。
                 try:
-                    async with self._gate:
-                        await self._flow.run_after_exists(
-                            prefix,
-                            target,
-                            poll_s=poll_s,
-                            timeout_s=remaining,
-                        )
+                    await asyncio.wait_for(self._gate.acquire(), timeout=left)
+                except TimeoutError:
+                    raise _stopped() from None
+                try:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise _stopped()
+                    await self._flow.run_after_exists(
+                        prefix,
+                        target,
+                        poll_s=poll_s,
+                        timeout_s=left,
+                    )
                 except AdmissionWait:
-                    # 进闸后复查不够：名额已随 with 退出归还，回到闸外。
+                    # 进闸后复查不够：下面的 finally 还名额，回到闸外。
                     continue
                 except AdmissionStop as e:
                     raise PrefetchError(
                         f"segment missing, prefetch stopped: {e}"
                     ) from e
-                return
+                else:
+                    return
+                finally:
+                    self._gate.release()
         finally:
             if token is not None and closer is not None:
                 closer(token)

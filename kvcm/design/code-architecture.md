@@ -455,7 +455,19 @@ sequenceDiagram
     W->>Ex: exists（不过前缀闸）
     Ex->>M: batch_is_exist
     M-->>Ex: 在池
-    W->>Q: acquire 前缀闸
+    loop 闸外，直到第一个目标段放得下或超时
+        W->>M: GET /query_segment（只查 rank 0 那一段）
+        alt 放不下，或管理端口暂时连不上
+            Note over W: 睡 0.5 秒。不占前缀闸。大小不再重查
+        else 段不存在，或预算到了还没有任务号
+            Note over W: 停止这次预热，不记成复制失败
+        end
+    end
+    W->>Q: acquire 前缀闸（不超过剩余预算）
+    W->>M: 进闸后再查一次 /query_segment
+    alt 仍然放不下
+        W->>Q: release，回到闸外等
+    else 复查通过
     rect rgb(232, 240, 254)
         Note over W,S: 每个 key 拿一次。同时在飞不超过 4。RPC 返回就 release。前缀闸在这整段都不还
         loop 逐 key
@@ -473,12 +485,14 @@ sequenceDiagram
     end
     W->>W: 写 Ledger 终态
     W->>Q: release 前缀闸
+    end
 ```
 
 - 线程只在 `Ex`（线程池）这一列出现：每个 RPC 执行的几毫秒
 - 协程（W）全程只是一段代码状态，挂起时不占线程——排队 100 个这样的协程也免费
 - `loop 逐 key` 画的是提交信号量的拿还，不是「key 必须一个个串行」。同时在飞的 `create_copy_task` 不超过 4，多出来的 key 在 `S` 上等
-- 图只画了成功路径。失败 / 超时 / 取消同样在终态归还前缀闸。提交信号量在每次 `create_copy_task` 返回时已经还过，不跟前缀闸一起还
+- 等段剩余在 acquire 之前。进闸后、`create_copy_task` 之前再查一次；不够就 release，回到闸外。等闸也吃从开始等待算起的预算：到点还没有任务号就停，不提交
+- 图的提交和轮询画的是放得下之后的成功路径。失败 / 超时 / 取消同样在终态归还前缀闸。提交信号量在每次 `create_copy_task` 返回时已经还过，不跟前缀闸一起还
 
 **线程池大小**：
 
@@ -505,7 +519,7 @@ sequenceDiagram
 `asyncio.Queue` + 传输闸限并发 + 协程消费者，无优先级、不分轻重通道。
 
 - **队列与拿取**：intent 进 `asyncio.Queue`；K 个协程循环 `get`（K 可以很大，协程便宜——在队列里等、在传输闸上等，都是协程挂起，不占线程）
-- **传输闸 = `asyncio.Semaphore`（默认 4，参数化）**：一个名额 = 一个前缀正停在 `run_after_exists`（提交 + 轮询 + 副本核验），终态才 release。闸满时在传的不是 4 个任务：该前缀的全部 key 都会交给 master（32K token、tp=2 时大约 512 个 key，4 个满额前缀大约 4×512）。**不按 key 计，也不是带宽管控**（带宽归 E15）。它和进程级 `submit_concurrency` 不重复：那把信号量只包住 `create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受。没有前缀闸的话，排队前缀会以每次 4 个建链 RPC 的速度全部提交完——master 上叠着所有 plan，并且每个 handle 每轮 `query_task` 都要按 key 顺序各查一次（RPC 池只有 4~8 个线程）。前缀闸把「已经决定提交、还没终态的预热前缀」卡在 `max_concurrent`。**闸外**有两件：`exists` 探测（预热的前置检查，毫秒级 RPC，读即续租），以及等目标段放得下。都在 `_run_prefetch` 里、`async with self._gate` 之前。等空间只查计划里的第一个目标段，一次 `GET /query_segment`（0.3.11 在 `rpc_service.cpp`，主线同文在 `master_admin_service.cpp::HandleQuerySegment`；不使用 `/get_segments_detail`）。剩余 = 容量 − 已用，同一组 TP 段按这一份。新占用只加落在这个段上、且副本端点里还没有这个段的 key。缺大小时用本批已经读到的一个大小乘以缺的个数，日志标明估算；一个大小都没有就停止，不填假数字。这一段的新占用大于这份剩余，整批不发，闸外 0.5 秒后再查——每轮只重查这一次 `/query_segment`，不重查大小。放得下才进闸；进闸后、`create_copy_task` 之前再查一次，不够就出闸继续等。超时从开始等待算；还没有任务号就停止这次预热，不记成复制失败。段不存在立即停止。管理端口暂时连不上则等到超时。查完到 master 真正留下内存之前，别人仍可能先占；这里不加锁、不预留，判断只能少失败。这不是 E15 的网卡限速，网卡利用率限速仍不做。**闸内是 `run_after_exists` 整段**——复查通过之后的提交流、轮询、副本核验；keepalive 注册在 `release` 之后，也在闸外。轮询占着名额，但不额外发建链。promote 的触发 RPC 是毫秒级（不过闸），但其 READY 是核验式轮询（时长由池的提回进度决定，**不是毫秒即返**）；D2 §3 的另一条主动路径（读删写，数据经 kvcm）若启用，则属 kvcm 发起的传输，要占闸
+- **传输闸 = `asyncio.Semaphore`（默认 4，参数化）**：一个名额 = 一个前缀正停在 `run_after_exists`（提交 + 轮询 + 副本核验），终态才 release。闸满时在传的不是 4 个任务：该前缀的全部 key 都会交给 master（32K token、tp=2 时大约 512 个 key，4 个满额前缀大约 4×512）。**不按 key 计，也不是带宽管控**（带宽归 E15）。它和进程级 `submit_concurrency` 不重复：那把信号量只包住 `create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受。没有前缀闸的话，排队前缀会以每次 4 个建链 RPC 的速度全部提交完——master 上叠着所有 plan，并且每个 handle 每轮 `query_task` 都要按 key 顺序各查一次（RPC 池只有 4~8 个线程）。前缀闸把「已经决定提交、还没终态的预热前缀」卡在 `max_concurrent`。**闸外**有两件：`exists` 探测（预热的前置检查，毫秒级 RPC，读即续租），以及等目标段放得下。都在 `_run_prefetch` 里、`async with self._gate` 之前。等空间只查计划里的第一个目标段，一次 `GET /query_segment`（0.3.11 在 `rpc_service.cpp`，主线同文在 `master_admin_service.cpp::HandleQuerySegment`；不使用 `/get_segments_detail`）。剩余 = 容量 − 已用，同一组 TP 段按这一份。新占用只加落在这个段上、且副本端点里还没有这个段的 key。缺大小时用本批已经读到的一个大小乘以缺的个数，日志标明估算；一个大小都没有就停止，不填假数字。这一段的新占用大于这份剩余，整批不发，闸外 0.5 秒后再查——每轮只重查这一次 `/query_segment`，不重查大小。放得下才去等前缀闸（等闸吃同一段预算，到点还没提交就停）。进闸后、`create_copy_task` 之前再查一次，不够就出闸继续等。超时从开始等待算；还没有任务号就停止这次预热，不记成复制失败。段不存在立即停止。管理端口暂时连不上则等到超时。查完到 master 真正留下内存之前，别人仍可能先占；这里不加锁、不预留，判断只能少失败。这不是 E15 的网卡限速，网卡利用率限速仍不做。**闸内是 `run_after_exists` 整段**——复查通过之后的提交流、轮询、副本核验；keepalive 注册在 `release` 之后，也在闸外。轮询占着名额，但不额外发建链。promote 的触发 RPC 是毫秒级（不过闸），但其 READY 是核验式轮询（时长由池的提回进度决定，**不是毫秒即返**）；D2 §3 的另一条主动路径（读删写，数据经 kvcm）若启用，则属 kvcm 发起的传输，要占闸
 - **重启恢复不占闸（已知窗口）**：`TaskEngine._track` 只轮询 `rebuild` 捞回的 handle，不 acquire 传输闸。重启后旧前缀全部仍在 master 上搬，新预热仍可占满名额。接受这个叠加——让恢复任务去等闸，轮询会被串行化
 - **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
 - **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；`session_end` 类可延迟任务排队无妨

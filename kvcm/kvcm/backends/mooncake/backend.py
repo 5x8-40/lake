@@ -142,9 +142,10 @@ class MooncakeBackend(KvOps):
             一个名额 = 一个前缀从提交占到终态）。两把不重复：只有本信号量
             时，排队前缀会以每次 4 个 RPC 的速度全部提交完。它也不是「单次
             copy 的窗口」——传输闸允许 4 个前缀同时提交，若每个 copy 各持
-            一把默认 4 的窗口，在飞建链就是 4×4=16，正好超过 0.3.11 实测
-            打爆的量（ascend 上 14 连发约半数 TRANSFER_FAIL；窗口 4 节奏化
-            42/42 全成）。所以上限必须是**进程级**的。链路利用率限速器仍归 E15。
+            一把默认 4 的窗口，在飞建链就是 4×4=16，正好超过 #16 的打爆点
+            （单机 14 连发是建链 TRANSFER_FAIL，不是 #17 的
+            NO_AVAILABLE_HANDLE；窗口 4 节奏化 42/42 全成）。所以上限必须
+            是**进程级**的。链路利用率限速器仍归 E15。
         """
         if submit_concurrency <= 0:
             raise ValueError("submit_concurrency must be positive")
@@ -290,7 +291,7 @@ class MooncakeBackend(KvOps):
         `create_copy_task` 这一次 RPC，返回即还。前者挡住「还没传完就
         继续提交下一个前缀」，后者限建链速率。本信号量是**进程级**的，
         因为闸允许 4 个前缀同时提交，每 copy 各限 4 就会变成 16 个并发
-        建链（0.3.11 实测 14 连发就打爆）。
+        建链（#16：14 连发 ConnectToPeer FAILED / TRANSFER_FAIL）。
 
         延迟创建：`Semaphore()` 构造时不绑循环（`daemon.py:_serve` 里
         `build_backend` 执行时循环已经在跑，构造绑不绑都不影响），但
