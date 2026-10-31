@@ -157,7 +157,7 @@ flowchart LR
 | PrefetchFlow | exists 前置检查 → copy → query_task 轮询到 READY（keepalive 注册已接通，由 `TaskEngine` 在 flow 返回后做；READY 补发 `BlockStored` 待 E14） | 已实现（`flows/prefetch.py`） |
 | SessionEndFlow | 停 keepalive + demote | 未实现（D1 §6） |
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
-| RetainFlow | retain（主路径 = retained client 注册；0.3.11 过渡 = move 到存活节点的 seg） | 未实现（D2 §4） |
+| RetainFlow | retain（死前 move/copy 到还活着的段；DFS 另编，不走这个返回值） | 未实现（D2 §4） |
 
 - **失败处理**：除 exists 的 `QueryError`（不包装、可重试上抛）外，流程对调用方只抛一种异常（当前叫 `PrefetchError`——这个名字绑死在 Prefetch 上，其他流程没法用，将改为一般化的 `FlowError`，随 KeySet 一起实施）——调用方不用关心失败发生在哪一步，具体原因写在异常消息里。编程错误（KeyError、TypeError 这类代码 bug）不包装，直接向上抛。异常类型定义见 L3「失败语义」。各分支：
 
@@ -176,8 +176,8 @@ flowchart LR
 ## L3 原子操作层（核心抽象）
 
 - 接口规格直接抄 D2 §1：八项操作的语义、完成信号、READY 有无、幂等性都已定型——本层把它们落成 Python 抽象基类
-- 八项分三类（D2 §1）：**原子动作**（copy / move / keepalive / demote / promote / remove）、**元数据标记**（pin）、**目的型**（retain——由 demote / move / pin 组合完成，但调用方看起来仍像一步）
-- 完成信号：READY 的本义 =「可以把请求调度过来」（D2 §1）——copy / move / promote 有 READY（它们的完成都意味着「这个实例能接请求了」）；demote 降层后本就不能调度，没有 READY。retain 也返回任务凭据（定义见下「接口形态」）：无异步工作的路径返回空凭据，`query_task` 入口直接 READY；0.3.11 的 move 过渡路径返回真凭据、走同一套轮询。keepalive / stop_keepalive / pin / demote / remove 无 READY
+- 八项分三类（D2 §1）：**原子动作**（copy / move / keepalive / demote / promote / remove）、**元数据标记**（pin）、**目的型**（retain——死前把副本放到还活着的 client 上，或写成 DFS，调用方看起来仍像一步）
+- 完成信号：READY 的本义 =「可以把请求调度过来」（D2 §1）——copy / move / promote 有 READY（它们的完成都意味着「这个实例能接请求了」）；demote 降层后本就不能调度，没有 READY。retain 不产生「把请求调到源实例」的 READY。这个方法只表达 move/copy，返回任务号，再查副本确认已经在目标 client 上。空任务号不是完成信号，`query_task` 对它抛 `ValueError`。keepalive / stop_keepalive / pin / demote / remove 无 READY
 - 幂等：同一个前缀对同一台实例，已经在复制就不重复发、已完成也不重复发（D1 §4）；后端侧重复调用也有幂等保护（D1 F11）
 
 **接口形态（`kvcm/ops/`）**
@@ -186,8 +186,8 @@ flowchart LR
 - **任务凭据（TaskHandle）**：一次 `copy(前缀)` 在 mooncake 上是逐条 key 各发一个复制任务——一个前缀通常对应多条 key（块数 × rank 数），所以一次操作会产生多个任务。凭据里的 `task_ids` 装着这次操作的全部任务号，查询时一起查。任务号的类型对 L3 不透明（`tuple[object, ...]`）：mooncake 的任务号是两个整数组成的整数对，L3 原样保存、原样回传，不做字符串化（`str()` 化后真实绑定的 `query_task` 会报 TypeError）；要写进 Ledger 时由实现侧编码成 `"整数:整数"` 的字符串（`encode_task_id`/`decode_task_id`，重启可还原）
 - **READY 规则**（本义 =「可以把请求调度过来」，D2 §1）：
   - copy / move：任务完成 + 目标侧副本核验通过（任务型，凭据里有任务号）
-  - promote：**核验式 READY**——触发式实现（反复 `GetReplicaList` 刷计数，master 按冷热策略**自主**搬运，kvcm 没有任务号）；READY = 轮询确认副本提回到位。凭据 = 触发记录——**不能用空凭据**：`task_ids=()` 已定义为「无异步工作 → `query_task` 入口直接 READY」（retain 主路径），promote 用它会在副本还在盘上时被误报 READY。其搬运是池自主行为，**不占传输闸**
-  - **retain 返回 TaskHandle**——结果必须可观测（「保住了没有」是本操作存在的意义；实现路径 = D2 §4）。主路径 = mooncake 主线版本的 retained client 注册（一次 RPC，无异步工作）返回空凭据 `task_ids=()`，`query_task` 入口直接 READY；0.3.11 过渡 move 返回真凭据
+  - promote：**核验式 READY**——触发式实现（反复 `GetReplicaList` 刷计数，master 按冷热策略**自主**搬运，kvcm 没有任务号）；READY = 轮询确认副本提回到位。凭据 = 触发记录。空任务号会让 `query_task` 抛 `ValueError`，不能拿来表示「还在等池自己搬」。其搬运是池自主行为，**不占传输闸**
+  - **retain 返回 TaskHandle**——这个方法只表达 move/copy（D2 §4），返回这次搬运的任务号。DFS 不走这个返回值。空任务号抛 `ValueError`
   - 其余方法（keepalive / stop_keepalive / pin / demote / remove）无 READY
 - **exists（查询，不是第九项管理操作）**：实现是 `batch_is_exist`，它有个副作用——被查到的 key 会被续租，所以预热前的存在性检查顺便就起了保活作用。两种结果必须分清：「不在池里」（key 确实没有 → 该预热）和「查询本身失败」（RPC 出错或单 key 返回 -1 → 转成 QueryError 等一会儿重查）——把查询失败当成「不在池里」会误判成需要重新计算
 - **abandon（放弃跟踪）**：kvcm 发起任务后要定期查它完成没有，这叫跟踪。abandon = 不再查了：删掉进程内的核验登记，Ledger 记为 abandoned，凭据从此失效（再查报 KeyError）。它**不是取消任务**——后端没有取消接口，传输可能照常完成。**abandon 之后不会自动删副本**：副本留在池里，按冷热策略自然降层、过期；要立刻删除得显式调 remove（未实现，归释放流程 ReleaseLoop，D1 §6）
@@ -195,13 +195,14 @@ flowchart LR
 
 ### 失败语义
 
-异常分三类（`kvcm/ops/base.py`；除 exists 的 QueryError 直接上抛外，流程对调用方统一只抛 PrefetchError）：
+异常里，流程对调用方统一只抛 PrefetchError（exists 的 QueryError 直接上抛；`ValueError` 是编程错误，直接传播）：
 
 | 异常 | 什么时候抛 | 调用方怎么办 |
 |------|-----------|-------------|
 | SubmitError | 提交任务的中途出错。异常消息带已提交的任务号——那些任务还在池里跑，需要有人跟 | 视为失败；重试与否由编排层决定（重复提交有幂等保护，见下） |
 | QueryError | 查任务状态、查副本时 RPC 出错（网络抖动这类临时问题） | 轮询阶段：等一会儿重查，不算失败；exists 阶段：不包装，直接上抛给调用方 |
 | VerifyError | 任务全部显示完成、但副本核验缺副本。异常带明细 | 视为失败 |
+| ValueError | 任务号是空的。空任务号不是完成信号 | 编程错误，直接传播，不包装 |
 
 **重复提交不视为失败（等副本状态，代码里叫 `_watch`）**
 
@@ -267,11 +268,10 @@ stateDiagram-v2
 | has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活即可，无需调后端；提回 = HTTP `/query_key`） | RPC ✓ 通道 ✓（同左） | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
-| has_retained_client（保留身份注册） | ✗ | RPC ✓ 通道 ✗（绑定、HTTP 均无；自封装 .so 候选；替代 = move 到存活节点的 seg） | D2 F13② |
 | has_dfs_replica（共享 3FS 副本） | ✗ | RPC ✓ 通道 △（写入路径待 E6 核对） | D2 F13② |
 | has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**（`/batch_query_keys` 零副作用） | D2 F11b |
 
-- L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 的 retained client/DFS 前提，本质就是能力分支——本层把它落成显式声明
+- L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 的 DFS 是否可用，本质就是能力分支——本层把它落成显式声明
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
 
 **接口演进：KeySet（已定方向，待实施）**
@@ -327,9 +327,9 @@ stateDiagram-v2
 3. **C 接口**（`mooncake-store/include/store_c.h`，ctypes 可直调）
    - 数据面操作：put / get / is_exist / remove / register_buffer
    - put 的 config 带完整 pin 支持（`with_hard_pin`、`soft_pin_action` ENABLE/DISABLE/PRESERVE、TTL）——但注释明确这只是发布时的行为，即「写新 key 时挂 pin」：写新 key 是引擎的活，kvcm 不写新 key；kvcm 要的 pin 全是**事后操作**（key 已在池里）
-   - 事后加/解 pin 的唯一通道 = upsert（D2 F3/F12），C 接口只有 put 没有 upsert；copy/move、retained 注册、admin 查询也都不在——所以缺的接口仍要自封装 .so 补
+   - 事后加/解 pin 的唯一通道 = upsert（D2 F3/F12），C 接口只有 put 没有 upsert；copy/move、admin 查询也不在。空写 upsert 要自封装 .so 补。retain 没有可以补的注册接口
 
-**自封装 .so**（补两个缺口：空写 upsert、retained 注册——绑定、HTTP、C 接口都没有，C++ client 类有）：
+**自封装 .so**（补空写 upsert：绑定、HTTP、C 接口都没有一步式空写，C++ 的 `UpsertStart` / `UpsertEnd` 有）：
 
 - 写法：照 `store_py.cpp` 的写法——`#include` mooncake 头文件，调 C++ client 类方法，对外暴露 pybind 或 extern "C" 接口；产物放 kvcm 侧，不改 mooncake 源码
 - 单 client 保证（约束见上「三条接入通道」节：store_py 与自封装 .so 必须共用同一 client 实例/UUID）：
@@ -348,7 +348,7 @@ stateDiagram-v2
 - 两个断点（E6）：
   1. 符号可见性：x86 0.3.13 wheel 实测 `Client` 类方法本体全部导出（`nm -D`：`BatchUpsert` / `CreateCopyTask` / `CreateMoveTask` 及 `RealClient::upsert_*_helper` 均在，连 `MooncakeStorePyWrapper` 自身符号也导出）；npu 0.3.11 wheel 待测试机复核（同一构建系统，预期一致；符号不导出则此路不通，退回替代实现）
   2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机；路径 A 的 pybind11 对齐：mooncake 锁定 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a），自封装 .so 编译用同版本即可对齐 internals
-- E6 另核：`/query_key` 的续租副作用在核验场景能否接受；retained 注册的具体符号名按 main 源码确认（0.3.13 x86 wheel 未见 retained 符号）。另：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），上游原生支持 NPU（v0.3.11 tag 已有 `ascend_transport` 目录）
+- E6 另核：`/query_key` 的续租副作用在核验场景能否接受。另：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），上游原生支持 NPU（v0.3.11 tag 已有 `ascend_transport` 目录）
 
 ### EngineAdapter（引擎适配）
 
@@ -357,13 +357,19 @@ stateDiagram-v2
 | 子件 | 职责 | 包路径 |
 |------|------|--------|
 | KeyComputer | 前缀 → hash 链 → PoolKey。key 格式直接从 vllm-ascend 库导入（两个版本的导入路径都试），保证和引擎算得一致；容器外没有库时回退到内置的格式副本并警告可能和引擎不一致，容器内有测试逐字节比对，用来兜住这个风险。`build_plan`：每条 key 映射到目标 seg（源和目标 TP 不同时按倍数归并）。PYTHONHASHSEED 必须为 0 的检查 | `engines/vllm/keys.py` |
-| RankTopology | rank 与 KV 切片的对应关系（TP/PP/DP 切分；源和目标 TP 不同时，kvcm `peer_tp_size` 必须与引擎环境变量 `PEER_TP_SIZE` 同值）；rank 与 seg 对号（探测：pidfile/进程树/ss//proc，跨机时把脚本源码经 ssh 送到目标机执行，ss/ssh 带超时） | `engines/vllm/topology.py` |
+| RankTopology | rank 与 KV 切片的对应关系（TP/PP/DP 切分；异构时 `max(tp_size, peer_tp_size)` 等于引擎的 `max(本机 TP, 对端 TP)`，见下方异构前置）；rank 与 seg 对号（探测：pidfile/进程树/ss//proc，跨机时把脚本源码经 ssh 送到目标机执行，ss/ssh 带超时） | `engines/vllm/topology.py` |
 | 事件格式 | 引擎 KV 事件（`BlockStored` 等）schema 的生成/解析 | 待做（EventPublisher 补发时按本格式构造） |
 | engine config | block_size / num_kv_heads / head_size / 层数读取（KV 大小估算，E14 容量规划输入） | 待做 |
 
 - **KeyComputer 归引擎侧，不归存储侧**——PoolKey 的权威定义在**引擎**（引擎写 KV 时用的就是这个 key；kvcm 不定自己的格式，只是按同样的规则把 key 再算出来）；mooncake 对 key 无格式要求（不透明字符串），后端不掺和 key 语义
 - **引擎之间 key 计算不一样**：vLLM 是链式 block hash（`vllm/v1/core/kv_cache_utils.py::hash_block_tokens`，`prefix_caching_hash_algo` + `init_none_hash` 的初始种子参与计算、block_size、Mamba/MLA 模型类型均影响结果）；SGLang 是 `RadixKey` = token id 序列本身（`sglang/srt/mem_cache/radix_cache.py`）——连 key 形态都不同（hash 值 vs token 序列）。KeyComputer 放通用层或存储侧都是放错了层
 - **引擎强关联物全归本层**：key 计算、rank 拓扑、事件 schema、engine config——换引擎（如 SGLangAdapter）时 StoreBackend 一行不动
+- **异构 TP 的引擎前置**（源 TP 与目标 TP 不同时才有；同构不用）
+  - 两端引擎的 `PEER_TP_SIZE` 都填 `max(本机 TP, 对端 TP)`，两方向用同一组值，不要按方向翻成「对端」。大 TP 端这个值等于自身，mismatch 关掉是对的。kvcm 的 `--tp-size` 填一侧 TP，`--peer-tp-size` 填另一侧 TP（`run_e2e.sh` 传 `--tp-size` 为目标、`--peer-tp-size` 为源）。`max` 两边必须相等。不要把 `--peer-tp-size` 填成引擎环境变量那个 max
+  - 小 TP 当源时，引擎必须按这个口径写 key。`pool_worker.py` 的 `_start_kv_transfer_threads` 构造收发线程时要传入 `worker=self`，同步 load 也要走 `_load_kv_tp_mismatch`。漏了的话，put 仍用本地 rank 名和全本地 head 切片；大 TP 一侧按 eff-rank 找 key，有的撞名读到错字节，有的直接 miss。小 TP 当消费者时，坏在 get：按本地 head 尺寸去读 eff key。两种都会让 kvcm 的 `exists` 报 `prefix not fully in pool`
+  - 上游修复是 [vllm-ascend #15835](https://github.com/vllm-project/vllm-ascend/pull/15835)（2026-09-09 合入 main，merge commit `9f8773ea`）。实验镜像 `quay.io/ascend/vllm-ascend:v0.26.0rc1` 不含这次提交。rc2 同样不含；补丁按 rc1 上下文写，rc2 上能否 apply 未实测
+  - rc1 用 `kvcm/demo/patch_tp_mismatch_worker.patch`（#15835 的 rc1 backport）。引擎树已含 `9f8773ea` 则不打。kvcm 进程里做不到这件事：`KVPoolWorker` 在引擎进程内，不在 kvcm 里
+  - 现象与用法细节在 [demo/README.md](../demo/README.md)「异构 TP」
 
 ## L5 状态层
 
@@ -552,7 +558,7 @@ sequenceDiagram
 2. **能力显式，不假装统一**：后端差异走 capability 声明，L2 按能力分支；不在接口里塞进只有 mooncake 有的概念
 3. **只建一层抽象**：L3 接口服务当前唯一后端（mooncake），第二后端（MemCache）接入时再修——不预判假想需求
 4. **语义规格以 D1/D2 为准**：本文任何接口定义与 D1/D2 冲突时，改本文
-5. **多实现方式：先实现一种，其余登记**：一个操作有多种实现方式时（D2 已有实例：retain = retained client / DFS 副本 / move 到存活节点的 seg / 自挂 SSD 作最后手段，§4；降层写穿 vs 写回分支，§3；copy 无指定源能力时以 move 替代，F7），**优先实现一种**，其余作为已知替代方式登记在 API 文档（能力前提、语义差异、补齐条件），后续按 capability 逐个补——不同时实现多个
+5. **多实现方式：先实现一种，其余登记**：一个操作有多种实现方式时（D2 已有实例：retain 的方法只表达 move/copy；DFS 另编；kvcm 挂盘卸引擎副本现有通道做不到，§4；降层写穿 vs 写回分支，§3；copy 无指定源能力时以 move 替代，F7），**优先实现一种**，其余作为已知替代方式登记在 API 文档（能力前提、语义差异、补齐条件），后续按 capability 逐个补——不同时实现多个
 
 ## 与 E10 / E11 / E15 的对位
 

@@ -35,7 +35,6 @@ def mooncake_v0311() -> BackendCapability:
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
-        has_retained_client=Capability(Support.NO, Support.NO, "本版本无此接口"),
         has_dfs_replica=Capability(Support.NO, Support.NO, "本版本无此接口"),
         has_admin_query=Capability(
             Support.NO, Support.NO, "HTTP 查询有副作用（续租 + 计命中）"
@@ -61,11 +60,6 @@ def mooncake_main() -> BackendCapability:
         has_promotion=Capability(Support.YES, Support.YES, "同 0.3.11"),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
-        has_retained_client=Capability(
-            Support.YES,
-            Support.NO,
-            "Python 绑定与 HTTP 均无入口；自封装 .so 候选；替代 = move 到存活节点",
-        ),
         has_dfs_replica=Capability(Support.YES, Support.UNKNOWN, "写入路径待核对"),
         has_admin_query=Capability(
             Support.YES,

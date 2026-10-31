@@ -368,7 +368,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--model-name", required=True)
     p.add_argument("--block-size", type=int, default=128)
     p.add_argument("--tp-size", type=int, default=1)
-    p.add_argument("--peer-tp-size", type=int, default=None)
+    p.add_argument(
+        "--peer-tp-size",
+        type=int,
+        default=None,
+        help="另一侧的 TP，不是引擎环境变量 PEER_TP_SIZE。"
+        "max(--tp-size, --peer-tp-size) 必须等于两端引擎的 "
+        "max(本机 TP, 对端 TP)。引擎 env 两端都填这个 max，不要按方向翻转。"
+        "小 TP 当源时，rc1 须打 demo/patch_tp_mismatch_worker.patch"
+        "（引擎树已含 vllm-ascend 9f8773ea 则不用）",
+    )
     p.add_argument("--put-step", type=int, default=1)
     p.add_argument("--hash-algo", default="sha256")
     p.add_argument(
