@@ -30,4 +30,4 @@ class PinKind(enum.Enum):
     """pin 类型。"""
 
     SOFT = "soft"  # 可解
-    HARD = "hard"  # 写入时固化、不可解；已存在的 KV 无法事后补标
+    HARD = "hard"  # 标记创建时固化。pin(HARD) 登记保活，不设置这个位

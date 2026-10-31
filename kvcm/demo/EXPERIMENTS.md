@@ -194,8 +194,8 @@ pid。途中根出 8 个坑，全部对代码验证：
 
 1. **异步编排 ≠ 无限并发安全**。`asyncio` 只让调用方不堵；Mooncake/Ascend 路径在句柄耗尽时直接 `FAILED`，不会自动排队到成功。
 2. **公开 wheel 未暴露「建链上限 = N」配置**；能确定的是：kvcm 软闸默认 **4**；底层对 `NO_AVAILABLE_HANDLE` **最多重试 10 次**；有效安全区靠实测——本床 **14 任务全成、42 任务不可靠**。
-3. **生产风险**：一个稍长前缀在 TP≥2 时很容易展开到数十 key；若 Router 突发多个 prefetch intent，或单 intent 内一次铺开全部 key，会稳定踩到本崖。PR70 现状（`max_concurrent=4` + `submit_interval_s=0.2`）是止血，**不是**可承诺的 SLO 级吞吐。
+3. **生产风险**：一个稍长前缀在 TP≥2 时很容易展开到数十 key；若 Router 突发多个 prefetch intent，或单 intent 内一次铺开全部 key，会稳定踩到本崖。当时的 `submit_interval_s=0.2` 已删除，由并发窗口取代（`max_concurrent=4` + `submit_concurrency` 默认 4）。这是止血，**不是**可承诺的 SLO 级吞吐。
 4. **E15 为阻塞项**：需要按窗口推进的限速器 + 明确背压/重试语义；仅靠协程多开会把传输子系统打进降级态（连带打伤引擎自身 put，见 #16 坑 8）。
 5. **异构 TP2↔TP4 本轮未测**：Qwen3.8-27B hybrid 被 gate；要复验异构需换非 hybrid 模型（或上游解除 gate）。
 
-代码锚点：`kvcm/backends/mooncake/backend.py`（`submit_interval_s` 注释与连发止血）、`kvcm/task_engine.py`（`max_concurrent` 传输闸）、Mooncake `client_service` 对 `NO_AVAILABLE_HANDLE` 有限重试（错误文案 `max retries reached: 10`）。
+代码锚点：`kvcm/backends/mooncake/backend.py`（`submit_interval_s` 已删除，连发由 `submit_concurrency` 窗口取代）、`kvcm/task_engine.py`（`max_concurrent` 传输闸）、Mooncake `client_service` 对 `NO_AVAILABLE_HANDLE` 有限重试（错误文案 `max retries reached: 10`）。

@@ -14,6 +14,7 @@ import pytest
 from conftest import run
 from kvcm.flows.prefetch import PrefetchError
 from kvcm.ops.base import (
+    IntentInputError,
     KvOps,
     OpKind,
     QueryError,
@@ -705,6 +706,217 @@ def test_consumer_exits_on_programming_error() -> None:
             await asyncio.sleep(0.1)
             alive = [t for t in eng._consumers if not t.done()]
             assert not alive, f"编程错误后消费者还活着: {len(alive)} 条"
+            assert eng._accepting is False
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_alternating_errors_stop_when_last_consumer_dies() -> None:
+    """好坏交替清掉 3 次计数。两条消费者都死后不再接受新 intent。"""
+
+    class Alt(FakeOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mode = "bad"
+
+        async def exists(self, prefix):
+            if self.mode == "bad":
+                raise TypeError("programming bug")
+            return True
+
+    async def scenario():
+        ops = Alt()
+        eng = TaskEngine(ops, max_concurrent=1, consumer_count=2)
+        eng.start()
+        try:
+            first = eng.submit_intent(
+                Prefix(model_id="q", token_ids=(1,)), _T, poll_s=0.01
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                dead = sum(t.done() for t in eng._consumers)
+                if dead == 1 and eng.intent_status(first) is IntentStatus.FAILED:
+                    break
+                await asyncio.sleep(0.01)
+            assert eng._accepting is True
+            assert eng._programming_errors == 1
+
+            ops.mode = "good"
+            second = eng.submit_intent(
+                Prefix(model_id="q", token_ids=(2,)), _T, poll_s=0.01
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if eng.intent_status(second) is IntentStatus.READY:
+                    break
+                await asyncio.sleep(0.01)
+            assert eng.intent_status(second) is IntentStatus.READY
+            assert eng._programming_errors == 0
+            assert sum(t.done() for t in eng._consumers) == 1
+
+            ops.mode = "bad"
+            third = eng.submit_intent(
+                Prefix(model_id="q", token_ids=(3,)), _T, poll_s=0.01
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if not eng._accepting and eng.intent_status(third) is IntentStatus.FAILED:
+                    break
+                await asyncio.sleep(0.01)
+            assert eng.intent_status(third) is IntentStatus.FAILED
+            assert "TypeError" in eng.intent_detail(third)
+            assert eng._programming_errors == 1
+            assert not eng._accepting
+            assert not any(not t.done() for t in eng._consumers)
+            with pytest.raises(RuntimeError, match="shutting down"):
+                eng.submit_intent(Prefix(model_id="q", token_ids=(4,)), _T)
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_three_programming_errors_stop_accepting() -> None:
+    """连续 3 次编程错误后停收。错误仍然抛出，不吞掉继续循环。"""
+
+    class BoomOps(FakeOps):
+        async def exists(self, prefix):
+            raise TypeError("programming bug")
+
+    async def scenario():
+        eng = TaskEngine(BoomOps(), max_concurrent=1, consumer_count=3)
+        eng.start()
+        try:
+            keys = [
+                eng.submit_intent(
+                    Prefix(model_id="q", token_ids=(i,)), _T, poll_s=0.01
+                )
+                for i in range(3)
+            ]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if not eng._accepting and all(
+                    eng.intent_status(k) is IntentStatus.FAILED for k in keys
+                ):
+                    break
+                await asyncio.sleep(0.01)
+            assert eng._accepting is False
+            for key in keys:
+                assert eng.intent_status(key) is IntentStatus.FAILED
+                assert "TypeError" in eng.intent_detail(key)
+            alive = [t for t in eng._consumers if not t.done()]
+            assert not alive
+            with pytest.raises(RuntimeError, match="shutting down"):
+                eng.submit_intent(Prefix(model_id="q", token_ids=(9,)), _T)
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_unregistered_instance_does_not_cancel_consumer() -> None:
+    """未登记实例、前缀不足一块、没设 PYTHONHASHSEED 只失败这一次。
+
+    消费者不能因此退出或变成 cancelled，下一条还要能取到。
+    """
+
+    class Ops(FakeOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mode = "miss"
+
+        async def copy(self, prefix, target):
+            if self.mode == "miss":
+                raise IntentInputError(f"instance not registered: {target}")
+            if self.mode == "short":
+                raise IntentInputError(
+                    "prefix expands to no keys (shorter than one block?)"
+                )
+            if self.mode == "seed":
+                raise IntentInputError("PYTHONHASHSEED must be '0'")
+            return await super().copy(prefix, target)
+
+    async def scenario():
+        ops = Ops()
+        eng = TaskEngine(ops, max_concurrent=1, consumer_count=1)
+        eng.start()
+        try:
+            cases = (
+                ("miss", IntentStatus.FAILED, "not registered"),
+                ("short", IntentStatus.FAILED, "shorter than one block"),
+                ("seed", IntentStatus.FAILED, "PYTHONHASHSEED"),
+                ("ok", IntentStatus.READY, ""),
+            )
+            for i, (mode, want, needle) in enumerate(cases):
+                ops.mode = mode
+                prefix = Prefix(model_id=mode, token_ids=(i + 1,))
+                key = eng.submit_intent(prefix, _T, poll_s=0.01, timeout_s=2)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if eng.intent_status(key) is want:
+                        break
+                    await asyncio.sleep(0.01)
+                assert eng.intent_status(key) is want, eng.intent_detail(key)
+                if needle:
+                    assert needle in eng.intent_detail(key)
+                alive = [t for t in eng._consumers if not t.done()]
+                assert alive, f"{mode} 之后消费者退出了"
+                assert not any(t.cancelled() for t in eng._consumers)
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_plan_mismatch_does_not_cancel_consumer() -> None:
+    """段名单和 TP 对不上只失败这一次，消费者继续。"""
+
+    messages = (
+        "key rank max=3 but only 1 targets",
+        "all keys are rank 0 but 2 targets given",
+        "ranks out of range for targets: [4]",
+    )
+
+    class Ops(FakeOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.boom: str | None = messages[0]
+
+        async def copy(self, prefix, target):
+            if self.boom:
+                raise IntentInputError(self.boom)
+            return await super().copy(prefix, target)
+
+    async def scenario():
+        ops = Ops()
+        eng = TaskEngine(ops, max_concurrent=1, consumer_count=1)
+        eng.start()
+        try:
+            for i, message in enumerate(messages):
+                ops.boom = message
+                prefix = Prefix(model_id=f"plan{i}", token_ids=(i + 1,))
+                key = eng.submit_intent(prefix, _T, poll_s=0.01, timeout_s=2)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if eng.intent_status(key) is IntentStatus.FAILED:
+                        break
+                    await asyncio.sleep(0.01)
+                assert eng.intent_status(key) is IntentStatus.FAILED
+                assert message in eng.intent_detail(key)
+                assert any(not t.done() for t in eng._consumers)
+                assert not any(t.cancelled() for t in eng._consumers)
+            ops.boom = None
+            key = eng.submit_intent(
+                Prefix(model_id="ok", token_ids=(9,)), _T, poll_s=0.01, timeout_s=2
+            )
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if eng.intent_status(key) is IntentStatus.READY:
+                    break
+                await asyncio.sleep(0.01)
+            assert eng.intent_status(key) is IntentStatus.READY
         finally:
             await eng.shutdown(timeout_s=2)
 

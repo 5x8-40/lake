@@ -70,38 +70,40 @@
 
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
-- 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
+- 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。tasks 与 keepalive 有写入方。replicas 与 sessions 表在，还没有写入方。
+- 遗留：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。
+- 遗留：`SubmitIntent` 现在只有预热（前缀 × 目标实例）。move / pin / demote / promote / remove 只有操作，没有 intent。这是大遗留，这次不扩协议、不加流程。
+- locate：进程内「实例 → rank 有序段名单」。intent 和操作入参没有 segment。没登记的实例报错。
+- remove：无论 force 都先停保活。`force=False` 再等满一个 lease TTL，然后 `batch_remove(..., force=False)`。`force=True` 停保活后立刻 `batch_remove(..., force=True)`，不等。失败或取消不把保活加回去，停过就留停，调用方自己重试，租约可以过期。
+- 保活续租用 BatchExistKey（`exists` → `batch_is_exist`），不用 ProbeKey。`keepalive` / `stop_keepalive` 只登记或注销 Ledger 里的同一张表。
+- 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回删掉了用 offload 端点对 seg 名的检查（offload RPC 用 port 0 由内核分配，seg 名是 `local_hostname_`，不是同一次真机测量），仍打会累计命中的 GetReplicaList（默认 2 次），再用内存副本传输端点对 `locate(target)`，同步核验，不轮询。daemon `--admin` 必填；`--capability` 默认 `main`。`v0311` 启动直接失败：那个端点有续租副作用，也没有盘副本字段。
+- 软钉空写：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。wheel 不带 C++ 头文件，扩展只链 `store.so`。`get_real_client()` 是退路：只有以后真实调用失败，才包含 `pyclient.h`，在对象还原成 `MooncakeStorePyWrapper` 之后取出已建 client。现在不走这条。client_id 用方案一：`UpsertStart` 发出的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时副本留在 PROCESSING。扫任务记录再补 End/Revoke 的崩溃恢复暂时不做，这次不写（D2 F5）。保留身份先不动。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐——🟡 候选已列出，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
-  - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert 一个方案：
+- pin：READY 后防驱逐——硬钉走候选 ①，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
+  - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert，实现不改：
     - 好处：不动全局 lease、断线窗口 30 分钟级
-    - 代价：空写通道（Python 绑定没有分离接口）+ client_id 问题
-  - hard pin 级（绝对不可逐）——两个候选：
-    - ① lease 调大 + keepalive：零改动、零client_id 问题；代价 = 全局读租约变长 + kvcm 必须活着续租
-    - ② 读删写：kvcm 失联也安全；代价 = 数据要经过 kvcm 本地 + client_id 问题
-  - 取消方式：① 停续租等过期 / 空写传 false 或 `SoftPinAction::DISABLE` / hard pin 没有 unpin，只能再读删写一遍
+    - 代价：官方绑定没有拆开的 upsert。空写走单独的 `_empty_pin.so`（只链 `store.so`，见上）。client_id 用方案一
+  - hard pin 级：选定候选 ①。`pin(HARD)` 登记保活（同一张 Ledger 表），不读数据、不 Remove、不重 put、不空写、不改 hard pin 位。`hard_pin_after` 仍表示不能事后改 hard pin 标记。lease 时长是 master 的 `default_kv_lease_ttl`，不是 kvcm 对单个 key 改标记；kvcm 不改这个配置
+  - 候选 ② 读删写代价太大，这次不做
+  - 取消：停续租，等满一个 lease TTL。没有马上撤销 lease 的调用，也不查剩余租约。空写 soft pin 的取消是主线 `SoftPinAction::DISABLE`。扩展只对着主线，0.3.11 的 soft_pin 通道是 NO
   - 读锁方案已否决：refcnt 是任务级保护，两个版本都没有读者引用 RPC
-  - client_id 问题两个方案并列（空写与读删写都要面对）：
-    - client_id 改归 kvcm：不改 mooncake；语义变（Revoke/`BatchReplicaClear` 权限归 kvcm，kvcm 死期间锁死；死透时逃生门 = 任一 client upsert 把 client_id 改写成自己、接管权限，upsert 不验身份）；与副本存亡无关——两方案下引擎下线行为一致（E5 已闭环）
-    - 借原 client_id UUID：语义不变；需 master 加「key → client_id」查询 RPC（内部数据现成）
-    - 决策条件：mooncake 能不能改（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
+  - client_id：方案一是当前路径（空写写成 kvcm 的 UUID，目前没感受到权限影响）。方案二借名仍做不到，不是当前路径；机制说明留在 D2 §2
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）
-- retain：🟡 机制已定，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
-  - 正式路径 = main 的两条池机制并列：
-    - retained client：断线后数据保留、等重连接管（`AddReplicaForRetainedClient` + client 库 `BufferRegistrationAction::kRetained` 注册）——应对引擎进程下线；kvcm 用同一个库也能注册
-    - DFS 副本：写共享 3FS，不随 client 死被清——应对整机灭失；前提是部署 3FS
+- retain：先不做。结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
+  - 1fc27b6 没有 `AddReplicaForRetainedClient`。`BufferRegistrationAction::kRetained` 是外部 buffer 引用计数。通道保持关闭
+  - DFS 副本：写共享 3FS，不随 client 死被清。前提是部署 3FS。本次不实现
   - 0.3.11 下 demote 解决不了 retain：盘副本绑引擎 client，引擎死了照样清
-  - 0.3.11 的过渡办法（E5 已闭环）：move 到活 seg 有效；改 client_id 对副本存亡无效（只动鉴权字段）；kvcm 自挂 SSD 兜底（不依赖任何引擎存活；main 下 kvcm 以 retained 身份注册，则 kvcm 自己死了数据也保留）
+  - 0.3.11 已核对的办法（E5 已闭环，本次不实现）：move 到活 seg 有效；改 client_id 对副本存亡无效（只动鉴权字段）；kvcm 自挂 SSD 兜底（不依赖任何引擎存活）
   - 计划下线：`GracefulUnmountSegment`（0.3.11）/ `CreateDrainJob`（两版本都有，job 级可取消）
   - 长期未命中 → demote 到 SSD，由策略层定
-- demote / promote：🟡 设计完成，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
+- demote / promote：结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
   - 框架：语义是原子的，实现是组合动作（池通道或 kvcm 读写组合 + 核验）；存储统一归 mooncake（引擎实例挂本机 SSD 做分层，kvcm 自己不持存储）
-  - demote = 池开 `enable_offload`：
+  - demote：先确认前缀能展开成 key、并且 admin 已配置，再 `stop_keepalive`。然后等满一个 lease TTL（`--lease-ttl-s`，默认 10，须与 master 的 `default_kv_lease_ttl` 一致；测试床实配过 11s；0.3.11 代码默认 5s，main 默认 10s）。kvcm 不改 master 的这个值。再用 `GET /batch_query_keys` 确认每个 key 的 disk / local_disk。不用 `GetReplicaList`（会续租）。没有立刻搬到盘上的 RPC。写回且池不满时仍失败。不读数据落盘，不调 `MountLocalDiskSegment`。失败或取消只恢复原本就有的保活行，且不重置窗口；原来没有保活行不会新建。成功不加回
+  - 池侧前提仍是 `enable_offload`：
     - 写穿 / 写回两模式（≈ HiCache write_through / write_back）
-    - 写回模式须先停保活、等 lease 过期——保活挡住驱逐，也就挡住落盘
   - promote 三条路：
     - `promotion_on_hit`：命中时池被动提回
-    - kvcm 主动①：反复调 `GetReplicaList` 看命中计数，过线就触发
+    - kvcm 主动①：打 N 次 `GetReplicaList`，再用内存副本传输端点对段。不拿 offload 端点对 seg 名。同步核验，不轮询
     - kvcm 主动②：读删写自己搬
     - promote 执行端 = 引擎来取（`PromotionObjectHeartbeat`，两版本都有，触发链不变）
   - copy/move 到不了 SSD（disk seg 没有 seg 名，两版本同）
@@ -124,7 +126,7 @@
     - offload 取消不对外（`CancelQueuedOffloadTask` 唯一调用点是 `UpsertStart` 内部）
     - `EvictDiskReplica`（两版本）：通知型；`LOCAL_DISK` 限登记 client（kvcm 自挂 SSD 后可用来收尾），`DISK` 不验 client_id（误用风险已登记）
     - `AddReplica` 不是独立 RPC（是 `NotifyOffloadSuccess` 的内部步骤）——kvcm 自挂 SSD 走 `NotifyOffloadSuccess` 上报登记
-    - retained client 注册在 client 库（`BufferRegistrationAction::kRetained`），kvcm 同库可注册——main 下 kvcm 以 retained 身份注册，kvcm 死亡数据也保留
+    - `BufferRegistrationAction::kRetained` 是外部 buffer 引用计数。1fc27b6 没有 `AddReplicaForRetainedClient`。retain 先不做
     - `BatchQueryIp`（两版本）：client_id→IP，副本位置解析的最后一环
     - `GetStorageUsageSnapshot`（main）：分层容量快照，demote 触发输入
     - 台账失效通知（main）：KV 事件流 removed/cleared；stored 事件没有位置信息，代替不了定期比对
@@ -153,7 +155,7 @@
   - 预复制不续租的话，一个 TTL 窗口内没有读流量就可能被驱逐
   - 约束已定：保活循环必须有界——无限续租事实上等于 pin；kvcm 断线后租约到期自然失效，不残留
   - 策略未定：续多久、何时停——候选 = 会话期 / 固定窗口 / 首流量后停租，未选定
-- key 的 client_id 下线后的副本存亡：🟡 机制已定（D2 §4 retain）——main 有两条池机制并列（retained client / DFS 副本）；0.3.11 过渡手段 E5 已闭环：move 到活 seg 有效、改 client_id 对副本存亡无效、kvcm 自挂 SSD 兜底
+- key 的 client_id 下线后的副本存亡：retain 先不做（D2 §4）。main 的 DFS 副本不随 client 死被清；retained client 不是可用路径。0.3.11 已核对：move 到活 seg 有效、改 client_id 对副本存亡无效、kvcm 自挂 SSD 兜底。这几条本次不实现
 - 计划下线迁移：归 D2 retain 条（`CreateDrainJob` 两版本都有，把指定 seg 上的数据迁空到目标 seg，带并发上限、job 级可取消）
 - 落盘（写到 SSD）：Mooncake 的 DRAM→SSD 是池内冷热分层（client 侧 `enable_ssd_offload`，默认 `false`），不是「预复制时直接指定写盘」；SSD 只作容量/恢复用的异步 demote 去向（机制归 D2 demote 条）
 - 直接影响故障恢复时已预热前缀的可用性（D5，已闭环，见本文）。事实输入：E5（已闭环，见本文 E 节）。
@@ -238,7 +240,7 @@
 - **E3. 多卡自动匹配验证**——resolve 的 `VLLM::Worker_TP<N>` proctitle 匹配在多卡真机走通（现在是 `--targets` 手工指定对应关系；匹配失效时必须明确报错，不能默不作声地配错）。
 - **E4. 单 token 不一致的根因**——输出里偶发有一个 token 与预期不同：旧非 DEBUG 实例偶发，新实例未复现；首次外部读的输出逐字一致，怀疑是不同执行路径的数值扰动。生产化前必须查清（[EXPERIMENTS.md](demo/EXPERIMENTS.md) #10）。
 - **E5. 副本消失机制核实**——✅ 已闭环（10-20 受控复验，结论落 D1 F5 / [D2-kv-operations.md](design/D2-kv-operations.md) F6b）：副本存亡绑定所在 seg 所在 client（副本所在 client），key 的 client_id 下线只清其自己 seg 上的副本，远端副本保留且可读（kill A → TTL 过期 unmount → `batch_is_exist` 32/32 + 跨机字节级 get 3/3；master 日志零驱逐零 remove）。早期「key 连同全部副本消失、exist 0/32」是 key 名漂移假失败（控制面未带 `PYTHONHASHSEED`，[EXPERIMENTS.md](demo/EXPERIMENTS.md) 踩坑 1/3、总表 #15），不是级联删除
-  - 对设计的落地：改 client_id 对副本存亡无效（只动鉴权字段）；move 到活 seg 有效；kvcm 自挂 SSD 是不依赖任何引擎存活的兜底；main 的 retained client / DFS 副本是正式路径
+  - 对设计的落地：改 client_id 对副本存亡无效（只动鉴权字段）；move 到活 seg 有效；kvcm 自挂 SSD 是不依赖任何引擎存活的兜底。main 的 DFS 副本不随 client 死被清。retained client 不是正式路径：1fc27b6 没有 `AddReplicaForRetainedClient`，`kRetained` 是外部 buffer 引用计数
   - 剩余事实输入：lease TTL 11s（master 实配 `default_kv_lease_ttl=11000` 毫秒）+ 驱逐候选资格（lease 过期→驱逐首选）仍归 D3/TTL 议题
 - **E6. 0.3.11 API 子集核对**——✅ 已闭环（结论写在 D2 F13）
   - 做法：三个版本的 RPC 注册表 diff（v0.3.11 与 v0.3.11.post1 完全相同）

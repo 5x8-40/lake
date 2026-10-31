@@ -120,13 +120,16 @@ def _args(tmp: str) -> argparse.Namespace:
         peer_tp_size=None,
         put_step=1,
         hash_algo="sha256",
-        segs="127.0.0.1:10001,127.0.0.1:10002",
-        capability="v0311",
+        instance_segs=["inst=127.0.0.1:10001,127.0.0.1:10002"],
+        capability="main",
+        admin="http://127.0.0.1:9003",
         ledger=f"{tmp}/ledger.sqlite",
         max_concurrent=4,
         copy_submit_concurrency=4,
+        promote_hits=2,
         listen="",
         keepalive_interval_s=0.05,
+        lease_ttl_s=10.0,
         keepalive_window_s=600.0,
         shutdown_timeout_s=2.0,
         rpc_timeout_s=30.0,
@@ -808,3 +811,118 @@ def test_shutdown_signal_interrupts_connect_wait(monkeypatch, tmp_path, capsys) 
     assert "got shutdown signal during connect" in err, (
         f"走的是超时分支而不是信号分支: {err!r}"
     )
+
+
+def test_cli_repeats_instance_segs(monkeypatch) -> None:
+    """一次启动可以登记多个实例。旧的单一 --segs 不再接受。"""
+    captured: dict = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(daemon, "run", fake_run)
+    rc = daemon.main(
+        [
+            "--master", "127.0.0.1:50088",
+            "--local-hostname", "127.0.0.1:13021",
+            "--model-name", "qwen",
+            "--admin", "http://127.0.0.1:9003",
+            "--instance-segs", "A=seg-A0,seg-A1",
+            "--instance-segs", "B=seg-B0",
+            "--ledger", "/tmp/ledger.sqlite",
+        ]
+    )
+    assert rc == 0
+    assert captured["args"].instance_segs == [
+        "A=seg-A0,seg-A1",
+        "B=seg-B0",
+    ]
+    assert captured["args"].lease_ttl_s == 10.0
+    with pytest.raises(SystemExit):
+        daemon.main(
+            [
+                "--master", "127.0.0.1:50088",
+                "--local-hostname", "127.0.0.1:13021",
+                "--model-name", "qwen",
+                "--segs", "seg0,seg1",
+                "--ledger", "/tmp/ledger.sqlite",
+            ]
+        )
+
+
+def test_empty_admin_exits_before_serve(monkeypatch, capsys) -> None:
+    """没配管理端口就启动：报错返回，不进服务循环。"""
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应进入服务循环")
+
+    monkeypatch.setattr(daemon, "_serve", boom)
+    rc = daemon.main(
+        [
+            "--master", "127.0.0.1:50088",
+            "--local-hostname", "127.0.0.1:13021",
+            "--model-name", "qwen",
+            "--instance-segs", "A=seg-A0",
+            "--ledger", "/tmp/ledger.sqlite",
+        ]
+    )
+    assert rc == 1
+    assert "管理端口" in capsys.readouterr().err
+
+
+def test_v0311_capability_exits_before_serve(monkeypatch, capsys) -> None:
+    """0.3.11 能力集对不上零副作用核验，启动直接失败。"""
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应进入服务循环")
+
+    monkeypatch.setattr(daemon, "_serve", boom)
+    rc = daemon.main(
+        [
+            "--master", "127.0.0.1:50088",
+            "--local-hostname", "127.0.0.1:13021",
+            "--model-name", "qwen",
+            "--admin", "http://127.0.0.1:9003",
+            "--capability", "v0311",
+            "--instance-segs", "A=seg-A0",
+            "--ledger", "/tmp/ledger.sqlite",
+        ]
+    )
+    assert rc == 1
+    assert "零副作用" in capsys.readouterr().err
+
+
+def test_admin_without_scheme_exits_before_serve(monkeypatch, capsys) -> None:
+    """--admin 没有 http:// 或 https:// 时启动直接失败。"""
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应进入服务循环")
+
+    monkeypatch.setattr(daemon, "_serve", boom)
+    rc = daemon.main(
+        [
+            "--master", "127.0.0.1:50088",
+            "--local-hostname", "127.0.0.1:13021",
+            "--model-name", "qwen",
+            "--admin", "127.0.0.1:9003",
+            "--instance-segs", "A=seg-A0",
+            "--ledger", "/tmp/ledger.sqlite",
+        ]
+    )
+    assert rc == 1
+    assert "http://" in capsys.readouterr().err
+
+
+def test_directory_rejects_duplicate_and_empty() -> None:
+    from kvcm.instances import InstanceDirectory, directory_from_specs
+
+    directory = InstanceDirectory()
+    directory.register("A", ["seg-A0"])
+    with pytest.raises(ValueError, match="already registered"):
+        directory.register("A", ["seg-A1"])
+    assert directory.locate("A") == ("seg-A0",)
+    with pytest.raises(ValueError, match="都不能空"):
+        directory_from_specs(["A="])
+    with pytest.raises(ValueError, match="至少要有一条"):
+        directory_from_specs([])

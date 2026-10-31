@@ -1,8 +1,7 @@
 """常驻循环（E11 进程化的支撑组件，L2）。
 
-KeepaliveLoop 本期落地；ReleaseLoop / RetainLoop 只留骨架——依赖的
-demote/retain/remove 在 L4 尚未接线（MooncakeBackend 均
-NotImplementedError），能力接线完成前没有可执行内容。
+KeepaliveLoop 本期落地。ReleaseLoop / RetainLoop 只留骨架，不调用
+已落地的 move / remove / demote，也不实现 retain。续租仍是本循环的 exists。
 
 形态：**协程定时器**（事件循环内 `asyncio.sleep` 周期触发），不是独立
 线程——E11 执行模型。
@@ -17,13 +16,15 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
 
 from kvcm.ledger import Ledger
 from kvcm.ops.base import KvOps, QueryError
 from kvcm.ops.types import Prefix
+
+logger = logging.getLogger(__name__)
 
 
 class KeepaliveLoop:
@@ -48,7 +49,6 @@ class KeepaliveLoop:
         *,
         interval_s: float = 5.0,
         window_s: float = 600.0,
-        executor: ThreadPoolExecutor | None = None,
     ) -> None:
         if interval_s <= 0:
             raise ValueError("interval_s must be positive")
@@ -58,10 +58,6 @@ class KeepaliveLoop:
         self._ledger = ledger
         self._interval = interval_s
         self._window = window_s
-        self._executor = executor or ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="kvcm-keepalive"
-        )
-        self._owns_executor = executor is None
         self._task: asyncio.Task | None = None
         self._stop = False
         self._register_failures = 0
@@ -74,10 +70,8 @@ class KeepaliveLoop:
     def register(self, prefix: Prefix) -> None:
         """登记保活。
 
-        调用场景：TaskEngine 在副本 READY 后注册。**同一前缀 × 同一实例
-        不会重复预热**（幂等键挡住），所以这里不需要「刷新窗口」的语义
-        ——实现上是 `INSERT OR REPLACE`，重复调用会覆盖 `registered_at`，
-        那只是幂等写入的副作用，不是设计意图。
+        调用场景：TaskEngine 在副本 READY 后注册。终态后再提交会再次
+        注册。行已存在时保留原来的 ``registered_at``，不把窗口拨回现在。
 
         **不抛异常**：保活失败只意味着副本可能提前变冷，不是预热失败。
         这里吞掉并计数（`register_failures`），避免把已经 READY 的 intent
@@ -107,12 +101,14 @@ class KeepaliveLoop:
         """
         loop = self._loop
         if loop is None or not loop.is_running():
-            # 事件循环未起（daemon 启动早期）：交给 executor 直接跑，
-            # 不在调用线程做 sqlite
+            # 事件循环未起：交给 Ledger 自己的 executor，不在调用线程做 sqlite。
+            # Future 必须观察，否则写入失败变成「exception was never retrieved」。
             try:
-                self._executor.submit(fn, *args)
+                fut = self._ledger.executor.submit(fn, *args)
             except RuntimeError:
                 self._note_failure()  # 池已关（退出期）
+                return
+            fut.add_done_callback(self._observe_ledger_future)
             return
         try:
             loop.call_soon_threadsafe(self._schedule_ledger_write, fn, args)
@@ -126,9 +122,16 @@ class KeepaliveLoop:
         task.add_done_callback(self._on_ledger_write_done)
 
     def _on_ledger_write_done(self, task: asyncio.Task) -> None:
-        if task.cancelled():
+        self._observe_ledger_future(task)
+
+    def _observe_ledger_future(self, fut) -> None:
+        if fut.cancelled():
             return
-        exc = task.exception()
+        try:
+            exc = fut.exception()
+        except Exception as e:
+            self._note_failure(e)
+            return
         if exc is not None:
             self._note_failure(exc)
 
@@ -146,7 +149,7 @@ class KeepaliveLoop:
     async def _ledger_call(self, fn, *args):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
-            self._executor, functools.partial(fn, *args)
+            self._ledger.executor, functools.partial(fn, *args)
         )
 
     # ------------------------------------------------------------------
@@ -174,9 +177,7 @@ class KeepaliveLoop:
                 self._task = None
 
     def close(self) -> None:
-        """释放自建 executor（外部注入的由调用方管）。"""
-        if self._owns_executor:
-            self._executor.shutdown(wait=False)
+        """不关 Ledger 的 executor。那是 Ledger 自己的池。"""
 
     async def _run(self) -> None:
         while not self._stop:
@@ -201,6 +202,7 @@ class KeepaliveLoop:
     # ------------------------------------------------------------------
 
     async def sweep_once(self) -> None:
+        started = time.monotonic()
         now = time.time()
         records = await self._ledger_call(self._ledger.list_keepalive_records)
         for rec in records:
@@ -209,6 +211,9 @@ class KeepaliveLoop:
                 await self._ledger_call(
                     self._ledger.unregister_keepalive, rec.prefix
                 )
+                continue
+            if not await self._ledger_call(self._ledger.has_keepalive, rec.prefix):
+                # 快照之后 stop_keepalive 已删行。再 exists 会把刚停的租约授满。
                 continue
             try:
                 present = await self._ops.exists(rec.prefix)
@@ -225,14 +230,21 @@ class KeepaliveLoop:
                 await self._ledger_call(
                     self._ledger.unregister_keepalive, rec.prefix
                 )
+        elapsed = time.monotonic() - started
+        if elapsed > self._interval:
+            logger.warning(
+                "keepalive sweep slower than interval: prefixes=%d elapsed=%.3fs interval=%.3fs",
+                len(records),
+                elapsed,
+                self._interval,
+            )
 
 
 class ReleaseLoop:
-    """软释放 / demote / 主动 Remove 三级（D1 §6）。骨架——依赖的
-    demote/remove 在 L4 未接线，capability 具备并接线后再常驻化。"""
+    """软释放 / demote / 主动 Remove 三级（D1 §6）。骨架——不调用
+    已落地的 remove / demote。"""
 
 
 class RetainLoop:
-    """retain 与计划下线编排（D2 §4）。骨架——依赖的 retain/move 在
-    L4 未接线（retain 契约已定为返回 TaskHandle，主路径 retained
-    client 注册待 mooncake 版本升级），能力接线后再常驻化。"""
+    """retain 与计划下线编排（D2 §4）。骨架——不调用 move，也不实现 retain。
+    1fc27b6 没有 AddReplicaForRetainedClient。kRetained 是外部 buffer 引用计数。"""

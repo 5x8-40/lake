@@ -26,8 +26,9 @@ RPC executor 那几个线程。
 `create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受——
 管的是建链速率（0.3.11 上 14 连发会 `ConnectToPeer FAILED`）。没有
 这把前缀闸的话，排队的前缀会以每次 4 个建链 RPC 的速度全部提交完：
-master 上叠着所有 plan，并且每个 handle 每轮 `query_task` 都要按 key
-顺序各查一次。前缀闸把「还没终态的预热前缀」卡在 `max_concurrent`。
+master 上叠着所有 plan，并且每个 handle 的 `query_task` 用 gather
+并发查，整个 backend 共用一把、不超过 4。前缀闸把「还没终态的预热前缀」
+卡在 `max_concurrent`。
 
 **线程边界**：`submit_intent` / `intent_status` 是**同步方法**，供 gRPC
 servicer（在其线程池线程里）调用——入队经 `call_soon_threadsafe` 投递
@@ -43,13 +44,20 @@ from __future__ import annotations
 import asyncio
 import enum
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
 from kvcm.ledger import prefix_key
 from kvcm.loops import KeepaliveLoop
-from kvcm.ops.base import KvOps, QueryError, TaskHandle, TaskStatus, VerifyError
+from kvcm.ops.base import (
+    IntentInputError,
+    KvOps,
+    QueryError,
+    TaskHandle,
+    TaskStatus,
+    VerifyError,
+)
 from kvcm.ops.types import InstanceId, Prefix
 
 # 限速器钩子：() -> bool，False = 暂缓发起（E15 接入点，提交前询问）
@@ -153,6 +161,7 @@ class TaskEngine:
         self._finished: OrderedDict[str, _Finished] = OrderedDict()
         self._finished_max = max(1, finished_max)
         self._accepting = True
+        self._programming_errors = 0
         self._consumers: list[asyncio.Task] = []
         self._recover_tasks: list[asyncio.Task] = []
         # 下界，不是容量上限：出队后先做 exists（闸外），再在闸上挂起。
@@ -428,18 +437,29 @@ class TaskEngine:
                     rec.prefix, rec.target, rec.poll_s, rec.timeout_s
                 )
                 self._finish(rec, IntentStatus.READY)
+                self._programming_errors = 0
             except asyncio.CancelledError:
                 self._finish(rec, IntentStatus.FAILED, "cancelled (shutdown)")
                 raise
-            except PrefetchError as e:
-                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
-            except QueryError as e:
-                # exists 的查询失败（不包成 PrefetchError）只该判定这次
-                # intent 失败——**不能向上抛**，否则消费者协程退出，几次
-                # 抖动后全部消费者死光、新 intent 永远 PENDING
+            except (PrefetchError, QueryError, IntentInputError) as e:
+                # 这一次 intent 失败。不能向上抛，否则消费者退出，
+                # 几次之后新 intent 永远 PENDING。
+                # QueryError 是 exists 查询失败，不包成 PrefetchError。
+                # IntentInputError 是未登记实例、前缀不足一块、段名单和
+                # TP 对不上、PYTHONHASHSEED 未设。
+                self._programming_errors = 0
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
             except Exception as e:  # 编程错误也留原因，再往上抛（不吞）
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
+                self._programming_errors += 1
+                current = asyncio.current_task()
+                others_done = all(
+                    t.done() for t in self._consumers if t is not current
+                )
+                # 3 次门槛，或这是最后一条活着的消费者。好坏交替会把计数清零，
+                # 但消费者仍会一条条死光，不在这里停收的话新 intent 永远 PENDING。
+                if self._programming_errors >= 3 or others_done:
+                    self._accepting = False
                 raise
             finally:
                 self._queue.task_done()

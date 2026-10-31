@@ -16,17 +16,39 @@ store client（它必须在线，否则 master 派不了源任务）。
 
 from __future__ import annotations
 
-import time
-from typing import Iterable, Sequence
+from typing import Sequence
 
 # mooncake.store 为 lazy import（connect 时）：无 mooncake 安装的环境
 # 仍可 import 本模块（离线 key 计算、拓扑解析、单元测试）。
 
 
+def is_memory_replica(desc: object) -> bool:
+    """内存副本谓词。上游绑定是方法，测试对象可以是布尔属性。
+
+    方法对象本身为真。不能把 ``getattr`` 的结果直接当布尔，否则盘副本
+    也会去调 ``get_memory_descriptor()``。
+    """
+    if not hasattr(desc, "is_memory_replica"):
+        raise StoreClientError(
+            "副本描述没有 is_memory_replica，绑定面不对"
+        )
+    pred = desc.is_memory_replica
+    if callable(pred):
+        return bool(pred())
+    return bool(pred)
+
+
 def entry_exists(e) -> bool:
-    """batch_is_exist 返回项的_truthy 判定——唯一的判定定义，所有
-    「key 是否在池」的调用共用（错误项 -1 不到这里，is_exist 先抛）。"""
-    return e == 1 or e is True or (isinstance(e, int) and e > 0)
+    """batch_is_exist 的成功码：0 = 不存在，1 或 True = 存在。
+
+    其它整数是 ErrorCode（``RPC_FAIL=-900`` 等），不是「存在」。
+    调用方应先拒绝这些码；这里也不把任意正数当成存在。
+    """
+    if e is True or e == 1:
+        return True
+    if e is False or e == 0:
+        return False
+    raise StoreClientError(f"batch_is_exist unexpected code {e!r}")
 
 
 class StoreClientError(RuntimeError):
@@ -110,17 +132,24 @@ class StoreClient:
     def is_exist(self, keys: Sequence[str]) -> list[bool]:
         """batch_is_exist → bool 列表（读即续租——保活机制利用这一点）。
 
-        单 key 查询失败（返回 -1）不吞成「不存在」——抛
-        StoreClientError，由调用方按可重试错误处理（吞掉会让
-        「查询失败」被当成「缓存不存在」，误触发重算/预热）。
+        成功只认 0（不存在）、1 或 True（存在）。其它整数是 ErrorCode
+        原值（``INTERNAL_ERROR=-1``、``RPC_FAIL=-900``、``RPC_TIMEOUT=-901``），
+        抛 StoreClientError，信息里带实际返回值。吞成 False 会让
+        「查失败」变成「不在池」：预热终态失败，保活还会把行注销。
         """
         keys = list(keys)
-        raw = self._s().batch_is_exist(keys)
-        failed = [k for k, e in zip(keys, raw) if e == -1]
+        raw = list(self._s().batch_is_exist(keys))
+        failed = [
+            (k, e)
+            for k, e in zip(keys, raw)
+            if e is not True and e is not False and e not in (0, 1)
+        ]
         if failed:
+            shown = failed[:4]
+            tail = "..." if len(failed) > 4 else ""
             raise StoreClientError(
                 f"batch_is_exist per-key query failed ({len(failed)}/{len(keys)}): "
-                f"{failed[:4]}{'...' if len(failed) > 4 else ''}"
+                f"{shown}{tail}"
             )
         return [entry_exists(e) for e in raw]
 
@@ -151,6 +180,83 @@ class StoreClient:
             )
         return task_id
 
+    def create_move_task(self, key: str, source: str, target: str) -> object:
+        """发起移动：把 key 从源 seg 挪到目标 seg，完成后源副本删除。返回任务 id。
+
+        绑定 `create_move_task(key, source, target) -> (UUID, err)`。一次一个
+        key、一个源段、一个目标段——没有 targets 列表，也没有「省略 source
+        让 master 挑源」的重载（那是 copy 的行为）。
+        """
+        task_id, err = self._s().create_move_task(key, source, target)
+        if err != 0:
+            raise StoreClientError(
+                f"create_move_task failed err={err} key={key!r} "
+                f"source={source!r} target={target!r}"
+            )
+        return task_id
+
+    def batch_remove(self, keys: Sequence[str], force: bool = False) -> list[int]:
+        """按 key 批量删除，每个 key 的全部副本一起删（全局生效）。
+
+        绑定 `batch_remove(keys, force=False) -> list[int]`：0 成功，负数是
+        错误码。长度不符或任一非 0 都当失败抛出，不把「删了一半」报成成功。
+        force 默认 false：lease 未过期或复制任务在途时 master 拒删。
+        删除不占新内存，调用方不要为此做容量判断。
+        """
+        keys = list(keys)
+        raw = list(self._s().batch_remove(keys, force))
+        if len(raw) != len(keys):
+            raise StoreClientError(
+                f"batch_remove size mismatch keys={len(keys)} results={len(raw)}"
+            )
+        failed = [(k, rc) for k, rc in zip(keys, raw) if rc != 0]
+        if failed:
+            shown = failed[:4]
+            tail = "..." if len(failed) > 4 else ""
+            raise StoreClientError(
+                f"batch_remove failed {len(failed)}/{len(keys)}: {shown}{tail}"
+            )
+        return raw
+
+    def soft_pin(
+        self, keys: Sequence[str], sizes: Sequence[int], *, enable: bool = True
+    ) -> None:
+        """空写软钉。用官方包已经建好的 client，不第二次 create。
+
+        ``sizes`` 由调用方从 ``GET /batch_query_keys`` 的 ``size_`` 传入。
+        这里不调 ``batch_get_replica_desc`` / ``GetReplicaList``，那会
+        ``GrantReadLease``。``has_read_lease`` 且存在非内存副本时，main 的
+        ``UpsertStart`` 直接 ``OBJECT_HAS_LEASE``，空写失败。Case C 只在
+        有租约且副本全是内存时：丢掉旧副本再按 ``replica_num=1`` 重分配，
+        空写中间不写数据。这次只去掉 kvcm 自己取尺寸时授上的那次租约。
+        已有租约且副本全是内存的情况仍未解决。有盘副本的 key 在调用前拒绝。
+
+        ``_get_pyclient_capsule`` 拿回 setup 时放进 ``store_`` 的 PyClient。
+        扩展在这个对象上调 ``MasterClient::UpsertStart`` / ``UpsertEnd``，
+        中间不 ``TransferWrite``。不用 ``upsert_tensor`` 重写数据。
+        """
+        store = self._s()
+        keys = list(keys)
+        sizes = [int(s) for s in sizes]
+        if len(keys) != len(sizes) or not keys or any(s <= 0 for s in sizes):
+            raise StoreClientError("软钉读不到唯一的原尺寸，没有钉上")
+        capsule_fn = getattr(store, "_get_pyclient_capsule", None)
+        if not callable(capsule_fn):
+            raise StoreClientError(
+                "官方包没有 _get_pyclient_capsule，拿不回已建 client，没有钉上"
+            )
+        capsule = capsule_fn()
+        if capsule is None:
+            raise StoreClientError("已建 client 的 capsule 是空的，没有钉上")
+        from kvcm.native.empty_pin import empty_soft_pin
+
+        try:
+            empty_soft_pin(capsule, keys, sizes, enable)
+        except ImportError as e:
+            raise StoreClientError(
+                "空写扩展还没加载，没有钉上"
+            ) from e
+
     def query_task(self, task_id: object) -> object:
         """查询任务状态（QueryTaskResponse）。"""
         resp, err = self._s().query_task(task_id)
@@ -159,55 +265,9 @@ class StoreClient:
         return resp
 
     # ------------------------------------------------------------------
-    # 同步便利封装（demo 脚本用；MooncakeBackend 的异步 query_task 路径
-    # 不走这里——以下方法当前无 L3/L2 调用方，删除前先确认 demo 不再用）
-    # ------------------------------------------------------------------
-
-    def wait_task(self, task_id: object, *, poll_s: float = 0.5, timeout_s: float = 120.0) -> object:
-        """轮询到终态（SUCCESS/FAILED）或超时。"""
-        from mooncake.store import TaskStatus
-
-        deadline = time.monotonic() + timeout_s
-        while True:
-            resp = self.query_task(task_id)
-            if resp.status in (TaskStatus.SUCCESS, TaskStatus.FAILED):
-                return resp
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"task {task_id} not terminal after {timeout_s}s; last={resp}"
-                )
-            time.sleep(poll_s)
-
-    def copy_and_wait(self, key: str, targets: Sequence[str], *, timeout_s: float = 120.0) -> None:
-        """同步组合：发起 + 等到成功（失败/超时抛错）。同步调用方用。"""
-        from mooncake.store import TaskStatus
-
-        task_id = self.create_copy_task(key, targets)
-        resp = self.wait_task(task_id, timeout_s=timeout_s)
-        if resp.status != TaskStatus.SUCCESS:
-            raise StoreClientError(
-                f"copy task finished non-success: status={resp.status} "
-                f"key={key!r} targets={list(targets)} resp={resp}"
-            )
-
-    # ------------------------------------------------------------------
     # 副本核验（绑定通道；注意：本通道有续租副作用。
-    # 零副作用核验走 HTTP 管理端点，仅新版本有——随版本接线）
-    #
-    # 调用方现状：MooncakeBackend 只用 batch 版；单 key 版与
-    # assert_targets_have_replicas 为 demo 脚本遗留的便利封装，L3/L2
-    # 当前无调用方。
+    # 零副作用核验走 HTTP 管理端点。提回仍用这一条累计命中）
     # ------------------------------------------------------------------
-
-    def memory_replica_endpoints(self, key: str) -> list[str]:
-        """单个 key 的内存副本传输端点列表（demo 脚本用；L3 走 batch 版）。"""
-        endpoints: list[str] = []
-        for desc in self._s().get_replica_desc(key):
-            if not desc.is_memory_replica:
-                continue
-            mem = desc.get_memory_descriptor()
-            endpoints.append(mem.buffer_descriptor.transport_endpoint)
-        return endpoints
 
     def batch_memory_replica_endpoints(self, keys: Sequence[str]) -> dict[str, list[str]]:
         """key → 内存副本端点映射（batch_get_replica_desc）。"""
@@ -217,29 +277,8 @@ class StoreClient:
         for key, replicas in items:
             eps: list[str] = []
             for desc in replicas or []:
-                if getattr(desc, "is_memory_replica", False):
+                if is_memory_replica(desc):
                     mem = desc.get_memory_descriptor()
                     eps.append(mem.buffer_descriptor.transport_endpoint)
             out[str(key)] = eps
         return out
-
-    def assert_targets_have_replicas(
-        self, keys: Iterable[str], targets: Sequence[str]
-    ) -> dict[str, list[str]]:
-        """核验：每个 key 在每个目标 seg 上都有内存副本，否则抛错。
-
-        demo 脚本用；L3（MooncakeBackend.query_task 的 READY 核验）按
-        「每个 key 在其映射目标上有副本」逐 key 判定，不走这里——本方法
-        的语义是「每个 key 在每个目标上都有」，对 rank 映射计划过强。
-        """
-        key_list = list(keys)
-        placement = self.batch_memory_replica_endpoints(key_list)
-        missing: list[str] = []
-        for key in key_list:
-            have = set(placement.get(key, []))
-            for t in targets:
-                if t not in have:
-                    missing.append(f"{key} missing on {t} (have={sorted(have)})")
-        if missing:
-            raise StoreClientError("verify failed:\n  " + "\n  ".join(missing))
-        return placement

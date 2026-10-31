@@ -97,12 +97,25 @@ def test_exists_false_fails_before_copy() -> None:
 
 
 def test_submit_error_wrapped_as_prefetch_error() -> None:
-    """copy 提交失败（SubmitError 带明细）统一出口为 PrefetchError。"""
-    ops = FakeOps(
-        exists=True, seq=[], copy_error=SubmitError("1/2 tasks submitted: [(1, 101)]")
+    """copy 提交失败（SubmitError 带明细）统一出口为 PrefetchError。
+
+    已经落账的句柄先 abandon。账本写失败不盖掉原来的提交失败。
+    """
+    handle = TaskHandle(op=OpKind.COPY, task_ids=((1, 101),))
+
+    class Ops(FakeOps):
+        async def abandon(self, handle):
+            self.calls.append("abandon")
+            raise RuntimeError("ledger write failed")
+
+    ops = Ops(
+        exists=True,
+        seq=[],
+        copy_error=SubmitError("1/2 tasks submitted: [(1, 101)]", handle=handle),
     )
     with pytest.raises(PrefetchError, match=r"copy submit failed.*\(1, 101\)"):
         run(PrefetchFlow(ops).run(_P, _T, poll_s=0))
+    assert "abandon" in ops.calls
 
 
 def test_task_failed_raises() -> None:

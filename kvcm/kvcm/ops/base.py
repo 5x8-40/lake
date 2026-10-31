@@ -30,10 +30,18 @@ from kvcm.ops.capability import BackendCapability
 from kvcm.ops.types import InstanceId, PinKind, Prefix
 
 
+class IntentInputError(Exception):
+    """这一次 intent 的输入不对，不是编程错误。
+
+    未登记实例、前缀不足一块、段名单和 TP 对不上、PYTHONHASHSEED 未设。
+    消费者按这个类型记 FAILED 后继续。其它异常仍记 FAILED 再抛。
+    """
+
+
 class TaskStatus(enum.Enum):
     """任务状态机（任务类操作：copy / move / promote）。"""
 
-    PENDING = "pending"  # 排队
+    PENDING = "pending"  # 当前没有生产者
     RUNNING = "running"  # 进行
     READY = "ready"  # 任务完成且目标侧副本核验通过
     FAILED = "failed"  # 失败（处理策略归编排层：重发 / 弃置清副本 / 衔接）
@@ -45,6 +53,7 @@ class OpKind(enum.Enum):
     COPY = "copy"
     MOVE = "move"
     PROMOTE = "promote"
+    RETAIN = "retain"
 
 
 @dataclass(frozen=True)
@@ -85,10 +94,15 @@ class QueryError(RuntimeError):
 class SubmitError(RuntimeError):
     """操作提交失败（copy/move/promote 的发起阶段）。
 
-    异常消息携带明细（如已发起的任务号——中途失败时那些任务需要跟踪）。
+    已经落账的句柄放在 ``handle`` 上，交给流程 ``abandon``（账本记
+    abandoned）。池里的传输不取消。没有任务号时 ``handle`` 为 None。
     与 QueryError（查询可重试）、VerifyError（核验终态）区分：提交失败
     的重试策略归编排层（幂等键 + 后端幂等兜底）。
     """
+
+    def __init__(self, message: str = "", *args, handle: TaskHandle | None = None):
+        super().__init__(message, *args)
+        self.handle = handle
 
 
 class KvOps(ABC):
@@ -98,9 +112,8 @@ class KvOps(ABC):
     ——跑通 copy 流程的最小集。其余操作基类给默认实现（抛
     UnsupportedCapabilityError，消息注明适配器未接线）：编排层判断可
     用性应读 capability()，异常只是兜底；适配器落地某项时 override
-    并细化（通道具备但未接线抛 NotImplementedError，通道不具备抛
-    UnsupportedCapabilityError——mooncake 后端的 pin 即此形态）。第二
-    后端接入时不必先 stub 全部操作。
+    并细化。未接线抛 UnsupportedCapabilityError。第二后端接入时不必先
+    stub 全部操作。
     """
 
     def _unsupported(self, op: str) -> UnsupportedCapabilityError:
@@ -148,37 +161,45 @@ class KvOps(ABC):
         """注销保活。不是第九项操作——是 keepalive 注册的管理面。"""
         raise self._unsupported("stop_keepalive")
 
-    async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
-        """元数据标记防驱逐：对已存在的 KV 生效，不写数据。
-        SOFT 可解；HARD 写入时固化、不可解，已存在的 KV 无法事后补标
-        （能力集 hard_pin_after）。无 READY。"""
+    async def pin(
+        self, prefix: Prefix, kind: PinKind = PinKind.SOFT, *, enable: bool = True
+    ) -> None:
+        """防驱逐。SOFT 是事后 soft pin，不写数据。``enable=False`` 走空写关闭。
+        HARD 标记创建时固化，不接受 ``enable=False``。
+        mooncake 上 pin(HARD) 的控制效果是登记保活，不是设置这个位。无 READY。"""
         raise self._unsupported("pin")
 
     async def demote(self, prefix: Prefix) -> None:
-        """放弃前缀 KV 的热层位置。本接口不指定目标层——去向由池的冷热
-        策略决定；是否立即生效取决于后端能力（has_per_key_demote 全版本
-        均无，实际为停止保活后的自然降层）。无 READY。"""
+        """放弃前缀 KV 的热层位置。没有立刻搬到盘上的调用。
+        mooncake 上先停保活，等满一个 lease TTL，再用
+        GET /batch_query_keys 确认盘副本。写回且池不满时失败。无 READY。"""
         raise self._unsupported("demote")
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
-        """把前缀 KV 提回指定实例本机层级（调度意图，与 demote 的
-        「放弃位置」不对称是刻意的）。READY 同 copy。"""
+        """把前缀 KV 提回到 target。
+
+        打 N 次 GetReplicaList，再用内存副本端点对 locate(target)。
+        不能在打次数之前证明 target 是盘副本登记实例。打完仍没有
+        内存副本就失败，不在这里轮询。
+        """
         raise self._unsupported("promote")
 
     async def retain(self, prefix: Prefix) -> TaskHandle:
-        """目的型：让前缀 KV 在源引擎下线后仍存活。目标基线 = 后端主线
-        能力：主路径 = 保留身份注册（mooncake main 的 retained client，
-        一次注册 RPC 即完成，无异步工作）——返回空句柄 task_ids=()，
-        query_task 立即 READY。过渡替代 = move 到存活节点（0.3.11 无
-        retained 能力时的登记实现）则是任务型，返回真实句柄。
-
-        返回 TaskHandle 而非 None：结果必须可观测（「保住了没有」是
-        本操作存在的全部意义）；空句柄与真句柄由实现按路径给出。
+        """目的型：让前缀 KV 在源引擎下线后仍存活。结果要可观测，所以
+        签名返回 TaskHandle。当前不实现。1fc27b6 没有
+        ``AddReplicaForRetainedClient``。``BufferRegistrationAction::kRetained``
+        是外部 buffer 引用计数。通道保持关闭。
         """
         raise self._unsupported("retain")
 
-    async def remove(self, prefix: Prefix) -> None:
-        """删除前缀 KV 的全部副本，全局生效。无 READY。"""
+    async def remove(self, prefix: Prefix, force: bool = False) -> None:
+        """删除前缀 KV 的全部副本，全局生效。无 READY。
+
+        无论 force 都先停保活。force=False 再等一个 lease 后
+        ``batch_remove(force=False)``。force=True 立刻强删。
+        失败或取消不把保活加回去：停过就留停，调用方看到原因后自己重试，
+        租约可以过期。
+        """
         raise self._unsupported("remove")
 
     @abstractmethod

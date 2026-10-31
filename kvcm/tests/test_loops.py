@@ -68,6 +68,32 @@ def test_register_then_sweep_renews_via_exists() -> None:
         led.close()
 
 
+def test_sweep_skips_exists_if_unregistered_after_snapshot() -> None:
+    """快照之后行已删，不要再 exists 续租。"""
+    led, path = _ledger()
+    try:
+        ops = FakeOps(present=True)
+        loop = KeepaliveLoop(ops, led, interval_s=999, window_s=600)
+        loop.register(_P)
+        real = led.list_keepalive_records
+
+        def snapshot():
+            rows = real()
+            led._unregister_keepalive_sync(_P)
+            return rows
+
+        led.list_keepalive_records = snapshot  # type: ignore[method-assign]
+        run(loop.sweep_once())
+        assert ops.calls == []
+        loop.close()
+    finally:
+        led.close()
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
+
+
 def test_window_expiry_unregisters() -> None:
     """窗口到：停租注销，不再调 exists（保活必须有界）。"""
     led, path = _ledger()
@@ -110,6 +136,25 @@ def test_query_error_skips_round_keeps_registration() -> None:
         loop.close()
     finally:
         led.close()
+
+
+def test_reregister_keeps_registered_at() -> None:
+    """再次登记不把窗口拨回现在。"""
+    led, path = _ledger()
+    try:
+        led.register_keepalive(_P)
+        first = led.list_keepalive_records()[0].registered_at
+        time.sleep(0.02)
+        led.register_keepalive(_P)
+        rows = led.list_keepalive_records()
+        assert len(rows) == 1
+        assert rows[0].registered_at == first
+    finally:
+        led.close()
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
 
 
 def test_restart_recovery_needs_no_special_casing() -> None:
@@ -299,6 +344,10 @@ def test_register_before_start_does_not_block_caller() -> None:
 
         def list_keepalive_records(self):
             return self._real.list_keepalive_records()
+
+        @property
+        def executor(self):
+            return self._real.executor
 
     led, path = _ledger()
     try:

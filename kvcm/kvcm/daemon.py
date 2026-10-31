@@ -27,13 +27,20 @@ KeepaliveLoop 停 → **等 RPC 线程结束** → StoreClient.close() + ledger.
 - `os._exit` 跳过 GC / `__del__` / atexit：已提交的 ledger 行还在（正在写的
   那条丢掉，靠 rebuild 重建 running 任务）；mooncake 侧靠 client TTL 回收
 
-locate 本期静态注入（`--segs`，单实例冒烟形态）；生产 locate =
-L1 InstanceWatcher 注册，归 E13。
+locate 读进程里的一份实例目录，不读命令。SubmitIntent 只有
+prefix{model_id, token_ids} 和 target 实例名；copy / move / remove
+也不带段。``--instance-segs`` 只在进程拉起时做初始登记
+（``实例=seg0,seg1``，可重复），不是每次操作换一套。只在启动时登记。
+``locate(实例)`` 只返回该实例的段；没登记就报错。
+实例下线不在这里。
 
 用法：
     python -m kvcm.daemon --master 127.0.0.1:50088 \
         --local-hostname 127.0.0.1:13021 \
-        --model-name qwen --tp-size 2 --segs seg0,seg1 \
+        --admin http://127.0.0.1:9003 \
+        --model-name qwen --tp-size 2 \
+        --instance-segs inst-a=seg0,seg1 \
+        --instance-segs inst-b=seg2,seg3 \
         --ledger /var/lib/kvcm/ledger.sqlite \
         --listen 127.0.0.1:9000
 """
@@ -48,10 +55,12 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from kvcm.api.grpc_server import IntentGrpcServer
+from kvcm.backends.mooncake.admin_main import MainlineAdmin
 from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.capability import mooncake_main, mooncake_v0311
 from kvcm.backends.mooncake.client import StoreClient
 from kvcm.engines.vllm.keys import KeyComputer
+from kvcm.instances import directory_from_specs
 from kvcm.ledger import Ledger
 from kvcm.loops import KeepaliveLoop
 from kvcm.task_engine import TaskEngine
@@ -63,8 +72,8 @@ def build_backend(
     ledger: Ledger,
     executor: ThreadPoolExecutor | None = None,
 ) -> MooncakeBackend:
-    """按参数组装 backend。独立成函数便于测试注入（fake client +
-    静态 locate 即可起进程壳）。"""
+    """按参数组装 backend。独立成函数便于测试注入（fake client 即可起
+    进程壳）。实例目录在这里装一次，locate 走这份目录。"""
     keys = KeyComputer(
         model_name=args.model_name,
         block_size=args.block_size,
@@ -73,16 +82,21 @@ def build_backend(
         put_step=args.put_step,
         hash_algo=args.hash_algo,
     )
-    segs = [s for s in args.segs.split(",") if s]
+    directory = directory_from_specs(args.instance_segs)
     capability = mooncake_main() if args.capability == "main" else mooncake_v0311()
+    admin_url = getattr(args, "admin", "") or ""
+    admin = MainlineAdmin(admin_url) if admin_url else None
     return MooncakeBackend(
         client=client,
         key_computer=keys,
-        locate=lambda _inst: list(segs),  # 静态注入；生产 = InstanceWatcher（E13）
+        locate=directory.locate,
         capability=capability,
+        admin=admin,
         ledger=ledger,
         submit_concurrency=args.copy_submit_concurrency,
         rpc_timeout_s=args.rpc_timeout_s,
+        lease_ttl_s=args.lease_ttl_s,
+        promote_hits=args.promote_hits,
         executor=executor,
     )
 
@@ -201,7 +215,6 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
             ledger,
             interval_s=args.keepalive_interval_s,
             window_s=args.keepalive_window_s,
-            executor=backend.executor,
         )
         engine = TaskEngine(backend, keepalive=keepalive, max_concurrent=args.max_concurrent)
         # 2. 重启恢复：running 任务重建跟踪，收编进 TaskEngine
@@ -337,6 +350,30 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
 
 def run(args: argparse.Namespace, *, stop: asyncio.Event | None = None) -> int:
     """进程主流程（stop 注入便于测试；None = 自己装 signal handler）。"""
+    admin = str(getattr(args, "admin", "") or "").strip()
+    if not admin:
+        print(
+            "[kvcm] startup: --admin 不能空。副本核验必须有管理端口"
+            "（GET /batch_query_keys）。为空时核验一直 QueryError，"
+            "预热要等满超时才失败。不进入服务循环。",
+            file=sys.stderr,
+        )
+        return 1
+    if not (admin.startswith("http://") or admin.startswith("https://")):
+        print(
+            "[kvcm] startup: --admin 必须带 http:// 或 https://。"
+            "否则第一次核验才会失败。不进入服务循环。",
+            file=sys.stderr,
+        )
+        return 1
+    if getattr(args, "capability", "main") == "v0311":
+        print(
+            "[kvcm] startup: --capability v0311 不能用来核验。"
+            "副本核验要主线的零副作用 GET /batch_query_keys。"
+            "0.3.11 的这个端点有续租副作用，能力集对不上。不进入服务循环。",
+            file=sys.stderr,
+        )
+        return 1
 
     async def _main() -> int:
         ev = stop or asyncio.Event()
@@ -372,15 +409,28 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--put-step", type=int, default=1)
     p.add_argument("--hash-algo", default="sha256")
     p.add_argument(
-        "--segs",
+        "--admin",
+        default="",
+        help="master HTTP 管理面根 URL，必须带 http:// 或 https://。"
+        "副本核验必须有管理端口：核验和降层查盘走 GET /batch_query_keys。"
+        "为空或没有协议头则启动直接失败，不进入服务循环",
+    )
+    p.add_argument(
+        "--instance-segs",
+        action="append",
         required=True,
-        help="静态 locate：rank 有序 seg 列表，逗号分隔（生产 = InstanceWatcher，E13）",
+        dest="instance_segs",
+        metavar="INSTANCE=SEG0,SEG1",
+        help="进程拉起时的初始登记：实例=rank 有序 seg 列表，可重复。"
+        "不是 SubmitIntent / copy / move / remove 的参数；"
+        "locate 只返回这一实例的段，没登记就报错",
     )
     p.add_argument(
         "--capability",
         choices=["v0311", "main"],
-        default="v0311",
-        help="后端版本能力集（填错 = 编排选错路径）",
+        default="main",
+        help="后端版本能力集。默认 main：核验走主线零副作用 GET /batch_query_keys。"
+        "v0311 启动直接失败，那个端点有续租副作用，能力集对不上",
     )
     p.add_argument("--ledger", required=True, help="Ledger sqlite 路径")
     p.add_argument(
@@ -401,6 +451,21 @@ def main(argv: list[str] | None = None) -> int:
         help="续租周期（必须显著小于 master lease TTL，实配 11s）",
     )
     p.add_argument(
+        "--promote-hits",
+        type=int,
+        default=2,
+        help="提回时对每个 key 调 GetReplicaList 的次数。"
+        "须不小于 master 的 promotion_admission_threshold（默认同为 2，可改）",
+    )
+    p.add_argument(
+        "--lease-ttl-s",
+        type=float,
+        default=10.0,
+        help="降层前要等满的 lease 秒数，必须与 master 的 default_kv_lease_ttl 一致。"
+        "测试床实配过 11s。0.3.11 代码默认 5s，main 默认 10s"
+        "（DEFAULT_DEFAULT_KV_LEASE_TTL = 10000ms）。kvcm 不改 master 的这个值",
+    )
+    p.add_argument(
         "--keepalive-window-s",
         type=float,
         default=600.0,
@@ -416,7 +481,10 @@ def main(argv: list[str] | None = None) -> int:
         "--copy-submit-concurrency",
         type=int,
         default=4,
-        help="进程内同时在飞的 create_copy_task 上限（所有 copy 共用；0.3.11 实测窗口 4 全成）",
+        help="进程内同时在飞的 create_copy_task 上限（所有 copy 共用）。"
+        "默认 4 来自实验 #16 单机合成目标段（窗口 4 时 42/42 全成）。"
+        "#17 跨机同样窗口大约一半失败，主错误是 master 留内存失败，"
+        "所以它不是跨机的充分条件。不代替 E15，也不做网卡限速",
     )
     p.add_argument(
         "--rpc-timeout-s",
