@@ -66,9 +66,13 @@ class AdminClient:
         """GET /query_segment?segment=名字，返回 (used, capacity)。
 
         这两个数是该段 allocator 的 size()/capacity() 之和。剩余由调用方
-        算 capacity - used。段不存在（含容量为 0）抛 SegmentNotFound。
+        算 capacity - used。段不存在时 master 以 500 正文
+        「Failed to query segment」失败（容量为 0 的 QuerySegments 也走
+        这条，不返回 Capacity: 0），这里抛 SegmentNotFound。
         连不上抛 AdminError（status 为空）；其它 5xx 抛 AdminError 并带上
         状态码——那是暂时失败，由调用方重试，本方法不把失败当成剩余 0。
+        解析出的 capacity 不再在这里另判：真 0 容量到不了成功正文；
+        假 admin 直接返回 (0, 0) 时由后端再判。
         """
         # 段名是 ip:port，冒号和方括号留着，避免依赖服务端是否解码 %3A。
         path = "/query_segment?segment=" + quote(segment, safe=":/[]")
@@ -92,14 +96,7 @@ class AdminClient:
                 status=status,
                 body=body,
             )
-        used, capacity = parsed
-        if capacity == 0:
-            raise SegmentNotFound(
-                f"segment not found: {segment} (capacity 0)",
-                status=status,
-                body=body,
-            )
-        return used, capacity
+        return parsed
 
     def _read(self, path: str) -> tuple[int, str]:
         """GET，返回 (status, body)。HTTP 错误不抛，把状态码交回调用方。

@@ -34,7 +34,14 @@ from __future__ import annotations
 import asyncio
 import time
 
-from kvcm.ops.base import KvOps, QueryError, SubmitError, TaskStatus, VerifyError
+from kvcm.ops.base import (
+    KvOps,
+    QueryError,
+    SubmitError,
+    TaskHandle,
+    TaskStatus,
+    VerifyError,
+)
 from kvcm.ops.types import InstanceId, Prefix
 
 
@@ -94,31 +101,59 @@ class PrefetchFlow:
         见 `TaskEngine._run_prefetch`。
 
         timeout_s 是调用方给的剩余预算（从等空间开始的那一段里还剩多少）。
-        copy 还没返回时到点，取消等待：那时还没有任务号，不按「提交失败
-        之后的部分落账」再记一笔。若取消时已经发出一部分 create_copy_task，
-        落账仍由 copy 自己的取消路径负责。放不下（AdmissionWait）和段不存在
+        copy 还没返回时到点：Python 3.12 的 `wait_for` 超时取消的是当前
+        这次等待，copy 协程还在；真正取消 copy 的是后面的 `_drain_copy`。
+        若那时已经有任务号，copy 把句柄交回来（账本先记 running），这里再
+        `abandon`（账本记 abandoned），然后抛 PrefetchError。没有任务号
+        就不落账，也不 abandon。放不下（AdmissionWait）和段不存在
         （AdmissionStop）原样抛出，由闸外决定再等还是停止。
+        进程退出（外层 CancelledError）若已经拿到这个句柄，先 abandon，
+        再把取消抛出去，不改成 PrefetchError。
         """
         deadline = time.monotonic() + timeout_s
         copy_task = asyncio.create_task(self._ops.copy(prefix, target))
         try:
             remaining = deadline - time.monotonic()
-            handle = await asyncio.wait_for(copy_task, timeout=remaining)
+            if remaining <= 0:
+                raise TimeoutError
+            # shield：超时取消的是这次等待，不是 copy。copy 若在这里被
+            # 取消并交回句柄，wait_for 会把句柄当成提交成功。真正取消
+            # copy 的是下面的 _drain_copy。不 shield 在飞的建链 RPC。
+            handle = await asyncio.wait_for(
+                asyncio.shield(copy_task), timeout=remaining
+            )
         except SubmitError as e:
             raise PrefetchError(f"copy submit failed: {e}") from e
         except TimeoutError:
-            # wait_for 已经取消了 copy。再等它收尾：没发出任务则没有号；
-            # 已经发出一部分则 copy 里现有的落账会记下那些号。这里不另记。
+            handle = None
             try:
-                await _drain_copy(copy_task)
+                handle = await _drain_copy(copy_task)
             except SubmitError as e:
                 raise PrefetchError(f"copy submit failed: {e}") from e
+            except asyncio.CancelledError:
+                await self._abandon_if_handed(copy_task, handle)
+                raise
+            if handle is not None:
+                try:
+                    await self._ops.abandon(handle)
+                except KeyError:
+                    pass
             raise PrefetchError(
                 f"copy not READY after {timeout_s}s (cancelled before handle)"
             )
         except asyncio.CancelledError:
-            # 外层取消（进程退出）。copy 自己的取消路径负责已发出的号。
-            await _drain_copy(copy_task)
+            # 进程退出。句柄交回来之后先 abandon，再把取消抛出去。
+            handle = None
+            try:
+                handle = await _drain_copy(copy_task)
+            except asyncio.CancelledError:
+                await self._abandon_if_handed(copy_task, handle)
+                raise
+            if handle is not None:
+                try:
+                    await self._ops.abandon(handle)
+                except KeyError:
+                    pass
             raise
         if handle_sink is not None:
             handle_sink(handle)
@@ -155,15 +190,39 @@ class PrefetchFlow:
                 pass  # 已终态被移除登记
             raise
 
+    async def _abandon_if_handed(
+        self, copy_task: asyncio.Task, handle: TaskHandle | None
+    ) -> None:
+        """关闭信号打断排空时，已经交回来的句柄先 abandon。"""
+        if handle is None and copy_task.done() and not copy_task.cancelled():
+            if copy_task.exception() is None:
+                result = copy_task.result()
+                if isinstance(result, TaskHandle):
+                    handle = result
+        if handle is None:
+            return
+        try:
+            await self._ops.abandon(handle)
+        except KeyError:
+            pass
 
-async def _drain_copy(copy_task: asyncio.Task) -> None:
-    """等 copy 的取消路径跑完。没跑完就取消再等。
 
-    copy 在还没有任务号时被取消，不会落账；已经写出的号由它自己记下。
+async def _drain_copy(copy_task: asyncio.Task) -> TaskHandle | None:
+    """取消还在跑的 copy，并把收尾结果交给调用方。
+
+    有任务号时 copy 返回句柄；没有任务号时它以 CancelledError 结束。
+    只有「子任务自己以 CancelledError 结束」且当前任务
+    `cancelling() == 0` 时才吞掉。`cancelling() > 0`（进程正在关闭）
+    继续抛出，不把这次等待罩进最长 30 秒的 RPC。
     """
-    if not copy_task.done():
+    # 已经在取消中就不要再 cancel 一次：第二次会把「return 句柄」
+    # 丢掉，调用方拿不到、也就 abandon 不了。
+    if not copy_task.done() and copy_task.cancelling() == 0:
         copy_task.cancel()
     try:
-        await copy_task
+        return await copy_task
     except asyncio.CancelledError:
-        pass
+        current = asyncio.current_task()
+        if current is not None and current.cancelling() > 0:
+            raise
+        return None

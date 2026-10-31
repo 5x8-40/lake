@@ -154,11 +154,17 @@ class KvOps(ABC):
         """结束一轮预热等待。默认无事可做。"""
         return None
 
-    async def admit_planned_copy(self, prefix: Prefix, target: InstanceId) -> None:
+    async def admit_planned_copy(
+        self,
+        prefix: Prefix,
+        target: InstanceId,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
         """闸外判断这一批现在放不放得下。放不下由子类抛 AdmissionWait。
 
         默认不占目标段，直接通过。第二个后端不 override 就不会静默漏掉调用，
-        只是没有段容量这一步。
+        只是没有段容量这一步。timeout_s 是剩余预算；默认实现不查询，忽略它。
         """
         return None
 

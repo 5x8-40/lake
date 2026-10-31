@@ -171,6 +171,8 @@ flowchart LR
 | 任务全部完成、但副本核验缺（VerifyError） | 报错，带缺哪些副本的明细 |
 | 任务失败（FAILED） | 报错 |
 | 超过时限没完成 | 先放弃跟踪（abandon，见 L3 节），再报错 |
+| 目标段暂时放不下（AdmissionWait） | 只在 TaskEngine 的等待循环里出现，闸外再等。`PrefetchFlow.run` 没有等待循环，直接调用会把 AdmissionWait 抛出进程外。生产路径走 TaskEngine |
+| 段不存在（AdmissionStop） | TaskEngine 里包成 PrefetchError，这次预热停止 |
 
 流程的步骤、数据流与失败分支：**[flows/prefetch.md](flows/prefetch.md)**（每流程一篇，新增流程同目录另立）。
 
@@ -456,8 +458,9 @@ sequenceDiagram
     W->>Ex: exists（不过前缀闸）
     Ex->>M: batch_is_exist
     M-->>Ex: 在池
-    loop 闸外，直到第一个目标段放得下或超时
-        W->>M: GET /query_segment（只查 rank 0 那一段）
+    loop 闸外，直到计划第一条的目标段放得下或超时
+        Note over W: 大小用 batch_get_replica_desc，一轮只取一次
+        W->>M: GET /query_segment（只查计划第一条的目标段）
         alt 放不下，或管理端口暂时连不上
             Note over W: 睡 0.5 秒。不占前缀闸。大小不再重查
         else 段不存在，或预算到了还没有任务号
@@ -526,7 +529,7 @@ sequenceDiagram
 - **READY 补发（E14，闸外）**：正常路径在前缀闸释放之后，`_on_ready` 注册保活并按目标实例补一条 `BlockStored`。没有端点或发送抛错只记日志，已经 READY 的预热仍成功，保活照常登记。发布器按实例懒绑定，只在 `TaskEngine.shutdown`（进程退出）时关，不跟实例下线
 - **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
 - **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；`session_end` 类可延迟任务排队无妨
-- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。窗口上限来自两次分开的真机实验，不是一件事（[../demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md) #16、#17）。10 月 26 日单机（#16）：连不上是 `TRANSFER_FAIL`；窗口 4 节奏化 42/42 全成。10 月 29 日跨机（#17）：主错误是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），master 留内存失败；14 条全成，42 条大约一半失败。#17 不靠网卡限速解决——提交前按第一个目标段的剩余决定整批发不发，是上面「传输闸」那一节的做法。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过实测打爆的点。网卡利用率限速（网卡计数器采样）仍归 E15，仍不做，接在同一层信号量上
+- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。窗口上限来自两次分开的真机实验，不是一件事（[../demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md) #16、#17）。10 月 26 日单机（#16）：连不上是 `TRANSFER_FAIL`；窗口 4 节奏化 42/42 全成。10 月 29 日跨机（#17）：主错误是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），master 留内存失败；14 条全成，42 条大约一半失败。这次实验的错误是 master 留内存失败；段剩余预检对得上这个错误类型；它不代替 E15；实验当时也没跑这条预检。#16 的 `TRANSFER_FAIL` 与 #17 不是同一种失败。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过实测打爆的点。网卡利用率限速（网卡计数器采样）仍归 E15，仍不做，接在同一层信号量上
 - **排队超时**：intent 在队列等待的语义（等多久算放弃）随 E12 intent 字段一起定；执行超时沿用 flow 现有 `timeout_s`
 - **失败态策略**（只留接口，随 E11 细化）：失败后的动作三种——① 重发；② 放弃这批任务，事后把留下的副本清掉（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 复制中途源实例下线时的处理（D5）。语义引 D2 §1 与 D5，不新造语义
 

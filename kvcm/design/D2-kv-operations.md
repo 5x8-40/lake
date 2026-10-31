@@ -156,6 +156,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 源选择：master 从该 key 现有副本所在的 seg 里**随机挑一个**（`:5816`）
   - 执行模型：master 不搬数据，只生成任务记录；任务派给源 seg 所在 client 进程执行——复制要求源 seg 所在 client 在线
   - 校验：key 存在、目标 seg 已挂载可分配
+  - kvcm 在 `CreateCopyTask` 之前用 `query_segment` 做客户端预检；分配仍发生在 `CopyStart`；租户配额是另一本账，`ChargeTenantQuota` 在 `AllocateFrom` 之前，预检看不见
 - **CreateMoveTask**（key, source, target，`:5845`）
   - 唯一能指定源的路径；语义是**移动**——完成后源副本删除
   - 执行模型与 copy 相同：任务派给源 seg 所在 client 执行（`GetClientIdBySegmentName(source)`），同样要求源在线；失败则源保留
