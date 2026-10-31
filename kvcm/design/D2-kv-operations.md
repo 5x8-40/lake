@@ -112,7 +112,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
     - Case A（key 不存在）：按新 key 分配 buffer
     - Case B（存在且尺寸一致）：**原位更新**——复用原有 buffer 地址，不重新分配；pin 相关行为都发生在这条路径（F3）
     - Case C（存在但尺寸不同）：丢弃旧副本、按新尺寸重分配；旧 pin 设置保留/合并到新元数据
-    - main 的 `UpsertStart`（约 `master_service.cpp:6004`）在读租约未过期时不走 Case B，而走 Case C 重分配。0.3.11 没有这道门槛。空写因此不能在有租约时原位改 pin。尺寸改走 `GET /batch_query_keys`，只去掉 kvcm 自己取尺寸时授上的那次租约；key 上已经有未过期读租约时仍会走 Case C，这次未解决
+    - main 的 `UpsertStart`（约 `master_service.cpp:6004`）有更硬的一岔：`has_read_lease` 且存在非内存副本时，直接 `OBJECT_HAS_LEASE`，空写失败。Case C 只在有租约且副本全是内存时：丢掉旧副本再按 `replica_num=1` 重分配，空写中间不写数据。只有 `!has_read_lease` 且尺寸一致才走 Case B 原位更新。0.3.11 没有这道门槛。尺寸改走 `GET /batch_query_keys`，只去掉 kvcm 自己取尺寸时授上的那次租约；已有租约且副本全是内存时仍会走 Case C，这次未解决
   - 拒绝条件
     - 该 key 的副本正被任务引用（copy/offload 在途，refcnt>0）→ `OBJECT_REPLICA_BUSY`（改写中的 buffer 会破坏在途 RDMA 读；检查是 per-key 的，不影响其他 key）
     - 该 key 有 copy/offload 任务在途 → `OBJECT_HAS_REPLICATION_TASK`
@@ -489,7 +489,7 @@ sequenceDiagram
     M->>A: ② 派任务给源 seg 所在 client（随机选源，F7）
     A->>B: ③ RDMA：A.DRAM → B.DRAM
     A->>M: ④ CopyEnd
-    K->>M: ⑤ QueryTask + GetReplicaList 核验
+    K->>M: ⑤ QueryTask + GET /batch_query_keys 核验
     K-->>R: ⑥ READY（上报调度，D1 §4）
 ```
 
@@ -512,7 +512,7 @@ sequenceDiagram
     A->>B: ③ RDMA：A.DRAM → B.DRAM
     A->>M: ④ MoveEnd
     Note over M: 源副本随任务完成删除（失败则源保留）
-    K->>M: ⑤ QueryTask + GetReplicaList 核验
+    K->>M: ⑤ QueryTask + GET /batch_query_keys 核验
     end
 
     rect rgb(222, 235, 247)
@@ -562,7 +562,7 @@ sequenceDiagram
 
     rect rgb(222, 235, 247)
     Note over K,M: soft pin 级：空写 upsert（驱逐排最后）
-    K->>M: S1 GetReplicaList（查原尺寸）
+    K->>M: S1 GET /batch_query_keys（查原尺寸）
     K->>M: S2 UpsertStart(key, 原尺寸, with_soft_pin)
     Note over M: 副本标写中，key 不可读（毫秒级，F3④）
     K->>M: S2 UpsertEnd（不写数据）
@@ -825,7 +825,7 @@ sequenceDiagram
 
 ### soft pin 级（驱逐排最后，极端情况可逐）：空写 upsert 设 soft pin
 
-- 做法：`UpsertStart`(key, 原尺寸, with_soft_pin) → 不写数据 → `UpsertEnd`；原尺寸由 `GET /batch_query_keys` 的 `size_` 查，不走会授租约的 `GetReplicaList`
+- 做法：`UpsertStart`(key, 原尺寸, with_soft_pin) → 不写数据 → `UpsertEnd`；原尺寸由 `GET /batch_query_keys` 的 `size_` 查，不走会授租约的 `GetReplicaList`。若该 key 的 `disk_replicas > 0` 或 `local_disk_endpoints` 非空，调用空写前拒绝：`PutEnd` 的 `is_target_replica` 在 `ReplicaType::ALL` 下只认 memory / nof / dfs，不含 LOCAL_DISK 和 DISK。Case B 会把盘副本标成 PROCESSING，End 不把它们置回
 - mooncake 代码：不改。空写在 kvcm 侧的 `_empty_pin.so`，只链 `store.so`，不给官方绑定打补丁（F12）
 - client_id 问题：**有**（upsert 必改写 client_id，F3①——见「client_id 问题」节）
 - 保护语义：驱逐两轮里只排第二轮（F8），第一轮候选凑不够时仍可逐——这是 mooncake soft pin 的本义，与「防驱逐」有缝，接受才用
@@ -934,7 +934,7 @@ sequenceDiagram
 ### promote 实现
 
 - **被动路径（流量驱动）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本登记 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
-- **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——先用 `GET /batch_query_keys` 核对 `local_disk` 端点。target 必须是盘副本登记的那个实例，否则 `VerifyError`，一次 `GetReplicaList` 都不打。对上之后才反复调 `GetReplicaList` 至命中计数过线（默认 2 次）：计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），kvcm 的调用与真实流量同池累计，到线即触发上面的被动路径。打完 N 次仍没有内存副本就失败，不在这里轮询等待
+- **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——打 `promote_hits` 次 `GetReplicaList`（默认 2），再用内存副本的传输端点对 `locate(target)`。不能在打次数之前证明 target 是盘副本登记实例：offload 端点和 seg 名不是同一套（seg 名是挂段时的传输引擎端口，local_disk 端点是 offload RPC 端口）。计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），kvcm 的调用与真实流量同池累计，到线即触发上面的被动路径。打完 N 次仍没有内存副本就失败，不在这里轮询等待
   - 前提：`promotion_on_hit` 开启 + DRAM 还没满到要驱逐的程度（内存紧张时 master 不批——提回来也马上被逐）+ 盘副本所在引擎在线
   - 触发必须用 `GetReplicaList`——`ExistKey` 触发不了（只授 lease、不计命中次数，`master_service.cpp:752-770` @0.3.11）；触发顺带授 lease（F11b 的副作用在此是正作用：提回期间防逐）
 - **kvcm 主动路径二：读删写（重，确定性自搬）**——读盘副本数据 → `Remove` → `PutStart` 新建 DRAM 副本 → 写数据 → `PutEnd` → 校验

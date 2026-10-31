@@ -211,10 +211,11 @@ class StoreClient:
 
         ``sizes`` 由调用方从 ``GET /batch_query_keys`` 的 ``size_`` 传入。
         这里不调 ``batch_get_replica_desc`` / ``GetReplicaList``，那会
-        ``GrantReadLease``。若 key 上已经有未过期读租约（例如别的读者或
-        保活刚续过），main 的 ``UpsertStart`` 仍会走 Case C，丢掉旧副本再按
-        ``replica_num=1`` 重分配，空写中间不写数据。这次只去掉 kvcm 自己
-        取尺寸时授上的那次租约。已有租约的情况仍未解决。
+        ``GrantReadLease``。``has_read_lease`` 且存在非内存副本时，main 的
+        ``UpsertStart`` 直接 ``OBJECT_HAS_LEASE``，空写失败。Case C 只在
+        有租约且副本全是内存时：丢掉旧副本再按 ``replica_num=1`` 重分配，
+        空写中间不写数据。这次只去掉 kvcm 自己取尺寸时授上的那次租约。
+        已有租约且副本全是内存的情况仍未解决。有盘副本的 key 在调用前拒绝。
 
         ``_get_pyclient_capsule`` 拿回 setup 时放进 ``store_`` 的 PyClient。
         扩展在这个对象上调 ``MasterClient::UpsertStart`` / ``UpsertEnd``，

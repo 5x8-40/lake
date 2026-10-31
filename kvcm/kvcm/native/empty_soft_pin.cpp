@@ -39,8 +39,9 @@ mooncake::Client* client_of(py::handle cap_obj) {
 
 void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
                     const std::vector<size_t>& sizes, bool enable) {
-    // 尺寸来自零副作用查询。若 key 上已经有未过期读租约，main 的
-    // UpsertStart 仍走 Case C。这次只去掉 kvcm 取尺寸时自己授上的那次。
+    // 尺寸来自零副作用查询。has_read_lease 且存在非内存副本时，
+    // UpsertStart 直接 OBJECT_HAS_LEASE，空写失败。Case C 只在有租约
+    // 且副本全是内存时。有盘副本的 key 在 Python 侧拒绝，不进这里。
     if (keys.size() != sizes.size() || keys.empty()) {
         throw std::runtime_error("软钉的 key 和 size 不合法，没有钉上");
     }
@@ -49,6 +50,8 @@ void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
     config.replica_num = 1;
     config.soft_pin_action = enable ? mooncake::SoftPinAction::ENABLE
                                     : mooncake::SoftPinAction::DISABLE;
+    // RPC 期间放开 GIL。这个作用域里只碰 C++ 字符串和 master client。
+    py::gil_scoped_release release;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (sizes[i] == 0) {
             throw std::runtime_error("软钉缺少原尺寸，没有钉上: " + keys[i]);

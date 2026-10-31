@@ -38,10 +38,10 @@ def mooncake_v0311() -> BackendCapability:
             "通道不具备，demote 在停保活前拒绝",
         ),
         has_promotion=Capability(
-            Support.NO,
-            Support.NO,
-            "提回开头要主线 /batch_query_keys 核对 local_disk 登记实例。"
-            "0.3.11 没有这条零副作用查询，通道不具备",
+            Support.YES,
+            Support.YES,
+            "打 GetReplicaList 累计命中，再用内存副本传输端点对 locate(target)。"
+            "不拿 offload 端点对 seg 名：两套端口不同",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
@@ -89,9 +89,9 @@ def mooncake_main() -> BackendCapability:
         has_promotion=Capability(
             Support.YES,
             Support.YES,
-            "先用 GET /batch_query_keys 核对 local_disk 端点，"
-            "target 必须是盘副本登记实例；然后再打 GetReplicaList，默认 2 次。"
-            "同步核验，不轮询，不做读删写",
+            "打 GetReplicaList，默认 2 次，再用内存副本传输端点对 locate(target)。"
+            "不能在打次数之前证明 target 是盘副本登记实例："
+            "offload 端点和 seg 名不是同一套。同步核验，不轮询，不做读删写",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
@@ -104,8 +104,8 @@ def mooncake_main() -> BackendCapability:
         has_admin_query=Capability(
             Support.YES,
             Support.YES,
-            "副本核验走 HTTP GET /batch_query_keys，用传输端点比段还在不在；"
-            "提回不走这条，提回用会累计命中的 GetReplicaList",
+            "副本核验走 HTTP GET /batch_query_keys，用传输端点比段还在不在。"
+            "提回删掉了用 offload 端点对 seg 名的检查，仍打 GetReplicaList",
         ),
         has_tenant_quota=Capability(
             Support.YES,

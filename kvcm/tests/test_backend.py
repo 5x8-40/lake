@@ -1176,6 +1176,99 @@ def test_pin_soft_disable_calls_empty_write(fake_store_module, monkeypatch) -> N
         run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD, enable=False))
 
 
+def test_pin_soft_refuses_disk_replica_before_empty_write(
+    fake_store_module, monkeypatch
+) -> None:
+    """有盘副本时空写收尾盖不住 PROCESSING 的盘副本，不能调用扩展。"""
+
+    class Client(FakeClient):
+        def soft_pin(self, keys, sizes, *, enable=True):
+            raise AssertionError("有盘副本不应进入空写")
+
+    def admin_for(**kwargs):
+        class Admin:
+            def batch_query_keys(self, keys):
+                from kvcm.backends.mooncake.admin_main import (
+                    KeyReplicaQuery,
+                    MemoryReplicaView,
+                )
+
+                return {
+                    k: KeyReplicaQuery(
+                        key=k,
+                        ok=True,
+                        memory=(MemoryReplicaView("seg-A", size=64),),
+                        **kwargs,
+                    )
+                    for k in keys
+                }
+
+        return Admin()
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    for extra in (
+        {"disk_replicas": 1},
+        {"local_disk_endpoints": ("10.0.0.2:9",)},
+    ):
+        b = MooncakeBackend(
+            client=Client(),
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A"],
+            capability=mooncake_main(),
+            admin=admin_for(**extra),
+        )
+        with pytest.raises(StoreClientError, match="有盘副本"):
+            run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+
+
+def test_remove_false_stops_keepalive_and_sleeps(
+    fake_store_module, monkeypatch
+) -> None:
+    client = RemoveClient()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", sleep)
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _move_backend(client, monkeypatch, ledger=led)
+        b._lease_ttl_s = 10
+        prefix = Prefix(model_id="qwen", token_ids=(1, 2))
+        run(b.keepalive(prefix))
+        run(b.remove(prefix, force=False))
+        assert slept == [10]
+        assert led.list_keepalive() == []
+        assert client.removed[-1][1] is False
+
+        slept.clear()
+        run(b.keepalive(prefix))
+        run(b.remove(prefix, force=True))
+        assert slept == []
+        assert led.list_keepalive() == []
+        assert client.removed[-1][1] is True
+
+        class Fail(RemoveClient):
+            def batch_remove(self, keys, force=False):
+                raise StoreClientError("batch_remove failed")
+
+        fail = Fail()
+        b._client = fail
+        run(b.keepalive(prefix))
+        with pytest.raises(StoreClientError, match="batch_remove failed"):
+            run(b.remove(prefix, force=False))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
 def test_pin_hard_registers_keepalive(fake_store_module, monkeypatch) -> None:
     """pin(HARD) 只登记保活。不走空写，也不因为补不上 hard pin 位而拒绝。"""
     assert mooncake_main().hard_pin_after.channel is Support.NO
@@ -1797,18 +1890,28 @@ def test_move_requires_source_instance(fake_store_module, monkeypatch) -> None:
 
 def test_remove_deletes_expanded_keys_without_admit(fake_store_module, monkeypatch) -> None:
     client = RemoveClient()
-    b = _move_backend(client, monkeypatch)
-    called = []
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _move_backend(client, monkeypatch, ledger=led)
+        b._lease_ttl_s = 0
+        called = []
 
-    async def admit(plan):
-        called.append(plan)
+        async def admit(plan):
+            called.append(plan)
 
-    b._admit_new_bytes = admit
-    kc = b._keys
-    expected = kc.expand(["h0"])
-    run(b.remove(Prefix(model_id="qwen", token_ids=(1, 2))))
-    assert client.removed == [(expected, False)]
-    assert called == []
+        b._admit_new_bytes = admit
+        kc = b._keys
+        expected = kc.expand(["h0"])
+        run(b.remove(Prefix(model_id="qwen", token_ids=(1, 2))))
+        assert client.removed == [(expected, False)]
+        assert called == []
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
 
 
 def test_client_move_and_remove_use_binding_symbols() -> None:
@@ -1928,11 +2031,13 @@ def test_remove_force_stops_keepalive_first(fake_store_module, monkeypatch) -> N
     try:
         b = _move_backend(client, monkeypatch, ledger=led)
         prefix = Prefix(model_id="qwen", token_ids=(1, 2))
+        b._lease_ttl_s = 0
         run(b.keepalive(prefix))
         assert led.list_keepalive() == [prefix]
         run(b.remove(prefix, force=False))
-        assert led.list_keepalive() == [prefix]
+        assert led.list_keepalive() == []
         assert client.removed[-1][1] is False
+        run(b.keepalive(prefix))
         run(b.remove(prefix, force=True))
         assert led.list_keepalive() == []
         assert client.removed[-1][1] is True
@@ -2142,28 +2247,26 @@ def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> 
         run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
 
 
-def test_promote_wrong_disk_owner_skips_replica_list(
+def test_promote_offload_endpoint_does_not_skip_replica_list(
     fake_store_module, monkeypatch
 ) -> None:
-    """目标段没有 local disk 时不打 GetReplicaList。"""
+    """offload 端点不是 seg 名，不能据此跳过 GetReplicaList。
+
+    打完 N 次仍没有内存副本，仍然 VerifyError。
+    """
+    hits = {"n": 0}
 
     class Client(FakeClient):
         def batch_memory_replica_endpoints(self, keys):
-            raise AssertionError("不该打 GetReplicaList")
+            hits["n"] += 1
+            return {k: ["seg-ELSE"] for k in keys}
 
     class Admin:
         def batch_query_keys(self, keys):
-            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
-
-            return {
-                k: KeyReplicaQuery(
-                    key=k, ok=True, local_disk_endpoints=("seg-OTHER",)
-                )
-                for k in keys
-            }
+            raise AssertionError("提回不该拿 local_disk 端点对 seg 名")
 
     kc = KeyComputer(model_name="qwen", tp_size=1)
-    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]) if ids else [])
     b = MooncakeBackend(
         client=Client(),
         key_computer=kc,
@@ -2172,29 +2275,31 @@ def test_promote_wrong_disk_owner_skips_replica_list(
         admin=Admin(),
         promote_hits=2,
     )
-    with pytest.raises(VerifyError, match="没有打 GetReplicaList"):
+    with pytest.raises(VerifyError, match="已按 2 次触发"):
         run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
+    assert hits["n"] == 2
 
 
-def test_promote_v0311_refuses_before_query(fake_store_module, monkeypatch) -> None:
-    assert mooncake_v0311().has_promotion.channel is Support.NO
+def test_promote_v0311_hits_without_admin(fake_store_module, monkeypatch) -> None:
+    assert mooncake_v0311().has_promotion.channel is Support.YES
     assert mooncake_main().has_promotion.channel is Support.YES
 
     class Admin:
         def batch_query_keys(self, keys):
-            raise AssertionError("v0311 提回不该查 admin")
+            raise AssertionError("提回不该查 admin")
 
     kc = KeyComputer(model_name="qwen", tp_size=1)
-    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]) if ids else [])
     b = MooncakeBackend(
-        client=FakeClient(),
+        client=FakeClient(replicas_on=["seg-A"]),
         key_computer=kc,
         locate=lambda _inst: ["seg-A"],
         capability=mooncake_v0311(),
         admin=Admin(),
+        promote_hits=2,
     )
-    with pytest.raises(UnsupportedCapabilityError, match="batch_query_keys"):
-        run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
+    handle = run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
+    assert handle.task_ids == ()
 
 
 def test_retain_channel_not_present(fake_store_module, monkeypatch) -> None:

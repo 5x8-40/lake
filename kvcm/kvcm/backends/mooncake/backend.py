@@ -833,6 +833,17 @@ class MooncakeBackend(KvOps):
             parsed = await self._rpc(self._admin.batch_query_keys, keys)
         except (AdminMainError, StoreClientError) as e:
             raise QueryError(str(e)) from e
+        blocked = [
+            key
+            for key in keys
+            if (item := parsed.get(key)) is not None
+            and item.ok
+            and (item.disk_replicas > 0 or bool(item.local_disk_endpoints))
+        ]
+        if blocked:
+            raise StoreClientError(
+                "有盘副本，空写收尾盖不住它们: " + ", ".join(blocked[:4])
+            )
         sizes: list[int] = []
         for key in keys:
             item = parsed.get(key)
@@ -900,15 +911,14 @@ class MooncakeBackend(KvOps):
             raise
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
-        """把前缀 KV 提回盘副本登记的那个实例。
+        """把前缀 KV 提回到 target。
 
-        target 必须是 LOCAL_DISK 副本登记的实例，不是任意实例。
-        打 ``GetReplicaList`` 之前先用 ``GET /batch_query_keys`` 看
-        ``local_disk`` 的传输端点。``locate(target)`` 的段里没有这条
-        盘副本就抛 ``VerifyError``，一次 ``GetReplicaList`` 都不打。
-        对上之后才打 ``promote_hits`` 次（绑定
-        ``batch_memory_replica_endpoints``）。打完仍没有内存副本就失败，
-        不在这里空等，也不做读删写。
+        不能在打次数之前证明 target 是盘副本登记实例。offload 端点和
+        seg 名不是同一套：seg 名是挂段时的 ``local_hostname_``（传输引擎
+        端口），local_disk 端点是 offload RPC 端口，内核另分配。
+        打 ``promote_hits`` 次 ``batch_memory_replica_endpoints``
+        （``GetReplicaList``），再用内存副本的传输端点对 ``locate(target)``。
+        打完仍没有内存副本就失败，不在这里空等，也不做读删写。
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
@@ -916,30 +926,7 @@ class MooncakeBackend(KvOps):
                 "prefix expands to no keys (shorter than one block?)"
             )
         if self._cap.has_promotion.channel is not Support.YES:
-            raise UnsupportedCapabilityError(
-                "0.3.11 提回的前置核对要主线 /batch_query_keys，通道不具备"
-            )
-        if self._admin is None:
-            raise QueryError(
-                "提回前要确认盘副本登记实例，需要 GET /batch_query_keys"
-            )
-        try:
-            parsed = await self._rpc(self._admin.batch_query_keys, keys)
-        except (AdminMainError, StoreClientError) as e:
-            raise QueryError(str(e)) from e
-        segs = set(self._locate(target))
-        wrong = [
-            key
-            for key in keys
-            if not segs.intersection(
-                parsed[key].local_disk_endpoints if parsed.get(key) else ()
-            )
-        ]
-        if wrong:
-            raise VerifyError(
-                "promote: target 不是盘副本登记的实例，没有打 GetReplicaList: "
-                + ", ".join(wrong[:4])
-            )
+            raise UnsupportedCapabilityError("提回通道不具备")
         plan = self._keys.build_plan(keys, list(self._locate(target)))
         last: dict = {}
         for _ in range(self._promote_hits):
@@ -972,8 +959,10 @@ class MooncakeBackend(KvOps):
     async def remove(self, prefix: Prefix, force: bool = False) -> None:
         """删除该前缀展开出的全部 key，每个 key 的全部副本一起删。
 
-        force=False：不停保活，``batch_remove(..., force=False)``。
-        force=True：先停这份前缀的保活，再 ``batch_remove(..., force=True)``。
+        无论 force，都先 ``stop_keepalive``。``force=False`` 再等满一个
+        ``lease_ttl_s``，然后 ``batch_remove(..., force=False)``。
+        ``force=True`` 停保活后立刻 ``batch_remove(..., force=True)``，不等。
+        删除失败或取消时把保活加回去，再抛原异常。成功不加回。
         不占新内存，不调用 ``_admit_new_bytes``。
         """
         keys = await self._expand_keys(prefix.token_ids)
@@ -981,6 +970,14 @@ class MooncakeBackend(KvOps):
             raise IntentInputError(
                 "prefix expands to no keys (shorter than one block?)"
             )
-        if force:
-            await self.stop_keepalive(prefix)
-        await self._rpc(self._client.batch_remove, keys, force)
+        await self.stop_keepalive(prefix)
+        try:
+            if not force:
+                await asyncio.sleep(self._lease_ttl_s)
+            await self._rpc(self._client.batch_remove, keys, force)
+        except asyncio.CancelledError:
+            await self.keepalive(prefix)
+            raise
+        except Exception:
+            await self.keepalive(prefix)
+            raise

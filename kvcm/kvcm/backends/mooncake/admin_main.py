@@ -56,7 +56,8 @@ class KeyReplicaQuery:
     # disk_values 与 local_disk_values 的条数。降层只看有没有盘副本，
     # 不当段剩余空间。
     disk_replicas: int = 0
-    # local_disk 的传输端点。提回前用来确认 target 是登记实例。
+    # local_disk 的传输端点（offload RPC 端口）。和挂段时的 seg 名不是同一套。
+    # 软钉看到它非空就拒绝空写。提回不用它去对 seg 名。
     local_disk_endpoints: tuple[str, ...] = ()
 
 

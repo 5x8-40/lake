@@ -74,9 +74,9 @@
 - 遗留：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。
 - 遗留：`SubmitIntent` 现在只有预热（前缀 × 目标实例）。move / pin / demote / promote / remove 只有操作，没有 intent。这是大遗留，这次不扩协议、不加流程。
 - locate：进程内「实例 → rank 有序段名单」。intent 和操作入参没有 segment。没登记的实例报错。
-- remove：`force=False` 不停保活，`batch_remove(..., force=False)`；`force=True` 先停这份前缀的保活，再 `force=True`。
+- remove：无论 force 都先停保活。`force=False` 再等满一个 lease TTL，然后 `batch_remove(..., force=False)`。`force=True` 停保活后立刻 `batch_remove(..., force=True)`，不等。删除失败或取消时把保活加回去。
 - 保活续租用 BatchExistKey（`exists` → `batch_is_exist`），不用 ProbeKey。`keepalive` / `stop_keepalive` 只登记或注销 Ledger 里的同一张表。
-- 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回先用这条核对 local_disk 端点，target 必须是盘副本登记实例，否则 `VerifyError` 且不打 `GetReplicaList`；对上之后再打会累计命中的 GetReplicaList（默认 2 次），同步核验，不轮询。daemon `--admin` 必填；`--capability` 默认 `main`。`v0311` 启动直接失败：那个端点有续租副作用，也没有盘副本字段。
+- 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回删掉了用 offload 端点对 seg 名的检查（两套端口不同，真机交集为空），仍打会累计命中的 GetReplicaList（默认 2 次），再用内存副本传输端点对 `locate(target)`，同步核验，不轮询。daemon `--admin` 必填；`--capability` 默认 `main`。`v0311` 启动直接失败：那个端点有续租副作用，也没有盘副本字段。
 - 软钉空写：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。wheel 不带 C++ 头文件，扩展只链 `store.so`。`get_real_client()` 是退路：只有以后真实调用失败，才包含 `pyclient.h`，在对象还原成 `MooncakeStorePyWrapper` 之后取出已建 client。现在不走这条。client_id 用方案一：`UpsertStart` 发出的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时副本留在 PROCESSING。扫任务记录再补 End/Revoke 的崩溃恢复暂时不做，这次不写（D2 F5）。保留身份先不动。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
 - pin：READY 后防驱逐——硬钉走候选 ①，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
@@ -103,7 +103,7 @@
     - 写穿 / 写回两模式（≈ HiCache write_through / write_back）
   - promote 三条路：
     - `promotion_on_hit`：命中时池被动提回
-    - kvcm 主动①：先核对 local_disk 端点，target 必须是盘副本登记实例；然后打 N 次 `GetReplicaList`，同步核验，不轮询
+    - kvcm 主动①：打 N 次 `GetReplicaList`，再用内存副本传输端点对段。不拿 offload 端点对 seg 名。同步核验，不轮询
     - kvcm 主动②：读删写自己搬
     - promote 执行端 = 引擎来取（`PromotionObjectHeartbeat`，两版本都有，触发链不变）
   - copy/move 到不了 SSD（disk seg 没有 seg 名，两版本同）
