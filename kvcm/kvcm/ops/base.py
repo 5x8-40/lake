@@ -143,6 +143,25 @@ class KvOps(ABC):
         """在目标实例本机层级为前缀 KV 建副本；源副本由池侧选择。
         READY：任务完成 + 目标侧副本核验通过。"""
 
+    def open_copy_admission(self) -> object | None:
+        """一轮预热等待开始。占目标段的后端在这里记下本轮字节需求。
+
+        默认不占新段，返回 None。编排层总是调用，不探测具体后端有没有这个方法。
+        """
+        return None
+
+    def close_copy_admission(self, token: object | None) -> None:
+        """结束一轮预热等待。默认无事可做。"""
+        return None
+
+    async def admit_planned_copy(self, prefix: Prefix, target: InstanceId) -> None:
+        """闸外判断这一批现在放不放得下。放不下由子类抛 AdmissionWait。
+
+        默认不占目标段，直接通过。第二个后端不 override 就不会静默漏掉调用，
+        只是没有段容量这一步。
+        """
+        return None
+
     async def move(
         self,
         prefix: Prefix,

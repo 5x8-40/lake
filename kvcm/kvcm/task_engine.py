@@ -498,10 +498,7 @@ class TaskEngine:
         没有任务号就停，不进 `create_copy_task`。
         """
         deadline = time.monotonic() + timeout_s
-        admit = getattr(self._ops, "admit_planned_copy", None)
-        opener = getattr(self._ops, "open_copy_admission", None)
-        closer = getattr(self._ops, "close_copy_admission", None)
-        token = opener() if opener is not None else None
+        token = self._ops.open_copy_admission()
 
         def _stopped() -> PrefetchError:
             return PrefetchError(
@@ -512,21 +509,20 @@ class TaskEngine:
             while True:
                 if deadline - time.monotonic() <= 0:
                     raise _stopped()
-                if admit is not None:
-                    try:
-                        await admit(prefix, target)
-                    except AdmissionWait:
-                        # 闸外等。0.5 秒，但不超过剩余预算。
-                        # 剩余按查完之后重算：慢查询不能把预算又加回去。
-                        left = deadline - time.monotonic()
-                        if left <= 0:
-                            raise _stopped()
-                        await asyncio.sleep(min(0.5, left))
-                        continue
-                    except AdmissionStop as e:
-                        raise PrefetchError(
-                            f"segment missing, prefetch stopped: {e}"
-                        ) from e
+                try:
+                    await self._ops.admit_planned_copy(prefix, target)
+                except AdmissionWait:
+                    # 闸外等。0.5 秒，但不超过剩余预算。
+                    # 剩余按查完之后重算：慢查询不能把预算又加回去。
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise _stopped()
+                    await asyncio.sleep(min(0.5, left))
+                    continue
+                except AdmissionStop as e:
+                    raise PrefetchError(
+                        f"segment missing, prefetch stopped: {e}"
+                    ) from e
                 left = deadline - time.monotonic()
                 if left <= 0:
                     raise _stopped()
@@ -558,8 +554,7 @@ class TaskEngine:
                 finally:
                     self._gate.release()
         finally:
-            if token is not None and closer is not None:
-                closer(token)
+            self._ops.close_copy_admission(token)
 
     async def _track(self, handle: TaskHandle, poll_s: float, timeout_s: float) -> None:
         """轮询恢复的句柄到终态。不占传输闸（已知窗口，见设计文档）。"""
