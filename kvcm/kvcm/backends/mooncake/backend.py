@@ -792,16 +792,17 @@ class MooncakeBackend(KvOps):
         await self._rpc(functools.partial(self._client.soft_pin, keys, enable=True))
 
     async def demote(self, prefix: Prefix) -> None:
-        """先停保活，等满一个 lease TTL，再查是否已有盘副本。
+        """先确认能展开成 key、并且 admin 已配置，再停保活。
 
-        没有马上撤销 lease 的调用，也不查剩余租约，所以睡满
-        ``lease_ttl_s``（须与 master 的 ``default_kv_lease_ttl`` 一致）。
+        然后等满一个 lease TTL，再查是否已有盘副本。没有马上撤销
+        lease 的调用，也不查剩余租约，所以睡满 ``lease_ttl_s``
+        （须与 master 的 ``default_kv_lease_ttl`` 一致）。
         然后用已有的 ``GET /batch_query_keys`` 看 disk / local_disk 条数。
         不用 ``GetReplicaList`` / ``batch_get_replica_desc``，那会续租，
         把刚停的保活又续上。每个 key 都有盘副本才算成功。
         写回且池不满时仍会失败：不读数据落盘，不调 ``MountLocalDiskSegment``。
+        展开不出 key、或没配 admin，在停保活之前就失败。
         """
-        await self.stop_keepalive(prefix)
         keys = self._keys.keys_for_tokens(prefix.token_ids)
         if not keys:
             raise ValueError(
@@ -809,6 +810,7 @@ class MooncakeBackend(KvOps):
             )
         if self._admin is None:
             raise QueryError("降层查盘副本需要主线 GET /batch_query_keys")
+        await self.stop_keepalive(prefix)
         await asyncio.sleep(self._lease_ttl_s)
         try:
             parsed = await self._rpc(self._admin.batch_query_keys, keys)

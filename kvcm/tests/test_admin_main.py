@@ -147,6 +147,35 @@ def test_mainline_admin_paths_with_fake_body() -> None:
     assert seen[2] == "http://127.0.0.1:9003/api/v1/tenant_quotas"
 
 
+def test_batch_query_keys_splits_long_request_line() -> None:
+    """长前缀按请求行 8KB 分批，结果合并。空 key 仍报错。"""
+    import json
+    from urllib.parse import parse_qs, urlparse
+
+    from kvcm.backends.mooncake.admin_main import _MAX_BATCH_QUERY_REQUEST_BYTES
+
+    seen: list[str] = []
+
+    def fetch(url: str) -> str:
+        seen.append(url)
+        raw = parse_qs(urlparse(url).query)["keys"][0]
+        data = {key: {"ok": True, "values": []} for key in raw.split(",")}
+        return json.dumps({"success": True, "data": data})
+
+    keys = [f"k{i:04d}" + ("x" * 400) for i in range(30)]
+    admin = MainlineAdmin("http://127.0.0.1:9003", fetcher=fetch)
+    queried = admin.batch_query_keys(keys)
+    assert len(seen) >= 2
+    assert set(queried) == set(keys)
+    base = "http://127.0.0.1:9003"
+    for url in seen:
+        path = url[len(base):]
+        line = len(b"GET ") + len(path.encode()) + len(b" HTTP/1.1")
+        assert line <= _MAX_BATCH_QUERY_REQUEST_BYTES, line
+    with pytest.raises(AdminMainError, match="at least one"):
+        admin.batch_query_keys([])
+
+
 def test_capability_verify_uses_batch_query_keys() -> None:
     main = mooncake_main()
     note = main.has_admin_query.note

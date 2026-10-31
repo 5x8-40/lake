@@ -438,6 +438,23 @@ class TaskEngine:
                 # intent 失败——**不能向上抛**，否则消费者协程退出，几次
                 # 抖动后全部消费者死光、新 intent 永远 PENDING
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
+            except KeyError as e:
+                # locate 未登记实例是这一次 intent 的失败，不是编程错误。
+                # 其它 KeyError（例如未知任务句柄）仍记 FAILED 再抛。
+                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
+                if "not registered" not in str(e):
+                    raise
+            except ValueError as e:
+                # 前缀不足一块。其它 ValueError 仍是编程错误。
+                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
+                if "shorter than one block" not in str(e):
+                    raise
+            except RuntimeError as e:
+                # PYTHONHASHSEED 没设。其它 RuntimeError（含已单独接住的
+                # PrefetchError / QueryError 之外）仍记 FAILED 再抛。
+                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
+                if "PYTHONHASHSEED" not in str(e):
+                    raise
             except Exception as e:  # 编程错误也留原因，再往上抛（不吞）
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
                 raise

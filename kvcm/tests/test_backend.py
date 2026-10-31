@@ -1221,8 +1221,12 @@ def test_soft_pin_missing_size_does_not_call_extension(monkeypatch) -> None:
 
 
 def test_empty_pin_extension_rejects_non_capsule() -> None:
-    """虚拟环境里加载编好的扩展。不连 master，只检查入参被拒绝。"""
-    import kvcm.native._empty_pin as ext
+    """虚拟环境里加载编好的扩展。不连 master，只检查入参被拒绝。
+
+    ``_empty_pin.so`` 被 gitignore，CI 不编译。导不进就跳过，
+    干净检出不应因此失败。
+    """
+    ext = pytest.importorskip("kvcm.native._empty_pin")
 
     assert callable(ext.empty_soft_pin)
     with pytest.raises(TypeError):
@@ -1927,6 +1931,34 @@ def test_demote_succeeds_when_every_key_has_disk(fake_store_module, monkeypatch)
         run(b.demote(prefix))
         assert led.list_keepalive() == []
         assert steps == [("sleep", 0.01), ("query", ["k0"])]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_keeps_keepalive_until_preconditions_hold(
+    fake_store_module, monkeypatch
+) -> None:
+    """没有 admin、或展开不出 key 时，还没停保活。"""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, object(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.keepalive(prefix))
+        b._admin = None
+        with pytest.raises(QueryError, match="batch_query_keys"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+
+        monkeypatch.setattr(b._keys, "keys_for_tokens", lambda ids: [])
+        b._admin = object()
+        with pytest.raises(ValueError, match="shorter than one block"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
     finally:
         led.close()
         import os

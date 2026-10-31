@@ -376,8 +376,8 @@ stateDiagram-v2
 |----|--------|------|
 | tasks 任务状态机 | 可丢 | task_id / handle_id（同组任务分组键）/ op / prefix_key / target / status（running/ready/failed/abandoned，写入校验）/ model_id / token_ids / 时间戳；`gc_tasks` 清超龄终态 |
 | keepalive 保活注册表 | 不可丢 | prefix_key / model_id / token_ids（还原 Prefix 必需，重启后续上保活） |
-| replicas 副本台账 | 半可丢 | key / instance / verified_at（可从 master 副本查询重建） |
-| sessions 会话绑定 | 不可丢 | session_id / prefix_key / instance / model_id / token_ids |
+| replicas 副本台账 | 半可丢 | 表在，还没有写入方。key / instance / verified_at（可从 master 副本查询重建） |
+| sessions 会话绑定 | 不可丢 | 表在，还没有写入方。session_id / prefix_key / instance / model_id / token_ids |
 
 - **记账归实现侧（L4 持有，L2 不直接碰）**：copy / query_task / abandon 时由 MooncakeBackend 经 Ledger 迁移状态——记账需要任务号的持久化编码与状态迁移的时机，两样都只在实现侧手里；编排层记账两头都缺还会漏分支
 - **批量写入单事务**（多任务同迁移不出现半新半旧）；只管新建库（kvcm 未部署，不做老库迁移，旧结构文件删除重建）

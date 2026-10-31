@@ -28,6 +28,10 @@ class AdminMainError(RuntimeError):
     """主线管理端点调用失败，或响应不是约定的 JSON。"""
 
 
+# 单批 GET 的请求行上限。长前缀把全部 key 拼进一条 URL 会到几十 KB。
+_MAX_BATCH_QUERY_REQUEST_BYTES = 8192
+
+
 @dataclass(frozen=True)
 class MemoryReplicaView:
     """一条内存副本里核验用得上的字段。
@@ -141,11 +145,37 @@ class MainlineAdmin:
         self._fetcher = fetcher
 
     def batch_query_keys(self, keys: Sequence[str]) -> dict[str, KeyReplicaQuery]:
-        """``GET /batch_query_keys?keys=k1,k2``。key 逐个百分号编码，逗号作分隔。"""
+        """``GET /batch_query_keys?keys=k1,k2``。key 逐个百分号编码，逗号作分隔。
+
+        按请求行长度分批。单批 ``GET {path} HTTP/1.1`` 不超过 8KB，
+        各批结果合并后返回。一把 key 自己就超过上限时仍单独发出
+        （切不开）。空列表报错。
+        """
         if not keys:
             raise AdminMainError("batch_query_keys requires at least one key")
+        merged: dict[str, KeyReplicaQuery] = {}
+        batch: list[str] = []
+        for key in keys:
+            candidate = [*batch, str(key)]
+            if batch and self._request_line_len(candidate) > _MAX_BATCH_QUERY_REQUEST_BYTES:
+                merged.update(self._fetch_batch_query(batch))
+                batch = [str(key)]
+            else:
+                batch = candidate
+        merged.update(self._fetch_batch_query(batch))
+        return merged
+
+    def _batch_query_path(self, keys: Sequence[str]) -> str:
         joined = ",".join(urllib.parse.quote(k, safe="") for k in keys)
-        return parse_batch_query_keys(self._get(f"/batch_query_keys?keys={joined}"))
+        return f"/batch_query_keys?keys={joined}"
+
+    def _request_line_len(self, keys: Sequence[str]) -> int:
+        """``GET {path} HTTP/1.1`` 的字节数。path 含已编码的 key。"""
+        path = self._batch_query_path(keys)
+        return len(b"GET ") + len(path.encode()) + len(b" HTTP/1.1")
+
+    def _fetch_batch_query(self, keys: Sequence[str]) -> dict[str, KeyReplicaQuery]:
+        return parse_batch_query_keys(self._get(self._batch_query_path(keys)))
 
     def get_tenant_quotas(
         self, tenant_id: str | None = None

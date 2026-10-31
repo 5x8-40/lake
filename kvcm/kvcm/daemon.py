@@ -349,6 +349,15 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
 
 def run(args: argparse.Namespace, *, stop: asyncio.Event | None = None) -> int:
     """进程主流程（stop 注入便于测试；None = 自己装 signal handler）。"""
+    admin = getattr(args, "admin", "") or ""
+    if not str(admin).strip():
+        print(
+            "[kvcm] startup: --admin 不能空。副本核验必须有管理端口"
+            "（GET /batch_query_keys）。为空时核验一直 QueryError，"
+            "预热要等满超时才失败。不进入服务循环。",
+            file=sys.stderr,
+        )
+        return 1
 
     async def _main() -> int:
         ev = stop or asyncio.Event()
@@ -386,7 +395,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--admin",
         default="",
-        help="master HTTP 管理面根 URL。副本核验和降层查盘走 GET /batch_query_keys",
+        help="master HTTP 管理面根 URL。副本核验必须有管理端口："
+        "核验和降层查盘走 GET /batch_query_keys。"
+        "为空则启动直接失败，不进入服务循环",
     )
     p.add_argument(
         "--instance-segs",

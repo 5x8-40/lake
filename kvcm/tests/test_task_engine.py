@@ -711,6 +711,60 @@ def test_consumer_exits_on_programming_error() -> None:
     run(scenario())
 
 
+def test_unregistered_instance_does_not_cancel_consumer() -> None:
+    """未登记实例、前缀不足一块、没设 PYTHONHASHSEED 只失败这一次。
+
+    消费者不能因此退出或变成 cancelled，下一条还要能取到。
+    """
+
+    class Ops(FakeOps):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mode = "miss"
+
+        async def copy(self, prefix, target):
+            if self.mode == "miss":
+                raise KeyError(f"instance not registered: {target}")
+            if self.mode == "short":
+                raise ValueError(
+                    "prefix expands to no keys (shorter than one block?)"
+                )
+            if self.mode == "seed":
+                raise RuntimeError("PYTHONHASHSEED must be '0'")
+            return await super().copy(prefix, target)
+
+    async def scenario():
+        ops = Ops()
+        eng = TaskEngine(ops, max_concurrent=1, consumer_count=1)
+        eng.start()
+        try:
+            cases = (
+                ("miss", IntentStatus.FAILED, "not registered"),
+                ("short", IntentStatus.FAILED, "shorter than one block"),
+                ("seed", IntentStatus.FAILED, "PYTHONHASHSEED"),
+                ("ok", IntentStatus.READY, ""),
+            )
+            for i, (mode, want, needle) in enumerate(cases):
+                ops.mode = mode
+                prefix = Prefix(model_id=mode, token_ids=(i + 1,))
+                key = eng.submit_intent(prefix, _T, poll_s=0.01, timeout_s=2)
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline:
+                    if eng.intent_status(key) is want:
+                        break
+                    await asyncio.sleep(0.01)
+                assert eng.intent_status(key) is want, eng.intent_detail(key)
+                if needle:
+                    assert needle in eng.intent_detail(key)
+                alive = [t for t in eng._consumers if not t.done()]
+                assert alive, f"{mode} 之后消费者退出了"
+                assert not any(t.cancelled() for t in eng._consumers)
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
 def test_max_concurrent_must_be_positive() -> None:
     with pytest.raises(ValueError):
         TaskEngine(FakeOps(), max_concurrent=0)

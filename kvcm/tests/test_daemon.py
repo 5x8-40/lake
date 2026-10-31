@@ -122,6 +122,7 @@ def _args(tmp: str) -> argparse.Namespace:
         hash_algo="sha256",
         instance_segs=["inst=127.0.0.1:10001,127.0.0.1:10002"],
         capability="v0311",
+        admin="http://127.0.0.1:9003",
         ledger=f"{tmp}/ledger.sqlite",
         max_concurrent=4,
         copy_submit_concurrency=4,
@@ -825,6 +826,7 @@ def test_cli_repeats_instance_segs(monkeypatch) -> None:
             "--master", "127.0.0.1:50088",
             "--local-hostname", "127.0.0.1:13021",
             "--model-name", "qwen",
+            "--admin", "http://127.0.0.1:9003",
             "--instance-segs", "A=seg-A0,seg-A1",
             "--instance-segs", "B=seg-B0",
             "--ledger", "/tmp/ledger.sqlite",
@@ -846,6 +848,26 @@ def test_cli_repeats_instance_segs(monkeypatch) -> None:
                 "--ledger", "/tmp/ledger.sqlite",
             ]
         )
+
+
+def test_empty_admin_exits_before_serve(monkeypatch, capsys) -> None:
+    """没配管理端口就启动：报错返回，不进服务循环。"""
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应进入服务循环")
+
+    monkeypatch.setattr(daemon, "_serve", boom)
+    rc = daemon.main(
+        [
+            "--master", "127.0.0.1:50088",
+            "--local-hostname", "127.0.0.1:13021",
+            "--model-name", "qwen",
+            "--instance-segs", "A=seg-A0",
+            "--ledger", "/tmp/ledger.sqlite",
+        ]
+    )
+    assert rc == 1
+    assert "管理端口" in capsys.readouterr().err
 
 
 def test_directory_rejects_duplicate_and_empty() -> None:

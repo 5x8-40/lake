@@ -914,9 +914,10 @@ sequenceDiagram
 - **前提（部署时定）**：池开 `enable_offload`，引擎实例挂本机 SSD；两种模式二选一（见上「写穿/写回」）
 - **没有「立即降层」的单接口**：master 没有一个 RPC 能对它说「把 key X 现在搬去 SSD」——落盘只在两个时刻发生：写入时（写穿）/ 被驱逐时（写回）。所以 kvcm 的 demote 不是一个 RPC，而是一组动作的组合
 - **kvcm 动作**（`demote` 按这个顺序做）
-  1. `stop_keepalive`
-  2. `asyncio.sleep` 满一个 lease TTL。没有马上撤销 lease 的调用，也不查剩余租约。时长是构造参数 `lease_ttl_s`（daemon `--lease-ttl-s`，默认 10），必须与 master 的 `default_kv_lease_ttl` 一致。kvcm 不改 master 的这个值
-  3. 用已有的 `GET /batch_query_keys` 看 disk / local_disk 条数。不用 `GetReplicaList` / `batch_get_replica_desc`，那会续租，把刚停的保活又续上。每个 key 都有盘副本才算成功，否则失败
+  1. 先确认前缀能展开成 key，并且 admin 已配置。否则直接失败，不停保活
+  2. `stop_keepalive`
+  3. `asyncio.sleep` 满一个 lease TTL。没有马上撤销 lease 的调用，也不查剩余租约。时长是构造参数 `lease_ttl_s`（daemon `--lease-ttl-s`，默认 10），必须与 master 的 `default_kv_lease_ttl` 一致。kvcm 不改 master 的这个值
+  4. 用已有的 `GET /batch_query_keys` 看 disk / local_disk 条数。不用 `GetReplicaList` / `batch_get_replica_desc`，那会续租，把刚停的保活又续上。每个 key 都有盘副本才算成功，否则失败
   - 落盘时机（kvcm 只能促、不能定）
     - 写穿模式：SSD 副本**写入时已有**——数据早已在盘上，DRAM 副本待自然驱逐释放即可（何时释放无所谓，它只是个缓存副本）
     - 写回模式：key 进驱逐候选后，池驱逐时自动先落 SSD 再释放 DRAM（`BatchEvict` 里 `PushOffloadingQueue`，`master_service.cpp:4545` @0.3.11 / `:11624` @main）——时机不可控：池不满就不驱逐、不落盘。这时 demote 失败。不读数据落盘，不调 `MountLocalDiskSegment`
