@@ -372,9 +372,11 @@ def main(argv: list[str] | None = None) -> int:
         "--peer-tp-size",
         type=int,
         default=None,
-        help="对端 TP。与 --tp-size 不同时，源引擎须已含 vllm-ascend #15835"
-        "（v0.26.0rc1/rc2 用 demo/patch_tp_mismatch_worker.patch），"
-        "且两端 PEER_TP_SIZE 配成对端 TP。见 KeyComputer 异构前提链",
+        help="另一侧的 TP，不是引擎环境变量 PEER_TP_SIZE。"
+        "max(--tp-size, --peer-tp-size) 必须等于两端引擎的 "
+        "max(本机 TP, 对端 TP)。引擎 env 两端都填这个 max，不要按方向翻转。"
+        "小 TP 当源时，rc1 须打 demo/patch_tp_mismatch_worker.patch"
+        "（引擎树已含 vllm-ascend 9f8773ea 则不用）",
     )
     p.add_argument("--put-step", type=int, default=1)
     p.add_argument("--hash-algo", default="sha256")

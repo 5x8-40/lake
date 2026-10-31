@@ -372,7 +372,7 @@ class MooncakeBackend(KvOps):
         """
         from mooncake.store import TaskStatus as StoreTaskStatus
 
-        # 空任务号不是「已经完成」。retain 的挂盘/DFS 也不走这里。
+        # 空任务号不是「已经完成」。
         if not handle.task_ids:
             raise ValueError("task handle has no task ids")
         entry = self._plans.get(handle)

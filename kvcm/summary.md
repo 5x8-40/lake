@@ -88,11 +88,10 @@
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）
 - retain：🟡 已重写，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
   - 清理看副本所在 client，不看 key 的 client_id。没有保留身份注册
-  - 做法：死前 move/copy 到还活着的段（有任务号）；或 kvcm 启动时打开 SSD offload，由初始化挂盘并用 `NotifyOffloadSuccess` 登记（无任务号，用副本查询确认）；或写成 DFS 副本（main，无任务号）。DFS 下线不清，lease 过期会被 `RunDfsEviction` 逐，要续租
+  - `retain` 只表达 move/copy，返回任务号。DFS（main）是另一条：下线不清；用量到高水位后，lease 过期且没 pin 的会被 `RunDfsEviction` 逐，要续租。kvcm 挂自己的盘卸不来引擎上的字节（offload 只认本机内存），不作为现在的做法
   - 降到源引擎自己的盘：master 清登记，文件还在。这台机器的 store 再启动会用新 client_id 扫盘重新登记。引擎不再来，或换机器读，接不上。改 key 的 client_id 也留不住
   - NoF 段不随 client 过期被摘（`USE_NOF` 默认关）。摘段看盘心跳，不看挂载它的 client 死没死
   - `#2991` 只是同一个 client_id 的重连窗口。窗口内 Ping 保住的是登记，字节仍在死进程里。窗口过后 worker 清这个 client 的内存副本和本机盘副本
-  - kvcm 自己的 client 也要一直心跳。它下线后，名下副本同样被清
   - 计划下线：先迁走，再用 `GracefulUnmountSegment` / `CreateDrainJob` 收口
   - 长期未命中 → demote 到 SSD，由策略层定。这是防驱逐，不是换 client
 - demote / promote：🟡 设计完成，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
@@ -239,7 +238,7 @@
 - **E3. 多卡自动匹配验证**——resolve 的 `VLLM::Worker_TP<N>` proctitle 匹配在多卡真机走通（现在是 `--targets` 手工指定对应关系；匹配失效时必须明确报错，不能默不作声地配错）。
 - **E4. 单 token 不一致的根因**——输出里偶发有一个 token 与预期不同：旧非 DEBUG 实例偶发，新实例未复现；首次外部读的输出逐字一致，怀疑是不同执行路径的数值扰动。生产化前必须查清（[EXPERIMENTS.md](demo/EXPERIMENTS.md) #10）。
 - **E5. 副本消失机制核实**——✅ 已闭环（10-20 受控复验，结论落 D1 F5 / [D2-kv-operations.md](design/D2-kv-operations.md) F6b）：副本存亡绑定所在 seg 所在 client（副本所在 client），key 的 client_id 下线只清其自己 seg 上的副本，远端副本保留且可读（kill A → TTL 过期 unmount → `batch_is_exist` 32/32 + 跨机字节级 get 3/3；master 日志零驱逐零 remove）。早期「key 连同全部副本消失、exist 0/32」是 key 名漂移假失败（控制面未带 `PYTHONHASHSEED`，[EXPERIMENTS.md](demo/EXPERIMENTS.md) 踩坑 1/3、总表 #15），不是级联删除
-  - 对设计的落地：改 key 的 client_id 对副本存亡无效（只动鉴权字段）；move 到活段有效；kvcm 自己挂盘后，盘副本登记在 kvcm 上，引擎死不清它；DFS 副本不挂任何 client。没有保留身份注册
+  - 对设计的落地：改 key 的 client_id 对副本存亡无效（只动鉴权字段）；move 到活段有效；DFS 副本不挂任何 client。kvcm 挂自己的盘卸不来引擎上的字节，不作为现在的做法。没有保留身份注册
   - 剩余事实输入：lease TTL 11s（master 实配 `default_kv_lease_ttl=11000` 毫秒）+ 驱逐候选资格（lease 过期→驱逐首选）仍归 D3/TTL 议题
 - **E6. 0.3.11 API 子集核对**——✅ 已闭环（结论写在 D2 F13）
   - 做法：三个版本的 RPC 注册表 diff（v0.3.11 与 v0.3.11.post1 完全相同）

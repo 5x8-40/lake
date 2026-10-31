@@ -233,5 +233,5 @@ class ReleaseLoop:
 
 
 class RetainLoop:
-    """retain 与计划下线编排（D2 §4）。骨架——依赖的 move/copy 与挂盘
-    登记在 L4 未接线。没有保留身份注册。能力接线后再常驻化。"""
+    """retain 与计划下线编排（D2 §4）。骨架——依赖的 move/copy 在 L4
+    未接线。没有保留身份注册。能力接线后再常驻化。"""

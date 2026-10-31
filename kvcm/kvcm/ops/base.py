@@ -6,11 +6,10 @@
 - 目的型：retain——由其他操作组合实现，对外仍呈现单步语义
 
 完成信号：copy / move / promote 有 READY（任务状态完成 + 目标侧副本
-核验通过）。retain 不产生「把请求调到源实例」的 READY。先实现的做法是
-move/copy，返回任务号，再查副本确认已经在目标 client 上。挂盘登记和
-DFS 没有任务号。空任务号不是完成信号。其余方法（keepalive /
-stop_keepalive / pin / demote / remove）无 READY。任务状态经 query_task
-查询。
+核验通过）。retain 只表达 move/copy，返回任务号，不产生「把请求调回
+源实例」的 READY。空任务号不是完成信号，query_task 抛 ValueError。
+其余方法（keepalive / stop_keepalive / pin / demote / remove）无 READY。
+任务状态经 query_task 查询。
 
 幂等：**本层不去重**——`copy` 每次调用都发起任务，同一前缀重复调用会产生
 重复传输。去重归编排层（TaskEngine 以 intent_id = 前缀 × 目标实例 为键：
@@ -170,8 +169,9 @@ class KvOps(ABC):
     async def retain(self, prefix: Prefix) -> TaskHandle:
         """目的型：让前缀 KV 在源引擎下线后仍存活。
 
-        先实现 move/copy（D2 §4），返回这次搬运的任务号。挂盘登记和 DFS
-        没有任务号，完成看副本查询，不交空任务号。没有保留身份注册。
+        这个方法只表达 move/copy（D2 §4），返回这次搬运的任务号。
+        DFS 不走这个返回值。kvcm 挂自己的盘卸引擎副本，现有通道做不到。
+        没有保留身份注册。不返回空任务号。
 
         返回 TaskHandle 而非 None：结果必须可观测（「保住了没有」是
         本操作存在的全部意义）。
@@ -187,7 +187,8 @@ class KvOps(ABC):
         """查询任务状态。任务管理面，非第九项 KV 操作。
 
         失败语义：核验失败抛 VerifyError（终态）；查询本身失败抛
-        QueryError（可重试）；未知句柄抛 KeyError（编程错误，直接传播）。
+        QueryError（可重试）；未知句柄抛 KeyError（编程错误，直接传播）；
+        空任务号抛 ValueError（契约错误，直接传播）。
         """
 
     @abstractmethod

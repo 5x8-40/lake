@@ -232,8 +232,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 **② 数据跨引擎存活**（retain 的事实，做法在 §4）
 - **清理看副本所在 client，不看 key 的 client_id**（F6b，两版本同）。副本已经在别的活 client 的段上，源引擎下线清不到它
 - **DFS 副本**（main）：不挂任何 client。下线清理不删它（`ProcessClientOffboardingJob` 只清内存副本和本机盘副本，`master_service.cpp:2965-2976`）。描述里有 `file_path`，挂同一共享目录的机器按路径读
-  - 下线清理不删，不等于一直留着。`RunDfsEviction`（`master_service.cpp:8204`）在 lease 过期、没有 hard pin、soft pin 也不挡的时候，按 LRU 删 DFS 副本。`eviction_enabled` 默认开（`distributed_storage_config.h`）
-  - 用 DFS 做 retain 时要续租，否则副本会被这次驱逐清掉
+  - 下线清理不删，不等于一直留着。用量到高水位（默认 0.9）之后，`RunDfsEviction` 才按 LRU 删 lease 已过期、又没有 pin 挡住的 DFS 副本。`eviction_enabled` 默认开。用 DFS 做 retain 时要续租
 - **没有「保留身份」**。`AddReplicaForRetainedClient` 是 master 内部函数：这个 client 还没 `OFFLINE` 时，给它登记一块 `LOCAL_DISK`。`dummy_client.h` 的 `kRetained` 是外部内存的引用计数。两者都不是注册接口
 - **`#2991` 不是 retain**。它给每个 client 一条 `ACTIVE → SUSPECTED → OFFLINE` 的状态机（默认 10 秒 + 20 秒）。同一个 `client_id` 在变成 `OFFLINE` 之前 `Ping` 或重新挂盘，登记还在。字节仍在原进程的地址和原传输端点上。窗口过后，后台 worker 清掉这个 client 的内存副本和本机盘副本
 
@@ -283,7 +282,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 按性质分三类
     - **原子动作**：copy / move / keepalive / demote / promote / remove——原子指**语义**：一个操作一个效果、无中间态对外。实现上 copy/move/keepalive/remove 各对应单 RPC；demote/promote 是组合动作（池通道或 kvcm 读写组合 + 核验，§3），对外仍呈现单步语义
     - **元数据标记**：pin——设一次长期有效的标记
-    - **目的型**：retain——「源引擎下线后副本还在」是目的不是机制。做法是死前把副本放到一个还活着的 client 上（copy / move / kvcm 自己挂盘），或写成 DFS 副本（§4）。降到源引擎自己的盘、pin、keepalive 都不改变副本所在 client
+    - **目的型**：retain——「源引擎下线后副本还在」是目的不是机制。`retain` 方法只表达死前 move/copy。DFS 另编。kvcm 挂自己的盘卸引擎副本，现有通道做不到（§4）。降到源引擎自己的盘、pin、keepalive 都不改变副本所在 client
   - 复合流程由原子操作编排而成（策略层组合），不写成一体状态机
   - 理由：kvcm 定位是通用 KV 管理控制面，不只是为预热一个场景服务
 
@@ -303,8 +302,8 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 无 READY（5 个）：
     - keepalive / pin：不动数据，RPC 返回即完成，记台账即可
     - retain：这个操作不产生「把请求调到源实例」的 READY。要的结果是副本不随源 client 下线被清
-      - 先实现的做法是 move/copy，返回那次搬运的任务号。任务完成后再查副本，确认已经在目标 client 上
-      - 挂盘登记和 DFS 没有 copy/move 任务号。完成看上报或写入成功，加上副本查询能看到那份盘副本或 DFS 副本。不能交空任务号冒充已经完成
+      - `retain` 只表达 move/copy，返回那次搬运的任务号。任务完成后再查副本，确认已经在目标 client 上
+      - DFS 不从这个方法返回任务号。完成看副本查询。kvcm 挂自己的盘再卸引擎副本，现有通道做不到（§4）
     - demote：完成信号 = 「盘副本在册」，只记台账——降层后请求本来就不能直接发过去，没有「可调度」可上报
     - release：语义相反——不是「可以发过去」，而是「别再发过来」：清台账 + 同步索引删除
 
@@ -703,19 +702,12 @@ sequenceDiagram
     Note over M: 副本所在 client 已换成目标段的 client（F6b）→ 留着
     end
 
-    rect rgb(223, 242, 223)
-    Note over E,DFS: 做法②（两版本）：kvcm 自己的 client 挂盘<br/>Python 无单独挂盘方法；setup 打开 ssd offload 时由 FileStorage::Init 发出
-    K->>M: MountLocalDiskSegment
-    K->>E: 读数据（源进程还活着）
-    E-->>K: 数据
-    K->>KS: 写入 kvcm 的盘
-    K->>M: NotifyOffloadSuccess（盘副本登记者 = kvcm）
-    E--xM: 引擎死
-    Note over M: 清理扫不到 kvcm 名下的盘副本
+    rect rgb(230, 230, 230)
+    Note over E,DFS: 现有通道做不到：kvcm 挂自己的盘再卸引擎上的副本<br/>OffloadObjects 只认本机内存；没有「卸到我的盘」的 RPC
     end
 
     rect rgb(223, 242, 223)
-    Note over E,DFS: 做法③（main）：DFS 副本。下线不清，lease 过期仍会被 DFS 层 LRU 逐，要续租
+    Note over E,DFS: 做法②（main）：DFS 副本。用量到高水位后，lease 过期且没 pin 的会被 LRU 逐，要续租
     E->>DFS: 写成 DFS 副本（描述里有 file_path）
     E--xM: 引擎死
     Note over M: 下线清理不删 DFS 副本
@@ -927,11 +919,10 @@ sequenceDiagram
 - **缺口（真功能缺口，归池侧扩展）**
   - **写回模式下无确定性 demote**：offload 任务的入队时机只有 put 完成时（写穿）和驱逐选中时（写回）两处（两版本同）——kvcm 想让指定 key 立刻、确定性地落盘，做不到；池不满就永不落盘
   - 「立即清掉内存副本、只留盘副本」同属此缺口：`BatchReplicaClear` 校验请求者必须是 key 的 client_id（F6②），kvcm 的 UUID 对不上，调不动
-- **远期可行性方案（与 §4「kvcm 挂 SSD」形态绑定）**
-  - 流程：kvcm `MountLocalDiskSegment` 挂盘 → 读 DRAM 数据 → 写自己本机盘文件 → `NotifyOffloadSuccess` 上报登记盘副本
-  - 要点：`AddReplica` 两版本均非独立 RPC，是该上报的内部步骤、无在途 offload 任务时同样登记（F1）；只收 LOCAL_DISK、不带 pin
-  - 效果：副本绑 kvcm 的 client 与本机盘，引擎读它走远端盘路径、经 kvcm 转发读数
-  - 代价：kvcm 从纯控制面变成数据面一环（要承担带宽与可用性责任），故不作现役路径
+- **远期可行性方案（不作现役）**
+  - 不能走 `FileStorage::OffloadObjects`：它只认本机内存副本。offload 任务也只派给源内存所在的 client
+  - 若要做：kvcm 自己把字节读进进程，写入自己的盘文件，再 `NotifyOffloadSuccess` 登记（`AddReplica` 是这次上报的内部步骤，只收 LOCAL_DISK、不带 pin）
+  - 代价：kvcm 变成数据面，要承担带宽。故不作现役路径。详见 §4
 
 ### promote 实现
 
@@ -959,31 +950,29 @@ sequenceDiagram
 - **副本生死**（E5 已闭环，F6b）
   - 内存副本跟着它所在的段。段属于哪个 client，那个 client 下线，这份内存副本被清
   - 本机盘副本跟着登记它的 client。登记者下线，这份盘副本被清
-  - DFS 副本不挂任何 client（main）。下线清理不删它。lease 过期时 DFS 层 LRU 仍会删（`RunDfsEviction`）
+  - DFS 副本不挂任何 client（main）。下线清理不删它。用量到高水位之后，lease 过期且没 pin 的会被 `RunDfsEviction` 删
   - 已经 copy 或 move 到别的机器上的副本，跟着那台机器的段。源引擎下线不清它
-- **做法：死前把副本放到一个还活着的 client 上，或写成 DFS**
+- **`retain` 这个方法只表达 move/copy**，返回那次搬运的任务号。DFS 是另一条编排（写入之后续租），不从这个方法返回任务号
+- **做法**
   - **move / copy 到还活着的段**（两版本，E5 已证实 move / 他机 copy）
-    - 目标可以是另一台确定后关的引擎，也可以是 kvcm 自己挂的内存段
+    - 目标是另一台确定后关的引擎的段
     - `move` 做完，副本所在 client 换成目标段的 client。`copy` 是多留一份，源还在
     - 必须在源进程还活着时做完。死后内存字节没了，复制任务派给原进程，原进程已经不在
     - **改 key 的 client_id 留不住数据**：改的是鉴权字段，副本还在原段上（F6b）
-  - **kvcm 自己的 client 挂盘**（两版本）
-    - 挂盘发生在 client 初始化：`FileStorage::Init` 调用 `MountLocalDiskSegment`（`file_storage.cpp`）。Python 的 `setup` 有 `enable_ssd_offload` 和 `ssd_offload_path`，没有单独的挂盘方法。卸载有 `unmount_local_disk_segment`
-    - 数据写入 kvcm 的盘，`NotifyOffloadSuccess` 登记（`AddReplica` 是这次上报的内部步骤，F1）
-    - 盘副本的登记者是 kvcm。引擎下线的清理扫不到它
-    - 完成信号是上报成功，并且副本查询能看到这份盘副本。没有 copy/move 任务号
-    - kvcm 这个 client 自己要一直心跳。它下线之后，名下的内存副本和本机盘副本同样被清。没有额外的身份能让 kvcm 死了数据还留着
-    - 代价：数据要经过 kvcm，kvcm 要带盘
   - **DFS 副本**（main）
     - 不挂任何 client。下线清理的条件不覆盖它（`master_service.cpp:2965-2976`）
     - 描述里有 `file_path`。挂同一共享目录的机器按路径读。整机没了也能读
-    - lease 过期且没有 pin 挡住时，`RunDfsEviction` 会按 LRU 删掉它（`eviction_enabled` 默认开）。要留住就得续租
-    - 完成信号是写入成功，并且副本查询能看到这份 DFS 副本。没有 copy/move 任务号。DFS 的 `ScanMeta` 不支持，重启不会靠扫盘把 DFS 对象重新登记
+    - 驱逐不是 lease 一过期就发生。shard 用量到 `eviction_high_watermark`（默认 0.9，`shard_allocator.cpp` 的 `PrepareEvictionFromShard`）才开始按 LRU 挑；lease 没过期、或有 pin 挡住的留下。用量降到低水位停。bucket 模式另有一条分配失败时强制逐一整桶（`TryRecoverDfsSpaceAfterAllocationFailure`）
+    - 要留住就续租。完成看副本查询能看到这份 DFS 副本，不走 `retain` 的任务号。DFS 的 `ScanMeta` 不支持，重启不会靠扫盘把 DFS 对象重新登记
     - 前提：部署共享文件系统
   - **NoF 段**（编译进 `USE_NOF` 才有，CMake 默认关）
     - client 过期不摘 NoF 段。测试 `ClientExpiryDoesNotUnmountNoFSegment` 把这一点钉死。NoF 副本不是内存副本，也不在下线清理的谓词里
     - 段被摘的条件是盘心跳失败：`TryUnmountNoFSegmentByHeartbeat`
     - 盘还在、心跳还在，挂载它的 client 下线，这段上的副本还在。这不是把副本过户给 kvcm
+- **现有通道做不到：kvcm 挂自己的盘，再把引擎上的副本卸过来**
+  - `setup(enable_ssd_offload=True, ssd_offload_path=...)` 会在 `FileStorage::Init` 里调 `MountLocalDiskSegment`。没有单独的挂盘方法。master 没开 `enable_offload` 时这次调用返回 `UNABLE_OFFLOAD`，setup 失败
+  - 挂上之后也卸不来引擎的字节。`FileStorage::OffloadObjects` 只收本机内存副本（`IsReplicaOnLocalMemory`：传输端点是自己）。offload 任务只入队给源内存所在的 client（`PushOffloadingQueue`）。kvcm 现在不挂内存段（`global_segment_size=0`），名下没有可卸的本地副本
+  - 要做成，kvcm 得自己持有内存段，把数据读进来，再以自己的身份写入。key 的 `client_id` 变成 kvcm，kvcm 变成数据面写入者。这和「kvcm 不持存储、不写新 key」冲突，不作为现在的做法
 - **这些做法留不住数据**
   - **拿着旧 `client_id` 去 `Ping`（`#2991`，main）**
     - master 只认 `client_id`，不认是不是原来那个进程
