@@ -140,6 +140,38 @@ def test_submit_abandon_sqlite_error_stays_prefetch_error() -> None:
     assert ei.value.__cause__ is cause
 
 
+def test_submit_abandon_interpreter_shutdown_stays_prefetch_error() -> None:
+    """解释器退出那句也是账本写失败，不要当成编程错误抛出去。"""
+    cause = SubmitError("submit boom", handle=_PARTIAL)
+
+    class _Ops(FakeOps):
+        async def abandon(self, handle: TaskHandle) -> None:
+            raise RuntimeError(
+                "cannot schedule new futures after interpreter shutdown"
+            )
+
+    ops = _Ops(exists=True, seq=[], copy_error=cause)
+    with pytest.raises(PrefetchError, match="copy submit failed") as ei:
+        run(PrefetchFlow(ops).run_after_exists(_P, _T, poll_s=0, timeout_s=5))
+    assert ei.value.__cause__ is cause
+
+
+def test_submit_abandon_other_runtime_error_propagates() -> None:
+    """其它 RuntimeError 仍是编程错误。"""
+
+    class _Ops(FakeOps):
+        async def abandon(self, handle: TaskHandle) -> None:
+            raise RuntimeError("bug")
+
+    ops = _Ops(
+        exists=True,
+        seq=[],
+        copy_error=SubmitError("submit boom", handle=_PARTIAL),
+    )
+    with pytest.raises(RuntimeError, match="bug"):
+        run(PrefetchFlow(ops).run_after_exists(_P, _T, poll_s=0, timeout_s=5))
+
+
 def test_task_failed_raises() -> None:
     ops = FakeOps(exists=True, seq=[TaskStatus.FAILED])
     with pytest.raises(PrefetchError, match="copy task failed"):

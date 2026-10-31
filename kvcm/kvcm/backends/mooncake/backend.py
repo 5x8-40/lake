@@ -262,7 +262,8 @@ class MooncakeBackend(KvOps):
         **不用 RPC 池**：Ledger 的公共方法是「submit().result()」的同步
         阻塞形态，本来就要进线程；投到 Ledger 池只套一层。用 RPC 池还有
         两个害处：占掉传输名额，以及退出时池已关（`abandon` 恰好在那个
-        窗口落账，会抛 `cannot schedule new futures after shutdown`，
+        窗口落账，会抛 `cannot schedule new futures after shutdown`
+        （解释器退出时是 `after interpreter shutdown`），
         账本留 `running`）。
         """
         loop = asyncio.get_running_loop()
