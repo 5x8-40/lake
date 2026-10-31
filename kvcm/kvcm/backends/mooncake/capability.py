@@ -21,7 +21,8 @@ def mooncake_v0311() -> BackendCapability:
         soft_pin_after=Capability(
             Support.YES,
             Support.YES,
-            "通道 = 自封装 .so 空写（路径 A）；.so 不在时加载器报错，不会记成已钉上",
+            "通道 = 官方 wheel 的 ReplicateConfig.soft_pin_action；"
+            "绑定没有 UpsertStart/End，空写调不到就不记成已钉上",
         ),
         hard_pin_after=Capability(Support.NO, Support.NO, "pin 写入时固化、无 unpin"),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
@@ -63,7 +64,8 @@ def mooncake_main() -> BackendCapability:
         soft_pin_after=Capability(
             Support.YES,
             Support.YES,
-            "同 0.3.11：自封装 .so 空写；.so 不在时加载器报错，不会记成已钉上",
+            "官方 wheel：ReplicateConfig.soft_pin_action + upsert_tensor；"
+            "没有空写 Start/End，不自己编译 .so",
         ),
         hard_pin_after=Capability(Support.NO, Support.NO, "pin 写入时固化、无 unpin"),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
@@ -82,8 +84,7 @@ def mooncake_main() -> BackendCapability:
         has_retained_client=Capability(
             Support.YES,
             Support.YES,
-            "通道 = 自封装 .so 保留身份注册（路径 A，复用已有 client）；"
-            ".so 不在时加载器报错，不会返回已保留",
+            "走官方 wheel。store_py 未导出保留身份时调用失败，不会返回已保留",
         ),
         has_dfs_replica=Capability(Support.YES, Support.UNKNOWN, "写入路径待核对"),
         has_admin_query=Capability(

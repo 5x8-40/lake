@@ -1097,11 +1097,11 @@ def _pin_backend(monkeypatch, cap) -> MooncakeBackend:
     )
 
 
-def test_pin_soft_missing_so_is_not_success(fake_store_module, monkeypatch) -> None:
-    from kvcm.native.loader import NativeMissing
-
+def test_pin_soft_missing_wheel_method_is_not_success(
+    fake_store_module, monkeypatch
+) -> None:
     b = _pin_backend(monkeypatch, mooncake_v0311())
-    with pytest.raises(NativeMissing, match="没有钉上"):
+    with pytest.raises(StoreClientError, match="没有钉上"):
         run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
 
 
@@ -1111,16 +1111,15 @@ def test_pin_hard_always_unsupported(fake_store_module, monkeypatch) -> None:
         run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD))
 
 
-def test_pin_soft_calls_fake_extension(fake_store_module, monkeypatch) -> None:
+def test_pin_soft_calls_wheel_client(fake_store_module, monkeypatch) -> None:
     seen = {}
 
-    class Ext:
-        def soft_pin_empty_upsert(self, store, keys):
-            seen["store"] = store
+    class Client(FakeClient):
+        def soft_pin(self, keys, *, enable=True):
             seen["keys"] = list(keys)
-            return 0
+            seen["enable"] = enable
 
-    client = FakeClient()
+    client = Client()
     kc = KeyComputer(model_name="qwen", tp_size=1)
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
     b = MooncakeBackend(
@@ -1128,10 +1127,9 @@ def test_pin_soft_calls_fake_extension(fake_store_module, monkeypatch) -> None:
         key_computer=kc,
         locate=lambda _inst: ["seg-A"],
         capability=mooncake_v0311(),
-        native=Ext(),
     )
     run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
-    assert seen["store"] is client
+    assert seen["enable"] is True
     assert seen["keys"]
 
 
@@ -1806,9 +1804,9 @@ def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> 
         run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
 
 
-def test_retain_missing_so_is_not_success(fake_store_module, monkeypatch) -> None:
-    from kvcm.native.loader import NativeMissing
-
+def test_retain_missing_wheel_method_is_not_success(
+    fake_store_module, monkeypatch
+) -> None:
     kc = KeyComputer(model_name="qwen", tp_size=1)
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
     b = MooncakeBackend(
@@ -1817,7 +1815,7 @@ def test_retain_missing_so_is_not_success(fake_store_module, monkeypatch) -> Non
         locate=lambda _inst: ["seg-A"],
         capability=mooncake_main(),
     )
-    with pytest.raises(NativeMissing, match="没有注册"):
+    with pytest.raises(StoreClientError, match="没有注册"):
         run(b.retain(Prefix(model_id="qwen", token_ids=(1,))))
 
     b0311 = MooncakeBackend(

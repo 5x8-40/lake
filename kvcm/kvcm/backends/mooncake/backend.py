@@ -28,7 +28,6 @@ from typing import Any, Callable, Sequence
 
 from kvcm.backends.mooncake.admin_main import AdminMainError
 from kvcm.backends.mooncake.client import StoreClient, StoreClientError
-from kvcm.native.loader import load_native
 from kvcm.engines.vllm.keys import KeyComputer
 from kvcm.ledger import Ledger
 from kvcm.ops.base import (
@@ -92,7 +91,6 @@ class MooncakeBackend(KvOps):
         executor: ThreadPoolExecutor | None = None,
         rpc_timeout_s: float = 30.0,
         admin: Any | None = None,
-        native: Any | None = None,
         promote_hits: int = 2,
     ) -> None:
         """
@@ -125,8 +123,6 @@ class MooncakeBackend(KvOps):
         # 副本核验走主线 GET /batch_query_keys。不设则核验失败，不退回
         # batch_get_replica_desc。
         self._admin = admin
-        # 测试注入的假扩展。None 时 pin/retain 去加载 kvcm_native。
-        self._native = native
         self._promote_hits = promote_hits
         self._keys = key_computer
         self._locate = locate
@@ -740,12 +736,6 @@ class MooncakeBackend(KvOps):
         await self._record(handle, "running")
         return handle
 
-    def _extension(self):
-        """自封装 .so。没有注入、也加载不到时抛 NativeMissing。"""
-        if self._native is not None:
-            return self._native
-        return load_native()
-
     async def _require_ledger(self):
         if self._ledger is None:
             raise RuntimeError("保活登记需要 Ledger")
@@ -773,16 +763,14 @@ class MooncakeBackend(KvOps):
             raise NotImplementedError("hard pin：通道具备但尚未接线")
         if self._cap.soft_pin_after.channel is not Support.YES:
             raise UnsupportedCapabilityError(
-                "soft pin 事后加：通道不具备（自封装 .so 接线前）"
+                "soft pin 事后加：官方 wheel 的通道不具备"
             )
         keys = self._keys.keys_for_tokens(prefix.token_ids)
         if not keys:
             raise ValueError(
                 "prefix expands to no keys (shorter than one block?)"
             )
-        # 加载失败直接抛出：没有钉上。
-        ext = self._extension()
-        await self._rpc(ext.soft_pin_empty_upsert, self._client.binding(), keys)
+        await self._rpc(functools.partial(self._client.soft_pin, keys, enable=True))
 
     async def demote(self, prefix: Prefix) -> None:
         """先停保活，再查是否已有盘副本。
@@ -845,18 +833,17 @@ class MooncakeBackend(KvOps):
         return TaskHandle(op=OpKind.PROMOTE, task_ids=())
 
     async def retain(self, prefix: Prefix) -> TaskHandle:
-        """保留身份走自封装 .so。加载不到就失败，不返回已保留的空句柄。"""
+        """保留身份走官方 wheel。绑定没导出就失败，不返回已保留的空句柄。"""
         if self._cap.has_retained_client.channel is not Support.YES:
             raise UnsupportedCapabilityError(
-                "retained client：通道不具备（0.3.11 无此接口；main 依赖自封装 .so）"
+                "retained client：官方 wheel 未导出这个符号"
             )
         keys = self._keys.keys_for_tokens(prefix.token_ids)
         if not keys:
             raise ValueError(
                 "prefix expands to no keys (shorter than one block?)"
             )
-        ext = self._extension()
-        await self._rpc(ext.register_retained_client, self._client.binding())
+        await self._rpc(self._client.register_retained)
         return TaskHandle(op=OpKind.RETAIN, task_ids=())
 
     async def remove(self, prefix: Prefix, force: bool = False) -> None:

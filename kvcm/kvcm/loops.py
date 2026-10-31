@@ -233,4 +233,4 @@ class ReleaseLoop:
 
 class RetainLoop:
     """retain 与计划下线编排（D2 §4）。骨架——不调用已落地的 move / retain。
-    retain 的保留身份走自封装 .so，加载不到就失败。"""
+    retain 的保留身份走官方 wheel，绑定没导出就失败。"""

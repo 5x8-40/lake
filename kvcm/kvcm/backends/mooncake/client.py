@@ -104,7 +104,7 @@ class StoreClient:
         return self._store
 
     def binding(self):
-        """已建好的 store_py 对象。自封装 .so 复用它，不再新建 client。"""
+        """已建好的官方 wheel store 对象。软钉和保留身份都用它，不再另建 client。"""
         return self._s()
 
     # ------------------------------------------------------------------
@@ -192,6 +192,54 @@ class StoreClient:
                 f"batch_remove failed {len(failed)}/{len(keys)}: {shown}{tail}"
             )
         return raw
+
+    def soft_pin(self, keys: Sequence[str], *, enable: bool = True) -> None:
+        """用官方 wheel（``mooncake.store``）设 soft pin。不自己编译扩展。
+
+        绑定导出了 ``ReplicateConfig.soft_pin_action`` 和 ``upsert_tensor``。
+        没有把 ``UpsertStart`` / ``UpsertEnd`` 分开，所以做不到不写数据的空写。
+        不用 ``upsert_tensor`` 重写一份数据来冒充已经钉上。
+        """
+        store = self._store
+        if store is None:
+            raise StoreClientError("store 未连接，软钉没有钉上")
+        from mooncake.store import ReplicateConfig, SoftPinAction
+
+        cfg = ReplicateConfig()
+        cfg.replica_num = 1
+        cfg.soft_pin_action = (
+            SoftPinAction.ENABLE if enable else SoftPinAction.DISABLE
+        )
+        fn = getattr(store, "batch_soft_pin", None)
+        if not callable(fn):
+            raise StoreClientError(
+                "mooncake wheel 的 store 没有只改 soft pin 的方法，软钉没有钉上。"
+                "绑定有 ReplicateConfig.soft_pin_action 和 upsert_tensor，"
+                "没有 UpsertStart/UpsertEnd。"
+            )
+        rc = fn(list(keys), cfg)
+        if rc not in (0, None):
+            raise StoreClientError(f"soft pin failed rc={rc}")
+
+    def register_retained(self) -> None:
+        """用官方 wheel 登记保留身份。绑定没导出这个符号时直接失败。"""
+        store = self._store
+        if store is None:
+            raise StoreClientError("store 未连接，保留身份没有注册")
+        import mooncake.store as store_mod
+
+        fn = getattr(store, "register_retained_client", None)
+        if not callable(fn):
+            names = [
+                name
+                for name in dir(store_mod)
+                if "retain" in name.lower()
+            ]
+            raise StoreClientError(
+                "mooncake wheel 没有保留身份注册，没有注册。"
+                f" store 模块里相关名字: {names or '无'}"
+            )
+        fn()
 
     def query_task(self, task_id: object) -> object:
         """查询任务状态（QueryTaskResponse）。"""

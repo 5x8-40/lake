@@ -261,13 +261,13 @@ stateDiagram-v2
 | 能力 | mooncake 0.3.11（部署现状） | mooncake main（目标基线） | 出处 |
 |------|------------------------------|----------------------------|------|
 | has_lease（读续租） | RPC ✓ 通道 ✓（`is_exist`） | RPC ✓ 通道 ✓ | D2 F9 |
-| soft pin 事后加（用 upsert 空写的方式） | RPC ✓ 通道 ✓（自封装 .so 路径 A；.so 不在则报错，不假装已钉上） | 同左 | D2 F1/F12 |
+| soft pin 事后加（用 upsert 空写的方式） | RPC ✓ 通道 = 官方 wheel 的 `ReplicateConfig.soft_pin_action`。绑定没有 UpsertStart/End，空写调不到就不记成已钉上 | 同左 | D2 F1/F12 |
 | hard pin 事后加 | ✗（创建时固化、无 unpin） | ✗ | D2 F1 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源） | ✗ | D2 F7 |
 | has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活后必须已有盘副本，否则失败；提回 = GetReplicaList 累计命中，默认 2 次，不用零副作用查询） | 同左 | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
-| has_retained_client（保留身份注册） | ✗ | RPC ✓ 通道 ✓（自封装 .so 路径 A；.so 不在则报错，不假装已保留） | D2 F13② |
+| has_retained_client（保留身份注册） | ✗ | RPC 在 C++，官方 wheel 的 store_py 未导出。调用失败，不假装已保留 | D2 F13② |
 | has_dfs_replica（共享 3FS 副本） | ✗ | RPC ✓ 通道 △（写入路径待 E6 核对） | D2 F13② |
 | has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**。副本核验走 `GET /batch_query_keys`，用传输端点比段还在不在。提回不走这条 | D2 F11b |
 | has_tenant_quota（租户配额读） | ✗（channel NO；不是段剩余空间） | HTTP ✓（GET `/api/v1/tenant_quotas`）。租户配额记账，不能当段剩余空间用 | D2 F13 |
@@ -302,7 +302,7 @@ stateDiagram-v2
 
 | 子件 | 职责 | 包路径 |
 |------|------|--------|
-| StoreClient | store 绑定生命周期（lazy import；connect/close，setup 失败先 close）+ **双通道**：控制类走绑定（create_copy_task / create_move_task / batch_remove / query_task / is_exist / batch_get_replica_desc）。副本核验走 `admin_main` 的 `GET /batch_query_keys`。提回仍用绑定的 GetReplicaList 累计命中。软钉空写和保留身份走 `kvcm/native` 自封装 .so（路径 A），.so 不在就报错 | `client.py` + `http_admin.py` + `admin_main.py` + `native/` |
+| StoreClient | store 绑定生命周期（lazy import；connect/close，setup 失败先 close）+ **双通道**：控制类走绑定（create_copy_task / create_move_task / batch_remove / query_task / is_exist / batch_get_replica_desc）。副本核验走 `admin_main` 的 `GET /batch_query_keys`。提回仍用绑定的 GetReplicaList 累计命中。软钉和保留身份走官方 wheel（`mooncake.store`），不自己编译扩展。空写 Start/End 和保留身份若绑定未导出，调用失败，不记成已做成 | `client.py` + `http_admin.py` + `admin_main.py` |
 | SegTopology | 查 master 的 seg 名单（见上）；seg、client_id、lease 语义归这里 | `topology.py` |
 | capability 填充 | 按连接上的版本填充（**构造必填**——不许默认冒充 main；目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | `capability.py` |
 
