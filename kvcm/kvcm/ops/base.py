@@ -216,3 +216,11 @@ class KvOps(ABC):
         None——调用方需在轮询前取。默认 None：适配器未接线时编排层
         退化为「恢复任务 READY 后不保活」（与重启前未注册同语义）。"""
         return None
+
+    def target_of(self, handle: TaskHandle) -> InstanceId | None:
+        """句柄对应的目标实例。与 prefix_of 对称，须在轮询前取。
+
+        终态会删核验登记，READY 返回后再取就是 None。恢复路径按实例
+        补发 BlockStored 要用它。默认 None：适配器未接线时恢复路径
+        不补发（保活仍走 prefix_of）。"""
+        return None

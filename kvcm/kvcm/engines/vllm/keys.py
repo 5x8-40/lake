@@ -240,8 +240,26 @@ def expand_store_keys(
 # ---------------------------------------------------------------------------
 
 
-def hash_token_blocks(token_ids: tuple[int, ...], block_size: int, hash_algo: str) -> list[str]:
-    """token 序列 → 块 hash 链（与引擎同口径）。
+@dataclass(frozen=True)
+class TokenBlockChain:
+    """一条前缀的满块 hash 链，转十六进制进 PoolKey 之前的原值。
+
+    ``block_hashes`` 是 ``hash_block_tokens`` 的逐块结果。
+    ``parent_block_hash`` 是链首块的 parent（前缀从块 0 起则为 None）。
+    ``token_ids`` 只含满块覆盖的 token，尾巴不满一块的不进链。
+    ``keys_for_tokens`` 仍只用下面 ``hash_token_blocks`` 的十六进制串。
+    """
+
+    block_hashes: tuple[object, ...]
+    parent_block_hash: object | None
+    token_ids: tuple[int, ...]
+    block_size: int
+
+
+def hash_token_block_chain(
+    token_ids: tuple[int, ...], block_size: int, hash_algo: str
+) -> TokenBlockChain:
+    """token 序列 → 满块 hash 链的原值（与引擎同口径，不转十六进制）。
 
     守卫前置：上游把 NONE_HASH 折入整条 hash 链，PYTHONHASHSEED 未设时
     rc1 容器的 vllm 用 os.urandom(32) 充盐（对所有算法；vllm main 已改
@@ -260,6 +278,35 @@ def hash_token_blocks(token_ids: tuple[int, ...], block_size: int, hash_algo: st
     from vllm.utils.hashing import get_hash_fn_by_name
     from vllm.v1.core import kv_cache_utils as ku
 
+    hash_fn = get_hash_fn_by_name(hash_algo)
+    ku.init_none_hash(hash_fn)
+
+    hashes: list = []
+    # 链从块 0 起：首块的 parent 是 None（hash_block_tokens 内部才折成 NONE_HASH）
+    parent = None
+    n_full = (len(token_ids) // block_size) * block_size
+    full_tokens = token_ids[:n_full]
+    for i in range(0, n_full, block_size):
+        chunk = full_tokens[i : i + block_size]
+        h = ku.hash_block_tokens(hash_fn, parent, chunk, None)
+        hashes.append(h)
+        parent = h
+    return TokenBlockChain(
+        block_hashes=tuple(hashes),
+        parent_block_hash=None,
+        token_ids=full_tokens,
+        block_size=block_size,
+    )
+
+
+def hash_token_blocks(token_ids: tuple[int, ...], block_size: int, hash_algo: str) -> list[str]:
+    """token 序列 → 块 hash 的十六进制串（PoolKey 的 chunk hash）。
+
+    原值在 ``hash_token_block_chain``。这里只做进 PoolKey 的那一步转换，
+    不把十六进制串当成事件里的 block hash。
+    """
+    chain = hash_token_block_chain(token_ids, block_size, hash_algo)
+
     try:  # v0.26 rc1/rc2 布局
         from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.config_data import (
             block_hash_to_str,
@@ -269,18 +316,7 @@ def hash_token_blocks(token_ids: tuple[int, ...], block_size: int, hash_algo: st
             block_hash_to_str,
         )
 
-    hash_fn = get_hash_fn_by_name(hash_algo)
-    ku.init_none_hash(hash_fn)
-
-    hashes: list = []
-    parent = None
-    n_full = (len(token_ids) // block_size) * block_size
-    for i in range(0, n_full, block_size):
-        chunk = token_ids[i : i + block_size]
-        h = ku.hash_block_tokens(hash_fn, parent, chunk, None)
-        hashes.append(h)
-        parent = h
-    return [block_hash_to_str(h) for h in hashes]
+    return [block_hash_to_str(h) for h in chain.block_hashes]
 
 
 # ---------------------------------------------------------------------------
@@ -331,7 +367,11 @@ class KeyComputer:
         return self.tp_size
 
     def keys_for_tokens(self, token_ids: tuple[int, ...]) -> list[str]:
-        """token 序列 → PoolKey 列表（hash 链仅容器内可用）。"""
+        """token 序列 → PoolKey 列表（hash 链仅容器内可用）。
+
+        PoolKey 吃十六进制串。事件里的块链用 ``hash_token_block_chain``，
+        不要拿本方法的返回值去填 BlockStored。
+        """
         hexes = hash_token_blocks(token_ids, self.block_size, self.hash_algo)
         return expand_store_keys(
             model_name=self.model_name,

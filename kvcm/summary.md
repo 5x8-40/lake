@@ -267,18 +267,19 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 - **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自己产生引擎格式的事件
   - **发布端（pub）**：
     - 直接 import 上游 `ZmqEventPublisher`（`kv_events.py:304`）
-    - 事件字段取自 keys.py 的中间产物（hash 链 / token ids）
-    - READY 核验后按目标实例各发一条 `BlockStored`
-    - 每个目标实例一个发布端点；「端点 → 实例」注册归 D4/E13
-  - **删除信号（升级 mooncake 后）**：
+    - 事件字段取自 `hash_token_block_chain`。发出前每个 hash（以及非空的 `parent_block_hash`）过上游 `maybe_convert_block_hash`：默认发低 64 位整数，不发原字节，也不发十六进制字符串（Dynamo 不接收 bytes）。token 只到满块，个数 = len(block_hashes) × block_size，不满一块的尾巴不进事件，满块链为空则不发（D1 §3）。`medium` 用上游常量 `MEDIUM_CPU`，字符串是 `"CPU"`。`group_idx` 补发填 0，同时 `kv_cache_spec_kind="full_attention"`。`extra_keys` 这次不填：`hash_block_tokens` 传 `None`。这次只覆盖纯文本全注意力。滑动窗口、Mamba 不能用这个 kind
+    - 操作对应：复制、移动的目标、主动提回 → `BlockStored`；移动的源、删除 → `BlockRemoved`；保活、钉住、停保活不发。本次代码只在预热 READY 发 `BlockStored`，移动和删除在另一分支，合入后再接
+    - READY 核验后按目标实例各发一条 `BlockStored`（一条装下连续满块链）。重启后仍在跟踪的 copy，轮询前用 `target_of` 读出登记的目标实例，READY 后同样补发。补发失败（没有端点或发送抛错）只记日志，不把已经 READY 的操作判成失败。预热仍成功，保活照常登记
+    - 每个目标实例一个发布地址，不按 seg 或 rank 拆。发布路径不调用 `/register`，也不订阅 master publisher；把地址交给索引仍归 D4/E13
+  - **删除信号（升级 mooncake 后，本分支不实现）**：
     - 首选：索引侧直接订阅 master publisher、解析 object_key（Conductor 现成，D1 §2 方案 b）
-    - 备选：kvcm 加订阅端 + 翻译——订阅 master publisher（F14），从 PoolKey 解析出 block hash、按 rank 去重，重发 `BlockRemoved` / `AllBlocksCleared`；解析对照 mooncake-conductor `object_key_parser.cpp:160-276`（`ParseVllmObjectKey`，已覆盖 vLLM-Ascend key 布局）
+    - 备选：kvcm 加订阅端 + 翻译——订阅 master publisher（F14），从 PoolKey 解析出 block hash、按 rank 去重，重发 `BlockRemoved` / `AllBlocksCleared`；解析对照 mooncake-conductor `object_key_parser.cpp:160-276`（`ParseVllmObjectKey`，已覆盖 vLLM-Ascend key 布局）。本分支不订阅、不翻译
     - 引擎事件的订阅端归索引侧
   - **端点生命周期**：
-    - 何时为实例开补发端点（实例上线随 E13 事件 / 首次预热该实例时）、实例下线时回收
-    - 端口分配与上报编排（与 E12/E13 同通道）
-    - 补发事件 `data_parallel_rank` 字段的取值与消费侧归组行为（目标实例 DP>1 时）；上游 DP 端口偏移先例 `offset_endpoint_port`（`kv_events.py:528`）
-  - 发布端骨架可直接开工
+    - `--kv-event-endpoint instance_id=tcp://*:port`。引擎继续用自己的端口，kvcm 另绑这个地址
+    - 当前 DP=1：`data_parallel_rank` 固定 0，不做端口偏移。上游 `offset_endpoint_port`（`kv_events.py:528`）在秩 0 时端口不动；目标实例 DP>1 时的消费侧归组仍未做
+    - 第一次要给该实例补发时才构造 `ZmqEventPublisher` 并绑定。实例下线不关。`shutdown` 只在 kvcm 进程退出时调用
+    - 端口交给索引仍归 E13，不在补发函数里做
 
 ### C. 性能与生产化
 

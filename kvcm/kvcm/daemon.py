@@ -8,7 +8,8 @@
 2. `backend.rebuild()`：重启恢复 running 任务的跟踪登记，恢复的 handle
    交 TaskEngine.track 收编（只轮询到终态，不重跑流程）
 3. KeepaliveLoop 启动（协程定时器，固定窗口占位策略）；TaskEngine 就绪
-   （READY 后经 KeepaliveLoop.register 接线保活）
+   （READY 后经 KeepaliveLoop.register 接线保活，并按目标实例补发
+   BlockStored；发送失败不改变 READY）
 4. IntentReceiver gRPC 服务（--listen，E12 协议见 proto/）启动
    —— gRPC 用普通版（自己的线程池接请求），servicer 只做「入队即返」，
    不阻塞；任务执行全在事件循环里
@@ -52,6 +53,7 @@ from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.capability import mooncake_main, mooncake_v0311
 from kvcm.backends.mooncake.client import StoreClient
 from kvcm.engines.vllm.keys import KeyComputer
+from kvcm.events.publisher import BlockStoredPublisher, parse_kv_event_endpoints
 from kvcm.ledger import Ledger
 from kvcm.loops import KeepaliveLoop
 from kvcm.task_engine import TaskEngine
@@ -203,7 +205,17 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
             window_s=args.keepalive_window_s,
             executor=backend.executor,
         )
-        engine = TaskEngine(backend, keepalive=keepalive, max_concurrent=args.max_concurrent)
+        events = BlockStoredPublisher(
+            parse_kv_event_endpoints(getattr(args, "kv_event_endpoint", None)),
+            block_size=args.block_size,
+            hash_algo=args.hash_algo,
+        )
+        engine = TaskEngine(
+            backend,
+            keepalive=keepalive,
+            max_concurrent=args.max_concurrent,
+            events=events,
+        )
         # 2. 重启恢复：running 任务重建跟踪，收编进 TaskEngine
         #    （rebuild 内部有 Ledger 同步阻塞调用，同样走 executor）
         #    和 connect 一样带超时并监听信号：裸 await 会让 sqlite 卡住时
@@ -429,6 +441,18 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=5.0,
         help="优雅退出时等待在途协程的上限（等满不再等）",
+    )
+    p.add_argument(
+        "--kv-event-endpoint",
+        action="append",
+        default=None,
+        metavar="INSTANCE=ENDPOINT",
+        help=(
+            "补发 BlockStored 的端点，可重复：instance_id=tcp://*:port。"
+            "每个实例一个地址，与引擎自己的端口分开；第一次补发时才绑定，"
+            "进程退出才关，实例下线不关。"
+            "没有端点或发送失败只记日志，预热仍成功"
+        ),
     )
     return run(p.parse_args(argv))
 
