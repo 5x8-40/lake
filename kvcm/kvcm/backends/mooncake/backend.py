@@ -394,7 +394,7 @@ class MooncakeBackend(KvOps):
         if need is None:
             return
         probe, nbytes = need
-        await self._check_segments(probe, nbytes, deadline=deadline)
+        await self._check_segment(probe, nbytes, deadline=deadline)
 
     async def _bounded_rpc(
         self, fn: Callable[..., Any], *args: Any, deadline: float | None
@@ -407,7 +407,7 @@ class MooncakeBackend(KvOps):
             raise QueryError(f"RPC timeout after 0s: {_name_of(fn)}")
         return await self._rpc(fn, *args, timeout_s=left)
 
-    async def _check_segments(
+    async def _check_segment(
         self, probe: str, nbytes: int, *, deadline: float | None = None
     ) -> None:
         """只对计划里的第一个目标段打一次 /query_segment。
@@ -577,8 +577,10 @@ class MooncakeBackend(KvOps):
                 e = asyncio.CancelledError()
             task_ids = [t for t in slots if t is not None]
             partial_plan = [plan[i] for i, t in enumerate(slots) if t is not None]
+            handed: TaskHandle | None = None
             if task_ids:
                 partial = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
+                handed = partial
                 self._plans[partial] = (
                     prefix,
                     target,
@@ -603,7 +605,8 @@ class MooncakeBackend(KvOps):
                 raise e
             raise SubmitError(
                 f"copy submit failed after {len(task_ids)}/{len(plan)} tasks "
-                f"(submitted ids: {task_ids}): {e}"
+                f"(submitted ids: {task_ids}): {e}",
+                handle=handed,
             ) from e
         task_ids = [t for t in slots if t is not None]
         handle = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
@@ -741,7 +744,13 @@ class MooncakeBackend(KvOps):
         conflicted = set(self._watch.pop(handle, ()))
         rest = [t for t in handle.task_ids if t not in conflicted]
         if rest:
-            await self._record(handle, "abandoned", tids=rest)
+            try:
+                # 和 copy 里记 running 一样：取消打在这次 sqlite 写上时
+                # 不能把 abandon 拦腰截断。shield 再被取消（取消两次）
+                # 仍按 E11 已知遗留接受丢账，不再套一层。
+                await asyncio.shield(self._record(handle, "abandoned", tids=rest))
+            except asyncio.CancelledError:
+                raise
         self._plans.pop(handle, None)
 
     async def exists(self, prefix: Prefix) -> bool:

@@ -9,8 +9,8 @@
    后注册；补发归接口层 EventPublisher（未接通）
 
 失败分类（统一出口 = PrefetchError；编程错误除外，直接传播）：
-- 前置检查不过（前缀确实不在池）/ copy 提交失败（SubmitError，带
-  已发任务号明细）——终态上抛
+- 前置检查不过（前缀确实不在池）/ copy 提交失败（SubmitError）——
+  已落账的句柄先 abandon，再终态上抛；池里的传输不取消
 - 前置检查查询失败（QueryError：RPC/单 key 查询错误）——**不经
   PrefetchError 包装，直接传播**：「查不出来」可重试，「不存在」
   才终态，两者不得混
@@ -104,9 +104,13 @@ class PrefetchFlow:
         copy 还没返回时到点：Python 3.12 的 `wait_for` 超时取消的是当前
         这次等待，copy 协程还在；真正取消 copy 的是后面的 `_drain_copy`。
         若那时已经有任务号，copy 把句柄交回来（账本先记 running），这里再
-        `abandon`（账本记 abandoned），然后抛 PrefetchError。没有任务号
-        就不落账，也不 abandon。放不下（AdmissionWait）和段不存在
-        （AdmissionStop）原样抛出，由闸外决定再等还是停止。
+        `abandon`（账本记 abandoned），然后抛 PrefetchError。有句柄的文案
+        与轮询超时相同：`copy not READY after {timeout_s}s (handle=...)`。
+        没有任务号就不落账，也不 abandon，文案是 `cancelled before handle`。
+        直接提交失败，以及排空里等到的 SubmitError：异常上已落账的句柄
+        同样先 abandon，再抛 PrefetchError。池里的传输不取消。
+        放不下（AdmissionWait）和段不存在（AdmissionStop）原样抛出，由闸外
+        决定再等还是停止。
         进程退出（外层 CancelledError）若已经拿到这个句柄，先 abandon，
         再把取消抛出去，不改成 PrefetchError。
         """
@@ -123,12 +127,14 @@ class PrefetchFlow:
                 asyncio.shield(copy_task), timeout=remaining
             )
         except SubmitError as e:
+            await self._abandon_submitted(e)
             raise PrefetchError(f"copy submit failed: {e}") from e
         except TimeoutError:
             handle = None
             try:
                 handle = await _drain_copy(copy_task)
             except SubmitError as e:
+                await self._abandon_submitted(e)
                 raise PrefetchError(f"copy submit failed: {e}") from e
             except asyncio.CancelledError:
                 await self._abandon_if_handed(copy_task, handle)
@@ -138,6 +144,9 @@ class PrefetchFlow:
                     await self._ops.abandon(handle)
                 except KeyError:
                     pass
+                raise PrefetchError(
+                    f"copy not READY after {timeout_s}s (handle={handle})"
+                )
             raise PrefetchError(
                 f"copy not READY after {timeout_s}s (cancelled before handle)"
             )
@@ -189,6 +198,15 @@ class PrefetchFlow:
             except KeyError:
                 pass  # 已终态被移除登记
             raise
+
+    async def _abandon_submitted(self, err: SubmitError) -> None:
+        """提交失败里已经落账的句柄先 abandon。池里的传输不取消。"""
+        if err.handle is None:
+            return
+        try:
+            await self._ops.abandon(err.handle)
+        except KeyError:
+            pass
 
     async def _abandon_if_handed(
         self, copy_task: asyncio.Task, handle: TaskHandle | None

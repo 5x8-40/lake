@@ -191,6 +191,37 @@ def test_timeout_cancels_copy_before_handle() -> None:
     run(scenario())
 
 
+def test_shutdown_during_drain_is_cancelled_error() -> None:
+    """排空进行中当前任务被取消：CancelledError 冒出去，不变成 PrefetchError。"""
+    import asyncio
+
+    entered_drain = asyncio.Event()
+
+    class _SlowCancel(FakeOps):
+        async def copy(self, prefix, target):
+            self.calls.append("copy")
+            try:
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                entered_drain.set()
+                await asyncio.sleep(30)
+                raise
+
+    async def scenario():
+        ops = _SlowCancel(exists=True, seq=[])
+        task = asyncio.create_task(
+            PrefetchFlow(ops).run_after_exists(
+                _P, _T, poll_s=0.01, timeout_s=0.05
+            )
+        )
+        await asyncio.wait_for(entered_drain.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(scenario())
+
+
 def test_timeout_budget_covers_copy_and_poll() -> None:
     """同一段 timeout_s 覆盖提交和轮询，不是两段相加。"""
     import asyncio

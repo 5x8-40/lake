@@ -322,7 +322,7 @@ def test_prefetch_timeout_mid_submit_abandons_partial(
             submit_concurrency=1,
         )
 
-        with pytest.raises(PrefetchError, match="cancelled before handle"):
+        with pytest.raises(PrefetchError, match=r"not READY after 0\.8s \(handle="):
             run(
                 PrefetchFlow(b).run_after_exists(
                     Prefix(model_id="qwen", token_ids=(1,)),

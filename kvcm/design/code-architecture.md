@@ -159,18 +159,18 @@ flowchart LR
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
 | RetainFlow | retain（主路径 = retained client 注册；0.3.11 过渡 = move 到存活节点的 seg） | 未实现（D2 §4） |
 
-- **失败处理**：除 exists 的 `QueryError`（不包装、可重试上抛）外，流程对调用方只抛一种异常（当前叫 `PrefetchError`——这个名字绑死在 Prefetch 上，其他流程没法用，将改为一般化的 `FlowError`，随 KeySet 一起实施）——调用方不用关心失败发生在哪一步，具体原因写在异常消息里。编程错误（KeyError、TypeError 这类代码 bug）不包装，直接向上抛。异常类型定义见 L3「失败语义」。各分支：
+- **失败处理**：生产路径走 `TaskEngine`，对外是 `PrefetchError`；`PrefetchFlow.run` 没有等待循环，直接调用会把 `AdmissionWait` 抛出去。exists 的 `QueryError` 不包装、可重试上抛。编程错误（KeyError、TypeError 这类代码 bug）不包装，直接向上抛。异常类型定义见 L3「失败语义」。各分支：
 
 | 发生了什么 | 流程怎么处理 |
 |-----------|-------------|
 | exists 查询时 RPC 出错（QueryError） | 不包装，直接向上抛（可重试） |
 | 前缀不在池（exists 返回 False） | 报错，不发起复制（复制了也没意义） |
-| 复制提交中途出错（SubmitError） | 报错；异常里带已提交的任务号——那些任务还在池里跑，需要有人跟 |
+| 复制提交中途出错（SubmitError） | 报错；已经落账的号由流程 `abandon`，账本是 abandoned；池里的传输不取消 |
 | 查任务状态时 RPC 出错（QueryError） | 不报失败，等一会儿重查，直到超时 |
 | 任务全部完成、但副本核验缺（VerifyError） | 报错，带缺哪些副本的明细 |
 | 任务失败（FAILED） | 报错 |
 | 超过时限没完成 | 先放弃跟踪（abandon，见 L3 节），再报错 |
-| 目标段暂时放不下（AdmissionWait） | 只在 TaskEngine 的等待循环里出现，闸外再等。`PrefetchFlow.run` 没有等待循环，直接调用会把 AdmissionWait 抛出进程外。生产路径走 TaskEngine |
+| 目标段暂时放不下（AdmissionWait） | TaskEngine 在闸外再等，不记复制失败 |
 | 段不存在（AdmissionStop） | TaskEngine 里包成 PrefetchError，这次预热停止 |
 
 流程的步骤、数据流与失败分支：**[flows/prefetch.md](flows/prefetch.md)**（每流程一篇，新增流程同目录另立）。
@@ -197,11 +197,11 @@ flowchart LR
 
 ### 失败语义
 
-异常分三类（`kvcm/ops/base.py`；除 exists 的 QueryError 直接上抛外，流程对调用方统一只抛 PrefetchError）：
+异常分三类（`kvcm/ops/base.py`）。生产路径走 `TaskEngine`，对外是 `PrefetchError`；`PrefetchFlow.run` 没有等待循环，直接调用会把 `AdmissionWait` 抛出去。exists 的 `QueryError` 不包装：
 
 | 异常 | 什么时候抛 | 调用方怎么办 |
 |------|-----------|-------------|
-| SubmitError | 提交任务的中途出错。异常消息带已提交的任务号——那些任务还在池里跑，需要有人跟 | 视为失败；重试与否由编排层决定（重复提交有幂等保护，见下） |
+| SubmitError | 提交任务的中途出错。已经落账的号由流程 `abandon`，账本是 abandoned；池里的传输不取消 | 视为失败；重试与否由编排层决定（重复提交有幂等保护，见下） |
 | QueryError | 查任务状态、查副本时 RPC 出错（网络抖动这类临时问题） | 轮询阶段：等一会儿重查，不算失败；exists 阶段：不包装，直接上抛给调用方 |
 | VerifyError | 任务全部显示完成、但副本核验缺副本。异常带明细 | 视为失败 |
 
