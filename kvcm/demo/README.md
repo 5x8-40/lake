@@ -269,7 +269,7 @@ fail loud 边界（宁错杀不静默错配——拷错 seg 就失去 local-firs
 | 层 | 结论 |
 |----|------|
 | **Mooncake Store** | 不管 TP；只认 `key → segment 副本`。 |
-| **AscendStore**（`v0.26.0rc1`） | **原生支持**异构：extra_config `prefill_tp_size` / `decode_tp_size` → `infer_tp_mismatch_info`。语义：`effective_tp = max(local, peer)`；条件：TP 不同、非 MLA、非 hybrid、`num_kv_heads % effective_tp == 0`；`num_sub_keys = local_heads_per_rank // effective_heads_per_rank`；key 的 `head_or_tp_rank` 改写为 `effective_rank = tp_rank * num_sub_keys + sub_idx`（`pool_worker.py::_build_tp_mismatch_keys_and_addrs`），KV 按 head 切片 strided 读写。MLA 与 hybrid 在 `infer_tp_mismatch_info` 里直接 `enabled=False`（静默）。sparse 与 layerwise 是算出来已经启用之后，在 `pool_worker.py` 里 `raise`。 |
+| **AscendStore**（`v0.26.0rc1`） | **原生支持**异构：extra_config `prefill_tp_size` / `decode_tp_size` → `infer_tp_mismatch_info`。语义：`effective_tp = max(local, peer)`；条件：TP 不同、非 MLA、非 hybrid、`num_kv_heads % effective_tp == 0`；`num_sub_keys = local_heads_per_rank // effective_heads_per_rank`；key 的 `head_or_tp_rank` 改写为 `effective_rank = tp_rank * num_sub_keys + sub_idx`（`pool_worker.py::_build_tp_mismatch_keys_and_addrs`），KV 按 head 切片 strided 读写。MLA 在 `infer_tp_mismatch_info` 里 `enabled=False`（静默）。hybrid 在 scheduler 传入 `use_hybrid` 时同样静默关掉；worker 调用没传 `use_hybrid`，默认当成不是 hybrid，算出启用后在 `pool_worker.py` 抛 `NotImplementedError`。sparse 与 layerwise 是算出来已经启用之后在 `pool_worker.py` 里 `raise`。 |
 | **上游 vLLM `MooncakeStoreConnector`** | 有异构 Store-TP / LCM（[PR #53129](https://github.com/vllm-project/vllm/pull/53129)）。 |
 | **SGLang HiCache** | `tp_lcm_size` + head split。 |
 
@@ -429,7 +429,7 @@ demo/
 - **控制面依赖**
   - `protocol` 须与 `mooncake.json` 一致（store 半程可 `tcp`，NPU 集群用 `ascend`）。
   - `resolve.py`：master admin `:9003` 在线（mooncake_master 内置默认，见 `start_master.sh` 注释）；`start_worker.sh` 写的 pidfile（跨机经 `--ssh` 读 B 机）；TP>1 时 rank 号依赖进程名 `VLLM::Worker_TP<N>`——vLLM 改命名会 **fail loud**（不静默错配），届时按 `pgrep -af 'VLLM::'` 实际输出更新模块内模式。
-- **异构 TP**：`v0.26.0rc1` 必打 `patch_tp_mismatch_worker.patch`。rc2 同样不含 #15835，补丁按 rc1 写，能否 apply 未实测。MLA / hybrid 会静默关掉 tp_mismatch；sparse / layerwise 会报错（机制与补丁见「怎么运作 · 异构 TP」）。
+- **异构 TP**：`v0.26.0rc1` 必打 `patch_tp_mismatch_worker.patch`。rc2 同样不含 #15835，补丁按 rc1 写，能否 apply 未实测。MLA 静默关掉 tp_mismatch。hybrid 在 scheduler 侧静默关掉，在 worker 侧会抛 `NotImplementedError`。sparse / layerwise 报错（机制与补丁见「怎么运作 · 异构 TP」）。
 
 ## 开放问题（待讨论）
 

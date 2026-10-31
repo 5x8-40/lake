@@ -107,13 +107,13 @@
   - copy/move 到不了 SSD（disk seg 没有 seg 名，两版本同）
   - 触发时机（会话结束 / 变冷 / DRAM 压力 / 计划下线）归策略层
   - 真正的功能缺口：写回模式下确定性的 demote——没有 per-key 降层 RPC，`BatchReplicaClear` 又限 key 的 client_id，offload 取消也不对外 → 需要池侧扩展
-  - 远期：kvcm 自己挂 SSD + `NotifyOffloadSuccess` 上报登记（`AddReplica` 不是独立 RPC，是它的内部步骤）
+  - kvcm 挂 SSD 再卸引擎上的副本，现有通道做不到（D2 §4）。`AddReplica` 不是独立 RPC，是 `NotifyOffloadSuccess` 的内部步骤
   - 每个操作都有完成信号；READY 特指 DRAM 副本写好、可以调度
 - release：✅ 已闭环，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
   - 决策归属 D1 §6
   - kvcm 可用：`Remove` / `BatchRemove` / `RemoveByRegex`（要配 key 命名空间才有意义）/ `RemoveAll`
   - `BatchReplicaClear` 限 key 的 client_id 自己调——kvcm 动不了别人的 key
-  - `EvictDiskReplica`（两版本）是通知型：`LOCAL_DISK` 限登记 client（kvcm 自挂 SSD 后可用来收尾）、`DISK` 不验 client_id（误用风险已登记，不作正式路径）
+  - `EvictDiskReplica`（两版本）是通知型：`LOCAL_DISK` 限登记 client（只有盘副本已经在 kvcm 名下才能清自己的；现有通道卸不来引擎字节）、`DISK` 不验 client_id（误用风险已登记，不作正式路径）
   - `force` 仅限「确认没人用」
   - 收尾 = 清台账 + 同步索引
 - 机制查缺补漏：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) F13⑤/③、§1 对照表、§3 远期方案、§4 retain/release）
@@ -122,8 +122,8 @@
     - 动态副本（main）：kvcm 能触发、不能指定目标（反复调 `GetReplicaList` 观测，和 promote 同一种做法，观测在同一个函数里）——只适合池级自动调节，满足不了预热语义
     - offload / promotion 的执行端两版本都是引擎来取（`OffloadObjectHeartbeat` / `PromotionObjectHeartbeat`），kvcm 触发链不变
     - offload 取消不对外（`CancelQueuedOffloadTask` 唯一调用点是 `UpsertStart` 内部）
-    - `EvictDiskReplica`（两版本）：通知型；`LOCAL_DISK` 限登记 client（kvcm 自挂 SSD 后可用来收尾），`DISK` 不验 client_id（误用风险已登记）
-    - `AddReplica` 不是独立 RPC（是 `NotifyOffloadSuccess` 的内部步骤）——kvcm 自挂 SSD 走 `NotifyOffloadSuccess` 上报登记
+    - `EvictDiskReplica`（两版本）：通知型；`LOCAL_DISK` 限登记 client（盘副本已在 kvcm 名下才能清自己的），`DISK` 不验 client_id（误用风险已登记）
+    - `AddReplica` 不是独立 RPC（是 `NotifyOffloadSuccess` 的内部步骤）。引擎自己落盘后上报走这条。kvcm 用它卸引擎副本，现有通道做不到
     - 没有保留身份注册。`kRetained` 是外部内存引用计数；`AddReplicaForRetainedClient` 是 master 内部的盘副本登记。`#2991` 是同一个 client_id 的重连窗口，不搬走字节
     - `BatchQueryIp`（两版本）：client_id→IP，副本位置解析的最后一环
     - `GetStorageUsageSnapshot`（main）：分层容量快照，demote 触发输入

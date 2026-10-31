@@ -427,7 +427,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 
 | 功能 | 卡点 | kvcm 现状手段 |
 |---|---|---|
-| 写回模式确定性 demote（含「只清 DRAM 副本、留盘副本」） | 无 per-key 降层 RPC（两版本同）+ `BatchReplicaClear` 限 key 的 client_id（F6②） | 停保活进驱逐候选，时机不可控；远期：kvcm 自己挂 SSD + 上报登记（§3） |
+| 写回模式确定性 demote（含「只清 DRAM 副本、留盘副本」） | 无 per-key 降层 RPC（两版本同）+ `BatchReplicaClear` 限 key 的 client_id（F6②） | 停保活进驱逐候选，时机不可控。kvcm 挂 SSD 再卸引擎副本，现有通道做不到（§4） |
 | 在途 copy/move 任务取消（止损） | 无任务取消 RPC（两版本同，P9） | 弃置 + 事后清副本——止不住在途带宽，只清结果 |
 
 **功能对齐，组合实现（mooncake 无直接可用接口）**
@@ -600,7 +600,7 @@ sequenceDiagram
 - S2 与 R3 的**发起方身份 = 新 client_id**（F3①）：传自己 UUID 改归 kvcm / 传原 client_id UUID 借名（需 master 加查询 RPC）——两选择的取舍见 §2「client_id 问题」节
 - 效果与代价（保护语义、断线窗口、持续开销）见 §2 对比表；取消方式的机制依据见「pin 的取消」节
 
-**⑤ demote（DRAM→SSD；三形态时序：绿 = 写穿、橙 = 写回、蓝 = 远期 kvcm 自挂 SSD，§3）**
+**⑤ demote（DRAM→SSD；三形态时序：绿 = 写穿、橙 = 写回、蓝 = 现有通道做不到，§4）**
 
 ```mermaid
 sequenceDiagram
@@ -1000,7 +1000,7 @@ sequenceDiagram
   - `RemoveAll()`：全池清空（运维重置）——main 改为异步：master 置标志、各 client 轮询 `PollRemoveAll` 自清 SSD（F13），完成时机以台账比对为准
   - `BatchReplicaClear(keys, client_id, seg)`：定点清副本——限 key 的 client_id 自调，另有 lease 未过期 skip、PROCESSING 免清两道门槛，seg 传空 = 删整 key（机制全图见 F6②）；引擎下线前自清理用；kvcm 调不动别人的 key
   - `EvictDiskReplica` / `BatchEvictDiskReplica`（两版本同有，F13③）：client 盘副本被逐后的**上报**通道。对 kvcm 有用的地方有两处：
-    - `LOCAL_DISK` 限登记 client 本人——kvcm 自挂 SSD 后是自己盘副本的登记 client，可主动清（自挂形态的收尾工具）
+    - `LOCAL_DISK` 限登记 client 本人。只有盘副本已经登记在 kvcm 名下时，kvcm 才能清自己的。现有通道卸不来引擎上的字节（§4），所以这不是现在的收尾工具
     - `DISK`（DFS 副本）不验 client_id——能清 DFS 副本；但语义是「驱逐上报」不是主动删除，误用它清副本是把「上报」当「命令」用，release 正式路径仍走 Remove 系
   - 公共参数 `force`：Remove 默认有两道保险——① lease 未过期拒删（最近有人读过，可能还在用）② copy/offload 任务在途拒删（传输中删除会破坏数据）；`force=true` 跳过保险强删
     - 仅「确认没人用」（D1 §6 例外级，如全局废弃前缀）才用 force
