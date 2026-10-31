@@ -92,6 +92,7 @@ class MooncakeBackend(KvOps):
         rpc_timeout_s: float = 30.0,
         admin: Any | None = None,
         promote_hits: int = 2,
+        lease_ttl_s: float = 10.0,
     ) -> None:
         """
         client：已 connect 的 StoreClient（控制面身份，global_segment_size=0）。
@@ -119,11 +120,17 @@ class MooncakeBackend(KvOps):
             raise ValueError("submit_concurrency must be positive")
         if promote_hits < 1:
             raise ValueError("promote_hits must be positive")
+        if lease_ttl_s < 0:
+            raise ValueError("lease_ttl_s must be >= 0")
         self._client = client
         # 副本核验走主线 GET /batch_query_keys。不设则核验失败，不退回
         # batch_get_replica_desc。
         self._admin = admin
         self._promote_hits = promote_hits
+        # 与 master 的 default_kv_lease_ttl 对齐。main 默认 10s
+        # （DEFAULT_DEFAULT_KV_LEASE_TTL = 10000ms）。kvcm 不改 master 的这个值。
+        # demote 等满这一段：没有马上撤销 lease 的调用，也不查剩余租约。
+        self._lease_ttl_s = lease_ttl_s
         self._keys = key_computer
         self._locate = locate
         self._cap = capability
@@ -767,11 +774,12 @@ class MooncakeBackend(KvOps):
 
     async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
         if kind is PinKind.HARD:
-            if self._cap.hard_pin_after.channel is not Support.YES:
-                raise UnsupportedCapabilityError(
-                    "hard pin 写入时固化，已存在的 KV 无法事后补标（全版本无此能力）"
-                )
-            raise NotImplementedError("hard pin：通道具备但尚未接线")
+            # 标记创建时固化，这里不设置 hard pin 位。
+            # 控制效果是登记保活（同一张 Ledger 表）。不读数据、不 Remove、
+            # 不重 put、不走空写。lease 时长是 master 的 default_kv_lease_ttl，
+            # kvcm 不改那个配置。hard_pin_after 仍表示不能事后改这个位。
+            await self.keepalive(prefix)
+            return
         if self._cap.soft_pin_after.channel is not Support.YES:
             raise UnsupportedCapabilityError(
                 "soft pin 事后加：这个能力集的通道不具备"
@@ -784,10 +792,14 @@ class MooncakeBackend(KvOps):
         await self._rpc(functools.partial(self._client.soft_pin, keys, enable=True))
 
     async def demote(self, prefix: Prefix) -> None:
-        """先停保活，再查是否已有盘副本。
+        """先停保活，等满一个 lease TTL，再查是否已有盘副本。
 
-        没有盘副本就失败：还没落盘，不能当成已经降层。只查一次，不等待。
-        盘副本看 /batch_query_keys 的 disk / local_disk 条数。
+        没有马上撤销 lease 的调用，也不查剩余租约，所以睡满
+        ``lease_ttl_s``（须与 master 的 ``default_kv_lease_ttl`` 一致）。
+        然后用已有的 ``GET /batch_query_keys`` 看 disk / local_disk 条数。
+        不用 ``GetReplicaList`` / ``batch_get_replica_desc``，那会续租，
+        把刚停的保活又续上。每个 key 都有盘副本才算成功。
+        写回且池不满时仍会失败：不读数据落盘，不调 ``MountLocalDiskSegment``。
         """
         await self.stop_keepalive(prefix)
         keys = self._keys.keys_for_tokens(prefix.token_ids)
@@ -797,6 +809,7 @@ class MooncakeBackend(KvOps):
             )
         if self._admin is None:
             raise QueryError("降层查盘副本需要主线 GET /batch_query_keys")
+        await asyncio.sleep(self._lease_ttl_s)
         try:
             parsed = await self._rpc(self._admin.batch_query_keys, keys)
         except (AdminMainError, StoreClientError) as e:

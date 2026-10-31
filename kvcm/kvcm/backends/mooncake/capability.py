@@ -23,12 +23,19 @@ def mooncake_v0311() -> BackendCapability:
             Support.NO,
             "空写扩展对着主线 SoftPinAction。这个能力集不把通道标成已有",
         ),
-        hard_pin_after=Capability(Support.NO, Support.NO, "pin 写入时固化、无 unpin"),
+        hard_pin_after=Capability(
+            Support.NO,
+            Support.NO,
+            "标记创建时固化；pin(HARD) 的控制效果是登记保活，不是设置这个位。"
+            "lease 时长是 master 的 default_kv_lease_ttl，kvcm 不改这个配置",
+        ),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
         has_offload=Capability(
             Support.YES,
             Support.YES,
-            "降层 = 先停保活，再查已有盘副本；没有盘副本就失败，不等待",
+            "降层 = 先停保活，等满一个 lease TTL，再用 GET /batch_query_keys "
+            "查 disk / local_disk；没有盘副本就失败。"
+            "不用 GetReplicaList（会续租）",
         ),
         has_promotion=Capability(
             Support.YES,
@@ -67,12 +74,17 @@ def mooncake_main() -> BackendCapability:
             "扩展调 MasterClient::UpsertStart/UpsertEnd，不 TransferWrite，"
             "不第二次 RealClient::create",
         ),
-        hard_pin_after=Capability(Support.NO, Support.NO, "pin 写入时固化、无 unpin"),
+        hard_pin_after=Capability(
+            Support.NO,
+            Support.NO,
+            "标记创建时固化；pin(HARD) 的控制效果是登记保活，不是设置这个位。"
+            "lease 时长是 master 的 default_kv_lease_ttl，kvcm 不改这个配置",
+        ),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
         has_offload=Capability(
             Support.YES,
             Support.YES,
-            "同 0.3.11：停保活后必须已有盘副本，否则失败",
+            "同 0.3.11：停保活、等满 lease TTL、再用 GET /batch_query_keys 查盘副本；没有就失败",
         ),
         has_promotion=Capability(
             Support.YES,

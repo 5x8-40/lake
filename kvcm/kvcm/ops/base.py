@@ -150,15 +150,15 @@ class KvOps(ABC):
         raise self._unsupported("stop_keepalive")
 
     async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
-        """元数据标记防驱逐：对已存在的 KV 生效，不写数据。
-        SOFT 可解；HARD 写入时固化、不可解，已存在的 KV 无法事后补标
-        （能力集 hard_pin_after）。无 READY。"""
+        """防驱逐。SOFT 是事后 soft pin，不写数据。
+        HARD 标记创建时固化，能力集 hard_pin_after 表示不能事后改这个位。
+        mooncake 上 pin(HARD) 的控制效果是登记保活，不是设置这个位。无 READY。"""
         raise self._unsupported("pin")
 
     async def demote(self, prefix: Prefix) -> None:
-        """放弃前缀 KV 的热层位置。本接口不指定目标层——去向由池的冷热
-        策略决定；是否立即生效取决于后端能力（has_per_key_demote 全版本
-        均无，实际为停止保活后的自然降层）。无 READY。"""
+        """放弃前缀 KV 的热层位置。没有立刻搬到盘上的调用。
+        mooncake 上先停保活，等满一个 lease TTL，再用
+        GET /batch_query_keys 确认盘副本。写回且池不满时失败。无 READY。"""
         raise self._unsupported("demote")
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:

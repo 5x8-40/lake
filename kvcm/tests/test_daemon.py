@@ -127,6 +127,7 @@ def _args(tmp: str) -> argparse.Namespace:
         copy_submit_concurrency=4,
         listen="",
         keepalive_interval_s=0.05,
+        lease_ttl_s=10.0,
         keepalive_window_s=600.0,
         shutdown_timeout_s=2.0,
         rpc_timeout_s=30.0,
@@ -834,6 +835,7 @@ def test_cli_repeats_instance_segs(monkeypatch) -> None:
         "A=seg-A0,seg-A1",
         "B=seg-B0",
     ]
+    assert captured["args"].lease_ttl_s == 10.0
     with pytest.raises(SystemExit):
         daemon.main(
             [

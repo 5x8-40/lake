@@ -94,6 +94,7 @@ def build_backend(
         ledger=ledger,
         submit_concurrency=args.copy_submit_concurrency,
         rpc_timeout_s=args.rpc_timeout_s,
+        lease_ttl_s=args.lease_ttl_s,
         executor=executor,
     )
 
@@ -420,6 +421,14 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=5.0,
         help="续租周期（必须显著小于 master lease TTL，实配 11s）",
+    )
+    p.add_argument(
+        "--lease-ttl-s",
+        type=float,
+        default=10.0,
+        help="降层前要等满的 lease 秒数，必须与 master 的 default_kv_lease_ttl 一致。"
+        "测试床实配过 11s。0.3.11 代码默认 5s，main 默认 10s"
+        "（DEFAULT_DEFAULT_KV_LEASE_TTL = 10000ms）。kvcm 不改 master 的这个值",
     )
     p.add_argument(
         "--keepalive-window-s",

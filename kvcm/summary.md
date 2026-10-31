@@ -72,25 +72,22 @@
 
 - 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
 - 遗留：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。
+- 遗留：`SubmitIntent` 现在只有预热（前缀 × 目标实例）。move / pin / demote / promote / remove 只有操作，没有 intent。这是大遗留，这次不扩协议、不加流程。
 - locate：进程内「实例 → rank 有序段名单」。intent 和操作入参没有 segment。没登记的实例报错。
 - remove：`force=False` 不停保活，`batch_remove(..., force=False)`；`force=True` 先停这份前缀的保活，再 `force=True`。
 - 保活续租用 BatchExistKey（`exists` → `batch_is_exist`），不用 ProbeKey。`keepalive` / `stop_keepalive` 只登记或注销 Ledger 里的同一张表。
 - 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回不用这条，用会累计命中的 GetReplicaList（默认 2 次）。
-- 软钉空写：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。wheel 不带 C++ 头文件，扩展只链 `store.so`。`get_real_client()` 是退路：只有以后真实调用失败，才包含 `pyclient.h`，在对象还原成 `MooncakeStorePyWrapper` 之后取出已建 client。现在不走这条。`UpsertStart` 发出的是这个 client 自己的 UUID，所以这次调用会把 `client_id` 写成 kvcm 的。借名做不到。D2 的两个方案仍未选定。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`；进程死在 Start 与 End 之间时副本留在 PROCESSING，恢复还没做（D2 F5）。保留身份先不动。
+- 软钉空写：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。wheel 不带 C++ 头文件，扩展只链 `store.so`。`get_real_client()` 是退路：只有以后真实调用失败，才包含 `pyclient.h`，在对象还原成 `MooncakeStorePyWrapper` 之后取出已建 client。现在不走这条。client_id 用方案一：`UpsertStart` 发出的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时副本留在 PROCESSING。扫任务记录再补 End/Revoke 的崩溃恢复暂时不做，这次不写（D2 F5）。保留身份先不动。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐——🟡 候选已列出，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
-  - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert 一个方案：
+- pin：READY 后防驱逐——硬钉走候选 ①，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
+  - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert，实现不改：
     - 好处：不动全局 lease、断线窗口 30 分钟级
-    - 代价：官方绑定没有拆开的 upsert。空写走单独的 `_empty_pin.so`（只链 `store.so`，见上）。client_id 两个方案仍未选定
-  - hard pin 级（绝对不可逐）——两个候选：
-    - ① lease 调大 + keepalive：零改动、零client_id 问题；代价 = 全局读租约变长 + kvcm 必须活着续租
-    - ② 读删写：kvcm 失联也安全；代价 = 数据要经过 kvcm 本地 + client_id 问题
-  - 取消方式：① 停续租等过期 / 空写传 false 或 `SoftPinAction::DISABLE` / hard pin 没有 unpin，只能再读删写一遍
+    - 代价：官方绑定没有拆开的 upsert。空写走单独的 `_empty_pin.so`（只链 `store.so`，见上）。client_id 用方案一
+  - hard pin 级：选定候选 ①。`pin(HARD)` 登记保活（同一张 Ledger 表），不读数据、不 Remove、不重 put、不空写、不改 hard pin 位。`hard_pin_after` 仍表示不能事后改 hard pin 标记。lease 时长是 master 的 `default_kv_lease_ttl`，不是 kvcm 对单个 key 改标记；kvcm 不改这个配置
+  - 候选 ② 读删写代价太大，这次不做
+  - 取消：停续租，等满一个 lease TTL。没有马上撤销 lease 的调用，也不查剩余租约。空写 soft pin 的取消仍是传 false 或 `SoftPinAction::DISABLE`
   - 读锁方案已否决：refcnt 是任务级保护，两个版本都没有读者引用 RPC
-  - client_id 问题两个方案并列（空写与读删写都要面对）：
-    - client_id 改归 kvcm：不改 mooncake；语义变（Revoke/`BatchReplicaClear` 权限归 kvcm，kvcm 死期间锁死；死透时逃生门 = 任一 client upsert 把 client_id 改写成自己、接管权限，upsert 不验身份）；与副本存亡无关——两方案下引擎下线行为一致（E5 已闭环）
-    - 借原 client_id UUID：语义不变；要 master 暴露「key → client_id」，并且调用能带上别人的 UUID。当前 `MasterClient::UpsertStart` 两样都没有
-    - 两个方案仍未选定。当前空写会把 client_id 写成 kvcm 的 UUID，见上面软钉空写那条
+  - client_id：方案一是当前路径（空写写成 kvcm 的 UUID，目前没感受到权限影响）。方案二借名仍做不到，不是当前路径；机制说明留在 D2 §2
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）
 - retain：先不做。结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
   - 1fc27b6 没有 `AddReplicaForRetainedClient`。`BufferRegistrationAction::kRetained` 是外部 buffer 引用计数。通道保持关闭
@@ -99,11 +96,11 @@
   - 0.3.11 已核对的办法（E5 已闭环，本次不实现）：move 到活 seg 有效；改 client_id 对副本存亡无效（只动鉴权字段）；kvcm 自挂 SSD 兜底（不依赖任何引擎存活）
   - 计划下线：`GracefulUnmountSegment`（0.3.11）/ `CreateDrainJob`（两版本都有，job 级可取消）
   - 长期未命中 → demote 到 SSD，由策略层定
-- demote / promote：🟡 设计完成，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
+- demote / promote：结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
   - 框架：语义是原子的，实现是组合动作（池通道或 kvcm 读写组合 + 核验）；存储统一归 mooncake（引擎实例挂本机 SSD 做分层，kvcm 自己不持存储）
-  - demote = 池开 `enable_offload`：
+  - demote：先 `stop_keepalive`，再等满一个 lease TTL（`--lease-ttl-s`，默认 10，须与 master 的 `default_kv_lease_ttl` 一致；测试床实配过 11s；0.3.11 代码默认 5s，main 默认 10s）。kvcm 不改 master 的这个值。然后用 `GET /batch_query_keys` 确认每个 key 的 disk / local_disk。不用 `GetReplicaList`（会续租）。没有立刻搬到盘上的 RPC。写回且池不满时仍失败。不读数据落盘，不调 `MountLocalDiskSegment`
+  - 池侧前提仍是 `enable_offload`：
     - 写穿 / 写回两模式（≈ HiCache write_through / write_back）
-    - 写回模式须先停保活、等 lease 过期——保活挡住驱逐，也就挡住落盘
   - promote 三条路：
     - `promotion_on_hit`：命中时池被动提回
     - kvcm 主动①：反复调 `GetReplicaList` 看命中计数，过线就触发

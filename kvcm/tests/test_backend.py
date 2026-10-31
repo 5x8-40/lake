@@ -458,11 +458,13 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
         capability="v0311",
         rpc_timeout_s=30.0,
         copy_submit_concurrency=7,  # 非默认值，才能证明真的传了
+        lease_ttl_s=11.0,
     )
     daemon.build_backend(args, client=object(), ledger=object())
     assert seen["submit_concurrency"] == 7, (
         f"--copy-submit-concurrency 没传下去: {seen.get('submit_concurrency')}"
     )
+    assert seen["lease_ttl_s"] == 11.0
     assert list(seen["locate"]("inst-B")) == ["seg-A"]
     with pytest.raises(KeyError, match="not registered"):
         seen["locate"]("other")
@@ -1083,7 +1085,7 @@ def test_abandon_purges_and_marks(fake_store_module, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
-# pin 能力判定（SOFT 看 soft_pin_after，HARD 看 hard_pin_after）
+# pin：SOFT 走空写；HARD 登记保活，不改 hard pin 位
 # ---------------------------------------------------------------------------
 
 
@@ -1120,10 +1122,43 @@ def test_pin_soft_calls_client(fake_store_module, monkeypatch) -> None:
     assert seen["keys"] == ["k0"]
 
 
-def test_pin_hard_always_unsupported(fake_store_module, monkeypatch) -> None:
-    b = _pin_backend(monkeypatch, mooncake_main())  # hard 通道 NO（全版本）
-    with pytest.raises(UnsupportedCapabilityError, match="hard pin"):
-        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD))
+def test_pin_hard_registers_keepalive(fake_store_module, monkeypatch) -> None:
+    """pin(HARD) 只登记保活。不走空写，也不因为补不上 hard pin 位而拒绝。"""
+    assert mooncake_main().hard_pin_after.channel is Support.NO
+    assert mooncake_v0311().hard_pin_after.channel is Support.NO
+    called = {"soft": 0}
+
+    class Client(FakeClient):
+        def soft_pin(self, keys, *, enable=True):
+            called["soft"] += 1
+
+        def batch_get_replica_desc(self, keys):
+            raise AssertionError("pin(HARD) 不应读副本")
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        kc = KeyComputer(model_name="qwen", tp_size=1)
+        monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+        b = MooncakeBackend(
+            client=Client(),
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A"],
+            capability=mooncake_main(),
+            ledger=led,
+            lease_ttl_s=0,
+        )
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.pin(prefix, PinKind.HARD))
+        run(b.pin(prefix, PinKind.HARD))
+        assert led.list_keepalive() == [prefix]
+        assert called["soft"] == 0
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
 
 
 def test_soft_pin_reuses_existing_capsule(monkeypatch) -> None:
@@ -1812,33 +1847,86 @@ def test_keepalive_uses_ledger_table(fake_store_module, monkeypatch) -> None:
         os.unlink(path)
 
 
+def _demote_backend(monkeypatch, led, admin, *, lease_ttl_s: float):
+    client = FakeClient()
+
+    def batch_get_replica_desc(keys):
+        raise AssertionError("demote 不能走 GetReplicaList，那会续租")
+
+    client.batch_get_replica_desc = batch_get_replica_desc
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    return MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        ledger=led,
+        admin=admin,
+        lease_ttl_s=lease_ttl_s,
+    )
+
+
 def test_demote_fails_without_disk_replica(fake_store_module, monkeypatch) -> None:
     from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
 
+    steps: list[tuple] = []
+
+    async def fake_sleep(seconds):
+        steps.append(("sleep", seconds, list(led.list_keepalive())))
+
     class Admin:
         def batch_query_keys(self, keys):
+            steps.append(("query", list(keys)))
             return {k: KeyReplicaQuery(key=k, ok=True, disk_replicas=0) for k in keys}
 
+    monkeypatch.setattr(
+        "kvcm.backends.mooncake.backend.asyncio.sleep", fake_sleep
+    )
     with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
         path = f.name
     led = Ledger(path)
     try:
-        client = FakeClient()
-        kc = KeyComputer(model_name="qwen", tp_size=1)
-        monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
-        b = MooncakeBackend(
-            client=client,
-            key_computer=kc,
-            locate=lambda _inst: ["seg-A"],
-            capability=mooncake_v0311(),
-            ledger=led,
-            admin=Admin(),
-        )
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
         prefix = Prefix(model_id="qwen", token_ids=(1,))
         run(b.keepalive(prefix))
         with pytest.raises(RuntimeError, match="还没有盘副本"):
             run(b.demote(prefix))
         assert led.list_keepalive() == []
+        assert steps == [("sleep", 0, []), ("query", ["k0"])]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_succeeds_when_every_key_has_disk(fake_store_module, monkeypatch) -> None:
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    steps: list[tuple] = []
+
+    async def fake_sleep(seconds):
+        steps.append(("sleep", seconds))
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            steps.append(("query", list(keys)))
+            return {k: KeyReplicaQuery(key=k, ok=True, disk_replicas=1) for k in keys}
+
+    monkeypatch.setattr(
+        "kvcm.backends.mooncake.backend.asyncio.sleep", fake_sleep
+    )
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0.01)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.keepalive(prefix))
+        run(b.demote(prefix))
+        assert led.list_keepalive() == []
+        assert steps == [("sleep", 0.01), ("query", ["k0"])]
     finally:
         led.close()
         import os

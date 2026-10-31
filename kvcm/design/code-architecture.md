@@ -76,7 +76,7 @@ flowchart TB
 ```
 
 - `IntentReceiver`、`InstanceWatcher` 只接收，箭头从进程外进来。`EventPublisher` 只发送，箭头从进程里出去。三者互不调用
-- **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`（前缀闸外），再占一个前缀闸名额跑 `PrefetchFlow.run_after_exists`，终态才还。`copy` 里每个 key 另过进程级提交信号量，`create_copy_task` 返回即还。回执由调用方 `GetTask` 主动查
+- **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`（前缀闸外），再占一个前缀闸名额跑 `PrefetchFlow.run_after_exists`，终态才还。`copy` 里每个 key 另过进程级提交信号量，`create_copy_task` 返回即还。回执由调用方 `GetTask` 主动查。`SubmitIntent` 现在只有预热。move / pin / demote / promote / remove 没有 intent，这次不扩协议
 - 已接通的驱动是 `PrefetchFlow` 调 `KvOps`——运行时这个对象就是 `MooncakeBackend`，不是中间再转一跳。它写 `Ledger`，账本落在圈外的 sqlite 文件上；`rebuild` 再把 running 行读回来
 - **实例拓扑的两条来路**：demo 环境没有注册通道，`RankTopology` 用探测法推断「哪个 rank 对应哪个 seg」（见 L4 节）；生产环境由实例启动时把自己的拓扑（TP 配置、rank 与 seg 对应表）经 `InstanceWatcher` 注册进来（D1 §3、E13）——两条来路汇成一个 `locate` 函数注入 backend
 - `StoreClient` 走 master 的 RPC `:50088`。`SegTopology` 自己会打 HTTP `:9003` 的 `/get_all_segments`（查存储池当前挂了哪些 seg）。`RankTopology` 用这份名单做 demo 探测，这条探测装配还没接进进程。现在的进程入口是 `InstanceDirectory`：daemon 用 `--instance-segs` 做初始登记，locate 只返回该实例的段
@@ -142,7 +142,7 @@ flowchart LR
 
 | 模块 | 职责 | 出处 |
 |------|------|------|
-| IntentReceiver | 收 Router 预热 intent（E12 已实现）。**协议**：gRPC `KvcmIntent.SubmitIntent { prefix{model_id, token_ids}, target }`，入队后立即返回 `intent_id`；执行状态由调用方 `GetTask(intent_id)` 查（PENDING / READY / FAILED / UNKNOWN）。intent ≠ command：kvcm 按池现状决定做不做、何时做，调用方不得假设执行时机。servicer 只调 `TaskEngine` 公开方法，不含存储概念 | D1 §4 职责边界、`proto/kvcm_intent.proto` |
+| IntentReceiver | 收 Router 预热 intent（E12 已实现）。**协议**：gRPC `KvcmIntent.SubmitIntent { prefix{model_id, token_ids}, target }`，入队后立即返回 `intent_id`；执行状态由调用方 `GetTask(intent_id)` 查（PENDING / READY / FAILED / UNKNOWN）。intent ≠ command：kvcm 按池现状决定做不做、何时做，调用方不得假设执行时机。servicer 只调 `TaskEngine` 公开方法，不含存储概念。协议现在只有预热（前缀 × 目标实例）。move / pin / demote / promote / remove 只有操作，没有 intent。这是大遗留，这次不扩协议、不加流程 | D1 §4 职责边界、`proto/kvcm_intent.proto` |
 | EventPublisher | READY 后按目标实例端点补发 `BlockStored`；端点生命周期（每实例一端点、注册给索引） | D1 §2 方案 a、E14 |
 | InstanceWatcher | 实例上线/销毁接入 → 触发预热 / seg 副本处理；「端点→实例」「seg→实例」注册的权威来源（E13；先占位，事件源随 D4） | D1 §3、E13 |
 
@@ -176,7 +176,7 @@ flowchart LR
 ## L3 原子操作层（核心抽象）
 
 - 接口规格直接抄 D2 §1：八项操作的语义、完成信号、READY 有无、幂等性都已定型——本层把它们落成 Python 抽象基类
-- 八项分三类（D2 §1）：**原子动作**（copy / move / keepalive / demote / promote / remove）、**元数据标记**（pin）、**目的型**（retain——由 demote / move / pin 组合完成，但调用方看起来仍像一步）
+- 八项分三类（D2 §1）：**原子动作**（copy / move / keepalive / demote / promote / remove）、**元数据标记**（pin 的 soft；hard 级当前是登记保活，不改 hard pin 位）、**目的型**（retain——由 demote / move / pin 组合完成，但调用方看起来仍像一步）
 - 完成信号：READY 的本义 =「可以把请求调度过来」（D2 §1）——copy / move / promote 有 READY（它们的完成都意味着「这个实例能接请求了」）；demote 降层后本就不能调度，没有 READY。retain 的完成信号先不落地：本次不实现，通道关闭。keepalive / stop_keepalive / pin / demote / remove 无 READY
 - 幂等：同一个前缀对同一台实例，已经在复制就不重复发、已完成也不重复发（D1 §4）；后端侧重复调用也有幂等保护（D1 F11）
 
@@ -262,9 +262,9 @@ stateDiagram-v2
 |------|------------------------------|----------------------------|------|
 | has_lease（读续租） | RPC ✓ 通道 ✓（`is_exist`） | RPC ✓ 通道 ✓ | D2 F9 |
 | soft pin 事后加（用 upsert 空写的方式） | RPC ✓ 通道 ✗（能力集仍按部署版本填写；空写扩展对着主线 `SoftPinAction`） | RPC ✓ 通道 ✓。`_get_pyclient_capsule` 拿回已建 client，扩展调 `MasterClient::UpsertStart` / `UpsertEnd`，不 `TransferWrite`，不第二次 `create` | D2 F1/F12 |
-| hard pin 事后加 | ✗（创建时固化、无 unpin） | ✗ | D2 F1 |
+| hard pin 事后改标记 | ✗（创建时固化。`pin(HARD)` 登记保活，不设置这个位。lease 是 master 的 `default_kv_lease_ttl`，kvcm 不改） | ✗ | D2 §2 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源） | ✗ | D2 F7 |
-| has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活后必须已有盘副本，否则失败；提回 = GetReplicaList 累计命中，默认 2 次，不用零副作用查询） | 同左 | D2 §3 |
+| has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活、等满一个 lease TTL、再用 `GET /batch_query_keys` 确认盘副本，没有就失败；不用 `GetReplicaList`，那会续租。提回 = GetReplicaList 累计命中，默认 2 次） | 同左 | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
 | has_retained_client（保留身份注册） | ✗ | 先不做。这份主线树没有 `AddReplicaForRetainedClient`；`kRetained` 是外部 buffer 引用计数，不是引擎死后 KV 还在 | D2 F13② |
@@ -339,8 +339,8 @@ stateDiagram-v2
     - 类型只写到 `master_client_` 为止。与完整类定义对过：`PyClient::client_` 在 8 字节，`Client::master_client_` 在 48 字节，`ReplicateConfig` 208 字节，`ObjectMeta` 48 字节。
     - 官方包用 `_get_pyclient_capsule` 把 `setup` 放进 `store_` 的那一个对象交出来。扩展按 `mooncake_pin_api.h` 里的成员调用 `UpsertStart` / `UpsertEnd`。
     - **含 `pyclient.h` 的路径是退路，不是当前实现。** 若当前小头文件在真实调用上失败，再改回：pybind 参数为 `MooncakeStorePyWrapper&`，`get_real_client()` 拿出已建 client。拿到这个对象之后，`get_real_client()` 只是返回成员。不确定的是跨模块还原这个类：它没有单独头文件，pybind 版本还要和 wheel 一致（2.13.6）。代价是编译期要读 `pyclient.h` 带进来的那串头文件。使用时仍然只链 `store.so`。现在不走这条。
-    - **client_id**：`MasterClient::UpsertStart` 发出去的是这个 client 自己的 UUID，没有「传入别人的 UUID」的参数。当前空写会把 `client_id` 写成 kvcm 的 UUID。借名（D2 方案二）这条调用做不到。两个方案仍未选定。
-    - **写中窗口**：同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 和 End 之间时，副本停在 PROCESSING。按 D2 F5 补 `End` 或 `Revoke` 的崩溃恢复还没做。
+    - **client_id**：当前路径是方案一。`MasterClient::UpsertStart` 发出去的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。机制说明留在 D2 §2。
+    - **写中窗口**：同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 和 End 之间时，副本停在 PROCESSING。扫任务记录再补 `End` 或 `Revoke` 暂时不做，这次不写。
     - 保留身份先不动。1fc27b6 没有 `AddReplicaForRetainedClient`。`dummy_client.h` 的 `kRetained` 是外部 buffer 的引用计数。
   - **另一条退路（未做）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）重新绑定一遍，Python 只 import 自封装 .so；天然单 client，代价是复制绑定面
 - 为什么空写不从 Python ctypes 直调：
