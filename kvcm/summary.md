@@ -72,6 +72,11 @@
 
 - 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
 - 遗留：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。
+- locate：进程内「实例 → rank 有序段名单」。intent 和操作入参没有 segment。没登记的实例报错。
+- remove：`force=False` 不停保活，`batch_remove(..., force=False)`；`force=True` 先停这份前缀的保活，再 `force=True`。
+- 保活续租用 BatchExistKey（`exists` → `batch_is_exist`），不用 ProbeKey。`keepalive` / `stop_keepalive` 只登记或注销 Ledger 里的同一张表。
+- 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回不用这条，用会累计命中的 GetReplicaList（默认 2 次）。
+- 软钉空写和保留身份走自封装 .so（路径 A）。.so 不在时加载器报错，不假装已经钉上或已经保留。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
 - pin：READY 后防驱逐——🟡 候选已列出，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
   - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert 一个方案：

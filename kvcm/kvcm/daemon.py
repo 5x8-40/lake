@@ -54,6 +54,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 
 from kvcm.api.grpc_server import IntentGrpcServer
+from kvcm.backends.mooncake.admin_main import MainlineAdmin
 from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.capability import mooncake_main, mooncake_v0311
 from kvcm.backends.mooncake.client import StoreClient
@@ -82,11 +83,14 @@ def build_backend(
     )
     directory = directory_from_specs(args.instance_segs)
     capability = mooncake_main() if args.capability == "main" else mooncake_v0311()
+    admin_url = getattr(args, "admin", "") or ""
+    admin = MainlineAdmin(admin_url) if admin_url else None
     return MooncakeBackend(
         client=client,
         key_computer=keys,
         locate=directory.locate,
         capability=capability,
+        admin=admin,
         ledger=ledger,
         submit_concurrency=args.copy_submit_concurrency,
         rpc_timeout_s=args.rpc_timeout_s,
@@ -378,6 +382,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--peer-tp-size", type=int, default=None)
     p.add_argument("--put-step", type=int, default=1)
     p.add_argument("--hash-algo", default="sha256")
+    p.add_argument(
+        "--admin",
+        default="",
+        help="master HTTP 管理面根 URL。副本核验和降层查盘走 GET /batch_query_keys",
+    )
     p.add_argument(
         "--instance-segs",
         action="append",

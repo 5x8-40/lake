@@ -3,10 +3,9 @@
 两条端点都只在主线有、且这里只读：
 
 - ``GET /batch_query_keys``：``BatchGetReplicaListForAdmin``，零副作用
-  （不授 lease、不触发 promote、不计命中）。解析结果供以后核验用。
-  **不接进** ``MooncakeBackend._verify_missing``——那条仍走绑定
-  ``batch_get_replica_desc``。能力表记的是「主线有这个端点」；换包
-  不会让核验调用自己换过来。
+  （不授 lease、不触发 promote、不计命中）。副本核验走这里，用内存副本
+  的 ``transport_endpoint_`` 和段名单比。提回不用这条：提回要累计命中，
+  走绑定的 ``GetReplicaList``。
 - ``GET /api/v1/tenant_quotas``：租户配额快照（requested / effective /
   charged）。这是租户记账，不是段剩余空间，不能拿来当段剩余容量。
 
@@ -33,8 +32,8 @@ class AdminMainError(RuntimeError):
 class MemoryReplicaView:
     """一条内存副本里核验用得上的字段。
 
-    ``transport_endpoint`` 是传输端点，不是 seg 名。本结构只解析，
-    当前没有任何核验调用消费它。
+    ``transport_endpoint`` 是传输端点，不是 seg 名。核验用它和计划里的
+    段比，判断这份副本还在不在那个端点上。
     """
 
     transport_endpoint: str
@@ -50,6 +49,9 @@ class KeyReplicaQuery:
     ok: bool
     error: str | None = None
     memory: tuple[MemoryReplicaView, ...] = ()
+    # disk_values 与 local_disk_values 的条数。降层只看有没有盘副本，
+    # 不当段剩余空间。
+    disk_replicas: int = 0
 
 
 @dataclass(frozen=True)
@@ -73,8 +75,8 @@ def parse_batch_query_keys(body: str) -> dict[str, KeyReplicaQuery]:
     """解析 ``GET /batch_query_keys`` 的 JSON 正文。
 
     成功体：``{"success": true, "data": {key: {ok, error?, values?}}}``。
-    ``values`` 是内存副本描述（``transport_endpoint_``）。盘副本字段
-    （``disk_values`` / ``local_disk_values``）不进内存视图。
+    ``values`` 是内存副本描述（``transport_endpoint_``）。盘副本只计条数
+    （``disk_values`` + ``local_disk_values``），不进内存端点列表。
     """
     payload = _load_object(body)
     _require_success(payload)
@@ -90,10 +92,14 @@ def parse_batch_query_keys(body: str) -> dict[str, KeyReplicaQuery]:
         if error is not None and not isinstance(error, str):
             raise AdminMainError(f"batch_query_keys: error for {key!r} is not a string")
         memory: tuple[MemoryReplicaView, ...] = ()
+        disks = 0
         if ok:
             memory = _memory_views(key, item.get("values"))
+            disks = _replica_count(item.get("disk_values")) + _replica_count(
+                item.get("local_disk_values")
+            )
         out[str(key)] = KeyReplicaQuery(
-            key=str(key), ok=ok, error=error, memory=memory
+            key=str(key), ok=ok, error=error, memory=memory, disk_replicas=disks
         )
     return out
 
@@ -181,6 +187,14 @@ def _load_object(body: str) -> dict:
 def _require_success(payload: dict) -> None:
     if payload.get("success") is not True:
         raise AdminMainError(f"admin response success is not true: {payload!r}")
+
+
+def _replica_count(values: object) -> int:
+    if values is None:
+        return 0
+    if not isinstance(values, list):
+        raise AdminMainError("batch_query_keys: disk replica field is not a list")
+    return len(values)
 
 
 def _memory_views(key: str, values: object) -> tuple[MemoryReplicaView, ...]:

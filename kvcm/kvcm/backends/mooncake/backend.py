@@ -26,7 +26,9 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Sequence
 
+from kvcm.backends.mooncake.admin_main import AdminMainError
 from kvcm.backends.mooncake.client import StoreClient, StoreClientError
+from kvcm.native.loader import load_native
 from kvcm.engines.vllm.keys import KeyComputer
 from kvcm.ledger import Ledger
 from kvcm.ops.base import (
@@ -89,6 +91,9 @@ class MooncakeBackend(KvOps):
         submit_concurrency: int = 4,
         executor: ThreadPoolExecutor | None = None,
         rpc_timeout_s: float = 30.0,
+        admin: Any | None = None,
+        native: Any | None = None,
+        promote_hits: int = 2,
     ) -> None:
         """
         client：已 connect 的 StoreClient（控制面身份，global_segment_size=0）。
@@ -114,7 +119,15 @@ class MooncakeBackend(KvOps):
         """
         if submit_concurrency <= 0:
             raise ValueError("submit_concurrency must be positive")
+        if promote_hits < 1:
+            raise ValueError("promote_hits must be positive")
         self._client = client
+        # 副本核验走主线 GET /batch_query_keys。不设则核验失败，不退回
+        # batch_get_replica_desc。
+        self._admin = admin
+        # 测试注入的假扩展。None 时 pin/retain 去加载 kvcm_native。
+        self._native = native
+        self._promote_hits = promote_hits
         self._keys = key_computer
         self._locate = locate
         self._cap = capability
@@ -431,22 +444,30 @@ class MooncakeBackend(KvOps):
         return TaskStatus.READY
 
     async def _verify_missing(self, plan: list[tuple[str, str]]) -> list[str]:
-        """副本核验：每个 key 在其映射目标 seg 上有内存副本；返回缺失明细
-        （空 = 通过）。核验 RPC 失败抛 QueryError（可重试）。
+        """副本核验：每个 key 在其映射目标上有内存副本；返回缺失明细
+        （空 = 通过）。
 
-        TODO(版本接线)：capability has_admin_query = YES（main）时应切
-        HTTP /batch_query_keys 零副作用通道——当前写死绑定通道，每次
-        核验都给 key 续租（GetReplicaList 副作用），0.3.11 别无选择。
+        走主线 GET /batch_query_keys（零副作用）。段还在不在，用副本描述
+        里的传输端点去比。不用 batch_get_replica_desc：那条会续租、计命中。
+        查询失败抛 QueryError（可重试）。
         """
+        if self._admin is None:
+            raise QueryError(
+                "副本核验需要主线 GET /batch_query_keys，未配置 admin"
+            )
+        keys = [key for key, _ in plan]
+        try:
+            parsed = await self._rpc(self._admin.batch_query_keys, keys)
+        except (AdminMainError, StoreClientError) as e:
+            raise QueryError(str(e)) from e
         missing: list[str] = []
         for key, seg in plan:
-            try:
-                descs = await self._rpc(
-                    self._client.batch_memory_replica_endpoints, [key]
-                )
-                endpoints = descs.get(key, [])
-            except StoreClientError as e:
-                raise QueryError(str(e)) from e
+            item = parsed.get(key)
+            endpoints = (
+                [m.transport_endpoint for m in item.memory]
+                if item is not None and item.ok
+                else []
+            )
             if seg not in endpoints:
                 missing.append(f"{key} missing on {seg} (have={sorted(endpoints)})")
         return missing
@@ -719,11 +740,29 @@ class MooncakeBackend(KvOps):
         await self._record(handle, "running")
         return handle
 
+    def _extension(self):
+        """自封装 .so。没有注入、也加载不到时抛 NativeMissing。"""
+        if self._native is not None:
+            return self._native
+        return load_native()
+
+    async def _require_ledger(self):
+        if self._ledger is None:
+            raise RuntimeError("保活登记需要 Ledger")
+
     async def keepalive(self, prefix: Prefix) -> None:
-        raise NotImplementedError("keepalive：随保活注册表落地")
+        """登记保活。写入与 KeepaliveLoop.register 同一张 keepalive 表。
+
+        续租不在这里做，仍由循环的 exists → BatchExistKey（batch_is_exist）。
+        不改成 ProbeKey。
+        """
+        await self._require_ledger()
+        await self._in_ledger(self._ledger.register_keepalive, prefix)
 
     async def stop_keepalive(self, prefix: Prefix) -> None:
-        raise NotImplementedError("stop_keepalive：随保活注册表落地")
+        """注销保活。同一张表，DELETE 这一条前缀。"""
+        await self._require_ledger()
+        await self._in_ledger(self._ledger.unregister_keepalive, prefix)
 
     async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
         if kind is PinKind.HARD:
@@ -736,26 +775,102 @@ class MooncakeBackend(KvOps):
             raise UnsupportedCapabilityError(
                 "soft pin 事后加：通道不具备（自封装 .so 接线前）"
             )
-        raise NotImplementedError("soft pin：通道具备但尚未接线")
+        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        if not keys:
+            raise ValueError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        # 加载失败直接抛出：没有钉上。
+        ext = self._extension()
+        await self._rpc(ext.soft_pin_empty_upsert, self._client.binding(), keys)
 
     async def demote(self, prefix: Prefix) -> None:
-        raise NotImplementedError("demote：随释放流程落地")
+        """先停保活，再查是否已有盘副本。
+
+        没有盘副本就失败：还没落盘，不能当成已经降层。只查一次，不等待。
+        盘副本看 /batch_query_keys 的 disk / local_disk 条数。
+        """
+        await self.stop_keepalive(prefix)
+        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        if not keys:
+            raise ValueError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        if self._admin is None:
+            raise QueryError("降层查盘副本需要主线 GET /batch_query_keys")
+        try:
+            parsed = await self._rpc(self._admin.batch_query_keys, keys)
+        except (AdminMainError, StoreClientError) as e:
+            raise QueryError(str(e)) from e
+        missing = [
+            key
+            for key in keys
+            if parsed.get(key) is None
+            or not parsed[key].ok
+            or parsed[key].disk_replicas < 1
+        ]
+        if missing:
+            raise RuntimeError(
+                "demote: 还没有盘副本，没有降层成功: " + ", ".join(missing[:4])
+            )
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
-        raise NotImplementedError("promote：随提回流程落地")
+        """对前缀的 key 调 GetReplicaList，次数默认 2，用来过命中线。
 
-    async def retain(self, prefix: Prefix) -> TaskHandle:
-        raise NotImplementedError("retain：随保留流程落地（能力集 has_retained_client）")
-
-    async def remove(self, prefix: Prefix) -> None:
-        """删除该前缀展开出的全部 key，每个 key 的全部副本一起删（全局生效）。
-
-        绑定 ``batch_remove(keys, force=False)``。不占新内存，不调用
-        ``_admit_new_bytes``。没有调用方：ReleaseLoop 仍不调它。
+        走绑定 batch_get_replica_desc（batch_memory_replica_endpoints），
+        不走 /batch_query_keys，不做读删写。过线后目标端点上仍没有内存
+        副本就失败，不在这里空等。
         """
         keys = self._keys.keys_for_tokens(prefix.token_ids)
         if not keys:
             raise ValueError(
                 "prefix expands to no keys (shorter than one block?)"
             )
-        await self._rpc(self._client.batch_remove, keys)
+        plan = self._keys.build_plan(keys, list(self._locate(target)))
+        last: dict = {}
+        for _ in range(self._promote_hits):
+            last = await self._rpc(
+                self._client.batch_memory_replica_endpoints, keys
+            )
+        missing = [
+            f"{key} missing on {seg} (have={sorted(last.get(key, []))})"
+            for key, seg in plan
+            if seg not in last.get(key, [])
+        ]
+        if missing:
+            raise RuntimeError(
+                "promote: 命中次数已过线，目标上还没有内存副本，没有提回成功:\n  "
+                + "\n  ".join(missing)
+            )
+        return TaskHandle(op=OpKind.PROMOTE, task_ids=())
+
+    async def retain(self, prefix: Prefix) -> TaskHandle:
+        """保留身份走自封装 .so。加载不到就失败，不返回已保留的空句柄。"""
+        if self._cap.has_retained_client.channel is not Support.YES:
+            raise UnsupportedCapabilityError(
+                "retained client：通道不具备（0.3.11 无此接口；main 依赖自封装 .so）"
+            )
+        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        if not keys:
+            raise ValueError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        ext = self._extension()
+        await self._rpc(ext.register_retained_client, self._client.binding())
+        return TaskHandle(op=OpKind.RETAIN, task_ids=())
+
+    async def remove(self, prefix: Prefix, force: bool = False) -> None:
+        """删除该前缀展开出的全部 key，每个 key 的全部副本一起删。
+
+        force=False：不停保活，``batch_remove(..., force=False)``。
+        force=True：先停这份前缀的保活，再 ``batch_remove(..., force=True)``。
+        不占新内存，不调用 ``_admit_new_bytes``。
+        """
+        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        if not keys:
+            raise ValueError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        if force:
+            await self.stop_keepalive(prefix)
+        await self._rpc(self._client.batch_remove, keys, force)

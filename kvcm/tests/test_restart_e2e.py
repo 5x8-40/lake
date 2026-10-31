@@ -53,6 +53,9 @@ def fake_store_module(monkeypatch):
     pkg = types.ModuleType("mooncake")
     monkeypatch.setitem(sys.modules, "mooncake", pkg)
     monkeypatch.setitem(sys.modules, "mooncake.store", mod)
+    from test_backend import _install_verify_admin
+
+    _install_verify_admin(monkeypatch)
     return mod
 
 

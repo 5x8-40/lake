@@ -45,6 +45,7 @@ class OpKind(enum.Enum):
     COPY = "copy"
     MOVE = "move"
     PROMOTE = "promote"
+    RETAIN = "retain"
 
 
 @dataclass(frozen=True)
@@ -177,8 +178,12 @@ class KvOps(ABC):
         """
         raise self._unsupported("retain")
 
-    async def remove(self, prefix: Prefix) -> None:
-        """删除前缀 KV 的全部副本，全局生效。无 READY。"""
+    async def remove(self, prefix: Prefix, force: bool = False) -> None:
+        """删除前缀 KV 的全部副本，全局生效。无 READY。
+
+        force=False：不停保活，删除走绑定默认保险（lease 未过期或任务
+        在途时 master 拒删）。force=True：先停这份前缀的保活，再强删。
+        """
         raise self._unsupported("remove")
 
     @abstractmethod

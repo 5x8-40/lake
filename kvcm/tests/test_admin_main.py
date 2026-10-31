@@ -82,6 +82,14 @@ def test_parse_batch_query_keys_memory_endpoint_and_miss() -> None:
     assert miss.ok is False
     assert miss.error == "OBJECT_NOT_FOUND"
     assert miss.memory == ()
+    assert hot.disk_replicas == 0
+    with_disk = parse_batch_query_keys(
+        '{"success": true, "data": {"k": {"ok": true, "values": [],'
+        ' "local_disk_values": [{"client_id": "c", "object_size": 1,'
+        ' "transport_endpoint": "10.0.0.1:1"}]}}}'
+    )
+    assert with_disk["k"].disk_replicas == 1
+    assert with_disk["k"].memory == ()
 
 
 def test_parse_tenant_quotas_list_and_single() -> None:
@@ -139,12 +147,12 @@ def test_mainline_admin_paths_with_fake_body() -> None:
     assert seen[2] == "http://127.0.0.1:9003/api/v1/tenant_quotas"
 
 
-def test_capability_records_endpoint_without_switching_verify() -> None:
+def test_capability_verify_uses_batch_query_keys() -> None:
     main = mooncake_main()
     note = main.has_admin_query.note
     assert main.has_admin_query.channel is Support.YES
-    assert "不把核验调用换过去" in note
-    assert "不会自动接上" in note
+    assert "/batch_query_keys" in note
+    assert "GetReplicaList" in note
     assert main.has_tenant_quota.channel is Support.YES
     assert "段剩余" in main.has_tenant_quota.note
 

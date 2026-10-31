@@ -1,8 +1,7 @@
 """常驻循环（E11 进程化的支撑组件，L2）。
 
-KeepaliveLoop 本期落地；ReleaseLoop / RetainLoop 只留骨架，不调用
-move / remove（后端方法已接线，这里仍没有调用方）。demote / retain
-在 L4 仍是 NotImplementedError。
+KeepaliveLoop 本期落地。ReleaseLoop / RetainLoop 只留骨架，不调用
+已落地的 move / remove / demote / retain。续租仍是本循环的 exists。
 
 形态：**协程定时器**（事件循环内 `asyncio.sleep` 周期触发），不是独立
 线程——E11 执行模型。
@@ -229,10 +228,9 @@ class KeepaliveLoop:
 
 class ReleaseLoop:
     """软释放 / demote / 主动 Remove 三级（D1 §6）。骨架——不调用
-    已落地的 remove；demote 在 L4 仍是 NotImplementedError。"""
+    已落地的 remove / demote。"""
 
 
 class RetainLoop:
-    """retain 与计划下线编排（D2 §4）。骨架——不调用已落地的 move。
-    retain 在 L4 仍是 NotImplementedError（主路径 retained client
-    注册没有绑定入口）。"""
+    """retain 与计划下线编排（D2 §4）。骨架——不调用已落地的 move / retain。
+    retain 的保留身份走自封装 .so，加载不到就失败。"""

@@ -103,6 +103,10 @@ class StoreClient:
             raise StoreClientError("not connected")
         return self._store
 
+    def binding(self):
+        """已建好的 store_py 对象。自封装 .so 复用它，不再新建 client。"""
+        return self._s()
+
     # ------------------------------------------------------------------
     # 存在性
     # ------------------------------------------------------------------
