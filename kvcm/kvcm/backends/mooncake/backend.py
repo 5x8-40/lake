@@ -276,7 +276,8 @@ class MooncakeBackend(KvOps):
     async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机 seg 为前缀 KV 建副本（发起式；READY 经 query_task）。
 
-        内部展开：前缀 → key 列表（引擎侧）→ 目标实例 seg 列表（locate）
+        调用方只给实例，入参没有 segment。段从进程内目录 ``locate(target)``
+        读。内部展开：前缀 → key 列表（引擎侧）→ 目标实例 seg 列表
         → rank 映射计划（引擎侧）→ 逐 key 发起复制任务。「复制前确认
         warm 已覆盖前缀」的存在性检查归编排层，不在本操作内。
         """
@@ -628,12 +629,14 @@ class MooncakeBackend(KvOps):
         target: InstanceId,
         source: InstanceId | None = None,
     ) -> TaskHandle:
-        """把前缀 KV 从源实例的 seg 挪到目标实例的 seg（一次一个 key）。
+        """把前缀 KV 从源实例挪到目标实例（一次一个 key）。
 
-        与 copy 同形：前缀展开 → rank 映射计划 → 进程级信号量逐 key 提交
-        → 句柄登记，READY 仍走 query_task 的目标侧副本核验。差别是绑定
-        ``create_move_task(key, source, target)`` 的 source 是段名且必填，
-        所以源实例不能省——按与目标相同的 rank 映射换成源段。
+        调用方只给实例，入参没有 segment。内部自己 ``locate(源)`` 和
+        ``locate(目标)``，两边可以是不同的段。与 copy 同形：前缀展开 →
+        rank 映射计划 → 进程级信号量逐 key 提交 → 句柄登记，READY 仍走
+        query_task 的目标侧副本核验。绑定 ``create_move_task(key, source,
+        target)`` 的 source 是段名且必填，所以源实例不能省——段从目录里
+        按 rank 映射出来，不是调用方传入的。
 
         提交前 ``await self._admit_new_bytes(plan)``。plan 与 copy 同形，
         是 ``(key, 目标 seg)`` 列表：目标段要新占一份。这个方法由外部赋到

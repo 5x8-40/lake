@@ -27,13 +27,19 @@ KeepaliveLoop 停 → **等 RPC 线程结束** → StoreClient.close() + ledger.
 - `os._exit` 跳过 GC / `__del__` / atexit：已提交的 ledger 行还在（正在写的
   那条丢掉，靠 rebuild 重建 running 任务）；mooncake 侧靠 client TTL 回收
 
-locate 本期静态注入（`--segs`，单实例冒烟形态）；生产 locate =
-L1 InstanceWatcher 注册，归 E13。
+locate 读进程里的一份实例目录，不读命令。SubmitIntent 只有
+prefix{model_id, token_ids} 和 target 实例名；copy / move / remove
+也不带段。``--instance-segs`` 只在进程拉起时做初始登记
+（``实例=seg0,seg1``，可重复），不是每次操作换一套。进程跑着时用
+``register`` 加实例。``locate(实例)`` 只返回该实例的段；没登记就报错。
+实例下线不在这里。
 
 用法：
     python -m kvcm.daemon --master 127.0.0.1:50088 \
         --local-hostname 127.0.0.1:13021 \
-        --model-name qwen --tp-size 2 --segs seg0,seg1 \
+        --model-name qwen --tp-size 2 \
+        --instance-segs inst-a=seg0,seg1 \
+        --instance-segs inst-b=seg2,seg3 \
         --ledger /var/lib/kvcm/ledger.sqlite \
         --listen 127.0.0.1:9000
 """
@@ -52,6 +58,7 @@ from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.capability import mooncake_main, mooncake_v0311
 from kvcm.backends.mooncake.client import StoreClient
 from kvcm.engines.vllm.keys import KeyComputer
+from kvcm.instances import directory_from_specs
 from kvcm.ledger import Ledger
 from kvcm.loops import KeepaliveLoop
 from kvcm.task_engine import TaskEngine
@@ -63,8 +70,8 @@ def build_backend(
     ledger: Ledger,
     executor: ThreadPoolExecutor | None = None,
 ) -> MooncakeBackend:
-    """按参数组装 backend。独立成函数便于测试注入（fake client +
-    静态 locate 即可起进程壳）。"""
+    """按参数组装 backend。独立成函数便于测试注入（fake client 即可起
+    进程壳）。实例目录在这里装一次，locate 走这份目录。"""
     keys = KeyComputer(
         model_name=args.model_name,
         block_size=args.block_size,
@@ -73,12 +80,12 @@ def build_backend(
         put_step=args.put_step,
         hash_algo=args.hash_algo,
     )
-    segs = [s for s in args.segs.split(",") if s]
+    directory = directory_from_specs(args.instance_segs)
     capability = mooncake_main() if args.capability == "main" else mooncake_v0311()
     return MooncakeBackend(
         client=client,
         key_computer=keys,
-        locate=lambda _inst: list(segs),  # 静态注入；生产 = InstanceWatcher（E13）
+        locate=directory.locate,
         capability=capability,
         ledger=ledger,
         submit_concurrency=args.copy_submit_concurrency,
@@ -372,9 +379,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--put-step", type=int, default=1)
     p.add_argument("--hash-algo", default="sha256")
     p.add_argument(
-        "--segs",
+        "--instance-segs",
+        action="append",
         required=True,
-        help="静态 locate：rank 有序 seg 列表，逗号分隔（生产 = InstanceWatcher，E13）",
+        dest="instance_segs",
+        metavar="INSTANCE=SEG0,SEG1",
+        help="进程拉起时的初始登记：实例=rank 有序 seg 列表，可重复。"
+        "不是 SubmitIntent / copy / move / remove 的参数；"
+        "locate 只返回这一实例的段，没登记就报错",
     )
     p.add_argument(
         "--capability",

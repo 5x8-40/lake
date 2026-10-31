@@ -416,7 +416,7 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
         peer_tp_size=None,
         put_step=1,
         hash_algo="sha256",
-        segs="seg-A",
+        instance_segs=["inst-B=seg-A"],
         capability="v0311",
         rpc_timeout_s=30.0,
         copy_submit_concurrency=7,  # 非默认值，才能证明真的传了
@@ -425,6 +425,9 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
     assert seen["submit_concurrency"] == 7, (
         f"--copy-submit-concurrency 没传下去: {seen.get('submit_concurrency')}"
     )
+    assert list(seen["locate"]("inst-B")) == ["seg-A"]
+    with pytest.raises(KeyError, match="not registered"):
+        seen["locate"]("other")
 
 
 def test_copy_submits_concurrently_up_to_cap(fake_store_module, monkeypatch) -> None:
@@ -1362,10 +1365,14 @@ def test_close_bounded_when_rpc_hangs(fake_store_module, monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _locate_move(inst):
-    if inst == "src":
-        return ["seg-S0", "seg-S1"]
-    return ["seg-T0", "seg-T1"]
+def _move_directory():
+    """源、目标各一份段名单。没登记的实例不会落到其中任何一份。"""
+    from kvcm.instances import InstanceDirectory
+
+    directory = InstanceDirectory()
+    directory.register(InstanceId("src"), ["seg-S0", "seg-S1"])
+    directory.register(InstanceId("tgt"), ["seg-T0", "seg-T1"])
+    return directory
 
 
 class MoveClient(FakeClient):
@@ -1399,10 +1406,59 @@ def _move_backend(client, monkeypatch, ledger=None, capability=None):
     return MooncakeBackend(
         client=client,
         key_computer=kc,
-        locate=_locate_move,
+        locate=_move_directory().locate,
         capability=capability or mooncake_v0311(),
         ledger=ledger,
     )
+
+
+def test_move_between_two_registered_instances(fake_store_module, monkeypatch) -> None:
+    """A、B 各有自己的段。移动用 locate(源) 和 locate(目标)，两边不是同一段。"""
+    from kvcm.instances import InstanceDirectory
+
+    directory = InstanceDirectory()
+    directory.register(InstanceId("A"), ["seg-A0", "seg-A1"])
+    directory.register(InstanceId("B"), ["seg-B0", "seg-B1"])
+    assert directory.locate(InstanceId("A")) != directory.locate(InstanceId("B"))
+
+    client = MoveClient()
+    kc = KeyComputer(model_name="qwen", tp_size=2)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=directory.locate,
+        capability=mooncake_v0311(),
+    )
+
+    async def admit(plan):
+        return None
+
+    b._admit_new_bytes = admit
+    run(b.move(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("B"), InstanceId("A")))
+    assert [(src, tgt) for _, src, tgt in client.moves] == [
+        ("seg-A0", "seg-B0"),
+        ("seg-A1", "seg-B1"),
+    ]
+    assert {src for _, src, _ in client.moves}.isdisjoint(
+        {tgt for _, _, tgt in client.moves}
+    )
+
+    # 进程已经在用这份目录，还可以再登记一个新实例。
+    directory.register(InstanceId("C"), ["seg-C0"])
+    assert directory.locate(InstanceId("C")) == ("seg-C0",)
+
+    with pytest.raises(KeyError, match="not registered"):
+        directory.locate(InstanceId("missing"))
+    client.moves.clear()
+
+    async def admit_should_not_run(plan):
+        raise AssertionError("未登记的实例不该进入容量判断")
+
+    b._admit_new_bytes = admit_should_not_run
+    with pytest.raises(KeyError, match="not registered"):
+        run(b.move(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("B"), InstanceId("missing")))
+    assert client.moves == []
 
 
 def test_move_admits_then_submits_one_task_per_key(fake_store_module, monkeypatch) -> None:
