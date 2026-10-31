@@ -48,10 +48,10 @@ kvcm 是独立原型，以下仅作参考，不构成约束。
 
 **引擎 kv event**
 
-- **F7 事件 schema 带介质字段**：`MEDIUM_GPU` / `MEDIUM_CPU`（上游 `vllm/distributed/kv_events.py:51-52`）；`BlockStored{block_hashes, parent_block_hash, token_ids, block_size, medium}`（`:56-68`）。medium 标记 KV 在哪种介质上——gpu = HBM 显存、cpu = DRAM 内存池；router 据此区分命中层级（§5 分层成本）。
+- **F7 事件 schema 带介质字段**：`MEDIUM_GPU = "GPU"` / `MEDIUM_CPU = "CPU"`（上游 `vllm/distributed/kv_events.py:51-52`）；`BlockStored{block_hashes, parent_block_hash, token_ids, block_size, medium}`（`:56-68`）。`"GPU"` 是 HBM，`"CPU"` 是 DRAM 内存池；router 据此区分命中层级（§5 分层成本）。kvcm 补发用 `MEDIUM_CPU`（`"CPU"`），不用小写 `"cpu"`。
 - **F8 事件有两个发布源**：
-  1. **引擎核（GPU/APC 块）**：上游 `BlockPool` 在块进 HBM 缓存时发 `BlockStored(medium="gpu")`、驱逐时发 `BlockRemoved(medium="gpu")`（上游 `vllm/v1/core/block_pool.py:362` / `:548` / `:621`）；vllm-ascend 的 coordinator patch 原样建 `BlockPool` 并透传门控（`patch_kv_cache_coordinator.py:120-127`）。
-  2. **连接器（池 put）**：worker 侧在引擎自己 put 成功后生成 `BlockStored(medium="cpu")`（`kv_transfer.py:870-876`、`pool_worker.py:2071-2077`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py:198`）；门控 `enable_kv_cache_events`（`pool_worker.py:328`）。池副本的删除/驱逐不在这条引擎通道上发——那是 master publisher 的事（另一条通道，F14，0.3.11 不含）。
+  1. **引擎核（GPU/APC 块）**：上游 `BlockPool` 在块进 HBM 缓存时发 `BlockStored(medium=self.medium)`，默认 `MEDIUM_GPU`（`"GPU"`）；驱逐时发 `BlockRemoved`，介质同样是 `self.medium`（上游 `vllm/v1/core/block_pool.py:362` / `:548` / `:621`）；vllm-ascend 的 coordinator patch 原样建 `BlockPool` 并透传门控（`patch_kv_cache_coordinator.py:120-127`）。
+  2. **连接器（池 put）**：worker 侧在引擎自己 put 成功后生成 `BlockStored`，介质写的是小写字面量 `"cpu"`（`kv_transfer.py`、`pool_worker.py`；vLLM 树里同形的是 `mooncake/store/worker.py` 的 `BlockStored`），跨 rank `KVEventAggregator` 聚合后经 `take_events()` 发出（`ascend_store_connector.py`）；门控 `enable_kv_cache_events`。这个字面量不是常量 `MEDIUM_CPU`。kvcm 补发跟常量 `"CPU"`，不跟这个字面量（Dynamo 索引按 `"CPU"` 认 DRAM）。池副本的删除/驱逐不在这条引擎通道上发——那是 master publisher 的事（另一条通道，F14，0.3.11 不含）。
   - 范围：本部署只挂 AscendStoreConnector；recompute_cpu_offload（旧名 preempt_offload）connector 另有事件路径（`recompute_cpu_offload/manager.py:107`，cpu_block_pool 事件），不在本部署范围。
 - **F9 盲区一：预复制在两条通道上都不会自动产生事件**：引擎事件只在引擎处理请求时产生（F8 两条路径都要过引擎代码），`create_copy_task` 完全在引擎之外 → 引擎通道**结构上**不会有预复制事件；master publisher（F14，main 才有、0.3.11 不含）是另一条通道，其复制路径同样零发布——所以预复制落位只能由 kvcm 补发（§2 方案 a）。
 - **F10 盲区二：引擎事件通道上看不到池副本的删除**：vllm-ascend 全仓零 `BlockRemoved` → 池副本消失（驱逐 / TTL / key 的 client_id 下线清其 seg 内副本，F5）对引擎事件消费者不可见。注意三条通道别混淆：HBM 淘汰有 Removed（引擎通道，F8-1）；池删除有 removed（master publisher 通道，F14，0.3.11 不含）；引擎通道的池 put 只有 Stored 没有 Removed。
@@ -106,7 +106,7 @@ flowchart TB
         SB["本机 DRAM seg"]
     end
     EA -->|"② put 满块，固定写本机 seg（preferred_segment）"| SA
-    EA -.->|"③ BlockStored gpu/cpu；BlockRemoved 仅 gpu（F8）"| IDX
+    EA -.->|"③ BlockStored GPU/CPU；BlockRemoved 仅 GPU（F8）"| IDX
     EA -->|"local-first 本机读（F3）"| SA
     EB -->|"⑤ 副本在 A：跨机 RDMA 读"| SA
     EA -->|"④ 读：BatchQuery 现查（F1）"| M
@@ -228,11 +228,11 @@ flowchart LR
 | `parent_block_hash` | 同上，链首块的 parent |
 | `token_ids` | 满块覆盖的 token，个数 = len(block_hashes) × block_size。不满一块的尾巴不进事件 |
 | `block_size` | 参数 |
-| `medium` | 与引擎池 put 事件对齐（F8；上游常量 `MEDIUM_CPU`，`kv_events.py:51`） |
+| `medium` | 上游常量 `MEDIUM_CPU`，字符串 `"CPU"`（`kv_events.py:52`）。连接器池 put 写了小写 `"cpu"`（F8-2），与常量不一致；补发跟常量 |
 
-- **发布组件**：直接 import 上游 `ZmqEventPublisher`（`kv_events.py:304`）——构造给 `endpoint`/`topic`，`publish(EventBatch)` 一次调用；wire 格式（topic + seq + msgpack 三帧）与 replay buffer 内置。kvcm 容器路径本就已 import vllm / vllm_ascend（keys.py），零新增依赖；沿用 keys.py/common.py 的 lazy import 形态，debug 路径不背 vllm。
-- **身份（哪台机器）**：事件体无实例字段（仅 `data_parallel_rank`，`kv_events.py:39`），上游机制是**身份 = 端点**——索引按订阅端点把事件归入实例；一个实例多个端点有现成先例（DP rank 端口偏移 `offset_endpoint_port`，`kv_events.py:528`）。因此 kvcm **每个目标实例开一个发布端点**。kvcm 的发布路径不调用 `/register`。索引自己订阅：Dynamo 是调用方 `POST /register` 或索引启动参数 `--workers`（`standalone-indexer.md`）；llm-d 是 Router 配置 `ZMQEndpoint` 后自己订阅（`preciseprefixcache/producer.go`）。把地址交给索引仍归 E13，不在补发函数里。索引把补发端点并入该实例的端点集合即可，不需要新概念。ZMQ topic 是消息分拣标签（订阅端按它过滤消息），多个发布者可共用同一个 topic——它标不出「来自哪台机器」，所以身份只能走端点。
-- **发布时机**：READY 核验通过（`precopy.py::assert_targets_have_replicas`）后，一次预复制发一条 `BlockStored`（block_hashes = 前缀连续满块链；引擎侧经 `KVEventAggregator` 跨 rank 聚合后同语义）。一条 `BlockStored` 可以装连续满块链（vLLM `block_pool.py::_build_block_stored_event`）。Mooncake 连接器一块一条是同一格式的短列表（`mooncake/store/worker.py`）。补发失败（没有端点或发送抛错）只记日志，不把已经 READY 的操作判成失败。预热仍成功，保活照常登记。
+- **发布组件**：直接 import 上游 `ZmqEventPublisher`（`kv_events.py:304`）——`publish(EventBatch)` 一次调用；wire 格式（topic + seq + msgpack 三帧）与 replay buffer 在这个类里。调用只传 `data_parallel_rank=0` 和 `endpoint`；topic 用上游默认空串（与 `KVEventsConfig` 默认相同），不另开 `replay_endpoint`。kvcm 容器路径本就已 import vllm / vllm_ascend（keys.py），零新增依赖；沿用 keys.py/common.py 的 lazy import 形态，debug 路径不背 vllm。
+- **身份（哪台机器）**：事件体无实例字段（仅 `data_parallel_rank`，`kv_events.py:39`），上游机制是**身份 = 端点**——索引按订阅端点把事件归入实例；一个实例多个端点有现成先例（DP rank 端口偏移 `offset_endpoint_port`，`kv_events.py:528`）。因此 kvcm **每个目标实例开一个发布端点**（不按 seg、不按 rank 拆）。当前 DP=1：`data_parallel_rank` 固定 0，不按 rank 改端口（`offset_endpoint_port` 在秩 0 时端口本来不动）；引擎继续绑自己的端口，kvcm 用 `--kv-event-endpoint instance_id=tcp://*:port` 另绑一个。第一次要给该实例补发时才构造 `ZmqEventPublisher` 并绑定；实例下线不关，`shutdown` 只在 kvcm 进程退出时调用。kvcm 的发布路径不调用 `/register`，也不订阅 master publisher。索引自己订阅：Dynamo 是调用方 `POST /register` 或索引启动参数 `--workers`（`standalone-indexer.md`）；llm-d 是 Router 配置 `ZMQEndpoint` 后自己订阅（`preciseprefixcache/producer.go`）。把地址交给索引仍归 E13，不在补发函数里。索引把补发端点并入该实例的端点集合即可，不需要新概念。ZMQ topic 是消息分拣标签（订阅端按它过滤消息），多个发布者可共用同一个 topic——它标不出「来自哪台机器」，所以身份只能走端点。
+- **发布时机**：`MooncakeBackend.query_task` 副本核验通过（`_verify_missing`：plan 里每个 key 都在映射到的目标 seg 上有内存副本）并返回 READY 之后，`TaskEngine._on_ready` 发一条 `BlockStored`（block_hashes = 前缀连续满块链；引擎侧经 `KVEventAggregator` 跨 rank 聚合后同语义）。服务路径不从 demo 的 `precopy.py::assert_targets_have_replicas` 补发。重启后仍是 running 的 copy，在轮询前用 `target_of` 读出登记里的目标实例（终态会删登记），READY 后走同一处。一条 `BlockStored` 可以装连续满块链（vLLM `block_pool.py::_build_block_stored_event`）。Mooncake 连接器一块一条是同一格式的短列表（`mooncake/store/worker.py`）。补发失败（没有端点或发送抛错）只记日志，不把已经 READY 的操作判成失败。预热仍成功，保活照常登记。
 - **幂等**：索引是集合语义，补发与引擎自发重复无害；重复预热重复补发亦无害（池层幂等 F11）。
 - **形态无关性（设计性质）**：补发接口与消费侧形态无关——**一套端点、一套格式**（引擎格式 + 身份 = 端点），「Router 内置索引」与「独立进程 Conductor」两种方案 kvcm 零适配、零分支；差异 100% 在编排层注册动作（端点配置给 Router vs 调 Conductor `/register`）。成立依据是两种消费侧吃的是同一种格式：Conductor 的实现证据 `mooncake-conductor/src/zmq/msg_decoder.cpp::ParseVllmEvent:365`（vLLM 的 `BlockStored` / `BlockRemoved` / `AllBlocksCleared` 全解析，`DecodeVllmEventBatch:886`），Router 内置索引（llm-d/Dynamo 形态）订的同样是该格式。消费侧选型归 Router 团队，不构成 kvcm 的设计变量。
 
@@ -245,7 +245,7 @@ flowchart LR
 成立条件（已核事实）：
 
 - **Router 口径即索引声称**：Router 不读 master（§2），「拥有」= 索引中 P 的连续满块链每个 block hash 都有 X 的条目。条目可能过时（cpu 侧只增不减，F10），选错由读路径兜底（F3），只损性能。
-- **rank 维度由事件语义消除**：引擎侧全 rank put 才发（`KVEventAggregator`，F8-2）；kvcm 侧全 rank READY 核验才补发（`assert_targets_have_replicas`）。一条事件 = 该实例全 rank 齐备，router 无需 per-rank 索引。MLA（`put_step>1`）时 KV 只按 rank 0 存（传输计划全部分配到 `targets[0]`），判定退化为单 rank，未实测（E7）。
+- **rank 维度由事件语义消除**：引擎侧全 rank put 才发（`KVEventAggregator`，F8-2）；kvcm 侧全 rank READY 核验才补发（`MooncakeBackend._verify_missing`）。一条事件 = 该实例全 rank 齐备，router 无需 per-rank 索引。MLA（`put_step>1`）时 KV 只按 rank 0 存（传输计划全部分配到 `targets[0]`），判定退化为单 rank，未实测（E7）。
 - **本机 = 事件归属实例**：cpu 条目的物理位置 = 发布端点归属的实例（引擎 put 固定写本机 seg；kvcm 按目标实例端点补发，§2）。同机多实例各持 seg 的细分（本机他实例 seg 算不算「本机」）当前部署不出现，出现时按 seg→实例注册细化，归 D4/E13。
 
 ### 4. 时序：预热与选路的先后
