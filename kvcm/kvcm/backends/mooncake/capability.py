@@ -84,7 +84,7 @@ def mooncake_main() -> BackendCapability:
         has_offload=Capability(
             Support.YES,
             Support.YES,
-            "同 0.3.11：停保活、等满 lease TTL、再用 GET /batch_query_keys 查盘副本；没有就失败",
+            "主线：停保活、等满 lease TTL、再用 GET /batch_query_keys 查盘副本；没有就失败",
         ),
         has_promotion=Capability(
             Support.YES,
