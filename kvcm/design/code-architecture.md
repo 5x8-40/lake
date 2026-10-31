@@ -359,7 +359,7 @@ stateDiagram-v2
 |------|------|--------|
 | KeyComputer | 前缀 → hash 链 → PoolKey。key 格式直接从 vllm-ascend 库导入（两个版本的导入路径都试），保证和引擎算得一致；容器外没有库时回退到内置的格式副本并警告可能和引擎不一致，容器内有测试逐字节比对，用来兜住这个风险。`build_plan`：每条 key 映射到目标 seg（源和目标 TP 不同时按倍数归并）。PYTHONHASHSEED 必须为 0 的检查 | `engines/vllm/keys.py` |
 | RankTopology | rank 与 KV 切片的对应关系（TP/PP/DP 切分；源和目标 TP 不同时，kvcm `peer_tp_size` 必须与引擎环境变量 `PEER_TP_SIZE` 同值）；rank 与 seg 对号（探测：pidfile/进程树/ss//proc，跨机时把脚本源码经 ssh 送到目标机执行，ss/ssh 带超时） | `engines/vllm/topology.py` |
-| 事件格式 | 引擎 KV 事件：`BlockStoredPublisher` 用上游 `BlockStored` / `EventBatch` / `ZmqEventPublisher` 构造并发送。一条事件装连续满块链；`hash_token_block_chain` 的 hash 发出前过 `maybe_convert_block_hash`，默认发低 64 位整数，不发原字节，也不发十六进制字符串；`group_idx` 补发填 0；`medium` 为 `MEDIUM_CPU`（`"CPU"`） | `events/publisher.py` |
+| 事件格式 | 引擎 KV 事件：`BlockStoredPublisher` 用上游 `BlockStored` / `EventBatch` / `ZmqEventPublisher` 构造并发送。一条事件装连续满块链；`hash_token_block_chain` 的 hash 发出前过 `maybe_convert_block_hash`，默认发低 64 位整数，不发原字节，也不发十六进制字符串；`group_idx` 补发填 0，同时 `kv_cache_spec_kind="full_attention"`；这次只覆盖纯文本全注意力，滑动窗口和 Mamba 不用这个 kind；`medium` 为 `MEDIUM_CPU`（`"CPU"`） | `events/publisher.py` |
 | engine config | block_size / num_kv_heads / head_size / 层数读取（KV 大小估算） | 待做 |
 
 - **KeyComputer 归引擎侧，不归存储侧**——PoolKey 的权威定义在**引擎**（引擎写 KV 时用的就是这个 key；kvcm 不定自己的格式，只是按同样的规则把 key 再算出来）；mooncake 对 key 无格式要求（不透明字符串），后端不掺和 key 语义
