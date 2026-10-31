@@ -269,7 +269,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
     - 直接 import 上游 `ZmqEventPublisher`（`kv_events.py:304`）
     - 事件字段取自 keys.py 的中间产物（hash 链 / token ids）。token 只到满块，个数 = len(block_hashes) × block_size，与命中长度一致（D1 §3）
     - 操作对应：复制、移动的目标、主动提回 → `BlockStored`；移动的源、删除 → `BlockRemoved`；保活、钉住、停保活不发。本次代码只在预热 READY 发 `BlockStored`，移动和删除在另一分支，合入后再接
-    - READY 核验后按目标实例各发一条 `BlockStored`
+    - READY 核验后按目标实例各发一条 `BlockStored`。补发失败（没有端点或发送抛错）只记日志，不把已经 READY 的操作判成失败。预热仍成功，保活照常登记
     - 每个目标实例一个发布端点。发布路径不调用 `/register`；把地址交给索引仍归 D4/E13
   - **删除信号（升级 mooncake 后）**：
     - 首选：索引侧直接订阅 master publisher、解析 object_key（Conductor 现成，D1 §2 方案 b）
