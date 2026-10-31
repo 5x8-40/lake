@@ -32,6 +32,7 @@ TaskEngine。
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 
 from kvcm.ops.base import (
@@ -43,6 +44,8 @@ from kvcm.ops.base import (
     VerifyError,
 )
 from kvcm.ops.types import InstanceId, Prefix
+
+logger = logging.getLogger(__name__)
 
 
 class PrefetchError(RuntimeError):
@@ -200,13 +203,23 @@ class PrefetchFlow:
             raise
 
     async def _abandon_submitted(self, err: SubmitError) -> None:
-        """提交失败里已经落账的句柄先 abandon。池里的传输不取消。"""
+        """提交失败里已经落账的句柄先 abandon。池里的传输不取消。
+
+        账本写失败只记日志，函数照常返回，好让调用方仍用原来的
+        SubmitError 抛 PrefetchError。取消继续抛。
+        """
         if err.handle is None:
             return
         try:
             await self._ops.abandon(err.handle)
+        except asyncio.CancelledError:
+            raise
         except KeyError:
             pass
+        except Exception:
+            logger.exception(
+                "abandon after submit failure failed (handle=%s)", err.handle
+            )
 
     async def _abandon_if_handed(
         self, copy_task: asyncio.Task, handle: TaskHandle | None

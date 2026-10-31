@@ -713,9 +713,52 @@ def test_submit_failure_carries_partial_ids(fake_store_module, monkeypatch) -> N
         run(b.copy(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst-B")))
 
 
-# ---------------------------------------------------------------------------
-# 在途冲突观测态（OBJECT_HAS_REPLICATION_TASK → 不当失败，只核验副本）
-# ---------------------------------------------------------------------------
+def test_prefetch_abandons_ledger_on_submit_error(
+    fake_store_module, monkeypatch
+) -> None:
+    """第二个 key 提交失败：走 PrefetchFlow，账本是 abandoned，不是 running。
+
+    只调 MooncakeBackend.copy 会停在 SubmitError，没人 abandon。
+    """
+    import os
+
+    from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
+
+    class BoomClient(FakeClient):
+        def create_copy_task(self, key, targets):
+            with self._id_lock:
+                already = len(self.created)
+            if already >= 1:
+                raise RuntimeError("submit boom")
+            return super().create_copy_task(key, targets)
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        client = BoomClient()
+        b = _backend(
+            client,
+            KeyComputer(model_name="qwen", tp_size=2),
+            monkeypatch,
+            ledger=led,
+            submit_concurrency=1,
+        )
+        with pytest.raises(PrefetchError, match="copy submit failed"):
+            run(
+                PrefetchFlow(b).run_after_exists(
+                    Prefix(model_id="qwen", token_ids=(1,)),
+                    InstanceId("inst-B"),
+                    poll_s=0.01,
+                    timeout_s=5,
+                )
+            )
+        assert led.list_running_tasks() == []
+        row = led.get_task(encode_task_id((1, 101)))
+        assert row is not None and row.status == "abandoned", row
+    finally:
+        led.close()
+        os.unlink(path)
 
 _CONFLICT_MSG = "OBJECT_HAS_REPLICATION_TASK (max retries reached: 3)"
 
