@@ -338,7 +338,8 @@ stateDiagram-v2
   - **路径 A（已落地的空写）**：把 `setup` 建好的那一个 client 传进扩展，调用它的 `UpsertStart`，不写数据，再 `UpsertEnd`。不 `RealClient::create()`。
     - 扩展是单独的 `_empty_pin.so`，只链 wheel 里的 `store.so`。使用时不读 Mooncake 头文件。
     - 类型在 `kvcm/kvcm/native/mooncake_pin_api.h`：只写到 `master_client_` 为止，成员地址由编译器算。与完整类定义对过：`PyClient::client_` 在 8 字节，`Client::master_client_` 在 48 字节，`ReplicateConfig` 208 字节，`ObjectMeta` 48 字节。
-    - 官方包用 `_get_pyclient_capsule` 把 `setup` 放进 `store_` 的那一个对象交出来。`MooncakeStorePyWrapper` 没有单独头文件，`get_real_client()` 是内联成员，不在动态符号表里，所以没有走「pybind 参数直接声明为 `MooncakeStorePyWrapper&`」那一版。
+    - 官方包用 `_get_pyclient_capsule` 把 `setup` 放进 `store_` 的那一个对象交出来。扩展按 `mooncake_pin_api.h` 里的成员调用 `UpsertStart` / `UpsertEnd`。
+    - **退路仍是包含 `pyclient.h` 的路径 A。** 若当前小头文件在真实调用上失败，再改回：pybind 参数为 `MooncakeStorePyWrapper&`，`get_real_client()` 拿出已建 client。拿到这个对象之后，`get_real_client()` 只是返回成员，一定可行。不确定的是跨模块还原这个类：它没有单独头文件，pybind 版本还要和 wheel 一致。代价是编译期要读 `pyclient.h` 带进来的那串头文件。使用时仍然只链 `store.so`，不读这些头。
     - **client_id**：`MasterClient::UpsertStart` 发出去的是这个 client 自己的 UUID，没有「传入别人的 UUID」的参数。当前空写因此把 `client_id` 改归 kvcm（D2 方案一）。借名（D2 方案二）这条调用做不到，两个方案仍未选定。
     - **写中窗口**：同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 和 End 之间时，副本停在写中；按 D2 F5 补 `End` 或 `Revoke` 的崩溃恢复还没做。
     - 保留身份先不动。设计点名的 `AddReplicaForRetainedClient` 这份主线树里没有；`dummy_client.h` 的 `kRetained` 是外部 buffer 的引用计数，不是引擎死后 KV 还在。

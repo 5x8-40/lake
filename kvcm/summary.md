@@ -76,7 +76,7 @@
 - remove：`force=False` 不停保活，`batch_remove(..., force=False)`；`force=True` 先停这份前缀的保活，再 `force=True`。
 - 保活续租用 BatchExistKey（`exists` → `batch_is_exist`），不用 ProbeKey。`keepalive` / `stop_keepalive` 只登记或注销 Ledger 里的同一张表。
 - 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回不用这条，用会累计命中的 GetReplicaList（默认 2 次）。
-- 软钉空写：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。`UpsertStart` 发出的是这个 client 自己的 UUID，因此 `client_id` 改归 kvcm（D2 方案一）；借名做不到，两个方案仍未选定。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`；进程死在 Start 与 End 之间的恢复还没做（D2 F5）。保留身份先不动。
+- 软钉空写：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。若真实调用失败，退回包含 `pyclient.h` 的路径 A（`get_real_client()` 拿到对象后一定可行；代价是编译期那串头文件，使用时仍只链 `store.so`）。`UpsertStart` 发出的是这个 client 自己的 UUID，因此 `client_id` 改归 kvcm（D2 方案一）；借名做不到，两个方案仍未选定。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`；进程死在 Start 与 End 之间的恢复还没做（D2 F5）。保留身份先不动。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
 - pin：READY 后防驱逐——🟡 候选已列出，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
   - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert 一个方案：
