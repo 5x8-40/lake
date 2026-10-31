@@ -960,8 +960,8 @@ def test_rebuild_restores_watch_state(fake_store_module, monkeypatch) -> None:
         os.unlink(path)
 
 
-def test_empty_handle_is_immediately_ready(fake_store_module) -> None:
-    """空句柄（task_ids=()，没有异步工作）立即 READY，不查登记、不核验。"""
+def test_empty_handle_is_rejected(fake_store_module) -> None:
+    """空任务号不是完成信号，query_task 直接拒绝。"""
     b = MooncakeBackend(
         client=FakeClient(),
         key_computer=KeyComputer(model_name="qwen", tp_size=1),
@@ -971,7 +971,12 @@ def test_empty_handle_is_immediately_ready(fake_store_module) -> None:
     from kvcm.ops.base import TaskHandle
 
     empty = TaskHandle(op=OpKind.COPY, task_ids=())
-    assert run(b.query_task(empty)) is TaskStatus.READY
+    try:
+        run(b.query_task(empty))
+    except ValueError as e:
+        assert "no task ids" in str(e)
+    else:
+        raise AssertionError("empty handle should be rejected")
 
 
 def test_rebuild_skips_unresolvable(fake_store_module, monkeypatch) -> None:

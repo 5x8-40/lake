@@ -42,6 +42,5 @@ class BackendCapability:
     has_promotion: Capability  # 池通道提回
     has_per_key_demote: Capability  # 确定性立即降层
     has_task_cancel: Capability  # copy/move 任务取消
-    has_retained_client: Capability  # 保留身份注册。两版本都没有这个接口
     has_dfs_replica: Capability  # 共享文件系统副本
     has_admin_query: Capability  # 零副作用副本核验

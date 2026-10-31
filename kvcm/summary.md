@@ -88,8 +88,9 @@
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）
 - retain：🟡 已重写，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
   - 清理看副本所在 client，不看 key 的 client_id。没有保留身份注册
-  - 做法：死前 move/copy 到还活着的段；或 kvcm 自己的 client 挂盘并用 `NotifyOffloadSuccess` 登记；或写成 DFS 副本（main，描述里有文件路径）
-  - 降到源引擎自己的盘留不住。改 key 的 client_id 也留不住
+  - 做法：死前 move/copy 到还活着的段（有任务号）；或 kvcm 启动时打开 SSD offload，由初始化挂盘并用 `NotifyOffloadSuccess` 登记（无任务号，用副本查询确认）；或写成 DFS 副本（main，无任务号）。DFS 下线不清，lease 过期会被 `RunDfsEviction` 逐，要续租
+  - 降到源引擎自己的盘：master 清登记，文件还在。这台机器的 store 再启动会用新 client_id 扫盘重新登记。引擎不再来，或换机器读，接不上。改 key 的 client_id 也留不住
+  - NoF 段不随 client 过期被摘（`USE_NOF` 默认关）。摘段看盘心跳，不看挂载它的 client 死没死
   - `#2991` 只是同一个 client_id 的重连窗口。窗口内 Ping 保住的是登记，字节仍在死进程里。窗口过后 worker 清这个 client 的内存副本和本机盘副本
   - kvcm 自己的 client 也要一直心跳。它下线后，名下副本同样被清
   - 计划下线：先迁走，再用 `GracefulUnmountSegment` / `CreateDrainJob` 收口
@@ -128,7 +129,7 @@
     - `BatchQueryIp`（两版本）：client_id→IP，副本位置解析的最后一环
     - `GetStorageUsageSnapshot`（main）：分层容量快照，demote 触发输入
     - 台账失效通知（main）：KV 事件流 removed/cleared；stored 事件没有位置信息，代替不了定期比对
-    - `MountNoFSegment`：盘硬件在远端阵列，段仍登记在挂载它的 client 上。这个 client 下线后，数据不会自动交给别人
+    - `MountNoFSegment`：client 过期不摘这段（`ClientExpiryDoesNotUnmountNoFSegment`）。盘心跳失败才摘（`TryUnmountNoFSegmentByHeartbeat`）。`USE_NOF` 默认关
     - `ReMountSegment` 排除：重连时重新登记，不是复活旧副本
     - 租户配额五件套（main）：tenant 在 `Client::Create` 绑定，client 级粒度，正好匹配「一个模型版本一个租户」
   - 否决项：
@@ -146,14 +147,14 @@
 - READY 语义：✅ 已定型（D2 §1 完成信号，八项逐一点名）
   - 什么是 READY：目标实例的 DRAM 副本写好、kvcm 核验通过后，上报 Router「可以把请求调度过来」
   - 谁有：copy / move / promote 三个——做完后某实例新具备「请求发过来就能直接用本机 KV」的条件
-  - 谁没有：keepalive / pin / retain（不动数据）、demote（只记台账）、release（通知索引删除）
+  - 谁没有：keepalive / pin（不动数据）、retain（不把请求调回源实例；move/copy 那次搬运自己的完成信号另计）、demote（只记台账）、release（通知索引删除）
   - 「本机」= 本机 HBM + 本机池 seg 两层（D1 §3）
 - 保活：🟡 机制已定、策略未定（机制 D2 §1/F9，事实 D1 F15）
   - 机制已定：keepalive 周期调 `ExistKey` 续租约（lease）——`batch_is_exist` 调用会顺带续租（`ProbeKey` 不续），TTL = master 配置（D2 F9），保护窗口 = 租约时长
   - 预复制不续租的话，一个 TTL 窗口内没有读流量就可能被驱逐
   - 约束已定：保活循环必须有界——无限续租事实上等于 pin；kvcm 断线后租约到期自然失效，不残留
   - 策略未定：续多久、何时停——候选 = 会话期 / 固定窗口 / 首流量后停租，未选定
-- key 的 client_id 下线后的副本存亡：🟡 已重写（D2 §4）——副本跟着所在 client。死前 move/copy 到活段、kvcm 自己挂盘、DFS 副本留得住。没有保留身份注册。拿旧 client_id 去 Ping 只保住窗口内的登记
+- key 的 client_id 下线后的副本存亡：🟡 已重写（D2 §4）——副本跟着所在 client。死前 move/copy 到活段、kvcm 启动时挂自己的盘、DFS 副本（要续租，否则被 DFS 层 LRU 逐）留得住。NoF 段不随 client 过期被摘。源引擎自己的盘：登记会被清，文件还在，这台机器的 store 再启动会重新登记。没有保留身份注册。拿旧 client_id 去 Ping 只保住窗口内的登记
 - 计划下线迁移：归 D2 retain 条（`CreateDrainJob` 两版本都有，把指定 seg 上的数据迁空到目标 seg，带并发上限、job 级可取消）
 - 落盘（写到 SSD）：Mooncake 的 DRAM→SSD 是池内冷热分层（client 侧 `enable_ssd_offload`，默认 `false`），不是「预复制时直接指定写盘」；SSD 只作容量/恢复用的异步 demote 去向（机制归 D2 demote 条）
 - 直接影响故障恢复时已预热前缀的可用性（D5，已闭环，见本文）。事实输入：E5（已闭环，见本文 E 节）。

@@ -6,9 +6,11 @@
 - 目的型：retain——由其他操作组合实现，对外仍呈现单步语义
 
 完成信号：copy / move / promote 有 READY（任务状态完成 + 目标侧副本
-核验通过）。retain 的完成信号跟着做法走（move/copy 的任务号，核验副本
-已经在目标 client 上）。其余方法（keepalive / stop_keepalive / pin /
-demote / remove）无 READY。任务状态经 query_task 查询。
+核验通过）。retain 不产生「把请求调到源实例」的 READY。先实现的做法是
+move/copy，返回任务号，再查副本确认已经在目标 client 上。挂盘登记和
+DFS 没有任务号。空任务号不是完成信号。其余方法（keepalive /
+stop_keepalive / pin / demote / remove）无 READY。任务状态经 query_task
+查询。
 
 幂等：**本层不去重**——`copy` 每次调用都发起任务，同一前缀重复调用会产生
 重复传输。去重归编排层（TaskEngine 以 intent_id = 前缀 × 目标实例 为键：
@@ -168,9 +170,8 @@ class KvOps(ABC):
     async def retain(self, prefix: Prefix) -> TaskHandle:
         """目的型：让前缀 KV 在源引擎下线后仍存活。
 
-        做法（D2 §4）：死前 move/copy 到一个还活着的 client，或 kvcm
-        自己的 client 挂盘并登记，或写成 DFS 副本。返回这次搬运的任务号。
-        没有保留身份注册，不返回空句柄。
+        先实现 move/copy（D2 §4），返回这次搬运的任务号。挂盘登记和 DFS
+        没有任务号，完成看副本查询，不交空任务号。没有保留身份注册。
 
         返回 TaskHandle 而非 None：结果必须可观测（「保住了没有」是
         本操作存在的全部意义）。

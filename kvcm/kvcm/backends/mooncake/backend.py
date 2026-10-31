@@ -372,10 +372,9 @@ class MooncakeBackend(KvOps):
         """
         from mooncake.store import TaskStatus as StoreTaskStatus
 
-        # 空句柄（task_ids=()）：没有异步工作，立即 READY，不查登记、
-        # 不做副本核验。retain 不使用空句柄。
+        # 空任务号不是「已经完成」。retain 的挂盘/DFS 也不走这里。
         if not handle.task_ids:
-            return TaskStatus.READY
+            raise ValueError("task handle has no task ids")
         entry = self._plans.get(handle)
         if entry is None:
             raise KeyError(f"unknown task handle: {handle}")
