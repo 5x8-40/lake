@@ -48,9 +48,11 @@ from kvcm.ops.types import InstanceId, Prefix
 
 logger = logging.getLogger(__name__)
 
-# 退出时 Ledger 线程池已关，`_in_ledger` 抛的就是这句。其它 RuntimeError
-# 是编程错误，不能跟这一句混在一起吞掉。
-_LEDGER_SHUTDOWN = "cannot schedule new futures after shutdown"
+# 退出时 Ledger 线程池已关，`_in_ledger` 抛的是这两句之一：
+# `cannot schedule new futures after shutdown`，或解释器退出时的
+# `cannot schedule new futures after interpreter shutdown`。
+# 其它 RuntimeError 是编程错误，不能跟这两句混在一起吞掉。
+_LEDGER_SHUTDOWN = "cannot schedule new futures after"
 
 
 class PrefetchError(RuntimeError):
