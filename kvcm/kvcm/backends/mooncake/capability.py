@@ -84,8 +84,7 @@ def mooncake_main() -> BackendCapability:
         has_retained_client=Capability(
             Support.YES,
             Support.NO,
-            "路径 A 停在编译前：header path not found，且 nm -D 无 Retained / "
-            "kRetained / AddReplicaForRetained / BufferRegistration。通道不标成已有",
+            "这份主线树没有 AddReplicaForRetainedClient。dummy_client.h 的 kRetained 是外部 buffer 引用计数。先不做",
         ),
         has_dfs_replica=Capability(Support.YES, Support.UNKNOWN, "写入路径待核对"),
         has_admin_query=Capability(

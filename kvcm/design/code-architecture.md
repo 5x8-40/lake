@@ -267,7 +267,7 @@ stateDiagram-v2
 | has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活后必须已有盘副本，否则失败；提回 = GetReplicaList 累计命中，默认 2 次，不用零副作用查询） | 同左 | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
-| has_retained_client（保留身份注册） | ✗ | RPC ✓ 通道 ✗。0.3.13.post1 `store.so` 的 `nm -D` 没有 `Retained` / `kRetained` / `AddReplicaForRetained` / `BufferRegistration`。不标成已有 | D2 F13② |
+| has_retained_client（保留身份注册） | ✗ | 先不做。这份主线树没有 `AddReplicaForRetainedClient`；`kRetained` 是外部 buffer 引用计数，不是引擎死后 KV 还在 | D2 F13② |
 | has_dfs_replica（共享 3FS 副本） | ✗ | RPC ✓ 通道 △（写入路径待 E6 核对） | D2 F13② |
 | has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**。副本核验走 `GET /batch_query_keys`，用传输端点比段还在不在。提回不走这条 | D2 F11b |
 | has_tenant_quota（租户配额读） | ✗（channel NO；不是段剩余空间） | HTTP ✓（GET `/api/v1/tenant_quotas`）。租户配额记账，不能当段剩余空间用 | D2 F13 |
@@ -335,30 +335,21 @@ stateDiagram-v2
 - 写法：照 `store_py.cpp` 的写法——`#include` mooncake 头文件，调 C++ client 类方法，对外暴露 pybind 或 extern "C" 接口；产物放 kvcm 侧，不改 mooncake 源码
 - 单 client 保证（约束见上「三条接入通道」节：store_py 与自封装 .so 必须共用同一 client 实例/UUID）：
   - 不能走的写法：自封装 .so 自己 `RealClient::create()` 再建一个 → 两个 UUID 两套心跳
-  - **路径 A（首选）：自封装 .so 复用 store_py 已建的 client**
-    - 依据：`MooncakeStorePyWrapper` 的成员 `store_` 是 public（`store_py.cpp:535` @1fc27b6，holder 为 `std::shared_ptr<PyClient>`），另有 public 访问器 `get_real_client()`（`:1647`）
-    - 做法：自封装 .so 用 pybind11 写，函数参数声明为 `MooncakeStorePyWrapper&`；Python 侧把 store_py 建好的 store 对象传进来，pybind11 跨模块按类型名在全局类型表里找到已注册的类型，还原出 C++ 对象 → 经 `store_` / `get_real_client()` 拿到同一个 `RealClient`，调缺口方法
-    - 效果：全进程一个 client 实例、一个 UUID、一套心跳；已有绑定与自封装 .so 缺口方法落在同一 client 上
-    - 前提：自封装 .so 编译用的 pybind11 与 wheel 内 store_py 的 internals 版本一致（不一致则跨模块 cast 查不到类型）；RTTI 开启（wheel 默认开）
-    - **空写怎么拿到这一个 client**：官方包 `MooncakeDistributedStore._get_pyclient_capsule` 把 `setup` 时放进 `store_` 的 `PyClient` 交出来。扩展收这个胶囊，走到 `Client::master_client_`，只调 `UpsertStart` / `UpsertEnd`。不 `TransferWrite`，不 `RealClient::create()`。头文件用源码树 `3rdparty/mooncake`，不改那些文件。wheel 自己不带头文件。
-      - **0.3.13.post1 的 `store.so`（stripped）**：`MasterClient::UpsertStart` / `UpsertEnd` 有 `T` 导出。`get_real_client` 是 C++ 内联成员，不在动态符号表，也不必在那里。保留登记符号没有。
-      - **`nm -D` 里没有的符号**（动态符号表 0 条）：`get_real_client`、`MooncakeStorePyWrapper`。保留登记也没有：`Retained`、`kRetained`、`AddReplicaForRetained`、`BufferRegistration`、`register_retained` 均为 0。`strings` 能看到被截断的 mangled 名 `ZN8mooncake22MooncakeStorePyWrapper26upsert_tensor_with_tp_impl`，`nm -D` 没有对应符号，不能拿来链接。
-      - **`nm -D` 里有、且是 `T` 的符号**（只记本文件实际导出的，不拿来冒充路径 A 已接通）：
-        - `mooncake::MasterClient::UpsertStart(string const&, vector<unsigned long> const&, ReplicateConfig const&)`
-        - `mooncake::MasterClient::UpsertEnd(ObjectMeta const&, ReplicaType)`
-        - `mooncake::MasterClient::BatchUpsertStart(...)`、`BatchUpsertEnd(...)`、`BatchUpsertRevoke(...)`
-        - `mooncake::Client::Upsert(...)`、`Client::BatchUpsert` 两个重载、`StartBatchUpsert`、`FinalizeBatchUpsert`（参数里带 `Slice` / `PutOperation`，是带数据的写，不是空写）
-        - `mooncake::RealClient::upsert_from` / `upsert_batch` / `upsert_parts` / `upsert_internal` / `batch_upsert_from` 以及对应的 `*_internal`、`*_dummy_helper`（带指针或 span）
-      - 这些 `T` 符号不能代替 `get_real_client()`：路径 A 要的是拿 `store_py` 已经建好的那一个 client。单独调 `MasterClient::UpsertStart` 会另起身份。没有头文件，这些符号也链不上。
-      - `readelf -d` 的 `NEEDED` 含 `libibverbs.so.1`、`libmlx5.so.1`、`libnuma.so.1`、`libcudart.so.12`（`libcuda.so.1` 在 `/usr/lib/wsl/lib`）。即便补了头文件，链接也要这些系统库；本环境不跑 `sudo apt`，所以同样不能开编译。
-  - **路径 B（退路）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）+ 缺口方法重新绑定一遍，Python 只 import 自封装 .so；天然单 client、不依赖跨模块 cast，代价是复制绑定面
+  - **路径 A（已落地的空写）**：把 `setup` 建好的那一个 client 传进扩展，调用它的 `UpsertStart`，不写数据，再 `UpsertEnd`。不 `RealClient::create()`。
+    - 扩展是单独的 `_empty_pin.so`，只链 wheel 里的 `store.so`。使用时不读 Mooncake 头文件。
+    - 类型在 `kvcm/kvcm/native/mooncake_pin_api.h`：只写到 `master_client_` 为止，成员地址由编译器算。与完整类定义对过：`PyClient::client_` 在 8 字节，`Client::master_client_` 在 48 字节，`ReplicateConfig` 208 字节，`ObjectMeta` 48 字节。
+    - 官方包用 `_get_pyclient_capsule` 把 `setup` 放进 `store_` 的那一个对象交出来。`MooncakeStorePyWrapper` 没有单独头文件，`get_real_client()` 是内联成员，不在动态符号表里，所以没有走「pybind 参数直接声明为 `MooncakeStorePyWrapper&`」那一版。
+    - **client_id**：`MasterClient::UpsertStart` 发出去的是这个 client 自己的 UUID，没有「传入别人的 UUID」的参数。当前空写因此把 `client_id` 改归 kvcm（D2 方案一）。借名（D2 方案二）这条调用做不到，两个方案仍未选定。
+    - **写中窗口**：同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 和 End 之间时，副本停在写中；按 D2 F5 补 `End` 或 `Revoke` 的崩溃恢复还没做。
+    - 保留身份先不动。设计点名的 `AddReplicaForRetainedClient` 这份主线树里没有；`dummy_client.h` 的 `kRetained` 是外部 buffer 的引用计数，不是引擎死后 KV 还在。
+  - **路径 B（退路，未做）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）+ 缺口方法重新绑定一遍，Python 只 import 自封装 .so；天然单 client、不依赖跨模块 cast，代价是复制绑定面
 - 为什么不能 Python 直调（ctypes）：
   - ctypes 能调 C 函数，但造不了 C++ 对象
   - 方法参数和返回是 C++ 类型（`std::string` 的内存布局（短字符串内嵌）、`UUID` struct、`tl::expected` 返回值），在 Python 里按字节拼这些对象 = 手工复刻编译器的类型布局，且布局随 libstdc++ 版本变
   - 所以中间必须有一层 C++：它用头文件调类方法（布局由编译器保证），对 Python 只暴露 C 类型
   - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）
 - 两个断点（E6）：
-  1. 符号可见性：0.3.13.post1 `store.so` 的 `nm -D` 里，`Client::BatchUpsert` / `MasterClient::UpsertStart` / `MasterClient::UpsertEnd` 是 `T`。`get_real_client` 与 `MooncakeStorePyWrapper` **不在**动态符号表。路径 A 因此停住（见上节实测）。npu 0.3.11 wheel 仍待测试机复核
+  1. 符号可见性：0.3.13.post1 `store.so` 导出 `MasterClient::UpsertStart` / `UpsertEnd` / `UpsertRevoke`。空写扩展链接这三个符号。`get_real_client` 是内联成员，不在动态符号表。
   2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机；路径 A 的 pybind11 对齐：mooncake 锁定 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a），自封装 .so 编译用同版本即可对齐 internals
 - E6 另核：`/query_key` 的续租副作用在核验场景能否接受；retained 注册的具体符号名按 main 源码确认（0.3.13 x86 wheel 未见 retained 符号）。另：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），上游原生支持 NPU（v0.3.11 tag 已有 `ascend_transport` 目录）
 
