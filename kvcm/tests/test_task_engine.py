@@ -778,6 +778,40 @@ def test_alternating_errors_stop_when_last_consumer_dies() -> None:
     run(scenario())
 
 
+def test_queued_intent_fails_when_consumers_die() -> None:
+    """两条消费者都死后，队列里还躺着的那条变成 FAILED，不是一直 PENDING。"""
+
+    class BoomOps(FakeOps):
+        async def exists(self, prefix):
+            raise TypeError("programming bug")
+
+    async def scenario():
+        eng = TaskEngine(BoomOps(), max_concurrent=1, consumer_count=2)
+        eng.start()
+        try:
+            keys = [
+                eng.submit_intent(
+                    Prefix(model_id="q", token_ids=(i,)), _T, poll_s=0.01
+                )
+                for i in range(3)
+            ]
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if all(t.done() for t in eng._consumers) and eng.intent_status(
+                    keys[2]
+                ) is IntentStatus.FAILED:
+                    break
+                await asyncio.sleep(0.01)
+            assert all(t.done() for t in eng._consumers)
+            assert eng.intent_status(keys[2]) is IntentStatus.FAILED
+            assert eng.intent_detail(keys[2]) == "cancelled (shutdown, never started)"
+            assert eng.intent_status(keys[2]) is not IntentStatus.PENDING
+        finally:
+            await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
 def test_three_programming_errors_stop_accepting() -> None:
     """连续 3 次编程错误后停收。错误仍然抛出，不吞掉继续循环。"""
 

@@ -303,7 +303,9 @@ class MooncakeBackend(KvOps):
     def _query_gate(self) -> asyncio.Semaphore:
         """整个 backend 共用一把 query_task 信号量，并发不超过 4。
 
-        不是每个 handle 一把。
+        不是每个 handle 一把。跨循环复用会
+        ``RuntimeError: bound to a different event loop``，和
+        ``_submit_sem`` 一样。
         """
         if self._query_sem is None:
             self._query_sem = asyncio.Semaphore(min(4, self._submit_concurrency))

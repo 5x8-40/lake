@@ -210,20 +210,7 @@ class TaskEngine:
         #    只是不再等结果）。等线程的事归 daemon 的 `_wait_executor`——
         #    池由 daemon 创建并注入，`backend.close()` 对注入的池会直接
         #    return（`_owns_executor` 为假），等不到。这里不做。
-        # 队列里还没被取走的：标记失败，别让调用方永远等一个 PENDING。
-        # `get_nowait` 与 `task_done` 必须配对，否则 `_unfinished_tasks`
-        # 泄漏（将来有人 `await queue.join()` 会永久挂住）。
-        while True:
-            try:
-                rec = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            try:
-                self._finish(
-                    rec, IntentStatus.FAILED, "cancelled (shutdown, never started)"
-                )
-            finally:
-                self._queue.task_done()
+        self._fail_never_started()
         # 已建占位但 _admit 还没跑到的（不在队列里）：同样标失败。
         # 必须先用 `list(...)` 快照——`_finish` 会从 `_records` 删条目，
         # 边迭代边删会抛 `RuntimeError: dictionary changed size`。
@@ -460,7 +447,26 @@ class TaskEngine:
                 # 但消费者仍会一条条死光，不在这里停收的话新 intent 永远 PENDING。
                 if self._programming_errors >= 3 or others_done:
                     self._accepting = False
+                    self._fail_never_started()
                 raise
+            finally:
+                self._queue.task_done()
+
+    def _fail_never_started(self) -> None:
+        """队列里还没被取走的 intent 收成 FAILED。
+
+        和 shutdown 同一句原因。``get_nowait`` 与 ``task_done`` 必须配对，
+        否则 ``_unfinished_tasks`` 泄漏。
+        """
+        while True:
+            try:
+                rec = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                self._finish(
+                    rec, IntentStatus.FAILED, "cancelled (shutdown, never started)"
+                )
             finally:
                 self._queue.task_done()
 

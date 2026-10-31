@@ -515,6 +515,7 @@ sequenceDiagram
 - **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。默认 4 来自实验 #16 单机合成目标段（14 连发约半数 `TRANSFER_FAIL`，窗口 4 时 42/42 全成）。#17 跨机同样窗口大约一半失败，主错误是 master 留内存失败，所以它不是跨机的充分条件。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过单机实测打爆的点。不代替 E15，也不做网卡限速；链路利用率感知的限速器仍归 E15，接在同一层信号量上
 - **排队超时**：intent 在队列等待的语义（等多久算放弃）随 E12 intent 字段一起定；执行超时沿用 flow 现有 `timeout_s`
 - **失败态策略**（只留接口，随 E11 细化）：失败后的动作三种——① 重发；② 放弃这批任务，事后把留下的副本清掉（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 复制中途源实例下线时的处理（D5）。语义引 D2 §1 与 D5，不新造语义
+- **编程错误停收**：连续 3 次，或最后一条消费者退出时，`_accepting=False` 拒新 intent。已经入队、还没被取走的，按 shutdown 同款收成 FAILED（`cancelled (shutdown, never started)`）。编程错误本身仍然向上抛，不吞掉
 
 ### KeepaliveLoop
 
@@ -559,7 +560,7 @@ sequenceDiagram
 
 ## 与 E10 / E11 / E15 的对位
 
-- **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，207 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
+- **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest 全绿，1 例 skip（容器内上游漂移哨兵））；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
 - **E11（进程化）🔁 实施中**（[PR #70](https://github.com/5x8-40/lake/pull/70)）：设计 = 本文「运行时结构」节。**范围切分**：
   - 本期做：进程壳（启动/退出/rebuild 接通）+ TaskEngine + KeepaliveLoop（唯一常驻循环）+ IntentReceiver（gRPC，E12）+ **copy 并发提交**（信号量窗口，见 TaskEngine 节）
   - 只留类骨架：ReleaseLoop、RetainLoop（不调用已落地的 move / remove / demote；retain 通道关闭，不登记）

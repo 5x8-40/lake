@@ -157,6 +157,27 @@ def test_reregister_keeps_registered_at() -> None:
             os.unlink(path)
 
 
+def test_restore_keepalive_leaves_newer_row_alone() -> None:
+    """行已经在时，恢复不把新窗口盖回旧时间。"""
+    led, path = _ledger()
+    try:
+        led.register_keepalive(_P)
+        led._backdate_keepalive(seconds=100)
+        old = led.list_keepalive_records()[0].registered_at
+        led.unregister_keepalive(_P)
+        led.register_keepalive(_P)
+        fresh = led.list_keepalive_records()[0].registered_at
+        assert fresh != old
+        led.restore_keepalive(_P, old)
+        assert led.list_keepalive_records()[0].registered_at == fresh
+    finally:
+        led.close()
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
+
+
 def test_restart_recovery_needs_no_special_casing() -> None:
     """重启：注册行在 Ledger 里，新 Loop 首扫自然接管（窗口按原
     registered_at 连续起算）。"""

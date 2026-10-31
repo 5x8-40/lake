@@ -381,15 +381,17 @@ class Ledger:
         return None if row is None else float(row[0])
 
     def restore_keepalive(self, prefix: Prefix, registered_at: float) -> None:
-        """按原来的 registered_at 把保活行插回去。不用现在的时间。"""
+        """行不存在时，按原来的 registered_at 插回去。
+
+        行已经在（例如 demote 期间又预热登记了新窗口）就不要动。
+        """
         self._run(self._restore_keepalive_sync, prefix, registered_at)
 
     def _restore_keepalive_sync(self, prefix: Prefix, registered_at: float) -> None:
         self._conn.execute(
             "INSERT INTO keepalive (prefix_key, model_id, token_ids, registered_at)"
             " VALUES (?, ?, ?, ?)"
-            " ON CONFLICT(prefix_key) DO UPDATE SET"
-            " registered_at = excluded.registered_at",
+            " ON CONFLICT(prefix_key) DO NOTHING",
             (
                 prefix_key(prefix),
                 prefix.model_id,
