@@ -1,7 +1,7 @@
 """常驻循环（E11 进程化的支撑组件，L2）。
 
 KeepaliveLoop 本期落地。ReleaseLoop / RetainLoop 只留骨架，不调用
-已落地的 move / remove / demote / retain。续租仍是本循环的 exists。
+已落地的 move / remove / demote，也不实现 retain。续租仍是本循环的 exists。
 
 形态：**协程定时器**（事件循环内 `asyncio.sleep` 周期触发），不是独立
 线程——E11 执行模型。
@@ -232,5 +232,5 @@ class ReleaseLoop:
 
 
 class RetainLoop:
-    """retain 与计划下线编排（D2 §4）。骨架——不调用已落地的 move / retain。
-    retain 的保留身份走官方 wheel，绑定没导出就失败。"""
+    """retain 与计划下线编排（D2 §4）。骨架——不调用 move，也不实现 retain。
+    1fc27b6 没有 AddReplicaForRetainedClient。kRetained 是外部 buffer 引用计数。"""

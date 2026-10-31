@@ -1002,8 +1002,8 @@ def test_rebuild_restores_watch_state(fake_store_module, monkeypatch) -> None:
 
 
 def test_empty_handle_is_immediately_ready(fake_store_module) -> None:
-    """空句柄（task_ids=()，retained 注册类无异步工作路径）立即 READY，
-    不查登记、不核验。"""
+    """空句柄（task_ids=()）立即 READY，不查登记、不核验。
+    提回只在确认目标上已有内存副本之后才返回这种句柄。"""
     b = MooncakeBackend(
         client=FakeClient(),
         key_computer=KeyComputer(model_name="qwen", tp_size=1),
@@ -1882,6 +1882,7 @@ def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> 
 
 
 def test_retain_channel_not_present(fake_store_module, monkeypatch) -> None:
+    assert mooncake_main().has_retained_client.rpc is Support.NO
     assert mooncake_main().has_retained_client.channel is Support.NO
     kc = KeyComputer(model_name="qwen", tp_size=1)
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
@@ -1891,7 +1892,7 @@ def test_retain_channel_not_present(fake_store_module, monkeypatch) -> None:
         locate=lambda _inst: ["seg-A"],
         capability=mooncake_main(),
     )
-    with pytest.raises(UnsupportedCapabilityError, match="路径 A"):
+    with pytest.raises(UnsupportedCapabilityError, match="没有该接口"):
         run(b.retain(Prefix(model_id="qwen", token_ids=(1,))))
 
     b0311 = MooncakeBackend(

@@ -7,7 +7,7 @@
   - §1 操作集框架：闭环——八项操作业界逐项对照、完备性审计、kvcm 能力边界（只能被动等池的真缺口 2 条，归池侧扩展 vs 无专用 RPC 但组合可达 7 条）
   - §2 pin：候选已列出；落地选择依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞
   - §3 demote / promote：设计完成
-  - §4 retain / release：定型；retain 的池机制正式路径在 main（retained client 或 DFS 副本，F13），0.3.11 下的过渡手段 = move 到活 seg / kvcm 自挂 SSD（E5 已闭环，F6b）
+  - §4 retain / release：release 定型。retain 先不做。1fc27b6 没有 `AddReplicaForRetainedClient`；`dummy_client.h` 的 `kRetained` 是外部 buffer 引用计数。DFS 副本，以及 0.3.11 下 move 到活 seg / kvcm 自挂 SSD，仍是已登记手段（F13、E5），本次不实现 retain
   - 未决问题（详见 summary）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）
 - 上游问题：summary D2（kvcm 对池内 KV 的操作面）
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
@@ -122,7 +122,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   4. **副本标为写中**：COMPLETE→PROCESSING，该 key 对所有读者不可见，直到 UpsertEnd 标回——空写的「不可读窗口」来自这里
 - **F4 UpsertStart 不验身份**
   - 对调用方 client_id 无任何校验（不要求等于原 client_id、不要求活跃注册，只查参数合法性）
-  - 推论：kvcm 调用时把**原 client_id 的 UUID 原样传回**，行为 1 就把 client_id 赋回它自己 = client_id 实际不变，pin 照加（「借名」方案的机制基础）
+  - 推论：master 不核对调用方是谁。若请求里带的是原 client_id 的 UUID，行为 1 会把 client_id 写回原值，pin 照加。这是「借名」在 master 侧的基础。`MasterClient::UpsertStart` 没有「传入别人的 UUID」这个参数，发出去的是这个 client 自己的 UUID。当前空写因此做不到借名
   - 一个例外条件：upsert 开头 master 顺手做**单 key 惰性清理**（`CleanupStaleHandles`，`:2530`）——只遍历当前这把 key 自己的副本（O(副本数)），把挂在已死客户端 seg 上的副本清掉；若清完无有效副本，请求落入 Case A 新建。所以借名 upsert 要求原 client_id 当时在线（预热场景成立）
 - **F5 Revoke = 写中止**
   - `UpsertEnd / UpsertRevoke` 直通 `PutEnd / PutRevoke`（`:1770` 附近 @0.3.11）
@@ -130,7 +130,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 约束
     - 校验 client_id：与 key 的 client_id 不符调用 → `ILLEGAL_CLIENT`（只有发起写的人能中止）
     - 只撤写中副本；副本已就绪则拒绝 → `INVALID_WRITE`
-  - 与 kvcm 的关系：空写若在 Start/End 之间崩溃，副本卡写中——恢复时扫描任务记录，补 End 或 Revoke 清理（归 §1 状态记录①的崩溃恢复）
+  - 与 kvcm 的关系：同一次空写里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时，副本留在 PROCESSING。扫描任务记录再补 `End` 或 `Revoke` 的崩溃恢复还没做
 
 ### client_id 字段与级联清理
 
@@ -205,10 +205,10 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 分工：续租用 `ExistKey`（F9，要的就是续租）；副本状态核验在 main 用 admin 查询，0.3.11 只能用 `GetReplicaList` 连带副作用
 - **F12 空写的发送通道**
   - master 协议层：`UpsertStart` / `UpsertEnd` 是公开 RPC（`master_service.h:331/:338` @0.3.11）
-  - Python 绑定：只有「带数据、一次完成」的一体化接口 `upsert_tensor`，没有 start/end 分开调的接口——空写从 Python 发不出来
-  - kvcm 要实现空写
-    - 用编译型语言客户端库（C++/Go/Rust）或直接按协议发 master RPC → 不用改 mooncake
-    - 继续用 Python → 需要给绑定层打补丁（改 mooncake）
+  - 官方 Python 绑定只有「带数据、一次完成」的 `upsert_tensor`，没有把 start/end 拆开的接口
+  - kvcm 的空写是单独的 `_empty_pin.so`。它只链已安装 wheel 里的 `store.so`（`mooncake-transfer-engine==0.3.13.post1`）。这个 wheel 不带 C++ 头文件。扩展用本地 `kvcm/native/mooncake_pin_api.h` 声明要用的类型，调用 `client->master_client_.UpsertStart` / `UpsertEnd`，成员地址由编译器计算。链接这一步读的是 `store.so` 的导出符号，不读 mooncake 的头文件
+  - `get_real_client()` 是退路，不是当前实现。只有以后真实的 `UpsertStart` 调用失败，才改为包含 `pyclient.h`，在 Python 对象还原成 `MooncakeStorePyWrapper` 之后用 `get_real_client()` 取出已建 client。拿到对象之后，这个函数只是返回成员。现在不走这条，也不把 pybind 跨模块转换写进当前扩展
+  - `MasterClient::UpsertStart` 发出的是这个 client 自己的 UUID。当前空写会把 key 的 client_id 写成 kvcm 的 UUID。借引擎的 UUID 这条 API 做不到。§2 的两个方案仍未选定
 
 ### F13 main 相对 0.3.11 的能力增量（按「对 kvcm 有什么用」分六组；各处引用统一指向本条）
 
@@ -216,7 +216,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 
 - **消费方四分总纲**（读六组前先立框架）：main 的能力补齐分四个消费方向
   - **master 内部自治**：动态副本、热度统计——按访问统计自动调节，不对外
-  - **引擎 client**：任务改为自己来取（master 把任务放内存队列、client 定期取）；另有驱逐/容量上报、retained 注册——client 从单纯存取数据变成帮池子干活
+  - **引擎 client**：任务改为自己来取（master 把任务放内存队列、client 定期取）；另有驱逐/容量上报——client 从单纯存取数据变成帮池子干活。retained 注册不在这条里：1fc27b6 没有 `AddReplicaForRetainedClient`，`kRetained` 是外部 buffer 引用计数（见下②）
   - **控制面/管理面**：Admin 命名查询、DrainJob 三件套两版本同有；main 补齐零副作用查询（`GetReplicaListForAdmin`）、租户配额五件套、DFS 容量管理——**kvcm 的位置**
   - **master 自身 HA**：`RestoreFromStandby`，supervisor 主备
   - 前两层与 kvcm 不冲突：自治层按统计自动调节、kvcm 按业务语义指定目标，分工互补
@@ -229,8 +229,8 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 - 多把 key 可绑成一个**生命周期组**（`group_ids`）：驱逐时整组同进退——kvcm 的「前缀族」在 main 可以整体绑组，不再逐 key 各自为政
 - kvcm 用法：一个模型版本 = 一个租户（0.3.11 只能靠 key 名前缀模拟，§4 release）
 
-**② 数据跨引擎存活**（retain 的正式路径，§4）
-- **retained client**：client 断线，master 不立即清它的数据，留时间让它重连接管——解「引擎进程重启」
+**② 数据跨引擎存活**（§4；retain 本次不实现）
+- **retained client 这条先划掉**：1fc27b6 的主线树没有 `AddReplicaForRetainedClient`。`dummy_client.h` 的 `BufferRegistrationAction::kRetained` 是外部 buffer 的引用计数。retain 不接这个枚举，通道也不标成已有
 - **DFS 副本**：数据直接写共享文件系统（3FS，多机挂同一目录）——谁死了文件都在，任何挂同一 DFS 的机器都能读——解「整机灭失」
   - 硬事实：引擎下线时 master 只清「内存副本 + 本机盘副本」，**不清 DFS 副本**（`ProcessClientOffboardingJob`，`master_service.cpp:2965-2973`）；DFS 副本只在整 key 删除时释放
   - 前提：部署 3FS（测试床没有）
@@ -272,7 +272,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 「无 per-key 立即降层 RPC」的结论两版本成立
 
 **⑥ main 仍没有的**（别去找了）
-- per-key 立即降层 RPC、copy/move 任务取消、Python 绑定的空写通道、key→client_id 查询
+- per-key 立即降层 RPC、copy/move 任务取消、官方 Python 绑定里拆开的空写接口、key→client_id 查询。kvcm 的空写不靠给官方绑定打补丁，见 F12
 
 ## §1 操作集框架
 
@@ -385,7 +385,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 | pin | LMCache `pin`/`unpin`（后端接口级）；KVCR `claim/pin`/`release_pin`（**传输窗口专用**，`FETCHABLE` 须等 pin 成功才确定）；TensorCast `pinned` policy（必须驻留 + 溢出**拒绝写入**）；HiCache `lock_ref`（`protected_size_` vs `evictable_size_`，dec 到 0 ≠ 释放、仍可命中） | mooncake 三件套（lease/soft/hard）比多数系统细。差异：TensorCast `pinned` 溢出拒绝写入，mooncake hard pin 无此语义（创建时固化、之后改不了，F1）；KVCR 的传输窗口 pin 在 mooncake 由「copy 任务在途拒 upsert」覆盖（F2） |
 | demote | §3 专节（FlexKV/LMCache/UCM/KVBM/MemCache 对照 + HiCache 写穿/写回） | —— |
 | promote | HiCache `load_back`（L2→L1 提回）；FlexKV SSD→GPU 的 H2D 回填；KVCR `fetch`；mooncake `promotion_on_hit`（命中达阈值自动提回） | 被动提升（读命中驱动）是各家主路径；kvcm 另有主动两条：反复调 `GetReplicaList` 至命中计数过线触发 / 读删写自搬（§3） |
-| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择；kvcm 的正式路径 = main 的 retained client 机制（client 断线数据保留，§4），存储统一在 mooncake。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：client_id 管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是 key 的 client_id |
+| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择。kvcm 这次不实现 retain。1fc27b6 没有 `AddReplicaForRetainedClient`；`kRetained` 是外部 buffer 引用计数（§4）。已登记的手段是 DFS 副本，以及 0.3.11 的 move / 自挂 SSD。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：client_id 管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是 key 的 client_id |
 | remove | LMCache `remove`/`clear`；SGLang 分层放弃（`block-lifecycle.md`）：无 L3 时 `evict` 删叶 = 彻底；**有 L3 时引擎永不主动放弃**——删除下放 L3 后端独立 LRU/TTL，引擎看不到 | SGLang 的「释放 = 逐层剥离」（L1 摘节点降层 → L2 摘除 → L3 后端自决）对应 kvcm 三级（软释放 / demote / remove）。「L3 删除引擎不可见」提醒：kvcm remove 后索引侧条目需同步清（D1 已知：池副本删除事件通道缺失） |
 
 - **总观察**
@@ -680,7 +680,7 @@ sequenceDiagram
 - 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 反复调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本所在引擎在线
 - `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本所在引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
 
-**⑦ retain（key 的 client_id 下线后副本存续；五方案时序：绿 = main 正式路径两条、橙 = 0.3.11 过渡两手段、灰 = 接受现状，§4）**
+**⑦ retain（key 的 client_id 下线后副本存续。绿里 retained client 已撤回，DFS 仍登记。橙 = 0.3.11 过渡。灰 = 接受现状。§4。本次不实现 retain）**
 
 ```mermaid
 sequenceDiagram
@@ -692,11 +692,7 @@ sequenceDiagram
     participant DFS as 共享 3FS
 
     rect rgb(223, 242, 223)
-    Note over E,DFS: 正式路径①（main）：retained client——解引擎进程重启
-    E->>M: 以「保留」身份注册运行
-    E--xM: 断线（心跳停）
-    Note over M: 数据登记保留，等重连接管（停机保号）<br/>不立即清（AddReplicaForRetainedClient，F13②）
-    E->>M: 重启回来接管 → 副本继续可用
+    Note over E,DFS: retained client 这条先撤回。1fc27b6 没有 AddReplicaForRetainedClient。<br/>kRetained 是外部 buffer 引用计数。retain 先不做
     end
 
     rect rgb(223, 242, 223)
@@ -828,7 +824,7 @@ sequenceDiagram
 ### soft pin 级（驱逐排最后，极端情况可逐）：空写 upsert 设 soft pin
 
 - 做法：`UpsertStart`(key, 原尺寸, with_soft_pin) → 不写数据 → `UpsertEnd`；原尺寸由 `GetReplicaList` 查
-- mooncake 代码：不改（前提：空写通道不落 Python，F12）
+- mooncake 代码：不改。空写在 kvcm 侧的 `_empty_pin.so`，只链 `store.so`，不给官方绑定打补丁（F12）
 - client_id 问题：**有**（upsert 必改写 client_id，F3①——见「client_id 问题」节）
 - 保护语义：驱逐两轮里只排第二轮（F8），第一轮候选凑不够时仍可逐——这是 mooncake soft pin 的本义，与「防驱逐」有缝，接受才用
 - kvcm 失联：TTL 内保护自持（时钟在池里，main 默认 30min），到期不续才失效
@@ -864,15 +860,18 @@ sequenceDiagram
 | | 方案一：client_id 改归 kvcm | 方案二：不改 client_id（借名） |
 |---|---|---|
 | 做法 | kvcm 传自己的 UUID（自己就是 client，天然持有；sqlite 持久化，重启同 id 重注册） | kvcm 先查得原 client_id UUID，调用时原样传回（F4） |
-| mooncake 代码 | **不改**（前提：空写通道不落 Python，F12） | **要改**：master 加「key → client_id」查询 RPC（数据内部现成，纯暴露，F11） |
+| mooncake 代码 | **不改**。`_empty_pin.so` 链 `store.so`，不打绑定补丁（F12）。当前调用会把 client_id 写成 kvcm 的 UUID，这是这条 API 的效果，不是选定本方案 | **要改**：master 加「key → client_id」查询 RPC（数据内部现成，纯暴露，F11）。`MasterClient::UpsertStart` 也没有传入别人 UUID 的参数，当前空写做不到借名 |
 | client_id 语义 | 改变：kvcm 成在途写与 `BatchReplicaClear` 的权限持有者，kvcm 死期间这些权限锁死；缓解两道：① UUID 持久化 + 重启快于 master 心跳超时，kvcm 复活即恢复；② kvcm 死透（UUID 也丢）时，任一 client 对 key 调 upsert 即可把 client_id 改写成自己、接管权限——upsert 不验身份（F4），这是死透时的逃生门。key 的 client_id 下线行为两方案无差异——本就不清远端副本（F6b） | **不变**（维持现状语义） |
 | 引擎配合 | 无 | 无（补丁打在 master，引擎零感知） |
 
+- **当前空写落在哪，以及还没定什么**
+  - 空写从 kvcm 的 Python 进程发出，靠 `_empty_pin.so` 链 `store.so`。wheel 不带 C++ 头文件，扩展用本地 `mooncake_pin_api.h`，不改 mooncake（F12）
+  - 这次调用发出的是 kvcm 自己的 UUID，key 的 client_id 会写成 kvcm 的。借名做不到。上表两个方案仍未选定
+  - 同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时副本留在 PROCESSING。崩溃恢复还没做（F5）
 - **决策条件（外部依赖，非单方可定）**
   1. mooncake 代码可改性——多人合作的开源项目，不是单方说了算
      - 上游提 PR（纯暴露只读接口，接受度预期高，节奏不可控）或 fork 维护本地 patch——是**独立成本**；升级拿 publisher 是官方功能零 patch，与此无关
-  2. kvcm 实现语言（summary E10/E11 未定）
-     - 若落 Python，空写通道也需绑定补丁 → 方案一同样改 mooncake
+  2. 借名还要 master 暴露「key → client_id」，并且客户端调用能带上别人的 UUID。当前 `MasterClient::UpsertStart` 两样都没有
 - client_id 方案与 retain 已脱钩（E5 闭环：改 client_id 救不了副本，§4 不定它）——本决策只看 pin 挂载与权限归属，纯工程成本权衡
 - **注意**：若 pin 全走 hard pin 级 ①（lease 调大），client_id 问题只剩读删写一处触发，权重下降
 
@@ -944,33 +943,29 @@ sequenceDiagram
 
 - disk 副本的登记者 = 写盘的 client——写穿/写回两种模式下都是**引擎自己**（master 把 offload 任务派给源副本 seg 所在 client）
 - 引擎进程死亡（心跳超时）后的连锁清理：master 的例行扫描发现「这个 client 心跳断了」→ 摘掉它名下的盘登记 → 它登记在盘上的副本一并清除（`CleanupStaleHandles` @0.3.11；main 由 client 过期分支做同样的事，引擎也可死前主动 `UnmountLocalDiskSegment` 摘登记）
-- 所以 **0.3.11 下「引擎下线后盘副本继续存活」没有池机制**（main 有：retained client / DFS 副本，F13）——这是 retain 要解决的问题，见 §4
+- 所以 **0.3.11 下「引擎下线后盘副本继续存活」没有池机制**。main 上 DFS 副本不随 client 死被清（F13）。retained client 不在可用路径里，见 §4
 
 ## §4 retain / release
 
-### retain（key 的 client_id 下线后副本存续）：机制定型
+### retain（key 的 client_id 下线后副本存续）：先不做
 
-- **目标**：写入引擎（= key 的 client_id）下线后，它写的 KV 副本仍可用
+- **目标**：写入引擎（= key 的 client_id）下线后，它写的 KV 副本仍可用。本节只登记手段，kvcm 这次不实现 retain
 - **副本生死的绑定关系**（E5 已闭环，机制与实测互证见 F6b）
   - 内存副本绑 seg：seg 所在 client 死 → seg 失效 → 副本清
   - disk 副本绑「写盘的 client」：该 client 死 → 副本清（§3）
   - **DFS 副本不绑任何 client 生死**（main，F13）——清理条件不覆盖它，释放只走 key 级删除
   - copy 到他机的副本绑他机 seg（F7）——源引擎下线不影响它
-- **正式路径 = main 的池机制，两条并列**（0.3.11 都没有，升级获得；与副本所在 client 清理正交，直接生效）
-  - **retained client**：client 以「保留」身份注册后，即使断线，master 也不立刻清它的数据，留时间让它重连接管——类似「停机保号」
-    - 入口：`AddReplicaForRetainedClient`（`master_service.cpp:5400` @main）
-    - 注册侧在 client 库：`BufferRegistrationAction::kRetained`（`dummy_client.h:260` @main）——引擎与 kvcm 链接同一 client 库，**kvcm 同样能以保留身份注册**
-    - 前提：引擎以此身份运行
-  - **DFS 副本**：demote 的目标层选共享 3FS 而非本机 SSD——副本天然跨 client 存亡存活（F13）。前提：部署 3FS
-  - 两条不互斥：retained client 解「引擎进程下线」，DFS 解「整机/整实例灭失 + 跨机可读」
-- **0.3.11 过渡期手段**（正式形态是上面的池机制；E5 已定：**主路径 = move 到活 seg**，加强项 = kvcm 自挂 SSD）
+- **已核对、先不做的一条**
+  - 1fc27b6 没有 `AddReplicaForRetainedClient`。`dummy_client.h` 的 `BufferRegistrationAction::kRetained` 是外部 buffer 的引用计数。retain 不接这个枚举，能力通道保持关闭
+- **仍登记的手段**
+  - **DFS 副本**：demote 的目标层选共享 3FS 而非本机 SSD——副本天然跨 client 存亡存活（F13）。前提：部署 3FS。本次不实现
+- **0.3.11 过渡期手段**（E5 已定：move 到活 seg 有效；加强项 = kvcm 自挂 SSD。本次不实现）
   - **先说清 demote 在 0.3.11 解不了 retain**：盘副本绑登记它的 client，而 client 库活在引擎进程内——引擎进程死 = client 死 = 盘副本清（§3）。demote 落的是引擎自己的盘，引擎一死照样带走
   - **move 到活 seg（E5 证实有效）**：清理按 seg 维度走（F6b）——把副本迁到长寿 seg（kvcm 机、或确定后死的实例），源引擎下线带不走它。**改 client_id 对 retain 无效**：改的是鉴权字段，副本还绑在原 seg 上，引擎死照清（F6b）；改 client_id 的用途在权限与 pin（§2），不在副本存亡
   - **kvcm 自己挂 SSD（0.3.11 下不依赖任何引擎存活的兜底）**：kvcm 以独立 client 身份挂本机盘（`MountLocalDiskSegment`，与引擎同样的挂法），把关键 KV 落一份到自己名下、`NotifyOffloadSuccess` 上报登记（F1）
     - 效果：盘副本绑 kvcm 而非引擎，引擎全灭仍存活；也是远期「资源用满」的形态（§3 存储形态）
     - 代价：kvcm 机器要带盘、kvcm 自身变有状态
-    - **main 下此方案再强化**：kvcm 以 retained client 身份注册（client 库 `kRetained`，上条）——连 kvcm 自己死亡，名下盘副本也保留，等新 kvcm 接管
-    - 挂盘另一形态：`MountNoFSegment`（两版本同有）挂 NVMe-oF 远端盘——盘在远端阵列、不绑 kvcm 机器，比挂本地盘更接近「kvcm 死也保留」
+    - 挂盘另一形态：`MountNoFSegment`（两版本同有）挂 NVMe-oF 远端盘——盘在远端阵列、不绑 kvcm 机器
     - 排除项：`ReMountSegment` 是 client 重连后重新申报 seg（幂等），不是死掉副本的复活——retain 走不了这条
   - 或接受现状：副本全在死引擎 seg 上的 key 整 key 消失，预热投入重来——已预热到他机的 key 不受影响（F6b），损失面只限这一部分
 - **计划下线的编排**（控制面主导，四步）

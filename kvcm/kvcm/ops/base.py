@@ -167,14 +167,10 @@ class KvOps(ABC):
         raise self._unsupported("promote")
 
     async def retain(self, prefix: Prefix) -> TaskHandle:
-        """目的型：让前缀 KV 在源引擎下线后仍存活。目标基线 = 后端主线
-        能力：主路径 = 保留身份注册（mooncake main 的 retained client，
-        一次注册 RPC 即完成，无异步工作）——返回空句柄 task_ids=()，
-        query_task 立即 READY。过渡替代 = move 到存活节点（0.3.11 无
-        retained 能力时的登记实现）则是任务型，返回真实句柄。
-
-        返回 TaskHandle 而非 None：结果必须可观测（「保住了没有」是
-        本操作存在的全部意义）；空句柄与真句柄由实现按路径给出。
+        """目的型：让前缀 KV 在源引擎下线后仍存活。结果要可观测，所以
+        签名返回 TaskHandle。当前不实现。1fc27b6 没有
+        ``AddReplicaForRetainedClient``。``BufferRegistrationAction::kRetained``
+        是外部 buffer 引用计数。通道保持关闭。
         """
         raise self._unsupported("retain")
 

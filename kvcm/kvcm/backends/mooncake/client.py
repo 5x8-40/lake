@@ -104,7 +104,7 @@ class StoreClient:
         return self._store
 
     def binding(self):
-        """已建好的官方 wheel store 对象。软钉和保留身份都用它，不再另建 client。"""
+        """已建好的官方 wheel store 对象。软钉用它，不再另建 client。"""
         return self._s()
 
     # ------------------------------------------------------------------
@@ -247,7 +247,9 @@ class StoreClient:
             ) from e
 
     def register_retained(self) -> None:
-        """用官方 wheel 登记保留身份。绑定没导出这个符号时直接失败。"""
+        """保留身份这次不登记。1fc27b6 没有 AddReplicaForRetainedClient。
+        这里不接 kRetained。绑定上若没有 register_retained_client，调用会失败。
+        """
         store = self._store
         if store is None:
             raise StoreClientError("store 未连接，保留身份没有注册")

@@ -384,8 +384,8 @@ class MooncakeBackend(KvOps):
         """
         from mooncake.store import TaskStatus as StoreTaskStatus
 
-        # 空句柄（task_ids=()）：无异步工作的路径（如保留身份注册一次
-        # RPC 即完成）——立即 READY，不查登记、不做副本核验。
+        # 空句柄（task_ids=()）：调用方已经做完同步核验（提回确认目标上
+        # 有内存副本之后才返回这种句柄）——立即 READY，不查登记、不做副本核验。
         if not handle.task_ids:
             return TaskStatus.READY
         entry = self._plans.get(handle)
@@ -774,7 +774,7 @@ class MooncakeBackend(KvOps):
             raise NotImplementedError("hard pin：通道具备但尚未接线")
         if self._cap.soft_pin_after.channel is not Support.YES:
             raise UnsupportedCapabilityError(
-                "soft pin 事后加：路径 A 还没接上，通道不具备"
+                "soft pin 事后加：这个能力集的通道不具备"
             )
         keys = self._keys.keys_for_tokens(prefix.token_ids)
         if not keys:
@@ -844,10 +844,10 @@ class MooncakeBackend(KvOps):
         return TaskHandle(op=OpKind.PROMOTE, task_ids=())
 
     async def retain(self, prefix: Prefix) -> TaskHandle:
-        """保留身份走官方 wheel。绑定没导出就失败，不返回已保留的空句柄。"""
+        """保留身份先不做。通道关闭时直接失败，不登记、不返回空句柄。"""
         if self._cap.has_retained_client.channel is not Support.YES:
             raise UnsupportedCapabilityError(
-                "retained client：路径 A 还没接上，通道不具备"
+                "retained client：这份主线没有该接口，通道不具备"
             )
         keys = self._keys.keys_for_tokens(prefix.token_ids)
         if not keys:

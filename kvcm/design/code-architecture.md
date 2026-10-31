@@ -157,7 +157,7 @@ flowchart LR
 | PrefetchFlow | exists 前置检查 → copy → query_task 轮询到 READY（keepalive 注册已接通，由 `TaskEngine` 在 flow 返回后做；READY 补发 `BlockStored` 待 E14） | 已实现（`flows/prefetch.py`） |
 | SessionEndFlow | 停 keepalive + demote | 未实现（D1 §6） |
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
-| RetainFlow | retain（主路径 = retained client 注册；0.3.11 过渡 = move 到存活节点的 seg） | 未实现（D2 §4） |
+| RetainFlow | retain。1fc27b6 没有 `AddReplicaForRetainedClient`；`kRetained` 是外部 buffer 引用计数。DFS / move 到活 seg / 自挂 SSD 只登记，本次不实现 | 未实现（D2 §4） |
 
 - **失败处理**：除 exists 的 `QueryError`（不包装、可重试上抛）外，流程对调用方只抛一种异常（当前叫 `PrefetchError`——这个名字绑死在 Prefetch 上，其他流程没法用，将改为一般化的 `FlowError`，随 KeySet 一起实施）——调用方不用关心失败发生在哪一步，具体原因写在异常消息里。编程错误（KeyError、TypeError 这类代码 bug）不包装，直接向上抛。异常类型定义见 L3「失败语义」。各分支：
 
@@ -177,7 +177,7 @@ flowchart LR
 
 - 接口规格直接抄 D2 §1：八项操作的语义、完成信号、READY 有无、幂等性都已定型——本层把它们落成 Python 抽象基类
 - 八项分三类（D2 §1）：**原子动作**（copy / move / keepalive / demote / promote / remove）、**元数据标记**（pin）、**目的型**（retain——由 demote / move / pin 组合完成，但调用方看起来仍像一步）
-- 完成信号：READY 的本义 =「可以把请求调度过来」（D2 §1）——copy / move / promote 有 READY（它们的完成都意味着「这个实例能接请求了」）；demote 降层后本就不能调度，没有 READY。retain 也返回任务凭据（定义见下「接口形态」）：无异步工作的路径返回空凭据，`query_task` 入口直接 READY；0.3.11 的 move 过渡路径返回真凭据、走同一套轮询。keepalive / stop_keepalive / pin / demote / remove 无 READY
+- 完成信号：READY 的本义 =「可以把请求调度过来」（D2 §1）——copy / move / promote 有 READY（它们的完成都意味着「这个实例能接请求了」）；demote 降层后本就不能调度，没有 READY。retain 的完成信号先不落地：本次不实现，通道关闭。keepalive / stop_keepalive / pin / demote / remove 无 READY
 - 幂等：同一个前缀对同一台实例，已经在复制就不重复发、已完成也不重复发（D1 §4）；后端侧重复调用也有幂等保护（D1 F11）
 
 **接口形态（`kvcm/ops/`）**
@@ -186,11 +186,11 @@ flowchart LR
 - **任务凭据（TaskHandle）**：一次 `copy(前缀)` 在 mooncake 上是逐条 key 各发一个复制任务——一个前缀通常对应多条 key（块数 × rank 数），所以一次操作会产生多个任务。凭据里的 `task_ids` 装着这次操作的全部任务号，查询时一起查。任务号的类型对 L3 不透明（`tuple[object, ...]`）：mooncake 的任务号是两个整数组成的整数对，L3 原样保存、原样回传，不做字符串化（`str()` 化后真实绑定的 `query_task` 会报 TypeError）；要写进 Ledger 时由实现侧编码成 `"整数:整数"` 的字符串（`encode_task_id`/`decode_task_id`，重启可还原）
 - **READY 规则**（本义 =「可以把请求调度过来」，D2 §1）：
   - copy / move：任务完成 + 目标侧副本核验通过（任务型，凭据里有任务号）
-  - promote：**核验式 READY**——触发式实现（反复 `GetReplicaList` 刷计数，master 按冷热策略**自主**搬运，kvcm 没有任务号）；READY = 轮询确认副本提回到位。凭据 = 触发记录——**不能用空凭据**：`task_ids=()` 已定义为「无异步工作 → `query_task` 入口直接 READY」（retain 主路径），promote 用它会在副本还在盘上时被误报 READY。其搬运是池自主行为，**不占传输闸**
-  - **retain 返回 TaskHandle**——结果必须可观测（「保住了没有」是本操作存在的意义；实现路径 = D2 §4）。主路径 = mooncake 主线版本的 retained client 注册（一次 RPC，无异步工作）返回空凭据 `task_ids=()`，`query_task` 入口直接 READY；0.3.11 过渡 move 返回真凭据
+  - promote：对前缀的 key 调 `batch_get_replica_desc`（`GetReplicaList`），默认 2 次。返回前已经确认目标端点上有内存副本，然后才返回空凭据 `task_ids=()`。`query_task` 对空凭据直接 READY。副本还在盘上时方法抛错，不会把空凭据交出去。不用 `/batch_query_keys`，不做读删写。搬运是池自主行为，**不占传输闸**
+  - **retain 返回 TaskHandle** 的约定还在：结果必须可观测。本次不实现。1fc27b6 没有 `AddReplicaForRetainedClient`；`kRetained` 是外部 buffer 引用计数。通道保持关闭
   - 其余方法（keepalive / stop_keepalive / pin / demote / remove）无 READY
 - **exists（查询，不是第九项管理操作）**：实现是 `batch_is_exist`，它有个副作用——被查到的 key 会被续租，所以预热前的存在性检查顺便就起了保活作用。两种结果必须分清：「不在池里」（key 确实没有 → 该预热）和「查询本身失败」（RPC 出错或单 key 返回 -1 → 转成 QueryError 等一会儿重查）——把查询失败当成「不在池里」会误判成需要重新计算
-- **abandon（放弃跟踪）**：kvcm 发起任务后要定期查它完成没有，这叫跟踪。abandon = 不再查了：删掉进程内的核验登记，Ledger 记为 abandoned，凭据从此失效（再查报 KeyError）。它**不是取消任务**——后端没有取消接口，传输可能照常完成。**abandon 之后不会自动删副本**：副本留在池里，按冷热策略自然降层、过期；要立刻删除得显式调 remove（未实现，归释放流程 ReleaseLoop，D1 §6）
+- **abandon（放弃跟踪）**：kvcm 发起任务后要定期查它完成没有，这叫跟踪。abandon = 不再查了：删掉进程内的核验登记，Ledger 记为 abandoned，凭据从此失效（再查报 KeyError）。它**不是取消任务**——后端没有取消接口，传输可能照常完成。**abandon 之后不会自动删副本**：副本留在池里，按冷热策略自然降层、过期；要立刻删除得显式调 remove（操作已落地；ReleaseLoop 骨架仍不调用它，D1 §6）
 
 
 ### 失败语义
@@ -253,7 +253,7 @@ stateDiagram-v2
     - 绑定：`store_py.cpp` 的 pybind 绑定（v0.3.11 共 112 个 `.def` / @1fc27b6 共 120 个）；demo 部署的 `mooncake_transfer_engine_npu` wheel 是**官方 NPU 构建变体**（`scripts/build_wheel.sh` 改包名发布，同机制另有 `-efa` 变体），`create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），非 fork 私有
     - HTTP admin：两版本都有（端点见下「三条接入通道」节）
   - RPC ✓ 而通道 ✗ 时的处理顺序：
-    1. **自封装 .so**：照 `store_py.cpp` 的写法自写封装，link wheel 的 C++ 库，不改 mooncake 源码（两个断点待 E6 验证，见下）
+    1. **自封装 .so**：链 wheel 里的 `store.so`，不改 mooncake 源码。空写已经这样做：本地 `mooncake_pin_api.h` 声明类型，不读 wheel 里不存在的 C++ 头文件（见下）
     2. **替代实现**：原则 5
     3. **自研协议客户端**：最后手段
   - △ = 待 E6 核对
@@ -272,7 +272,7 @@ stateDiagram-v2
 | has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**。副本核验走 `GET /batch_query_keys`，用传输端点比段还在不在。提回不走这条 | D2 F11b |
 | has_tenant_quota（租户配额读） | ✗（channel NO；不是段剩余空间） | HTTP ✓（GET `/api/v1/tenant_quotas`）。租户配额记账，不能当段剩余空间用 | D2 F13 |
 
-- L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 的 retained client/DFS 前提，本质就是能力分支——本层把它落成显式声明
+- L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 里仍登记的 DFS 前提，本质就是能力分支——本层把它落成显式声明。retained client 在这份主线上没有 RPC，通道关闭，L2 不选它
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
 
 **接口演进：KeySet（已定方向，待实施）**
@@ -328,31 +328,30 @@ stateDiagram-v2
 3. **C 接口**（`mooncake-store/include/store_c.h`，ctypes 可直调）
    - 数据面操作：put / get / is_exist / remove / register_buffer
    - put 的 config 带完整 pin 支持（`with_hard_pin`、`soft_pin_action` ENABLE/DISABLE/PRESERVE、TTL）——但注释明确这只是发布时的行为，即「写新 key 时挂 pin」：写新 key 是引擎的活，kvcm 不写新 key；kvcm 要的 pin 全是**事后操作**（key 已在池里）
-   - 事后加/解 pin 的唯一通道 = upsert（D2 F3/F12），C 接口只有 put 没有 upsert；copy/move、retained 注册、admin 查询也都不在——所以缺的接口仍要自封装 .so 补
+   - 事后加/解 pin 的通道 = 空写 upsert（D2 F3/F12）。C 接口只有 put，没有 upsert。copy/move 在官方绑定里，副本核验走 HTTP admin。空写用 kvcm 自己的 `_empty_pin.so`，不给 mooncake 打补丁
 
-**自封装 .so**（补两个缺口：空写 upsert、retained 注册——绑定、HTTP、C 接口都没有，C++ client 类有）：
+**自封装 .so**（已落地的缺口只有空写 upsert。保留身份不在这份主线里，不用这个 .so 去补）：
 
-- 写法：照 `store_py.cpp` 的写法——`#include` mooncake 头文件，调 C++ client 类方法，对外暴露 pybind 或 extern "C" 接口；产物放 kvcm 侧，不改 mooncake 源码
+- 已落地的空写：单独的 `_empty_pin.so`，只链 wheel 里的 `store.so`。wheel 不带 C++ 头文件。扩展用本地 `kvcm/kvcm/native/mooncake_pin_api.h` 声明要用的类型，调用 `client->master_client_.UpsertStart` / `UpsertEnd`。成员地址由编译器算。产物放 kvcm 侧，不改 mooncake 源码
 - 单 client 保证（约束见上「三条接入通道」节：store_py 与自封装 .so 必须共用同一 client 实例/UUID）：
   - 不能走的写法：自封装 .so 自己 `RealClient::create()` 再建一个 → 两个 UUID 两套心跳
-  - **路径 A（已落地的空写）**：把 `setup` 建好的那一个 client 传进扩展，调用它的 `UpsertStart`，不写数据，再 `UpsertEnd`。不 `RealClient::create()`。
-    - 扩展是单独的 `_empty_pin.so`，只链 wheel 里的 `store.so`。使用时不读 Mooncake 头文件。
-    - 类型在 `kvcm/kvcm/native/mooncake_pin_api.h`：只写到 `master_client_` 为止，成员地址由编译器算。与完整类定义对过：`PyClient::client_` 在 8 字节，`Client::master_client_` 在 48 字节，`ReplicateConfig` 208 字节，`ObjectMeta` 48 字节。
+  - **当前空写**：把 `setup` 建好的那一个 client 传进扩展，调用它的 `UpsertStart`，不写数据，再 `UpsertEnd`。不 `RealClient::create()`。
+    - 类型只写到 `master_client_` 为止。与完整类定义对过：`PyClient::client_` 在 8 字节，`Client::master_client_` 在 48 字节，`ReplicateConfig` 208 字节，`ObjectMeta` 48 字节。
     - 官方包用 `_get_pyclient_capsule` 把 `setup` 放进 `store_` 的那一个对象交出来。扩展按 `mooncake_pin_api.h` 里的成员调用 `UpsertStart` / `UpsertEnd`。
-    - **退路仍是包含 `pyclient.h` 的路径 A。** 若当前小头文件在真实调用上失败，再改回：pybind 参数为 `MooncakeStorePyWrapper&`，`get_real_client()` 拿出已建 client。拿到这个对象之后，`get_real_client()` 只是返回成员，一定可行。不确定的是跨模块还原这个类：它没有单独头文件，pybind 版本还要和 wheel 一致。代价是编译期要读 `pyclient.h` 带进来的那串头文件。使用时仍然只链 `store.so`，不读这些头。
-    - **client_id**：`MasterClient::UpsertStart` 发出去的是这个 client 自己的 UUID，没有「传入别人的 UUID」的参数。当前空写因此把 `client_id` 改归 kvcm（D2 方案一）。借名（D2 方案二）这条调用做不到，两个方案仍未选定。
-    - **写中窗口**：同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 和 End 之间时，副本停在写中；按 D2 F5 补 `End` 或 `Revoke` 的崩溃恢复还没做。
-    - 保留身份先不动。设计点名的 `AddReplicaForRetainedClient` 这份主线树里没有；`dummy_client.h` 的 `kRetained` 是外部 buffer 的引用计数，不是引擎死后 KV 还在。
-  - **路径 B（退路，未做）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）+ 缺口方法重新绑定一遍，Python 只 import 自封装 .so；天然单 client、不依赖跨模块 cast，代价是复制绑定面
-- 为什么不能 Python 直调（ctypes）：
+    - **含 `pyclient.h` 的路径是退路，不是当前实现。** 若当前小头文件在真实调用上失败，再改回：pybind 参数为 `MooncakeStorePyWrapper&`，`get_real_client()` 拿出已建 client。拿到这个对象之后，`get_real_client()` 只是返回成员。不确定的是跨模块还原这个类：它没有单独头文件，pybind 版本还要和 wheel 一致（2.13.6）。代价是编译期要读 `pyclient.h` 带进来的那串头文件。使用时仍然只链 `store.so`。现在不走这条。
+    - **client_id**：`MasterClient::UpsertStart` 发出去的是这个 client 自己的 UUID，没有「传入别人的 UUID」的参数。当前空写会把 `client_id` 写成 kvcm 的 UUID。借名（D2 方案二）这条调用做不到。两个方案仍未选定。
+    - **写中窗口**：同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 和 End 之间时，副本停在 PROCESSING。按 D2 F5 补 `End` 或 `Revoke` 的崩溃恢复还没做。
+    - 保留身份先不动。1fc27b6 没有 `AddReplicaForRetainedClient`。`dummy_client.h` 的 `kRetained` 是外部 buffer 的引用计数。
+  - **另一条退路（未做）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）重新绑定一遍，Python 只 import 自封装 .so；天然单 client，代价是复制绑定面
+- 为什么空写不从 Python ctypes 直调：
   - ctypes 能调 C 函数，但造不了 C++ 对象
   - 方法参数和返回是 C++ 类型（`std::string` 的内存布局（短字符串内嵌）、`UUID` struct、`tl::expected` 返回值），在 Python 里按字节拼这些对象 = 手工复刻编译器的类型布局，且布局随 libstdc++ 版本变
-  - 所以中间必须有一层 C++：它用头文件调类方法（布局由编译器保证），对 Python 只暴露 C 类型
-  - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）
+  - 中间这一层 C++ 用本地 `mooncake_pin_api.h` 声明类型，链接 `store.so` 的导出符号。wheel 里没有 mooncake 头文件，链接不读那些头
+  - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）。当前空写不用它
 - 两个断点（E6）：
-  1. 符号可见性：0.3.13.post1 `store.so` 导出 `MasterClient::UpsertStart` / `UpsertEnd` / `UpsertRevoke`。空写扩展链接这三个符号。`get_real_client` 是内联成员，不在动态符号表。
-  2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机；路径 A 的 pybind11 对齐：mooncake 锁定 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a），自封装 .so 编译用同版本即可对齐 internals
-- E6 另核：`/query_key` 的续租副作用在核验场景能否接受；retained 注册的具体符号名按 main 源码确认（0.3.13 x86 wheel 未见 retained 符号）。另：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），上游原生支持 NPU（v0.3.11 tag 已有 `ascend_transport` 目录）
+  1. 符号可见性：0.3.13.post1 `store.so` 导出 `MasterClient::UpsertStart` / `UpsertEnd` / `UpsertRevoke`。空写扩展链接这三个符号。`get_real_client` 是内联成员，不在动态符号表，当前空写也不调用它。
+  2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机。含 `pyclient.h` 的退路才要求 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a）与跨模块还原对齐。当前空写不转换 `MooncakeStorePyWrapper`。
+- E6 另核：`/query_key` 的续租副作用在核验场景能否接受。保留身份的符号不用再找：1fc27b6 没有 `AddReplicaForRetainedClient`，`kRetained` 是外部 buffer 引用计数。另：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），上游原生支持 NPU（v0.3.11 tag 已有 `ascend_transport` 目录）
 
 ### EngineAdapter（引擎适配）
 
@@ -526,7 +525,7 @@ sequenceDiagram
 
 ### ReleaseLoop / RetainLoop
 
-只留类骨架——不调用已落地的 move / remove。`demote` / `retain` 在 L4 仍是 NotImplementedError。职责：ReleaseLoop = 软释放 / demote / 主动 Remove 三级（D1 §6）；RetainLoop = retain 与计划下线编排（D2 §4）。
+只留类骨架——不调用已落地的 move / remove / demote。retain 在适配器上通道关闭，直接失败，不登记。职责：ReleaseLoop = 软释放 / demote / 主动 Remove 三级（D1 §6）；RetainLoop = retain 与计划下线编排（D2 §4）。
 
 ### 进程生命周期
 
@@ -556,14 +555,14 @@ sequenceDiagram
 2. **能力显式，不假装统一**：后端差异走 capability 声明，L2 按能力分支；不在接口里塞进只有 mooncake 有的概念
 3. **只建一层抽象**：L3 接口服务当前唯一后端（mooncake），第二后端（MemCache）接入时再修——不预判假想需求
 4. **语义规格以 D1/D2 为准**：本文任何接口定义与 D1/D2 冲突时，改本文
-5. **多实现方式：先实现一种，其余登记**：一个操作有多种实现方式时（D2 已有实例：retain = retained client / DFS 副本 / move 到存活节点的 seg / 自挂 SSD 作最后手段，§4；降层写穿 vs 写回分支，§3；copy 无指定源能力时以 move 替代，F7），**优先实现一种**，其余作为已知替代方式登记在 API 文档（能力前提、语义差异、补齐条件），后续按 capability 逐个补——不同时实现多个
+5. **多实现方式：先实现一种，其余登记**：一个操作有多种实现方式时（D2 已有实例：retain 的已登记手段 = DFS 副本 / move 到存活节点的 seg / 自挂 SSD，§4；1fc27b6 没有 `AddReplicaForRetainedClient`，`kRetained` 不是其中一种，本次不实现 retain。降层写穿 vs 写回分支，§3；copy 无指定源能力时以 move 替代，F7），**优先实现一种**，其余作为已知替代方式登记在 API 文档（能力前提、语义差异、补齐条件），后续按 capability 逐个补——不同时实现多个
 
 ## 与 E10 / E11 / E15 的对位
 
 - **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，73 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
 - **E11（进程化）🔁 实施中**（[PR #70](https://github.com/5x8-40/lake/pull/70)）：设计 = 本文「运行时结构」节。**范围切分**：
   - 本期做：进程壳（启动/退出/rebuild 接通）+ TaskEngine + KeepaliveLoop（唯一常驻循环）+ IntentReceiver（gRPC，E12）+ **copy 并发提交**（信号量窗口，见 TaskEngine 节）
-  - 只留类骨架：ReleaseLoop、RetainLoop（不调用已落地的 move/remove；demote/retain 仍是 NotImplementedError）
+  - 只留类骨架：ReleaseLoop、RetainLoop（不调用已落地的 move / remove / demote；retain 通道关闭，不登记）
   - 不做：链路利用率限速器（E15 剩余部分）、重发策略、多模型归属判定（多模型接入前置，已登记）、E13/E14 协议
 - **E11 阶段计划**：
   1. 进程壳 + 状态恢复：Ledger 单线程 executor → 启动时 `rebuild()` 接通 → KeepaliveLoop（固定窗口，协程定时器）→ 优雅退出（协程取消 + abandon 处理）

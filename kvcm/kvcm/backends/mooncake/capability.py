@@ -82,7 +82,7 @@ def mooncake_main() -> BackendCapability:
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
         has_retained_client=Capability(
-            Support.YES,
+            Support.NO,
             Support.NO,
             "这份主线树没有 AddReplicaForRetainedClient。dummy_client.h 的 kRetained 是外部 buffer 引用计数。先不做",
         ),
