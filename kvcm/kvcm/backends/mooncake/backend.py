@@ -714,8 +714,6 @@ class MooncakeBackend(KvOps):
             )
         plan = self._keys.build_plan(keys, list(self._locate(target)))
         source_plan = self._keys.build_plan(keys, list(self._locate(source)))
-        if [k for k, _ in source_plan] != [k for k, _ in plan]:
-            raise ValueError("move source/target plans are not key-aligned")
         # 容量判断在任何 create_move_task 之前。拒绝则一个任务都不发。
         # 方法本身不在本类：它在 feat/kvcm-segment-admission（PR 72）。
         admit = getattr(self, "_admit_new_bytes", None)
@@ -829,8 +827,28 @@ class MooncakeBackend(KvOps):
             raise IntentInputError(
                 "prefix expands to no keys (shorter than one block?)"
             )
+        if self._admin is None:
+            raise QueryError("软钉取尺寸需要主线 GET /batch_query_keys")
+        try:
+            parsed = await self._rpc(self._admin.batch_query_keys, keys)
+        except (AdminMainError, StoreClientError) as e:
+            raise QueryError(str(e)) from e
+        sizes: list[int] = []
+        for key in keys:
+            item = parsed.get(key)
+            found = [
+                view.size
+                for view in (item.memory if item is not None and item.ok else ())
+                if view.size is not None
+            ]
+            uniq = set(found)
+            if len(uniq) != 1:
+                raise QueryError(
+                    f"软钉读不到唯一的原尺寸，没有钉上: {key} sizes={sorted(uniq)}"
+                )
+            sizes.append(uniq.pop())
         await self._rpc(
-            functools.partial(self._client.soft_pin, keys, enable=enable)
+            functools.partial(self._client.soft_pin, keys, sizes, enable=enable)
         )
 
     async def demote(self, prefix: Prefix) -> None:
@@ -857,22 +875,29 @@ class MooncakeBackend(KvOps):
                 "0.3.11 的 /batch_query_keys 没有盘副本字段，不能降层"
             )
         await self.stop_keepalive(prefix)
-        await asyncio.sleep(self._lease_ttl_s)
         try:
-            parsed = await self._rpc(self._admin.batch_query_keys, keys)
-        except (AdminMainError, StoreClientError) as e:
-            raise QueryError(str(e)) from e
-        missing = [
-            key
-            for key in keys
-            if parsed.get(key) is None
-            or not parsed[key].ok
-            or parsed[key].disk_replicas < 1
-        ]
-        if missing:
-            raise VerifyError(
-                "demote: 还没有盘副本，没有降层成功: " + ", ".join(missing[:4])
-            )
+            await asyncio.sleep(self._lease_ttl_s)
+            try:
+                parsed = await self._rpc(self._admin.batch_query_keys, keys)
+            except (AdminMainError, StoreClientError) as e:
+                raise QueryError(str(e)) from e
+            missing = [
+                key
+                for key in keys
+                if parsed.get(key) is None
+                or not parsed[key].ok
+                or parsed[key].disk_replicas < 1
+            ]
+            if missing:
+                raise VerifyError(
+                    "demote: 还没有盘副本，没有降层成功: " + ", ".join(missing[:4])
+                )
+        except asyncio.CancelledError:
+            await self.keepalive(prefix)
+            raise
+        except (QueryError, VerifyError):
+            await self.keepalive(prefix)
+            raise
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """把前缀 KV 提回盘副本登记的那个实例。
@@ -889,6 +914,10 @@ class MooncakeBackend(KvOps):
         if not keys:
             raise IntentInputError(
                 "prefix expands to no keys (shorter than one block?)"
+            )
+        if self._cap.has_promotion.channel is not Support.YES:
+            raise UnsupportedCapabilityError(
+                "0.3.11 提回的前置核对要主线 /batch_query_keys，通道不具备"
             )
         if self._admin is None:
             raise QueryError(

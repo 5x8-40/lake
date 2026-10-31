@@ -38,10 +38,10 @@ def mooncake_v0311() -> BackendCapability:
             "通道不具备，demote 在停保活前拒绝",
         ),
         has_promotion=Capability(
-            Support.YES,
-            Support.YES,
-            "提回 = 绑定 batch_get_replica_desc（GetReplicaList，累计命中），"
-            "默认 2 次过线；不用 /batch_query_keys，不做读删写",
+            Support.NO,
+            Support.NO,
+            "提回开头要主线 /batch_query_keys 核对 local_disk 登记实例。"
+            "0.3.11 没有这条零副作用查询，通道不具备",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
@@ -89,7 +89,9 @@ def mooncake_main() -> BackendCapability:
         has_promotion=Capability(
             Support.YES,
             Support.YES,
-            "同 0.3.11：GetReplicaList 累计命中，默认 2 次；不用零副作用查询",
+            "先用 GET /batch_query_keys 核对 local_disk 端点，"
+            "target 必须是盘副本登记实例；然后再打 GetReplicaList，默认 2 次。"
+            "同步核验，不轮询，不做读删写",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),

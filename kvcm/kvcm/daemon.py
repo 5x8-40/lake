@@ -37,6 +37,7 @@ prefix{model_id, token_ids} 和 target 实例名；copy / move / remove
 用法：
     python -m kvcm.daemon --master 127.0.0.1:50088 \
         --local-hostname 127.0.0.1:13021 \
+        --admin http://127.0.0.1:9003 \
         --model-name qwen --tp-size 2 \
         --instance-segs inst-a=seg0,seg1 \
         --instance-segs inst-b=seg2,seg3 \

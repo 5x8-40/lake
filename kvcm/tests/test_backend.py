@@ -1107,9 +1107,24 @@ def test_pin_soft_calls_client(fake_store_module, monkeypatch) -> None:
     seen = {}
 
     class Client(FakeClient):
-        def soft_pin(self, keys, *, enable=True):
+        def soft_pin(self, keys, sizes, *, enable=True):
             seen["keys"] = list(keys)
+            seen["sizes"] = list(sizes)
             seen["enable"] = enable
+
+        def batch_get_replica_desc(self, keys):
+            raise AssertionError("软钉取尺寸不能走 GetReplicaList")
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery, MemoryReplicaView
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k, ok=True, memory=(MemoryReplicaView("seg-A", size=64),)
+                )
+                for k in keys
+            }
 
     kc = KeyComputer(model_name="qwen", tp_size=1)
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
@@ -1118,19 +1133,33 @@ def test_pin_soft_calls_client(fake_store_module, monkeypatch) -> None:
         key_computer=kc,
         locate=lambda _inst: ["seg-A"],
         capability=mooncake_main(),
+        admin=Admin(),
     )
     run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
     assert seen["enable"] is True
     assert seen["keys"] == ["k0"]
+    assert seen["sizes"] == [64]
 
 
 def test_pin_soft_disable_calls_empty_write(fake_store_module, monkeypatch) -> None:
     seen = {}
 
     class Client(FakeClient):
-        def soft_pin(self, keys, *, enable=True):
+        def soft_pin(self, keys, sizes, *, enable=True):
             seen["keys"] = list(keys)
+            seen["sizes"] = list(sizes)
             seen["enable"] = enable
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery, MemoryReplicaView
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k, ok=True, memory=(MemoryReplicaView("seg-A", size=8),)
+                )
+                for k in keys
+            }
 
     kc = KeyComputer(model_name="qwen", tp_size=1)
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
@@ -1139,9 +1168,10 @@ def test_pin_soft_disable_calls_empty_write(fake_store_module, monkeypatch) -> N
         key_computer=kc,
         locate=lambda _inst: ["seg-A"],
         capability=mooncake_main(),
+        admin=Admin(),
     )
     run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT, enable=False))
-    assert seen == {"keys": ["k0"], "enable": False}
+    assert seen == {"keys": ["k0"], "sizes": [8], "enable": False}
     with pytest.raises(ValueError, match="enable=False"):
         run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD, enable=False))
 
@@ -1153,7 +1183,7 @@ def test_pin_hard_registers_keepalive(fake_store_module, monkeypatch) -> None:
     called = {"soft": 0}
 
     class Client(FakeClient):
-        def soft_pin(self, keys, *, enable=True):
+        def soft_pin(self, keys, sizes, *, enable=True):
             called["soft"] += 1
 
         def batch_get_replica_desc(self, keys):
@@ -1224,8 +1254,6 @@ def test_memory_replica_predicate_calls_method() -> None:
 
     client = StoreClient()
     client._store = Store()
-    assert client._memory_replica_sizes(["k"]) == [32]
-    assert called == {"disk": 0, "mem": 1}
     eps = client.batch_memory_replica_endpoints(["k"])
     assert eps["k"] == ["10.0.0.3:1", "10.0.0.3:1"]
     assert called["disk"] == 0
@@ -1260,7 +1288,7 @@ def test_soft_pin_reuses_existing_capsule(monkeypatch) -> None:
 
     class Store:
         def batch_get_replica_desc(self, keys):
-            return {k: [Desc()] for k in keys}
+            raise AssertionError("软钉取尺寸不能走 GetReplicaList")
 
         def _get_pyclient_capsule(self):
             return "existing-client"
@@ -1274,7 +1302,7 @@ def test_soft_pin_reuses_existing_capsule(monkeypatch) -> None:
     monkeypatch.setattr("kvcm.native.empty_pin.empty_soft_pin", _pin)
     client = StoreClient()
     client._store = Store()
-    client.soft_pin(["h0"], enable=True)
+    client.soft_pin(["h0"], [64], enable=True)
     assert seen == {
         "capsule": "existing-client",
         "keys": ["h0"],
@@ -1299,7 +1327,7 @@ def test_soft_pin_missing_size_does_not_call_extension(monkeypatch) -> None:
     client = StoreClient()
     client._store = Store()
     with pytest.raises(StoreClientError, match="没有钉上"):
-        client.soft_pin(["h0"], enable=True)
+        client.soft_pin(["h0"], [], enable=True)
 
 
 def test_empty_pin_extension_rejects_non_capsule() -> None:
@@ -2002,7 +2030,7 @@ def test_demote_fails_without_disk_replica(fake_store_module, monkeypatch) -> No
         run(b.keepalive(prefix))
         with pytest.raises(VerifyError, match="还没有盘副本"):
             run(b.demote(prefix))
-        assert led.list_keepalive() == []
+        assert led.list_keepalive() == [prefix]
         assert steps == [("sleep", 0, []), ("query", ["k0"])]
     finally:
         led.close()
@@ -2100,7 +2128,7 @@ def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> 
         client=client,
         key_computer=kc,
         locate=lambda _inst: ["seg-A"],
-        capability=mooncake_v0311(),
+        capability=mooncake_main(),
         admin=Admin(),
         promote_hits=2,
     )
@@ -2145,6 +2173,27 @@ def test_promote_wrong_disk_owner_skips_replica_list(
         promote_hits=2,
     )
     with pytest.raises(VerifyError, match="没有打 GetReplicaList"):
+        run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
+
+
+def test_promote_v0311_refuses_before_query(fake_store_module, monkeypatch) -> None:
+    assert mooncake_v0311().has_promotion.channel is Support.NO
+    assert mooncake_main().has_promotion.channel is Support.YES
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            raise AssertionError("v0311 提回不该查 admin")
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        admin=Admin(),
+    )
+    with pytest.raises(UnsupportedCapabilityError, match="batch_query_keys"):
         run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
 
 

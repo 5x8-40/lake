@@ -204,34 +204,17 @@ class StoreClient:
             )
         return raw
 
-    def _memory_replica_sizes(self, keys: Sequence[str]) -> list[int]:
-        """每个 key 的内存副本字节数。空写把这个数交给 UpsertStart，不新写数据。"""
-        keys = list(keys)
-        descs = self._s().batch_get_replica_desc(keys)
-        items = descs.items() if isinstance(descs, dict) else zip(keys, descs)
-        found: dict[str, int] = {}
-        for key, replicas in items:
-            sizes: list[int] = []
-            for desc in replicas or []:
-                if not is_memory_replica(desc):
-                    continue
-                mem = desc.get_memory_descriptor()
-                sizes.append(int(mem.buffer_descriptor.size))
-            uniq = set(sizes)
-            if len(uniq) != 1:
-                raise StoreClientError(
-                    f"软钉读不到唯一的原尺寸，没有钉上: {key!r} sizes={sorted(uniq)}"
-                )
-            found[str(key)] = uniq.pop()
-        missing = [k for k in keys if k not in found]
-        if missing:
-            raise StoreClientError(
-                "软钉缺少内存副本尺寸，没有钉上: " + ", ".join(missing[:4])
-            )
-        return [found[k] for k in keys]
-
-    def soft_pin(self, keys: Sequence[str], *, enable: bool = True) -> None:
+    def soft_pin(
+        self, keys: Sequence[str], sizes: Sequence[int], *, enable: bool = True
+    ) -> None:
         """空写软钉。用官方包已经建好的 client，不第二次 create。
+
+        ``sizes`` 由调用方从 ``GET /batch_query_keys`` 的 ``size_`` 传入。
+        这里不调 ``batch_get_replica_desc`` / ``GetReplicaList``，那会
+        ``GrantReadLease``。若 key 上已经有未过期读租约（例如别的读者或
+        保活刚续过），main 的 ``UpsertStart`` 仍会走 Case C，丢掉旧副本再按
+        ``replica_num=1`` 重分配，空写中间不写数据。这次只去掉 kvcm 自己
+        取尺寸时授上的那次租约。已有租约的情况仍未解决。
 
         ``_get_pyclient_capsule`` 拿回 setup 时放进 ``store_`` 的 PyClient。
         扩展在这个对象上调 ``MasterClient::UpsertStart`` / ``UpsertEnd``，
@@ -239,7 +222,9 @@ class StoreClient:
         """
         store = self._s()
         keys = list(keys)
-        sizes = self._memory_replica_sizes(keys)
+        sizes = [int(s) for s in sizes]
+        if len(keys) != len(sizes) or not keys or any(s <= 0 for s in sizes):
+            raise StoreClientError("软钉读不到唯一的原尺寸，没有钉上")
         capsule_fn = getattr(store, "_get_pyclient_capsule", None)
         if not callable(capsule_fn):
             raise StoreClientError(

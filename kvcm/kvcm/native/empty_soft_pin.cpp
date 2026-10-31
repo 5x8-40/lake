@@ -39,6 +39,8 @@ mooncake::Client* client_of(py::handle cap_obj) {
 
 void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
                     const std::vector<size_t>& sizes, bool enable) {
+    // 尺寸来自零副作用查询。若 key 上已经有未过期读租约，main 的
+    // UpsertStart 仍走 Case C。这次只去掉 kvcm 取尺寸时自己授上的那次。
     if (keys.size() != sizes.size() || keys.empty()) {
         throw std::runtime_error("软钉的 key 和 size 不合法，没有钉上");
     }

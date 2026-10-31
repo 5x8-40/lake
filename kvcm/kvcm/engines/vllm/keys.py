@@ -400,6 +400,11 @@ class KeyComputer:
         unknown = [r for r in by_rank if r < 0 or r >= len(targets)]
         if unknown:
             raise IntentInputError(f"ranks out of range for targets: {unknown}")
+        if len(targets) > max_rank + 1:
+            extra = list(targets[max_rank + 1 :])
+            raise IntentInputError(
+                f"extra segments beyond rank {max_rank}: {extra}"
+            )
         return [(k, targets[parse_key_rank(k)]) for k in keys]
 
 

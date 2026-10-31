@@ -128,6 +128,14 @@ def test_plan_tp2_rank_mapped() -> None:
     assert plan[1] == (keys[1], "10.0.0.1:5002")
 
 
+def test_plan_extra_segments_fail_after_rank_cover() -> None:
+    """多 rank 时多出来的 seg 不能静默忽略。异构折算仍刚好覆盖。"""
+    kc = km.KeyComputer(model_name="qwen", tp_size=2)
+    keys = kc.expand(["h0"])
+    with pytest.raises(IntentInputError, match="extra segments"):
+        kc.build_plan(keys, ["10.0.0.1:1", "10.0.0.1:2", "10.0.0.1:3"])
+
+
 def test_plan_hetero_reverse_expands() -> None:
     """peer 4 > 目标 2：eff rank i → targets[i//2]（seg 列表按倍展开）。"""
     kc = km.KeyComputer(model_name="qwen", tp_size=2, peer_tp_size=4)

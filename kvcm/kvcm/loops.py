@@ -16,12 +16,15 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import logging
 import sys
 import time
 
 from kvcm.ledger import Ledger
 from kvcm.ops.base import KvOps, QueryError
 from kvcm.ops.types import Prefix
+
+logger = logging.getLogger(__name__)
 
 
 class KeepaliveLoop:
@@ -199,6 +202,7 @@ class KeepaliveLoop:
     # ------------------------------------------------------------------
 
     async def sweep_once(self) -> None:
+        started = time.monotonic()
         now = time.time()
         records = await self._ledger_call(self._ledger.list_keepalive_records)
         for rec in records:
@@ -223,6 +227,14 @@ class KeepaliveLoop:
                 await self._ledger_call(
                     self._ledger.unregister_keepalive, rec.prefix
                 )
+        elapsed = time.monotonic() - started
+        if elapsed > self._interval:
+            logger.warning(
+                "keepalive sweep slower than interval: prefixes=%d elapsed=%.3fs interval=%.3fs",
+                len(records),
+                elapsed,
+                self._interval,
+            )
 
 
 class ReleaseLoop:
