@@ -101,6 +101,7 @@ class BlockStoredPublisher:
             return
         chain = self._chain_fn(prefix.token_ids, self._block_size, self._hash_algo)
         BlockStored, EventBatch, medium_cpu, _ = self._events_fn()
+        # MEDIUM_CPU 是 "CPU"。连接器里有小写字面量 "cpu"，不跟它。
         event = BlockStored(
             block_hashes=list(chain.block_hashes),
             parent_block_hash=chain.parent_block_hash,

@@ -9,7 +9,7 @@
    口径与引擎漂移，直接失败（复制了也没意义）
 2. **copy 发起**：前缀 → key 列表 → rank 映射计划 → 逐 key 提交复制任务
 3. **query_task 轮询到 READY**：任务全部完成 + 副本核验通过
-4. （待接通）keepalive 注册、READY 事件补发（`BlockStored`）
+4. **流程返回之后**（`TaskEngine._on_ready`，不在本流程里）：注册保活，并按目标实例补发一条 `BlockStored`。恢复跟踪在轮询前用 `target_of` 取目标，READY 后同样补发。没有端点或发送失败只记日志，预热仍成功
 
 ## 数据流
 
@@ -121,6 +121,6 @@ sequenceDiagram
 - **locate**：目标实例 → rank 有序 seg 列表（demo 探测 / 生产实例注册）
 - **StoreClient**：绑定 RPC（exists / copy 提交 / query_task / 副本核验）
 - **Ledger**：任务状态（running → ready/failed/abandoned）
-- **EventPublisher**（待接通）：READY 后按目标实例端点补发 `BlockStored`
-- **keepalive**（待接通）：READY 后注册保活（见
+- **EventPublisher**：`TaskEngine` 在 READY 后按目标实例补发一条 `BlockStored`（`kvcm/events/publisher.py`）。不调用 `/register`。把地址交给索引归 E13
+- **keepalive**：`TaskEngine` 在 READY 后注册保活（见
   [../code-architecture.md](../code-architecture.md) 运行时结构节）
