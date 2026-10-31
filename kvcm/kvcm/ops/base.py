@@ -85,10 +85,15 @@ class QueryError(RuntimeError):
 class SubmitError(RuntimeError):
     """操作提交失败（copy/move/promote 的发起阶段）。
 
-    异常消息携带明细（如已发起的任务号——中途失败时那些任务需要跟踪）。
+    已经落账的句柄放在 `handle` 上，交给流程 `abandon`（账本记
+    abandoned）。池里的传输不取消。没有任务号时 `handle` 为 None。
     与 QueryError（查询可重试）、VerifyError（核验终态）区分：提交失败
     的重试策略归编排层（幂等键 + 后端幂等兜底）。
     """
+
+    def __init__(self, message: str = "", *args, handle: TaskHandle | None = None):
+        super().__init__(message, *args)
+        self.handle = handle
 
 
 class AdmissionWait(Exception):

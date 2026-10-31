@@ -54,7 +54,7 @@ sequenceDiagram
         BE->>M: GET /query_segment（只查计划第一条的目标段）
         alt 这一段放不下，或管理端口暂时连不上
             BE-->>Flow: AdmissionWait
-            Note over Flow: TaskEngine 在前缀闸外等。还没有任务号，不记复制失败
+            Note over Flow: TaskEngine 在前缀闸外等。还没有任务号，不记复制失败，不提交
         else 段不存在
             BE-->>Flow: AdmissionStop
             Note over Flow: TaskEngine 包成 PrefetchError，立即停止
@@ -70,14 +70,17 @@ sequenceDiagram
                     M-->>SC: task_id（两个整数）
                     SC-->>BE: task_id
                 end
-            end
-        end
-        alt 提交中途失败
-            BE-->>Flow: SubmitError, 已发 id 只在异常消息里
-        else 提交成功
-            BE->>DB: upsert status=running
-            BE-->>Flow: TaskHandle
-            loop 轮询到终态或超时
+                alt 提交中途失败，或提交中途超时且已有任务号
+                    Note over BE: 句柄交给 run_after_exists。池里的传输不取消
+                    Flow->>BE: abandon(handle)
+                    BE->>DB: status=abandoned
+                    BE-->>Flow: PrefetchError, handle=...
+                else 没有任务号就超时
+                    BE-->>Flow: PrefetchError, cancelled before handle, 不写 Ledger
+                else 提交成功
+                    BE->>DB: upsert status=running
+                    BE-->>Flow: TaskHandle
+                    loop 轮询到终态或超时
                 Flow->>BE: query_task(handle)
                 alt 不在等副本状态
                     BE->>SC: query_task(每个 task_id)
@@ -105,6 +108,8 @@ sequenceDiagram
                     BE->>DB: 其余行 abandoned, 撞车任务保持 failed
                     BE-->>Flow: PrefetchError
                 end
+                    end
+                end
             end
         end
     end
@@ -119,8 +124,9 @@ sequenceDiagram
 - 与 master 的交互里，复制和核验仍是绑定 RPC。提交前多一次管理端口
   `GET /query_segment`（明文 Used / Capacity），不用 `/get_segments_detail`，
   也不用 `/batch_query_keys`（零副作用核验还没接通）
-- Ledger 只在 copy 成功、到终态、进入等副本状态、abandon 时写。
-  exists 失败和提交失败不写行
+- Ledger 在 copy 落账、到终态、进入等副本状态、abandon 时写。
+  exists 失败，以及还没有任务号的提交失败，不写行。已经落账的号由
+  `abandon` 记成 abandoned；池里的传输不取消
 - 图里的「超时」指本次预热的截止时间到了，接下来流程调用
   `abandon`——它不是 `query_task` 的一种返回值
 - 「等副本」状态（代码里叫 `_watch`）：失败全是撞车时先记 failed、立
