@@ -366,14 +366,10 @@ class KeyComputer:
             return max(self.tp_size, self.peer_tp_size)
         return self.tp_size
 
-    def block_chain(self, token_ids: tuple[int, ...]) -> TokenBlockChain:
-        """token 序列 → 满块 hash 链原值（事件 block_hashes 用这个）。"""
-        return hash_token_block_chain(token_ids, self.block_size, self.hash_algo)
-
     def keys_for_tokens(self, token_ids: tuple[int, ...]) -> list[str]:
         """token 序列 → PoolKey 列表（hash 链仅容器内可用）。
 
-        PoolKey 吃十六进制串。事件里的 block hash 用 ``block_chain`` 的原值，
+        PoolKey 吃十六进制串。事件里的块链用 ``hash_token_block_chain``，
         不要拿本方法的返回值去填 BlockStored。
         """
         hexes = hash_token_blocks(token_ids, self.block_size, self.hash_algo)

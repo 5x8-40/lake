@@ -9,10 +9,10 @@
 代码分五层，依赖方向只允许向下（L1 → L2 → L3 ← L4；L5 由 L4 持有）：
 
 ```text
-L1 接口层     IntentReceiver / EventPublisher / InstanceWatcher      kvcm/api/
+L1 接口层     IntentReceiver / InstanceWatcher                        kvcm/api/
               进程对外通道；不含任何存储概念（IntentReceiver 已实现 gRPC。
-              BlockStored 补发在 kvcm/events/，由 daemon 注入 TaskEngine；
-              api/events.py 仍是占位。把地址交给索引与 InstanceWatcher 归 E13）
+              BlockStored 补发在 kvcm/events/ 的 BlockStoredPublisher，由 daemon
+              注入 TaskEngine。把地址交给索引与 InstanceWatcher 归 E13）
 L2 编排层     PrefetchFlow 已实现；SessionEnd/Drain/Retain 未实现    kvcm/flows/
               只调 L3 接口；代码里不出现 seg / lease / client_id / PoolKey / rank
 L3 原子操作层 KvOps：八操作 + query_task / exists / abandon          kvcm/ops/
@@ -91,7 +91,7 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-  Api["api<br/>intents/events/watcher"] --> Types
+  Api["api<br/>intents/watcher"] --> Types
   Flow["flows.prefetch"] --> Base["ops.base"]
   Flow --> Types["ops.types"]
   Base --> OCap["ops.capability"]
@@ -144,7 +144,7 @@ flowchart LR
 | 模块 | 职责 | 出处 |
 |------|------|------|
 | IntentReceiver | 收 Router 预热 intent（E12 已实现）。**协议**：gRPC `KvcmIntent.SubmitIntent { prefix{model_id, token_ids}, target }`，入队后立即返回 `intent_id`；执行状态由调用方 `GetTask(intent_id)` 查（PENDING / READY / FAILED / UNKNOWN）。intent ≠ command：kvcm 按池现状决定做不做、何时做，调用方不得假设执行时机。servicer 只调 `TaskEngine` 公开方法，不含存储概念 | D1 §4 职责边界、`proto/kvcm_intent.proto` |
-| EventPublisher | READY 后按目标实例补发一条 `BlockStored`（`kvcm/events/publisher.py` 的 `BlockStoredPublisher`，daemon 注入 `TaskEngine`）。每个实例一个 `--kv-event-endpoint`，第一次补发才绑定，进程退出才关；不调用 `/register`，把地址交给索引归 E13。`api/events.py` 的同名类是占位，不接发布 | D1 §2 方案 a、E14 |
+| EventPublisher | READY 后按目标实例补发一条 `BlockStored`（`kvcm/events/publisher.py` 的 `BlockStoredPublisher`，daemon 注入 `TaskEngine`）。每个实例一个 `--kv-event-endpoint`，第一次补发才绑定，进程退出才关；不调用 `/register`，把地址交给索引归 E13 | D1 §2 方案 a、E14 |
 | InstanceWatcher | 实例上线/销毁接入 → 触发预热 / seg 副本处理；「端点→实例」「seg→实例」注册的权威来源（E13；先占位，事件源随 D4） | D1 §3、E13 |
 
 - IntentReceiver / EventPublisher 两条通道与 D1 §4「两条单向通道」一致（intent 进来、事件发出去）；InstanceWatcher 是第三条接入（实例事件，归 D4/E13）
@@ -359,7 +359,7 @@ stateDiagram-v2
 |------|------|--------|
 | KeyComputer | 前缀 → hash 链 → PoolKey。key 格式直接从 vllm-ascend 库导入（两个版本的导入路径都试），保证和引擎算得一致；容器外没有库时回退到内置的格式副本并警告可能和引擎不一致，容器内有测试逐字节比对，用来兜住这个风险。`build_plan`：每条 key 映射到目标 seg（源和目标 TP 不同时按倍数归并）。PYTHONHASHSEED 必须为 0 的检查 | `engines/vllm/keys.py` |
 | RankTopology | rank 与 KV 切片的对应关系（TP/PP/DP 切分；源和目标 TP 不同时，kvcm `peer_tp_size` 必须与引擎环境变量 `PEER_TP_SIZE` 同值）；rank 与 seg 对号（探测：pidfile/进程树/ss//proc，跨机时把脚本源码经 ssh 送到目标机执行，ss/ssh 带超时） | `engines/vllm/topology.py` |
-| 事件格式 | 引擎 KV 事件：`BlockStoredPublisher` 用上游 `BlockStored` / `EventBatch` / `ZmqEventPublisher` 构造并发送。一条事件装连续满块链；hash 为 `hash_block_tokens` 原值；`medium` 为 `MEDIUM_CPU`（`"CPU"`） | `events/publisher.py` |
+| 事件格式 | 引擎 KV 事件：`BlockStoredPublisher` 用上游 `BlockStored` / `EventBatch` / `ZmqEventPublisher` 构造并发送。一条事件装连续满块链；`hash_token_block_chain` 的 hash 发出前过 `maybe_convert_block_hash`，默认发低 64 位整数，不发原字节，也不发十六进制字符串；`group_idx` 补发填 0；`medium` 为 `MEDIUM_CPU`（`"CPU"`） | `events/publisher.py` |
 | engine config | block_size / num_kv_heads / head_size / 层数读取（KV 大小估算） | 待做 |
 
 - **KeyComputer 归引擎侧，不归存储侧**——PoolKey 的权威定义在**引擎**（引擎写 KV 时用的就是这个 key；kvcm 不定自己的格式，只是按同样的规则把 key 再算出来）；mooncake 对 key 无格式要求（不透明字符串），后端不掺和 key 语义
