@@ -102,11 +102,12 @@ flowchart LR
   BE --> Led
   BE --> SC["client<br/>StoreClient"]
   BE --> KC["engines.vllm.keys<br/>KeyComputer"]
+  KC --> Types
   McCap["capability.py<br/>（mooncake 两版本能力表）"] --> OCap
   Seg["topology.py<br/>SegTopology"] --> Http["http_admin"]
 ```
 
-- `engines.vllm.keys`、`engines.vllm.topology`、`client`、`http_admin` 不 import 任何 kvcm 模块（图上没有它们的出边）
+- `engines.vllm.keys` 从 `kvcm.ops.types` 引 `IntentInputError`，不 import `ops.base`。`engines.vllm.topology`、`client`、`http_admin` 不 import 任何 kvcm 模块
 
 **谁调谁**（运行时方法调用）：
 
@@ -512,7 +513,7 @@ sequenceDiagram
 - **重启恢复不占闸（已知窗口）**：`TaskEngine._track` 只轮询 `rebuild` 捞回的 handle，不 acquire 传输闸。重启后旧前缀全部仍在 master 上搬，新预热仍可占满名额。接受这个叠加——让恢复任务去等闸，轮询会被串行化
 - **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
 - **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；`session_end` 类可延迟任务排队无妨
-- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。默认 4 来自实验 #16 单机合成目标段（14 连发约半数 `TRANSFER_FAIL`，窗口 4 时 42/42 全成）。#17 跨机同样窗口大约一半失败，主错误是 master 留内存失败，所以它不是跨机的充分条件。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过单机实测打爆的点。不代替 E15，也不做网卡限速；链路利用率感知的限速器仍归 E15，接在同一层信号量上
+- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。默认 4 来自实验 #16 单机合成目标段（14 连发约半数 `TRANSFER_FAIL`，窗口 4 时 42/42 全成）。#17 跨机同样窗口大约一半失败，主导错误名是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），所以它不是跨机的充分条件。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过单机实测打爆的点。不代替 E15，也不做网卡限速；链路利用率感知的限速器仍归 E15，接在同一层信号量上
 - **排队超时**：intent 在队列等待的语义（等多久算放弃）随 E12 intent 字段一起定；执行超时沿用 flow 现有 `timeout_s`
 - **失败态策略**（只留接口，随 E11 细化）：失败后的动作三种——① 重发；② 放弃这批任务，事后把留下的副本清掉（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 复制中途源实例下线时的处理（D5）。语义引 D2 §1 与 D5，不新造语义
 - **编程错误停收**：连续 3 次，或最后一条消费者退出时，`_accepting=False` 拒新 intent。已经入队、还没被取走的，按 shutdown 同款收成 FAILED（`cancelled (shutdown, never started)`）。编程错误本身仍然向上抛，不吞掉

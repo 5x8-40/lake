@@ -147,6 +147,7 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
         thread_name_prefix="kvcm-rpc",
     )
     keepalive: KeepaliveLoop | None = None
+    keepalive_started = False
     engine: TaskEngine | None = None
     engine_shutdown_done = False
     backend: MooncakeBackend | None = None
@@ -257,6 +258,7 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
             print(f"[kvcm] startup: gc removed {gone} stale task rows", file=sys.stderr)
         # 3. 常驻组件启动（协程）
         keepalive.start()
+        keepalive_started = True
         engine.start()
         if args.listen:
             host, _, port = args.listen.rpartition(":")
@@ -298,6 +300,10 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
         #    （`_owns_executor` 为假时会直接 return，等待会被静默跳过）。
         drained = _wait_executor(executor, args.shutdown_timeout_s)
         if keepalive is not None:
+            # close 不关 Ledger executor，也不停 sweep。已经 start 过的循环
+            # 要先 stop，异常路径才不会把一轮 sweep 留在事件循环上。
+            if keepalive_started:
+                await keepalive.stop(timeout_s=args.shutdown_timeout_s)
             keepalive.close()
         if not drained:
             # 有线程卡在 mooncake 绑定或 Ledger 的 submit().result() 里。
@@ -483,7 +489,8 @@ def main(argv: list[str] | None = None) -> int:
         default=4,
         help="进程内同时在飞的 create_copy_task 上限（所有 copy 共用）。"
         "默认 4 来自实验 #16 单机合成目标段（窗口 4 时 42/42 全成）。"
-        "#17 跨机同样窗口大约一半失败，主错误是 master 留内存失败，"
+        "#17 跨机同样窗口大约一半失败，主导错误名是 NO_AVAILABLE_HANDLE"
+        "（max retries reached: 10），"
         "所以它不是跨机的充分条件。不代替 E15，也不做网卡限速",
     )
     p.add_argument(

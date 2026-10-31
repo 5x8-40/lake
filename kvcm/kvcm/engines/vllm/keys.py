@@ -25,7 +25,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, fields
 
-from kvcm.ops.base import IntentInputError
+from kvcm.ops.types import IntentInputError
 
 _RANK_RE = re.compile(r"@head_or_tp_rank:(\d+)@")
 

@@ -27,15 +27,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from kvcm.ops.capability import BackendCapability
-from kvcm.ops.types import InstanceId, PinKind, Prefix
-
-
-class IntentInputError(Exception):
-    """这一次 intent 的输入不对，不是编程错误。
-
-    未登记实例、前缀不足一块、段名单和 TP 对不上、PYTHONHASHSEED 未设。
-    消费者按这个类型记 FAILED 后继续。其它异常仍记 FAILED 再抛。
-    """
+from kvcm.ops.types import InstanceId, IntentInputError, PinKind, Prefix
 
 
 class TaskStatus(enum.Enum):

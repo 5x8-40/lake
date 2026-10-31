@@ -15,8 +15,7 @@ from __future__ import annotations
 import threading
 from typing import Sequence
 
-from kvcm.ops.base import IntentInputError
-from kvcm.ops.types import InstanceId
+from kvcm.ops.types import InstanceId, IntentInputError
 
 
 class InstanceDirectory:

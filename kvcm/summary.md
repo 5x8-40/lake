@@ -64,7 +64,7 @@
 - 引擎事件通道上看不到池副本删除（F10）→ 索引里池副本条目只增不减，条目过时只损性能（F3）
 - GPU 侧有 Removed 事件（F8）
 - 池原生 publisher 有 removed 事件，但 0.3.11 不含、且载荷只说 key 怎么了、不说在哪台机器（F14，E8 已核）——升级后首选索引侧直接订阅解析（D1 §2 方案 b），kvcm 翻译重发为备选
-- 选路方进程形态与 D4 耦合；E11-E14 依赖设计定型，E10/E11 骨架可先行
+- 选路方进程形态与 D4 耦合；E13/E14 仍依赖设计定型。E10、E11（daemon / TaskEngine / KeepaliveLoop）、E12（SubmitIntent / GetTask）已落地
 
 **D2. KV 调度操作集（pin / demote / prefetch / retain / release）**
 
@@ -260,11 +260,11 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 ### B. 服务化重构（骨架可直接开工，接口依赖设计）
 
-- **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），按五层架构重组（L3 原子操作抽象屏蔽后端语义 + L4 mooncake 适配器 + L2 编排层只调 L3），明确状态归属与接口边界，为进程化打基础。🟡 **进行中**——三步（Ledger / L3+L4 / L2+API）已落地，PR 审核中。设计：[code-architecture.md](design/code-architecture.md)
+- **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），按五层架构重组（L3 原子操作抽象屏蔽后端语义 + L4 mooncake 适配器 + L2 编排层只调 L3），明确状态归属与接口边界，为进程化打基础。✅ **已落地**（Ledger / L3+L4 / L2+API）。设计：[code-architecture.md](design/code-architecture.md)
   - **已知边界（rebuild 任务归属）**：重启恢复（`MooncakeBackend.rebuild`）不区分任务归属——账本里全部 running 任务都按本实例的模型口径重算；多模型/多实例共用同一 Ledger 时会错算。当前单实例单模型无影响；**多模型前必须先加归属判定（model_id 不符则跳过）**。设计文档补全时写入
   - **后续已定（接口 KeySet 化）**：L3 加 `keys_of(prefix) -> KeySet`（不透明类型），操作方法入参从 Prefix 改为 KeySet——长序列下消除「一次预热算两遍 key」。方案与分层论证见 [code-architecture.md](design/code-architecture.md)「接口演进：KeySet」；本 PR 不动代码，合入后实施
-- **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。分层与模块划分：[code-architecture.md](design/code-architecture.md)
-- **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC 候选，与仓内跨语言 RPC 选型一致）。协议字段依赖 D4 定型；通道骨架可先行。
+- **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。✅ **已落地**：daemon、TaskEngine、KeepaliveLoop 已在进程里跑。分层与模块划分：[code-architecture.md](design/code-architecture.md)
+- **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC，与仓内跨语言 RPC 选型一致）。✅ **已落地**：`SubmitIntent` / `GetTask`。协议字段里仍依赖 D4 定型的部分没有扩。
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例启动 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3 耦合；D5 已闭环，见本文）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
 - **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自己产生引擎格式的事件
   - **发布端（pub）**：

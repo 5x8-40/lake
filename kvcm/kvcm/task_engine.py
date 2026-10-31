@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import sys
 from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Callable
@@ -51,14 +52,13 @@ from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
 from kvcm.ledger import prefix_key
 from kvcm.loops import KeepaliveLoop
 from kvcm.ops.base import (
-    IntentInputError,
     KvOps,
     QueryError,
     TaskHandle,
     TaskStatus,
     VerifyError,
 )
-from kvcm.ops.types import InstanceId, Prefix
+from kvcm.ops.types import InstanceId, IntentInputError, Prefix
 
 # 限速器钩子：() -> bool，False = 暂缓发起（E15 接入点，提交前询问）
 RateLimiter = Callable[[], bool]
@@ -447,6 +447,13 @@ class TaskEngine:
                 # 但消费者仍会一条条死光，不在这里停收的话新 intent 永远 PENDING。
                 if self._programming_errors >= 3 or others_done:
                     self._accepting = False
+                    print(
+                        "[kvcm] consumer exiting on programming error, "
+                        "no longer accepting intents: "
+                        f"{type(e).__name__}: {e}",
+                        file=sys.stderr,
+                    )
+                    sys.stderr.flush()
                     self._fail_never_started()
                 raise
             finally:

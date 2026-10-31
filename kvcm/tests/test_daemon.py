@@ -636,6 +636,43 @@ def test_startup_failure_still_cancels_recovery_tasks(monkeypatch, tmp_path) -> 
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_startup_failure_after_keepalive_start_stops_loop(monkeypatch, tmp_path) -> None:
+    """keepalive.start 成功之后，后面的启动步骤失败，finally 要先 stop 再 close。"""
+    events: list[str] = []
+
+    class RecordingKeepalive(FakeKeepalive):
+        def start(self) -> None:
+            super().start()
+            events.append("keepalive.start")
+
+        async def stop(self, *, timeout_s: float = 10.0) -> None:
+            events.append("keepalive.stop")
+            await super().stop(timeout_s=timeout_s)
+
+        def close(self) -> None:
+            events.append("keepalive.close")
+            super().close()
+
+    class BoomEngine(daemon.TaskEngine):
+        def start(self) -> None:
+            raise RuntimeError("engine start boom")
+
+        async def shutdown(self, *, timeout_s: float = 5.0) -> None:
+            events.append("engine.shutdown")
+
+    monkeypatch.setattr(daemon, "TaskEngine", BoomEngine)
+    monkeypatch.setattr(daemon, "KeepaliveLoop", lambda *a, **kw: RecordingKeepalive())
+    monkeypatch.setattr(daemon, "StoreClient", lambda: FakeClient(events))
+    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: FakeBackend())
+
+    t, _stop = _run_daemon_in_thread(_args(tmp_path))
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert events.index("keepalive.start") < events.index("keepalive.stop")
+    assert events.index("keepalive.stop") < events.index("keepalive.close")
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_connect_plain_error_closes_cleanly(monkeypatch, tmp_path, capsys) -> None:
     """connect 抛普通异常（不是超时）：不硬退出，走 finally 正常收尾。
 

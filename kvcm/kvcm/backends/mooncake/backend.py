@@ -32,7 +32,6 @@ from kvcm.ledger import Ledger
 from kvcm.ops.base import (
     KvOps,
     OpKind,
-    IntentInputError,
     QueryError,
     SubmitError,
     TaskHandle,
@@ -41,7 +40,7 @@ from kvcm.ops.base import (
     VerifyError,
 )
 from kvcm.ops.capability import BackendCapability, Support
-from kvcm.ops.types import InstanceId, PinKind, Prefix
+from kvcm.ops.types import InstanceId, IntentInputError, PinKind, Prefix
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +114,8 @@ class MooncakeBackend(KvOps):
             一把默认 4 的窗口，在飞建链就是 4×4=16，正好超过单机实测
             打爆的量（ascend 上 14 连发约半数 TRANSFER_FAIL）。默认 4 来自
             实验 #16 单机合成目标段（窗口 4 时 42/42 全成）。#17 跨机同样
-            窗口大约一半失败，主错误是 master 留内存失败，所以它不是跨机
+            窗口大约一半失败，主导错误名是 ``NO_AVAILABLE_HANDLE``
+            （``max retries reached: 10``），所以它不是跨机
             的充分条件。所以上限必须是**进程级**的。不代替 E15，也不做网卡限速。
         """
         if submit_concurrency <= 0:
