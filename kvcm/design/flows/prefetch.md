@@ -128,7 +128,10 @@ sequenceDiagram
 [../code-architecture.md](../code-architecture.md) L2 节。本流程特有的
 一点：「前缀不在池」在 exists 阶段直接失败，不发起复制。段不存在
 同样立即停止。段上暂时放不下则在闸外等到预热超时；还没有任务号就
-停止，不记成复制失败。
+停止，不记成复制失败。另一条前缀已经提交、但目标段还没划出
+缓冲区时，剩余里看不见它，两条都可能放行。彻底避开代价高，
+接受这个窗口。详见
+[../code-architecture.md](../code-architecture.md) 传输闸一节。
 
 ## 与其他部件的衔接
 
