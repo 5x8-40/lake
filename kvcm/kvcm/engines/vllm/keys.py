@@ -25,6 +25,8 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass, fields
 
+from kvcm.ops.base import IntentInputError
+
 _RANK_RE = re.compile(r"@head_or_tp_rank:(\d+)@")
 
 
@@ -251,7 +253,7 @@ def hash_token_blocks(token_ids: tuple[int, ...], block_size: int, hash_algo: st
     运行两套 key。此处直接报错。
     """
     if os.environ.get("PYTHONHASHSEED") != "0":
-        raise RuntimeError(
+        raise IntentInputError(
             "PYTHONHASHSEED must be '0' to reproduce the engine's block-hash "
             "chain (vllm init_none_hash salts with os.urandom when unset). "
             "Export PYTHONHASHSEED=0 and rerun."
@@ -370,7 +372,7 @@ class KeyComputer:
             if not by_rank:
                 return []
             if len(targets) != 1:
-                raise ValueError(
+                raise IntentInputError(
                     f"all keys are rank 0 but {len(targets)} targets given "
                     f"(targets={list(targets)}) — single-rank target should "
                     "resolve to exactly one segment; dirty locate result?"
@@ -391,13 +393,13 @@ class KeyComputer:
             ):
                 targets = [targets[i // n_sub] for i in range(eff)]
             else:
-                raise ValueError(
+                raise IntentInputError(
                     f"key rank max={max_rank} but only {len(targets)} targets "
                     f"(need targets[0..{max_rank}])"
                 )
         unknown = [r for r in by_rank if r < 0 or r >= len(targets)]
         if unknown:
-            raise ValueError(f"ranks out of range for targets: {unknown}")
+            raise IntentInputError(f"ranks out of range for targets: {unknown}")
         return [(k, targets[parse_key_rank(k)]) for k in keys]
 
 

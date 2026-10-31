@@ -836,7 +836,7 @@ sequenceDiagram
 
 | | ① 登记保活（当前路径） | ② 读删写（这次不做） |
 |---|---|---|
-| 做法 | `pin(HARD)` 走已有的 `keepalive()`，同一张 Ledger 表 `INSERT OR REPLACE`。不读数据、不 Remove、不重 put、不空写、不改 hard pin 位。lease 时长是 master 的 `default_kv_lease_ttl`（0.3.11 代码默认 5s，main 默认 10s，测试床实配过 11s）。要调长是改 master 这个全局配置，不是 kvcm 对单个 key 改标记。kvcm 不改这个配置 | 读出数据 → `Remove` → 带 hard_pin 重新 put → 校验副本。代价太大，这次不做 |
+| 做法 | `pin(HARD)` 走已有的 `keepalive()`，同一张 Ledger 表。行已存在时保留原来的 `registered_at`，不刷新窗口。不读数据、不 Remove、不重 put、不空写、不改 hard pin 位。lease 时长是 master 的 `default_kv_lease_ttl`（0.3.11 代码默认 5s，main 默认 10s，测试床实配过 11s）。要调长是改 master 这个全局配置，不是 kvcm 对单个 key 改标记。kvcm 不改这个配置 | 读出数据 → `Remove` → 带 hard_pin 重新 put → 校验副本。代价太大，这次不做 |
 | 保护强度 | lease 期内绝对不可逐 | 绝对不可逐，创建时固化、无到期概念（F1） |
 | mooncake 代码 | **不改** | 不改 |
 | client_id 问题 | **无**（不碰写路径） | **有**（Remove 后走 Case A 新建，PutStart 传谁 UUID client_id 就是谁——见「client_id 问题」节） |

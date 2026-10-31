@@ -29,6 +29,7 @@ from kvcm.engines.vllm.keys import KeyComputer
 from kvcm.ledger import Ledger
 from kvcm.ops.capability import Support
 from kvcm.ops.base import (
+    IntentInputError,
     OpKind,
     QueryError,
     SubmitError,
@@ -222,7 +223,7 @@ def test_empty_prefix_raises(fake_store_module, monkeypatch) -> None:
         locate=lambda _inst: ["seg-A"],
         capability=mooncake_v0311(),
     )
-    with pytest.raises(ValueError, match="no keys"):
+    with pytest.raises(IntentInputError, match="no keys"):
         run(b.copy(Prefix(model_id="qwen", token_ids=()), InstanceId("inst-B")))
 
 
@@ -465,7 +466,7 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
     assert seen["lease_ttl_s"] == 11.0
     assert seen["promote_hits"] == 3
     assert list(seen["locate"]("inst-B")) == ["seg-A"]
-    with pytest.raises(KeyError, match="not registered"):
+    with pytest.raises(IntentInputError, match="not registered"):
         seen["locate"]("other")
 
 
@@ -1229,6 +1230,18 @@ def test_memory_replica_predicate_calls_method() -> None:
     assert eps["k"] == ["10.0.0.3:1", "10.0.0.3:1"]
     assert called["disk"] == 0
 
+    class Bare:
+        pass
+
+    class BareStore:
+        def batch_get_replica_desc(self, keys):
+            return {keys[0]: [Bare()]}
+
+    bare = StoreClient()
+    bare._store = BareStore()
+    with pytest.raises(StoreClientError, match="绑定面不对"):
+        bare.batch_memory_replica_endpoints(["k"])
+
 
 def test_soft_pin_reuses_existing_capsule(monkeypatch) -> None:
     seen = {}
@@ -1665,7 +1678,7 @@ def test_move_between_two_registered_instances(fake_store_module, monkeypatch) -
     directory.register(InstanceId("C"), ["seg-C0"])
     assert directory.locate(InstanceId("C")) == ("seg-C0",)
 
-    with pytest.raises(KeyError, match="not registered"):
+    with pytest.raises(IntentInputError, match="not registered"):
         directory.locate(InstanceId("missing"))
     client.moves.clear()
 
@@ -1673,7 +1686,7 @@ def test_move_between_two_registered_instances(fake_store_module, monkeypatch) -
         raise AssertionError("未登记的实例不该进入容量判断")
 
     b._admit_new_bytes = admit_should_not_run
-    with pytest.raises(KeyError, match="not registered"):
+    with pytest.raises(IntentInputError, match="not registered"):
         run(b.move(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("B"), InstanceId("missing")))
     assert client.moves == []
 
@@ -2049,7 +2062,7 @@ def test_demote_keeps_keepalive_until_preconditions_hold(
 
         monkeypatch.setattr(b._keys, "keys_for_tokens", lambda ids: [])
         b._admin = object()
-        with pytest.raises(ValueError, match="shorter than one block"):
+        with pytest.raises(IntentInputError, match="shorter than one block"):
             run(b.demote(prefix))
         assert led.list_keepalive() == [prefix]
     finally:
@@ -2072,7 +2085,14 @@ def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> 
 
     class Admin:
         def batch_query_keys(self, keys):
-            raise AssertionError("提回不能走零副作用查询")
+            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k, ok=True, local_disk_endpoints=("seg-A",)
+                )
+                for k in keys
+            }
 
     kc = KeyComputer(model_name="qwen", tp_size=1)
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
@@ -2091,6 +2111,40 @@ def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> 
 
     client._replicas_on = ["seg-ELSE"]
     with pytest.raises(VerifyError, match="已按 2 次触发"):
+        run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
+
+
+def test_promote_wrong_disk_owner_skips_replica_list(
+    fake_store_module, monkeypatch
+) -> None:
+    """目标段没有 local disk 时不打 GetReplicaList。"""
+
+    class Client(FakeClient):
+        def batch_memory_replica_endpoints(self, keys):
+            raise AssertionError("不该打 GetReplicaList")
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k, ok=True, local_disk_endpoints=("seg-OTHER",)
+                )
+                for k in keys
+            }
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+        promote_hits=2,
+    )
+    with pytest.raises(VerifyError, match="没有打 GetReplicaList"):
         run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
 
 

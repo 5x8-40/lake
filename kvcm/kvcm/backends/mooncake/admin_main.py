@@ -56,6 +56,8 @@ class KeyReplicaQuery:
     # disk_values 与 local_disk_values 的条数。降层只看有没有盘副本，
     # 不当段剩余空间。
     disk_replicas: int = 0
+    # local_disk 的传输端点。提回前用来确认 target 是登记实例。
+    local_disk_endpoints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,13 +99,20 @@ def parse_batch_query_keys(body: str) -> dict[str, KeyReplicaQuery]:
             raise AdminMainError(f"batch_query_keys: error for {key!r} is not a string")
         memory: tuple[MemoryReplicaView, ...] = ()
         disks = 0
+        local_disk: tuple[str, ...] = ()
         if ok:
             memory = _memory_views(key, item.get("values"))
             disks = _replica_count(item.get("disk_values")) + _replica_count(
                 item.get("local_disk_values")
             )
+            local_disk = _local_disk_endpoints(key, item.get("local_disk_values"))
         out[str(key)] = KeyReplicaQuery(
-            key=str(key), ok=ok, error=error, memory=memory, disk_replicas=disks
+            key=str(key),
+            ok=ok,
+            error=error,
+            memory=memory,
+            disk_replicas=disks,
+            local_disk_endpoints=local_disk,
         )
     return out
 
@@ -217,6 +226,26 @@ def _load_object(body: str) -> dict:
 def _require_success(payload: dict) -> None:
     if payload.get("success") is not True:
         raise AdminMainError(f"admin response success is not true: {payload!r}")
+
+
+def _local_disk_endpoints(key: str, values: object) -> tuple[str, ...]:
+    """local_disk 描述里的传输端点。没有端点字段的条目不计入。"""
+    if values is None:
+        return ()
+    if not isinstance(values, list):
+        raise AdminMainError("batch_query_keys: disk replica field is not a list")
+    found: list[str] = []
+    for desc in values:
+        if not isinstance(desc, dict):
+            raise AdminMainError(
+                f"batch_query_keys: replica of {key!r} is not an object"
+            )
+        endpoint = desc.get("transport_endpoint")
+        if endpoint is None:
+            endpoint = desc.get("transport_endpoint_")
+        if isinstance(endpoint, str) and endpoint:
+            found.append(endpoint)
+    return tuple(found)
 
 
 def _replica_count(values: object) -> int:

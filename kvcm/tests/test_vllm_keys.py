@@ -13,6 +13,7 @@ import tempfile
 import pytest
 
 from kvcm.engines.vllm import keys as km
+from kvcm.ops.base import IntentInputError
 from kvcm.engines.vllm.keys import (
     KeySpec,
     expand_store_keys,
@@ -115,7 +116,7 @@ def test_plan_single_rank_extra_targets_fails() -> None:
     必须报错而不是替调用方猜（fail loud）。"""
     kc = km.KeyComputer(model_name="qwen", tp_size=1)
     keys = kc.expand(["h0"])
-    with pytest.raises(ValueError, match="rank 0 but 2 targets"):
+    with pytest.raises(IntentInputError, match="rank 0 but 2 targets"):
         kc.build_plan(keys, ["10.0.0.1:5001", "10.0.0.1:5002"])
 
 
@@ -141,7 +142,7 @@ def test_plan_rank_overflow_fails() -> None:
     keys = km.expand_store_keys(
         model_name="qwen", chunk_hashes=["h0"], tp_size=4, prefer_upstream=False
     )
-    with pytest.raises(ValueError, match="rank max=3"):
+    with pytest.raises(IntentInputError, match="rank max=3"):
         kc.build_plan(keys, ["10.0.0.1:5001", "10.0.0.1:5002"])
 
 

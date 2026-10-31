@@ -30,8 +30,8 @@ KeepaliveLoop 停 → **等 RPC 线程结束** → StoreClient.close() + ledger.
 locate 读进程里的一份实例目录，不读命令。SubmitIntent 只有
 prefix{model_id, token_ids} 和 target 实例名；copy / move / remove
 也不带段。``--instance-segs`` 只在进程拉起时做初始登记
-（``实例=seg0,seg1``，可重复），不是每次操作换一套。进程跑着时用
-``register`` 加实例。``locate(实例)`` 只返回该实例的段；没登记就报错。
+（``实例=seg0,seg1``，可重复），不是每次操作换一套。只在启动时登记。
+``locate(实例)`` 只返回该实例的段；没登记就报错。
 实例下线不在这里。
 
 用法：
@@ -349,12 +349,19 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
 
 def run(args: argparse.Namespace, *, stop: asyncio.Event | None = None) -> int:
     """进程主流程（stop 注入便于测试；None = 自己装 signal handler）。"""
-    admin = getattr(args, "admin", "") or ""
-    if not str(admin).strip():
+    admin = str(getattr(args, "admin", "") or "").strip()
+    if not admin:
         print(
             "[kvcm] startup: --admin 不能空。副本核验必须有管理端口"
             "（GET /batch_query_keys）。为空时核验一直 QueryError，"
             "预热要等满超时才失败。不进入服务循环。",
+            file=sys.stderr,
+        )
+        return 1
+    if not (admin.startswith("http://") or admin.startswith("https://")):
+        print(
+            "[kvcm] startup: --admin 必须带 http:// 或 https://。"
+            "否则第一次核验才会失败。不进入服务循环。",
             file=sys.stderr,
         )
         return 1
@@ -403,9 +410,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument(
         "--admin",
         default="",
-        help="master HTTP 管理面根 URL。副本核验必须有管理端口："
-        "核验和降层查盘走 GET /batch_query_keys。"
-        "为空则启动直接失败，不进入服务循环",
+        help="master HTTP 管理面根 URL，必须带 http:// 或 https://。"
+        "副本核验必须有管理端口：核验和降层查盘走 GET /batch_query_keys。"
+        "为空或没有协议头则启动直接失败，不进入服务循环",
     )
     p.add_argument(
         "--instance-segs",
@@ -473,7 +480,10 @@ def main(argv: list[str] | None = None) -> int:
         "--copy-submit-concurrency",
         type=int,
         default=4,
-        help="进程内同时在飞的 create_copy_task 上限（所有 copy 共用；0.3.11 实测窗口 4 全成）",
+        help="进程内同时在飞的 create_copy_task 上限（所有 copy 共用）。"
+        "默认 4 来自实验 #16 单机合成目标段（窗口 4 时 42/42 全成）。"
+        "#17 跨机同样窗口大约一半失败，主错误是 master 留内存失败，"
+        "所以它不是跨机的充分条件。不代替 E15，也不做网卡限速",
     )
     p.add_argument(
         "--rpc-timeout-s",

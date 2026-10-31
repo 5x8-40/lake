@@ -32,6 +32,7 @@ from kvcm.ledger import Ledger
 from kvcm.ops.base import (
     KvOps,
     OpKind,
+    IntentInputError,
     QueryError,
     SubmitError,
     TaskHandle,
@@ -111,9 +112,11 @@ class MooncakeBackend(KvOps):
             一个名额 = 一个前缀从提交占到终态）。两把不重复：只有本信号量
             时，排队前缀会以每次 4 个 RPC 的速度全部提交完。它也不是「单次
             copy 的窗口」——传输闸允许 4 个前缀同时提交，若每个 copy 各持
-            一把默认 4 的窗口，在飞建链就是 4×4=16，正好超过 0.3.11 实测
-            打爆的量（ascend 上 14 连发约半数 TRANSFER_FAIL；窗口 4 节奏化
-            42/42 全成）。所以上限必须是**进程级**的。链路利用率限速器仍归 E15。
+            一把默认 4 的窗口，在飞建链就是 4×4=16，正好超过单机实测
+            打爆的量（ascend 上 14 连发约半数 TRANSFER_FAIL）。默认 4 来自
+            实验 #16 单机合成目标段（窗口 4 时 42/42 全成）。#17 跨机同样
+            窗口大约一半失败，主错误是 master 留内存失败，所以它不是跨机
+            的充分条件。所以上限必须是**进程级**的。不代替 E15，也不做网卡限速。
         """
         if submit_concurrency <= 0:
             raise ValueError("submit_concurrency must be positive")
@@ -298,7 +301,10 @@ class MooncakeBackend(KvOps):
         return self._submit_sem
 
     def _query_gate(self) -> asyncio.Semaphore:
-        """同一 handle 里并发 query_task 的上限，不超过 4。"""
+        """整个 backend 共用一把 query_task 信号量，并发不超过 4。
+
+        不是每个 handle 一把。
+        """
         if self._query_sem is None:
             self._query_sem = asyncio.Semaphore(min(4, self._submit_concurrency))
         return self._query_sem
@@ -313,7 +319,7 @@ class MooncakeBackend(KvOps):
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
-            raise ValueError(
+            raise IntentInputError(
                 "prefix expands to no keys (shorter than one block?)"
             )
         targets = list(self._locate(target))
@@ -392,7 +398,10 @@ class MooncakeBackend(KvOps):
         task_ids = [t for t in slots if t is not None]
         handle = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
         self._plans[handle] = (prefix, target, plan, uuid.uuid4().hex)
-        await self._record(handle, "running")
+        try:
+            await asyncio.shield(self._record(handle, "running"))
+        except asyncio.CancelledError:
+            raise
         return handle
 
     async def query_task(self, handle: TaskHandle) -> TaskStatus:
@@ -700,7 +709,7 @@ class MooncakeBackend(KvOps):
             )
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
-            raise ValueError(
+            raise IntentInputError(
                 "prefix expands to no keys (shorter than one block?)"
             )
         plan = self._keys.build_plan(keys, list(self._locate(target)))
@@ -775,7 +784,10 @@ class MooncakeBackend(KvOps):
         task_ids = [t for t in slots if t is not None]
         handle = TaskHandle(op=OpKind.MOVE, task_ids=tuple(task_ids))
         self._plans[handle] = (prefix, target, plan, uuid.uuid4().hex)
-        await self._record(handle, "running")
+        try:
+            await asyncio.shield(self._record(handle, "running"))
+        except asyncio.CancelledError:
+            raise
         return handle
 
     async def _require_ledger(self):
@@ -814,7 +826,7 @@ class MooncakeBackend(KvOps):
             )
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
-            raise ValueError(
+            raise IntentInputError(
                 "prefix expands to no keys (shorter than one block?)"
             )
         await self._rpc(
@@ -835,7 +847,7 @@ class MooncakeBackend(KvOps):
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
-            raise ValueError(
+            raise IntentInputError(
                 "prefix expands to no keys (shorter than one block?)"
             )
         if self._admin is None:
@@ -863,16 +875,41 @@ class MooncakeBackend(KvOps):
             )
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
-        """对前缀的 key 调 GetReplicaList，次数由 ``promote_hits`` 决定。
+        """把前缀 KV 提回盘副本登记的那个实例。
 
-        走绑定 batch_get_replica_desc（batch_memory_replica_endpoints），
-        不走 /batch_query_keys，不做读删写。打完这些次数后目标上还没有
-        内存副本就失败，不在这里空等。
+        target 必须是 LOCAL_DISK 副本登记的实例，不是任意实例。
+        打 ``GetReplicaList`` 之前先用 ``GET /batch_query_keys`` 看
+        ``local_disk`` 的传输端点。``locate(target)`` 的段里没有这条
+        盘副本就抛 ``VerifyError``，一次 ``GetReplicaList`` 都不打。
+        对上之后才打 ``promote_hits`` 次（绑定
+        ``batch_memory_replica_endpoints``）。打完仍没有内存副本就失败，
+        不在这里空等，也不做读删写。
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
-            raise ValueError(
+            raise IntentInputError(
                 "prefix expands to no keys (shorter than one block?)"
+            )
+        if self._admin is None:
+            raise QueryError(
+                "提回前要确认盘副本登记实例，需要 GET /batch_query_keys"
+            )
+        try:
+            parsed = await self._rpc(self._admin.batch_query_keys, keys)
+        except (AdminMainError, StoreClientError) as e:
+            raise QueryError(str(e)) from e
+        segs = set(self._locate(target))
+        wrong = [
+            key
+            for key in keys
+            if not segs.intersection(
+                parsed[key].local_disk_endpoints if parsed.get(key) else ()
+            )
+        ]
+        if wrong:
+            raise VerifyError(
+                "promote: target 不是盘副本登记的实例，没有打 GetReplicaList: "
+                + ", ".join(wrong[:4])
             )
         plan = self._keys.build_plan(keys, list(self._locate(target)))
         last: dict = {}
@@ -912,7 +949,7 @@ class MooncakeBackend(KvOps):
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
-            raise ValueError(
+            raise IntentInputError(
                 "prefix expands to no keys (shorter than one block?)"
             )
         if force:

@@ -90,6 +90,7 @@ def test_parse_batch_query_keys_memory_endpoint_and_miss() -> None:
     )
     assert with_disk["k"].disk_replicas == 1
     assert with_disk["k"].memory == ()
+    assert with_disk["k"].local_disk_endpoints == ("10.0.0.1:1",)
 
 
 def test_parse_tenant_quotas_list_and_single() -> None:

@@ -165,7 +165,7 @@ flowchart LR
 
 - **时序**：`create_copy_task` 必须在目标节点的 get session 建立**之前**完成——session 建立时锁定单副本，复制晚于 session 则该请求仍读远端。进阶联动见下节
 - **目标指定**：segment 名 = worker 的 `local_seg`（`hostname:rpc_port`，`mooncake_backend.py:263`；fabric-mem 路径为裸 hostname，L276）
-- **key 名单**：**不要从头写 hash 链**——copy 与 put/get/exists 共用同一 key 字符串命名空间，直接复用 vllm-ascend 调度侧的现成计算（纯 Python，可移植进预取进程）：`get_block_hashes`（`pool_scheduler.py:478` 调用处）+ `block_hash_to_str` + `make_hit_check_keys`（`pool_scheduler.py:377`，按 block hash 枚举全 rank 的 key）；非 layerwise 路径对照 `_generate_store_query_keys`。`QueryByRegex` 无 Python 绑定；放置结果用 `batch_get_replica_desc` 核验（`store_py.cpp:3340`）
+- **key 名单**：**不要从头写 hash 链**——copy 与 put/get/exists 共用同一 key 字符串命名空间，直接复用 vllm-ascend 调度侧的现成计算（纯 Python，可移植进预取进程）：`get_block_hashes`（`pool_scheduler.py:478` 调用处）+ `block_hash_to_str` + `make_hit_check_keys`（`pool_scheduler.py:377`，按 block hash 枚举全 rank 的 key）；非 layerwise 路径对照 `_generate_store_query_keys`。`QueryByRegex` 无 Python 绑定；放置结果用 `GET /batch_query_keys` 核验。promote 仍走 `GetReplicaList`
 - **依赖**：源 seg 所在 client client 必须在线（贡献了源 segment 的 worker 进程内客户端）
 
 #### 进阶：与请求调度联动（解决时序约束）
@@ -179,7 +179,7 @@ sequenceDiagram
     participant G as gateway / router
     participant E as 目标节点引擎
     CP->>M: create_copy_task(key 名单)
-    CP->>M: 轮询 QueryTask / batch_get_replica_desc
+    CP->>M: 轮询 QueryTask / GET /batch_query_keys
     M-->>CP: 本机副本就绪
     CP->>G: 放行：该前缀的请求可路由到目标节点
     G->>E: 真实请求（或方案 A 壳请求）
@@ -212,7 +212,7 @@ sequenceDiagram
 
 1. A 路径端到端（非 layerwise）：预取请求 → 真实请求 APC 命中
 2. A 路径端到端（layerwise）：预取请求 → 真实请求本地全命中、加载列表为空（`start_block` 全覆盖，读路径日志核验零池读）
-3. B2 端到端：`create_copy_task` → 本机副本 → layerwise get session 选中本机副本（用 `batch_get_replica_desc` + 读路径日志核验）
+3. B2 端到端：`create_copy_task` → 本机副本 → layerwise get session 选中本机副本（用 `GET /batch_query_keys` + 读路径日志核验）
 
 风险：
 

@@ -30,10 +30,18 @@ from kvcm.ops.capability import BackendCapability
 from kvcm.ops.types import InstanceId, PinKind, Prefix
 
 
+class IntentInputError(Exception):
+    """这一次 intent 的输入不对，不是编程错误。
+
+    未登记实例、前缀不足一块、段名单和 TP 对不上、PYTHONHASHSEED 未设。
+    消费者按这个类型记 FAILED 后继续。其它异常仍记 FAILED 再抛。
+    """
+
+
 class TaskStatus(enum.Enum):
     """任务状态机（任务类操作：copy / move / promote）。"""
 
-    PENDING = "pending"  # 排队
+    PENDING = "pending"  # 当前没有生产者
     RUNNING = "running"  # 进行
     READY = "ready"  # 任务完成且目标侧副本核验通过
     FAILED = "failed"  # 失败（处理策略归编排层：重发 / 弃置清副本 / 衔接）
@@ -104,9 +112,8 @@ class KvOps(ABC):
     ——跑通 copy 流程的最小集。其余操作基类给默认实现（抛
     UnsupportedCapabilityError，消息注明适配器未接线）：编排层判断可
     用性应读 capability()，异常只是兜底；适配器落地某项时 override
-    并细化（通道具备但未接线抛 NotImplementedError，通道不具备抛
-    UnsupportedCapabilityError——mooncake 后端的 pin 即此形态）。第二
-    后端接入时不必先 stub 全部操作。
+    并细化。未接线抛 UnsupportedCapabilityError。第二后端接入时不必先
+    stub 全部操作。
     """
 
     def _unsupported(self, op: str) -> UnsupportedCapabilityError:
@@ -169,8 +176,12 @@ class KvOps(ABC):
         raise self._unsupported("demote")
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
-        """把前缀 KV 提回指定实例本机层级（调度意图，与 demote 的
-        「放弃位置」不对称是刻意的）。READY 同 copy。"""
+        """把前缀 KV 提回盘副本登记的那个实例。
+
+        target 必须是 LOCAL_DISK 副本登记的实例，不是任意实例。
+        池只把提回派给那个登记 client；key 若已在别处有内存副本就不再入队。
+        READY 同 copy。
+        """
         raise self._unsupported("promote")
 
     async def retain(self, prefix: Prefix) -> TaskHandle:

@@ -4,7 +4,7 @@
 remove 的入参都没有 segment；调用方只给实例，操作内部自己 ``locate``。
 
 ``--instance-segs`` 只在进程拉起时做初始登记，不是每次操作换一套。
-进程跑着的时候用 ``register`` 加实例。``locate(实例)`` 只返回该实例的段；
+没有运行期入口再加实例。``locate(实例)`` 只返回该实例的段；
 没登记就报错，不退回别人的段。
 
 没有下线。实例销毁、事件发布不在这里。
@@ -15,6 +15,7 @@ from __future__ import annotations
 import threading
 from typing import Sequence
 
+from kvcm.ops.base import IntentInputError
 from kvcm.ops.types import InstanceId
 
 
@@ -23,8 +24,7 @@ class InstanceDirectory:
 
     def __init__(self) -> None:
         self._segs: dict[str, tuple[str, ...]] = {}
-        # register 可以在事件循环之外调用（进程已经在跑），locate 在
-        # 请求路径上读。锁只保护这张表。
+        # 启动登记和 locate 可能不在同一条线程上。锁只保护这张表。
         self._lock = threading.Lock()
 
     def register(self, instance: InstanceId | str, segs: Sequence[str]) -> None:
@@ -41,13 +41,13 @@ class InstanceDirectory:
             self._segs[inst] = ordered
 
     def locate(self, instance: InstanceId | str) -> tuple[str, ...]:
-        """返回该实例的 seg 列表。没登记过抛 KeyError。"""
+        """返回该实例的 seg 列表。没登记过抛 IntentInputError。"""
         inst = str(instance).strip()
         with self._lock:
             try:
                 return self._segs[inst]
             except KeyError:
-                raise KeyError(f"instance not registered: {inst}") from None
+                raise IntentInputError(f"instance not registered: {inst}") from None
 
 
 def parse_instance_segs(spec: str) -> tuple[str, tuple[str, ...]]:

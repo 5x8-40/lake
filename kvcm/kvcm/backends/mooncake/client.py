@@ -28,7 +28,11 @@ def is_memory_replica(desc: object) -> bool:
     方法对象本身为真。不能把 ``getattr`` 的结果直接当布尔，否则盘副本
     也会去调 ``get_memory_descriptor()``。
     """
-    pred = getattr(desc, "is_memory_replica", False)
+    if not hasattr(desc, "is_memory_replica"):
+        raise StoreClientError(
+            "副本描述没有 is_memory_replica，绑定面不对"
+        )
+    pred = desc.is_memory_replica
     if callable(pred):
         return bool(pred())
     return bool(pred)

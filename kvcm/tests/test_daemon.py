@@ -893,6 +893,27 @@ def test_v0311_capability_exits_before_serve(monkeypatch, capsys) -> None:
     assert "零副作用" in capsys.readouterr().err
 
 
+def test_admin_without_scheme_exits_before_serve(monkeypatch, capsys) -> None:
+    """--admin 没有 http:// 或 https:// 时启动直接失败。"""
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应进入服务循环")
+
+    monkeypatch.setattr(daemon, "_serve", boom)
+    rc = daemon.main(
+        [
+            "--master", "127.0.0.1:50088",
+            "--local-hostname", "127.0.0.1:13021",
+            "--model-name", "qwen",
+            "--admin", "127.0.0.1:9003",
+            "--instance-segs", "A=seg-A0",
+            "--ledger", "/tmp/ledger.sqlite",
+        ]
+    )
+    assert rc == 1
+    assert "http://" in capsys.readouterr().err
+
+
 def test_directory_rejects_duplicate_and_empty() -> None:
     from kvcm.instances import InstanceDirectory, directory_from_specs
 

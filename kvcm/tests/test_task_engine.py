@@ -14,6 +14,7 @@ import pytest
 from conftest import run
 from kvcm.flows.prefetch import PrefetchError
 from kvcm.ops.base import (
+    IntentInputError,
     KvOps,
     OpKind,
     QueryError,
@@ -724,13 +725,13 @@ def test_unregistered_instance_does_not_cancel_consumer() -> None:
 
         async def copy(self, prefix, target):
             if self.mode == "miss":
-                raise KeyError(f"instance not registered: {target}")
+                raise IntentInputError(f"instance not registered: {target}")
             if self.mode == "short":
-                raise ValueError(
+                raise IntentInputError(
                     "prefix expands to no keys (shorter than one block?)"
                 )
             if self.mode == "seed":
-                raise RuntimeError("PYTHONHASHSEED must be '0'")
+                raise IntentInputError("PYTHONHASHSEED must be '0'")
             return await super().copy(prefix, target)
 
     async def scenario():
@@ -781,7 +782,7 @@ def test_plan_mismatch_does_not_cancel_consumer() -> None:
 
         async def copy(self, prefix, target):
             if self.boom:
-                raise ValueError(self.boom)
+                raise IntentInputError(self.boom)
             return await super().copy(prefix, target)
 
     async def scenario():

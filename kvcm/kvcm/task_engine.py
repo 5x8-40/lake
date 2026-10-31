@@ -26,8 +26,9 @@ RPC executor 那几个线程。
 `create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受——
 管的是建链速率（0.3.11 上 14 连发会 `ConnectToPeer FAILED`）。没有
 这把前缀闸的话，排队的前缀会以每次 4 个建链 RPC 的速度全部提交完：
-master 上叠着所有 plan，并且每个 handle 每轮 `query_task` 都要按 key
-顺序各查一次。前缀闸把「还没终态的预热前缀」卡在 `max_concurrent`。
+master 上叠着所有 plan，并且每个 handle 的 `query_task` 用 gather
+并发查，整个 backend 共用一把、不超过 4。前缀闸把「还没终态的预热前缀」
+卡在 `max_concurrent`。
 
 **线程边界**：`submit_intent` / `intent_status` 是**同步方法**，供 gRPC
 servicer（在其线程池线程里）调用——入队经 `call_soon_threadsafe` 投递
@@ -49,7 +50,14 @@ from typing import Callable
 from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
 from kvcm.ledger import prefix_key
 from kvcm.loops import KeepaliveLoop
-from kvcm.ops.base import KvOps, QueryError, TaskHandle, TaskStatus, VerifyError
+from kvcm.ops.base import (
+    IntentInputError,
+    KvOps,
+    QueryError,
+    TaskHandle,
+    TaskStatus,
+    VerifyError,
+)
 from kvcm.ops.types import InstanceId, Prefix
 
 # 限速器钩子：() -> bool，False = 暂缓发起（E15 接入点，提交前询问）
@@ -63,20 +71,6 @@ class IntentStatus(enum.Enum):
     PENDING = 1  # 排队或执行中
     READY = 2
     FAILED = 3
-
-
-# 这一次 intent 的失败，不是编程错误。消费者记 FAILED 后继续。
-_INTENT_VALUE_ERRORS = (
-    "shorter than one block",
-    "key rank max=",
-    "all keys are rank 0 but",
-    "ranks out of range for targets",
-)
-
-
-def _is_intent_value_error(exc: ValueError) -> bool:
-    text = str(exc)
-    return any(part in text for part in _INTENT_VALUE_ERRORS)
 
 
 def intent_id_of(prefix: Prefix, target: InstanceId) -> str:
@@ -445,31 +439,13 @@ class TaskEngine:
             except asyncio.CancelledError:
                 self._finish(rec, IntentStatus.FAILED, "cancelled (shutdown)")
                 raise
-            except PrefetchError as e:
+            except (PrefetchError, QueryError, IntentInputError) as e:
+                # 这一次 intent 失败。不能向上抛，否则消费者退出，
+                # 几次之后新 intent 永远 PENDING。
+                # QueryError 是 exists 查询失败，不包成 PrefetchError。
+                # IntentInputError 是未登记实例、前缀不足一块、段名单和
+                # TP 对不上、PYTHONHASHSEED 未设。
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
-            except QueryError as e:
-                # exists 的查询失败（不包成 PrefetchError）只该判定这次
-                # intent 失败——**不能向上抛**，否则消费者协程退出，几次
-                # 抖动后全部消费者死光、新 intent 永远 PENDING
-                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
-            except KeyError as e:
-                # locate 未登记实例是这一次 intent 的失败，不是编程错误。
-                # 其它 KeyError（例如未知任务句柄）仍记 FAILED 再抛。
-                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
-                if "not registered" not in str(e):
-                    raise
-            except ValueError as e:
-                # 前缀不足一块，或段名单和 TP 对不上（build_plan）。
-                # 其它 ValueError 仍是编程错误。
-                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
-                if not _is_intent_value_error(e):
-                    raise
-            except RuntimeError as e:
-                # PYTHONHASHSEED 没设。其它 RuntimeError（含已单独接住的
-                # PrefetchError / QueryError 之外）仍记 FAILED 再抛。
-                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
-                if "PYTHONHASHSEED" not in str(e):
-                    raise
             except Exception as e:  # 编程错误也留原因，再往上抛（不吞）
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
                 raise
