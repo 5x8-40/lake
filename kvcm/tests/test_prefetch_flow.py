@@ -105,6 +105,41 @@ def test_submit_error_wrapped_as_prefetch_error() -> None:
         run(PrefetchFlow(ops).run(_P, _T, poll_s=0))
 
 
+_PARTIAL = TaskHandle(op=OpKind.COPY, task_ids=((1, 101),))
+
+
+def test_submit_abandon_attribute_error_propagates() -> None:
+    """abandon 的编程错误要冒出去，不要变成 PrefetchError。"""
+
+    class _Ops(FakeOps):
+        async def abandon(self, handle: TaskHandle) -> None:
+            raise AttributeError("bug")
+
+    ops = _Ops(
+        exists=True,
+        seq=[],
+        copy_error=SubmitError("submit boom", handle=_PARTIAL),
+    )
+    with pytest.raises(AttributeError, match="bug"):
+        run(PrefetchFlow(ops).run_after_exists(_P, _T, poll_s=0, timeout_s=5))
+
+
+def test_submit_abandon_sqlite_error_stays_prefetch_error() -> None:
+    """账本写失败只记日志。提交失败仍是 PrefetchError，原因是原来的 SubmitError。"""
+    import sqlite3
+
+    cause = SubmitError("submit boom", handle=_PARTIAL)
+
+    class _Ops(FakeOps):
+        async def abandon(self, handle: TaskHandle) -> None:
+            raise sqlite3.OperationalError("disk I/O error")
+
+    ops = _Ops(exists=True, seq=[], copy_error=cause)
+    with pytest.raises(PrefetchError, match="copy submit failed") as ei:
+        run(PrefetchFlow(ops).run_after_exists(_P, _T, poll_s=0, timeout_s=5))
+    assert ei.value.__cause__ is cause
+
+
 def test_task_failed_raises() -> None:
     ops = FakeOps(exists=True, seq=[TaskStatus.FAILED])
     with pytest.raises(PrefetchError, match="copy task failed"):
