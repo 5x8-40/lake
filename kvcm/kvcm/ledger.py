@@ -316,8 +316,11 @@ class Ledger:
 
     def _register_keepalive_sync(self, prefix: Prefix) -> None:
         self._conn.execute(
-            "INSERT OR REPLACE INTO keepalive (prefix_key, model_id, token_ids, registered_at)"
-            " VALUES (?, ?, ?, ?)",
+            "INSERT INTO keepalive (prefix_key, model_id, token_ids, registered_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(prefix_key) DO UPDATE SET"
+            " model_id = excluded.model_id,"
+            " token_ids = excluded.token_ids",
             (
                 prefix_key(prefix),
                 prefix.model_id,

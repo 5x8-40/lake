@@ -71,11 +71,19 @@ def entry_exists(e) -> bool:
     return e == 1 or e is True or (isinstance(e, int) and e > 0)
 
 
+def _is_memory_replica(desc: object) -> bool:
+    """Upstream binds this as a method. A bool attribute still works."""
+    pred = getattr(desc, "is_memory_replica", False)
+    if callable(pred):
+        return bool(pred())
+    return bool(pred)
+
+
 def memory_replica_endpoints(store: MooncakeDistributedStore, key: str) -> list[str]:
     """Return transport endpoints of memory replicas for one key."""
     endpoints: list[str] = []
     for desc in store.get_replica_desc(key):
-        if not desc.is_memory_replica:
+        if not _is_memory_replica(desc):
             continue
         mem = desc.get_memory_descriptor()
         endpoints.append(mem.buffer_descriptor.transport_endpoint)
@@ -95,7 +103,7 @@ def batch_memory_replica_endpoints(
     for key, replicas in items:
         eps: list[str] = []
         for desc in replicas or []:
-            if getattr(desc, "is_memory_replica", False):
+            if _is_memory_replica(desc):
                 mem = desc.get_memory_descriptor()
                 eps.append(mem.buffer_descriptor.transport_endpoint)
         out[str(key)] = eps

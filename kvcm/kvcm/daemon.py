@@ -95,6 +95,7 @@ def build_backend(
         submit_concurrency=args.copy_submit_concurrency,
         rpc_timeout_s=args.rpc_timeout_s,
         lease_ttl_s=args.lease_ttl_s,
+        promote_hits=args.promote_hits,
         executor=executor,
     )
 
@@ -440,6 +441,13 @@ def main(argv: list[str] | None = None) -> int:
         type=float,
         default=5.0,
         help="续租周期（必须显著小于 master lease TTL，实配 11s）",
+    )
+    p.add_argument(
+        "--promote-hits",
+        type=int,
+        default=2,
+        help="提回时对每个 key 调 GetReplicaList 的次数。"
+        "须不小于 master 的 promotion_admission_threshold（默认同为 2，可改）",
     )
     p.add_argument(
         "--lease-ttl-s",

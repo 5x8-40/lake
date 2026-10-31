@@ -112,6 +112,25 @@ def test_query_error_skips_round_keeps_registration() -> None:
         led.close()
 
 
+def test_reregister_keeps_registered_at() -> None:
+    """再次登记不把窗口拨回现在。"""
+    led, path = _ledger()
+    try:
+        led.register_keepalive(_P)
+        first = led.list_keepalive_records()[0].registered_at
+        time.sleep(0.02)
+        led.register_keepalive(_P)
+        rows = led.list_keepalive_records()
+        assert len(rows) == 1
+        assert rows[0].registered_at == first
+    finally:
+        led.close()
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
+
+
 def test_restart_recovery_needs_no_special_casing() -> None:
     """重启：注册行在 Ledger 里，新 Loop 首扫自然接管（窗口按原
     registered_at 连续起算）。"""

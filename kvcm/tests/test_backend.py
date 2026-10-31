@@ -100,9 +100,6 @@ class FakeClient(StoreClient):
         ]
         return {k: list(on) for k in keys}
 
-    def binding(self):
-        return self
-
 
 def _install_verify_admin(monkeypatch) -> None:
     """核验走 admin.batch_query_keys。测试里用 client 上的端点填这份假响应。"""
@@ -171,7 +168,7 @@ def test_task_id_roundtrip_is_original_pair(fake_store_module, monkeypatch) -> N
     status = run(b.query_task(handle))
     assert status is TaskStatus.READY
     # 锁死：查询收到的标识与创建返回的完全一致（未被 str()）
-    assert client.queried == list(handle.task_ids)
+    assert sorted(client.queried) == sorted(handle.task_ids)
     # 终态即删核验登记（防长驻泄漏）
     assert handle not in b._plans
 
@@ -459,12 +456,14 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
         rpc_timeout_s=30.0,
         copy_submit_concurrency=7,  # 非默认值，才能证明真的传了
         lease_ttl_s=11.0,
+        promote_hits=3,
     )
     daemon.build_backend(args, client=object(), ledger=object())
     assert seen["submit_concurrency"] == 7, (
         f"--copy-submit-concurrency 没传下去: {seen.get('submit_concurrency')}"
     )
     assert seen["lease_ttl_s"] == 11.0
+    assert seen["promote_hits"] == 3
     assert list(seen["locate"]("inst-B")) == ["seg-A"]
     with pytest.raises(KeyError, match="not registered"):
         seen["locate"]("other")
@@ -1183,6 +1182,52 @@ def test_pin_hard_registers_keepalive(fake_store_module, monkeypatch) -> None:
         import os
 
         os.unlink(path)
+
+
+def test_memory_replica_predicate_calls_method() -> None:
+    """is_memory_replica 是方法时要调用。布尔属性仍然直接用。"""
+    called = {"disk": 0, "mem": 0}
+
+    class Disk:
+        def is_memory_replica(self):
+            return False
+
+        def get_memory_descriptor(self):
+            called["disk"] += 1
+            raise RuntimeError("Expected MemoryDescriptor")
+
+    class MemBuf:
+        size = 32
+        transport_endpoint = "10.0.0.3:1"
+
+    class MemDesc:
+        buffer_descriptor = MemBuf()
+
+    class Mem:
+        def is_memory_replica(self):
+            return True
+
+        def get_memory_descriptor(self):
+            called["mem"] += 1
+            return MemDesc()
+
+    class BoolMem:
+        is_memory_replica = True
+
+        def get_memory_descriptor(self):
+            return MemDesc()
+
+    class Store:
+        def batch_get_replica_desc(self, keys):
+            return {keys[0]: [Disk(), Mem(), BoolMem()]}
+
+    client = StoreClient()
+    client._store = Store()
+    assert client._memory_replica_sizes(["k"]) == [32]
+    assert called == {"disk": 0, "mem": 1}
+    eps = client.batch_memory_replica_endpoints(["k"])
+    assert eps["k"] == ["10.0.0.3:1", "10.0.0.3:1"]
+    assert called["disk"] == 0
 
 
 def test_soft_pin_reuses_existing_capsule(monkeypatch) -> None:
@@ -2045,7 +2090,7 @@ def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> 
     assert run(b.query_task(handle)) is TaskStatus.READY
 
     client._replicas_on = ["seg-ELSE"]
-    with pytest.raises(VerifyError, match="没有提回成功"):
+    with pytest.raises(VerifyError, match="已按 2 次触发"):
         run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
 
 

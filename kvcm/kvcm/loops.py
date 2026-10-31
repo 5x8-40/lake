@@ -67,10 +67,8 @@ class KeepaliveLoop:
     def register(self, prefix: Prefix) -> None:
         """登记保活。
 
-        调用场景：TaskEngine 在副本 READY 后注册。**同一前缀 × 同一实例
-        不会重复预热**（幂等键挡住），所以这里不需要「刷新窗口」的语义
-        ——实现上是 `INSERT OR REPLACE`，重复调用会覆盖 `registered_at`，
-        那只是幂等写入的副作用，不是设计意图。
+        调用场景：TaskEngine 在副本 READY 后注册。终态后再提交会再次
+        注册。行已存在时保留原来的 ``registered_at``，不把窗口拨回现在。
 
         **不抛异常**：保活失败只意味着副本可能提前变冷，不是预热失败。
         这里吞掉并计数（`register_failures`），避免把已经 READY 的 intent

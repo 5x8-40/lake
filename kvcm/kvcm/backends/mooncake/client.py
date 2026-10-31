@@ -22,6 +22,18 @@ from typing import Sequence
 # 仍可 import 本模块（离线 key 计算、拓扑解析、单元测试）。
 
 
+def is_memory_replica(desc: object) -> bool:
+    """内存副本谓词。上游绑定是方法，测试对象可以是布尔属性。
+
+    方法对象本身为真。不能把 ``getattr`` 的结果直接当布尔，否则盘副本
+    也会去调 ``get_memory_descriptor()``。
+    """
+    pred = getattr(desc, "is_memory_replica", False)
+    if callable(pred):
+        return bool(pred())
+    return bool(pred)
+
+
 def entry_exists(e) -> bool:
     """batch_is_exist 返回项的_truthy 判定——唯一的判定定义，所有
     「key 是否在池」的调用共用（错误项 -1 不到这里，is_exist 先抛）。"""
@@ -101,10 +113,6 @@ class StoreClient:
         if self._store is None:
             raise StoreClientError("not connected")
         return self._store
-
-    def binding(self):
-        """已建好的官方 wheel store 对象。软钉用它，不再另建 client。"""
-        return self._s()
 
     # ------------------------------------------------------------------
     # 存在性
@@ -201,7 +209,7 @@ class StoreClient:
         for key, replicas in items:
             sizes: list[int] = []
             for desc in replicas or []:
-                if not getattr(desc, "is_memory_replica", False):
+                if not is_memory_replica(desc):
                     continue
                 mem = desc.get_memory_descriptor()
                 sizes.append(int(mem.buffer_descriptor.size))
@@ -245,28 +253,6 @@ class StoreClient:
                 "空写扩展还没加载，没有钉上"
             ) from e
 
-    def register_retained(self) -> None:
-        """保留身份这次不登记。1fc27b6 没有 AddReplicaForRetainedClient。
-        这里不接 kRetained。绑定上若没有 register_retained_client，调用会失败。
-        """
-        store = self._store
-        if store is None:
-            raise StoreClientError("store 未连接，保留身份没有注册")
-        import mooncake.store as store_mod
-
-        fn = getattr(store, "register_retained_client", None)
-        if not callable(fn):
-            names = [
-                name
-                for name in dir(store_mod)
-                if "retain" in name.lower()
-            ]
-            raise StoreClientError(
-                "mooncake wheel 没有保留身份注册，没有注册。"
-                f" store 模块里相关名字: {names or '无'}"
-            )
-        fn()
-
     def query_task(self, task_id: object) -> object:
         """查询任务状态（QueryTaskResponse）。"""
         resp, err = self._s().query_task(task_id)
@@ -287,7 +273,7 @@ class StoreClient:
         for key, replicas in items:
             eps: list[str] = []
             for desc in replicas or []:
-                if getattr(desc, "is_memory_replica", False):
+                if is_memory_replica(desc):
                     mem = desc.get_memory_descriptor()
                     eps.append(mem.buffer_descriptor.transport_endpoint)
             out[str(key)] = eps

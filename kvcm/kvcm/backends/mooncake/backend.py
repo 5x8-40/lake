@@ -1,16 +1,16 @@
 """MooncakeBackend：原子操作接口的 mooncake 实现。
 
 组装两个适配维度的子件：
-- 存储侧：StoreClient（绑定 + HTTP 双通道）、SegTopology、能力集（按版本）
+- 存储侧：StoreClient（绑定 + HTTP 双通道）、能力集（按版本）
 - 引擎侧：KeyComputer（前缀 → key 列表 → rank 映射计划）、实例 → seg
   列表（以 locate 可调用注入——demo 环境 = pidfile/proctitle 探测，生产
   = 实例注册）
 
-任务标识（mooncake 为整数对）在本实现内原样透传，不做字符串化；需要
-写入 Ledger 时由本实现做可逆编码（"hi:lo"）。
+本类不组装 SegTopology。任务标识（mooncake 为整数对）在本实现内原样
+透传，不做字符串化；需要写入 Ledger 时由本实现做可逆编码（"hi:lo"）。
 
-本步落地 copy / move / remove / exists / query_task；其余操作随能力接线
-逐个落地，未落地的抛 NotImplementedError，通道不具备的抛
+copy / move / remove / exists / query_task / pin / keepalive / demote /
+promote 已接线。retain 通道关闭，开头直接拒绝。基类未接线的操作抛
 UnsupportedCapabilityError。
 """
 
@@ -138,6 +138,8 @@ class MooncakeBackend(KvOps):
         # 进程级提交信号量：延迟创建（首次 copy 时建）。Semaphore() 构造
         # 不绑循环，首次排队等名额才绑；什么时候创建不是正确性的关键。
         self._submit_sem: asyncio.Semaphore | None = None
+        # 同一 handle 内并发查任务，不超过 4，不另建线程池。
+        self._query_sem: asyncio.Semaphore | None = None
         # 协程侧 RPC 超时（0.3.11 的绑定没有超时参数；main 有
         # MC_RPC_TIMEOUT_MS，届时可与此对齐）。<=0 表示不设超时。
         self._rpc_timeout_s = rpc_timeout_s
@@ -295,6 +297,12 @@ class MooncakeBackend(KvOps):
             self._submit_sem = asyncio.Semaphore(self._submit_concurrency)
         return self._submit_sem
 
+    def _query_gate(self) -> asyncio.Semaphore:
+        """同一 handle 里并发 query_task 的上限，不超过 4。"""
+        if self._query_sem is None:
+            self._query_sem = asyncio.Semaphore(min(4, self._submit_concurrency))
+        return self._query_sem
+
     async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机 seg 为前缀 KV 建副本（发起式；READY 经 query_task）。
 
@@ -412,11 +420,14 @@ class MooncakeBackend(KvOps):
         if handle in self._watch:
             # 在途冲突观测态：任务已死（冲突失败，账已记），只等副本到位
             return await self._verify_watch(handle, plan)
+        sem = self._query_gate()
+
+        async def _one(tid: object) -> object:
+            async with sem:
+                return await self._rpc(self._client.query_task, tid)
+
         try:
-            resps = [
-                await self._rpc(self._client.query_task, tid)
-                for tid in handle.task_ids
-            ]
+            resps = list(await asyncio.gather(*(_one(tid) for tid in handle.task_ids)))
         except StoreClientError as e:
             raise QueryError(str(e)) from e
         failed = [r for r in resps if r.status == StoreTaskStatus.FAILED]
@@ -801,7 +812,7 @@ class MooncakeBackend(KvOps):
             raise UnsupportedCapabilityError(
                 "soft pin 事后加：这个能力集的通道不具备"
             )
-        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        keys = await self._expand_keys(prefix.token_ids)
         if not keys:
             raise ValueError(
                 "prefix expands to no keys (shorter than one block?)"
@@ -822,7 +833,7 @@ class MooncakeBackend(KvOps):
         写回且池不满时仍会失败：不读数据落盘，不调 ``MountLocalDiskSegment``。
         展开不出 key、或没配 admin，在停保活之前就失败。
         """
-        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        keys = await self._expand_keys(prefix.token_ids)
         if not keys:
             raise ValueError(
                 "prefix expands to no keys (shorter than one block?)"
@@ -852,13 +863,13 @@ class MooncakeBackend(KvOps):
             )
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
-        """对前缀的 key 调 GetReplicaList，次数默认 2，用来过命中线。
+        """对前缀的 key 调 GetReplicaList，次数由 ``promote_hits`` 决定。
 
         走绑定 batch_get_replica_desc（batch_memory_replica_endpoints），
-        不走 /batch_query_keys，不做读删写。过线后目标端点上仍没有内存
-        副本就失败，不在这里空等。
+        不走 /batch_query_keys，不做读删写。打完这些次数后目标上还没有
+        内存副本就失败，不在这里空等。
         """
-        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        keys = await self._expand_keys(prefix.token_ids)
         if not keys:
             raise ValueError(
                 "prefix expands to no keys (shorter than one block?)"
@@ -876,7 +887,8 @@ class MooncakeBackend(KvOps):
         ]
         if missing:
             raise VerifyError(
-                "promote: 命中次数已过线，目标上还没有内存副本，没有提回成功:\n  "
+                f"promote: 已按 {self._promote_hits} 次触发，目标上还没有内存副本，"
+                "没有提回成功:\n  "
                 + "\n  ".join(missing)
             )
         return TaskHandle(op=OpKind.PROMOTE, task_ids=())
@@ -887,13 +899,9 @@ class MooncakeBackend(KvOps):
             raise UnsupportedCapabilityError(
                 "retained client：这份主线没有该接口，通道不具备"
             )
-        keys = self._keys.keys_for_tokens(prefix.token_ids)
-        if not keys:
-            raise ValueError(
-                "prefix expands to no keys (shorter than one block?)"
-            )
-        await self._rpc(self._client.register_retained)
-        return TaskHandle(op=OpKind.RETAIN, task_ids=())
+        raise UnsupportedCapabilityError(
+            "retained client：通道打开也不登记，这次不实现"
+        )
 
     async def remove(self, prefix: Prefix, force: bool = False) -> None:
         """删除该前缀展开出的全部 key，每个 key 的全部副本一起删。
@@ -902,7 +910,7 @@ class MooncakeBackend(KvOps):
         force=True：先停这份前缀的保活，再 ``batch_remove(..., force=True)``。
         不占新内存，不调用 ``_admit_new_bytes``。
         """
-        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        keys = await self._expand_keys(prefix.token_ids)
         if not keys:
             raise ValueError(
                 "prefix expands to no keys (shorter than one block?)"

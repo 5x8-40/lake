@@ -119,7 +119,7 @@ sequenceDiagram
 
 - **KeyComputer**：前缀 → key 列表（引擎算法一致）；rank 映射计划
 - **locate**：目标实例 → rank 有序 seg 列表（demo 探测 / 生产实例注册）
-- **StoreClient**：绑定 RPC（exists / copy 提交 / query_task / 副本核验）
+- **StoreClient**：绑定 RPC（exists / copy 提交 / query_task）。副本核验走 admin 的 `GET /batch_query_keys`
 - **Ledger**：任务状态（running → ready/failed/abandoned）
 - **EventPublisher**（待接通）：READY 后按目标实例端点补发 `BlockStored`
 - **keepalive**：`TaskEngine._run_prefetch` 在流程返回 READY 后注册保活（见

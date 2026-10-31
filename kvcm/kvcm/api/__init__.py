@@ -4,7 +4,6 @@
 """
 
 from kvcm.api.events import EventPublisher
-from kvcm.api.intents import IntentReceiver
 from kvcm.api.watcher import InstanceWatcher
 
-__all__ = ["IntentReceiver", "EventPublisher", "InstanceWatcher"]
+__all__ = ["EventPublisher", "InstanceWatcher"]
