@@ -10,8 +10,7 @@
   charged）。这是租户记账，不是段剩余空间，不能拿来当段剩余容量。
 
 0.3.11 没有零副作用核验，也没有租户配额；本模块不服务那个版本。
-不改 ``http_admin.py``（另一处在改它）。写类端点（配额 PUT/DELETE）
-不在这里。
+写类端点（配额 PUT/DELETE）不在这里。
 """
 
 from __future__ import annotations
@@ -82,7 +81,8 @@ def parse_batch_query_keys(body: str) -> dict[str, KeyReplicaQuery]:
     """解析 ``GET /batch_query_keys`` 的 JSON 正文。
 
     成功体：``{"success": true, "data": {key: {ok, error?, values?}}}``。
-    ``values`` 是内存副本描述（``transport_endpoint_``）。盘副本只计条数
+    ``values`` 与 ``nof_values`` 都是可读副本描述（``transport_endpoint_``），
+    合并进内存端点列表，供核验使用。NOF 不算盘副本。盘副本只计条数
     （``disk_values`` + ``local_disk_values``），不进内存端点列表。
     """
     payload = _load_object(body)
@@ -102,7 +102,9 @@ def parse_batch_query_keys(body: str) -> dict[str, KeyReplicaQuery]:
         disks = 0
         local_disk: tuple[str, ...] = ()
         if ok:
-            memory = _memory_views(key, item.get("values"))
+            memory = _memory_views(key, item.get("values")) + _memory_views(
+                key, item.get("nof_values")
+            )
             disks = _replica_count(item.get("disk_values")) + _replica_count(
                 item.get("local_disk_values")
             )

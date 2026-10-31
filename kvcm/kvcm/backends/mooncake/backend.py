@@ -962,7 +962,8 @@ class MooncakeBackend(KvOps):
         无论 force，都先 ``stop_keepalive``。``force=False`` 再等满一个
         ``lease_ttl_s``，然后 ``batch_remove(..., force=False)``。
         ``force=True`` 停保活后立刻 ``batch_remove(..., force=True)``，不等。
-        删除失败或取消时把保活加回去，再抛原异常。成功不加回。
+        失败或取消不把保活加回去：停过就留停。调用方看到原因后自己重试，
+        租约可以过期。成功路径也不加回。
         不占新内存，不调用 ``_admit_new_bytes``。
         """
         keys = await self._expand_keys(prefix.token_ids)
@@ -971,13 +972,6 @@ class MooncakeBackend(KvOps):
                 "prefix expands to no keys (shorter than one block?)"
             )
         await self.stop_keepalive(prefix)
-        try:
-            if not force:
-                await asyncio.sleep(self._lease_ttl_s)
-            await self._rpc(self._client.batch_remove, keys, force)
-        except asyncio.CancelledError:
-            await self.keepalive(prefix)
-            raise
-        except Exception:
-            await self.keepalive(prefix)
-            raise
+        if not force:
+            await asyncio.sleep(self._lease_ttl_s)
+        await self._rpc(self._client.batch_remove, keys, force)

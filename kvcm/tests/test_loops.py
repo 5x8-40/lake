@@ -68,6 +68,32 @@ def test_register_then_sweep_renews_via_exists() -> None:
         led.close()
 
 
+def test_sweep_skips_exists_if_unregistered_after_snapshot() -> None:
+    """快照之后行已删，不要再 exists 续租。"""
+    led, path = _ledger()
+    try:
+        ops = FakeOps(present=True)
+        loop = KeepaliveLoop(ops, led, interval_s=999, window_s=600)
+        loop.register(_P)
+        real = led.list_keepalive_records
+
+        def snapshot():
+            rows = real()
+            led._unregister_keepalive_sync(_P)
+            return rows
+
+        led.list_keepalive_records = snapshot  # type: ignore[method-assign]
+        run(loop.sweep_once())
+        assert ops.calls == []
+        loop.close()
+    finally:
+        led.close()
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
+
+
 def test_window_expiry_unregisters() -> None:
     """窗口到：停租注销，不再调 exists（保活必须有界）。"""
     led, path = _ledger()

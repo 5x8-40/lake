@@ -93,6 +93,25 @@ def test_parse_batch_query_keys_memory_endpoint_and_miss() -> None:
     assert with_disk["k"].local_disk_endpoints == ("10.0.0.1:1",)
 
 
+def test_parse_nof_values_join_memory_endpoints_not_disk() -> None:
+    """NOF 副本可读，端点并进内存列表。不算 disk_replicas。"""
+    parsed = parse_batch_query_keys(
+        '{"success": true, "data": {"k": {"ok": true,'
+        ' "values": [{"size_": 4, "buffer_address_": 1, "protocol_": "tcp",'
+        ' "transport_endpoint_": "10.0.0.2:1"}],'
+        ' "nof_values": [{"size_": 8, "buffer_address_": 2, "protocol_": "tcp",'
+        ' "transport_endpoint_": "10.0.0.3:7"}],'
+        ' "disk_values": [{"file_path": "a", "object_size": 1}]}}}'
+    )
+    item = parsed["k"]
+    assert [m.transport_endpoint for m in item.memory] == [
+        "10.0.0.2:1",
+        "10.0.0.3:7",
+    ]
+    assert item.disk_replicas == 1
+    assert item.local_disk_endpoints == ()
+
+
 def test_parse_tenant_quotas_list_and_single() -> None:
     rows = parse_tenant_quotas(_QUOTAS)
     assert len(rows) == 1

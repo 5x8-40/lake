@@ -34,7 +34,7 @@ def mooncake_v0311() -> BackendCapability:
             Support.NO,
             Support.NO,
             "0.3.11 的 /batch_query_keys 只有内存副本，没有 disk_values / "
-            "local_disk_values（主线 #2685 才加）。按它查盘会定判成没有盘副本。"
+            "local_disk_values（主线 #2685 才加）。按它查盘会判定成没有盘副本。"
             "通道不具备，demote 在停保活前拒绝",
         ),
         has_promotion=Capability(

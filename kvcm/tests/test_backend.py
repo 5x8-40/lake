@@ -20,8 +20,6 @@ import pytest
 
 from conftest import run
 
-from conftest import run
-
 from kvcm.backends.mooncake.backend import MooncakeBackend, encode_task_id
 from kvcm.backends.mooncake.capability import mooncake_v0311, mooncake_main
 from kvcm.backends.mooncake.client import StoreClient, StoreClientError, entry_exists
@@ -1261,7 +1259,19 @@ def test_remove_false_stops_keepalive_and_sleeps(
         run(b.keepalive(prefix))
         with pytest.raises(StoreClientError, match="batch_remove failed"):
             run(b.remove(prefix, force=False))
-        assert led.list_keepalive() == [prefix]
+        assert led.list_keepalive() == []
+
+        async def cancel_sleep(_seconds):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(
+            "kvcm.backends.mooncake.backend.asyncio.sleep", cancel_sleep
+        )
+        b._client = client
+        run(b.keepalive(prefix))
+        with pytest.raises(asyncio.CancelledError):
+            run(b.remove(prefix, force=False))
+        assert led.list_keepalive() == []
     finally:
         led.close()
         import os

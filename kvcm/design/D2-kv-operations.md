@@ -567,7 +567,7 @@ sequenceDiagram
     Note over M: 副本标写中，key 不可读（毫秒级，F3④）
     K->>M: S2 UpsertEnd（不写数据）
     Note over M: soft pin 置位 ✓
-    Note over K,M: 取消：空写传 with_soft_pin=false（0.3.11）/ DISABLE（main 三态）<br/>或停止续期等 TTL 到期
+    Note over K,M: 取消：空写扩展只对着主线 SoftPinAction::DISABLE<br/>0.3.11 的 soft_pin 通道是 NO（布尔坑不走这条空写）<br/>或停止续期等 TTL 到期
     end
 
     rect rgb(223, 242, 223)
@@ -825,13 +825,13 @@ sequenceDiagram
 
 ### soft pin 级（驱逐排最后，极端情况可逐）：空写 upsert 设 soft pin
 
-- 做法：`UpsertStart`(key, 原尺寸, with_soft_pin) → 不写数据 → `UpsertEnd`；原尺寸由 `GET /batch_query_keys` 的 `size_` 查，不走会授租约的 `GetReplicaList`。若该 key 的 `disk_replicas > 0` 或 `local_disk_endpoints` 非空，调用空写前拒绝：`PutEnd` 的 `is_target_replica` 在 `ReplicaType::ALL` 下只认 memory / nof / dfs，不含 LOCAL_DISK 和 DISK。Case B 会把盘副本标成 PROCESSING，End 不把它们置回
+- 做法：`UpsertStart`(key, 原尺寸, with_soft_pin) → 不写数据 → `UpsertEnd`；原尺寸由 `GET /batch_query_keys` 的 `size_` 查，不走会授租约的 `GetReplicaList`。Case B 会把所有已完成副本（含 LOCAL_DISK/DISK）标成 PROCESSING，`PutEnd(ALL)` 不把盘副本置回。所以 `disk_replicas > 0` 或 `local_disk_endpoints` 非空就拒绝空写。`PutEnd` 的 `is_target_replica` 在 `ReplicaType::ALL` 下只认 memory / nof / dfs，不含 LOCAL_DISK 和 DISK
 - mooncake 代码：不改。空写在 kvcm 侧的 `_empty_pin.so`，只链 `store.so`，不给官方绑定打补丁（F12）
 - client_id 问题：**有**（upsert 必改写 client_id，F3①——见「client_id 问题」节）
 - 保护语义：驱逐两轮里只排第二轮（F8），第一轮候选凑不够时仍可逐——这是 mooncake soft pin 的本义，与「防驱逐」有缝，接受才用
 - kvcm 失联：TTL 内保护自持（时钟在池里，main 默认 30min），到期不续才失效
 - 持续开销：每 key 每 TTL 一次空写续期
-- 副作用：两 RPC 之间 key 不可读（毫秒级，F3④）；0.3.11 布尔坑——忘带 true 的 upsert 顺手清 pin（F1）
+- 副作用：两 RPC 之间 key 不可读（毫秒级，F3④）。0.3.11 布尔坑（忘带 true 的 upsert 顺手清 pin，F1）不在当前空写路径上：扩展只对着主线，0.3.11 的 soft_pin 通道是 NO
 
 ### hard pin 级（绝对不可驱逐）：选定候选 ①
 
@@ -851,7 +851,7 @@ sequenceDiagram
 ### pin 的取消
 
 - **①（当前路径）**：停止续租，等满一个 lease TTL 后自然失效（= §4 软释放级）。无「立即撤销 lease」RPC（背景概念节，两版本同），也不查剩余租约。窗口 = master 的 `default_kv_lease_ttl`，kvcm 不改这个值
-- **空写 soft pin**：主动取消 = 空写传 `with_soft_pin=false`（0.3.11）/ `SoftPinAction::DISABLE`（main 三态，`replica.h:64-68` @main）；或停止续期等 TTL 到期自动失效。注意 0.3.11 下取消可能**被动发生**（布尔坑，F1）
+- **空写 soft pin**：主动取消 = 空写传 `SoftPinAction::DISABLE`（main 三态，`replica.h:64-68` @main）；或停止续期等 TTL 到期自动失效。空写扩展只对着主线。0.3.11 的 `soft_pin_after` 通道是 NO，不走这条空写；0.3.11 的布尔坑（忘带 true 会清 pin，F1）因此不是当前取消路径
 - **读删写（候选 ②，不是当前路径）**：**没有 unpin**——两版本都是或运算保留（`with_hard_pin || IsHardPinned()`，`master_service.cpp:1741-1742` @0.3.11 / `:6068` @main；`hard_pinned is const`，`:1696` @0.3.11）——取消 = 再读删写一遍（读出 → Remove → 不带 hard_pin 重 put）。这次不做
 - 操作集因此不单列 unpin：取消分别由 停 keepalive（软释放）/ pin 同机制逆操作 / remove 系 覆盖
 

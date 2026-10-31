@@ -176,11 +176,11 @@ class KvOps(ABC):
         raise self._unsupported("demote")
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
-        """把前缀 KV 提回盘副本登记的那个实例。
+        """把前缀 KV 提回到 target。
 
-        target 必须是 LOCAL_DISK 副本登记的实例，不是任意实例。
-        池只把提回派给那个登记 client；key 若已在别处有内存副本就不再入队。
-        READY 同 copy。
+        打 N 次 GetReplicaList，再用内存副本端点对 locate(target)。
+        不能在打次数之前证明 target 是盘副本登记实例。打完仍没有
+        内存副本就失败，不在这里轮询。
         """
         raise self._unsupported("promote")
 
@@ -195,8 +195,10 @@ class KvOps(ABC):
     async def remove(self, prefix: Prefix, force: bool = False) -> None:
         """删除前缀 KV 的全部副本，全局生效。无 READY。
 
-        force=False：不停保活，删除走绑定默认保险（lease 未过期或任务
-        在途时 master 拒删）。force=True：先停这份前缀的保活，再强删。
+        无论 force 都先停保活。force=False 再等一个 lease 后
+        ``batch_remove(force=False)``。force=True 立刻强删。
+        失败或取消不把保活加回去：停过就留停，调用方看到原因后自己重试，
+        租约可以过期。
         """
         raise self._unsupported("remove")
 
