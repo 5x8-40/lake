@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
 import time
 
 from kvcm.ops.base import (
@@ -46,6 +47,10 @@ from kvcm.ops.base import (
 from kvcm.ops.types import InstanceId, Prefix
 
 logger = logging.getLogger(__name__)
+
+# 退出时 Ledger 线程池已关，`_in_ledger` 抛的就是这句。其它 RuntimeError
+# 是编程错误，不能跟这一句混在一起吞掉。
+_LEDGER_SHUTDOWN = "cannot schedule new futures after shutdown"
 
 
 class PrefetchError(RuntimeError):
@@ -130,23 +135,20 @@ class PrefetchFlow:
                 asyncio.shield(copy_task), timeout=remaining
             )
         except SubmitError as e:
-            await self._abandon_submitted(e)
+            await self._abandon(e.handle)
             raise PrefetchError(f"copy submit failed: {e}") from e
         except TimeoutError:
             handle = None
             try:
                 handle = await _drain_copy(copy_task)
             except SubmitError as e:
-                await self._abandon_submitted(e)
+                await self._abandon(e.handle)
                 raise PrefetchError(f"copy submit failed: {e}") from e
             except asyncio.CancelledError:
                 await self._abandon_if_handed(copy_task, handle)
                 raise
+            await self._abandon(handle)
             if handle is not None:
-                try:
-                    await self._ops.abandon(handle)
-                except KeyError:
-                    pass
                 raise PrefetchError(
                     f"copy not READY after {timeout_s}s (handle={handle})"
                 )
@@ -161,11 +163,7 @@ class PrefetchFlow:
             except asyncio.CancelledError:
                 await self._abandon_if_handed(copy_task, handle)
                 raise
-            if handle is not None:
-                try:
-                    await self._ops.abandon(handle)
-                except KeyError:
-                    pass
+            await self._abandon(handle)
             raise
         if handle_sink is not None:
             handle_sink(handle)
@@ -187,7 +185,7 @@ class PrefetchFlow:
                 if time.monotonic() >= deadline:
                     # 超时收口：放弃跟踪（删登记 + 记 abandoned）；后端任务
                     # 可能仍在进行，副本清理由 remove 负责。
-                    await self._ops.abandon(handle)
+                    await self._abandon(handle)
                     raise PrefetchError(
                         f"copy not READY after {timeout_s}s (handle={handle})"
                     )
@@ -196,30 +194,30 @@ class PrefetchFlow:
             # 进程退出取消：断开跟踪并记账（Ledger 记 abandoned）。
             # 不这样做的话账本会留 running，重启又被 rebuild 捞回来跟。
             # 后端任务本身不取消（无此能力），副本清理由 remove 负责。
-            try:
-                await self._ops.abandon(handle)
-            except KeyError:
-                pass  # 已终态被移除登记
+            await self._abandon(handle)
             raise
 
-    async def _abandon_submitted(self, err: SubmitError) -> None:
-        """提交失败里已经落账的句柄先 abandon。池里的传输不取消。
+    async def _abandon(self, handle: TaskHandle | None) -> None:
+        """放弃跟踪。池里的传输不取消。
 
-        账本写失败只记日志，函数照常返回，好让调用方仍用原来的
-        SubmitError 抛 PrefetchError。取消继续抛。
+        句柄已经不在（KeyError）忽略。账本写失败（sqlite，或退出时
+        线程池已关）记日志后返回，调用方照旧抛自己的结局。编程错误
+        继续抛。
         """
-        if err.handle is None:
+        if handle is None:
             return
         try:
-            await self._ops.abandon(err.handle)
+            await self._ops.abandon(handle)
         except asyncio.CancelledError:
             raise
         except KeyError:
             pass
-        except Exception:
-            logger.exception(
-                "abandon after submit failure failed (handle=%s)", err.handle
-            )
+        except sqlite3.Error:
+            logger.exception("abandon ledger write failed (handle=%s)", handle)
+        except RuntimeError as e:
+            if _LEDGER_SHUTDOWN not in str(e):
+                raise
+            logger.exception("abandon ledger write failed (handle=%s)", handle)
 
     async def _abandon_if_handed(
         self, copy_task: asyncio.Task, handle: TaskHandle | None
@@ -230,12 +228,7 @@ class PrefetchFlow:
                 result = copy_task.result()
                 if isinstance(result, TaskHandle):
                     handle = result
-        if handle is None:
-            return
-        try:
-            await self._ops.abandon(handle)
-        except KeyError:
-            pass
+        await self._abandon(handle)
 
 
 async def _drain_copy(copy_task: asyncio.Task) -> TaskHandle | None:
