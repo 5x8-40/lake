@@ -267,7 +267,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 - **E14. KV event 通信**——随 D1 §2 方案 a/b（已闭环），控制面自己产生引擎格式的事件
   - **发布端（pub）**：
     - 直接 import 上游 `ZmqEventPublisher`（`kv_events.py:304`）
-    - 事件字段取自 `hash_token_block_chain`。发出前每个 hash（以及非空的 `parent_block_hash`）过上游 `maybe_convert_block_hash`：默认发低 64 位整数，不发原字节，也不发十六进制字符串（Dynamo 不接收 bytes）。token 只到满块，个数 = len(block_hashes) × block_size，不满一块的尾巴不进事件，满块链为空则不发（D1 §3）。`medium` 用上游常量 `MEDIUM_CPU`，字符串是 `"CPU"`。`group_idx` 补发填 0。`extra_keys` 这次不填：`hash_block_tokens` 传 `None`，只覆盖纯文本前缀
+    - 事件字段取自 `hash_token_block_chain`。发出前每个 hash（以及非空的 `parent_block_hash`）过上游 `maybe_convert_block_hash`：默认发低 64 位整数，不发原字节，也不发十六进制字符串（Dynamo 不接收 bytes）。token 只到满块，个数 = len(block_hashes) × block_size，不满一块的尾巴不进事件，满块链为空则不发（D1 §3）。`medium` 用上游常量 `MEDIUM_CPU`，字符串是 `"CPU"`。`group_idx` 补发填 0，同时 `kv_cache_spec_kind="full_attention"`。`extra_keys` 这次不填：`hash_block_tokens` 传 `None`。这次只覆盖纯文本全注意力。滑动窗口、Mamba 不能用这个 kind
     - 操作对应：复制、移动的目标、主动提回 → `BlockStored`；移动的源、删除 → `BlockRemoved`；保活、钉住、停保活不发。本次代码只在预热 READY 发 `BlockStored`，移动和删除在另一分支，合入后再接
     - READY 核验后按目标实例各发一条 `BlockStored`（一条装下连续满块链）。重启后仍在跟踪的 copy，轮询前用 `target_of` 读出登记的目标实例，READY 后同样补发。补发失败（没有端点或发送抛错）只记日志，不把已经 READY 的操作判成失败。预热仍成功，保活照常登记
     - 每个目标实例一个发布地址，不按 seg 或 rank 拆。发布路径不调用 `/register`，也不订阅 master publisher；把地址交给索引仍归 D4/E13

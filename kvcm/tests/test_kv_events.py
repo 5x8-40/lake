@@ -129,6 +129,7 @@ def test_ready_publishes_one_with_converted_hash_and_cpu(monkeypatch) -> None:
     assert all(not isinstance(h, str) for h in event.block_hashes)
     assert event.medium == "CPU"
     assert event.group_idx == 0
+    assert event.kv_cache_spec_kind == "full_attention"
     assert event.parent_block_hash is None
     assert event.token_ids == [1, 2]  # 满块；尾巴 token 3 不进事件
     assert event.block_size == 2
@@ -207,6 +208,7 @@ def test_track_ready_publishes_when_target_known() -> None:
     assert len(sink[0].batches) == 1
     assert sink[0].batches[0].events[0].block_hashes == [_convert(_RAW)]
     assert sink[0].batches[0].events[0].group_idx == 0
+    assert sink[0].batches[0].events[0].kv_cache_spec_kind == "full_attention"
 
 
 def test_track_without_target_still_registers_keepalive() -> None:
@@ -290,6 +292,7 @@ def test_real_publisher_uses_put_nowait() -> None:
     assert batch.events[0].block_hashes == [_convert(_RAW)]
     assert batch.events[0].medium == "CPU"
     assert batch.events[0].group_idx == 0
+    assert batch.events[0].kv_cache_spec_kind == "full_attention"
 
 
 def test_full_queue_logs_and_keeps_ready(caplog) -> None:

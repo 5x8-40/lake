@@ -136,6 +136,9 @@ class BlockStoredPublisher:
             medium=medium_cpu,
             lora_name=None,
             group_idx=0,
+            # GroupIdx 非空时 llm-d 先查 kind。默认 None 被 omit_defaults 丢掉，
+            # 空 kind 会被判 unsupported_cache_kind。单组全注意力填这个字符串。
+            kv_cache_spec_kind="full_attention",
         )
         batch = EventBatch(
             ts=time.time(),
