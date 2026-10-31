@@ -20,9 +20,8 @@ def mooncake_v0311() -> BackendCapability:
         ),
         soft_pin_after=Capability(
             Support.YES,
-            Support.YES,
-            "通道 = 官方 wheel 的 ReplicateConfig.soft_pin_action；"
-            "绑定没有 UpsertStart/End，空写调不到就不记成已钉上",
+            Support.NO,
+            "空写扩展对着主线 SoftPinAction。这个能力集不把通道标成已有",
         ),
         hard_pin_after=Capability(Support.NO, Support.NO, "pin 写入时固化、无 unpin"),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
@@ -64,8 +63,9 @@ def mooncake_main() -> BackendCapability:
         soft_pin_after=Capability(
             Support.YES,
             Support.YES,
-            "官方 wheel：ReplicateConfig.soft_pin_action + upsert_tensor；"
-            "没有空写 Start/End，不自己编译 .so",
+            "空写：_get_pyclient_capsule 拿回已建 client，"
+            "扩展调 MasterClient::UpsertStart/UpsertEnd，不 TransferWrite，"
+            "不第二次 RealClient::create",
         ),
         hard_pin_after=Capability(Support.NO, Support.NO, "pin 写入时固化、无 unpin"),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
@@ -83,8 +83,9 @@ def mooncake_main() -> BackendCapability:
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
         has_retained_client=Capability(
             Support.YES,
-            Support.YES,
-            "走官方 wheel。store_py 未导出保留身份时调用失败，不会返回已保留",
+            Support.NO,
+            "路径 A 停在编译前：header path not found，且 nm -D 无 Retained / "
+            "kRetained / AddReplicaForRetained / BufferRegistration。通道不标成已有",
         ),
         has_dfs_replica=Capability(Support.YES, Support.UNKNOWN, "写入路径待核对"),
         has_admin_query=Capability(

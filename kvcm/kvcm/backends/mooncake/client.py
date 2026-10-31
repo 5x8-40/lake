@@ -193,33 +193,58 @@ class StoreClient:
             )
         return raw
 
-    def soft_pin(self, keys: Sequence[str], *, enable: bool = True) -> None:
-        """用官方 wheel（``mooncake.store``）设 soft pin。不自己编译扩展。
-
-        绑定导出了 ``ReplicateConfig.soft_pin_action`` 和 ``upsert_tensor``。
-        没有把 ``UpsertStart`` / ``UpsertEnd`` 分开，所以做不到不写数据的空写。
-        不用 ``upsert_tensor`` 重写一份数据来冒充已经钉上。
-        """
-        store = self._store
-        if store is None:
-            raise StoreClientError("store 未连接，软钉没有钉上")
-        from mooncake.store import ReplicateConfig, SoftPinAction
-
-        cfg = ReplicateConfig()
-        cfg.replica_num = 1
-        cfg.soft_pin_action = (
-            SoftPinAction.ENABLE if enable else SoftPinAction.DISABLE
-        )
-        fn = getattr(store, "batch_soft_pin", None)
-        if not callable(fn):
+    def _memory_replica_sizes(self, keys: Sequence[str]) -> list[int]:
+        """每个 key 的内存副本字节数。空写把这个数交给 UpsertStart，不新写数据。"""
+        keys = list(keys)
+        descs = self._s().batch_get_replica_desc(keys)
+        items = descs.items() if isinstance(descs, dict) else zip(keys, descs)
+        found: dict[str, int] = {}
+        for key, replicas in items:
+            sizes: list[int] = []
+            for desc in replicas or []:
+                if not getattr(desc, "is_memory_replica", False):
+                    continue
+                mem = desc.get_memory_descriptor()
+                sizes.append(int(mem.buffer_descriptor.size))
+            uniq = set(sizes)
+            if len(uniq) != 1:
+                raise StoreClientError(
+                    f"软钉读不到唯一的原尺寸，没有钉上: {key!r} sizes={sorted(uniq)}"
+                )
+            found[str(key)] = uniq.pop()
+        missing = [k for k in keys if k not in found]
+        if missing:
             raise StoreClientError(
-                "mooncake wheel 的 store 没有只改 soft pin 的方法，软钉没有钉上。"
-                "绑定有 ReplicateConfig.soft_pin_action 和 upsert_tensor，"
-                "没有 UpsertStart/UpsertEnd。"
+                "软钉缺少内存副本尺寸，没有钉上: " + ", ".join(missing[:4])
             )
-        rc = fn(list(keys), cfg)
-        if rc not in (0, None):
-            raise StoreClientError(f"soft pin failed rc={rc}")
+        return [found[k] for k in keys]
+
+    def soft_pin(self, keys: Sequence[str], *, enable: bool = True) -> None:
+        """空写软钉。用官方包已经建好的 client，不第二次 create。
+
+        ``_get_pyclient_capsule`` 拿回 setup 时放进 ``store_`` 的 PyClient。
+        扩展在这个对象上调 ``MasterClient::UpsertStart`` / ``UpsertEnd``，
+        中间不 ``TransferWrite``。不用 ``upsert_tensor`` 重写数据。
+        """
+        store = self._s()
+        keys = list(keys)
+        sizes = self._memory_replica_sizes(keys)
+        capsule_fn = getattr(store, "_get_pyclient_capsule", None)
+        if not callable(capsule_fn):
+            raise StoreClientError(
+                "官方包没有 _get_pyclient_capsule，拿不回已建 client，没有钉上"
+            )
+        capsule = capsule_fn()
+        if capsule is None:
+            raise StoreClientError("已建 client 的 capsule 是空的，没有钉上")
+        from kvcm.native.empty_pin import empty_soft_pin
+
+        try:
+            empty_soft_pin(capsule, keys, sizes, enable)
+        except ImportError as e:
+            raise StoreClientError(
+                "空写扩展还没加载，没有钉上"
+            ) from e
 
     def register_retained(self) -> None:
         """用官方 wheel 登记保留身份。绑定没导出这个符号时直接失败。"""

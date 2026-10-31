@@ -27,6 +27,7 @@ from kvcm.backends.mooncake.capability import mooncake_v0311, mooncake_main
 from kvcm.backends.mooncake.client import StoreClient, StoreClientError, entry_exists
 from kvcm.engines.vllm.keys import KeyComputer
 from kvcm.ledger import Ledger
+from kvcm.ops.capability import Support
 from kvcm.ops.base import (
     OpKind,
     QueryError,
@@ -1097,12 +1098,26 @@ def _pin_backend(monkeypatch, cap) -> MooncakeBackend:
     )
 
 
-def test_pin_soft_missing_wheel_method_is_not_success(
-    fake_store_module, monkeypatch
-) -> None:
-    b = _pin_backend(monkeypatch, mooncake_v0311())
-    with pytest.raises(StoreClientError, match="没有钉上"):
-        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+def test_pin_soft_calls_client(fake_store_module, monkeypatch) -> None:
+    assert mooncake_main().soft_pin_after.channel is Support.YES
+    seen = {}
+
+    class Client(FakeClient):
+        def soft_pin(self, keys, *, enable=True):
+            seen["keys"] = list(keys)
+            seen["enable"] = enable
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+    )
+    run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+    assert seen["enable"] is True
+    assert seen["keys"] == ["k0"]
 
 
 def test_pin_hard_always_unsupported(fake_store_module, monkeypatch) -> None:
@@ -1111,26 +1126,72 @@ def test_pin_hard_always_unsupported(fake_store_module, monkeypatch) -> None:
         run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD))
 
 
-def test_pin_soft_calls_wheel_client(fake_store_module, monkeypatch) -> None:
+def test_soft_pin_reuses_existing_capsule(monkeypatch) -> None:
     seen = {}
 
-    class Client(FakeClient):
-        def soft_pin(self, keys, *, enable=True):
-            seen["keys"] = list(keys)
-            seen["enable"] = enable
+    class Buf:
+        size = 64
 
-    client = Client()
-    kc = KeyComputer(model_name="qwen", tp_size=1)
-    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
-    b = MooncakeBackend(
-        client=client,
-        key_computer=kc,
-        locate=lambda _inst: ["seg-A"],
-        capability=mooncake_v0311(),
-    )
-    run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
-    assert seen["enable"] is True
-    assert seen["keys"]
+    class Mem:
+        buffer_descriptor = Buf()
+
+    class Desc:
+        is_memory_replica = True
+
+        def get_memory_descriptor(self):
+            return Mem()
+
+    class Store:
+        def batch_get_replica_desc(self, keys):
+            return {k: [Desc()] for k in keys}
+
+        def _get_pyclient_capsule(self):
+            return "existing-client"
+
+    def _pin(capsule, keys, sizes, enable):
+        seen["capsule"] = capsule
+        seen["keys"] = list(keys)
+        seen["sizes"] = list(sizes)
+        seen["enable"] = enable
+
+    monkeypatch.setattr("kvcm.native.empty_pin.empty_soft_pin", _pin)
+    client = StoreClient()
+    client._store = Store()
+    client.soft_pin(["h0"], enable=True)
+    assert seen == {
+        "capsule": "existing-client",
+        "keys": ["h0"],
+        "sizes": [64],
+        "enable": True,
+    }
+
+
+def test_soft_pin_missing_size_does_not_call_extension(monkeypatch) -> None:
+    def _pin(*_args):
+        raise AssertionError("没有尺寸时不应进入扩展")
+
+    monkeypatch.setattr("kvcm.native.empty_pin.empty_soft_pin", _pin)
+
+    class Store:
+        def batch_get_replica_desc(self, keys):
+            return {k: [] for k in keys}
+
+        def _get_pyclient_capsule(self):
+            return "existing-client"
+
+    client = StoreClient()
+    client._store = Store()
+    with pytest.raises(StoreClientError, match="没有钉上"):
+        client.soft_pin(["h0"], enable=True)
+
+
+def test_empty_pin_extension_rejects_non_capsule() -> None:
+    """虚拟环境里加载编好的扩展。不连 master，只检查入参被拒绝。"""
+    import kvcm.native._empty_pin as ext
+
+    assert callable(ext.empty_soft_pin)
+    with pytest.raises(TypeError):
+        ext.empty_soft_pin("not-a-capsule", ["k"], [8], True)
 
 
 # ---------------------------------------------------------------------------
@@ -1554,6 +1615,22 @@ def test_move_does_not_submit_when_admit_rejects(fake_store_module, monkeypatch)
     assert client.moves == []
 
 
+def test_move_without_admit_raises_before_submit(fake_store_module, monkeypatch) -> None:
+    """本类不定义 _admit_new_bytes。没注入时在 create_move_task 之前失败。"""
+    client = MoveClient()
+    b = _move_backend(client, monkeypatch)
+    assert "_admit_new_bytes" not in MooncakeBackend.__dict__
+    with pytest.raises(RuntimeError, match="_admit_new_bytes"):
+        run(
+            b.move(
+                Prefix(model_id="qwen", token_ids=(1,)),
+                InstanceId("tgt"),
+                InstanceId("src"),
+            )
+        )
+    assert client.moves == []
+
+
 def test_move_requires_source_instance(fake_store_module, monkeypatch) -> None:
     client = MoveClient()
     b = _move_backend(client, monkeypatch)
@@ -1804,9 +1881,8 @@ def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> 
         run(b.promote(Prefix(model_id="qwen", token_ids=(1,)), InstanceId("inst")))
 
 
-def test_retain_missing_wheel_method_is_not_success(
-    fake_store_module, monkeypatch
-) -> None:
+def test_retain_channel_not_present(fake_store_module, monkeypatch) -> None:
+    assert mooncake_main().has_retained_client.channel is Support.NO
     kc = KeyComputer(model_name="qwen", tp_size=1)
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
     b = MooncakeBackend(
@@ -1815,7 +1891,7 @@ def test_retain_missing_wheel_method_is_not_success(
         locate=lambda _inst: ["seg-A"],
         capability=mooncake_main(),
     )
-    with pytest.raises(StoreClientError, match="没有注册"):
+    with pytest.raises(UnsupportedCapabilityError, match="路径 A"):
         run(b.retain(Prefix(model_id="qwen", token_ids=(1,))))
 
     b0311 = MooncakeBackend(

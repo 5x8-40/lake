@@ -67,7 +67,7 @@ flowchart TB
   Seg -->|"已接通 HTTP<br/>GET /get_all_segments"| Master
   MB -->|"已接通<br/>控制面调用"| SC
   SC -->|"已接通 RPC<br/>batch_is_exist<br/>create_copy_task<br/>query_task<br/>batch_get_replica_desc"| Master
-  MB -.->|"待接通 HTTP<br/>/batch_query_keys 零副作用核验"| Master
+  MB -->|"已接通 HTTP<br/>GET /batch_query_keys 副本核验"| Master
   MB -->|"已接通写<br/>running 到 ready / failed / abandoned"| Led
   Led -->|"已接通读<br/>rebuild 取 running 行"| MB
   Led -->|"落盘"| DB
@@ -79,8 +79,8 @@ flowchart TB
 - **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`（前缀闸外），再占一个前缀闸名额跑 `PrefetchFlow.run_after_exists`，终态才还。`copy` 里每个 key 另过进程级提交信号量，`create_copy_task` 返回即还。回执由调用方 `GetTask` 主动查
 - 已接通的驱动是 `PrefetchFlow` 调 `KvOps`——运行时这个对象就是 `MooncakeBackend`，不是中间再转一跳。它写 `Ledger`，账本落在圈外的 sqlite 文件上；`rebuild` 再把 running 行读回来
 - **实例拓扑的两条来路**：demo 环境没有注册通道，`RankTopology` 用探测法推断「哪个 rank 对应哪个 seg」（见 L4 节）；生产环境由实例启动时把自己的拓扑（TP 配置、rank 与 seg 对应表）经 `InstanceWatcher` 注册进来（D1 §3、E13）——两条来路汇成一个 `locate` 函数注入 backend
-- `StoreClient` 走 master 的 RPC `:50088`。`SegTopology` 自己会打 HTTP `:9003` 的 `/get_all_segments`（查存储池当前挂了哪些 seg）。demo 里把这份名单交给 `RankTopology` 做比对，进程里还没有这条装配
-- 虚线都是类已建、调用未接通：控制面到实例监听、`EventPublisher` 到索引、`/batch_query_keys` 核验
+- `StoreClient` 走 master 的 RPC `:50088`。`SegTopology` 自己会打 HTTP `:9003` 的 `/get_all_segments`（查存储池当前挂了哪些 seg）。`RankTopology` 用这份名单做 demo 探测，这条探测装配还没接进进程。现在的进程入口是 `InstanceDirectory`：daemon 用 `--instance-segs` 做初始登记，locate 只返回该实例的段
+- 虚线都是类已建、调用未接通：控制面到实例监听、`EventPublisher` 到索引。副本核验已经走 `GET /batch_query_keys`
 
 ### 模块依赖（参考）
 
@@ -261,13 +261,13 @@ stateDiagram-v2
 | 能力 | mooncake 0.3.11（部署现状） | mooncake main（目标基线） | 出处 |
 |------|------------------------------|----------------------------|------|
 | has_lease（读续租） | RPC ✓ 通道 ✓（`is_exist`） | RPC ✓ 通道 ✓ | D2 F9 |
-| soft pin 事后加（用 upsert 空写的方式） | RPC ✓ 通道 = 官方 wheel 的 `ReplicateConfig.soft_pin_action`。绑定没有 UpsertStart/End，空写调不到就不记成已钉上 | 同左 | D2 F1/F12 |
+| soft pin 事后加（用 upsert 空写的方式） | RPC ✓ 通道 ✗（能力集仍按部署版本填写；空写扩展对着主线 `SoftPinAction`） | RPC ✓ 通道 ✓。`_get_pyclient_capsule` 拿回已建 client，扩展调 `MasterClient::UpsertStart` / `UpsertEnd`，不 `TransferWrite`，不第二次 `create` | D2 F1/F12 |
 | hard pin 事后加 | ✗（创建时固化、无 unpin） | ✗ | D2 F1 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源） | ✗ | D2 F7 |
 | has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活后必须已有盘副本，否则失败；提回 = GetReplicaList 累计命中，默认 2 次，不用零副作用查询） | 同左 | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
-| has_retained_client（保留身份注册） | ✗ | RPC 在 C++，官方 wheel 的 store_py 未导出。调用失败，不假装已保留 | D2 F13② |
+| has_retained_client（保留身份注册） | ✗ | RPC ✓ 通道 ✗。0.3.13.post1 `store.so` 的 `nm -D` 没有 `Retained` / `kRetained` / `AddReplicaForRetained` / `BufferRegistration`。不标成已有 | D2 F13② |
 | has_dfs_replica（共享 3FS 副本） | ✗ | RPC ✓ 通道 △（写入路径待 E6 核对） | D2 F13② |
 | has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**。副本核验走 `GET /batch_query_keys`，用传输端点比段还在不在。提回不走这条 | D2 F11b |
 | has_tenant_quota（租户配额读） | ✗（channel NO；不是段剩余空间） | HTTP ✓（GET `/api/v1/tenant_quotas`）。租户配额记账，不能当段剩余空间用 | D2 F13 |
@@ -302,11 +302,11 @@ stateDiagram-v2
 
 | 子件 | 职责 | 包路径 |
 |------|------|--------|
-| StoreClient | store 绑定生命周期（lazy import；connect/close，setup 失败先 close）+ **双通道**：控制类走绑定（create_copy_task / create_move_task / batch_remove / query_task / is_exist / batch_get_replica_desc）。副本核验走 `admin_main` 的 `GET /batch_query_keys`。提回仍用绑定的 GetReplicaList 累计命中。软钉和保留身份走官方 wheel（`mooncake.store`），不自己编译扩展。空写 Start/End 和保留身份若绑定未导出，调用失败，不记成已做成 | `client.py` + `http_admin.py` + `admin_main.py` |
+| StoreClient | store 绑定生命周期（lazy import；connect/close，setup 失败先 close）+ **双通道**：控制类走绑定（create_copy_task / create_move_task / batch_remove / query_task / is_exist / batch_get_replica_desc）。副本核验走 `admin_main` 的 `GET /batch_query_keys`。提回仍用绑定的 GetReplicaList 累计命中。软钉空写走 `_get_pyclient_capsule` 拿回已建 client，扩展调 `MasterClient::UpsertStart` / `UpsertEnd`。保留登记的符号这个 wheel 没导出 | `client.py` + `http_admin.py` + `admin_main.py` + `native/` |
 | SegTopology | 查 master 的 seg 名单（见上）；seg、client_id、lease 语义归这里 | `topology.py` |
 | capability 填充 | 按连接上的版本填充（**构造必填**——不许默认冒充 main；目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | `capability.py` |
 
-- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger?)`——`locate`（实例 → rank 有序 seg 列表）以可调用注入：demo 环境 = RankTopology 探测，生产 = L1 InstanceWatcher 注册，backend 不关心来源。本类不 import `SegTopology` / `RankTopology` / `AdminClient`，这三件不是它的字段
+- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger?)`——`locate`（实例 → rank 有序 seg 列表）以可调用注入。当前 daemon 用 `InstanceDirectory`（`--instance-segs`）。`RankTopology` 仍是 demo 探测，不是现在的进程入口。生产环境的上下线仍是 L1 InstanceWatcher。backend 不关心来源，本类不 import `SegTopology` / `RankTopology` / `AdminClient`，这三件不是它的字段
 - **copy 实现**（发起式）：前缀 → KeyComputer 算 key → locate 得 seg → `KeyComputer.build_plan` 做 rank 映射（异构 TP 反向展开）→ 逐 key 提交；`query_task` 聚合判定 READY。**rank 映射归引擎侧**——存储适配零 key 格式依赖（换引擎本类不动）
 - **exists 与 copy 目前各自独立算 key**：两个操作在接口上相互独立，同一前缀在一次预热里算两遍。短序列时成本可忽略，但长序列下不是——链式块 hash 逐块串行（token 数 ÷ block_size 次，不能并行），外加 块数 × rank 数 个 key 字符串。不设缓存（长驻进程的缓存增长管理问题更大）；正解见下「接口演进：KeySet」
 - **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——放通用层会把后端概念带进通用接口
@@ -340,6 +340,17 @@ stateDiagram-v2
     - 做法：自封装 .so 用 pybind11 写，函数参数声明为 `MooncakeStorePyWrapper&`；Python 侧把 store_py 建好的 store 对象传进来，pybind11 跨模块按类型名在全局类型表里找到已注册的类型，还原出 C++ 对象 → 经 `store_` / `get_real_client()` 拿到同一个 `RealClient`，调缺口方法
     - 效果：全进程一个 client 实例、一个 UUID、一套心跳；已有绑定与自封装 .so 缺口方法落在同一 client 上
     - 前提：自封装 .so 编译用的 pybind11 与 wheel 内 store_py 的 internals 版本一致（不一致则跨模块 cast 查不到类型）；RTTI 开启（wheel 默认开）
+    - **空写怎么拿到这一个 client**：官方包 `MooncakeDistributedStore._get_pyclient_capsule` 把 `setup` 时放进 `store_` 的 `PyClient` 交出来。扩展收这个胶囊，走到 `Client::master_client_`，只调 `UpsertStart` / `UpsertEnd`。不 `TransferWrite`，不 `RealClient::create()`。头文件用源码树 `3rdparty/mooncake`，不改那些文件。wheel 自己不带头文件。
+      - **0.3.13.post1 的 `store.so`（stripped）**：`MasterClient::UpsertStart` / `UpsertEnd` 有 `T` 导出。`get_real_client` 是 C++ 内联成员，不在动态符号表，也不必在那里。保留登记符号没有。
+      - **`nm -D` 里没有的符号**（动态符号表 0 条）：`get_real_client`、`MooncakeStorePyWrapper`。保留登记也没有：`Retained`、`kRetained`、`AddReplicaForRetained`、`BufferRegistration`、`register_retained` 均为 0。`strings` 能看到被截断的 mangled 名 `ZN8mooncake22MooncakeStorePyWrapper26upsert_tensor_with_tp_impl`，`nm -D` 没有对应符号，不能拿来链接。
+      - **`nm -D` 里有、且是 `T` 的符号**（只记本文件实际导出的，不拿来冒充路径 A 已接通）：
+        - `mooncake::MasterClient::UpsertStart(string const&, vector<unsigned long> const&, ReplicateConfig const&)`
+        - `mooncake::MasterClient::UpsertEnd(ObjectMeta const&, ReplicaType)`
+        - `mooncake::MasterClient::BatchUpsertStart(...)`、`BatchUpsertEnd(...)`、`BatchUpsertRevoke(...)`
+        - `mooncake::Client::Upsert(...)`、`Client::BatchUpsert` 两个重载、`StartBatchUpsert`、`FinalizeBatchUpsert`（参数里带 `Slice` / `PutOperation`，是带数据的写，不是空写）
+        - `mooncake::RealClient::upsert_from` / `upsert_batch` / `upsert_parts` / `upsert_internal` / `batch_upsert_from` 以及对应的 `*_internal`、`*_dummy_helper`（带指针或 span）
+      - 这些 `T` 符号不能代替 `get_real_client()`：路径 A 要的是拿 `store_py` 已经建好的那一个 client。单独调 `MasterClient::UpsertStart` 会另起身份。没有头文件，这些符号也链不上。
+      - `readelf -d` 的 `NEEDED` 含 `libibverbs.so.1`、`libmlx5.so.1`、`libnuma.so.1`、`libcudart.so.12`（`libcuda.so.1` 在 `/usr/lib/wsl/lib`）。即便补了头文件，链接也要这些系统库；本环境不跑 `sudo apt`，所以同样不能开编译。
   - **路径 B（退路）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）+ 缺口方法重新绑定一遍，Python 只 import 自封装 .so；天然单 client、不依赖跨模块 cast，代价是复制绑定面
 - 为什么不能 Python 直调（ctypes）：
   - ctypes 能调 C 函数，但造不了 C++ 对象
@@ -347,7 +358,7 @@ stateDiagram-v2
   - 所以中间必须有一层 C++：它用头文件调类方法（布局由编译器保证），对 Python 只暴露 C 类型
   - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）
 - 两个断点（E6）：
-  1. 符号可见性：x86 0.3.13 wheel 实测 `Client` 类方法本体全部导出（`nm -D`：`BatchUpsert` / `CreateCopyTask` / `CreateMoveTask` 及 `RealClient::upsert_*_helper` 均在，连 `MooncakeStorePyWrapper` 自身符号也导出）；npu 0.3.11 wheel 待测试机复核（同一构建系统，预期一致；符号不导出则此路不通，退回替代实现）
+  1. 符号可见性：0.3.13.post1 `store.so` 的 `nm -D` 里，`Client::BatchUpsert` / `MasterClient::UpsertStart` / `MasterClient::UpsertEnd` 是 `T`。`get_real_client` 与 `MooncakeStorePyWrapper` **不在**动态符号表。路径 A 因此停住（见上节实测）。npu 0.3.11 wheel 仍待测试机复核
   2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机；路径 A 的 pybind11 对齐：mooncake 锁定 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a），自封装 .so 编译用同版本即可对齐 internals
 - E6 另核：`/query_key` 的续租副作用在核验场景能否接受；retained 注册的具体符号名按 main 源码确认（0.3.13 x86 wheel 未见 retained 符号）。另：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），上游原生支持 NPU（v0.3.11 tag 已有 `ascend_transport` 目录）
 

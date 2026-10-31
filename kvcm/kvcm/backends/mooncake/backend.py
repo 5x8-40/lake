@@ -655,9 +655,12 @@ class MooncakeBackend(KvOps):
         target)`` 的 source 是段名且必填，所以源实例不能省——段从目录里
         按 rank 映射出来，不是调用方传入的。
 
-        提交前 ``await self._admit_new_bytes(plan)``。plan 与 copy 同形，
-        是 ``(key, 目标 seg)`` 列表：目标段要新占一份。这个方法由外部赋到
-        实例上，本类不实现。删除不占新内存，不走这里。
+        提交前要先做容量判断。plan 与 copy 同形，是 ``(key, 目标 seg)``
+        列表：目标段要新占一份。``_admit_new_bytes`` 在
+        ``feat/kvcm-segment-admission``（PR 72），本类不定义它。实例上
+        没有这份可调用对象时，``move`` 在任何 ``create_move_task`` 之前
+        抛出 ``RuntimeError``，错误信息点名 ``_admit_new_bytes``。测试可以
+        往实例上赋一个假实现来走提交路径。删除不占新内存，不走这里。
 
         没有实例销毁事件，本方法不被 daemon / TaskEngine 调用。
         移动成功后，源实例上这份 KV 没有了，要发 BlockRemoved；目标实例要发
@@ -677,7 +680,15 @@ class MooncakeBackend(KvOps):
         if [k for k, _ in source_plan] != [k for k, _ in plan]:
             raise ValueError("move source/target plans are not key-aligned")
         # 容量判断在任何 create_move_task 之前。拒绝则一个任务都不发。
-        await self._admit_new_bytes(plan)
+        # 方法本身不在本类：它在 feat/kvcm-segment-admission（PR 72）。
+        admit = getattr(self, "_admit_new_bytes", None)
+        if not callable(admit):
+            raise RuntimeError(
+                "move 在 create_move_task 之前需要 _admit_new_bytes；"
+                "该方法在 feat/kvcm-segment-admission（PR 72），"
+                "本分支没有这个方法"
+            )
+        await admit(plan)
         moves = [
             (key, src_seg, tgt_seg)
             for (key, tgt_seg), (_, src_seg) in zip(plan, source_plan)
@@ -763,7 +774,7 @@ class MooncakeBackend(KvOps):
             raise NotImplementedError("hard pin：通道具备但尚未接线")
         if self._cap.soft_pin_after.channel is not Support.YES:
             raise UnsupportedCapabilityError(
-                "soft pin 事后加：官方 wheel 的通道不具备"
+                "soft pin 事后加：路径 A 还没接上，通道不具备"
             )
         keys = self._keys.keys_for_tokens(prefix.token_ids)
         if not keys:
@@ -836,7 +847,7 @@ class MooncakeBackend(KvOps):
         """保留身份走官方 wheel。绑定没导出就失败，不返回已保留的空句柄。"""
         if self._cap.has_retained_client.channel is not Support.YES:
             raise UnsupportedCapabilityError(
-                "retained client：官方 wheel 未导出这个符号"
+                "retained client：路径 A 还没接上，通道不具备"
             )
         keys = self._keys.keys_for_tokens(prefix.token_ids)
         if not keys:
