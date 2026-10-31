@@ -227,6 +227,30 @@ def test_start_stop_lifecycle() -> None:
     run(scenario())
 
 
+def test_stop_during_idle_sleep_returns_quickly() -> None:
+    """空闲时 stop 取消 sleep，不必等完这一轮 interval。"""
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            loop = KeepaliveLoop(FakeOps(), led, interval_s=3.0, window_s=600)
+            loop.start()
+            await asyncio.sleep(0.05)
+            started = time.monotonic()
+            await loop.stop()
+            elapsed = time.monotonic() - started
+            assert elapsed < 0.5, f"stop 等了 {elapsed:.2f}s，接近 interval"
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+
+
 def test_sweep_exception_does_not_kill_loop() -> None:
     """单轮失败不该杀掉循环（下一轮继续）。"""
 

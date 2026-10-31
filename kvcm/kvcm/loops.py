@@ -165,16 +165,24 @@ class KeepaliveLoop:
         self._task = asyncio.create_task(self._run(), name="kvcm-keepalive")
 
     async def stop(self, *, timeout_s: float = 10.0) -> None:
-        """停循环（优雅退出）。不撤销注册——保活行留在 Ledger，重启后续
-        租或到期注销；lease TTL 到期自然失效，不残留。"""
+        """停循环（优雅退出）。先取消正在跑的 task，再等它结束。
+
+        空闲时 task 停在 ``sleep(interval)`` 上，不取消就要等这一轮睡完。
+        正在 sweep 时取消走 ``CancelledError``。不撤销注册——保活行留在
+        Ledger，重启后续租或到期注销。
+        """
         self._stop = True
-        if self._task is not None:
-            try:
-                await asyncio.wait([self._task], timeout=timeout_s)
-            finally:
-                if not self._task.done():
-                    self._task.cancel()
-                self._task = None
+        task = self._task
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await asyncio.wait([task], timeout=timeout_s)
+        finally:
+            if not task.done():
+                task.cancel()
+            self._task = None
 
     def close(self) -> None:
         """不关 Ledger 的 executor。那是 Ledger 自己的池。"""

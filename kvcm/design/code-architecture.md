@@ -107,7 +107,7 @@ flowchart LR
   Seg["topology.py<br/>SegTopology"] --> Http["http_admin"]
 ```
 
-- `engines.vllm.keys` 从 `kvcm.ops.types` 引 `IntentInputError`，不 import `ops.base`。`engines.vllm.topology`、`client`、`http_admin` 不 import 任何 kvcm 模块
+- `engines.vllm.keys` 从 `kvcm.ops.types` 引 `IntentInputError`，不直接 import `ops.base`。`import kvcm.ops` 仍会经包的 `__init__` 加载 `ops.base`。`engines.vllm.topology`、`client`、`http_admin` 不 import 任何 kvcm 模块
 
 **谁调谁**（运行时方法调用）：
 

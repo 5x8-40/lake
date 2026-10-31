@@ -660,16 +660,25 @@ def test_startup_failure_after_keepalive_start_stops_loop(monkeypatch, tmp_path)
         async def shutdown(self, *, timeout_s: float = 5.0) -> None:
             events.append("engine.shutdown")
 
+    real_wait = daemon._wait_executor
+
+    def wait(executor, timeout):
+        events.append("executor.close")
+        return real_wait(executor, timeout)
+
     monkeypatch.setattr(daemon, "TaskEngine", BoomEngine)
     monkeypatch.setattr(daemon, "KeepaliveLoop", lambda *a, **kw: RecordingKeepalive())
     monkeypatch.setattr(daemon, "StoreClient", lambda: FakeClient(events))
     monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: FakeBackend())
+    monkeypatch.setattr(daemon, "_wait_executor", wait)
 
     t, _stop = _run_daemon_in_thread(_args(tmp_path))
     t.join(timeout=5)
     assert not t.is_alive()
     assert events.index("keepalive.start") < events.index("keepalive.stop")
     assert events.index("keepalive.stop") < events.index("keepalive.close")
+    assert events.index("keepalive.stop") < events.index("executor.close")
+    assert events.index("keepalive.stop") < events.index("client.close")
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")

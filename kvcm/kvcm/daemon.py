@@ -298,12 +298,13 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
         #
         #    不把这个等待放进 backend.close()：池是注入的，backend 不拥有它
         #    （`_owns_executor` 为假时会直接 return，等待会被静默跳过）。
+        # 先停 sweep，再关 RPC 池。反过来的话循环下一轮 exists 会
+        # cannot schedule new futures after shutdown。正常路径也是先 stop
+        # 再排空。drained 为假时 stop 已经结束，不会再拖住 os._exit。
+        if keepalive is not None and keepalive_started:
+            await keepalive.stop(timeout_s=args.shutdown_timeout_s)
         drained = _wait_executor(executor, args.shutdown_timeout_s)
         if keepalive is not None:
-            # close 不关 Ledger executor，也不停 sweep。已经 start 过的循环
-            # 要先 stop，异常路径才不会把一轮 sweep 留在事件循环上。
-            if keepalive_started:
-                await keepalive.stop(timeout_s=args.shutdown_timeout_s)
             keepalive.close()
         if not drained:
             # 有线程卡在 mooncake 绑定或 Ledger 的 submit().result() 里。
