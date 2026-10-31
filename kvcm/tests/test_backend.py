@@ -217,11 +217,14 @@ def test_empty_prefix_raises(fake_store_module, monkeypatch) -> None:
 
 
 def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) -> None:
-    """提交中途被取消：已发出的任务号必须落账成 running。
+    """提交中途被取消：已发出的任务号必须落账成 running，并把句柄交回来。
 
     `CancelledError` 不是 `Exception` 的子类。只捕 `Exception` 的话，退出
     时取消落在提交循环里，已发出的号就丢了——`rebuild` 只认
     `status='running'` 的行，这些在途传输重启后再也没人跟踪。
+
+    已经有任务号时不把 CancelledError 再抛出去，否则 await 拿不到句柄，
+    调用方无法 abandon。本测试不 abandon，所以行仍是 running。
 
     必须是多 key 的 plan，且第 2 个提交卡住：取消点才落得到「第 1 个已
     发出、第 2 个还没回」的窗口上，否则测试会假通过。
@@ -262,8 +265,11 @@ def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) ->
                 await asyncio.sleep(0.01)
             assert client.created, "第 1 个任务都没发出，前提不成立"
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task  # 取消必须照常传播，不能被包成 SubmitError
+            # 已经有任务号时 copy 把句柄交回来，不抛 CancelledError，
+            # 否则调用方拿不到句柄、无法 abandon。这里不 abandon，
+            # 所以账本仍是 running。
+            handle = await task
+            assert handle.task_ids
 
         run(scenario())
         # 前提校验：取消时确实只发出了 1 个，测的才是「提交中途」
@@ -273,6 +279,65 @@ def test_cancelled_submit_records_partial_ids(fake_store_module, monkeypatch) ->
         from kvcm.backends.mooncake.backend import decode_task_id
 
         assert decode_task_id(running[0].task_id) == (1, 101)
+    finally:
+        gate.set()
+        led.close()
+        os.unlink(path)
+
+
+def test_prefetch_timeout_mid_submit_abandons_partial(
+    fake_store_module, monkeypatch
+) -> None:
+    """第一个 create_copy_task 已返回、第二个卡住：预热超时后账本是 abandoned。
+
+    句柄在超时分支交回来之后必须 abandon。否则意图已经失败，账本却留
+    running，要等重启 rebuild 才捞得到。
+    """
+    from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    gate = threading.Event()
+    try:
+        class SlowSecondClient(FakeClient):
+            def create_copy_task(self, key, targets):
+                if self.created:
+                    gate.wait(30.0)
+                return super().create_copy_task(key, targets)
+
+        client = SlowSecondClient()
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(
+            kc, "keys_for_tokens", lambda ids: kc.expand(["h0", "h1"])
+        )
+        b = MooncakeBackend(
+            client=client,
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+            submit_concurrency=1,
+        )
+
+        with pytest.raises(PrefetchError, match="cancelled before handle"):
+            run(
+                PrefetchFlow(b).run_after_exists(
+                    Prefix(model_id="qwen", token_ids=(1,)),
+                    InstanceId("inst-B"),
+                    poll_s=0.01,
+                    timeout_s=0.8,
+                )
+            )
+        assert client.created, "第一个任务没发出，前提不成立"
+        assert led.list_running_tasks() == []
+        from kvcm.backends.mooncake.backend import decode_task_id
+
+        row = led.get_task(encode_task_id((1, 101)))
+        assert row is not None and row.status == "abandoned", row
+        assert decode_task_id(row.task_id) == (1, 101)
     finally:
         gate.set()
         led.close()
@@ -336,8 +401,9 @@ def test_cancel_during_drain_after_submit_failure_still_records(
             await asyncio.sleep(0.15)  # 让它进到排空（卡在第 3 个上）
             assert not task.done(), "复制已经结束了，取消点不在排空阶段"
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
-                await task
+            # 排空时被取消、且已经有号：句柄交回来，账本是 running。
+            handle = await task
+            assert handle.task_ids
             # 取消可以不等在飞的提交，但已拿到的号必须落账。
             assert [r.task_id for r in led.list_running_tasks()] == ["1:101"], (
                 "排空阶段被取消，已拿到的号没落账"

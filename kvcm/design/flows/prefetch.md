@@ -7,9 +7,9 @@
 
 1. **exists 前置检查**：前缀完整在池才继续——warm 未覆盖该前缀，或 key
    口径与引擎漂移，直接失败（复制了也没意义）
-2. **copy 发起**：前缀 → key 列表 → rank 映射计划 → 先看第一个目标段还
-   放不放得下 → 放得下才逐 key 提交复制任务。等剩余的循环在 TaskEngine、
-   前缀闸外面；进闸后、`create_copy_task` 之前再查一次
+2. **copy 发起**：前缀 → key 列表 → rank 映射计划 → 先取大小，再只查
+   计划第一条的目标段还放不放得下 → 放得下才逐 key 提交复制任务。等剩余
+   的循环在 TaskEngine、前缀闸外面；进闸后再查一次，不够就回到闸外
 3. **query_task 轮询到 READY**：任务全部完成 + 副本核验通过
 4. （待接通）keepalive 注册、READY 事件补发（`BlockStored`）
 
@@ -48,20 +48,29 @@ sequenceDiagram
         Note over BE: locate(target) 得到 segs
         BE->>KC: build_plan(keys, segs)
         KC-->>BE: plan（每条 key 配好目标 seg）
-        BE->>M: GET /query_segment（只查计划里的第一个目标段）
+        BE->>SC: batch_get_replica_desc（取大小，一轮只一次）
+        SC->>M: RPC
+        M-->>BE: 每个 key 的副本大小
+        BE->>M: GET /query_segment（只查计划第一条的目标段）
         alt 这一段放不下，或管理端口暂时连不上
             BE-->>Flow: AdmissionWait
             Note over Flow: TaskEngine 在前缀闸外等。还没有任务号，不记复制失败
         else 段不存在
             BE-->>Flow: AdmissionStop
-            Note over Flow: 立即停止，不空等
+            Note over Flow: TaskEngine 包成 PrefetchError，立即停止
         else 放得下
-            Note over BE: 同一轮等待里大小只取一次 batch_get_replica_desc，之后只重查剩余
-            loop 每个 key 和 seg
-            BE->>SC: create_copy_task(key, seg)
-            SC->>M: RPC
-            M-->>SC: task_id（两个整数）
-            SC-->>BE: task_id
+            Note over Flow: acquire 前缀闸
+            BE->>M: 进闸后再查一次 /query_segment
+            alt 仍然不够
+                Note over Flow: release，回到闸外继续等
+            else 复查通过
+                loop 每个 key 和 seg
+                    BE->>SC: create_copy_task(key, seg)
+                    SC->>M: RPC
+                    M-->>SC: task_id（两个整数）
+                    SC-->>BE: task_id
+                end
+            end
         end
         alt 提交中途失败
             BE-->>Flow: SubmitError, 已发 id 只在异常消息里
@@ -98,7 +107,6 @@ sequenceDiagram
                 end
             end
         end
-        end
     end
 ```
 
@@ -126,11 +134,17 @@ sequenceDiagram
 
 失败处理总表（每种情况怎么处理）见
 [../code-architecture.md](../code-architecture.md) L2 节。本流程特有的
-一点：「前缀不在池」在 exists 阶段直接失败，不发起复制。段不存在
-同样立即停止。段上暂时放不下则在闸外等到预热超时；还没有任务号就
-停止，不记成复制失败。另一条前缀已经提交、但目标段还没划出
-缓冲区时，剩余里看不见它，两条都可能放行。彻底避开代价高，
-接受这个窗口。详见
+一点：「前缀不在池」在 exists 阶段直接失败，不发起复制。预检只查
+计划第一条的目标段，只加落在这一段上的新字节；其它段的剩余和字节
+都不参与。这一段不够就一个 key 都不发。代码认的是计划第一条，不是
+写死的 rank 0。没查的段仍可能在 `CopyStart` 时 `NO_AVAILABLE_HANDLE`。
+段不存在同样立即停止（`AdmissionStop` 在 TaskEngine 里包成
+PrefetchError）。段上暂时放不下（`AdmissionWait`）则在闸外等到预热
+超时；还没有任务号就停止，不记成复制失败。`AdmissionWait` 只在
+TaskEngine 的等待循环里出现。`PrefetchFlow.run` 没有等待循环，直接
+调用会把 `AdmissionWait` 抛出进程外。生产路径走 TaskEngine。另一条
+前缀已经提交、但目标段还没划出缓冲区时，剩余里看不见它，两条都可能
+放行。彻底避开代价高，接受这个窗口。详见
 [../code-architecture.md](../code-architecture.md) 传输闸一节。
 
 ## 与其他部件的衔接

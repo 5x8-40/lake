@@ -16,8 +16,8 @@ KeepaliveLoop，查询由各自调用方直接 await）。
 线程池下等待也把线程占死；协程下等待只是挂起——100 个任务挂着也只占
 RPC executor 那几个线程。
 
-**传输闸的语义**：一个名额 = 一个已经决定提交、还没到终态的前缀
-（`run_after_exists`：copy 提交 + 轮询 + 副本核验），终态才 release。
+**传输闸的语义**：名额在复查之前就 acquire；复查失败立刻 release。
+复查通过之后占到该前缀终态（提交 + 轮询 + 副本核验）。
 默认 4。闸满时在传的不是 4 个任务：每个前缀的全部 key 都会交给
 master（32K token、tp=2 时大约 512 个 key，4 个满额前缀大约 4×512）。
 闸外是 exists，以及目标段放不下时的等待；keepalive 注册在 release
@@ -463,10 +463,10 @@ class TaskEngine:
     ) -> None:
         """跑一次预热。
 
-        传输闸的范围：**exists 和等目标段空间在闸外**。名额从「复查通过、
-        开始提交」占到该前缀终态——这段时间 master 上有这个前缀的全部
+        传输闸的范围：**exists 和等目标段空间在闸外**。名额在复查之前就
+        `acquire`；复查失败立刻 `release`，回到闸外再等。复查通过之后，
+        这个名额占到该前缀终态——这段时间 master 上有这个前缀的全部
         key，轮询也占着名额。放不下就在闸外睡 0.5 秒再查，不占名额。
-        进闸后、真正提交前再查一次；仍然不够立刻出闸，回到闸外继续等。
         `submit_concurrency` 在建链 RPC 返回时就还，替不了这一段。
 
         timeout_s 从这里开始，覆盖等空间、等前缀闸、提交和轮询。还没有
@@ -507,10 +507,19 @@ class TaskEngine:
 
         try:
             while True:
-                if deadline - time.monotonic() <= 0:
+                left = deadline - time.monotonic()
+                if left <= 0:
                     raise _stopped()
                 try:
-                    await self._ops.admit_planned_copy(prefix, target)
+                    await self._ops.admit_planned_copy(
+                        prefix, target, timeout_s=left
+                    )
+                except QueryError:
+                    # 闸外这一次查询吃剩余预算。到点之后的 QueryError
+                    # 就是预算用完，按「还没提交就停」处理，不改准入比较。
+                    if deadline - time.monotonic() <= 0:
+                        raise _stopped() from None
+                    raise
                 except AdmissionWait:
                     # 闸外等。0.5 秒，但不超过剩余预算。
                     # 剩余按查完之后重算：慢查询不能把预算又加回去。

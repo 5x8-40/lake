@@ -51,7 +51,10 @@ logger = logging.getLogger(__name__)
 # None = 还没取大小；缺省 _UNSET = 不在 TaskEngine 的等待里（直接 copy）。
 class _AdmissionSlot:
     def __init__(self) -> None:
-        self.need: dict[str, int] | None = None
+        # key = (计划第一条的段名, 计划里的 key 集合)。对不上就重查大小。
+        self.key: tuple[str, frozenset[str]] | None = None
+        # None 且 key 已设 = 算过了，没有新占用。不要用空字典表示。
+        self.need: tuple[str, int] | None = None
 
 
 _UNSET = object()
@@ -161,8 +164,9 @@ class MooncakeBackend(KvOps):
         # 协程侧 RPC 超时（0.3.11 的绑定没有超时参数；main 有
         # MC_RPC_TIMEOUT_MS，届时可与此对齐）。<=0 表示不设超时。
         self._rpc_timeout_s = rpc_timeout_s
-        # 管理端口：同一组目标段剩余相同，每轮只打一次 /query_segment。
-        # 没有它就不知道剩余，准入直接拒绝，不许盲提交。
+        # 管理端口：每轮只打一次 /query_segment，是因为只查计划第一条，
+        # 不是因为假定各段剩余相同。没有它就不知道剩余，准入直接拒绝，
+        # 不许盲提交。
         self._admin = admin
         self._executor = executor or ThreadPoolExecutor(
             max_workers=max(4, min(8, (os.cpu_count() or 4))), thread_name_prefix="kvcm-rpc"
@@ -207,7 +211,12 @@ class MooncakeBackend(KvOps):
     # 阻塞调用的协程包装
     # ------------------------------------------------------------------
 
-    async def _rpc(self, fn: Callable[..., Any], *args: Any) -> Any:
+    async def _rpc(
+        self,
+        fn: Callable[..., Any],
+        *args: Any,
+        timeout_s: float | None = None,
+    ) -> Any:
         """在 RPC executor 里执行同步调用（mooncake 绑定），协程挂起等
         结果——等待期间不占事件循环。
 
@@ -229,13 +238,22 @@ class MooncakeBackend(KvOps):
                 raise
 
         fut = loop.run_in_executor(self._executor, _call)
-        if self._rpc_timeout_s <= 0:
+        limit = self._rpc_timeout_s
+        if timeout_s is not None:
+            limit = (
+                timeout_s
+                if self._rpc_timeout_s <= 0
+                else min(self._rpc_timeout_s, timeout_s)
+            )
+        if timeout_s is None and self._rpc_timeout_s <= 0:
             return await fut
+        if limit <= 0:
+            raise QueryError(f"RPC timeout after {limit}s: {_name_of(fn)}")
         try:
-            return await asyncio.wait_for(fut, timeout=self._rpc_timeout_s)
+            return await asyncio.wait_for(fut, timeout=limit)
         except (asyncio.TimeoutError, TimeoutError) as e:
             raise QueryError(
-                f"RPC timeout after {self._rpc_timeout_s}s: {_name_of(fn)}"
+                f"RPC timeout after {limit}s: {_name_of(fn)}"
             ) from e
 
     async def _in_ledger(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -323,20 +341,37 @@ class MooncakeBackend(KvOps):
             return []
         return self._keys.build_plan(keys, list(self._locate(target)))
 
-    async def admit_planned_copy(self, prefix: Prefix, target: InstanceId) -> None:
+    async def admit_planned_copy(
+        self,
+        prefix: Prefix,
+        target: InstanceId,
+        *,
+        timeout_s: float | None = None,
+    ) -> None:
         """闸外判断。放不下抛 AdmissionWait，段不存在抛 AdmissionStop。
 
         不在这里等。等待循环在 TaskEngine，而且在前缀闸外面。
+        timeout_s 是剩余预算：这一次查询（取大小和查剩余）必须在预算内
+        返回。不改比较本身。
         """
-        await self._admit_new_bytes(self._copy_plan(prefix, target))
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        await self._admit_new_bytes(
+            self._copy_plan(prefix, target), deadline=deadline
+        )
 
-    async def _admit_new_bytes(self, plan: list[tuple[str, str]]) -> None:
+    async def _admit_new_bytes(
+        self,
+        plan: list[tuple[str, str]],
+        *,
+        deadline: float | None = None,
+    ) -> None:
         """判断这一批现在放不放得下。不 sleep，函数里没有提交。
 
         plan 是 (key, 目标段名)。只看计划里的第一个目标段：新占用只加
         落在这个段上、且副本端点里还没有它的 key。字节需求在一轮等待开始时
         用一次 batch_get_replica_desc 取齐，之后每轮只对这个段打一次
-        GET /query_segment，不再重查大小。
+        GET /query_segment，不再重查大小。缓存键是计划第一条的段名加上
+        计划里的 key 集合；对不上就重查大小。
 
         放不下或管理端口暂时连不上：AdmissionWait（闸外再等）。
         段名在 master 上不存在：AdmissionStop（这次预热停止）。
@@ -347,19 +382,34 @@ class MooncakeBackend(KvOps):
         """
         if not plan:
             return
+        key = (plan[0][1], frozenset(k for k, _seg in plan))
         slot = _admission_need.get()
-        if isinstance(slot, _AdmissionSlot):
-            if slot.need is None:
-                slot.need = await self._new_bytes_by_segment(plan)
+        if isinstance(slot, _AdmissionSlot) and slot.key == key:
             need = slot.need
         else:
-            need = await self._new_bytes_by_segment(plan)
-        if not need:
+            need = await self._new_bytes_by_segment(plan, deadline=deadline)
+            if isinstance(slot, _AdmissionSlot):
+                slot.key = key
+                slot.need = need
+        if need is None:
             return
-        probe, nbytes = next(iter(need.items()))
-        await self._check_segments(probe, nbytes)
+        probe, nbytes = need
+        await self._check_segments(probe, nbytes, deadline=deadline)
 
-    async def _check_segments(self, probe: str, nbytes: int) -> None:
+    async def _bounded_rpc(
+        self, fn: Callable[..., Any], *args: Any, deadline: float | None
+    ) -> Any:
+        """deadline 为 None 时用默认 RPC 超时。有截止时间则不超过剩余预算。"""
+        if deadline is None:
+            return await self._rpc(fn, *args)
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise QueryError(f"RPC timeout after 0s: {_name_of(fn)}")
+        return await self._rpc(fn, *args, timeout_s=left)
+
+    async def _check_segments(
+        self, probe: str, nbytes: int, *, deadline: float | None = None
+    ) -> None:
         """只对计划里的第一个目标段打一次 /query_segment。
 
         这一段的新占用大于这份剩余，整批不发。不查其他段。
@@ -367,7 +417,9 @@ class MooncakeBackend(KvOps):
         if self._admin is None:
             raise QueryError("没有 admin 客户端，无法知道目标段剩余，拒绝提交")
         try:
-            used, capacity = await self._rpc(self._admin.query_segment, probe)
+            used, capacity = await self._bounded_rpc(
+                self._admin.query_segment, probe, deadline=deadline
+            )
         except SegmentNotFound as e:
             raise AdmissionStop(f"段不存在: {probe}") from e
         except AdminError as e:
@@ -375,7 +427,9 @@ class MooncakeBackend(KvOps):
                 logger.warning("准入：查询段 %s 失败（%s），闸外稍后重试", probe, e)
                 raise AdmissionWait(f"管理端口暂时不可用: {probe}") from e
             raise QueryError(str(e)) from e
-        # 容量为 0 是段不存在（QuerySegments），不当成剩余 0 去等。
+        # 容量为 0 当段不存在。真 master 在容量为 0 时已经用
+        # 「Failed to query segment」变成 SegmentNotFound，到不了这里。
+        # 再判一次是给假 admin：测试直接返回 (0, 0)，不经 HTTP 解析。
         if capacity == 0:
             raise AdmissionStop(f"段不存在: {probe}")
         remaining = capacity - used
@@ -391,12 +445,20 @@ class MooncakeBackend(KvOps):
             )
 
     async def _new_bytes_by_segment(
-        self, plan: list[tuple[str, str]]
-    ) -> dict[str, int]:
-        """只算计划里第一个目标段上、还没有该段副本的 key。空字典 = 没有新占用。"""
+        self,
+        plan: list[tuple[str, str]],
+        *,
+        deadline: float | None = None,
+    ) -> tuple[str, int] | None:
+        """只算计划里第一个目标段上、还没有该段副本的 key。
+
+        返回 (段名, 字节数)。None = 没有新占用。
+        """
         keys = list(dict.fromkeys(key for key, _seg in plan))
         try:
-            layout = await self._rpc(self._client.batch_memory_replica_sizes, keys)
+            layout = await self._bounded_rpc(
+                self._client.batch_memory_replica_sizes, keys, deadline=deadline
+            )
         except StoreClientError as e:
             raise QueryError(str(e)) from e
         placed: dict[str, set[str]] = {}
@@ -451,8 +513,8 @@ class MooncakeBackend(KvOps):
                 sample_size,
             )
         if total <= 0:
-            return {}
-        return {probe: total}
+            return None
+        return (probe, total)
 
     async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机 seg 为前缀 KV 建副本（发起式；READY 经 query_task）。
@@ -508,7 +570,7 @@ class MooncakeBackend(KvOps):
             # 要保证的是**记账不被跳过**：先有 key 失败 → 进到这里等其余
             # 在飞调用 → 退出信号到达。若让 CancelledError 直接冒出，读槽和
             # 记账都不跑，已拿到的号也会丢。所以吞下它、把异常换成取消，
-            # 照常落账后再抛出去。
+            # 照常落账。已经有任务号就把句柄交回去；没有任务号才按取消结束。
             try:
                 await asyncio.gather(*tasks, return_exceptions=True)
             except asyncio.CancelledError:
@@ -533,6 +595,10 @@ class MooncakeBackend(KvOps):
                     raise
                 except BaseException:
                     pass  # 记账失败不再掩盖原始异常
+                # 已经有任务号：把句柄交回去，不再把 CancelledError 抛出
+                # 去，否则 await 拿不到返回值，调用方无法 abandon。
+                if isinstance(e, asyncio.CancelledError):
+                    return partial
             if isinstance(e, asyncio.CancelledError):
                 raise e
             raise SubmitError(

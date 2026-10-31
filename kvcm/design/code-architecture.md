@@ -170,6 +170,8 @@ flowchart LR
 | 任务全部完成、但副本核验缺（VerifyError） | 报错，带缺哪些副本的明细 |
 | 任务失败（FAILED） | 报错 |
 | 超过时限没完成 | 先放弃跟踪（abandon，见 L3 节），再报错 |
+| 目标段暂时放不下（AdmissionWait） | 只在 TaskEngine 的等待循环里出现，闸外再等。`PrefetchFlow.run` 没有等待循环，直接调用会把 AdmissionWait 抛出进程外。生产路径走 TaskEngine |
+| 段不存在（AdmissionStop） | TaskEngine 里包成 PrefetchError，这次预热停止 |
 
 流程的步骤、数据流与失败分支：**[flows/prefetch.md](flows/prefetch.md)**（每流程一篇，新增流程同目录另立）。
 
@@ -455,8 +457,9 @@ sequenceDiagram
     W->>Ex: exists（不过前缀闸）
     Ex->>M: batch_is_exist
     M-->>Ex: 在池
-    loop 闸外，直到第一个目标段放得下或超时
-        W->>M: GET /query_segment（只查 rank 0 那一段）
+    loop 闸外，直到计划第一条的目标段放得下或超时
+        Note over W: 大小用 batch_get_replica_desc，一轮只取一次
+        W->>M: GET /query_segment（只查计划第一条的目标段）
         alt 放不下，或管理端口暂时连不上
             Note over W: 睡 0.5 秒。不占前缀闸。大小不再重查
         else 段不存在，或预算到了还没有任务号
@@ -519,11 +522,11 @@ sequenceDiagram
 `asyncio.Queue` + 传输闸限并发 + 协程消费者，无优先级、不分轻重通道。
 
 - **队列与拿取**：intent 进 `asyncio.Queue`；K 个协程循环 `get`（K 可以很大，协程便宜——在队列里等、在传输闸上等，都是协程挂起，不占线程）
-- **传输闸 = `asyncio.Semaphore`（默认 4，参数化）**：一个名额 = 一个前缀正停在 `run_after_exists`（提交 + 轮询 + 副本核验），终态才 release。闸满时在传的不是 4 个任务：该前缀的全部 key 都会交给 master（32K token、tp=2 时大约 512 个 key，4 个满额前缀大约 4×512）。**不按 key 计，也不是带宽管控**（带宽归 E15）。它和进程级 `submit_concurrency` 不重复：那把信号量只包住 `create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受。没有前缀闸的话，排队前缀会以每次 4 个建链 RPC 的速度全部提交完——master 上叠着所有 plan，并且每个 handle 每轮 `query_task` 都要按 key 顺序各查一次（RPC 池只有 4~8 个线程）。前缀闸把「已经决定提交、还没终态的预热前缀」卡在 `max_concurrent`。**闸外**有两件：`exists` 探测（预热的前置检查，毫秒级 RPC，读即续租），以及等目标段放得下。都在 `_run_prefetch` 里、`async with self._gate` 之前。等空间只查计划里的第一个目标段，一次 `GET /query_segment`（0.3.11 在 `rpc_service.cpp`，主线同文在 `master_admin_service.cpp::HandleQuerySegment`；不使用 `/get_segments_detail`）。剩余 = 容量 − 已用，同一组 TP 段按这一份。新占用只加落在这个段上、且副本端点里还没有这个段的 key。缺大小时用本批已经读到的一个大小乘以缺的个数，日志标明估算；一个大小都没有就停止，不填假数字。这一段的新占用大于这份剩余，整批不发，闸外 0.5 秒后再查——每轮只重查这一次 `/query_segment`，不重查大小。放得下才去等前缀闸（等闸吃同一段预算，到点还没提交就停）。进闸后、`create_copy_task` 之前再查一次，不够就出闸继续等。超时从开始等待算；还没有任务号就停止这次预热，不记成复制失败。段不存在立即停止。管理端口暂时连不上则等到超时。自己这一批的 key 在放行前已经加进需求，不会漏。另一条前缀如果已经提交、但 master 还没在目标段划出缓冲区，`/query_segment` 的已用还没加上，这条剩余看不见它，两条都可能放行。彻底避开要在 master 上预留，或把复制串成一条，代价高，接受这个窗口：不加锁、不预留，判断只能少失败。这不是 E15 的网卡限速，网卡利用率限速仍不做。**闸内是 `run_after_exists` 整段**——复查通过之后的提交流、轮询、副本核验；keepalive 注册在 `release` 之后，也在闸外。轮询占着名额，但不额外发建链。promote 的触发 RPC 是毫秒级（不过闸），但其 READY 是核验式轮询（时长由池的提回进度决定，**不是毫秒即返**）；D2 §3 的另一条主动路径（读删写，数据经 kvcm）若启用，则属 kvcm 发起的传输，要占闸
+- **传输闸 = `asyncio.Semaphore`（默认 4，参数化）**：一个名额在复查之前就 `acquire`；复查失败就 `release`，复查通过则占到该前缀终态（提交 + 轮询 + 副本核验）。闸满时在传的不是 4 个任务：该前缀的全部 key 都会交给 master（32K token、tp=2 时大约 512 个 key，4 个满额前缀大约 4×512）。**不按 key 计，也不是带宽管控**（带宽归 E15）。它和进程级 `submit_concurrency` 不重复：那把信号量只包住 `create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受。没有前缀闸的话，排队前缀会以每次 4 个建链 RPC 的速度全部提交完——master 上叠着所有 plan，并且每个 handle 每轮 `query_task` 都要按 key 顺序各查一次（RPC 池只有 4~8 个线程）。前缀闸把「已经决定提交、还没终态的预热前缀」卡在 `max_concurrent`。**闸外**有两件：`exists` 探测（预热的前置检查，毫秒级 RPC，读即续租），以及等目标段放得下。等待在 `TaskEngine._wait_then_run`，闸是显式 `acquire` / `release`。等空间只查计划第一条的目标段，一次 `GET /query_segment`（0.3.11 在 `rpc_service.cpp`，主线同文在 `master_admin_service.cpp::HandleQuerySegment`；不使用 `/get_segments_detail`）。剩余 = 这一段的容量 − 已用。只加落在这一段上、且副本端点里还没有这一段的新字节；其它段的剩余和字节都不参与。这一段不够就一个 key 都不发。没查的段仍可能在 `CopyStart` 时 `NO_AVAILABLE_HANDLE`。代码认的是计划第一条，不是写死的 rank 0。闸外这一次查询也吃剩余预算，到点就返回。缺大小时用本批已经读到的一个大小乘以缺的个数，日志标明估算；一个大小都没有就停止，不填假数字。这一段的新占用大于这份剩余，整批不发，闸外 0.5 秒后再查——每轮只重查这一次 `/query_segment`，不重查大小。放得下才去等前缀闸（等闸吃同一段预算，到点还没提交就停）。进闸后、`create_copy_task` 之前再查一次，不够就出闸继续等。超时从开始等待算；还没有任务号就停止这次预热，不记成复制失败。段不存在立即停止。管理端口暂时连不上则等到超时。自己这一批的 key 在放行前已经加进需求，不会漏。另一条前缀如果已经提交、但 master 还没在目标段划出缓冲区，`/query_segment` 的已用还没加上，这条剩余看不见它，两条都可能放行。彻底避开要在 master 上预留，或把复制串成一条，代价高，接受这个窗口：不加锁、不预留，判断只能少失败。这不是 E15 的网卡限速，网卡利用率限速仍不做。名额在复查之前就 `acquire`；复查不够就 `release`，回到闸外。复查通过之后名额占到终态（提交流、轮询、副本核验）。keepalive 注册在 `release` 之后，也在闸外。轮询占着名额，但不额外发建链。promote 的触发 RPC 是毫秒级（不过闸），但其 READY 是核验式轮询（时长由池的提回进度决定，**不是毫秒即返**）；D2 §3 的另一条主动路径（读删写，数据经 kvcm）若启用，则属 kvcm 发起的传输，要占闸
 - **重启恢复不占闸（已知窗口）**：`TaskEngine._track` 只轮询 `rebuild` 捞回的 handle，不 acquire 传输闸。重启后旧前缀全部仍在 master 上搬，新预热仍可占满名额。接受这个叠加——让恢复任务去等闸，轮询会被串行化
 - **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
 - **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；`session_end` 类可延迟任务排队无妨
-- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。窗口上限来自两次分开的真机实验，不是一件事（[../demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md) #16、#17）。10 月 26 日单机（#16）：连不上是 `TRANSFER_FAIL`；窗口 4 节奏化 42/42 全成。10 月 29 日跨机（#17）：主错误是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），master 留内存失败；14 条全成，42 条大约一半失败。#17 不靠网卡限速解决——提交前按第一个目标段的剩余决定整批发不发，是上面「传输闸」那一节的做法。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过实测打爆的点。网卡利用率限速（网卡计数器采样）仍归 E15，仍不做，接在同一层信号量上
+- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。窗口上限来自两次分开的真机实验，不是一件事（[../demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md) #16、#17）。10 月 26 日单机（#16）：连不上是 `TRANSFER_FAIL`；窗口 4 节奏化 42/42 全成。10 月 29 日跨机（#17）：主错误是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），master 留内存失败；14 条全成，42 条大约一半失败。这次实验的错误是 master 留内存失败；段剩余预检对得上这个错误类型；它不代替 E15；实验当时也没跑这条预检。#16 的 `TRANSFER_FAIL` 与 #17 不是同一种失败。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过实测打爆的点。网卡利用率限速（网卡计数器采样）仍归 E15，仍不做，接在同一层信号量上
 - **排队超时**：intent 在队列等待的语义（等多久算放弃）随 E12 intent 字段一起定；执行超时沿用 flow 现有 `timeout_s`
 - **失败态策略**（只留接口，随 E11 细化）：失败后的动作三种——① 重发；② 放弃这批任务，事后把留下的副本清掉（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 复制中途源实例下线时的处理（D5）。语义引 D2 §1 与 D5，不新造语义
 
