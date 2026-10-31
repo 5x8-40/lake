@@ -961,8 +961,7 @@ def test_rebuild_restores_watch_state(fake_store_module, monkeypatch) -> None:
 
 
 def test_empty_handle_is_immediately_ready(fake_store_module) -> None:
-    """空句柄（task_ids=()，retained 注册类无异步工作路径）立即 READY，
-    不查登记、不核验。"""
+    """空句柄（task_ids=()，没有异步工作）立即 READY，不查登记、不核验。"""
     b = MooncakeBackend(
         client=FakeClient(),
         key_computer=KeyComputer(model_name="qwen", tp_size=1),

@@ -7,7 +7,7 @@
   - §1 操作集框架：闭环——八项操作业界逐项对照、完备性审计、kvcm 能力边界（只能被动等池的真缺口 2 条，归池侧扩展 vs 无专用 RPC 但组合可达 7 条）
   - §2 pin：候选已列出；落地选择依赖外部条件（mooncake 可改性、kvcm 语言），不阻塞
   - §3 demote / promote：设计完成
-  - §4 retain / release：定型；retain 的池机制正式路径在 main（retained client 或 DFS 副本，F13），0.3.11 下的过渡手段 = move 到活 seg / kvcm 自挂 SSD（E5 已闭环，F6b）
+  - §4 retain / release：retain 已重写。数据留存靠「副本所在 client 还活着」，或 main 的 DFS 副本。不存在保留身份注册。`#2991` 只是同一个 `client_id` 的重连窗口
   - 未决问题（详见 summary）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）
 - 上游问题：summary D2（kvcm 对池内 KV 的操作面）
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
@@ -216,7 +216,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 
 - **消费方四分总纲**（读六组前先立框架）：main 的能力补齐分四个消费方向
   - **master 内部自治**：动态副本、热度统计——按访问统计自动调节，不对外
-  - **引擎 client**：任务改为自己来取（master 把任务放内存队列、client 定期取）；另有驱逐/容量上报、retained 注册——client 从单纯存取数据变成帮池子干活
+  - **引擎 client**：任务改为自己来取（master 把任务放内存队列、client 定期取）；另有驱逐/容量上报——client 从单纯存取数据变成帮池子干活
   - **控制面/管理面**：Admin 命名查询、DrainJob 三件套两版本同有；main 补齐零副作用查询（`GetReplicaListForAdmin`）、租户配额五件套、DFS 容量管理——**kvcm 的位置**
   - **master 自身 HA**：`RestoreFromStandby`，supervisor 主备
   - 前两层与 kvcm 不冲突：自治层按统计自动调节、kvcm 按业务语义指定目标，分工互补
@@ -229,11 +229,11 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 - 多把 key 可绑成一个**生命周期组**（`group_ids`）：驱逐时整组同进退——kvcm 的「前缀族」在 main 可以整体绑组，不再逐 key 各自为政
 - kvcm 用法：一个模型版本 = 一个租户（0.3.11 只能靠 key 名前缀模拟，§4 release）
 
-**② 数据跨引擎存活**（retain 的正式路径，§4）
-- **retained client**：client 断线，master 不立即清它的数据，留时间让它重连接管——解「引擎进程重启」
-- **DFS 副本**：数据直接写共享文件系统（3FS，多机挂同一目录）——谁死了文件都在，任何挂同一 DFS 的机器都能读——解「整机灭失」
-  - 硬事实：引擎下线时 master 只清「内存副本 + 本机盘副本」，**不清 DFS 副本**（`ProcessClientOffboardingJob`，`master_service.cpp:2965-2973`）；DFS 副本只在整 key 删除时释放
-  - 前提：部署 3FS（测试床没有）
+**② 数据跨引擎存活**（retain 的事实，做法在 §4）
+- **清理看副本所在 client，不看 key 的 client_id**（F6b，两版本同）。副本已经在别的活 client 的段上，源引擎下线清不到它
+- **DFS 副本**（main）：不挂任何 client。下线清理不删它（`ProcessClientOffboardingJob` 只清内存副本和本机盘副本，`master_service.cpp:2965-2976`）。描述里有 `file_path`，挂同一共享目录的机器按路径读。整 key 删除才释放
+- **没有「保留身份」**。`AddReplicaForRetainedClient` 是 master 内部函数：这个 client 还没 `OFFLINE` 时，给它登记一块 `LOCAL_DISK`。`dummy_client.h` 的 `kRetained` 是外部内存的引用计数。两者都不是注册接口
+- **`#2991` 不是 retain**。它给每个 client 一条 `ACTIVE → SUSPECTED → OFFLINE` 的状态机（默认 10 秒 + 20 秒）。同一个 `client_id` 在变成 `OFFLINE` 之前 `Ping` 或重新挂盘，登记还在。字节仍在原进程的地址和原传输端点上。窗口过后，后台 worker 清掉这个 client 的内存副本和本机盘副本
 
 **③ 下线与运维**
 - `UnmountLocalDiskSegment`（main 新增——0.3.11 挂了本地盘就摘不掉）：引擎死前主动摘掉盘的登记（效果等同死后被清，但更干净可控）
@@ -281,7 +281,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 按性质分三类
     - **原子动作**：copy / move / keepalive / demote / promote / remove——原子指**语义**：一个操作一个效果、无中间态对外。实现上 copy/move/keepalive/remove 各对应单 RPC；demote/promote 是组合动作（池通道或 kvcm 读写组合 + 核验，§3），对外仍呈现单步语义
     - **元数据标记**：pin——设一次长期有效的标记
-    - **目的型**：retain——「副本跨实例存亡活着」是目的不是机制，由 demote / move / pin 组合实现（§4）
+    - **目的型**：retain——「源引擎下线后副本还在」是目的不是机制。做法是死前把副本放到一个还活着的 client 上（copy / move / kvcm 自己挂盘），或写成 DFS 副本（§4）。降到源引擎自己的盘、pin、keepalive 都不改变副本所在 client
   - 复合流程由原子操作编排而成（策略层组合），不写成一体状态机
   - 理由：kvcm 定位是通用 KV 管理控制面，不只是为预热一个场景服务
 
@@ -299,7 +299,8 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
     - 核验方式：copy / move 查 `QueryTask` 确认任务结束；promote 为触发式（无任务号，见 §3 主动路径一），不走 `QueryTask`，直接以 `GetReplicaList` 轮询副本位置为准；三者最终都以 `GetReplicaList` 确认副本状态（F7）
     - move 多一件事：源副本被删，要同步通知索引「源实例不再有这份 KV」
   - 无 READY（5 个）：
-    - keepalive / pin / retain：不动数据，RPC 返回即完成，记台账即可
+    - keepalive / pin：不动数据，RPC 返回即完成，记台账即可
+    - retain：完成信号跟着它选用的做法走。copy / move 有任务号，核验副本已经在目标 client 上才算保住。没有「注册一次就完成」的空操作
     - demote：完成信号 = 「盘副本在册」，只记台账——降层后请求本来就不能直接发过去，没有「可调度」可上报
     - release：语义相反——不是「可以发过去」，而是「别再发过来」：清台账 + 同步索引删除
 
@@ -364,7 +365,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 - **防驱逐相关操作的语义界定**（keepalive / pin / retain 的区别）
   - **keepalive**（动作）：周期续租（F9）——窗口 = lease_ttl、轻、高频；kvcm 断线，lease 过期即失效
   - **pin**（元数据标记）：设一次长期有效——soft = 驱逐排最后 + TTL 窗口；hard = 绝对不可逐
-  - **retain**（目的，不是机制）：「长期未命中时副本继续活着」——手段组合见 §4。key 的 client_id 下线不需要 retain 兜底（远端副本本就保留，F6b）；retain 的对手只剩 lease 过期→驱逐
+  - **retain**（目的，不是机制）：源引擎下线后副本还在。已经在别的活 client 上的副本本来就留着（F6b）。还只在将死 client 上的副本，要在它死前搬走（§4）。lease 过期被驱逐是另一件事，靠 keepalive / pin，不靠换 client
   - 给哪些 key 续租、何时开始、周期多少 = **kvcm 策略层逻辑**（保活注册表驱动），不是原子操作语义的一部分
 - **状态记录四类**（按可丢性分级）
   1. **任务状态机**（可丢）：在途任务进度；丢了可重发——master 侧操作幂等（重复 copy 同 key 同目标不产生重复副本）
@@ -385,7 +386,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 | pin | LMCache `pin`/`unpin`（后端接口级）；KVCR `claim/pin`/`release_pin`（**传输窗口专用**，`FETCHABLE` 须等 pin 成功才确定）；TensorCast `pinned` policy（必须驻留 + 溢出**拒绝写入**）；HiCache `lock_ref`（`protected_size_` vs `evictable_size_`，dec 到 0 ≠ 释放、仍可命中） | mooncake 三件套（lease/soft/hard）比多数系统细。差异：TensorCast `pinned` 溢出拒绝写入，mooncake hard pin 无此语义（创建时固化、之后改不了，F1）；KVCR 的传输窗口 pin 在 mooncake 由「copy 任务在途拒 upsert」覆盖（F2） |
 | demote | §3 专节（FlexKV/LMCache/UCM/KVBM/MemCache 对照 + HiCache 写穿/写回） | —— |
 | promote | HiCache `load_back`（L2→L1 提回）；FlexKV SSD→GPU 的 H2D 回填；KVCR `fetch`；mooncake `promotion_on_hit`（命中达阈值自动提回） | 被动提升（读命中驱动）是各家主路径；kvcm 另有主动两条：反复调 `GetReplicaList` 至命中计数过线触发 / 读删写自搬（§3） |
-| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择；kvcm 的正式路径 = main 的 retained client 机制（client 断线数据保留，§4），存储统一在 mooncake。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：client_id 管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是 key 的 client_id |
+| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache daemon/远程后端；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择。kvcm 的做法相同：死前把副本放到一个还活着的 client 上（另一台引擎的段，或 kvcm 自己的 client），或写成 DFS 副本（§4）。没有保留身份注册。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：client_id 管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是 key 的 client_id |
 | remove | LMCache `remove`/`clear`；SGLang 分层放弃（`block-lifecycle.md`）：无 L3 时 `evict` 删叶 = 彻底；**有 L3 时引擎永不主动放弃**——删除下放 L3 后端独立 LRU/TTL，引擎看不到 | SGLang 的「释放 = 逐层剥离」（L1 摘节点降层 → L2 摘除 → L3 后端自决）对应 kvcm 三级（软释放 / demote / remove）。「L3 删除引擎不可见」提醒：kvcm remove 后索引侧条目需同步清（D1 已知：池副本删除事件通道缺失） |
 
 - **总观察**
@@ -680,7 +681,7 @@ sequenceDiagram
 - 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 反复调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本所在引擎在线
 - `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本所在引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
 
-**⑦ retain（key 的 client_id 下线后副本存续；五方案时序：绿 = main 正式路径两条、橙 = 0.3.11 过渡两手段、灰 = 接受现状，§4）**
+**⑦ retain（源引擎下线后副本还在。绿 = 做得到的做法，灰 = 不做或做了也接不走字节，§4）**
 
 ```mermaid
 sequenceDiagram
@@ -692,44 +693,44 @@ sequenceDiagram
     participant DFS as 共享 3FS
 
     rect rgb(223, 242, 223)
-    Note over E,DFS: 正式路径①（main）：retained client——解引擎进程重启
-    E->>M: 以「保留」身份注册运行
-    E--xM: 断线（心跳停）
-    Note over M: 数据登记保留，等重连接管（停机保号）<br/>不立即清（AddReplicaForRetainedClient，F13②）
-    E->>M: 重启回来接管 → 副本继续可用
+    Note over E,DFS: 做法①（两版本）：死前 move / copy 到还活着的段
+    K->>M: CreateMoveTask 或 CreateCopyTask（目标是他机段，或 kvcm 自己挂的内存段）
+    E--xM: 源引擎死
+    Note over M: 副本所在 client 已换成目标段的 client（F6b）→ 留着
     end
 
     rect rgb(223, 242, 223)
-    Note over E,DFS: 正式路径②（main）：DFS 副本——解整机灭失（前提：部署 3FS）
-    E->>DFS: put / demote 写共享 3FS
-    E--xM: 引擎全灭
-    Note over M: master 清内存+本机盘副本，不清 DFS 副本<br/>（ProcessClientOffboardingJob，F13②）
-    B->>DFS: 挂同一 DFS 的机器可读
-    end
-
-    rect rgb(255, 235, 214)
-    Note over E,DFS: 过渡①（0.3.11）：move 到活 seg——E5 证实有效（清理按 seg 维度）
-    K->>M: CreateMoveTask（副本迁到他机活 seg）
-    E--xM: 源引擎死
-    Note over M: 副本绑活 seg（F7）→ 存活
-    end
-
-    rect rgb(255, 235, 214)
-    Note over E,DFS: 过渡②（0.3.11）：kvcm 自挂 SSD——不依赖任何引擎存活的兜底
-    K->>E: 读关键 KV
+    Note over E,DFS: 做法②（两版本）：kvcm 自己的 client 挂盘
+    K->>M: MountLocalDiskSegment
+    K->>E: 读数据（源进程还活着）
     E-->>K: 数据
-    K->>KS: 写 kvcm 本机盘
-    K->>M: NotifyOffloadSuccess 上报登记（盘副本绑 kvcm，F1）
-    E--xM: 引擎全灭
-    Note over M: kvcm 名下盘副本存活；代价 = kvcm 带盘、变有状态
+    K->>KS: 写入 kvcm 的盘
+    K->>M: NotifyOffloadSuccess（盘副本登记者 = kvcm）
+    E--xM: 引擎死
+    Note over M: 清理扫不到 kvcm 名下的盘副本
+    end
+
+    rect rgb(223, 242, 223)
+    Note over E,DFS: 做法③（main）：DFS 副本
+    E->>DFS: 写成 DFS 副本（描述里有 file_path）
+    E--xM: 引擎死
+    Note over M: 下线清理不删 DFS 副本
+    B->>DFS: 挂同一目录的机器按路径读
     end
 
     rect rgb(230, 230, 230)
-    Note over E,DFS: 或接受现状：副本全在死引擎 seg 上的 key 整 key 消失，预热投入重来
+    Note over E,DFS: 不是 retain：拿着旧 client_id 在窗口内 Ping（#2991）
+    K->>M: Ping（同一个 client_id，尚未 OFFLINE）
+    Note over M: 登记还在，字节仍在死进程的地址和原传输端点
+    Note over M: 窗口过后 worker 清这个 client 的内存副本和本机盘副本
+    end
+
+    rect rgb(230, 230, 230)
+    Note over E,DFS: 不做：副本一直只在死引擎的段上，预热投入重来
     end
 ```
 
-- 先说清 demote 在 0.3.11 解不了 retain：盘副本绑登记它的引擎 client，引擎死照样清（§3）——所以过渡手段里没有 demote；改 client_id 同样不在——改的是鉴权字段，副本还绑在原 seg 上，引擎死照清（§4）
+- 降到源引擎自己的盘留不住：盘副本登记在引擎的 client 上，引擎一死就清（§3）。改 key 的 `client_id` 也留不住：改的是鉴权字段，副本还在原段上（F6b）
 
 **⑧ remove（release 四级时序：绿 = 软释放、蓝 = 主动 Remove、灰 = 全池清；决策归 D1 §6，§4）**
 
@@ -944,38 +945,49 @@ sequenceDiagram
 
 - disk 副本的登记者 = 写盘的 client——写穿/写回两种模式下都是**引擎自己**（master 把 offload 任务派给源副本 seg 所在 client）
 - 引擎进程死亡（心跳超时）后的连锁清理：master 的例行扫描发现「这个 client 心跳断了」→ 摘掉它名下的盘登记 → 它登记在盘上的副本一并清除（`CleanupStaleHandles` @0.3.11；main 由 client 过期分支做同样的事，引擎也可死前主动 `UnmountLocalDiskSegment` 摘登记）
-- 所以 **0.3.11 下「引擎下线后盘副本继续存活」没有池机制**（main 有：retained client / DFS 副本，F13）——这是 retain 要解决的问题，见 §4
+- 所以引擎下线后，登记在它自己名下的盘副本会被清掉。要留住，得在它死前把副本放到别的 client 上，或写成 DFS 副本。见 §4
 
 ## §4 retain / release
 
-### retain（key 的 client_id 下线后副本存续）：机制定型
+### retain（源引擎下线后副本还在）
 
-- **目标**：写入引擎（= key 的 client_id）下线后，它写的 KV 副本仍可用
-- **副本生死的绑定关系**（E5 已闭环，机制与实测互证见 F6b）
-  - 内存副本绑 seg：seg 所在 client 死 → seg 失效 → 副本清
-  - disk 副本绑「写盘的 client」：该 client 死 → 副本清（§3）
-  - **DFS 副本不绑任何 client 生死**（main，F13）——清理条件不覆盖它，释放只走 key 级删除
-  - copy 到他机的副本绑他机 seg（F7）——源引擎下线不影响它
-- **正式路径 = main 的池机制，两条并列**（0.3.11 都没有，升级获得；与副本所在 client 清理正交，直接生效）
-  - **retained client**：client 以「保留」身份注册后，即使断线，master 也不立刻清它的数据，留时间让它重连接管——类似「停机保号」
-    - 入口：`AddReplicaForRetainedClient`（`master_service.cpp:5400` @main）
-    - 注册侧在 client 库：`BufferRegistrationAction::kRetained`（`dummy_client.h:260` @main）——引擎与 kvcm 链接同一 client 库，**kvcm 同样能以保留身份注册**
-    - 前提：引擎以此身份运行
-  - **DFS 副本**：demote 的目标层选共享 3FS 而非本机 SSD——副本天然跨 client 存亡存活（F13）。前提：部署 3FS
-  - 两条不互斥：retained client 解「引擎进程下线」，DFS 解「整机/整实例灭失 + 跨机可读」
-- **0.3.11 过渡期手段**（正式形态是上面的池机制；E5 已定：**主路径 = move 到活 seg**，加强项 = kvcm 自挂 SSD）
-  - **先说清 demote 在 0.3.11 解不了 retain**：盘副本绑登记它的 client，而 client 库活在引擎进程内——引擎进程死 = client 死 = 盘副本清（§3）。demote 落的是引擎自己的盘，引擎一死照样带走
-  - **move 到活 seg（E5 证实有效）**：清理按 seg 维度走（F6b）——把副本迁到长寿 seg（kvcm 机、或确定后死的实例），源引擎下线带不走它。**改 client_id 对 retain 无效**：改的是鉴权字段，副本还绑在原 seg 上，引擎死照清（F6b）；改 client_id 的用途在权限与 pin（§2），不在副本存亡
-  - **kvcm 自己挂 SSD（0.3.11 下不依赖任何引擎存活的兜底）**：kvcm 以独立 client 身份挂本机盘（`MountLocalDiskSegment`，与引擎同样的挂法），把关键 KV 落一份到自己名下、`NotifyOffloadSuccess` 上报登记（F1）
-    - 效果：盘副本绑 kvcm 而非引擎，引擎全灭仍存活；也是远期「资源用满」的形态（§3 存储形态）
-    - 代价：kvcm 机器要带盘、kvcm 自身变有状态
-    - **main 下此方案再强化**：kvcm 以 retained client 身份注册（client 库 `kRetained`，上条）——连 kvcm 自己死亡，名下盘副本也保留，等新 kvcm 接管
-    - 挂盘另一形态：`MountNoFSegment`（两版本同有）挂 NVMe-oF 远端盘——盘在远端阵列、不绑 kvcm 机器，比挂本地盘更接近「kvcm 死也保留」
-    - 排除项：`ReMountSegment` 是 client 重连后重新申报 seg（幂等），不是死掉副本的复活——retain 走不了这条
-  - 或接受现状：副本全在死引擎 seg 上的 key 整 key 消失，预热投入重来——已预热到他机的 key 不受影响（F6b），损失面只限这一部分
+- **目标**：写入引擎下线后，它写的 KV 副本仍可用
+- **副本生死**（E5 已闭环，F6b）
+  - 内存副本跟着它所在的段。段属于哪个 client，那个 client 下线，这份内存副本被清
+  - 本机盘副本跟着登记它的 client。登记者下线，这份盘副本被清
+  - DFS 副本不挂任何 client（main）。下线清理不删它，释放只走整 key 删除
+  - 已经 copy 或 move 到别的机器上的副本，跟着那台机器的段。源引擎下线不清它
+- **做法：死前把副本放到一个还活着的 client 上，或写成 DFS**
+  - **move / copy 到还活着的段**（两版本，E5 已证实 move / 他机 copy）
+    - 目标可以是另一台确定后关的引擎，也可以是 kvcm 自己挂的内存段
+    - `move` 做完，副本所在 client 换成目标段的 client。`copy` 是多留一份，源还在
+    - 必须在源进程还活着时做完。死后内存字节没了，复制任务派给原进程，原进程已经不在
+    - **改 key 的 client_id 留不住数据**：改的是鉴权字段，副本还在原段上（F6b）
+  - **kvcm 自己的 client 挂盘**（两版本）
+    - `MountLocalDiskSegment`，数据写入 kvcm 的盘，`NotifyOffloadSuccess` 登记（`AddReplica` 是这次上报的内部步骤，F1）
+    - 盘副本的登记者是 kvcm。引擎下线的清理扫不到它
+    - kvcm 这个 client 自己要一直心跳。它下线之后，名下的内存副本和本机盘副本同样被清。没有额外的身份能让 kvcm 死了数据还留着
+    - 代价：数据要经过 kvcm，kvcm 要带盘
+  - **DFS 副本**（main）
+    - 不挂任何 client。下线清理的条件不覆盖它（`master_service.cpp:2965-2976`）
+    - 描述里有 `file_path`。挂同一共享目录的机器按路径读。整机没了也能读
+    - 前提：部署共享文件系统
+- **这些做法留不住数据**
+  - **拿着旧 `client_id` 去 `Ping`（`#2991`，main）**
+    - master 只认 `client_id`，不认是不是原来那个进程
+    - 同一个 id 在变成 `OFFLINE` 之前 `Ping` 或重新挂盘，状态回到 `ACTIVE`，登记还在
+    - 内存段仍记着死进程里的基址和传输端点。`ReMountSegment` 还要求基址、大小、端点、协议、`host_id` 和原来一致（`segment.cpp` 的 `ValidateRemountSegment`）。新进程对不上
+    - 本机盘的登记仍指向原来的传输端点。master 不删盘上的文件，但描述里没有文件路径（`LocalDiskDescriptor` 只有 `client_id`、大小、传输端点）
+    - 窗口默认是活跃 10 秒加怀疑 20 秒。过后 worker 清掉这个 client 的内存副本和本机盘副本，再删掉存活记录。同一个 id 再来，是一条新的空记录
+  - **`AddReplicaForRetainedClient`**：master 内部函数。调用方已经确认这个 client 还没 `OFFLINE`，然后给它登记 `LOCAL_DISK`。没有对应的 RPC
+  - **`BufferRegistrationAction::kRetained`**：一块外部内存的引用还没减到零，先别卸。不和 master 通信
+  - **降到源引擎自己的盘**：盘副本登记在引擎的 client 上，引擎进程一死就清
+  - **`MountNoFSegment`**：段登记在挂载它的 client 上。盘硬件在远端阵列，不因此变成别人的副本。这个 client 下线后，要留数据仍须走上面的做法
+  - **`ReMountSegment`**：同一个 client 重连时按原参数再申报段。不是把死掉的副本交到新 client 名下
+  - 副本一直只在死引擎段上的 key，整 key 消失，预热重来。已经在他机的 key 不受影响（F6b，实验 #15）
 - **计划下线的编排**（控制面主导，四步）
   1. **Router 摘流**：该实例不再接新请求，在途请求跑完
-  2. **kvcm 迁 KV**：这台 seg 上的预热副本 copy/move 到他机，或 demote 落盘
+  2. **kvcm 迁 KV**：这台段上的副本 copy/move 到还活着的 client，或写成 DFS。降到这台引擎自己的盘留不住
   3. **宽限期卸载**：引擎调 `GracefulUnmountSegment`（`master_service.cpp:669` @0.3.11）告诉 master「给我 N 毫秒宽限再摘 seg」——它是迁移的**时间窗保障**（防搬到一半 seg 被摘、数据随 seg 失效），由编排流程触发；不是引擎自己决定何时下线
   4. **缩容停引擎**
   - `CreateDrainJob`（两版本同有，F7）：master 后台 job 把指定 seg 上的副本逐个迁到别的 seg（带并发上限默认 4），排空后 seg 置 DRAINED 安全下线——可替代第 2 步的手动搬迁，且 job 级可取消（`CancelDrainJob`），比裸 copy/move 多一层控制

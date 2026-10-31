@@ -6,8 +6,8 @@
 - 目的型：retain——由其他操作组合实现，对外仍呈现单步语义
 
 完成信号：copy / move / promote 有 READY（任务状态完成 + 目标侧副本
-核验通过）；retain 返回空句柄（task_ids=()，无异步工作的路径）时
-query_task 立即 READY；其余方法（keepalive / stop_keepalive / pin /
+核验通过）。retain 的完成信号跟着做法走（move/copy 的任务号，核验副本
+已经在目标 client 上）。其余方法（keepalive / stop_keepalive / pin /
 demote / remove）无 READY。任务状态经 query_task 查询。
 
 幂等：**本层不去重**——`copy` 每次调用都发起任务，同一前缀重复调用会产生
@@ -166,14 +166,14 @@ class KvOps(ABC):
         raise self._unsupported("promote")
 
     async def retain(self, prefix: Prefix) -> TaskHandle:
-        """目的型：让前缀 KV 在源引擎下线后仍存活。目标基线 = 后端主线
-        能力：主路径 = 保留身份注册（mooncake main 的 retained client，
-        一次注册 RPC 即完成，无异步工作）——返回空句柄 task_ids=()，
-        query_task 立即 READY。过渡替代 = move 到存活节点（0.3.11 无
-        retained 能力时的登记实现）则是任务型，返回真实句柄。
+        """目的型：让前缀 KV 在源引擎下线后仍存活。
+
+        做法（D2 §4）：死前 move/copy 到一个还活着的 client，或 kvcm
+        自己的 client 挂盘并登记，或写成 DFS 副本。返回这次搬运的任务号。
+        没有保留身份注册，不返回空句柄。
 
         返回 TaskHandle 而非 None：结果必须可观测（「保住了没有」是
-        本操作存在的全部意义）；空句柄与真句柄由实现按路径给出。
+        本操作存在的全部意义）。
         """
         raise self._unsupported("retain")
 
