@@ -234,5 +234,5 @@ class ReleaseLoop:
 
 class RetainLoop:
     """retain 与计划下线编排（D2 §4）。骨架——依赖的 retain/move 在
-    L4 未接线（retain 契约已定为返回 TaskHandle，主路径 retained
-    client 注册待 mooncake 版本升级），能力接线后再常驻化。"""
+    L4 未接线（做法 = move/copy 到活 seg，或搬进 kvcm 自己的段再落盘，
+    或 DFS 副本），能力接线后再常驻化。"""
