@@ -148,26 +148,28 @@ class KvOps(ABC):
         """在目标实例本机层级为前缀 KV 建副本；源副本由池侧选择。
         READY：任务完成 + 目标侧副本核验通过。"""
 
-    def open_copy_admission(self) -> object | None:
-        """一轮预热等待开始。占目标段的后端在这里记下本轮字节需求。
+    def open_segment_budget(self) -> object | None:
+        """开始一轮等段剩余。占目标段的后端在这里新建一份本轮字节需求的缓存。
 
+        与「准入」无关：这里不接纳请求、不限并发，只是记这条前缀要往目标段写多少字节。
         默认不占新段，返回 None。编排层总是调用，不探测具体后端有没有这个方法。
         """
         return None
 
-    def close_copy_admission(self, token: object | None) -> None:
-        """结束一轮预热等待。默认无事可做。"""
+    def close_segment_budget(self, token: object | None) -> None:
+        """结束一轮等待，丢掉缓存。默认无事可做。"""
         return None
 
-    async def admit_planned_copy(
+    async def check_segment_room(
         self,
         prefix: Prefix,
         target: InstanceId,
         *,
         timeout_s: float | None = None,
     ) -> None:
-        """闸外判断这一批现在放不放得下。放不下由子类抛 AdmissionWait。
+        """闸外判断：这条前缀要写的新字节，目标段还放不放得下。
 
+        放不下由子类抛 AdmissionWait，段名不存在抛 AdmissionStop。
         默认不占目标段，直接通过。第二个后端不 override 就不会静默漏掉调用，
         只是没有段容量这一步。timeout_s 是剩余预算；默认实现不查询，忽略它。
         """

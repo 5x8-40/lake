@@ -122,10 +122,11 @@ sequenceDiagram
   key 提交后拿回一个任务号（两个整数组成的整数对）→ 写进 Ledger（任务
   号编码成 `"整数:整数"` 的字符串，连同 handle_id、token_ids）
 - 与 master 的交互里，复制和核验仍是绑定 RPC。提交前多一次管理端口
-  `GET /query_segment`（明文 Used / Capacity）。三个查询的分工：
+  `GET /query_segment`（明文 Used / Capacity）。三个查询各答什么：
   - `/query_segment`：一条请求返回这一段自己的已用和容量，正是「这一段还放不放得下」要的两个数。
   - `/get_segments_detail`：返回全池所有段的明细。为了查一段要扫一遍所有段，代价随段数增长。
   - `/batch_query_keys`：按 key 查副本，回答「这些 key 在不在、在哪个端点」，不回答「这一段还剩多少字节」。段剩余和副本位置是两件事。
+- 副本核验现在走绑定通道（`batch_get_replica_desc`），有续租副作用。main 的零副作用核验（`/batch_query_keys`）等升级到 mooncake 主线后接通（`has_admin_query`）；代码里 `_verify_missing` 留着这个 TODO。所以上一条说「不用 `/batch_query_keys`」只针对段剩余，不针对核验。
 - Ledger 在 copy 落账、到终态、进入等副本状态、abandon 时写。
   exists 失败，以及还没有任务号的提交失败，不写行。已经落账的号由
   `abandon` 记成 abandoned；池里的传输不取消

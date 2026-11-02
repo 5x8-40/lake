@@ -286,7 +286,12 @@ stateDiagram-v2
   - `Prefix` 保留在入口：intent 载荷、幂等键（前缀 × 实例）、Ledger 记 token_ids 的输入
   - 不选「keys 裸露进编排层」：PoolKey 出现在 L2 违反原则 1；不选「backend 内缓存」：引入缓存增长管理与淘汰语义
   - 影响面：KvOps 全部方法签名 + MooncakeBackend + PrefetchFlow + 测试；rebuild 内部重算路径不变（它本来就从 token_ids 现场算）
-  - **同批实施（都动方法签名，一次改完）**：`wait_ready` 挪进 ops——「等到 READY」的轮询循环从 flow 挪进 ops（跨流程通用件：Drain/Retain 同样需要等；flow 只剩编排 exists → copy → wait_ready）；`PrefetchError` → `FlowError`（统一出口异常一般化）。async 化不属于本批——它随 E11 本期完成（见「运行时结构」节）
+  - **同批实施（都动方法签名，一次改完）**：`wait_ready` 挪进 ops——「等到 READY」的轮询循环从 flow 挪进 ops（跨流程通用件：Drain/Retain 同样需要等；flow 只剩编排 exists → copy → wait_ready）
+- **`PrefetchError` → `FlowError`（同批，但独立于 KeySet）**
+  - 为什么改：这个名字把出口异常绑在预热上。Drain、Retain 接进来时，同一个「流程执行失败」的出口只能叫 PrefetchError，读代码的人会以为只有预热才会有。
+  - 为什么和 KeySet 同一批：两者都要改 `KvOps` 的方法签名与全部调用点。分两次做，等于把同一批签名改动做两遍、测试改两遍。
+  - 两者没有依赖关系：`FlowError` 只是重命名加放宽语义，可以先做；放在同一批是为了少改一遍，不是因为必须先有 `KeySet`。
+  - 现状：仍是 `PrefetchError`。这次没有改，避免与上面的签名改造交叉。
 
 ## L4 适配层（两个正交维度）
 
@@ -496,7 +501,7 @@ sequenceDiagram
 - 线程只在 `Ex`（线程池）这一列出现：每个 RPC 执行的几毫秒
 - 协程（W）全程只是一段代码状态，挂起时不占线程——排队 100 个这样的协程也免费
 - `loop 逐 key` 画的是提交信号量的拿还，不是「key 必须一个个串行」。同时在飞的 `create_copy_task` 不超过 4，多出来的 key 在 `S` 上等
-- 等段剩余在 acquire 之前。进闸后、`create_copy_task` 之前再查一次；不够就 release，回到闸外。等闸也吃从开始等待算起的预算：到点还没有任务号就停，不提交。`admit_planned_copy` 在 `KvOps` 上有默认实现（不占新段，直接通过）；占段的后端 override。编排层总是调用，不探测具体类有没有这个方法。
+- 等段剩余在 acquire 之前。进闸后、`create_copy_task` 之前再查一次；不够就 release，回到闸外。等闸也吃从开始等待算起的预算：到点还没有任务号就停，不提交。`check_segment_room` 在 `KvOps` 上有默认实现（不占新段，直接通过）；占段的后端 override。编排层总是调用，不探测具体类有没有这个方法。
 - 图的提交和轮询画的是放得下之后的成功路径。失败 / 超时 / 取消同样在终态归还前缀闸。提交信号量在每次 `create_copy_task` 返回时已经还过，不跟前缀闸一起还
 
 **线程池大小**：
@@ -541,7 +546,9 @@ sequenceDiagram
 - **等段剩余查什么、怎么比**
   - 查哪一段：只查计划里的**第一条**（`build_plan` 的第一条就是 rank 0 的段，但代码认的是「计划第一条」，不写死 rank 0）。一次 `GET /query_segment`，0.3.11 在 `rpc_service.cpp`，主线在 `master_admin_service.cpp::HandleQuerySegment`。不用 `/get_segments_detail`。
   - 比什么：剩余 = 这一段的容量 − 已用。只加落在这一段上、且副本端点里还没有这一段的新字节；其它段的剩余和字节都不参与。
-  - 怎么算新字节：这条前缀的全部 key 先加总，再和剩余比。同一批里前面的 key 还在传、后面的还没开始，都不影响这个总数。
+  - 新字节怎么加：先把**这一条前缀的全部 key** 加总，再和剩余比，不是每提交一个 key 比一次。所以同一批里前几个 key 还在传、后几个还没开始，都不会让这个总数变小。
+    - 这里说的「这一批」= 本次准入的这条前缀展开出的全部 key，不是全池、也不是别的请求。
+    - 反过来，别的请求的那一批不算在内：它自己加总、自己比。
   - 缺大小时：用本批已经读到的一个大小乘以缺的个数，日志标明是估算；一个大小都没有就停止，不填假数字。
   - 结论怎么用：这一段的新占用大于这份剩余，整批一个 key 都不发，闸外 0.5 秒后再查。每轮只重查这一次 `/query_segment`，不重查大小。
   - 放得下才去等前缀闸。等闸也吃同一段预算，到点还没提交就停。

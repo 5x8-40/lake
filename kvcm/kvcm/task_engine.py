@@ -506,7 +506,7 @@ class TaskEngine:
         没有任务号就停，不进 `create_copy_task`。
         """
         deadline = time.monotonic() + timeout_s
-        token = self._ops.open_copy_admission()
+        token = self._ops.open_segment_budget()
 
         def _stopped() -> PrefetchError:
             return PrefetchError(
@@ -519,7 +519,7 @@ class TaskEngine:
                 if left <= 0:
                     raise _stopped()
                 try:
-                    await self._ops.admit_planned_copy(
+                    await self._ops.check_segment_room(
                         prefix, target, timeout_s=left
                     )
                 except QueryError:
@@ -571,7 +571,7 @@ class TaskEngine:
                 finally:
                     self._gate.release()
         finally:
-            self._ops.close_copy_admission(token)
+            self._ops.close_segment_budget(token)
 
     async def _track(self, handle: TaskHandle, poll_s: float, timeout_s: float) -> None:
         """轮询恢复的句柄到终态。不占传输闸（已知窗口，见设计文档）。"""

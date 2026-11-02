@@ -329,11 +329,15 @@ class MooncakeBackend(KvOps):
             self._submit_sem = asyncio.Semaphore(self._submit_concurrency)
         return self._submit_sem
 
-    def open_copy_admission(self) -> contextvars.Token:
-        """一轮预热等待开始。大小留到第一次判断时再取。"""
+    def open_segment_budget(self) -> contextvars.Token:
+        """开始一轮等段剩余。新开一个空缓存：本轮的字节需求留到第一次判断时再算。
+
+        与「准入」无关：这里不接纳任何请求，只是记住这条前缀要往目标段写多少字节。
+        """
         return _admission_need.set(_AdmissionSlot())
 
-    def close_copy_admission(self, token: contextvars.Token) -> None:
+    def close_segment_budget(self, token: contextvars.Token) -> None:
+        """结束这一轮等待，丢掉缓存。"""
         _admission_need.reset(token)
 
     def _copy_plan(self, prefix: Prefix, target: InstanceId) -> list[tuple[str, str]]:
@@ -342,16 +346,17 @@ class MooncakeBackend(KvOps):
             return []
         return self._keys.build_plan(keys, list(self._locate(target)))
 
-    async def admit_planned_copy(
+    async def check_segment_room(
         self,
         prefix: Prefix,
         target: InstanceId,
         *,
         timeout_s: float | None = None,
     ) -> None:
-        """闸外判断。放不下抛 AdmissionWait，段不存在抛 AdmissionStop。
+        """闸外判断：这条前缀要写的新字节，目标段还放不放得下。
 
-        不在这里等。等待循环在 TaskEngine，而且在前缀闸外面。
+        放不下抛 AdmissionWait，段不存在抛 AdmissionStop。不在这里等。
+        等待循环在 TaskEngine，而且在前缀闸外面。
         timeout_s 是剩余预算：这一次查询（取大小和查剩余）必须在预算内
         返回。不改比较本身。
         """
