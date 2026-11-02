@@ -354,7 +354,6 @@ demo/
 | `README.md` | 本文：demo 端到端说明 |
 | `REPRODUCE.md` | 客户复现参考：结论 + 必配项 + 「读本机副本」判定方法 |
 | `EXPERIMENTS.md` | 实验总表至 #22 + 异构实录 + 踩坑记录（含撤回历史；#16 daemon / #17 并发度 / #18–#22 NAH） |
-| `mooncake-nah-src/` | NAH 分配诊断补丁与看守脚本（`largest_free`；真机换 .so 受出网限制） |
 | [../design/kv-prefetch.md](../design/kv-prefetch.md) | copy/prefetch 专项设计（A 壳请求 / B2 副本复制；B2 已由本 demo 实测） |
 | [../design/D1-router-scheduling.md](../design/D1-router-scheduling.md) | 生产化设计 D1：Router 集成与请求调度 |
 | [../design/D2-kv-operations.md](../design/D2-kv-operations.md) | 生产化设计 D2：KV 调度操作集 |

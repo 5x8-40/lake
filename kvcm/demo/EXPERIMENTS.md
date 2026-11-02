@@ -28,7 +28,7 @@
 | 18 | 10/30 | 先单机 put 填满；后清 225 占卡、拉回 B(TP2)，跨机 42-key 风暴 + `/metrics` 余量 | **驳回「B 物理空间装不下」单因说**：跨机 gate4×42 → 25 成 / **17 全是 NAH**，失败当下 **B 合计仍有 448–525MB free**；专打较空 seg 时 **free≈164MB 仍 NAH**（单对象 ~32MB 装得下）。put 填满对照给的是 `-800` 不是 `-200`。NAH 与**并发/分配压力**相关，不是「字节容量见底」 | 见「实验实录 · 2026-10-30 · #18」 |
 | 19 | 11/02 | 同拓扑 **空闲 B segment** 上 42 key × **window=1 vs window=4**（分轮 warm，每轮前重启 A/B 防 spill） | **两边皆 42/42、0 NAH**（W1≈42s，W4≈11s）。B segment 空闲 + 闸=4 **复现不出** #17/#18 的 NAH →「纯 window=4 并发预留」不是充分条件；#18 半挂需叠加更高连发/已有占用/节奏等因素 | 见「实验实录 · 2026-11-02 · #19」 |
 | 20 | 11/02 | 半占用 segment × window 矩阵 | **中止**（信息量低；与用户确认后停） | — |
-| 21 | 11/02 | NAH 源码诊断：给 `OffsetBufferAllocator::allocate` / `CopyStart` 打 `largest_free` | **补丁+看守就位，真机未跑成**：`demo/mooncake-nah-src/`（`0001-nah-alloc-diag.patch`、`-v=1` master、`watch_alloc_fail.sh`）；出网无法 clone/编 .so / 装 gdb；45↔225 卡被 122B placeholder 占满，Ascend 挂 seg 需 NPU | `mooncake-nah-src/README.md` |
+| 21 | 11/02 | NAH 源码诊断：给 `OffsetBufferAllocator::allocate` / `CopyStart` 打 `largest_free` | **方案已定、真机未跑成**（需改 Mooncake 打 `largest_free`；出网无法编换 .so / 装 gdb；当时卡被占）——不阻塞 #18/#22 结论 | — |
 | 22 | 11/02 | **seg 容量剂量**：同风暴半占用(~50%) + window=4 ×42，B **1GB vs 4GB** | **1GB：25/42、17 NAH**（失败时 B free≈449MB）；**4GB：42/42、0 NAH**。加大 segment 后 NAH 消失 → 运营上「segment 太小/有效空间不够」成立；但失败瞬间仍有数百 MB free，**不等于**字节已见底（与 #18 一致） | 见「实验实录 · 2026-11-02 · #22」 |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
