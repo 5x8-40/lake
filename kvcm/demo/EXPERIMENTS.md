@@ -25,6 +25,11 @@
 | 15 | 10/20 | 跨机正向 keys（#13 的 32 keys）不动，**kill 写入者 A 全进程树 → 等 client TTL 过期 → 复验** | **「副本随属主消失」不成立（纠正踩坑 3 早期误判）**：基线 32/32 → kill（17:06:51）→ 17:08:57 master `client_expired` + unmount A 两 seg（**零驱逐零 remove**）→ `batch_is_exist` **32/32**、副本全在 B 四 seg → 裸 client 跨机 `get` **3/3 字节级读回**（各 4.5MB）→ A 复活后终态仍 32/32。结论：副本存亡绑定 seg 所在 client，key 的 client_id 下线只清其 seg 内副本，远端副本保留 | master 日志切片（本机 `va-precopy/logs/`，不入仓）；见踩坑 3 |
 | 16 | 10/26 | 单机 245：源引擎 TP2 + 合成目标 seg + **kvcm daemon（E11/E12）** | PR70 进程化首验：**e2e 全绿**（warm → SubmitIntent → READY）；踩出 copy 连发打爆 adxl 建链（坑 2：14 连发半挂、窗口 4 节奏化 42/42） | 见「实验实录 · 2026-10-26」 |
 | 17 | 10/29 | 跨机 **45↔225**，Qwen3.8-27B（hybrid，`--block-size 1536`），**同构 TP2↔TP2**（异构 TP2↔TP4 被 hybrid gate 关掉），PR70 daemon | **主链路通过**（SubmitIntent ~11s READY，B External prefix hit 59.1%）；**并发度压力：14 `create_copy_task` 全成，42 约半挂**——窗口 4+0.2s 节奏在 42 规模仍扛不住；工程风险高，E15 限速为刚需 | 见「实验实录 · 2026-10-29」 |
+| 18 | 10/30 | 先单机 put 填满；后清 225 占卡、拉回 B(TP2)，跨机 42-key 风暴 + `/metrics` 余量 | **驳回「B 物理空间装不下」单因说**：跨机 gate4×42 → 25 成 / **17 全是 NAH**，失败当下 **B 合计仍有 448–525MB free**；专打较空 seg 时 **free≈164MB 仍 NAH**（单对象 ~32MB 装得下）。put 填满对照给的是 `-800` 不是 `-200`。NAH 与**并发/分配压力**相关，不是「字节容量见底」 | 见「实验实录 · 2026-10-30 · #18」 |
+| 19 | 11/02 | 同拓扑 **空闲 B segment** 上 42 key × **window=1 vs window=4**（分轮 warm，每轮前重启 A/B 防 spill） | **两边皆 42/42、0 NAH**（W1≈42s，W4≈11s）。B segment 空闲 + 闸=4 **复现不出** #17/#18 的 NAH →「纯 window=4 并发预留」不是充分条件；#18 半挂需叠加更高连发/已有占用/节奏等因素 | 见「实验实录 · 2026-11-02 · #19」 |
+| 20 | 11/02 | 半占用 segment × window 矩阵 | **中止**（信息量低；与用户确认后停） | — |
+| 21 | 11/02 | NAH 源码诊断：给 `OffsetBufferAllocator::allocate` / `CopyStart` 打 `largest_free` | **补丁+看守就位，真机未跑成**：`demo/mooncake-nah-src/`（`0001-nah-alloc-diag.patch`、`-v=1` master、`watch_alloc_fail.sh`）；出网无法 clone/编 .so / 装 gdb；45↔225 卡被 122B placeholder 占满，Ascend 挂 seg 需 NPU | `mooncake-nah-src/README.md` |
+| 22 | 11/02 | **seg 容量剂量**：同风暴半占用(~50%) + window=4 ×42，B **1GB vs 4GB** | **1GB：25/42、17 NAH**（失败时 B free≈449MB）；**4GB：42/42、0 NAH**。加大 segment 后 NAH 消失 → 运营上「segment 太小/有效空间不够」成立；但失败瞬间仍有数百 MB free，**不等于**字节已见底（与 #18 一致） | 见「实验实录 · 2026-11-02 · #22」 |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
 
@@ -188,14 +193,129 @@ pid。途中根出 8 个坑，全部对代码验证：
 - 方法陷阱：同一批 key 先跑窗口 4 再跑窗口 14 → 第二轮大量 `replica_copy_skipped` 假全成；**对比必须用互不重叠的 fresh key**。
 - 风暴后遗症：即便改回串行，仍可能半挂（信道缓存中毒，同 #16 坑 5/8）；需**重启源引擎**才能复原。
 
-对照 #16 坑 2（单机、合成目标 seg）：当时「窗口 4 节奏化 = 42/42 全成」。**本次跨机双真实引擎 TP2 床上，同样 42 任务 + 窗口 4+0.2s 仍约半挂**——说明「闸=4」不是跨拓扑的充分条件，E15 正式限速 / 背压仍缺。
+对照 #16 坑 2（单机、合成目标 seg）：当时「窗口 4 节奏化 = 42/42 全成」。**本次跨机双真实引擎 TP2 上，同样 42 任务 + 窗口 4+0.2s 仍约半挂**——说明「闸=4」不是跨拓扑的充分条件，E15 正式限速 / 背压仍缺。
 
 ### 工程含义（供 PR70 reviewer）
 
 1. **异步编排 ≠ 无限并发安全**。`asyncio` 只让调用方不堵；Mooncake/Ascend 路径在句柄耗尽时直接 `FAILED`，不会自动排队到成功。
-2. **公开 wheel 未暴露「建链上限 = N」配置**；能确定的是：kvcm 软闸默认 **4**；底层对 `NO_AVAILABLE_HANDLE` **最多重试 10 次**；有效安全区靠实测——本床 **14 任务全成、42 任务不可靠**。
-3. **生产风险**：一个稍长前缀在 TP≥2 时很容易展开到数十 key；若 Router 突发多个 prefetch intent，或单 intent 内一次铺开全部 key，会稳定踩到本崖。PR70 现状（`max_concurrent=4` + `submit_interval_s=0.2`）是止血，**不是**可承诺的 SLO 级吞吐。
+2. **公开 wheel 未暴露「建链上限 = N」配置**；能确定的是：kvcm 软闸默认 **4**；底层对 `NO_AVAILABLE_HANDLE` **最多重试 10 次**；有效安全区靠实测——本拓扑 **14 任务全成、42 任务不可靠**。
+3. **生产风险**：一个稍长前缀在 TP≥2 时很容易展开到数十 key；若 Router 突发多个 prefetch intent，或单 intent 内一次铺开全部 key，会稳定踩到本崖。PR70 现状（`max_concurrent=4` + 进程级 `submit_concurrency`）是止血，**不是**可承诺的 SLO 级吞吐。
 4. **E15 为阻塞项**：需要按窗口推进的限速器 + 明确背压/重试语义；仅靠协程多开会把传输子系统打进降级态（连带打伤引擎自身 put，见 #16 坑 8）。
 5. **异构 TP2↔TP4 本轮未测**：Qwen3.8-27B hybrid 被 gate；要复验异构需换非 hybrid 模型（或上游解除 gate）。
 
-代码锚点：`kvcm/backends/mooncake/backend.py`（`submit_interval_s` 注释与连发止血）、`kvcm/task_engine.py`（`max_concurrent` 传输闸）、Mooncake `client_service` 对 `NO_AVAILABLE_HANDLE` 有限重试（错误文案 `max retries reached: 10`）。
+代码锚点：`kvcm/backends/mooncake/backend.py`（`submit_concurrency`）、`kvcm/task_engine.py`（`max_concurrent` 传输闸）、Mooncake `client_service` 对 `NO_AVAILABLE_HANDLE` 有限重试（错误文案 `max retries reached: 10`）。
+
+### #18–#22 续测后的结论与生产启示（2026-11-02）
+
+| 命题 | 判定 |
+|------|------|
+| NAH = 目标 segment「字节已见底」 | **驳回（充分单因）**：失败时 B 仍有数百 MB free（#18/#22） |
+| NAH = 纯 window=4 | **驳回**：B segment 空闲时 W1/W4 皆 42/42（#19） |
+| 半占用(~50%) + window=4 ×42 可复现 | **成立**（#22 的 1GB 轮：25/17 NAH） |
+| 加大目标 segment 可压住同风暴 | **成立**（#22：B 4GB → 42/42、0 NAH） |
+
+生产启示（与 lake 职责边界对齐）：
+
+1. **copy/预热必须限速**——E15 + 现有提交窗/前缀闸是刚需；不能靠开闸多扔。
+2. **目标侧 `global_segment_size` 按突发 copy 留余量**——别只按稳态存放量；半占用小 segment 是危险组合。
+3. **监控看失败率 + 目标 free + 在飞 copy**，不要只看「总容量还没满」。
+4. **能 D-direct / 本地命中就少跨节点 copy**；NAH 是执行失败 → 上报/F4 重路由，过载拒绝仍归 gateway。
+
+## 实验实录 · 2026-10-30 · #18（NAH vs 目标空间）
+
+动机：同事认为 #17 的 `NO_AVAILABLE_HANDLE`「不是建链太多，而是 A→B 同时任务太多、B 物理空间申请不下来」。官方错误码表确写 `-200 NO_AVAILABLE_HANDLE` = *Memory allocation failed due to insufficient space*。本轮用 `/metrics` 的 `segment_*` 余量打点做对照。
+
+### 环境现状（测前）
+
+| 项 | 值 |
+|----|----|
+| A (45) | Qwen3.8-27B TP2 仍在；两 seg 各 1GiB，占用约 **80%+**（`segment_allocated_bytes`） |
+| B (225) | **已不在池**：`get_all_segments` 只剩 A；225 卡被 `qwen35-122b-mixed` TP8 占满 → **无法复跑 #17 跨机风暴并采 B 余量** |
+| 工具 | `GET :9003/metrics`（`segment_allocated_bytes` / `segment_total_capacity_bytes` / `master_put_start_alloc_failures_total`） |
+
+### 做了什么
+
+1. **引擎 key → 合成小 tgt（污染，作废）**：池内 key 租约 ~11s，copy 大量 `-704 OBJECT_NOT_FOUND`；tgt 占用曾升至 ~76% 但失败类不是 NAH。脚本：`demo/logs/probe_nah_capacity.py`。
+2. **合成 src→tgt copy（传输出错，作废）**：两 helper 之间 `HcclBatchPut`/`TRANSFER_FAIL`，tgt **始终 0%**——测不到分配崖。脚本：`demo/logs/probe_nah_capacity2.py`。
+3. **主结论实验：本机 put 填满 64MiB seg**（8MiB×对象，preferred=该 seg）  
+   - 0..7：全部 `rc=0`，`free` 从 64MiB 线性降到 **0（100%）**  
+   - 第 8 次：`pre_free=0` → 返回 **`rc=-800 TRANSFER_FAIL`**（日志伴 `Connect timeout` / `HcclCommPrepare` 失败，像是满了之后改走别的远端 seg 再传）  
+   - 全程 **`master_put_start_alloc_failures_total = 0`**，**从未出现 `-200 NO_AVAILABLE_HANDLE`**  
+   - 脚本与结果：`demo/logs/probe_put_fill.py`、`probe_put_fill_result.json`
+
+### 对同事结论的判定
+
+| 命题 | 判定 |
+|------|------|
+| 官方 `-200` 语义含「空间不够」 | 成立（文档） |
+| 「本拓扑 #17 失败 = B 物理空间放不下」 | **本轮不能坐实**：B 已卸，无失败瞬间 B 余量；可控「空间见底」路径给出的是 **-800** 而非 **-200**，且 alloc-fail 计数器为 0 |
+| 「所以不是建链问题」 | **也不能据此排除**：满 seg 的 put 失败路径本身就在打 Connect/HCCL；#16 日志里确有 `ConnectToPeer FAILED` |
+
+### 续测（清 225 占卡后，同日）
+
+环境：停 `qwen35-122b-mixed` / `vllm-ascend-v0.30`；拉回 A/B TP2 + master；B seg=`225:16137`/`225:16855` 各 1GiB。脚本：`demo/logs/probe_b_space_storm.py`、`probe_emptier_seg.run.log`。
+
+| 轮次 | 设置 | 结果 | 失败当下余量 |
+|------|------|------|----------------|
+| burst14 | window=14，14 key | **14/14 OK** | 开始前 B free 1.6GB |
+| gate4_42 | window=4 + 0.2s，42 key | **25 OK / 17 FAIL**，失败类 **全是 `NO_AVAILABLE_HANDLE`** | 失败时 B **合计 free 448–525MB**（约 75–79% 占用）；`put_start_alloc_failures=0` |
+| emptier-only | 只打较空 seg `225:16855`，window=4，12 key | **7 OK / 5 NAH** | NAH 时该 seg **free≈164MB / 113MB / 62MB**（单对象约 32MB，164MB 仍够装） |
+
+终态不均：一轮风暴后 `16137`≈97% 满、`16855`≈70%——rank→seg 映射会让单边先满，但 **emptier-only 轮在仍有 164MB free 时照样 NAH**，说明不是「目标 seg 字节见底」这一条能解释完。
+
+### 对同事结论（更新）
+
+| 命题 | 判定 |
+|------|------|
+| 官方 `-200` 语义含 insufficient space | 成立（文档） |
+| 「#17/#18 失败 = B 物理空间放不下」 | **驳回（作为充分单因）**：失败当下 B/目标 seg 仍有数百 MB free |
+| NAH 与并发/分配压力有关 | **成立**：同拓扑 14 全成、42 半挂；半占用小 segment 上 window=4 可稳复现（#22） |
+
+代码/结果：`demo/logs/probe_b_space_storm_result.json`、`probe_put_fill_result.json`。
+
+## 实验实录 · 2026-11-02 · #19（window=1 vs 4，空闲 B segment）
+
+动机：#18 显示 NAH 时 B 仍有数百 MB free，怀疑与**并发预留**有关。用同一 42-key 规模拆 **串行 window=1** vs **闸=4**，看是否「串行全成、并发 NAH」。
+
+### 方法要点
+
+- A/B 各 2×1GiB；一次 warm 两轮（~84 key）会把 A 打满并 **spill 到 B**，对照作废。改为 **PHASE 分轮**：每轮只 warm≈48 key（取 42），**每轮前重启 A/B** 保证 B≈空。
+- 脚本：`demo/logs/probe_w1_vs_w4.py`（`PHASE=w1|w4`）、结果 JSON 同目录。
+
+### 结果
+
+| 轮 | window | 开跑 B | 结果 | 耗时 | 结束后 B |
+|----|--------|--------|------|------|----------|
+| W1 | 1（串行） | 0% / free 2147MB | **42/42 OK，0 NAH** | 41.6s | 64% / free 774MB |
+| W4 | 4 | 0% / free 2147MB | **42/42 OK，0 NAH** | 10.6s | 64% / free 774MB |
+
+判定：`inconclusive_both_ok` —— B segment 空闲时闸=4 **压不出** NAH，不能单独坐实「window=4 并发预留 ⇒ NAH」。
+
+与 #17/#18 对齐：那边是 **已有占用 / 连发 14 或 42 风暴** 才半挂；B segment 空闲 + 温和闸=4 仍全成。E15 限速仍有价值（跨机高连发），但根因不是「闸=4 本身」。
+
+## 实验实录 · 2026-11-02 · #22（B seg 1GB vs 4GB）
+
+动机：用户假设「把 segment 挂大就不会 NAH ⇒ 就是放不下」。在可复现的半占用(~50%) 风暴上做剂量对照。
+
+### 方法
+
+- 拓扑同 #17/#18：A/B TP2，Qwen3.8-27B hybrid，`create_copy_task` window=4 × 42 key
+- 预填 B 至 ~50% 占用，再风暴（`probe_half_full.py`）
+- **1GB**：A/B `global_segment_size=1GB`（B 合计 cap≈2.1GB）
+- **4GB**：A 仍 1GB；B `4GB`×2（合计≈8.6GB；`gpu-memory-utilization=0.70`，因 4GB+缓冲会挤爆 0.9）
+- 日志：`probe_segsize_1GB_t50_w4_n42.log` / `probe_segsize_4GB_t50_w4_n42.log`
+
+### 结果
+
+| B seg | 风暴前 B | 结果 | 失败当下 |
+|-------|----------|------|----------|
+| 2×1GB | ~47% / free≈1.1GB 量级 | **25 OK / 17 NAH** | NAH 时 **B free≈449MB（79%）** |
+| 2×4GB | ~47% / free≈4.5GB 量级 | **42/42、0 NAH** | — |
+
+### 判定
+
+- **加大 B segment 后 NAH 消失** → 运营结论「segment 太小 / 有效可分配空间不够」**成立**（剂量响应清楚）。
+- **不等于**「失败 = 字节容量已经见底」：1GB 轮 NAH 时仍有 ~449MB free（单对象 ~32MB），与 #18 一致。
+- 更贴切：半占用的小 segment + 并发 `CopyStart→AllocateFrom` 时，**连续可分配洞 / 并发预留**扛不住；放大 cap 提高余量后压住。
+
+参考实现：Mooncake `MasterService::CopyStart` → `AllocateFrom` → `OffsetBufferAllocator::allocate` → `NO_AVAILABLE_HANDLE (-200)`。

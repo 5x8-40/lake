@@ -1,0 +1,45 @@
+From: lake-kvcm diagnostics
+Subject: [PATCH] LOG CopyStart/Offset alloc failures with largest_free
+
+Apply on Mooncake v0.3.11.post1 (matches installed mooncake-transfer-engine-npu).
+
+--- a/mooncake-store/src/allocator.cpp
++++ b/mooncake-store/src/allocator.cpp
+@@ - OffsetBufferAllocator::allocate failure path (VLOG -> ERROR + largest_free)
+         auto allocation_handle = offset_allocator_->allocate(size);
+         if (!allocation_handle) {
+-            VLOG(1) << "allocation_failed size=" << size
+-                    << " segment=" << segment_name_
+-                    << " current_size=" << cur_size_;
++            size_t largest_free = 0;
++            try {
++                largest_free = offset_allocator_->storageReport().largestFreeRegion;
++            } catch (...) {
++            }
++            const size_t used = cur_size_.load();
++            LOG(ERROR) << "action=offset_alloc_fail"
++                       << ", segment=" << segment_name_
++                       << ", request=" << size
++                       << ", used=" << used
++                       << ", capacity=" << total_size_
++                       << ", sum_free=" << (total_size_ > used ? total_size_ - used : 0)
++                       << ", largest_free=" << largest_free
++                       << ", frag=" << (largest_free < size &&
++                                       (total_size_ > used ? total_size_ - used : 0) >= size);
+             return nullptr;
+         }
+
+--- a/mooncake-store/src/master_service.cpp
++++ b/mooncake-store/src/master_service.cpp
+@@ - CopyStart AllocateFrom failure (enrich existing ERROR log)
+         if (!replica.has_value()) {
+-            LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+-                       << ", failed to allocate replica";
++            LOG(ERROR) << "action=copy_start_alloc_fail"
++                       << ", key=" << key
++                       << ", tgt_segment=" << tgt_segment
++                       << ", request=" << metadata.size
++                       << ", err=" << toString(replica.error())
++                       << ", failed to allocate replica";
+             return tl::make_unexpected(replica.error());
+         }
