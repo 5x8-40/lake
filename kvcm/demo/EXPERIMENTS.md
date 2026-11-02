@@ -2,7 +2,7 @@
 
 > **demo 记录**：precopy 预热验证（kvcm 八项操作中仅 **copy** 一项）的实验史。生产化设计见 [../design/](../design/)；kvcm 全貌见 [../README.md](../README.md)。
 
-2026-10-08 ~ 11-02 全量实验史（含已撤回证据），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。
+2026-10-08 ~ 11-02 全量实验史（含已撤回证据；总表至 #24），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。
 
 模型除注明外均为 `/data/models/Qwen3-VL-8B-w8a8c16`（GQA 8 KV head，block_size 128，`PYTHONHASHSEED=0`）；主机 245=7.242.105.245，217=7.242.105.217（**#17 起另用** 45=`7.242.104.45`，225=`7.242.110.225`）；容器镜像 `quay.io/ascend/vllm-ascend:v0.26.0rc1`；mooncake wheel `mooncake_transfer_engine_npu-0.3.11.post1`（除注明外）；master 在源机宿主机 `:50088`。
 
@@ -31,6 +31,7 @@
 | 21 | 11/02 | NAH 源码诊断：给 `OffsetBufferAllocator::allocate` / `CopyStart` 打 `largest_free` | **方案已定、真机未跑成**（需改 Mooncake 打 `largest_free`；出网无法编换 .so / 装 gdb；当时卡被占）——不阻塞 #18/#22 结论 | — |
 | 22 | 11/02 | **seg 容量剂量**：同风暴半占用(~50%) + window=4 ×42，B **1GB vs 4GB** | **1GB：25/42、17 NAH**（失败时 B free≈449MB）；**4GB：42/42、0 NAH**。加大 segment 后 NAH 消失 → 运营上「segment 太小/有效空间不够」成立；但失败瞬间仍有数百 MB free，**不等于**字节已见底（与 #18 一致） | 见「实验实录 · 2026-11-02 · #22」 |
 | 23 | 11/02 | 单机 45：A=TP2(:8001) + 本机合成目标 seg（卡6/7）+ **PR71 E14** （真 Mooncake `create_copy_task` + 真 `ZmqEventPublisher`） | **发件人侧通过**：warm→拷前 0→`create_copy_task=2`→拷后 2/2→`BlockStored(CPU, full_attention)`；warm 落 225 = A 近满 spill（非代码错）；真机脚本手工不进 Actions；**未验**索引/选路/gRPC/注册 | 见「实验实录 · 2026-11-02 · #23」 |
+| 24 | 11/02 | 单机 45：A=TP2(:8001) + **16MiB 合成空段**（卡6/7）+ **PR72 段容量准入**（真 warm / 真副本大小 / 真 `/query_segment`） | **通过**：need≈50MiB > remaining=16MiB → 闸外准入等待 → 3s 超时 `stopped before submit`；`create_copy_task=0`、目标 0 副本。**未验**：空间腾出后放行再拷成功、只查第一段在 TP>1 的漏放、gRPC SubmitIntent | 见「实验实录 · 2026-11-02 · #24」；[`tools/admission_real_smoke.py`](tools/admission_real_smoke.py) |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
 
@@ -363,4 +364,46 @@ pid。途中根出 8 个坑，全部对代码验证：
 ### 结论
 
 **E14 发件人侧（READY → 真端口补发 `BlockStored`）在真 Mooncake 路径上通过。** 选路闭环与注册面仍归后续。
+代码锚点：`kvcm/backends/mooncake/backend.py`（`submit_interval_s` 注释与连发止血）、`kvcm/task_engine.py`（`max_concurrent` 传输闸）、Mooncake `client_service` 对 `NO_AVAILABLE_HANDLE` 有限重试（错误文案 `max retries reached: 10`）。
 
+## 实验实录 · 2026-11-02 · #24（PR72 段容量准入）
+
+动机：PR72 在 `create_copy_task` 前用 master `GET /query_segment` 的 **Capacity−Used（段剩余）** 与本批真副本大小比较；放不下则闸外等待，不提交。验证「真剩余 + 真 need」能否拦住拷贝。
+
+
+### 环境
+
+- 容器 `vllm-ascend-lake-test`，主机 45=`7.242.104.45`；master `:50088` / admin `:9003`
+- A=Qwen3.8-27B hybrid TP2 卡0/1 `:8001`，`--block-size 1536`，`PYTHONHASHSEED=0`
+- 目标：本机合成空段卡 6/7，各 **16MiB**（master 段大小下限；远小于单 block）
+- 控制面：进程内 `TaskEngine` + `MooncakeBackend(admin=AdminClient)`（非 gRPC daemon）；卡 2 给控制面 ACL
+- 复现：[`tools/admission_real_smoke.py`](tools/admission_real_smoke.py)
+
+### 判定口径
+
+1. `/query_segment` 读出合成段 `used=0, capacity=16MiB, remaining=16MiB`
+2. 新鲜前缀 warm 后 plan key 全在池；`batch_memory_replica_sizes` 给出真大小（本轮 rank0 目标段 need≈**50MiB**）
+3. `need > remaining`
+4. `run_once` 在预算内以 `PrefetchError: … stopped before submit` 结束
+5. 全程 **`create_copy_task=0`**，合成段上副本仍为 0
+
+### 结果
+
+| 步骤 | 结果 |
+|------|------|
+| 容器内 admission 单测（Py3.12） | 17/17 PASS（宿主机 Py3.9 的 `TaskEngine`/`asyncio.Queue` 构造受事件循环限制，非逻辑回归） |
+| 挂 16MiB 合成段 | `remaining=16777216` |
+| warm 后真 need | `need_bytes=50331648`（> remaining） |
+| `run_once` timeout_s=3 | 日志反复「准入等待：需要 50331648，剩余 16777216」→ **`stopped before submit`** |
+| 提交与落位 | **`create_copy_task=0`**，`replicas on synth=0/2` |
+
+### 未覆盖
+
+- 段剩余变大后继续等待并成功 `create_copy_task`（本轮只验「塞不下则不提交」）
+- 只查计划第一条目标段时，其它 rank 段满导致的漏放/误放
+- gRPC `SubmitIntent` / daemon 装配路径
+
+### 结论
+
+**段容量准入在真 Mooncake 路径上按设计拦住了必败拷贝**：真 `/query_segment` 剩余 + 真副本大小 → 闸外等待 → 超时停在提交前，零 `create_copy_task`。与 #18/#22「NAH 不等于字节见底」不矛盾——本特性只挡「客户端已能看见 need>remaining」的明显塞不下，挡不住分配洞/并发预留类 NAH。
+ (docs(kvcm): 登记 #24 段容量准入真测——need>remaining 不提交)
