@@ -2,7 +2,7 @@
 
 > **demo 记录**：precopy 预热验证（kvcm 八项操作中仅 **copy** 一项）的实验史。生产化设计见 [../design/](../design/)；kvcm 全貌见 [../README.md](../README.md)。
 
-2026-10-08 ~ 10-29 全量实验史（含已撤回证据），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。
+2026-10-08 ~ 11-02 全量实验史（含已撤回证据），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。
 
 模型除注明外均为 `/data/models/Qwen3-VL-8B-w8a8c16`（GQA 8 KV head，block_size 128，`PYTHONHASHSEED=0`）；主机 245=7.242.105.245，217=7.242.105.217（**#17 起另用** 45=`7.242.104.45`，225=`7.242.110.225`）；容器镜像 `quay.io/ascend/vllm-ascend:v0.26.0rc1`；mooncake wheel `mooncake_transfer_engine_npu-0.3.11.post1`（除注明外）；master 在源机宿主机 `:50088`。
 
@@ -30,6 +30,7 @@
 | 20 | 11/02 | 半占用 segment × window 矩阵 | **中止**（信息量低；与用户确认后停） | — |
 | 21 | 11/02 | NAH 源码诊断：给 `OffsetBufferAllocator::allocate` / `CopyStart` 打 `largest_free` | **方案已定、真机未跑成**（需改 Mooncake 打 `largest_free`；出网无法编换 .so / 装 gdb；当时卡被占）——不阻塞 #18/#22 结论 | — |
 | 22 | 11/02 | **seg 容量剂量**：同风暴半占用(~50%) + window=4 ×42，B **1GB vs 4GB** | **1GB：25/42、17 NAH**（失败时 B free≈449MB）；**4GB：42/42、0 NAH**。加大 segment 后 NAH 消失 → 运营上「segment 太小/有效空间不够」成立；但失败瞬间仍有数百 MB free，**不等于**字节已见底（与 #18 一致） | 见「实验实录 · 2026-11-02 · #22」 |
+| 23 | 11/02 | 单机 45：A=TP2(:8001) + 本机合成目标 seg（卡6/7）+ **PR71 E14** （真 Mooncake `create_copy_task` + 真 `ZmqEventPublisher`） | **发件人侧通过**：新鲜前缀 warm→拷前目标 0 副本→`create_copy_task=2`→拷后目标 2/2→订阅端收到 `BlockStored(medium=CPU, kind=full_attention)`；**未验**索引订阅/改选路、gRPC SubmitIntent、实例注册 | 见「实验实录 · 2026-11-02 · #23」 |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
 
@@ -319,3 +320,45 @@ pid。途中根出 8 个坑，全部对代码验证：
 - 更贴切：半占用的小 segment + 并发 `CopyStart→AllocateFrom` 时，**连续可分配洞 / 并发预留**扛不住；放大 cap 提高余量后压住。
 
 参考实现：Mooncake `MasterService::CopyStart` → `AllocateFrom` → `OffsetBufferAllocator::allocate` → `NO_AVAILABLE_HANDLE (-200)`。
+
+## 实验实录 · 2026-11-02 · #23（PR71 E14：READY → BlockStored）
+
+动机：确认 E14「预热 READY 后补发引擎格式 `BlockStored`」在**真 Mooncake + 真 vLLM ZmqEventPublisher** 下可通，而不是假发布器单测。
+
+### 环境
+
+- 容器 `vllm-ascend-lake-test`（`quay.io/ascend/vllm-ascend:v0.26.0rc1`），主机 45=`7.242.104.45`
+- master `:50088`；A=Qwen3.8-27B hybrid TP2 卡0/1 `:8001`，`--block-size 1536`，`PYTHONHASHSEED=0`
+- 目标：**本机合成 seg**（卡 6/7，TransferEngine `rpc_port` 作 seg 名，各 2GiB）——不依赖 225
+- 控制面：进程内 `TaskEngine` + `MooncakeBackend`（非 gRPC daemon）；物理卡 2 给控制面 ACL
+- 复现脚本：[`tools/e14_mooncake_smoke.py`](tools/e14_mooncake_smoke.py)
+
+### 判定口径（避免空转 READY）
+
+须同时满足：
+
+1. warm **前** plan key `is_exist=0`；warm **后** `is_exist=全真`
+2. 拷 **前** 目标合成 seg 上副本数 = 0
+3. 实际调用 `create_copy_task` 次数 ≥ 1（本轮 = 2，TP2×1 满块×group0）
+4. 拷 **后** 目标合成 seg 上副本数 = plan key 数
+5. ZMQ SUB 收到 payload：`type=BlockStored`，`medium=CPU`，`kv_cache_spec_kind=full_attention`，满块 hash 数正确
+
+### 结果
+
+| 步骤 | 结果 |
+|------|------|
+| 假发布器单测（宿主机 Py3.9） | 逐条 14/14 通过；整文件一次跑受 3.9 事件循环干扰（非功能逻辑） |
+| 容器真 ZMQ（FakeOps READY） | SUB 收到 `BlockStored` |
+| 真 Mooncake + 合成目标（本轮） | **PASS**：`create_copy_task=2`，READY≈0.5s（2 key 同机），`on_synth=2/2`，ZMQ 收到 |
+
+### 踩坑（写进结论，避免误判）
+
+1. **仅看 READY 耗时不够**：首轮打向 225 已有 seg 时 ~1s READY，疑 `already_exist` 跳过传输；必须以「拷前/拷后位置 + `create_copy_task` 计数」为准。
+2. **tokenizer 必须与引擎同口径**：`add_special_tokens=True` 或 decode 再 encode 会导致 key 与 warm 漂移，误撞池内旧 key。
+3. **本床观察**：打 A(:8001) warm 后，group0 副本的 `transport_endpoint` 落在 **225** 的 B seg（原因未查清）；故本轮目标改用本机合成 seg，只验证 copy+补发，不依赖「副本应在 A」假设。
+4. **未覆盖**：索引 SUB/改表、Router 选路、gRPC `SubmitIntent`、实例注册交齐 endpoint+kind、hybrid 多 group 全量拷贝。
+
+### 结论
+
+**E14 发件人侧（READY → 真端口补发 `BlockStored`）在真 Mooncake 路径上通过。** 选路闭环与注册面仍归后续。
+
