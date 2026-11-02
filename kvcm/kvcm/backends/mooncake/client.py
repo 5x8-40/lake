@@ -49,11 +49,23 @@ class StoreClient:
         local_buffer_size: int = 32 * 1024 * 1024,
         protocol: str = "tcp",
         device_name: str = "",
+        ascend_device: int = 0,
     ) -> None:
         """建立 client（注册 UUID + 起心跳）。global_segment_size=0 = 纯控
-        制面身份（不挂载 seg、不持有存储）。"""
+        制面身份（不挂载 seg、不持有存储）。
+
+        protocol="ascend" 的前置仪式（真机冒烟实证）：NPU 版绑定无论
+        protocol 都安装 AscendDirectTransport，而它需要 ACL context
+        （不建则 setup 报 ctx NULL / rc=-600）——与 precopy 同对策，
+        setup 前 `torch.npu.set_device(ascend_device)`。torch/torch_npu
+        只在本分支 lazy import（重依赖，离线/纯 tcp 路径不背）。"""
         if self._store is not None:
             raise StoreClientError("already connected")
+        if protocol == "ascend":
+            import torch
+            import torch_npu  # noqa: F401
+
+            torch.npu.set_device(ascend_device)
         from mooncake.store import MooncakeDistributedStore
 
         store = MooncakeDistributedStore()

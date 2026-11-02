@@ -10,8 +10,11 @@
 query_task 立即 READY；其余方法（keepalive / stop_keepalive / pin /
 demote / remove）无 READY。任务状态经 query_task 查询。
 
-幂等：以（前缀 × 目标实例）为幂等键——在途不重复发、完成不重复发；
-后端幂等兜底。
+幂等：**本层不去重**——`copy` 每次调用都发起任务，同一前缀重复调用会产生
+重复传输。去重归编排层（TaskEngine 以 intent_id = 前缀 × 目标实例 为键：
+同键在途返回既有 id，不重复执行；同键已终态视为新意图、重新预热）。池侧对
+同 key 的并发复制以 `OBJECT_HAS_REPLICATION_TASK` 拒绝，实现侧把它当「在途」
+观测态处理（核验副本，不算失败）。
 
 编排层只调本接口；后端 key、段、租约、client 身份、rank 等概念不允
 许出现在签名里——那些归适配层。
@@ -105,16 +108,28 @@ class KvOps(ABC):
             f"{op}：后端适配器未接线本操作"
         )
 
+    # ------------------------------------------------------------------
+    # 同步 / 异步的分界：**会等待的方法一律 async**
+    #
+    # async（会等待后端 / 网络 / 时间）：copy / move / keepalive /
+    # stop_keepalive / pin / demote / promote / retain / remove /
+    # query_task / abandon / exists
+    #   —— 实现内部把阻塞调用（同步 RPC、sqlite）交给 executor，等待期
+    #      间协程挂起、不占线程（E11 执行模型）
+    # 同步（纯内存查询，无等待）：capability / prefix_of
+    #   —— 给它们加 async 只会平白多一次调度，调用方还得 await
+    # ------------------------------------------------------------------
+
     @abstractmethod
     def capability(self) -> BackendCapability:
         """后端能力声明，初始化时按后端版本填充。编排层按 channel 列选路径。"""
 
     @abstractmethod
-    def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
+    async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机层级为前缀 KV 建副本；源副本由池侧选择。
         READY：任务完成 + 目标侧副本核验通过。"""
 
-    def move(
+    async def move(
         self,
         prefix: Prefix,
         target: InstanceId,
@@ -124,33 +139,33 @@ class KvOps(ABC):
         （复制无此能力，移动才有）。READY 同 copy。"""
         raise self._unsupported("move")
 
-    def keepalive(self, prefix: Prefix) -> None:
+    async def keepalive(self, prefix: Prefix) -> None:
         """注册保活：对前缀 KV 周期续租防驱逐。停止经 stop_keepalive。
         无 READY。"""
         raise self._unsupported("keepalive")
 
-    def stop_keepalive(self, prefix: Prefix) -> None:
+    async def stop_keepalive(self, prefix: Prefix) -> None:
         """注销保活。不是第九项操作——是 keepalive 注册的管理面。"""
         raise self._unsupported("stop_keepalive")
 
-    def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
+    async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
         """元数据标记防驱逐：对已存在的 KV 生效，不写数据。
         SOFT 可解；HARD 写入时固化、不可解，已存在的 KV 无法事后补标
         （能力集 hard_pin_after）。无 READY。"""
         raise self._unsupported("pin")
 
-    def demote(self, prefix: Prefix) -> None:
+    async def demote(self, prefix: Prefix) -> None:
         """放弃前缀 KV 的热层位置。本接口不指定目标层——去向由池的冷热
         策略决定；是否立即生效取决于后端能力（has_per_key_demote 全版本
         均无，实际为停止保活后的自然降层）。无 READY。"""
         raise self._unsupported("demote")
 
-    def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
+    async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """把前缀 KV 提回指定实例本机层级（调度意图，与 demote 的
         「放弃位置」不对称是刻意的）。READY 同 copy。"""
         raise self._unsupported("promote")
 
-    def retain(self, prefix: Prefix) -> TaskHandle:
+    async def retain(self, prefix: Prefix) -> TaskHandle:
         """目的型：让前缀 KV 在源引擎下线后仍存活。目标基线 = 后端主线
         能力：主路径 = 保留身份注册（mooncake main 的 retained client，
         一次注册 RPC 即完成，无异步工作）——返回空句柄 task_ids=()，
@@ -162,12 +177,12 @@ class KvOps(ABC):
         """
         raise self._unsupported("retain")
 
-    def remove(self, prefix: Prefix) -> None:
+    async def remove(self, prefix: Prefix) -> None:
         """删除前缀 KV 的全部副本，全局生效。无 READY。"""
         raise self._unsupported("remove")
 
     @abstractmethod
-    def query_task(self, handle: TaskHandle) -> TaskStatus:
+    async def query_task(self, handle: TaskHandle) -> TaskStatus:
         """查询任务状态。任务管理面，非第九项 KV 操作。
 
         失败语义：核验失败抛 VerifyError（终态）；查询本身失败抛
@@ -175,7 +190,7 @@ class KvOps(ABC):
         """
 
     @abstractmethod
-    def abandon(self, handle: TaskHandle) -> None:
+    async def abandon(self, handle: TaskHandle) -> None:
         """放弃跟踪：删除核验登记，任务状态记为 abandoned。
 
         不是任务取消——后端没有任务取消能力，已发起的传输可能仍在进
@@ -185,9 +200,19 @@ class KvOps(ABC):
         """
 
     @abstractmethod
-    def exists(self, prefix: Prefix) -> bool:
+    async def exists(self, prefix: Prefix) -> bool:
         """前缀 KV 是否完整在池（全部 key 都在）。
 
         查询面，非第九项 KV 操作。注意：读即续租（能力集 has_lease）——
         本检查同时是保活机制的续租通道；预热编排用它做前置检查（warm
         未覆盖前缀或 key 口径漂移时 fail fast，复制无意义）。"""
+
+    def prefix_of(self, handle: TaskHandle) -> Prefix | None:
+        """句柄对应的前缀（句柄由某次 prefix 操作产生，后端持有登记）。
+
+        查询面，非 KV 操作。用途：rebuild 恢复的 handle 被 TaskEngine
+        track 到 READY 后，编排层要拿到 prefix 才能注册保活（恢复路径
+        上没有 submit 的 prefix 入参）。句柄已终态被删除登记后返回
+        None——调用方需在轮询前取。默认 None：适配器未接线时编排层
+        退化为「恢复任务 READY 后不保活」（与重启前未注册同语义）。"""
+        return None
