@@ -6,6 +6,7 @@
 - 状态：**设计完成**
   - §1 操作集框架：闭环——八项操作业界逐项对照、完备性审计、kvcm 能力边界（只能被动等池的真缺口 2 条，归池侧扩展 vs 无专用 RPC 但组合可达 7 条）
   - §2 pin：硬钉控制选定候选 ①（登记保活）。候选 ② 读删写这次不做。soft pin 仍是空写。client_id 用方案一
+  - **导读对照**：[lease-pin-eviction.md](lease-pin-eviction.md)——Mooncake lease / soft pin / hard pin / 驱逐与 kvcm tip 组件对照（不替代本节 F1/F8/F9 与 §2）
   - §3 demote / promote：demote 先停保活，等满一个 lease TTL，再用 `GET /batch_query_keys` 确认盘副本。写回且池不满仍会失败
   - 遗留：`SubmitIntent` 现在只有预热（前缀 × 目标实例）。move / pin / demote / promote / remove 只有操作，没有 intent。这是大遗留，这次不扩协议、不加流程
   - §4 retain / release：release 定型。retain 先不做。1fc27b6 没有 `AddReplicaForRetainedClient`；`dummy_client.h` 的 `kRetained` 是外部 buffer 引用计数。DFS 副本，以及 0.3.11 下 move 到活 seg / kvcm 自挂 SSD，仍是已登记手段（F13、E5），本次不实现 retain
@@ -174,6 +175,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 
 ### lease 与驱逐
 
+- 一页对照（Mooncake × kvcm tip）：[lease-pin-eviction.md](lease-pin-eviction.md)
 - **F8 驱逐算法的完整过滤与排序**（`BatchEvict`，`master_service.cpp:4467` 起 @0.3.11）
   - 硬过滤（两轮通用，满足任一即跳过）
     - hard pin → 永不候选

@@ -79,7 +79,7 @@
 - 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回删掉了用 offload 端点对 seg 名的检查（offload RPC 用 port 0 由内核分配，seg 名是 `local_hostname_`，不是同一次真机测量），仍打会累计命中的 GetReplicaList（默认 2 次），再用内存副本传输端点对 `locate(target)`，同步核验，不轮询。daemon `--admin` 必填；`--capability` 默认 `main`。`v0311` 启动直接失败：那个端点有续租副作用，也没有盘副本字段。
 - 软钉空写：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。wheel 不带 C++ 头文件，扩展只链 `store.so`。`get_real_client()` 是退路：只有以后真实调用失败，才包含 `pyclient.h`，在对象还原成 `MooncakeStorePyWrapper` 之后取出已建 client。现在不走这条。client_id 用方案一：`UpsertStart` 发出的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时副本留在 PROCESSING。扫任务记录再补 End/Revoke 的崩溃恢复暂时不做，这次不写（D2 F5）。保留身份先不动。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐——硬钉走候选 ①，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
+- pin：READY 后防驱逐——硬钉走候选 ①，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2；lease / soft / hard / 驱逐与 tip 对照见 [lease-pin-eviction.md](design/lease-pin-eviction.md)
   - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert，实现不改：
     - 好处：不动全局 lease、断线窗口 30 分钟级
     - 代价：官方绑定没有拆开的 upsert。空写走单独的 `_empty_pin.so`（只链 `store.so`，见上）。client_id 用方案一
