@@ -268,8 +268,8 @@ stateDiagram-v2
 | has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活即可，无需调后端；提回 = HTTP `/query_key`） | RPC ✓ 通道 ✓（同左） | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
-| has_local_segment（kvcm 自己挂 DRAM 段） | RPC ✓ 通道 ✗（绑定只暴露 `setup(global_segment_size)`，没有运行时挂段入口） | 同左（自封装 .so 补，见 D2 §4） | D2 §4 |
-| has_local_disk_mount（挂本机盘） | RPC ✓ 通道 ✗（只有 `setup(enable_ssd_offload)` 初始化时挂，有 `unmount_local_disk_segment`，没有单独挂盘入口） | 同左（自封装 .so 补） | D2 §4 |
+| has_local_segment（kvcm 自己挂 DRAM 段） | RPC ✓ 通道 ✓（`setup(global_segment_size)` 启动时挂） | 同左 | D2 §4 |
+| has_local_disk_mount（挂本机盘） | RPC ✓ 通道 ✓（`setup(enable_ssd_offload, ssd_offload_path)` 启动时挂，另有 `unmount_local_disk_segment`） | 同左 | D2 §4 |
 | has_dfs_replica（共享 3FS 副本） | ✗ | RPC ✓ 通道 △（写入路径待 E6 核对） | D2 F13② |
 | has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**（`/batch_query_keys` 零副作用） | D2 F11b |
 
@@ -329,7 +329,7 @@ stateDiagram-v2
 3. **C 接口**（`mooncake-store/include/store_c.h`，ctypes 可直调）
    - 数据面操作：put / get / is_exist / remove / register_buffer
    - put 的 config 带完整 pin 支持（`with_hard_pin`、`soft_pin_action` ENABLE/DISABLE/PRESERVE、TTL）——但注释明确这只是发布时的行为，即「写新 key 时挂 pin」：写新 key 是引擎的活，kvcm 不写新 key；kvcm 要的 pin 全是**事后操作**（key 已在池里）
-   - 事后加/解 pin 的唯一通道 = upsert（D2 F3/F12），C 接口只有 put 没有 upsert；copy/move、运行时挂段/挂盘、admin 查询也都不在——缺的接口仍要自封装 .so 补
+   - 事后加/解 pin 的唯一通道 = upsert（D2 F3/F12），C 接口只有 put 没有 upsert；copy/move、admin 查询也都不在——缺的接口仍要自封装 .so 补。挂段挂盘不在此列：`setup()` 启动时就能带上，不需要运行时入口
 
 **自封装 .so**（补空写 upsert：绑定、HTTP、C 接口都没有一步式空写，C++ 的 `UpsertStart` / `UpsertEnd` 有）：
 

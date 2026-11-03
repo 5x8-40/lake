@@ -928,8 +928,7 @@ sequenceDiagram
 - **确定性方案：kvcm 把副本搬进自己的段，再落到自己的盘**（与 §4 retain「kvcm 自己挂段挂盘」同一套）
   - 流程：kvcm 挂 DRAM 段与本机盘 → copy/move 副本到自己的段 → 盘侧心跳取到 offload 任务写进自己的盘 → `NotifyOffloadSuccess` 上报登记
   - 必须先有自己的段：`FileStorage::OffloadObjects` 只收本机内存副本（`IsReplicaOnLocalMemory`），offload 任务也只入队给源内存所在的 client
-  - 通道：照 `kvcm/kvcm/native/empty_soft_pin.cpp` 写自封装 .so 补上运行时挂段/挂盘入口，不改 mooncake
-  - 效果：落盘时机由 kvcm 决定，不必等池驱逐；副本绑 kvcm 的 client 与本机盘
+  - 通道：绑定在 `setup()` 时就能把段和盘挂好（`global_segment_size` 挂 DRAM 段、`enable_ssd_offload` + `ssd_offload_path` 挂盘），**挂段挂盘本身不用补通道**。缺的只是 kvcm 要在自己的进程里跑一个带这两个参数的 `setup()`——这是 kvcm 启动时的事，不是运行时能力
   - 代价：kvcm 从纯控制面变成数据面一环，要承担带宽与可用性责任——kvcm 不在了，这份副本也就没了。所以作为确定性备选，不作主路径
 
 ### promote 实现
@@ -975,29 +974,32 @@ sequenceDiagram
     - `move` 做完，副本所在 client 换成目标段的 client。`copy` 是多留一份，源还在
     - 必须在源进程还活着时做完。死后内存字节没了，复制任务派给原进程，原进程已经不在
     - **改 key 的 client_id 留不住数据**：改的是鉴权字段，副本还在原段上（F6b）
-  - **kvcm 自己挂段挂盘，把副本搬到自己名下再落盘**（两版本都可行，远期确定路径；过渡②；通道要补一层封装）
+  - **kvcm 自己挂段挂盘，把副本搬到自己名下再落盘**（两版本都可行，远期确定路径；过渡②）
     - 为什么可行：副本生死只认「它挂在谁身上」——内存副本跟段、盘副本跟登记它的 client。kvcm 本来就是独立 client，把副本搬到 kvcm 的段上、写进 kvcm 的盘，副本就归 kvcm，引擎全灭照样在
     - 流程
-      1. kvcm 挂一块 DRAM 段和一块本机 SSD（与引擎同样的挂法）
+      1. kvcm 启动时用带 `global_segment_size` 和 `enable_ssd_offload` 的 `setup()`，一次把 DRAM 段和本机盘挂上（与引擎同样的挂法，不需要运行时再挂）
       2. 把目标副本 `copy` 或 `move` 到 kvcm 自己的段（此时副本所在 client = kvcm）
       3. kvcm 的盘侧心跳取到 offload 任务，把这份本地内存副本写进自己的盘
       4. `NotifyOffloadSuccess` 登记盘副本。内部走 `AddReplicaForRetainedClient`：这个 client 还没 `OFFLINE` 时，给它登记一块 `LOCAL_DISK`（F1）
+    - **第 4 步只是登记，不写盘**：`AddReplicaForRetainedClient` 通篇只做元数据——校验类型、找或建 key 的元数据、把副本记进去。它收到的 `LocalDiskDescriptor` 只有 `client_id / object_size / transport_endpoint` 三个字段，**没有 `file_path`**（那是 `DiskDescriptor` 的字段）。所以不能「先调它，再指望盘上有数据」，必须第 3 步先把文件写下去
     - 第 2 步就是「把内存里的 KV 存到别的载体上」：副本一旦进了 kvcm 的段，引擎这时死掉也不影响它
     - 为什么必须先有段：两条约束叠在一起
       - `FileStorage::OffloadObjects` 的源只认本机内存副本：`IsReplicaOnLocalMemory` 拿副本描述里的 `transport_endpoint` 和 `GetTransportEndpoint()` 比，不是自己就跳过（`client_service.cpp`）
       - offload 任务只派给源内存副本所在 seg 的 client：`PushOffloadingQueue` 入队后，`OffloadObjectHeartbeat` 按 `client_id` 从 `local_ssd_manager_.SetOffloadingAndTakePending` 取本 client 的队列
       - 两条合起来：副本不在 kvcm 的段上，kvcm 既拿不到字节、也收不到任务
-    - 通道照 `kvcm/kvcm/native/empty_soft_pin.cpp` 补：绑定只暴露 `setup(global_segment_size)` 与 `setup(enable_ssd_offload, ssd_offload_path)`，没有运行时的挂段/挂盘入口；写一个自封装 .so，把已有 store 对象传进去再调 C++ 方法（同一套 pybind 跨模块取对象的手法，空写软钉上已经用过），不改 mooncake
+    - 通道：不用补。绑定在 `setup()` 时就能把段和盘挂好——`global_segment_size` 挂 DRAM 段，`enable_ssd_offload` + `ssd_offload_path` 挂盘（`FileStorage::Init` 里调 `MountLocalDiskSegment`）。kvcm 只是要在自己的进程里跑一个带这两个参数的 `setup()`，属于 kvcm 启动配置，不需要额外封装
     - 效果：盘副本登记在 kvcm 名下，引擎全灭仍存活；也是远期「资源用满」的形态（§3 存储形态）
     - 代价：kvcm 机器要带盘、kvcm 自身变有状态；数据要经过 kvcm，kvcm 从此承担带宽与可用性责任——kvcm 不在了，这条兜底也就没了
-    - 远端盘形态（可选）：`MountNoFSegment` 挂 NVMe-oF 远端盘（`USE_NOF`，默认关）。段仍登记在 kvcm 名下，但盘在远端阵列而不是本机。用它的唯一理由是不想给 kvcm 机器配本地盘；正常形态就是挂本机 SSD
   - **用旧 `client_id` 接管盘上的数据**（两版本都可行，过渡③；前提见下）
     - 场景：引擎死在原地、数据已经落在它自己的盘上，但没有第三方（kvcm）事先把副本收走。这时只能靠「冒充它」把盘上的东西接回来
     - 机制：`Client` 的 `client_id` 写死在构造里（`client_id_(generate_uuid())`，没有入参），所以**不用 `Client`**；直接用 public 的 `MasterClient(const UUID& client_id, ...)`，拿旧 id 建一个，之后所有 RPC 都以旧身份发出
     - 段怎么挂：用 `MasterClient::MountSegment(const Segment&)`，`Segment` 的 `id / name / base / size / te_endpoint / protocol / host_id` **全部由调用方填**。master 侧只校验非零和 Slab 对齐（`segment.cpp`），不校验 id 是不是它自己生成的
       - 所以段 id 可以照抄旧值，不需要用 `ReMountSegment`（那条才会拿 `ValidateRemountSegment` 逐字段比对已登记的值，新进程的 `base`/`te_endpoint` 通常对不上）
       - `base` 填新进程实际能访问的地址，自己 `RegisterLocalMemory` 进去即可；不要求和旧值相同
-    - 盘副本怎么接回来：master 下线清理只摘登记、不删盘上文件。新进程起来后由 `FileStorage::Init` 扫盘（`ScanMeta`）再 `NotifyOffloadSuccess` 上报。上报时会**更新已有 LOCAL_DISK 副本的 `transport_endpoint`**（`master_service.cpp` 里 `VisitReplicas` 分支），所以旧端点死了也能改指到新进程
+    - 盘副本怎么接回来：master 下线清理只摘登记、不删盘上文件。新进程起来后由 `FileStorage::Init` 扫盘（`ScanMeta`）再 `NotifyOffloadSuccess` 上报
+      - `ScanMeta` 回调里做两件事：从存储后端扫出 key 和 size，把 `transport_endpoint` 填成**当前进程的** `local_rpc_addr_`，然后 `NotifyOffloadSuccess`（`file_storage.cpp` 的 `Init`）
+      - 上报时会**更新已有 LOCAL_DISK 副本的 `transport_endpoint`**（`master_service.cpp` 里 `VisitReplicas` 分支），所以旧端点死了也能改指到新进程
+      - 前提：盘上的文件必须是 mooncake 存储后端的布局（key→文件名规则由 `StorageBackendAdaptor` 决定），随手写的文件扫不出来
       - 而且 `AddReplicaForRetainedClient` 允许同一个 key 上**同一个 client_id 既有内存副本又有盘副本**：`replacing_existing` 只看有没有 LOCAL_DISK，有就只更新那个盘副本，不清别的
       - 顺带一条现成容错：`OffloadObjectHeartbeat` 收到 `SEGMENT_NOT_FOUND` 时，`FileStorage` 会自己重挂盘段、再触发 `ScanMeta` 重登记（`file_storage.cpp`）。master 重启或盘段丢了都走这条
     - 内存副本接不回来：字节在匿名私有内存里，进程死透就被内核回收。这条路救的是**已经落盘**的那部分

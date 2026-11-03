@@ -36,10 +36,10 @@ def mooncake_v0311() -> BackendCapability:
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
         has_local_segment=Capability(
-            Support.YES, Support.NO, "绑定只有 setup(global_segment_size)，无运行时挂段入口"
+            Support.YES, Support.YES, "setup(global_segment_size) 启动时挂段"
         ),
         has_local_disk_mount=Capability(
-            Support.YES, Support.NO, "绑定只有 setup(enable_ssd_offload) 初始化时挂盘与 unmount"
+            Support.YES, Support.YES, "setup(enable_ssd_offload, ssd_offload_path) 启动时挂盘"
         ),
         has_dfs_replica=Capability(Support.NO, Support.NO, "本版本无此接口"),
         has_admin_query=Capability(
@@ -67,10 +67,10 @@ def mooncake_main() -> BackendCapability:
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
         has_local_segment=Capability(
-            Support.YES, Support.NO, "同 0.3.11；自封装 .so 候选"
+            Support.YES, Support.YES, "同 0.3.11"
         ),
         has_local_disk_mount=Capability(
-            Support.YES, Support.NO, "同 0.3.11；自封装 .so 候选"
+            Support.YES, Support.YES, "同 0.3.11"
         ),
         has_dfs_replica=Capability(Support.YES, Support.UNKNOWN, "写入路径待核对"),
         has_admin_query=Capability(

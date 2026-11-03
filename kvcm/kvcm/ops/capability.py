@@ -42,7 +42,7 @@ class BackendCapability:
     has_promotion: Capability  # 池通道提回
     has_per_key_demote: Capability  # 确定性立即降层
     has_task_cancel: Capability  # copy/move 任务取消
-    has_local_segment: Capability  # kvcm 运行时自己挂 DRAM 段
-    has_local_disk_mount: Capability  # kvcm 自己挂本机盘（落盘用）
+    has_local_segment: Capability  # kvcm 自己挂 DRAM 段（setup 时挂）
+    has_local_disk_mount: Capability  # kvcm 自己挂本机盘（setup 时挂）
     has_dfs_replica: Capability  # 共享文件系统副本
     has_admin_query: Capability  # 零副作用副本核验

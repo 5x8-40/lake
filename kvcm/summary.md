@@ -87,12 +87,17 @@
     - 决策条件：mooncake 能不能改（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）
 - retain：🟡 机制已定，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
-  - 清理看副本所在 client，不看 key 的 client_id。没有保留身份注册
-  - `retain` 只表达 move/copy，返回任务号。DFS（main）是另一条：下线不清；用量到高水位后，lease 过期且没 pin 的会被 `RunDfsEviction` 逐，要续租。kvcm 挂自己的盘卸不来引擎上的字节（offload 只认本机内存），不作为现在的做法
-  - 降到源引擎自己的盘：master 清登记，文件还在。这台机器的 store 再启动会用新 client_id 扫盘重新登记。引擎不再来，或换机器读，接不上。改 key 的 client_id 也留不住
-  - NoF 段不随 client 过期被摘（`USE_NOF` 默认关）。摘段看盘心跳，不看挂载它的 client 死没死
-  - `#2991` 只是同一个 client_id 的重连窗口。窗口内 Ping 保住的是登记，字节仍在死进程里。窗口过后 worker 清这个 client 的内存副本和本机盘副本
-  - 计划下线：先迁走，再用 `GracefulUnmountSegment` / `CreateDrainJob` 收口
+  - 依据：清理只看副本挂在谁身上（内存副本跟段、盘副本跟登记它的 client），不看 key 的 client_id。要保留的是 KV 本身，不是那块内存
+  - 四条可行路，顺序与 D2 时序图一致：
+    - DFS 副本（main，正式路径）：写共享 3FS，下线清理不清它；但用量到高水位后 lease 过期且没 pin 的会被逐，要续租
+    - move/copy 到还活着的 seg（E5 已证）
+    - kvcm 自己挂段挂盘：`setup(global_segment_size)` + `setup(enable_ssd_offload, ssd_offload_path)` 启动时把 DRAM 段和本机盘一起挂上，再把副本 copy/move 进自己的段，由盘侧心跳落到自己的盘，最后 `NotifyOffloadSuccess` 登记（内部走 `AddReplicaForRetainedClient`）
+    - 用旧 `client_id` 接管盘上数据：`MasterClient(旧id)` + `MountSegment`（参数自己填）+ `NotifyOffloadSuccess`（会更新已有 LOCAL_DISK 副本的 endpoint）
+  - `AddReplicaForRetainedClient` 只登记元数据、不写盘：它的 `LocalDiskDescriptor` 只有 `client_id / object_size / transport_endpoint`，没有 `file_path`。必须先写文件再上报
+  - 内存里那份随进程消失，所以要在引擎消失前把它转成别的载体。什么时候转、转去哪台，归编排层
+  - 降到源引擎自己的盘、但没人接管：master 清登记，文件还在。同一台机器的 store 再启动会扫盘重新登记；引擎不再来或换机器读，就断了
+  - 改 key 的 `client_id` 留不住：改的是鉴权字段，副本还在原段上
+  - `#2991` 只是同一个 client_id 的重连窗口。窗口内 Ping 保住的是登记，字节仍在死进程里
   - 长期未命中 → demote 到 SSD，由策略层定。这是防驱逐，不是换 client
 - demote / promote：🟡 设计完成，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
   - 框架：语义是原子的，实现是组合动作（池通道或 kvcm 读写组合 + 核验）；存储统一归 mooncake（引擎实例挂本机 SSD 做分层，kvcm 自己不持存储）
@@ -107,7 +112,7 @@
   - copy/move 到不了 SSD（disk seg 没有 seg 名，两版本同）
   - 触发时机（会话结束 / 变冷 / DRAM 压力 / 计划下线）归策略层
   - 真正的功能缺口：写回模式下确定性的 demote——没有 per-key 降层 RPC，`BatchReplicaClear` 又限 key 的 client_id，offload 取消也不对外 → 需要池侧扩展
-  - 确定性路径 = kvcm 挂 DRAM 段与本机盘，把副本搬进自己的段再由盘侧心跳落盘（D2 §3 / §4）。通道照 `native/empty_soft_pin.cpp` 补自封装 .so。`AddReplica` 不是独立 RPC，是 `NotifyOffloadSuccess` 的内部步骤；代价 = kvcm 变数据面，承担带宽与可用性
+  - 确定性路径 = kvcm 挂 DRAM 段与本机盘，把副本搬进自己的段再由盘侧心跳落盘（D2 §3 / §4）。挂段挂盘都在 `setup()` 时做，不用补通道。`AddReplica` 不是独立 RPC，是 `NotifyOffloadSuccess` 的内部步骤；代价 = kvcm 变数据面，承担带宽与可用性
   - 每个操作都有完成信号；READY 特指 DRAM 副本写好、可以调度
 - release：✅ 已闭环，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
   - 决策归属 D1 §6
@@ -128,7 +133,6 @@
     - `BatchQueryIp`（两版本）：client_id→IP，副本位置解析的最后一环
     - `GetStorageUsageSnapshot`（main）：分层容量快照，demote 触发输入
     - 台账失效通知（main）：KV 事件流 removed/cleared；stored 事件没有位置信息，代替不了定期比对
-    - `MountNoFSegment`：client 过期不摘这段（`ClientExpiryDoesNotUnmountNoFSegment`）。盘心跳失败才摘（`TryUnmountNoFSegmentByHeartbeat`）。`USE_NOF` 默认关
     - `ReMountSegment` 排除：重连时重新登记，不是复活旧副本
     - 租户配额五件套（main）：tenant 在 `Client::Create` 绑定，client 级粒度，正好匹配「一个模型版本一个租户」
   - 否决项：
@@ -153,7 +157,7 @@
   - 预复制不续租的话，一个 TTL 窗口内没有读流量就可能被驱逐
   - 约束已定：保活循环必须有界——无限续租事实上等于 pin；kvcm 断线后租约到期自然失效，不残留
   - 策略未定：续多久、何时停——候选 = 会话期 / 固定窗口 / 首流量后停租，未选定
-- key 的 client_id 下线后的副本存亡：🟡 机制已定（D2 §4）——副本跟着所在 client。死前 move/copy 到活段留得住；kvcm 自己挂段挂盘把副本收进名下也留得住（通道补自封装 .so）；DFS 副本下线不清，用量到高水位后 lease 过期且没 pin 会被逐，要续租。NoF 段不随 client 过期被摘。源引擎自己的盘：登记会被清，文件还在，这台机器的 store 再启动会重新登记。没有保留身份注册。拿旧 client_id 去 Ping 只保住窗口内的登记
+- key 的 client_id 下线后的副本存亡：🟡 机制已定（D2 §4）——副本跟着所在 client。死前 move/copy 到活段留得住；kvcm 自己挂段挂盘把副本收进名下也留得住（挂段挂盘在 setup 时做）；DFS 副本下线不清，用量到高水位后 lease 过期且没 pin 会被逐，要续租。源引擎自己的盘：登记会被清，文件还在，这台机器的 store 再启动会重新登记。没有保留身份注册。拿旧 client_id 去 Ping 只保住窗口内的登记
 - 计划下线迁移：归 D2 retain 条（`CreateDrainJob` 两版本都有，把指定 seg 上的数据迁空到目标 seg，带并发上限、job 级可取消）
 - 落盘（写到 SSD）：Mooncake 的 DRAM→SSD 是池内冷热分层（client 侧 `enable_ssd_offload`，默认 `false`），不是「预复制时直接指定写盘」；SSD 只作容量/恢复用的异步 demote 去向（机制归 D2 demote 条）
 - 直接影响故障恢复时已预热前缀的可用性（D5，已闭环，见本文）。事实输入：E5（已闭环，见本文 E 节）。
