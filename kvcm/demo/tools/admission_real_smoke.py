@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """PR72 #24 真测：段剩余 = master Capacity−Used；need 来自真副本大小。
 
-容器内：
-  python3 kvcm/demo/tools/admission_real_smoke.py
+真机手工冒烟，不进 GitHub Actions（需 NPU + master + 引擎 warm）。
+Actions 只覆盖假 admin 单测（``kvcm/tests/test_backend.py`` 准入用例）。
 
 做法：
-  1) NPU 6/7 挂两个很小的空段（16MiB，远小于一个 KV block）
+  1) 合成空段（默认卡 6/7，各 16MiB，远小于一个 KV block）
   2) 新鲜 prompt warm 进池（真 key、真 size）
   3) TaskEngine 预热到这两个小段
-期望：准入看见 need > remaining → 闸外等到超时，create_copy_task=0
+期望：need > remaining → 闸外等到超时，create_copy_task=0
+
+环境变量（缺省 = 45 机 #24 口径）::
+
+    ADMIT_HOST ADMIT_MASTER ADMIT_ADMIN ADMIT_MODEL_PATH ADMIT_MODEL_NAME
+    ADMIT_SERVED ADMIT_WARM_URL ADMIT_SYNTH_DEVICES ADMIT_COORD_DEVICE
+    ADMIT_COORD_PORT ADMIT_LEDGER ADMIT_SEG_BYTES
 """
 
 from __future__ import annotations
@@ -22,9 +28,12 @@ import sys
 import time
 import uuid
 import urllib.request
+from pathlib import Path
 
 os.environ.setdefault("PYTHONHASHSEED", "0")
-sys.path.insert(0, "/data/w84156052-104-45/lake/kvcm")
+_DEMO = Path(__file__).resolve().parents[1]
+_KVCM = _DEMO.parent
+sys.path.insert(0, str(_KVCM))
 
 from transformers import AutoTokenizer
 
@@ -38,20 +47,30 @@ from kvcm.ledger import Ledger
 from kvcm.ops.types import InstanceId, Prefix
 from kvcm.task_engine import TaskEngine
 
-HOST = "7.242.104.45"
-MASTER = f"{HOST}:50088"
-ADMIN = "http://127.0.0.1:9003"
-MODEL_PATH = "/data/models/Qwen3.8-27B"
-MODEL_NAME = "Qwen3.8-27B"
-SERVED = "qwen38-27b"
-BLOCK_SIZE = 1536
-TP = 2
-TARGET = InstanceId("inst-admit-real")
-COORD_DEVICE = 2
-COORD_PORT = 13037
-LEDGER = "/tmp/kvcm_admit_real_ledger.sqlite"
+HOST = os.environ.get("ADMIT_HOST", "7.242.104.45")
+MASTER = os.environ.get("ADMIT_MASTER", f"{HOST}:50088")
+ADMIN = os.environ.get("ADMIT_ADMIN", "http://127.0.0.1:9003")
+MODEL_PATH = os.environ.get("ADMIT_MODEL_PATH", "/data/models/Qwen3.8-27B")
+MODEL_NAME = os.environ.get("ADMIT_MODEL_NAME", "Qwen3.8-27B")
+SERVED = os.environ.get("ADMIT_SERVED", "qwen38-27b")
+WARM_URL = os.environ.get("ADMIT_WARM_URL", "http://127.0.0.1:8001/v1/completions")
+_SYNTH_SPEC = (
+    ("6", "23000", "28300-28334"),
+    ("7", "23100", "28400-28434"),
+)
+_SYNTH_WANT = [
+    d.strip()
+    for d in os.environ.get("ADMIT_SYNTH_DEVICES", "6,7").split(",")
+    if d.strip()
+]
+BLOCK_SIZE = int(os.environ.get("ADMIT_BLOCK_SIZE", "1536"))
+TP = int(os.environ.get("ADMIT_TP", "2"))
+TARGET = InstanceId(os.environ.get("ADMIT_TARGET", "inst-admit-real"))
+COORD_DEVICE = int(os.environ.get("ADMIT_COORD_DEVICE", "2"))
+COORD_PORT = int(os.environ.get("ADMIT_COORD_PORT", "13037"))
+LEDGER = os.environ.get("ADMIT_LEDGER", "/tmp/kvcm_admit_real_ledger.sqlite")
 # 真 block ~25–50MiB；master 段下限 16MiB，仍远小于一个 block → need > remaining
-SEG_BYTES = 16 * 1024 * 1024
+SEG_BYTES = int(os.environ.get("ADMIT_SEG_BYTES", str(16 * 1024 * 1024)))
 
 
 def http_json(url: str, payload: dict, timeout: float = 300) -> dict:
@@ -142,8 +161,28 @@ def start_helper(phys, base_port, hccl, port_hint):
     return p, stop, seg
 
 
+def _synth_specs() -> list[tuple[str, str, str]]:
+    by_dev = {phys: (phys, base, hccl) for phys, base, hccl in _SYNTH_SPEC}
+    out: list[tuple[str, str, str]] = []
+    for phys in _SYNTH_WANT:
+        if phys not in by_dev:
+            raise SystemExit(
+                f"ADMIT_SYNTH_DEVICES 含未知卡 {phys!r}；"
+                f"本脚本只预置 {[p for p, _, _ in _SYNTH_SPEC]}"
+            )
+        out.append(by_dev[phys])
+    if len(out) != 2:
+        raise SystemExit("ADMIT 冒烟需要恰好 2 个合成 seg（TP=2）")
+    return out
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
+    print(
+        f"[cfg] host={HOST} master={MASTER} model={MODEL_PATH} "
+        f"warm={WARM_URL} synth={_SYNTH_WANT} seg_bytes={SEG_BYTES}",
+        flush=True,
+    )
     uid = uuid.uuid4().hex[:12]
     tok = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     base = f"admitreal-{uid}- "
@@ -159,10 +198,16 @@ def main() -> int:
     if n_full < 1:
         return 2
 
-    print("[1] mount tiny synth segs on NPU 6/7…", flush=True)
+    specs = _synth_specs()
+    print(
+        f"[1] mount tiny synth segs on NPU {','.join(p for p, _, _ in specs)}…",
+        flush=True,
+    )
     suffix = int(time.time()) % 10000
-    p0, s0, seg0 = start_helper("6", "23000", "28300-28334", 19200 + suffix)
-    p1, s1, seg1 = start_helper("7", "23100", "28400-28434", 19300 + suffix)
+    helpers = []
+    for i, (phys, base_port, hccl) in enumerate(specs):
+        helpers.append(start_helper(phys, base_port, hccl, 19200 + suffix + i * 100))
+    (p0, s0, seg0), (p1, s1, seg1) = helpers
     synth = [seg0, seg1]
     print(f"[1] synth={synth}", flush=True)
 
@@ -206,7 +251,7 @@ def main() -> int:
     print("[3] warm A…", flush=True)
     t_warm = time.time()
     http_json(
-        "http://127.0.0.1:8001/v1/completions",
+        WARM_URL,
         {"model": SERVED, "prompt": prompt, "max_tokens": 1, "temperature": 0},
     )
     print(f"[3] warm {time.time()-t_warm:.1f}s", flush=True)

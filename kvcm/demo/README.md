@@ -27,7 +27,7 @@
 | PR70 跨机同构 TP2（45↔225，Qwen3.8-27B hybrid，2026-10-29） | **主链路通过**（SubmitIntent ~11s READY，External hit 59.1%）；**并发度：14 `create_copy_task` 全成、42 约半挂**（`NO_AVAILABLE_HANDLE` = master 留内存失败，不是 #16 的建链 `TRANSFER_FAIL`）——网卡限速仍归 E15，见 [EXPERIMENTS.md](EXPERIMENTS.md) #17 |
 | PR71 E14 补发 BlockStored（2026-11-02，#23） | **发件人侧通过**；假发布器 `@pytest.mark.smoke`（CI 可跑）；真机 `@pytest.mark.npu`（`KVCM_NPU_SMOKE=1`，不进 Actions）；warm→225=A 近满 spill — 见 [EXPERIMENTS.md](EXPERIMENTS.md) #23 |
 | NAH 根因对照（#18–#22，2026-10-30～11-02） | **驳回「字节见底」单因**（失败时仍有数百 MB free）；空闲 segment 上 window=4 不复现；半占用(~50%)+闸4×42 可稳复现；B seg **1GB→4GB 同风暴 NAH 消失**——见 [EXPERIMENTS.md](EXPERIMENTS.md) #18/#19/#22 |
-| PR72 段容量准入（#24，2026-11-02） | **通过**：16MiB 合成空段 + 真 warm（need≈50MiB）→ 闸外准入等待 → `stopped before submit`，`create_copy_task=0`——见 [EXPERIMENTS.md](EXPERIMENTS.md) #24；[`tools/admission_real_smoke.py`](tools/admission_real_smoke.py) |
+| PR72 段容量准入（#24，2026-11-02） | **通过**：16MiB 合成空段 + 真 warm（need≈50MiB）→ `stopped before submit`，`create_copy_task=0`；真机脚本**手工**（不进 Actions）— 见 [EXPERIMENTS.md](EXPERIMENTS.md) #24 |
 
 完整实验史（总表至 #24 + 异构实录 + 撤回记录；含 #17 跨机并发度、#18–#22 NAH 对照、#23 E14 补发、#24 段容量准入）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」；总结与待办见 [summary.md](../summary.md)。
 
@@ -356,7 +356,7 @@ demo/
 | `README.md` | 本文：demo 端到端说明 |
 | `REPRODUCE.md` | 客户复现参考：结论 + 必配项 + 「读本机副本」判定方法 |
 | `EXPERIMENTS.md` | 实验总表至 #24 + 异构实录 + 踩坑记录（含撤回历史；#16 daemon / #17 并发度 / #18–#22 NAH / #23 E14 / #24 段准入） |
-| `tools/admission_real_smoke.py` | PR72 #24：16MiB 合成段 + 真 warm，验 need>remaining 时不提交 |
+| `tools/admission_real_smoke.py` | PR72 #24：16MiB 合成段 + 真 warm，验 need>remaining 时不提交（真机手工，不进 Actions） |
 | [../design/kv-prefetch.md](../design/kv-prefetch.md) | copy/prefetch 专项设计（A 壳请求 / B2 副本复制；B2 已由本 demo 实测） |
 | [../design/D1-router-scheduling.md](../design/D1-router-scheduling.md) | 生产化设计 D1：Router 集成与请求调度 |
 | [../design/D2-kv-operations.md](../design/D2-kv-operations.md) | 生产化设计 D2：KV 调度操作集 |
