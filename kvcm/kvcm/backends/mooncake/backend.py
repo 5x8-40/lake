@@ -651,8 +651,8 @@ class MooncakeBackend(KvOps):
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         raise NotImplementedError("promote：随提回流程落地")
 
-    async def retain(self, prefix: Prefix) -> TaskHandle:
-        raise NotImplementedError("retain：死前把副本放到还活着的 client 上（D2 §4），尚未接通")
+    async def retain(self, prefix: Prefix, target: InstanceId | None = None) -> TaskHandle:
+        raise NotImplementedError("retain：做法见 D2 §4，尚未接通")
 
     async def remove(self, prefix: Prefix) -> None:
         raise NotImplementedError("remove：随删除流程落地")
