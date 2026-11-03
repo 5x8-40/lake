@@ -7,7 +7,7 @@
 
 完成信号：copy / move / promote 有 READY（任务状态完成 + 目标侧副本
 核验通过）。retain 的 READY 跟着做法走：用 copy/move 搬某实例时按
-copy/move 的规则上报 READY；搬进 kvcm 自己的段盘、mock 重挂、DFS
+copy/move 的规则上报 READY；搬进 kvcm 自己的段盘、用旧 client_id 接管、DFS
 则不上报 READY。其余方法（keepalive / stop_keepalive / pin / demote /
 remove）无 READY。任务状态经 query_task 查询。
 
@@ -172,7 +172,7 @@ class KvOps(ABC):
         做法决定完成信号（D2 §4）：
         - 给了 target、用 copy/move 搬到那台实例：返回搬运任务号，
           完成后那台实例具备服务这份前缀的条件（READY，可切流、停源实例）
-        - 搬进 kvcm 自己的段盘 / mock 同一个 client_id 重挂 / DFS：
+        - 搬进 kvcm 自己的段盘 / 用旧 client_id 接管盘上数据 / DFS：
           副本不落在某台引擎的 DRAM 上，没有可切流的实例；返回的任务号
           用于跟这次搬运，完成后用副本查询确认在册
 
