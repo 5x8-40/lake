@@ -53,7 +53,7 @@ from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.capability import mooncake_main, mooncake_v0311
 from kvcm.backends.mooncake.client import StoreClient
 from kvcm.engines.vllm.keys import KeyComputer
-from kvcm.events.publisher import BlockStoredPublisher, parse_kv_event_endpoints
+from kvcm.api.events import EventPublisher, parse_kv_event_endpoints
 from kvcm.ledger import Ledger
 from kvcm.loops import KeepaliveLoop
 from kvcm.task_engine import TaskEngine
@@ -205,7 +205,7 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
             window_s=args.keepalive_window_s,
             executor=backend.executor,
         )
-        events = BlockStoredPublisher(
+        events = EventPublisher(
             parse_kv_event_endpoints(getattr(args, "kv_event_endpoint", None)),
             block_size=args.block_size,
             hash_algo=args.hash_algo,

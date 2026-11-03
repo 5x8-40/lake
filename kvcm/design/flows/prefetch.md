@@ -121,6 +121,6 @@ sequenceDiagram
 - **locate**：目标实例 → rank 有序 seg 列表（demo 探测 / 生产实例注册）
 - **StoreClient**：绑定 RPC（exists / copy 提交 / query_task / 副本核验）
 - **Ledger**：任务状态（running → ready/failed/abandoned）
-- **EventPublisher**：`TaskEngine` 在 READY 后按目标实例补发一条 `BlockStored`（`kvcm/events/publisher.py`）。不调用 `/register`。把地址交给索引归 E13
+- **EventPublisher**：`TaskEngine` 在 READY 后按目标实例补发一条 `BlockStored`（`kvcm/api/events.py`）。不调用 `/register`。把地址交给索引归 E13
 - **keepalive**：`TaskEngine` 在 READY 后注册保活（见
   [../code-architecture.md](../code-architecture.md) 运行时结构节）

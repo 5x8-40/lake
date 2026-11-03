@@ -12,8 +12,8 @@ import pytest
 
 from conftest import run
 from kvcm.engines.vllm.keys import TokenBlockChain, hash_token_block_chain
-from kvcm.events.publisher import (
-    BlockStoredPublisher,
+from kvcm.api.events import (
+    EventPublisher,
     convert_block_hash,
     parse_kv_event_endpoints,
 )
@@ -82,7 +82,7 @@ def _publisher(endpoints, sink, *, block_size=2):
     def factory(endpoint: str) -> _Zmq:
         return _Zmq(endpoint, sink)
 
-    return BlockStoredPublisher(
+    return EventPublisher(
         endpoints,
         block_size=block_size,
         hash_algo="sha256",
@@ -95,7 +95,7 @@ def _publisher(endpoints, sink, *, block_size=2):
 
 def test_default_chain_is_raw_hash() -> None:
     """默认走 hash_token_block_chain，发出前过 convert_block_hash。"""
-    pub = BlockStoredPublisher({}, block_size=128, hash_algo="sha256")
+    pub = EventPublisher({}, block_size=128, hash_algo="sha256")
     assert pub._chain_fn is hash_token_block_chain
     assert pub._convert_fn is convert_block_hash
 
@@ -141,9 +141,9 @@ def test_same_instance_constructs_endpoint_once() -> None:
     sink: list[_Zmq] = []
     other = InstanceId("inst-A")
     pub = _publisher({str(_T): _ENDPOINT, str(other): "tcp://*:5558"}, sink)
-    pub.publish_ready(_P, _T)
-    pub.publish_ready(_P, _T)
-    pub.publish_ready(_P, other)
+    pub.publish_block_stored(_P, _T)
+    pub.publish_block_stored(_P, _T)
+    pub.publish_block_stored(_P, other)
     assert [z.endpoint for z in sink] == [_ENDPOINT, "tcp://*:5558"]
     assert len(sink[0].batches) == 2
     assert len(sink[1].batches) == 1
@@ -155,7 +155,7 @@ def test_missing_endpoint_prefetch_still_succeeds(caplog) -> None:
     pub = _publisher({}, sink)
     ka = FakeKeepalive()
     eng = TaskEngine(FakeOps(seq=[TaskStatus.READY]), keepalive=ka, events=pub)
-    with caplog.at_level(logging.WARNING, logger="kvcm.events.publisher"):
+    with caplog.at_level(logging.WARNING, logger="kvcm.api.events"):
         run(eng.run_once(_P, _T, poll_s=0.01))
         run(eng.run_once(_P, _T, poll_s=0.01))
     assert ka.registered == [_P, _P]
@@ -179,7 +179,7 @@ def test_publish_error_does_not_fail_ready() -> None:
     """补发抛错也不能把已核验的预热打成失败。"""
 
     class Boom:
-        def publish_ready(self, prefix, target) -> None:
+        def publish_block_stored(self, prefix, target) -> None:
             raise RuntimeError("zmq down")
 
         def shutdown(self) -> None:
@@ -236,7 +236,7 @@ def test_empty_block_chain_does_not_publish() -> None:
 
     pub = _publisher({str(_T): _ENDPOINT}, sink)
     pub._chain_fn = empty
-    pub.publish_ready(_P, _T)
+    pub.publish_block_stored(_P, _T)
     assert sink == []
 
 
@@ -254,7 +254,7 @@ def test_parent_block_hash_is_converted_when_present() -> None:
 
     pub = _publisher({str(_T): _ENDPOINT}, sink)
     pub._chain_fn = chain
-    pub.publish_ready(_P, _T)
+    pub.publish_block_stored(_P, _T)
     event = sink[0].batches[0].events[0]
     assert event.block_hashes == [_convert(_RAW)]
     assert event.parent_block_hash == _convert(_PARENT)
@@ -284,7 +284,7 @@ def test_real_publisher_uses_put_nowait() -> None:
 
     pub = _publisher({str(_T): _ENDPOINT}, [])
     pub._factory = factory
-    pub.publish_ready(_P, _T)
+    pub.publish_block_stored(_P, _T)
     assert len(made) == 1
     assert made[0].publish_called is False
     batch = q.get_nowait()
@@ -314,7 +314,7 @@ def test_full_queue_logs_and_keeps_ready(caplog) -> None:
     pub._factory = lambda endpoint: _Queued()
     ka = FakeKeepalive()
     eng = TaskEngine(FakeOps(seq=[TaskStatus.READY]), keepalive=ka, events=pub)
-    with caplog.at_level(logging.WARNING, logger="kvcm.events.publisher"):
+    with caplog.at_level(logging.WARNING, logger="kvcm.api.events"):
         run(eng.run_once(_P, _T, poll_s=0.01))
     assert ka.registered == [_P]
     assert q.get_nowait() == "sentinel"
@@ -341,7 +341,7 @@ def test_engine_shutdown_closes_publisher() -> None:
     async def scenario():
         eng = TaskEngine(FakeOps(), events=pub)
         eng.start()
-        pub.publish_ready(_P, _T)
+        pub.publish_block_stored(_P, _T)
         await eng.shutdown(timeout_s=1)
 
     run(scenario())

@@ -47,7 +47,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable
 
-from kvcm.events.publisher import BlockStoredPublisher
+from kvcm.api.events import EventPublisher
 from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
 from kvcm.ledger import prefix_key
 from kvcm.loops import KeepaliveLoop
@@ -115,7 +115,7 @@ class TaskEngine:
         queue_size: int = 0,
         consumer_count: int | None = None,
         finished_max: int = 25600,
-        events: BlockStoredPublisher | None = None,
+        events: EventPublisher | None = None,
     ) -> None:
         """
         max_concurrent：传输闸名额。一个名额 = 一个前缀正停在
@@ -540,7 +540,7 @@ class TaskEngine:
         if self._events is None or prefix is None or target is None:
             return
         try:
-            self._events.publish_ready(prefix, target)
+            self._events.publish_block_stored(prefix, target)
         except Exception:
             logger.exception(
                 "kvcm 补发 BlockStored 失败 target=%s（预热仍成功）", target

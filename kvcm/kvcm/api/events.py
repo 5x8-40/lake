@@ -1,10 +1,14 @@
-"""按目标实例补发一条 BlockStored。
+"""EventPublisher：KV 事件补发（上行通道）。
 
-复制不经过引擎，引擎不会发「这块 KV 已经在目标上」。kvcm 在 READY
-之后用上游 ``ZmqEventPublisher`` 补一条。wire 格式（topic +
-seq + msgpack）在上游发布器里，这里不另写一套。真正的发布器对
-``_event_queue`` 调 ``put_nowait``，避免 ``publish`` 里的 ``Queue.put``
-在队列满时卡住事件循环；没有该队列的发布器仍走 ``publish``。
+预热 READY 后按目标实例端点补发引擎格式的 BlockStored 事件——预复制
+完全在引擎之外发生，引擎通道与池通道都不会自动产生这件事的事件，只
+能由本进程补发。事件格式由引擎适配器提供（schema 归引擎侧）。
+
+复制不经过引擎，引擎不会发「这块 KV 已经在目标上」。本层用上游
+``ZmqEventPublisher`` 补一条。wire 格式（topic + seq + msgpack）在上游
+发布器里，这里不另写一套。真正的发布器对 ``_event_queue`` 调
+``put_nowait``，避免 ``publish`` 里的 ``Queue.put`` 在队列满时卡住事件
+循环；没有该队列的发布器仍走 ``publish``。
 
 身份 = 端点：每个目标实例一个端点，``data_parallel_rank`` 固定 0，
 不做 DP 端口偏移。第一次要给该实例补发时才构造发布器；本进程内不因
@@ -75,7 +79,7 @@ def parse_kv_event_endpoints(items: Sequence[str] | None) -> dict[str, str]:
     return out
 
 
-class BlockStoredPublisher:
+class EventPublisher:
     """每个目标实例一个上游发布器，READY 时补一条 BlockStored。"""
 
     def __init__(
@@ -100,7 +104,7 @@ class BlockStoredPublisher:
         self._pubs: dict[str, Any] = {}
         self._missing: set[str] = set()
 
-    def publish_ready(self, prefix: Prefix, target: InstanceId) -> None:
+    def publish_block_stored(self, prefix: Prefix, target: InstanceId) -> None:
         """向该实例的端点补发一条 BlockStored。
 
         没有端点：打一次日志并返回。不抛——调用方已经核验通过，
