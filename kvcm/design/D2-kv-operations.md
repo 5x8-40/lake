@@ -234,7 +234,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 - **DFS 副本**（main）：不挂任何 client。下线清理不删它（`ProcessClientOffboardingJob` 只清内存副本和本机盘副本，`master_service.cpp:2965-2976`）。描述里有 `file_path`，挂同一共享目录的机器按路径读
   - 下线清理不删，不等于一直留着。用量到高水位（默认 0.9）之后，`RunDfsEviction` 才按 LRU 删 lease 已过期、又没有 pin 挡住的 DFS 副本。`eviction_enabled` 默认开。用 DFS 做 retain 时要续租
 - **没有「保留身份」这种东西**（两个版本都没有）。`AddReplicaForRetainedClient` 是 master 内部函数：这个 client 还没 `OFFLINE` 时，给它登记一块 `LOCAL_DISK`；`dummy_client.h` 的 `kRetained` 是外部内存的引用计数。两者都不是注册接口
-- **`#2991` 是重连窗口，不是保留机制**。它给每个 client 一条 `ACTIVE → SUSPECTED → OFFLINE` 的状态机（默认 10 秒 + 20 秒）。同一个 `client_id` 在变成 `OFFLINE` 之前 `Ping` 或重新挂盘，登记还在。但字节仍在原进程的地址和原传输端点上——`Ping` 本身不搬字节，要真接回来得靠 §4 的做法（停服前 copy/move 搬走、或用旧 id 接管盘上数据）
+- **`#2991` 是重连窗口，不是保留机制**。它给每个 client 一条 `ACTIVE → SUSPECTED → OFFLINE` 的状态机（默认 10 秒 + 20 秒）。同一个 `client_id` 在变成 `OFFLINE` 之前 `Ping` 或重新挂盘，登记还在。但字节仍在原进程的地址和原传输端点上——`Ping` 本身不搬字节，要真接回来得靠 §4 的做法（引擎消失前 copy/move 搬走、或用旧 id 接管盘上数据）
 
 **③ 下线与运维**
 - `UnmountLocalDiskSegment`（main 新增——0.3.11 挂了本地盘就摘不掉）：引擎死前主动摘掉盘的登记（效果等同死后被清，但更干净可控）
@@ -711,10 +711,10 @@ sequenceDiagram
     end
 
     rect rgb(223, 242, 223)
-    Note over E,DFS: 计划内缩容：停服前用做法②把副本搬进 kvcm 的段（内存数据只有这一条路）<br/>fork / 共享内存都要改引擎，不作方案
+    Note over E,DFS: 保住内存数据只有一条路：引擎消失之前 copy/move 搬进 kvcm 或别的活 client 的段<br/>fork / 共享内存都要改引擎，不作方案
     K->>M: copy 或 move 副本到 kvcm 自己的段
     K->>KS: 落到 kvcm 的盘
-    Note over E: 搬完之后才停引擎
+    Note over E: 搬完引擎才消失（怎么消失归编排层）
     end
 
     rect rgb(223, 242, 223)
@@ -1000,7 +1000,7 @@ sequenceDiagram
       - `fork` 必须在目标进程内执行，kvcm 是独立进程，够不着
       - 共享内存要求引擎用 `MAP_SHARED` 分配段，那是改 mooncake 的分配路径
     - 所以保住内存数据的手段就是上面做法②的前半段：kvcm 挂自己的段，把副本 `copy`（留源）或 `move`（搬走）到自己段上。搬完副本所在 client 就是 kvcm，引擎随即可停
-    - 这也是为什么「计划缩容」要在停服**之前**做，不是停服之后想办法
+    - 时机：这件事必须在**引擎消失之前**完成。引擎是怎么消失的（计划缩容还是异常退出）不在本操作范围内——那是编排层决定何时调 retain 的问题
   - **用旧 `client_id` 接管盘上的数据**（两版本都可行，前提见下）
     - 场景：引擎死在原地、数据已经落在它自己的盘上，但没有第三方（kvcm）事先把副本收走。这时只能靠「冒充它」把盘上的东西接回来
     - 机制：`Client` 的 `client_id` 写死在构造里（`client_id_(generate_uuid())`，没有入参），所以**不用 `Client`**；直接用 public 的 `MasterClient(const UUID& client_id, ...)`，拿旧 id 建一个，之后所有 RPC 都以旧身份发出
@@ -1009,7 +1009,7 @@ sequenceDiagram
       - `base` 填新进程实际能访问的地址，自己 `RegisterLocalMemory` 进去即可；不要求和旧值相同
     - 盘副本怎么接回来：master 下线清理只摘登记、不删盘上文件。新进程起来后由 `FileStorage::Init` 扫盘（`ScanMeta`）再 `NotifyOffloadSuccess` 上报，登记就回到这个 `client_id` 名下
       - 顺带一条现成容错：`OffloadObjectHeartbeat` 收到 `SEGMENT_NOT_FOUND` 时，`FileStorage` 会自己重挂盘段、再触发 `ScanMeta` 重登记（`file_storage.cpp`）。master 重启或盘段丢了都走这条
-    - 内存副本接不回来：字节在匿名私有内存里，进程死透就被内核回收。这条路救的是**已经落盘**的那部分。要保内存里的，走上面「计划内交接」
+    - 内存副本接不回来：字节在匿名私有内存里，进程死透就被内核回收。这条路救的是**已经落盘**的那部分。要保内存里的，走上面「copy / move 搬出来」
     - 参数不用猜：`/get_segments_detail` 返回 `segment_name / segment_id / client_id / base_address / size_bytes / te_endpoint / protocol`；`host_id` 默认取 `local_hostname` 去端口，也可用 `MOONCAKE_HOST_ID` 固定
     - 限制
       - 同一台机器、源进程已经死透。源进程还活着时抢同一个 `client_id` 就是两个进程争一份身份
