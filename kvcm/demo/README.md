@@ -24,7 +24,7 @@
 | 异构跨机 245(TP2)→217(TP4)（2026-10-09，需容器补丁） | **通过** + **杀源实例法确证读本机副本**（仅剩 217 副本时 B 首中 768 token 全部外部 get 成功） |
 | 异构跨机正向 245(TP2)→217(TP4) 回归（2026-10-12，bc6b5be 单入口 + #15835 补丁） | **通过**：32 keys READY、8/8 token 逐字一致、零 invalid、external hit 88.2%（滚动累计口径，非单请求） |
 | 异构跨机反向 217(TP4)→245(TP2) **同步 load**（2026-10-12，bc6b5be + #15835 补丁） | **通过**：36/36 key 对号、每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 分发生效、8/8 token 逐字一致、74.6→79.7% hit、零 invalid |
-| PR70 跨机同构 TP2（45↔225，Qwen3.8-27B hybrid，2026-10-29） | **主链路通过**（SubmitIntent ~11s READY，External hit 59.1%）；**并发度：14 全成、42 约半挂**（`NO_AVAILABLE_HANDLE`）——E15 限速为刚需，见 [EXPERIMENTS.md](EXPERIMENTS.md) #17 |
+| PR70 跨机同构 TP2（45↔225，Qwen3.8-27B hybrid，2026-10-29） | **主链路通过**（SubmitIntent ~11s READY，External hit 59.1%）；**并发度：14 `create_copy_task` 全成、42 约半挂**（`NO_AVAILABLE_HANDLE` = master 留内存失败，不是 #16 的建链 `TRANSFER_FAIL`）——网卡限速仍归 E15，见 [EXPERIMENTS.md](EXPERIMENTS.md) #17 |
 | PR71 E14 补发 BlockStored（2026-11-02，#23） | **发件人侧通过**；假发布器 `@pytest.mark.smoke`（CI 可跑）；真机 `@pytest.mark.npu`（`KVCM_NPU_SMOKE=1`，不进 Actions）；warm→225=A 近满 spill — 见 [EXPERIMENTS.md](EXPERIMENTS.md) #23 |
 | NAH 根因对照（#18–#22，2026-10-30～11-02） | **驳回「字节见底」单因**（失败时仍有数百 MB free）；空闲 segment 上 window=4 不复现；半占用(~50%)+闸4×42 可稳复现；B seg **1GB→4GB 同风暴 NAH 消失**——见 [EXPERIMENTS.md](EXPERIMENTS.md) #18/#19/#22 |
 | PR72 段容量准入（#24，2026-11-02） | **通过**：16MiB 合成空段 + 真 warm（need≈50MiB）→ 闸外准入等待 → `stopped before submit`，`create_copy_task=0`——见 [EXPERIMENTS.md](EXPERIMENTS.md) #24；[`tools/admission_real_smoke.py`](tools/admission_real_smoke.py) |
