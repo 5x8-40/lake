@@ -427,7 +427,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 
 | 功能 | 卡点 | kvcm 现状手段 |
 |---|---|---|
-| 写回模式确定性 demote（含「只清 DRAM 副本、留盘副本」） | 无 per-key 降层 RPC（两版本同）+ `BatchReplicaClear` 限 key 的 client_id（F6②） | 停保活进驱逐候选，时机不可控；确定性路径 = kvcm 把副本搬进自己的段再落到自己的盘（§3 末、§4 做法②） |
+| 写回模式确定性 demote（含「只清 DRAM 副本、留盘副本」） | 无 per-key 降层 RPC（两版本同）+ `BatchReplicaClear` 限 key 的 client_id（F6②） | 停保活进驱逐候选，时机不可控；确定性路径 = kvcm 把副本搬进自己的段再落到自己的盘（§3 末、§4「kvcm 自己挂段挂盘」） |
 | 在途 copy/move 任务取消（止损） | 无任务取消 RPC（两版本同，P9） | 弃置 + 事后清副本——止不住在途带宽，只清结果 |
 
 **功能对齐，组合实现（mooncake 无直接可用接口）**
@@ -628,7 +628,7 @@ sequenceDiagram
     end
 
     rect rgb(222, 235, 247)
-    Note over K,KS: 确定性路径：kvcm 把副本搬进自己的段和自己的盘（与 §4 retain 做法②同一套）<br/>必须先有自己的段——offload 只收本机内存副本
+    Note over K,KS: 确定性路径：kvcm 把副本搬进自己的段和自己的盘（与 §4 retain「kvcm 自己挂段挂盘」同一套）<br/>必须先有自己的段——offload 只收本机内存副本
     K->>M: ① 挂 DRAM 段 + 本机盘（通道靠自封装 .so 补，见 §4）
     K->>M: ② copy / move 副本到 kvcm 自己的段
     K->>KS: ③ 盘侧心跳取 offload 任务，写进自己的盘
@@ -682,7 +682,7 @@ sequenceDiagram
 - 绿色与橙色的差别**只在触发者**（真实读流量 vs kvcm 反复调），master 派任务后的搬运链路完全相同——kvcm 触发同样依赖盘副本所在引擎在线
 - `ExistKey` 触发不了 promote（只授 lease、不计命中次数）；池的主动 RPC 链（`PromotionAllocStart`）只许盘副本所在引擎执行，kvcm 用不了——以上两条 kvcm 路径不依赖它；copy/move 接不了 SSD（F7 介质边界）
 
-**⑦ retain（源引擎下线后副本还在。绿 = 做得到的做法，灰 = 不做或做了也接不走字节，§4）**
+**⑦ retain（源引擎下线后 KV 还在；五方案时序：绿 = 正式路径、橙 = 过渡手段、灰 = 接受现状，§4）**
 
 ```mermaid
 sequenceDiagram
@@ -694,49 +694,36 @@ sequenceDiagram
     participant DFS as 共享 3FS
 
     rect rgb(223, 242, 223)
-    Note over E,DFS: 做法①（两版本）：死前 move / copy 到还活着的段
-    K->>M: CreateMoveTask 或 CreateCopyTask（目标是另一台还活着的引擎的段）
-    E--xM: 源引擎死
-    Note over M: 副本所在 client 已换成目标段的 client（F6b）→ 留着
+    Note over E,DFS: 正式路径①（main）：DFS 副本——解整机灭失（前提：部署 3FS）
+    E->>DFS: put / demote 写共享 3FS
+    E--xM: 引擎全灭
+    Note over M: 下线清理不删 DFS 副本<br/>但用量到高水位后，lease 过期且没 pin 的会被 LRU 逐，要续租
+    B->>DFS: 挂同一 DFS 的机器可读
     end
 
-    rect rgb(223, 242, 223)
-    Note over E,DFS: 做法②：kvcm 自己的段 + 自己的盘（两版本，通道补封装层）
-    K->>M: 挂 DRAM 段 + 本机盘
-    K->>M: copy / move 副本到 kvcm 自己的段（副本所在 client = kvcm）
+    rect rgb(255, 235, 214)
+    Note over E,DFS: 过渡①：move / copy 到还活着的段——E5 证实有效（清理按 seg 维度）
+    K->>M: CreateMoveTask 或 CreateCopyTask（目标是另一台还活着的引擎的段）
+    E--xM: 源引擎死
+    Note over M: 副本所在 client 已换成目标段的 client（F6b）→ 存活
+    end
+
+    rect rgb(255, 235, 214)
+    Note over E,DFS: 过渡②：kvcm 自己挂段挂盘——不依赖任何引擎存活的兜底（远期确定可行）
+    K->>M: 挂 DRAM 段 + MountLocalDiskSegment
+    K->>M: copy / move 副本到 kvcm 自己的段
     K->>KS: 盘侧心跳取 offload 任务，写进自己的盘
-    K->>M: NotifyOffloadSuccess 上报登记（盘副本绑 kvcm，F1）
+    K->>M: NotifyOffloadSuccess → AddReplicaForRetainedClient 登记盘副本
     E--xM: 引擎全灭
     Note over M: kvcm 名下盘副本存活；代价 = kvcm 带盘、变有状态，承担带宽与可用性
     end
 
-    rect rgb(223, 242, 223)
-    Note over E,DFS: 保住内存数据只有一条路：引擎消失之前 copy/move 搬进 kvcm 或别的活 client 的段<br/>fork / 共享内存都要改引擎，不作方案
-    K->>M: copy 或 move 副本到 kvcm 自己的段
-    K->>KS: 落到 kvcm 的盘
-    Note over E: 搬完引擎才消失（怎么消失归编排层）
-    end
-
-    rect rgb(223, 242, 223)
-    Note over E,DFS: 做法④：用旧 client_id 接管盘上数据（两版本，源进程已死透）<br/>MasterClient(旧id) + MountSegment 自己填参数，盘上文件由 ScanMeta 重登记
+    rect rgb(255, 235, 214)
+    Note over E,DFS: 过渡③：用旧 client_id 接管盘上数据——引擎已死透时唯一能把盘上东西接回来的路
     E--xM: 源进程死（数据已在盘上）
-    K->>M: MountSegment（旧 client_id，参数自己填）
-    K->>M: NotifyOffloadSuccess 登记盘副本
-    Note over M: 盘副本回到这个 client_id 名下；内存副本接不回
-    end
-
-    rect rgb(223, 242, 223)
-    Note over E,DFS: 做法⑤（main）：DFS 副本。下线不清，但用量到高水位后 lease 过期且没 pin 的会被 LRU 逐，要续租
-    E->>DFS: 写成 DFS 副本（描述里有 file_path）
-    E--xM: 引擎死
-    Note over M: 下线清理不删 DFS 副本
-    B->>DFS: 挂同一目录的机器按路径读
-    end
-
-    rect rgb(230, 230, 230)
-    Note over E,DFS: 不是 retain：只拿着旧 client_id 去 Ping（#2991）<br/>登记回来但字节仍在死进程里，不配合做法④接不回来
-    K->>M: Ping（同一个 client_id，尚未 OFFLINE）
-    Note over M: 窗口过后 worker 清这个 client 的内存副本和本机盘副本
+    K->>M: MasterClient(旧id) + MountSegment（参数自己填）
+    K->>M: NotifyOffloadSuccess（endpoint 更新成新进程的）
+    Note over M: 盘副本回到这个 client_id 名下；内存里那份已经没了
     end
 
     rect rgb(230, 230, 230)
@@ -744,7 +731,8 @@ sequenceDiagram
     end
 ```
 
-- 降到源引擎自己的盘留不住：盘副本登记在引擎的 client 上，引擎一死就清（§3）。改 key 的 `client_id` 也留不住：改的是鉴权字段，副本还在原段上（F6b）
+- 降到源引擎自己的盘、但没人接管：盘副本登记在引擎的 client 上，引擎一死登记就清（§3）。改 key 的 `client_id` 也留不住：改的是鉴权字段，副本还在原段上（F6b）
+- 内存里那份随进程消失，所以要在引擎消失前把它转成别的载体：搬到还活着的段（过渡①）、搬进 kvcm 的段再落盘（过渡②）、或本来就直接写进 DFS（正式路径①）
 
 **⑧ remove（release 四级时序：绿 = 软释放、蓝 = 主动 Remove、灰 = 全池清；决策归 D1 §6，§4）**
 
@@ -904,7 +892,7 @@ sequenceDiagram
   - 实例计划下线：下线前把 KV 降层保存
 - demote/promote 与 keepalive 是**独立操作**，但写回模式下有一处机制依赖：落盘由驱逐触发，而保活中的 key（lease 未过期）被驱逐硬过滤跳过（F8）——所以写回模式下 demote 想生效，须先停保活并等 lease 过期，否则驱逐永远轮不到它。写穿模式（put 时已落盘）和 promote（读盘写 DRAM，不经驱逐）都不受保活影响。「停保活」不等于「降层」，它是策略层的动作，不是 demote 语义的一部分
 - **存储形态：mooncake 统一管理**——引擎实例挂本机 SSD（`MountLocalDiskSegment`），DRAM + SSD 构成多级 tier；**kvcm 主路径不持存储**，只发控制指令。远期 kvcm 也可挂本机 SSD 把空闲资源用满——挂后 kvcm 名下盘副本可作 retain 的兜底（§4）
-- **copy/move 对两个方向都用不上**（F7 介质边界，两版本一致）：disk 不在 seg 名字空间——demote 拿 disk 当不了 copy/move 的**目标**；SSD 副本没有 seg 名——promote 拿它当不了 copy/move 的**源**。跨介质三条路：池通道（offload / promotion）、kvcm 读写组合（读删写）、kvcm 自己挂 SSD 登记（§4 做法②）
+- **copy/move 对两个方向都用不上**（F7 介质边界，两版本一致）：disk 不在 seg 名字空间——demote 拿 disk 当不了 copy/move 的**目标**；SSD 副本没有 seg 名——promote 拿它当不了 copy/move 的**源**。跨介质三条路：池通道（offload / promotion）、kvcm 读写组合（读删写）、kvcm 自己挂 SSD 登记（§4「kvcm 自己挂段挂盘」）
 - **版本说明**：本节的机制结论（介质边界、offload/promotion 通道、无立即降层入口）0.3.11 与 main 一致（main 增量全清单见 F13，均不改变本节主路径）
 
 ### 存储领域的冷热分级对照
@@ -937,7 +925,7 @@ sequenceDiagram
 - **缺口（池通道侧）**
   - **池通道没有「指定 key 立刻落盘」的 RPC**：offload 任务的入队时机只有 put 完成时（写穿）和驱逐选中时（写回）两处（两版本同），kvcm 通过池通道想让指定 key 立刻落盘做不到，池不满就永不落盘
   - 「立即清掉内存副本、只留盘副本」同属此缺口：`BatchReplicaClear` 校验请求者必须是 key 的 client_id（F6②），kvcm 的 UUID 对不上，调不动
-- **确定性方案：kvcm 把副本搬进自己的段，再落到自己的盘**（与 §4 retain 做法②同一套）
+- **确定性方案：kvcm 把副本搬进自己的段，再落到自己的盘**（与 §4 retain「kvcm 自己挂段挂盘」同一套）
   - 流程：kvcm 挂 DRAM 段与本机盘 → copy/move 副本到自己的段 → 盘侧心跳取到 offload 任务写进自己的盘 → `NotifyOffloadSuccess` 上报登记
   - 必须先有自己的段：`FileStorage::OffloadObjects` 只收本机内存副本（`IsReplicaOnLocalMemory`），offload 任务也只入队给源内存所在的 client
   - 通道：照 `kvcm/kvcm/native/empty_soft_pin.cpp` 写自封装 .so 补上运行时挂段/挂盘入口，不改 mooncake
@@ -967,25 +955,34 @@ sequenceDiagram
 
 ### retain（源引擎下线后副本还在）
 
-- **目标**：写入引擎下线后，它写的 KV 副本仍可用
+- **目标**：写入引擎消失后，它写进池里的 KV 仍可用。要保的是 KV 本身，不是「那块内存」——把内存里的 KV 转成别的载体（别的段、本机盘、共享文件系统）就算保住
 - **副本生死**（E5 已闭环，F6b）
   - 内存副本跟着它所在的段。段属于哪个 client，那个 client 下线，这份内存副本被清
   - 本机盘副本跟着登记它的 client。登记者下线，这份盘副本被清
   - DFS 副本不挂任何 client（main）。下线清理不删它。用量到高水位之后，lease 过期且没 pin 的会被 `RunDfsEviction` 删
   - 已经 copy 或 move 到别的机器上的副本，跟着那台机器的段。源引擎下线不清它
-- **做法**
-  - **move / copy 到还活着的段**（两版本，E5 已证实 move / 他机 copy）
+- **为什么「引擎消失前」是关键**：段内存是匿名私有映射（hugepage 用 `mmap(MAP_PRIVATE | MAP_ANONYMOUS)`，普通路径用 `aligned_alloc`），不共享、不落盘，进程一退出字节就被内核回收。要保的是这些字节里的 KV，就必须在退出前把它们写到别的载体上；写到哪儿决定了走下面哪条路
+- **四条可行路**（顺序与 main 的时序图一致：正式路径 → 过渡手段）
+  - **DFS 副本**（main，正式路径①）
+    - 不挂任何 client。下线清理的条件不覆盖它（`master_service.cpp:2965-2976`）
+    - 描述里有 `file_path`。挂同一共享目录的机器按路径读。整机没了也能读
+    - 这就是「把内存里的 KV 存到别的载体上」最直接的一条：写进共享文件系统，引擎死不死都不影响
+    - 驱逐不是 lease 一过期就发生：DFS 容量用到高水位（默认 0.9，`shard_allocator.cpp` 的 `PrepareEvictionFromShard`）才开始按 LRU 挑，lease 没过期或有 pin 挡住的留下，降到低水位停。回收单位取决于分配器：默认 `shard`（切成 64 个固定分片，按分片回收）或可选 `bucket`（若干对象装进不可变桶文件，按整桶回收；桶里任一个受保护就整桶跳过）。另有分配失败时强制回收一个的路径（`TryRecoverDfsSpaceAfterAllocationFailure`）
+    - 要留住就续租。完成看副本查询能看到这份 DFS 副本。DFS 的 `ScanMeta` 不支持，重启不会靠扫盘把 DFS 对象重新登记
+    - 前提：部署共享文件系统
+  - **move / copy 到还活着的段**（两版本，E5 已证实 move / 他机 copy；过渡①）
     - 目标是另一台确定后关的引擎的段
     - `move` 做完，副本所在 client 换成目标段的 client。`copy` 是多留一份，源还在
     - 必须在源进程还活着时做完。死后内存字节没了，复制任务派给原进程，原进程已经不在
     - **改 key 的 client_id 留不住数据**：改的是鉴权字段，副本还在原段上（F6b）
-  - **kvcm 自己挂段挂盘，把副本搬到自己名下再落盘**（两版本都可行，通道要补一层封装）
+  - **kvcm 自己挂段挂盘，把副本搬到自己名下再落盘**（两版本都可行，远期确定路径；过渡②；通道要补一层封装）
     - 为什么可行：副本生死只认「它挂在谁身上」——内存副本跟段、盘副本跟登记它的 client。kvcm 本来就是独立 client，把副本搬到 kvcm 的段上、写进 kvcm 的盘，副本就归 kvcm，引擎全灭照样在
     - 流程
       1. kvcm 挂一块 DRAM 段和一块本机 SSD（与引擎同样的挂法）
       2. 把目标副本 `copy` 或 `move` 到 kvcm 自己的段（此时副本所在 client = kvcm）
       3. kvcm 的盘侧心跳取到 offload 任务，把这份本地内存副本写进自己的盘
-      4. `NotifyOffloadSuccess` 登记盘副本（`AddReplica` 是这次上报的内部步骤，无在途任务时同样登记，F1）
+      4. `NotifyOffloadSuccess` 登记盘副本。内部走 `AddReplicaForRetainedClient`：这个 client 还没 `OFFLINE` 时，给它登记一块 `LOCAL_DISK`（F1）
+    - 第 2 步就是「把内存里的 KV 存到别的载体上」：副本一旦进了 kvcm 的段，引擎这时死掉也不影响它
     - 为什么必须先有段：两条约束叠在一起
       - `FileStorage::OffloadObjects` 的源只认本机内存副本：`IsReplicaOnLocalMemory` 拿副本描述里的 `transport_endpoint` 和 `GetTransportEndpoint()` 比，不是自己就跳过（`client_service.cpp`）
       - offload 任务只派给源内存副本所在 seg 的 client：`PushOffloadingQueue` 入队后，`OffloadObjectHeartbeat` 按 `client_id` 从 `local_ssd_manager_.SetOffloadingAndTakePending` 取本 client 的队列
@@ -994,53 +991,34 @@ sequenceDiagram
     - 效果：盘副本登记在 kvcm 名下，引擎全灭仍存活；也是远期「资源用满」的形态（§3 存储形态）
     - 代价：kvcm 机器要带盘、kvcm 自身变有状态；数据要经过 kvcm，kvcm 从此承担带宽与可用性责任——kvcm 不在了，这条兜底也就没了
     - 远端盘形态（可选）：`MountNoFSegment` 挂 NVMe-oF 远端盘（`USE_NOF`，默认关）。段仍登记在 kvcm 名下，但盘在远端阵列而不是本机。用它的唯一理由是不想给 kvcm 机器配本地盘；正常形态就是挂本机 SSD
-  - **保引擎内存里的数据，不改引擎只有一条路：copy / move 搬出来**
-    - 为什么必须先搬：段内存是匿名私有映射——hugepage 路径用 `mmap(MAP_PRIVATE | MAP_ANONYMOUS)`（`mmap_buffer.cpp`），普通路径用 `aligned_alloc`。都不与其他进程共享、也不落盘，进程一退出字节就被内核回收
-    - `fork` / 自建共享内存这两条也想过，都**要改引擎**，不作方案
-      - `fork` 必须在目标进程内执行，kvcm 是独立进程，够不着
-      - 共享内存要求引擎用 `MAP_SHARED` 分配段，那是改 mooncake 的分配路径
-    - 所以保住内存数据的手段就是上面做法②的前半段：kvcm 挂自己的段，把副本 `copy`（留源）或 `move`（搬走）到自己段上。搬完副本所在 client 就是 kvcm，引擎随即可停
-    - 时机：这件事必须在**引擎消失之前**完成。引擎是怎么消失的（计划缩容还是异常退出）不在本操作范围内——那是编排层决定何时调 retain 的问题
-  - **用旧 `client_id` 接管盘上的数据**（两版本都可行，前提见下）
+  - **用旧 `client_id` 接管盘上的数据**（两版本都可行，过渡③；前提见下）
     - 场景：引擎死在原地、数据已经落在它自己的盘上，但没有第三方（kvcm）事先把副本收走。这时只能靠「冒充它」把盘上的东西接回来
     - 机制：`Client` 的 `client_id` 写死在构造里（`client_id_(generate_uuid())`，没有入参），所以**不用 `Client`**；直接用 public 的 `MasterClient(const UUID& client_id, ...)`，拿旧 id 建一个，之后所有 RPC 都以旧身份发出
     - 段怎么挂：用 `MasterClient::MountSegment(const Segment&)`，`Segment` 的 `id / name / base / size / te_endpoint / protocol / host_id` **全部由调用方填**。master 侧只校验非零和 Slab 对齐（`segment.cpp`），不校验 id 是不是它自己生成的
       - 所以段 id 可以照抄旧值，不需要用 `ReMountSegment`（那条才会拿 `ValidateRemountSegment` 逐字段比对已登记的值，新进程的 `base`/`te_endpoint` 通常对不上）
       - `base` 填新进程实际能访问的地址，自己 `RegisterLocalMemory` 进去即可；不要求和旧值相同
-    - 盘副本怎么接回来：master 下线清理只摘登记、不删盘上文件。新进程起来后由 `FileStorage::Init` 扫盘（`ScanMeta`）再 `NotifyOffloadSuccess` 上报，登记就回到这个 `client_id` 名下
+    - 盘副本怎么接回来：master 下线清理只摘登记、不删盘上文件。新进程起来后由 `FileStorage::Init` 扫盘（`ScanMeta`）再 `NotifyOffloadSuccess` 上报。上报时会**更新已有 LOCAL_DISK 副本的 `transport_endpoint`**（`master_service.cpp` 里 `VisitReplicas` 分支），所以旧端点死了也能改指到新进程
+      - 而且 `AddReplicaForRetainedClient` 允许同一个 key 上**同一个 client_id 既有内存副本又有盘副本**：`replacing_existing` 只看有没有 LOCAL_DISK，有就只更新那个盘副本，不清别的
       - 顺带一条现成容错：`OffloadObjectHeartbeat` 收到 `SEGMENT_NOT_FOUND` 时，`FileStorage` 会自己重挂盘段、再触发 `ScanMeta` 重登记（`file_storage.cpp`）。master 重启或盘段丢了都走这条
-    - 内存副本接不回来：字节在匿名私有内存里，进程死透就被内核回收。这条路救的是**已经落盘**的那部分。要保内存里的，走上面「copy / move 搬出来」
+    - 内存副本接不回来：字节在匿名私有内存里，进程死透就被内核回收。这条路救的是**已经落盘**的那部分
     - 参数不用猜：`/get_segments_detail` 返回 `segment_name / segment_id / client_id / base_address / size_bytes / te_endpoint / protocol`；`host_id` 默认取 `local_hostname` 去端口，也可用 `MOONCAKE_HOST_ID` 固定
     - 限制
       - 同一台机器、源进程已经死透。源进程还活着时抢同一个 `client_id` 就是两个进程争一份身份
       - 只能接回盘上的数据；没落盘的那部分等于丢了
     - 何时值得用：kvcm 不在场（没有第三方 client 事先收走副本）时，这是唯一能把死引擎盘上数据接回来的路
-  - **DFS 副本**（main）
-    - 不挂任何 client。下线清理的条件不覆盖它（`master_service.cpp:2965-2976`）
-    - 描述里有 `file_path`。挂同一共享目录的机器按路径读。整机没了也能读
-    - 驱逐不是 lease 一过期就发生：DFS 容量用到高水位（默认 0.9，`shard_allocator.cpp` 的 `PrepareEvictionFromShard`）才开始按 LRU 挑，lease 没过期或有 pin 挡住的留下，降到低水位停。回收单位取决于分配器：默认 `shard`（切成 64 个固定分片，按分片回收）或可选 `bucket`（若干对象装进不可变桶文件，按整桶回收；桶里任一个受保护就整桶跳过）。另有分配失败时强制回收一个的路径（`TryRecoverDfsSpaceAfterAllocationFailure`）
-    - 要留住就续租。完成看副本查询能看到这份 DFS 副本。DFS 的 `ScanMeta` 不支持，重启不会靠扫盘把 DFS 对象重新登记
-    - 前提：部署共享文件系统
 - **这些做法解不了 retain，或者有条件才算**
   - **只拿着旧 `client_id` 去 `Ping`（`#2991`，main）**
     - master 只认 `client_id`，不认是不是原来那个进程
     - 同一个 id 在变成 `OFFLINE` 之前 `Ping` 或重新挂盘，状态回到 `ACTIVE`，登记还在
-    - 但光 `Ping` 不搬字节：内存段仍记着死进程里的基址和传输端点，本机盘登记仍指向原来的传输端点。要真的接回来，得按上面做法④走「占住同一个 `client_id` 再用 `MountSegment` + `NotifyOffloadSuccess` 把盘上的东西接回来」
+    - 但光 `Ping` 不搬字节：内存段仍记着死进程里的基址和传输端点，本机盘登记仍指向原来的传输端点。要真的接回来，得按上面「用旧 `client_id` 接管盘上的数据」走「占住同一个 `client_id` 再用 `MountSegment` + `NotifyOffloadSuccess` 把盘上的东西接回来」
     - 窗口默认是活跃 10 秒加怀疑 20 秒。窗口内做上面那条才接得回来；窗口过后 worker 已经清掉这个 client 的内存副本和本机盘副本
-  - **`AddReplicaForRetainedClient`**：名字像「给保留 client 加副本」，但它登记的必须是 `LOCAL_DISK`（`master_service.cpp` 里 `replica.type() != ReplicaType::LOCAL_DISK` 直接 `INVALID_PARAMS`）。用途是「把这块盘上的文件登记到某个 client 名下」——所以它正是「盘副本换个人登记」要用的那条内部函数；要加**内存**副本到别的实例则用 `CreateCopyTask`
   - **`BufferRegistrationAction::kRetained`**：一块外部内存的引用还没减到零，先别卸。不和 master 通信
   - **降到源引擎自己的盘，但没人接管**：master 会清这个 client 的盘副本登记，文件还在盘上。只有配合上面「用旧 `client_id` 接管」或让 kvcm 事先收走，数据才算接得回来；否则引擎不再启动、或换机器读，就断了
   - **`ReMountSegment` 单独用**：它走 `ValidateRemountSegment`，要求 `id / name / base / size / te_endpoint / protocol / host_id` 和已登记的值逐项一致。新进程的 `base` 和 `te_endpoint` 通常对不上，所以接管场景不走它，走 `MountSegment` 自己填参数
-  - **「用旧 `client_id` 接管」到底能做什么**
-    - **计划内销毁、数据还在内存**：这条路接不住内存数据。匿名私有内存随进程退出释放，必须先按做法②的 copy/move 搬到 kvcm 或别的活 client 的段上，再停引擎
-    - **进程已死透、数据已落盘**：用 `MasterClient(旧id)` + `MountSegment` + `NotifyOffloadSuccess` 把盘上的东西接回来（做法④）
-    - 也就是说：**retain 的本质是「死前把副本放到别人名下」，不是「死后还能把内存捞回来」**
-- **计划下线的编排**（控制面主导，四步）
-  1. **Router 摘流**：该实例不再接新请求，在途请求跑完
-  2. **kvcm 迁 KV**：这台段上的副本 copy/move 到还活着的 client（或搬进 kvcm 自己的段再落盘），或写成 DFS。降到这台引擎自己的盘留不住
-  3. **宽限期卸载**：引擎调 `GracefulUnmountSegment`（`master_service.cpp:669` @0.3.11）告诉 master「给我 N 毫秒宽限再摘 seg」——它是迁移的**时间窗保障**（防搬到一半 seg 被摘、数据随 seg 失效），由编排流程触发；不是引擎自己决定何时下线
-  4. **缩容停引擎**
-  - `CreateDrainJob`（两版本同有，F7）：master 后台 job 把指定 seg 上的副本逐个迁到别的 seg（带并发上限默认 4），排空后 seg 置 DRAINED 安全下线——可替代第 2 步的手动搬迁，且 job 级可取消（`CancelDrainJob`），比裸 copy/move 多一层控制
+- **计划下线的编排**（归编排层，不在本操作范围内）
+  - 本操作只保证「引擎消失时 KV 还在」；什么时候搬、搬到哪台、什么时候停引擎，是编排层的事
+  - 编排层要用到的三个原语：`GracefulUnmountSegment`（`master_service.cpp:669` @0.3.11，给 N 毫秒宽限期再摘 seg，是迁移的时间窗保障）、`CreateDrainJob`（两版本同有，F7，master 后台把指定 seg 上的副本逐个迁走，带并发上限默认 4，排空后 seg 置 DRAINED，job 级可取消）、本文的四条 retain 路
+  - 典型顺序：Router 摘流 → kvcm 迁 KV（四选一）→ 宽限期卸载 → 停引擎。具体步骤由编排层定
 - **长期未命中副本**：demote 到 SSD（§3）；何时降、降哪些归策略层编排
 - 与 D3 的边界：副本生命周期（TTL / READY 语义）归 D3；本节只定「key 的 client_id 下线」场景的机制组合
 
