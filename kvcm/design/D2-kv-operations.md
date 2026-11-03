@@ -701,7 +701,7 @@ sequenceDiagram
     Note over M: 副本所在 client 已换成目标段的 client（F6b）→ 留着
     end
 
-    rect rgb(230, 230, 230)
+    rect rgb(223, 242, 223)
     Note over E,DFS: 做法②：kvcm 自己的段 + 自己的盘（两版本，通道补封装层）
     K->>M: 挂 DRAM 段 + 本机盘
     K->>M: copy / move 副本到 kvcm 自己的段（副本所在 client = kvcm）
@@ -727,7 +727,7 @@ sequenceDiagram
     end
 
     rect rgb(230, 230, 230)
-    Note over E,DFS: 不做：副本一直只在死引擎的段上，预热投入重来
+    Note over E,DFS: 或接受现状：副本全在死引擎 seg 上的 key 整 key 消失，预热投入重来
     end
 ```
 

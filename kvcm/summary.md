@@ -86,7 +86,7 @@
     - 借原 client_id UUID：语义不变；需 master 加「key → client_id」查询 RPC（内部数据现成）
     - 决策条件：mooncake 能不能改（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
   - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）
-- retain：🟡 已重写，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
+- retain：🟡 机制已定，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
   - 清理看副本所在 client，不看 key 的 client_id。没有保留身份注册
   - `retain` 只表达 move/copy，返回任务号。DFS（main）是另一条：下线不清；用量到高水位后，lease 过期且没 pin 的会被 `RunDfsEviction` 逐，要续租。kvcm 挂自己的盘卸不来引擎上的字节（offload 只认本机内存），不作为现在的做法
   - 降到源引擎自己的盘：master 清登记，文件还在。这台机器的 store 再启动会用新 client_id 扫盘重新登记。引擎不再来，或换机器读，接不上。改 key 的 client_id 也留不住
@@ -153,7 +153,7 @@
   - 预复制不续租的话，一个 TTL 窗口内没有读流量就可能被驱逐
   - 约束已定：保活循环必须有界——无限续租事实上等于 pin；kvcm 断线后租约到期自然失效，不残留
   - 策略未定：续多久、何时停——候选 = 会话期 / 固定窗口 / 首流量后停租，未选定
-- key 的 client_id 下线后的副本存亡：🟡 已重写（D2 §4）——副本跟着所在 client。死前 move/copy 到活段留得住。DFS 副本下线不清，用量到高水位后 lease 过期且没 pin 会被逐，要续租。kvcm 启动时挂自己的盘，现有通道卸不来引擎字节，留不住。NoF 段不随 client 过期被摘。源引擎自己的盘：登记会被清，文件还在，这台机器的 store 再启动会重新登记。没有保留身份注册。拿旧 client_id 去 Ping 只保住窗口内的登记
+- key 的 client_id 下线后的副本存亡：🟡 机制已定（D2 §4）——副本跟着所在 client。死前 move/copy 到活段留得住；kvcm 自己挂段挂盘把副本收进名下也留得住（通道补自封装 .so）；DFS 副本下线不清，用量到高水位后 lease 过期且没 pin 会被逐，要续租。NoF 段不随 client 过期被摘。源引擎自己的盘：登记会被清，文件还在，这台机器的 store 再启动会重新登记。没有保留身份注册。拿旧 client_id 去 Ping 只保住窗口内的登记
 - 计划下线迁移：归 D2 retain 条（`CreateDrainJob` 两版本都有，把指定 seg 上的数据迁空到目标 seg，带并发上限、job 级可取消）
 - 落盘（写到 SSD）：Mooncake 的 DRAM→SSD 是池内冷热分层（client 侧 `enable_ssd_offload`，默认 `false`），不是「预复制时直接指定写盘」；SSD 只作容量/恢复用的异步 demote 去向（机制归 D2 demote 条）
 - 直接影响故障恢复时已预热前缀的可用性（D5，已闭环，见本文）。事实输入：E5（已闭环，见本文 E 节）。
