@@ -233,6 +233,5 @@ class ReleaseLoop:
 
 
 class RetainLoop:
-    """retain 与计划下线编排（D2 §4）。骨架——依赖的 retain/move 在
-    L4 未接线（做法 = move/copy 到活 seg，或搬进 kvcm 自己的段再落盘，
-    或 DFS 副本），能力接线后再常驻化。"""
+    """retain 与计划下线编排（D2 §4）。骨架——依赖的 move/copy 在 L4
+    未接线。没有保留身份注册。能力接线后再常驻化。"""

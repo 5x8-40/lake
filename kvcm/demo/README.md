@@ -24,10 +24,9 @@
 | 异构跨机 245(TP2)→217(TP4)（2026-10-09，需容器补丁） | **通过** + **杀源实例法确证读本机副本**（仅剩 217 副本时 B 首中 768 token 全部外部 get 成功） |
 | 异构跨机正向 245(TP2)→217(TP4) 回归（2026-10-12，bc6b5be 单入口 + #15835 补丁） | **通过**：32 keys READY、8/8 token 逐字一致、零 invalid、external hit 88.2%（滚动累计口径，非单请求） |
 | 异构跨机反向 217(TP4)→245(TP2) **同步 load**（2026-10-12，bc6b5be + #15835 补丁） | **通过**：36/36 key 对号、每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 分发生效、8/8 token 逐字一致、74.6→79.7% hit、零 invalid |
-| PR70 跨机同构 TP2（45↔225，Qwen3.8-27B hybrid，2026-10-29） | **主链路通过**（SubmitIntent ~11s READY，External hit 59.1%）；**并发度：14 全成、42 约半挂**（`NO_AVAILABLE_HANDLE`）——E15 限速为刚需，见 [EXPERIMENTS.md](EXPERIMENTS.md) #17 |
-| NAH 根因对照（#18–#22，2026-10-30～11-02） | **驳回「字节见底」单因**（失败时仍有数百 MB free）；空闲 segment 上 window=4 不复现；半占用(~50%)+闸4×42 可稳复现；B seg **1GB→4GB 同风暴 NAH 消失**——见 [EXPERIMENTS.md](EXPERIMENTS.md) #18/#19/#22 |
+| PR70 跨机同构 TP2（45↔225，Qwen3.8-27B hybrid，2026-10-29） | **主链路通过**（SubmitIntent ~11s READY，External hit 59.1%）；**并发度：14 `create_copy_task` 全成、42 约半挂**（`NO_AVAILABLE_HANDLE`）——E15 限速为刚需，见 [EXPERIMENTS.md](EXPERIMENTS.md) #17 |
 
-完整实验史（总表至 #22 + 异构实录 + 撤回记录；含 #17 跨机并发度与 #18–#22 NAH 对照）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」；总结与待办见 [summary.md](../summary.md)。
+完整实验史（总表 17 条 + 异构实录 + 撤回记录；含 #17 PR70 跨机并发度）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」；总结与待办见 [summary.md](../summary.md)。
 
 ## 快速开始
 
@@ -270,7 +269,7 @@ fail loud 边界（宁错杀不静默错配——拷错 seg 就失去 local-firs
 | 层 | 结论 |
 |----|------|
 | **Mooncake Store** | 不管 TP；只认 `key → segment 副本`。 |
-| **AscendStore**（`v0.26.0rc1`） | **原生支持**异构：extra_config `prefill_tp_size` / `decode_tp_size` → `config_data.py::infer_tp_mismatch_info`。语义：`effective_tp = max(local, peer)`；条件：TP 不同、非 MLA、非 hybrid、`num_kv_heads % effective_tp == 0`；`num_sub_keys = local_heads_per_rank // effective_heads_per_rank`；key 的 `head_or_tp_rank` 改写为 `effective_rank = tp_rank * num_sub_keys + sub_idx`（`pool_worker.py::_build_tp_mismatch_keys_and_addrs`），KV 按 head 切片 strided 读写。限制：不支持 layerwise / sparse / hybrid(Mamba/DSV4)；MLA 与 hybrid 在算出启用前就被 gate 关掉（静默），sparse / layerwise 是算出启用后直接报错。 |
+| **AscendStore**（`v0.26.0rc1`） | **原生支持**异构：extra_config `prefill_tp_size` / `decode_tp_size` → `infer_tp_mismatch_info`。语义：`effective_tp = max(local, peer)`；条件：TP 不同、非 MLA、非 hybrid、`num_kv_heads % effective_tp == 0`；`num_sub_keys = local_heads_per_rank // effective_heads_per_rank`；key 的 `head_or_tp_rank` 改写为 `effective_rank = tp_rank * num_sub_keys + sub_idx`（`pool_worker.py::_build_tp_mismatch_keys_and_addrs`），KV 按 head 切片 strided 读写。MLA 在 `infer_tp_mismatch_info` 里 `enabled=False`（静默）。hybrid 在 scheduler 传入 `use_hybrid` 时同样静默关掉；worker 调用没传 `use_hybrid`，默认当成不是 hybrid，算出启用后在 `pool_worker.py` 抛 `NotImplementedError`。sparse 与 layerwise 是算出来已经启用之后在 `pool_worker.py` 里 `raise`。 |
 | **上游 vLLM `MooncakeStoreConnector`** | 有异构 Store-TP / LCM（[PR #53129](https://github.com/vllm-project/vllm/pull/53129)）。 |
 | **SGLang HiCache** | `tp_lcm_size` + head split。 |
 
@@ -306,7 +305,7 @@ flowchart LR
 
 #### env 配置
 
-引擎从 `decode_tp_size` 字段读对端 TP（`config_data.py:48`，只在 worker init 算一次；`prefill_tp_size` 是 consumer 角色字段，本测试床用不到、脚本不生成）；算出的 `(enabled, eff, num_sub_keys)` 同时固定用于该实例的 put 与 get 两侧——**mismatch 信息与实验方向无关**，方向只决定谁 put 谁 get。因此：
+对端 TP 只在 worker init 算一次。`kv_consumer` 读 `prefill_tp_size`，其余角色（含本测试床的 `kv_both`）读 `decode_tp_size`（rc1 在 `config_data.py`，当前树在 `metadata.py` 的 `infer_tp_mismatch_info`）。本测试床脚本只写 `decode_tp_size`。算出的 `(enabled, eff, num_sub_keys)` 同时固定用于该实例的 put 与 get 两侧——**mismatch 信息与实验方向无关**，方向只决定谁 put 谁 get。因此：
 
 - **规则：每台实例 `PEER_TP_SIZE = max(本机 TP, 对端 TP)`**——`run_e2e.sh` 默认即 `max(TP_A,TP_B)`，`start_worker.sh` 把它写进引擎字段 `decode_tp_size`（PD 时代命名，即「对端 TP」）。同构填自身 TP（disabled=正确）。两方向同一组值，**不要按方向翻转**（翻转成 peer=自身 → mismatch 静默禁用，实例见 [EXPERIMENTS.md](EXPERIMENTS.md) #14）。
 - **错误配置的运行期指纹**：小 TP 端禁用后走 plain get，按本地 head 尺寸读 eff key → 尺寸不符 → `mooncake -800`，日志形状 `Failed to get <块数> keys`（每块 1 key；正确 mismatch 应为 `块数 × num_sub_keys`）。填了对 `eff=max(本机,对端)` 不整除的值同样静默禁用——`start_worker.sh` 带整除校验 fail loud。
@@ -353,7 +352,7 @@ demo/
 |------|------|
 | `README.md` | 本文：demo 端到端说明 |
 | `REPRODUCE.md` | 客户复现参考：结论 + 必配项 + 「读本机副本」判定方法 |
-| `EXPERIMENTS.md` | 实验总表至 #22 + 异构实录 + 踩坑记录（含撤回历史；#16 daemon / #17 并发度 / #18–#22 NAH） |
+| `EXPERIMENTS.md` | 实验总表 17 条 + 异构实录 + 踩坑记录（含撤回历史；#16 daemon 冒烟 / #17 跨机并发度） |
 | [../design/kv-prefetch.md](../design/kv-prefetch.md) | copy/prefetch 专项设计（A 壳请求 / B2 副本复制；B2 已由本 demo 实测） |
 | [../design/D1-router-scheduling.md](../design/D1-router-scheduling.md) | 生产化设计 D1：Router 集成与请求调度 |
 | [../design/D2-kv-operations.md](../design/D2-kv-operations.md) | 生产化设计 D2：KV 调度操作集 |
@@ -430,7 +429,7 @@ demo/
 - **控制面依赖**
   - `protocol` 须与 `mooncake.json` 一致（store 半程可 `tcp`，NPU 集群用 `ascend`）。
   - `resolve.py`：master admin `:9003` 在线（mooncake_master 内置默认，见 `start_master.sh` 注释）；`start_worker.sh` 写的 pidfile（跨机经 `--ssh` 读 B 机）；TP>1 时 rank 号依赖进程名 `VLLM::Worker_TP<N>`——vLLM 改命名会 **fail loud**（不静默错配），届时按 `pgrep -af 'VLLM::'` 实际输出更新模块内模式。
-- **异构 TP**：0.26 rc 镜像（rc1/rc2）必打 `patch_tp_mismatch_worker.patch`；tp_mismatch 不支持 layerwise / sparse / hybrid(Mamba/DSV4)，MLA 与 hybrid 会被 gate 静默关掉（机制与补丁见「怎么运作 · 异构 TP」）。
+- **异构 TP**：`v0.26.0rc1` 必打 `patch_tp_mismatch_worker.patch`。rc2 同样不含 #15835，补丁按 rc1 写，能否 apply 未实测。MLA 静默关掉 tp_mismatch。hybrid 在 scheduler 侧静默关掉，在 worker 侧会抛 `NotImplementedError`。sparse / layerwise 报错（机制与补丁见「怎么运作 · 异构 TP」）。
 
 ## 开放问题（待讨论）
 
