@@ -25,7 +25,7 @@
 | 异构跨机正向 245(TP2)→217(TP4) 回归（2026-10-12，bc6b5be 单入口 + #15835 补丁） | **通过**：32 keys READY、8/8 token 逐字一致、零 invalid、external hit 88.2%（滚动累计口径，非单请求） |
 | 异构跨机反向 217(TP4)→245(TP2) **同步 load**（2026-10-12，bc6b5be + #15835 补丁） | **通过**：36/36 key 对号、每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 分发生效、8/8 token 逐字一致、74.6→79.7% hit、零 invalid |
 | PR70 跨机同构 TP2（45↔225，Qwen3.8-27B hybrid，2026-10-29） | **主链路通过**（SubmitIntent ~11s READY，External hit 59.1%）；**并发度：14 全成、42 约半挂**（`NO_AVAILABLE_HANDLE`）——E15 限速为刚需，见 [EXPERIMENTS.md](EXPERIMENTS.md) #17 |
-| PR71 E14 补发 BlockStored（2026-11-02，#23） | **发件人侧通过**（真 Mooncake `create_copy_task` + 真 `ZmqEventPublisher`，合成目标 seg 拷前 0 / 拷后满；SUB 收到 `BlockStored(CPU)`）；索引/选路未验 — 见 [EXPERIMENTS.md](EXPERIMENTS.md) #23 |
+| PR71 E14 补发 BlockStored（2026-11-02，#23） | **发件人侧通过**（真 Mooncake + 真 `ZmqEventPublisher`；合成目标 seg）；warm 落 225 = A seg 近满 spill，非补发 bug；真机脚本**手工**（不进 Actions）— 见 [EXPERIMENTS.md](EXPERIMENTS.md) #23 |
 | NAH 根因对照（#18–#22，2026-10-30～11-02） | **驳回「字节见底」单因**（失败时仍有数百 MB free）；空闲 segment 上 window=4 不复现；半占用(~50%)+闸4×42 可稳复现；B seg **1GB→4GB 同风暴 NAH 消失**——见 [EXPERIMENTS.md](EXPERIMENTS.md) #18/#19/#22 |
 
 完整实验史（总表至 #23 + 异构实录 + 撤回记录；含 #17 跨机并发度、#18–#22 NAH 对照、#23 E14 补发）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」；总结与待办见 [summary.md](../summary.md)。

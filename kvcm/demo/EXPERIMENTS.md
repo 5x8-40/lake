@@ -30,7 +30,7 @@
 | 20 | 11/02 | 半占用 segment × window 矩阵 | **中止**（信息量低；与用户确认后停） | — |
 | 21 | 11/02 | NAH 源码诊断：给 `OffsetBufferAllocator::allocate` / `CopyStart` 打 `largest_free` | **方案已定、真机未跑成**（需改 Mooncake 打 `largest_free`；出网无法编换 .so / 装 gdb；当时卡被占）——不阻塞 #18/#22 结论 | — |
 | 22 | 11/02 | **seg 容量剂量**：同风暴半占用(~50%) + window=4 ×42，B **1GB vs 4GB** | **1GB：25/42、17 NAH**（失败时 B free≈449MB）；**4GB：42/42、0 NAH**。加大 segment 后 NAH 消失 → 运营上「segment 太小/有效空间不够」成立；但失败瞬间仍有数百 MB free，**不等于**字节已见底（与 #18 一致） | 见「实验实录 · 2026-11-02 · #22」 |
-| 23 | 11/02 | 单机 45：A=TP2(:8001) + 本机合成目标 seg（卡6/7）+ **PR71 E14** （真 Mooncake `create_copy_task` + 真 `ZmqEventPublisher`） | **发件人侧通过**：新鲜前缀 warm→拷前目标 0 副本→`create_copy_task=2`→拷后目标 2/2→订阅端收到 `BlockStored(medium=CPU, kind=full_attention)`；**未验**索引订阅/改选路、gRPC SubmitIntent、实例注册 | 见「实验实录 · 2026-11-02 · #23」 |
+| 23 | 11/02 | 单机 45：A=TP2(:8001) + 本机合成目标 seg（卡6/7）+ **PR71 E14** （真 Mooncake `create_copy_task` + 真 `ZmqEventPublisher`） | **发件人侧通过**：warm→拷前 0→`create_copy_task=2`→拷后 2/2→`BlockStored(CPU, full_attention)`；warm 落 225 = A 近满 spill（非代码错）；真机脚本手工不进 Actions；**未验**索引/选路/gRPC/注册 | 见「实验实录 · 2026-11-02 · #23」 |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
 
@@ -331,7 +331,8 @@ pid。途中根出 8 个坑，全部对代码验证：
 - master `:50088`；A=Qwen3.8-27B hybrid TP2 卡0/1 `:8001`，`--block-size 1536`，`PYTHONHASHSEED=0`
 - 目标：**本机合成 seg**（卡 6/7，TransferEngine `rpc_port` 作 seg 名，各 2GiB）——不依赖 225
 - 控制面：进程内 `TaskEngine` + `MooncakeBackend`（非 gRPC daemon）；物理卡 2 给控制面 ACL
-- 复现脚本：[`tools/e14_mooncake_smoke.py`](tools/e14_mooncake_smoke.py)
+- 复现脚本：[`tools/e14_mooncake_smoke.py`](tools/e14_mooncake_smoke.py)（**真机手工**；不进 GitHub Actions。Actions 只跑假发布器单测 `kvcm/tests/test_kv_events.py`）
+- 环境变量见脚本头（`E14_HOST` / `E14_MASTER` / `E14_MODEL_PATH` 等）；缺省仍为本床 45 机口径
 
 ### 判定口径（避免空转 READY）
 
@@ -355,7 +356,7 @@ pid。途中根出 8 个坑，全部对代码验证：
 
 1. **仅看 READY 耗时不够**：首轮打向 225 已有 seg 时 ~1s READY，疑 `already_exist` 跳过传输；必须以「拷前/拷后位置 + `create_copy_task` 计数」为准。
 2. **tokenizer 必须与引擎同口径**：`add_special_tokens=True` 或 decode 再 encode 会导致 key 与 warm 漂移，误撞池内旧 key。
-3. **本床观察**：打 A(:8001) warm 后，group0 副本的 `transport_endpoint` 落在 **225** 的 B seg（原因未查清）；故本轮目标改用本机合成 seg，只验证 copy+补发，不依赖「副本应在 A」假设。
+3. **warm → 225**：打 A(:8001) warm 后，group0 副本落到 **225** 的 B seg——当时 **A 本机 seg 已接近满载**，池把新写入 spill 到 B，属放置行为，**不是补发/copy 代码错误**。本轮目标改用本机合成空 seg，只验证「强制 `create_copy_task` + BlockStored」，不依赖「副本应在 A」。
 4. **未覆盖**：索引 SUB/改表、Router 选路、gRPC `SubmitIntent`、实例注册交齐 endpoint+kind、hybrid 多 group 全量拷贝。
 
 ### 结论

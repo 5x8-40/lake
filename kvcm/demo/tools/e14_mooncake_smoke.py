@@ -1,8 +1,17 @@
 #!/usr/bin/env python3
 """E14 + 真 Mooncake：本机合成空 seg 作目标，强制新鲜 create_copy_task。
 
-绕开「warm 后副本落在 225」的现状：目标改成本机卡 6/7 新建 seg，
-拷前确认目标无副本，拷后确认有副本，并收 ZMQ BlockStored。
+真机手工冒烟，不进 GitHub Actions（需 NPU + master + 引擎 warm）。
+Actions 只覆盖假发布器单测 ``kvcm/tests/test_kv_events.py``。
+
+A 近满时 warm 会 spill 到其它机 seg（本床曾见 225）——池放置，不是
+补发 bug。目标用本机空合成 seg，只验 copy + ZMQ ``BlockStored``。
+
+环境变量（缺省 = 45 机 #23 口径）::
+
+    E14_HOST E14_MASTER E14_ADMIN E14_MODEL_PATH E14_MODEL_NAME
+    E14_SERVED E14_WARM_URL E14_SYNTH_DEVICES E14_EVENT_PORT
+    E14_COORD_DEVICE E14_COORD_PORT E14_LEDGER
 """
 
 from __future__ import annotations
@@ -15,13 +24,16 @@ import sys
 import time
 import uuid
 import urllib.request
+from pathlib import Path
 
 import msgspec
 import zmq
 
 os.environ.setdefault("PYTHONHASHSEED", "0")
-sys.path.insert(0, "/data/w84156052-104-45/lake/kvcm")
-sys.path.insert(0, "/data/w84156052-104-45/lake/kvcm/demo/precopy")
+_DEMO = Path(__file__).resolve().parents[1]
+_KVCM = _DEMO.parent
+sys.path.insert(0, str(_KVCM))
+sys.path.insert(0, str(_DEMO / "precopy"))
 
 from transformers import AutoTokenizer
 
@@ -36,20 +48,31 @@ from kvcm.loops import KeepaliveLoop
 from kvcm.ops.types import InstanceId, Prefix
 from kvcm.task_engine import TaskEngine
 
-HOST = "7.242.104.45"
-MASTER = f"{HOST}:50088"
-ADMIN = "http://127.0.0.1:9003"
-MODEL_PATH = "/data/models/Qwen3.8-27B"
-MODEL_NAME = "Qwen3.8-27B"
-SERVED = "qwen38-27b"
-BLOCK_SIZE = 1536
-TP = 2
-TARGET = InstanceId("inst-synth")
-EVENT_PORT = 19574
+HOST = os.environ.get("E14_HOST", "7.242.104.45")
+MASTER = os.environ.get("E14_MASTER", f"{HOST}:50088")
+ADMIN = os.environ.get("E14_ADMIN", "http://127.0.0.1:9003")
+MODEL_PATH = os.environ.get("E14_MODEL_PATH", "/data/models/Qwen3.8-27B")
+MODEL_NAME = os.environ.get("E14_MODEL_NAME", "Qwen3.8-27B")
+SERVED = os.environ.get("E14_SERVED", "qwen38-27b")
+WARM_URL = os.environ.get("E14_WARM_URL", "http://127.0.0.1:8001/v1/completions")
+# 逗号分隔物理卡号；端口对按序绑死（与 #23 同：6→23000/28300，7→23100/28400）
+_SYNTH_SPEC = (
+    ("6", "23000", "28300-28334"),
+    ("7", "23100", "28400-28434"),
+)
+_SYNTH_WANT = [
+    d.strip()
+    for d in os.environ.get("E14_SYNTH_DEVICES", "6,7").split(",")
+    if d.strip()
+]
+BLOCK_SIZE = int(os.environ.get("E14_BLOCK_SIZE", "1536"))
+TP = int(os.environ.get("E14_TP", "2"))
+TARGET = InstanceId(os.environ.get("E14_TARGET", "inst-synth"))
+EVENT_PORT = int(os.environ.get("E14_EVENT_PORT", "19574"))
 EVENT_EP = f"tcp://*:{EVENT_PORT}"
-COORD_DEVICE = 2
-COORD_PORT = 13035
-LEDGER = "/tmp/kvcm_e14_smoke_ledger5.sqlite"
+COORD_DEVICE = int(os.environ.get("E14_COORD_DEVICE", "2"))
+COORD_PORT = int(os.environ.get("E14_COORD_PORT", "13035"))
+LEDGER = os.environ.get("E14_LEDGER", "/tmp/kvcm_e14_smoke_ledger5.sqlite")
 SEG_BYTES = 2 * 1024 * 1024 * 1024  # 2GiB / rank
 
 
@@ -160,7 +183,27 @@ def hit_on(placement: dict[str, list[str]], targets: set[str]) -> tuple[int, int
     return hit, len(placement)
 
 
+def _synth_specs() -> list[tuple[str, str, str]]:
+    by_dev = {phys: (phys, base, hccl) for phys, base, hccl in _SYNTH_SPEC}
+    out: list[tuple[str, str, str]] = []
+    for phys in _SYNTH_WANT:
+        if phys not in by_dev:
+            raise SystemExit(
+                f"E14_SYNTH_DEVICES 含未知卡 {phys!r}；"
+                f"本脚本只预置 {[p for p, _, _ in _SYNTH_SPEC]}"
+            )
+        out.append(by_dev[phys])
+    if len(out) != 2:
+        raise SystemExit("E14 冒烟需要恰好 2 个合成 seg（TP=2）")
+    return out
+
+
 def main() -> int:
+    print(
+        f"[cfg] host={HOST} master={MASTER} model={MODEL_PATH} "
+        f"warm={WARM_URL} synth={_SYNTH_WANT} event=:{EVENT_PORT}",
+        flush=True,
+    )
     uid = uuid.uuid4().hex[:12]
     tok = AutoTokenizer.from_pretrained(MODEL_PATH, trust_remote_code=True)
     base = f"e14fresh-{uid}- "
@@ -179,10 +222,13 @@ def main() -> int:
     if n_full < 1:
         return 2
 
-    print("[1] start synth helpers on NPU 6/7…", flush=True)
+    specs = _synth_specs()
+    print(f"[1] start synth helpers on NPU {','.join(p for p, _, _ in specs)}…", flush=True)
     suffix = int(time.time()) % 10000
-    p0, s0, seg0 = start_helper("6", "23000", "28300-28334", 19000 + suffix)
-    p1, s1, seg1 = start_helper("7", "23100", "28400-28434", 19100 + suffix)
+    helpers = []
+    for i, (phys, base_port, hccl) in enumerate(specs):
+        helpers.append(start_helper(phys, base_port, hccl, 19000 + suffix + i * 100))
+    (p0, s0, seg0), (p1, s1, seg1) = helpers
     synth = [seg0, seg1]
     synth_set = set(synth)
     print(f"[1] synth segs={synth}", flush=True)
@@ -221,7 +267,7 @@ def main() -> int:
     print("[3] warm A…", flush=True)
     t_warm = time.time()
     http_json(
-        "http://127.0.0.1:8001/v1/completions",
+        WARM_URL,
         {"model": SERVED, "prompt": prompt, "max_tokens": 1, "temperature": 0},
     )
     print(f"[3] warm {time.time()-t_warm:.1f}s", flush=True)
