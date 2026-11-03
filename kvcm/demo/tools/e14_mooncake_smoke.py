@@ -30,7 +30,7 @@ from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.capability import mooncake_v0311
 from kvcm.backends.mooncake.client import StoreClient
 from kvcm.engines.vllm.keys import KeyComputer
-from kvcm.events.publisher import BlockStoredPublisher
+from kvcm.api.events import EventPublisher
 from kvcm.ledger import Ledger
 from kvcm.loops import KeepaliveLoop
 from kvcm.ops.types import InstanceId, Prefix
@@ -265,7 +265,7 @@ def main() -> int:
         ledger=ledger,
         submit_concurrency=4,
     )
-    events = BlockStoredPublisher(
+    events = EventPublisher(
         {str(TARGET): EVENT_EP},
         block_size=BLOCK_SIZE,
         hash_algo="sha256",
