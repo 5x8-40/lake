@@ -72,7 +72,7 @@
 
 - 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐——🟡 候选已列出，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
+- pin：READY 后防驱逐——🟡 候选已列出，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2；lease / soft / hard / 驱逐易混淆点见 [lease-pin-eviction.md](design/lease-pin-eviction.md)
   - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert 一个方案：
     - 好处：不动全局 lease、断线窗口 30 分钟级
     - 代价：空写通道（Python 绑定没有分离接口）+ client_id 问题
