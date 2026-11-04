@@ -10,6 +10,8 @@
 
 状态标记：✅ 已闭环（附结论写在哪个文档）｜🟡 部分闭环｜无标记 = 待定。
 
+**当前目标版本：Mooncake v0.3.13.post1（master / client 同版本）。** 文中出现的 0.3.11 / main 对照是版本差异记录，不代表当前部署基线；D8/D9 与新增的调度/服务设计按 v0.3.13.post1 写。
+
 ## 一、设计决策
 
 **D1. Router 集成与请求调度** — ✅ 已闭环
@@ -229,21 +231,23 @@
 
 **D8. 统一调度中心（请求 × KV × 扩缩容）** — 🟡 设计草案
 
-- 目标：Router 侧一个 SchedulingCore，用 KVT（多源 KV 索引树）+ HookEnvelope（前端/agent 意图）+ L0/L1/L2 三环，联合决策“请求去哪、KV 怎么动、集群扩不扩”。
+- 目标形态：Router 侧一个 SchedulingCore，用 KVT（多源 KV 索引树）+ HookEnvelope（前端/agent 意图）+ L0/L1/L2 三环，联合决策“请求去哪、KV 怎么动、集群扩不扩”。
 - 原则：hint ≠ command；KV 动作只走 intent；请求不等 READY；不设 mode-to-mode fallback；索引是派生视图；预算先行；决策与执行分离。
 - 核心机制：多源事实→KVT（引擎事件 + kvcm READY + 池 publisher + speculative + miss 反馈）；hook 编译成 Demand；L0 打分（命中/传输/队列/SLO/未来价值/风险）；L1 预取/保留/TTL/预算；L2 快慢双环 + warm gate + KV-aware victim + 影子价格。
-- 版本约束：mooncake 0.3.11 无 publisher，删除面用 TTL + miss + 抽样核验降级；copy 无取消（P9）；pin 事后加受 client_id/空写通道约束（D2 §2）。
+- **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是十毫秒级跨机传输；HBM/D-direct 只省毫秒级本地拷贝。预取单独做往往只值十毫秒级，必须和保留/防驱逐一起做。
+- **版本基线 v0.3.13.post1**：publisher 代码有但构建默认 OFF、运行默认 false、copy 路径零发布；soft pin 空写有条件可用（PR73），hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入 PR72；E15 带宽限速未做。
 - 工作文档：[D8-joint-scheduling.md](design/D8-joint-scheduling.md)；流程时序：[flows/scheduling.md](design/flows/scheduling.md)。
-- 待定：索引主源（事件 vs 池权威）、hook 通道与信任、扩缩 actuator、多 Router leader、权重/阈值真机校准。
+- 待定：publisher 是否开启、hook 通道与信任、扩缩 actuator、多 Router leader、权重/阈值真机校准。
 
 **D9. 基于 kvcm 的服务地图（调度中心之外）** — 🟡 设计草案
 
 - 定位：kvcm 不做选路、不做扩缩决策、不持有前缀索引；在“执行 + 核验 + 记账 + 发布”边界内，把八项操作组合成服务。
 - 服务面：会话 KV（Session）、预热（Prewarm）、反熵/核验（Anti-entropy）、账本/归因（Ledger）、容量/放置顾问（Capacity Advisor）、下线/迁移（Drain）、治理（Governance）、回放/仿真（Replay）、分支/跨集群（Branch/Geo）。
 - 优先级：P0 = 会话 KV（SESSION 级）+ 预热 + 反熵 + 账本最小集；P1 = 容量顾问 + Drain + 治理；P2 = 回放/仿真、分支/跨集群/rollout。
-- 关键约束：session 权威在 kvcm ledger；保留默认软释放（停 keepalive）；pin 必须有 TTL/字节上限；反熵优先用 main 的零副作用 admin 查询。
+- **收益排序**：会话保留（避免 resume 重算）> 预热（避免跨机传输/防 miss）> 反熵/账本（让 ROI 可信）> 容量/Drain（保命中率）。
+- 关键约束：session 权威在 kvcm ledger；保留默认软释放（停 keepalive）；soft pin 有条件可用、hard pin 拒绝；反熵用 v0.3.13.post1 的零副作用 admin 查询。
 - 工作文档：[D9-kv-services.md](design/D9-kv-services.md)。
-- 待定：pin 可达性、反熵成本、prewarm 取消、多模型/多租户、跨集群。
+- 待定：pin 前置条件、反熵成本、prewarm 取消、多模型/多租户、retain/跨集群。
 
 ## 二、潜在问题
 
@@ -271,13 +275,14 @@
 - **E6. 0.3.11 API 子集核对**——✅ 已闭环（结论写在 D2 F13）
   - 做法：三个版本的 RPC 注册表 diff（v0.3.11 与 v0.3.11.post1 完全相同）
   - 0.3.11 已有：lease / offload / promotion 心跳取任务、Admin 查询三件套、`EvictDiskReplica`、`BatchExistKey` 续租（D1 F15）、soft pin（D2 F9）
-  - main 才有：`ProbeKey`/`BatchProbeKey`、零副作用 Admin 查询（`GetReplicaListForAdmin`）、租户配额五件套、KV 事件、容量快照、`UnmountLocalDiskSegment`
+  - main 才有：`ProbeKey`/`BatchProbeKey`、租户配额五件套、容量快照、`UnmountLocalDiskSegment`；`has_read_lease` 门槛在 0.3.14-pre/main
+  - **0.3.13.post1 补充**：零副作用 Admin 查询（`GetReplicaListForAdmin`/`GET /batch_query_keys`）、KV 事件 publisher 代码、`SoftPinAction` 三态已具备；publisher 默认构建 OFF/运行 false
   - `default_kv_lease_ttl` 测试床配置 11s（D2 F9）
   - 缺口清单 = D2 F13⑥（per-key 降层 RPC、copy/move 取消、key→client_id 查询）——kvcm 侧组合达不到完整语义，要补得动 mooncake 池侧（copy 取消有 kvcm 弱版「弃置 + 事后清副本」，P9）；改不改、何时补未议
 - **E7. MLA 实测**——`put_step>1` 时传输计划全部分配到 `targets[0]`、其余 rank 读远端：功能上推断正确但还没实测；hybrid/sparse 被上游的开关检查排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——✅ 已闭环（结论写在 D1 F14）
 
-publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medium+tenant+group，**无 seg/机器位置**；ZMQ 传输；CMake 默认 OFF、官方 wheel 构建 ON。**0.3.11.post1 不含此机制**（publisher 代码在 v0.3.11 之后进仓，tag 上无 `kv_event/` 目录、无构建开关）——D1 路径 b 要用须升级 mooncake 版本。
+publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medium+tenant+group，**无 seg/机器位置**；ZMQ 传输；CMake `ENABLE_KV_EVENTS` 默认 OFF，运行 `--enable_kv_events` 默认 false；copy 路径零发布。**0.3.11.post1 不含此机制**（publisher 代码在 v0.3.11 之后进仓）；**0.3.13.post1 含代码**，但是否编译进 wheel、是否运行开启要按部署确认——未显式开启时删除面仍不可见。
 
 - **E9. vLLM 事件载荷核对**——✅ 已闭环（结论写在 D1 事实基线 F7-F10）
   - `BlockStored` 含 `medium` 字段
@@ -321,9 +326,9 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 ### D. 调度中心与服务化（D8/D9）
 
-- **E17. 调度中心 MVP**——按 [D8](design/D8-joint-scheduling.md)：`HookEnvelope` / `KVFact` / `KVIntent` 扩展 / `DecisionRecord` 契约；KVT（先接引擎事件 + kvcm READY + speculative + miss 反馈）；L0 选路接入；L1 预取/保留最小集；决策日志。
+- **E17. 调度中心 MVP**——按 [D8](design/D8-joint-scheduling.md)：hook 信封 / KV 事实 / KV intent / 决策日志 契约；KVT（先接引擎事件 + kvcm READY + speculative + miss 反馈）；L0 选路接入；L1 预取/保留最小集。
   - 验收：KVT 合并/墓碑/置信度单测；L0 决策延迟 p99 <5ms；hook observe 模式不改变现有行为；READY/miss 回写闭环。
-- **E18. 反熵 + 账本最小集**——按 [D9](design/D9-kv-services.md)：热条目抽样核验（main 用 `GetReplicaListForAdmin`，0.3.11 用普通查询并接受 lease 副作用）；`LOST/REMOVED` 事实回写；ledger 增加 bytes/ROI/归因字段。
+- **E18. 反熵 + 账本最小集**——按 [D9](design/D9-kv-services.md)：热条目抽样核验（v0.3.13.post1 用 `GET /batch_query_keys` / `GetReplicaListForAdmin`，零副作用）；`LOST/REMOVED` 事实回写；ledger 增加 bytes/ROI/归因字段。
   - 验收：ghost 检出率、误判率、查询 QPS 预算；预取/保留 ROI 可算；不因核验阻塞请求。
 - **E19. 会话 KV 服务（SESSION 级）**——Open/Attach/Pause/Resume/Close；keepalive 有界续租；TTL/预算；默认软释放。
   - 验收：resume hit rate、resume TTFT、wasted retention；PIN/DURABLE 随 D2 能力后置。
