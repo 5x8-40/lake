@@ -1352,6 +1352,657 @@ def test_abandon_purges_and_marks(fake_store_module, monkeypatch) -> None:
 
 
 # ---------------------------------------------------------------------------
+# pin：SOFT 走空写；HARD 登记保活，不改 hard pin 位
+# ---------------------------------------------------------------------------
+
+
+def _pin_backend(monkeypatch, cap) -> MooncakeBackend:
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    return MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=cap,
+    )
+
+
+def test_pin_soft_calls_client(fake_store_module, monkeypatch) -> None:
+    assert mooncake_main().soft_pin_after.channel is Support.YES
+    seen = {}
+
+    class Client(FakeClient):
+        def soft_pin(self, keys, sizes, addresses, *, enable=True):
+            seen["keys"] = list(keys)
+            seen["sizes"] = list(sizes)
+            seen["addresses"] = list(addresses)
+            seen["enable"] = enable
+
+        def batch_get_replica_desc(self, keys):
+            raise AssertionError("软钉取尺寸不能走 GetReplicaList")
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery, MemoryReplicaView
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k,
+                    ok=True,
+                    memory=(
+                        MemoryReplicaView(
+                            "seg-A", size=64, buffer_address=0x1000
+                        ),
+                    ),
+                    nof=(
+                        MemoryReplicaView(
+                            "seg-N", size=64, buffer_address=0x2000
+                        ),
+                    ),
+                )
+                for k in keys
+            }
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+    )
+    run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+    assert seen["enable"] is True
+    assert seen["keys"] == ["k0"]
+    assert seen["sizes"] == [64]
+    assert seen["addresses"] == [0x1000]
+
+
+def test_pin_soft_requires_capability(fake_store_module, monkeypatch) -> None:
+    """能力集没有 soft pin 通道时直接拒绝。"""
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+    )
+    with pytest.raises(UnsupportedCapabilityError, match="通道"):
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+
+
+def test_pin_soft_requires_buffer_address(fake_store_module, monkeypatch) -> None:
+    """没有 buffer_address_ 就不能做原位检查。"""
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import (
+                KeyReplicaQuery,
+                MemoryReplicaView,
+            )
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k, ok=True, memory=(MemoryReplicaView("seg-A", size=64),)
+                )
+                for k in keys
+            }
+
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+    )
+    with pytest.raises(QueryError, match="地址"):
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+
+
+def test_pin_soft_admin_short_response_is_query_error(
+    fake_store_module, monkeypatch
+) -> None:
+    """admin 短回不能当成“没有内存副本”，要可重试。"""
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {}
+
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+    )
+    with pytest.raises(QueryError, match="短回"):
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+
+
+def test_pin_soft_admin_ok_false_is_query_error(
+    fake_store_module, monkeypatch
+) -> None:
+    """admin 对单 key 查询失败要可重试，不能当成缺副本。"""
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k, ok=False, error="OBJECT_NOT_FOUND"
+                )
+                for k in keys
+            }
+
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+    )
+    with pytest.raises(QueryError, match="OBJECT_NOT_FOUND"):
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+
+
+def test_verify_missing_ignores_nof_replica(
+    fake_store_module, monkeypatch
+) -> None:
+    """NoF 不是 DRAM；不能在核验里算 READY。"""
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import (
+                KeyReplicaQuery,
+                MemoryReplicaView,
+            )
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k,
+                    ok=True,
+                    nof=(MemoryReplicaView("seg-A"),),
+                )
+                for k in keys
+            }
+
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+    )
+    missing = run(b._verify_missing([("k0", "seg-A")]))
+    assert missing and "missing on seg-A" in missing[0]
+
+
+def test_verify_missing_short_response_is_query_error(
+    fake_store_module, monkeypatch
+) -> None:
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {}
+
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+    )
+    with pytest.raises(QueryError, match="短回"):
+        run(b._verify_missing([("k0", "seg-A")]))
+
+
+def test_verify_missing_ok_false_is_query_error(
+    fake_store_module, monkeypatch
+) -> None:
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+            return {
+                k: KeyReplicaQuery(key=k, ok=False, error="OBJECT_NOT_FOUND")
+                for k in keys
+            }
+
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+    )
+    with pytest.raises(QueryError, match="OBJECT_NOT_FOUND"):
+        run(b._verify_missing([("k0", "seg-A")]))
+
+
+def test_pin_soft_rejects_nof_only(fake_store_module, monkeypatch) -> None:
+    """NoF-only 没有 DRAM 原 buffer，不能空写。"""
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import (
+                KeyReplicaQuery,
+                MemoryReplicaView,
+            )
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k,
+                    ok=True,
+                    nof=(
+                        MemoryReplicaView(
+                            "seg-N", size=64, buffer_address=0x2000
+                        ),
+                    ),
+                )
+                for k in keys
+            }
+
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+    )
+    with pytest.raises(StoreClientError, match="单内存副本"):
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+
+
+def test_pin_soft_rejects_multiple_memory_replicas(
+    fake_store_module, monkeypatch
+) -> None:
+    """空写只支持单内存副本；多副本 master 也会 topology mismatch。"""
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import (
+                KeyReplicaQuery,
+                MemoryReplicaView,
+            )
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k,
+                    ok=True,
+                    memory=(
+                        MemoryReplicaView("seg-A", size=64, buffer_address=0x1000),
+                        MemoryReplicaView("seg-B", size=64, buffer_address=0x2000),
+                    ),
+                )
+                for k in keys
+            }
+
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+    )
+    with pytest.raises(StoreClientError, match="单内存副本"):
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+
+
+def test_pin_soft_rejects_put_step_gt_1(fake_store_module, monkeypatch) -> None:
+    """空写只支持单 slice；put_step != 1 直接拒绝。"""
+    kc = KeyComputer(model_name="qwen", tp_size=1, put_step=2)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    b = MooncakeBackend(
+        client=FakeClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+    )
+    with pytest.raises(UnsupportedCapabilityError, match="put_step"):
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+
+
+def test_pin_soft_disable_calls_empty_write(fake_store_module, monkeypatch) -> None:
+    seen = {}
+
+    class Client(FakeClient):
+        def soft_pin(self, keys, sizes, addresses, *, enable=True):
+            seen["keys"] = list(keys)
+            seen["sizes"] = list(sizes)
+            seen["addresses"] = list(addresses)
+            seen["enable"] = enable
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery, MemoryReplicaView
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k,
+                    ok=True,
+                    memory=(
+                        MemoryReplicaView(
+                            "seg-A", size=8, buffer_address=0x2000
+                        ),
+                    ),
+                )
+                for k in keys
+            }
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+    )
+    run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT, enable=False))
+    assert seen == {
+        "keys": ["k0"],
+        "sizes": [8],
+        "addresses": [0x2000],
+        "enable": False,
+    }
+    with pytest.raises(UnsupportedCapabilityError, match="keepalive"):
+        run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.HARD, enable=False))
+
+
+def test_pin_soft_refuses_disk_replica_before_empty_write(
+    fake_store_module, monkeypatch
+) -> None:
+    """有盘副本时空写收尾盖不住 PROCESSING 的盘副本，不能调用扩展。"""
+
+    class Client(FakeClient):
+        def soft_pin(self, keys, sizes, addresses, *, enable=True):
+            raise AssertionError("有盘副本不应进入空写")
+
+    def admin_for(**kwargs):
+        class Admin:
+            def batch_query_keys(self, keys):
+                from kvcm.backends.mooncake.admin_main import (
+                    KeyReplicaQuery,
+                    MemoryReplicaView,
+                )
+
+                return {
+                    k: KeyReplicaQuery(
+                        key=k,
+                        ok=True,
+                        memory=(MemoryReplicaView("seg-A", size=64),),
+                        **kwargs,
+                    )
+                    for k in keys
+                }
+
+        return Admin()
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    for extra in (
+        {"disk_replicas": 1},
+        {"local_disk_endpoints": ("10.0.0.2:9",)},
+    ):
+        b = MooncakeBackend(
+            client=Client(),
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A"],
+            capability=mooncake_main(),
+            admin=admin_for(**extra),
+        )
+        with pytest.raises(StoreClientError, match="有盘副本"):
+            run(b.pin(Prefix(model_id="qwen", token_ids=(1,)), PinKind.SOFT))
+
+
+def test_remove_false_unregisters_keepalive_and_sleeps(
+    fake_store_module, monkeypatch
+) -> None:
+    client = RemoveClient()
+    slept: list[float] = []
+
+    async def sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", sleep)
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _move_backend(client, monkeypatch, ledger=led)
+        b._lease_ttl_s = 10
+        prefix = Prefix(model_id="qwen", token_ids=(1, 2))
+        run(b.register_keepalive(prefix))
+        run(b.remove(prefix, force=False))
+        assert slept == [10]
+        assert led.list_keepalive() == []
+        assert client.removed[-1][1] is False
+
+        slept.clear()
+        run(b.register_keepalive(prefix))
+        run(b.remove(prefix, force=True))
+        assert slept == []
+        assert led.list_keepalive() == []
+        assert client.removed[-1][1] is True
+
+        class Fail(RemoveClient):
+            def batch_remove(self, keys, force=False):
+                raise StoreClientError("batch_remove failed")
+
+        fail = Fail()
+        b._client = fail
+        run(b.register_keepalive(prefix))
+        with pytest.raises(StoreClientError, match="batch_remove failed"):
+            run(b.remove(prefix, force=False))
+        assert led.list_keepalive() == []
+
+        async def cancel_sleep(_seconds):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(
+            "kvcm.backends.mooncake.backend.asyncio.sleep", cancel_sleep
+        )
+        b._client = client
+        run(b.register_keepalive(prefix))
+        with pytest.raises(asyncio.CancelledError):
+            run(b.remove(prefix, force=False))
+        assert led.list_keepalive() == []
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_pin_hard_rejected(fake_store_module, monkeypatch) -> None:
+    """pin(HARD) 拒绝：hard pin 创建时固化，不能拿 keepalive 冒充。"""
+    assert mooncake_main().hard_pin_after.channel is Support.NO
+    assert mooncake_v0311().hard_pin_after.channel is Support.NO
+    called = {"soft": 0}
+
+    class Client(FakeClient):
+        def soft_pin(self, keys, sizes, addresses, *, enable=True):
+            called["soft"] += 1
+
+        def batch_get_replica_desc(self, keys):
+            raise AssertionError("pin(HARD) 不应读副本")
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        kc = KeyComputer(model_name="qwen", tp_size=1)
+        monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+        b = MooncakeBackend(
+            client=Client(),
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A"],
+            capability=mooncake_main(),
+            ledger=led,
+            lease_ttl_s=0,
+        )
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        with pytest.raises(UnsupportedCapabilityError, match="keepalive"):
+            run(b.pin(prefix, PinKind.HARD))
+        assert led.list_keepalive() == []
+        assert called["soft"] == 0
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_memory_replica_predicate_calls_method() -> None:
+    """is_memory_replica 是方法时要调用。布尔属性仍然直接用。"""
+    called = {"disk": 0, "mem": 0}
+
+    class Disk:
+        def is_memory_replica(self):
+            return False
+
+        def get_memory_descriptor(self):
+            called["disk"] += 1
+            raise RuntimeError("Expected MemoryDescriptor")
+
+    class MemBuf:
+        size = 32
+        transport_endpoint = "10.0.0.3:1"
+
+    class MemDesc:
+        buffer_descriptor = MemBuf()
+
+    class Mem:
+        def is_memory_replica(self):
+            return True
+
+        def get_memory_descriptor(self):
+            called["mem"] += 1
+            return MemDesc()
+
+    class BoolMem:
+        is_memory_replica = True
+
+        def get_memory_descriptor(self):
+            return MemDesc()
+
+    class Store:
+        def batch_get_replica_desc(self, keys):
+            return {keys[0]: [Disk(), Mem(), BoolMem()]}
+
+    client = StoreClient()
+    client._store = Store()
+    eps = client.batch_memory_replica_endpoints(["k"])
+    assert eps["k"] == ["10.0.0.3:1", "10.0.0.3:1"]
+    assert called["disk"] == 0
+
+    class Bare:
+        pass
+
+    class BareStore:
+        def batch_get_replica_desc(self, keys):
+            return {keys[0]: [Bare()]}
+
+    bare = StoreClient()
+    bare._store = BareStore()
+    with pytest.raises(StoreClientError, match="绑定面不对"):
+        bare.batch_memory_replica_endpoints(["k"])
+
+
+def test_soft_pin_reuses_existing_capsule(monkeypatch) -> None:
+    seen = {}
+
+    class Buf:
+        size = 64
+
+    class Mem:
+        buffer_descriptor = Buf()
+
+    class Desc:
+        is_memory_replica = True
+
+        def get_memory_descriptor(self):
+            return Mem()
+
+    class Store:
+        def batch_get_replica_desc(self, keys):
+            raise AssertionError("软钉取尺寸不能走 GetReplicaList")
+
+        def _get_pyclient_capsule(self):
+            return "existing-client"
+
+    def _pin(capsule, keys, sizes, addresses, enable):
+        seen["capsule"] = capsule
+        seen["keys"] = list(keys)
+        seen["sizes"] = list(sizes)
+        seen["addresses"] = list(addresses)
+        seen["enable"] = enable
+
+    monkeypatch.setattr("kvcm.native.empty_pin.empty_soft_pin", _pin)
+    client = StoreClient()
+    client._store = Store()
+    client.soft_pin(["h0"], [64], [0x1000], enable=True)
+    assert seen == {
+        "capsule": "existing-client",
+        "keys": ["h0"],
+        "sizes": [64],
+        "addresses": [0x1000],
+        "enable": True,
+    }
+
+
+def test_soft_pin_missing_size_does_not_call_extension(monkeypatch) -> None:
+    def _pin(*_args):
+        raise AssertionError("没有尺寸时不应进入扩展")
+
+    monkeypatch.setattr("kvcm.native.empty_pin.empty_soft_pin", _pin)
+
+    class Store:
+        def batch_get_replica_desc(self, keys):
+            return {k: [] for k in keys}
+
+        def _get_pyclient_capsule(self):
+            return "existing-client"
+
+    client = StoreClient()
+    client._store = Store()
+    with pytest.raises(StoreClientError, match="没有钉上"):
+        client.soft_pin(["h0"], [], [], enable=True)
+
+
+def test_empty_pin_extension_rejects_non_capsule() -> None:
+    """虚拟环境里加载编好的扩展。不连 master，只检查入参被拒绝。
+
+    ``_empty_pin.so`` 被 gitignore，CI 不编译。导不进就跳过，
+    干净检出不应因此失败。
+    """
+    ext = pytest.importorskip("kvcm.native._empty_pin")
+
+    assert callable(ext.empty_soft_pin)
+    with pytest.raises(TypeError):
+        ext.empty_soft_pin("not-a-capsule", ["k"], [8], [0x1000], True)
+
+
 # ---------------------------------------------------------------------------
 # Ledger：批量事务 / status 校验 / 上下文管理器
 # ---------------------------------------------------------------------------
@@ -2478,202 +3129,6 @@ def test_rebuild_restores_move(fake_store_module, monkeypatch) -> None:
     finally:
         led.close()
         os.unlink(path)
-
-
-def test_verify_missing_ignores_nof_replica(
-    fake_store_module, monkeypatch
-) -> None:
-    """NoF 不是 DRAM；不能在核验里算 READY。"""
-    kc = KeyComputer(model_name="qwen", tp_size=1)
-    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
-
-    class Admin:
-        def batch_query_keys(self, keys):
-            from kvcm.backends.mooncake.admin_main import (
-                KeyReplicaQuery,
-                MemoryReplicaView,
-            )
-
-            return {
-                k: KeyReplicaQuery(
-                    key=k,
-                    ok=True,
-                    nof=(MemoryReplicaView("seg-A"),),
-                )
-                for k in keys
-            }
-
-    b = MooncakeBackend(
-        client=FakeClient(),
-        key_computer=kc,
-        locate=lambda _inst: ["seg-A"],
-        capability=mooncake_main(),
-        admin=Admin(),
-    )
-    missing = run(b._verify_missing([("k0", "seg-A")]))
-    assert missing and "missing on seg-A" in missing[0]
-
-
-def test_verify_missing_short_response_is_query_error(
-    fake_store_module, monkeypatch
-) -> None:
-    kc = KeyComputer(model_name="qwen", tp_size=1)
-    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
-
-    class Admin:
-        def batch_query_keys(self, keys):
-            return {}
-
-    b = MooncakeBackend(
-        client=FakeClient(),
-        key_computer=kc,
-        locate=lambda _inst: ["seg-A"],
-        capability=mooncake_main(),
-        admin=Admin(),
-    )
-    with pytest.raises(QueryError, match="短回"):
-        run(b._verify_missing([("k0", "seg-A")]))
-
-
-def test_verify_missing_ok_false_is_query_error(
-    fake_store_module, monkeypatch
-) -> None:
-    kc = KeyComputer(model_name="qwen", tp_size=1)
-    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
-
-    class Admin:
-        def batch_query_keys(self, keys):
-            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
-
-            return {
-                k: KeyReplicaQuery(key=k, ok=False, error="OBJECT_NOT_FOUND")
-                for k in keys
-            }
-
-    b = MooncakeBackend(
-        client=FakeClient(),
-        key_computer=kc,
-        locate=lambda _inst: ["seg-A"],
-        capability=mooncake_main(),
-        admin=Admin(),
-    )
-    with pytest.raises(QueryError, match="OBJECT_NOT_FOUND"):
-        run(b._verify_missing([("k0", "seg-A")]))
-
-
-def test_remove_false_unregisters_keepalive_and_sleeps(
-    fake_store_module, monkeypatch
-) -> None:
-    client = RemoveClient()
-    slept: list[float] = []
-
-    async def sleep(seconds):
-        slept.append(seconds)
-
-    monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", sleep)
-    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
-        path = f.name
-    led = Ledger(path)
-    try:
-        b = _move_backend(client, monkeypatch, ledger=led)
-        b._lease_ttl_s = 10
-        prefix = Prefix(model_id="qwen", token_ids=(1, 2))
-        run(b.register_keepalive(prefix))
-        run(b.remove(prefix, force=False))
-        assert slept == [10]
-        assert led.list_keepalive() == []
-        assert client.removed[-1][1] is False
-
-        slept.clear()
-        run(b.register_keepalive(prefix))
-        run(b.remove(prefix, force=True))
-        assert slept == []
-        assert led.list_keepalive() == []
-        assert client.removed[-1][1] is True
-
-        class Fail(RemoveClient):
-            def batch_remove(self, keys, force=False):
-                raise StoreClientError("batch_remove failed")
-
-        fail = Fail()
-        b._client = fail
-        run(b.register_keepalive(prefix))
-        with pytest.raises(StoreClientError, match="batch_remove failed"):
-            run(b.remove(prefix, force=False))
-        assert led.list_keepalive() == []
-
-        async def cancel_sleep(_seconds):
-            raise asyncio.CancelledError()
-
-        monkeypatch.setattr(
-            "kvcm.backends.mooncake.backend.asyncio.sleep", cancel_sleep
-        )
-        b._client = client
-        run(b.register_keepalive(prefix))
-        with pytest.raises(asyncio.CancelledError):
-            run(b.remove(prefix, force=False))
-        assert led.list_keepalive() == []
-    finally:
-        led.close()
-        import os
-
-        os.unlink(path)
-
-
-def test_memory_replica_predicate_calls_method() -> None:
-    """is_memory_replica 是方法时要调用。布尔属性仍然直接用。"""
-    called = {"disk": 0, "mem": 0}
-
-    class Disk:
-        def is_memory_replica(self):
-            return False
-
-        def get_memory_descriptor(self):
-            called["disk"] += 1
-            raise RuntimeError("Expected MemoryDescriptor")
-
-    class MemBuf:
-        size = 32
-        transport_endpoint = "10.0.0.3:1"
-
-    class MemDesc:
-        buffer_descriptor = MemBuf()
-
-    class Mem:
-        def is_memory_replica(self):
-            return True
-
-        def get_memory_descriptor(self):
-            called["mem"] += 1
-            return MemDesc()
-
-    class BoolMem:
-        is_memory_replica = True
-
-        def get_memory_descriptor(self):
-            return MemDesc()
-
-    class Store:
-        def batch_get_replica_desc(self, keys):
-            return {keys[0]: [Disk(), Mem(), BoolMem()]}
-
-    client = StoreClient()
-    client._store = Store()
-    eps = client.batch_memory_replica_endpoints(["k"])
-    assert eps["k"] == ["10.0.0.3:1", "10.0.0.3:1"]
-    assert called["disk"] == 0
-
-    class Bare:
-        pass
-
-    class BareStore:
-        def batch_get_replica_desc(self, keys):
-            return {keys[0]: [Bare()]}
-
-    bare = StoreClient()
-    bare._store = BareStore()
-    with pytest.raises(StoreClientError, match="绑定面不对"):
-        bare.batch_memory_replica_endpoints(["k"])
 
 
 def test_remove_force_unregisters_keepalive_first(fake_store_module, monkeypatch) -> None:

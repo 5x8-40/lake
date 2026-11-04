@@ -974,6 +974,7 @@ sequenceDiagram
   - Case C 旧 buffer 延迟释放（`put_start_release_timeout`，默认 600s）；地址检查在 C 上不误判依赖这个行为。
   - `GrantReadLease` 不续 soft pin（目标版本）；0.3.11 的 `GrantLease` 会同续 soft pin（F9），续期策略不同。
 - 注意：`SoftPinAction` 不是唯一门槛。0.3.11 / 0.3.12 即使只有 bool，`UpsertEnd` 也还是 `string` 签名；0.3.14-pre 起即使 API 名字相同，gate 也会让有租约的同尺寸空写走 Case C。
+- **升级注意（自己授的 lease）**：`pin` 在空写前先 `exists` 持租约防驱逐。目标 v0.3.13.post1 没有 `has_read_lease` gate，所以这个租约不会把同尺寸空写推成 Case C。换到 main / 0.3.14-pre+ 后，**这个自己授的 lease 就足以触发 Case C**，不是只防外部读者；升级前必须改 pin 路径或关闭空写。
 
 5. **调用方不在当前实现范围**
    - 当前实现只提供 `pin(SOFT)` 能力；prefetch READY 后是否 / 何时调用，由后续策略决定。

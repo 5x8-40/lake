@@ -73,9 +73,15 @@ def mooncake_main() -> BackendCapability:
             "通道 = is_exist，读即续租（预热前置检查的 exists 调用同样续租——保活免费搭车）",
         ),
         soft_pin_after=Capability(
-            Support.NO,
-            Support.NO,
-            "soft pin 未接线；native 空写见后续 soft pin PR",
+            Support.YES,
+            Support.YES,
+            "有条件可用（目标版本）：SoftPinAction；无 has_read_lease 门槛；"
+            "同尺寸空写走 Case B；pin 前 exists 持 lease；需 put_step=1、无盘副本、"
+            "单内存副本。lease 挡驱逐/非 force Remove，不挡 force Remove、lease "
+            "过期后的驱逐或 Case C；pin(SOFT) 不 register_keepalive。Case C 旧 buffer "
+            "延迟释放（默认 600s），地址复用残余主要来自 Case A。"
+            "Start-End 崩溃 / 读者短暂不可读 / client_id 改写 / 不续期 / "
+            "并发重写 / ABI 仍是已知边界",
         ),
         hard_pin_after=Capability(
             Support.NO,
