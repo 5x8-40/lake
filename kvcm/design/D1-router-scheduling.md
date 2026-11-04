@@ -325,5 +325,5 @@ flowchart LR
 - **D5**：故障衔接（源 seg 所在 client 掉线 copy 失败（F4）、与重路由的先后）
 - **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../../docs/research/vllm-ascend/layerwise-taxonomy.md)）
 - **D7**：方案 A（壳请求进 HBM）去留与叠加顺序
-- **D8**：统一调度中心（请求 × KV × 扩缩容；hook + KVT + L0/L1/L2 三环）——把本文的选路面扩展成联合决策，[D8-joint-scheduling.md](D8-joint-scheduling.md)
-- **D9**：基于 kvcm 能力的服务地图（会话 KV / 预热 / 反熵 / 账本 / 容量 / 迁移）——把 D2 的操作集组合成服务，[D9-kv-services.md](D9-kv-services.md)
+- **D8**：统一调度中心（请求 × KV × 扩缩容；hook + KVT + L0/L1/L2 三环；目标形态 + 性能模型）——把本文的选路面扩展成联合决策，[D8-joint-scheduling.md](D8-joint-scheduling.md)
+- **D9**：基于 kvcm 能力的服务地图（会话 KV / 预热 / 反熵 / 账本 / 容量 / 迁移；目标形态 + 收益）——把 D2 的操作集组合成服务，[D9-kv-services.md](D9-kv-services.md)

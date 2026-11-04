@@ -1,8 +1,10 @@
 # 调度流程（L0 / L1 / L2）
 
 - 定位: [D8-joint-scheduling.md](../D8-joint-scheduling.md) 的流程视图——每张图对应一个决策环或联合场景
-- 状态: 设计草案
+- 状态: 设计草案；版本基线 v0.3.13.post1
 - 读法: `->>` 调用/数据流；`-->>` 响应/异步回执；`--x` 失败/断线；`rect` 底色区分并列场景
+
+> **先记住一个区分**：kvcm 预取到目标 seg，得到的是**本机 DRAM**，不是 HBM。它让请求走本地读、省跨机 RDMA；第一次使用仍要把 KV 从 DRAM 拷进 HBM。**D-direct 需要 HBM 证据**（引擎 GPU 事件，或方案 A 壳请求）。
 
 ---
 
@@ -50,16 +52,21 @@ flowchart TB
     H --> D{"连续 HBM 命中 ≥ 阈值<br/>且置信度 ≥ 0.9?"}
     D -->|"是"| DD["D_DIRECT<br/>残差 prefill + decode"]
     D -->|"否"| P{"Pool 命中且 BW ≥ BW*?"}
-    P -->|"是"| PD["PD_DISAGG<br/>P 产出 → 传输 → D"]
+    P -->|"是"| PD["PD_DISAGG / 本地读<br/>P 产出 → 传输 → D"]
     P -->|"否"| CO["COLOCATED<br/>同节点完成"]
     DD --> O["下发"]
     PD --> O
     CO --> O
 ```
 
+注意：
+
+- “Pool 命中”包括本机 DRAM 与远端池；本机 DRAM 走本地读，省跨机传输。
+- kvcm READY 只说明本机 DRAM 有副本；它不能直接让 L0 选 D_DIRECT。
+
 ---
 
-## 3. L1：预取 → READY → 回写
+## 3. L1：预取 → READY（本机 DRAM）→ 回写
 
 ```mermaid
 sequenceDiagram
@@ -75,12 +82,18 @@ sequenceDiagram
     M->>W: 派任务给源 seg client
     W->>M: RDMA 复制
     M-->>K: CopyEnd
-    K->>M: QueryTask + 核验副本（全 rank）
+    K->>M: batch_query_keys / 核验副本（全 rank）
     M-->>K: Ready
-    K-->>R: READY / 补发 BlockStored
-    R->>KVT: 写 Confirmed(HBM, B)
+    K-->>R: READY / 补发 BlockStored（medium=CPU）
+    R->>KVT: 写 Confirmed(DRAM, B)
     Note over R,K: 超时：abandon + 按最新 KVT 重算
 ```
+
+要点：
+
+- READY 写的是 **DRAM tier**，不是 HBM。
+- 第一次请求仍从 DRAM 读进 HBM；收益是省跨机传输。
+- 若要让 HBM 也有副本，走方案 A 壳请求（`max_tokens=1`）或引擎自己的加载/APC。
 
 ---
 
@@ -102,7 +115,7 @@ sequenceDiagram
     end
     A->>R: 恢复请求
     R->>R: KVT.Match：S 的前缀仍在 B
-    R->>A: 路由到 B / D-direct
+    R->>A: 路由到 B（本机 DRAM 读）
     A->>R: Close
     R->>K: RELEASE(S)
     K->>K: 停 keepalive → lease 到期 → 池驱逐兜底
@@ -110,9 +123,9 @@ sequenceDiagram
 
 要点：
 
-- 默认软释放（停 keepalive），不是立即 Remove；
-- 保留有 TTL/字节上限；到期未用要能回收；
-- 恢复时如果前缀不在，按普通请求走，不阻塞。
+- 默认软释放（停 keepalive），不是立即 Remove。
+- soft pin 是“有条件可用”：Case B、单 slice、key 存在、无盘副本；hard pin 不事后设置。
+- 保留有 TTL/字节上限；到期未用要能回收。
 
 ---
 
@@ -133,7 +146,7 @@ sequenceDiagram
     N->>R: register(warming)
     L2->>K: 预热 hot/hook 前缀到 N
     K->>K: copy + verify
-    K-->>KVT: READY / BlockStored
+    K-->>KVT: READY / BlockStored（DRAM）
     KVT-->>L2: coverage
     alt coverage ≥ W_min 或 deadline
         L2->>R: ready，route_weight=1
@@ -141,6 +154,12 @@ sequenceDiagram
         L2->>R: 低权重/延迟加入
     end
 ```
+
+要点：
+
+- warm gate 的 coverage 默认按“本机 DRAM confirmed”算；HBM 覆盖是加分项，不是 Ready 的必要条件。
+- 新节点在 warming 期间不接/低权重接流量。
+- warm 可与权重加载重叠；`T_ready = provision + gate + warm` 要满足 <10s 目标。
 
 ---
 
@@ -173,8 +192,8 @@ sequenceDiagram
 
 要点：
 
-- victim 不是 LIFO；看 unique hot KV、会话风险、迁移成本；
-- drain 卡住不硬删；
+- victim 不是 LIFO；看 unique hot KV、会话风险、迁移成本。
+- drain 卡住不硬删。
 - 迁移失败按最新状态重算，不写 fallback 链。
 
 ---
@@ -196,7 +215,7 @@ sequenceDiagram
         L2->>K: DEMOTE/停保活（软路径）
         K->>K: 等驱逐/落盘
         K-->>KVT: 更新 tier
-        R->>R: 不再 D-direct，改传输/重算
+        R->>R: 不再本地读，改远端/重算
     else 容量真不够
         L2->>L2: 扩 KV 池 / 加 DRAM 节点
     end
@@ -225,8 +244,8 @@ sequenceDiagram
 
 要点：
 
-- ghost 只损性能；
-- miss 反馈是最便宜的反熵；
+- ghost 只损性能。
+- miss 反馈是最便宜的反熵。
 - 不要把“查询失败”当成“副本丢失”。
 
 ---
@@ -273,14 +292,14 @@ sequenceDiagram
     R->>K: PREFETCH(P→B) + RETAIN
     K->>M: create_copy_task
     M-->>K: CopyEnd
-    K-->>R: READY
-    R->>R: KVT：B.HBM Confirmed
+    K-->>R: READY（B 的 DRAM）
+    R->>R: KVT：B.DRAM Confirmed
 
     A->>G: 请求（P + 新内容）
     G->>R: request
-    R->>R: Match：B 连续 HBM 命中
-    R->>W: Generate(D_DIRECT, B)
-    W-->>R: 首 token
+    R->>R: Match：B 本机 DRAM 命中
+    R->>W: Generate(COLOCATED / 本地读, B)
+    W-->>R: 首 token；之后 B 的 APC 可能有 HBM 副本
 
     A->>G: POST(pause)
     G->>R: hook
@@ -289,7 +308,7 @@ sequenceDiagram
 
     A->>G: 恢复请求
     G->>R: request
-    R->>W: 路由到 B（命中）
+    R->>W: 路由到 B（若 HBM 命中则可 D-direct）
 ```
 
 ---
@@ -297,7 +316,7 @@ sequenceDiagram
 ## 11. 读图要点
 
 - **L0 不阻塞**：所有 KV intent 都是异步；请求走当前最优路径。
-- **READY 是回写事件**：KVT 的 `Confirmed` 以 kvcm READY/引擎事件为准，不以 intent 提交为准。
+- **READY 是 DRAM 回写事件**：KVT 的 `Confirmed(DRAM)` 以 kvcm READY/引擎事件为准；D-direct 需要 HBM。
 - **L2 只出决策**：provision 在外部编排；kvcm 只执行 KV 搬迁。
 - **失败不 fallback**：按最新 KVT/价格重算；读路径兜底不叫 fallback。
 - **多 Router**：请求环可水平扩；L2 单 leader；intent 幂等。

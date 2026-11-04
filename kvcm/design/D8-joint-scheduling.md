@@ -1,6 +1,7 @@
-# D8: 统一调度中心——请求 × KV × 扩缩容
+# D8: 统一调度中心——目标形态与性能模型
 
-- 状态: **设计草案**（原理与接口已定，权重/阈值待真机校准）
+- 状态: **设计草案**（目标形态与收益模型；数值为模型估算，待真机校准）
+- 版本基线: **Mooncake v0.3.13.post1**（master / client 同版本）；vLLM-Ascend 0.26 系（D1 的事实基线）
 - 上游: [summary.md](../summary.md) D8；[D1-router-scheduling.md](D1-router-scheduling.md)、[D2-kv-operations.md](D2-kv-operations.md) 的决策层扩展
 - 适用部署: **vLLM-Ascend + Mooncake Store + kvcm** 独立部署；Router 是请求控制面（实现语言不限）
 - 关系声明: **kvcm 是独立项目，本文不依赖 lake 运行时**。lake 仓库只提供参考文档与原型经验；文中引用 lake 的地方都是“可借鉴”，不是依赖
@@ -10,26 +11,116 @@
   - 不实现真实 provision（起 pod / 拉镜像 / 加载权重归外部编排）
   - 不做多租户计费/鉴权（归 gateway / 外部控制面）
   - 首版不做跨机房，只做单集群
+  - 不写代码结构/接口 IDL；本文只保留目标形态、控制原理、收益模型
 
 ---
 
-## 0. 一句话
+## 0. 结论
 
-在 Router 里放一个 **SchedulingCore**：用一棵多源 KV 索引树（KVT）做统一事实视图，用 hook 信封把“未来需求”提前变成可计算的需求预测，用 **L0 请求环 / L1 会话与 KV 环 / L2 容量环** 三条时间尺度不同的决策环，把“请求去哪、KV 怎么动、集群扩不扩”放进同一套目标和预算里。
+1. **终局不是“再加一个调度器”，而是给 Router 补一个决策内核**：一个共享状态 + 三条时间尺度不同的决策环，把“请求去哪、KV 怎么动、集群扩不扩”放进同一套目标与预算。
+2. **索引是事件派生的决策视图，不是第二权威**：引擎 KV events、kvcm READY、Mooncake publisher、Router 推测条目、worker miss 反馈，合成一棵 KVT；Mooncake master 仍是副本权威。
+3. **最大的性能杠杆是“命中/保留”，不是 D-direct**：命中省掉的是秒级 prefill；本地放置省掉的是十毫秒级跨机传输；HBM 命中再省掉毫秒级本地拷贝。三者的量级差一个数量级以上，调度优先级必须按这个顺序设计。
+4. **kvcm 的定位是“KV 执行 + 核验 + 记账 + 发布”**：不做选路、不做扩缩决策、不持有前缀索引。它的八项操作组合成会话、预热、反熵、账本、容量、迁移等服务。
+5. **v0.3.13.post1 下，soft pin 空写已“有条件可用”**（PR73）；hard pin 事后设置已明确拒绝；copy/move 仍无取消；retain 仍未实现；池 publisher 代码有、但默认构建/运行都不开。设计必须按这个基线写，而不是按 main。
 
 ---
 
-## 1. 为什么现在需要调度中心
+## 1. 目标形态
 
-### 1.1 三个决策目前是分开的
+### 1.1 一张图
 
-在没有调度中心时，vLLM-Ascend + Mooncake + kvcm 的实际形态是：
+```mermaid
+flowchart TB
+    A["Agent / 前端 / Coder"] --> G["Gateway<br/>鉴权 / 准入 / 过载"]
+    G -->|"请求 + HookEnvelope"| R["Router / SchedulingCore"]
+
+    subgraph R1["Router 内"]
+        KVT["KVT<br/>block hash → 实例 × 介质 × 状态"]
+        HK["Hook 编译<br/>意图 → 需求"]
+        SES["Session / Budget<br/>会话 / 保留 / 预算"]
+        CAP["Capacity / Price<br/>容量 / 慢快环 / 影子价格"]
+        L0["L0 请求环"]
+        L1["L1 会话与 KV 环"]
+        L2["L2 容量环"]
+    end
+
+    R --> L0
+    R --> L1
+    R --> L2
+    L0 -->|"Generate(mode,node,hint)"| W["vLLM-Ascend P/D/混部"]
+    L0 -->|"intent（异步）"| K["kvcm"]
+    L1 -->|"intent"| K
+    L2 -->|"目标容量"| O["外部编排<br/>K8s / HPA / KEDA / WVA"]
+
+    W <-->|"put/get KV"| M[("Mooncake Store / Master")]
+    W -.->|"KV events"| KVT
+    K <-->|"copy/move/pin/keepalive/remove"| M
+    K -.->|"READY / 补发事件"| KVT
+    M -.->|"removed/cleared（需开启）"| KVT
+    R -->|"决策日志"| LOG["Decision Log<br/>回放 / 归因"]
+```
+
+四个角色：
+
+| 角色 | 终局职责 | 不做什么 |
+|---|---|---|
+| **Router** | KVT、hook 编译、L0/L1/L2、intent、决策日志 | 不直连 master、不读写 KV、不开机器 |
+| **kvcm** | KV 执行、READY 核验、补发事件、会话/保活/台账、反熵 | 不选路、不扩缩、不持有前缀索引 |
+| **vLLM-Ascend** | 执行、产生 KV events、本地 APC | 不做跨实例调度 |
+| **Mooncake** | KV 数据/副本/lease/驱逐/offload | 不解释 token/hash |
+
+### 1.2 终局的五个特征
+
+1. **需求前置**：hook 在请求前给出会话、前缀、ETA、保留意图；Router 提前预取/保留/扩容，而不是等请求到了再反应。
+2. **视图统一**：请求、KV 位置、会话、容量、价格在同一决策状态里；不是“路由看一套、KV 看一套、扩缩看一套”。
+3. **决策分层**：L0 <5ms、L1 100ms–1s、L2 5–60s；三条环通过价格/预算耦合，不互相阻塞。
+4. **KV 生命周期服务化**：会话保留、预热、反熵、账本、迁移是长期运行的服务，不是一次性脚本。
+5. **弹性闭环**：扩缩不只看队列，还看 KV 价值、warm gate、会话风险；缩容不丢热 KV。
+
+### 1.3 终局能力清单
+
+| 面 | 终局能力 | 关键输入 | 关键输出 |
+|---|---|---|---|
+| 请求 | 三模式选路（PD/混部/D-direct）+ 节点/队列 | KVT、负载、SLO、价格 | mode + node + hint |
+| KV | 预取、保留、释放、降层、迁移 | hook、会话、KVT、预算 | intent（异步） |
+| 扩缩 | 计算池 + KV 池；扩容 warm gate；缩容 KV-aware victim | 需求预测、SLO、水位、KV 价值 | 目标容量/期望状态 |
+| 观测 | 命中归因、预热 ROI、决策回放 | KVT、intent、READY、请求结果 | 指标/账本/策略版本 |
+
+### 1.4 现状与终局的差距
+
+截至 2026-11-04，按分支现状（**以合入 main 为准**）：
+
+| 能力 | 现状 | 对 D8 的影响 |
+|---|---|---|
+| E10/E11/E12 | 已合入 main：五层重构、常驻进程、gRPC intent（仅预热） | L0/L1 可以先接 intent；其他操作还没有 intent |
+| E14 补发 | `feat/kvcm-e14-publish` 已实现真机补发：READY 后按实例端点发 `BlockStored`（`medium=CPU`、`full_attention`、低 64 位 hash） | KVT 的“预复制放置”有来源；move/remove 事件仍未接 |
+| soft pin | `feat/kvcm-ops-mainline`（PR73）：空写 **有条件可用**；hard pin 拒绝 | 会话保留可以先用 soft pin；有前置条件 |
+| 实例注册 | E13 设计已定：实例 id、rank 有序段、端点、DP、kind 一次交全；代码归 E13 | 端点/seg 映射仍靠启动参数；生产要多一次注册 |
+| 段容量准入 | PR72：提交前查目标段剩余；不够不发 | 预取会因段满失败；L1 要有退避 |
+| E15 带宽限速 | 未做：只有并发窗口，没有网卡利用率感知 | 预取/迁移会争带宽；L1 要预算 |
+| retain | 未实现：没有 `AddReplicaForRetainedClient`；可登记 move 到活 seg / kvcm 自挂 SSD | 会话跨实例存亡还不能完全兜住 |
+| publisher | v0.3.13.post1 有代码，但构建默认 OFF、运行默认 false；copy 路径零发布 | 删除面要么开启 publisher，要么靠 TTL/miss/核验 |
+
+> 结论：D8 的终局形态可以现在设计，但**落地必须按 v0.3.13.post1 的能力写**；不能把 main/0.3.14 的 `has_read_lease`、retained client、DFS 当成已具备。
+
+### 1.5 明确不做
+
+- 不做“全局在线优化器”：请求路径算不动，也会把扩缩抖动带进 TTFT。
+- 不让 Router 直读 Mooncake master：Router 会变成池感知组件，且每请求多一跳；D1 §2 已排除。
+- 不让 kvcm 持有前缀索引：索引是在线服务，kvcm 是后台控制面（D1 §4）。
+- 不做 mode-to-mode 固定降级链：失败按最新状态重跑（D1/F4 原则）。
+- 不做“无限 pin/无限预取”：没有预算的保留等于没有策略。
+
+---
+
+## 2. 为什么必须联合
+
+### 2.1 三个决策互相抵消
 
 ```mermaid
 flowchart LR
     subgraph R["Router（只做前缀亲和/负载）"]
-        R1["查前缀索引"]
-        R2["选实例"]
+        R1["查前缀索引"] --> R2["选实例"]
     end
     subgraph K["kvcm（只做 KV 操作）"]
         K1["copy / move / keepalive / remove"]
@@ -37,445 +128,132 @@ flowchart LR
     subgraph A["扩缩（只看队列/GPU）"]
         A1["加/减实例"]
     end
-    R1 --> R2
-    K1 -.->|"不知道请求何时来"| R2
-    A1 -.->|"不知道 KV 在哪、值多少"| R2
     R2 -.->|"不知道未来会不会复用"| K1
+    K1 -.->|"不知道请求何时来"| R2
+    R2 -.->|"不知道 KV 在哪、值多少"| A1
+    A1 -.->|"缩掉热节点"| R2
 ```
 
-三个问题各自都“能用”，但组合起来会互相抵消：
+典型互相抵消：
 
-- Router 把请求发到 A，kvcm 却把 KV 预取到 B——预取白做；
+- Router 把请求发到 A，kvcm 把 KV 预取到 B——预取白做；
 - 扩缩把持有热前缀的节点缩掉——命中率下降，再扩回来；
-- hook 说“30 秒后还要用这个前缀”，但没人把它变成预取/保留/不缩容的动作；
-- kvcm 的 READY 只用于“日志”，没有回写索引，下一次选路仍然不知道 B 有了。
+- hook 说“30 秒后还要用”，但没人把它变成预取/保留/不缩容；
+- kvcm READY 只写日志，没回写索引——下一次还是不知道 B 有了。
 
-### 1.2 三个决策的耦合点
-
-```mermaid
-flowchart TB
-    H["Hook：未来需求"] --> RQ["请求路由"]
-    H --> KV["KV 生命周期"]
-    H --> SC["容量/扩缩"]
-    RQ -->|"选到哪个实例"| KV
-    KV -->|"副本在哪、READY"| RQ
-    KV -->|"占用/释放 HBM/DRAM"| SC
-    SC -->|"加减实例、drain"| KV
-    SC -->|"改变可选节点/队列"| RQ
-    RQ -->|"实际命中/负载"| SC
-```
-
-三个耦合点：
-
-1. **路由 ↔ KV**：路由决定“哪个实例值得预取/保留”，KV 的 READY 决定“这个实例现在能不能 D-direct”。
-2. **KV ↔ 扩缩**：KV 的驻留量/水位决定“要不要扩”，扩缩的 drain 决定“KV 往哪搬”。
-3. **扩缩 ↔ 路由**：新节点没预热就接流量 = 冷 miss；缩容选错 victim = 热 KV 丢失。
-
-### 1.3 为什么不能做一个“全局在线优化器”
-
-请求路径预算 5ms（D1 与 lake 参考 SLO 都要求 D-direct 模式选择 <5ms），扩缩周期是秒到分钟。把三者塞进一个在线优化器，会有三个问题：
-
-- 算不动：候选节点 × 前缀块 × KV 动作 × 扩缩组合，状态空间爆炸；
-- 抖动传导：扩缩的慢决策会让请求路径抖动；
-- 不可解释：出错时无法判断是索引错、打分错还是扩缩错。
-
-所以采用 **时间尺度分离 + 影子价格**：L2 算“容量/带宽/预取”的边际价格，L0/L1 在价格下做局部最优。价格是三条环之间唯一的耦合信号。
-
----
-
-## 2. 设计原则
-
-| 原则 | 含义 | 反面 |
-|---|---|---|
-| **H1. hint ≠ command** | hook 只是意图；Router/kvcm 可裁剪、推迟、拒绝 | 把 hook 当硬约束，用户一改就雪崩 |
-| **H2. KV 动作只走 intent** | Router 不碰 PoolKey/seg/rank；kvcm 决定做不做、何时做 | Router 直连 master，变成池感知组件（D1 §2 已排除） |
-| **H3. 请求不等 READY** | 预取是后台投资；本次请求按当前最优可用路径走 | 排队等复制完成，TTFT 不可控 |
-| **H4. 不设 mode-to-mode fallback** | 失败/超时 → 按最新状态重跑决策 | “D-direct 失败就降级 PD”的固定阶梯 |
-| **H5. 索引是派生视图** | 陈旧只损性能，不损正确性；读路径兜底 | 把 KVT 当权威，靠它删数据 |
-| **H6. 预算先行** | 预取/保留/扩缩都有字节、TTL、并发、成本上限 | 无限 pin / 无限预取，最后等于没有策略 |
-| **H7. 决策可回放** | 每次决策记录输入、候选、价格、选择、版本 | 只记录结果，事故无法复盘 |
-| **H8. 决策与执行分离** | Router 决策；kvcm 执行 KV；外部编排执行 provision | 一个进程既决策又开机器，边界糊掉 |
-
----
-
-## 3. 部署形态与角色
-
-### 3.1 目标部署
+### 2.2 时间尺度差三个数量级
 
 ```mermaid
-flowchart TB
-    C["Client / Agent / Coder"] --> G["Gateway（鉴权/准入/过载）"]
-    G -->|"OpenAI 请求 + HookEnvelope"| R["Router / SchedulingCore"]
-    R -->|"Generate（mode + node + hint）"| W1["vLLM-Ascend P 实例"]
-    R -->|"Generate"| W2["vLLM-Ascend D 实例"]
-    R -->|"Generate"| W3["vLLM-Ascend 混部实例"]
-
-    W1 <-->|"put/get KV（AscendStoreConnector）"| M[("Mooncake Store / Master")]
-    W2 <--> M
-    W3 <--> M
-
-    W1 -.->|"KV events（ZMQ）"| R
-    W2 -.->|"KV events（ZMQ）"| R
-    W3 -.->|"KV events（ZMQ）"| R
-
-    R -->|"gRPC intent"| K["kvcm"]
-    K -->|"RPC：copy/move/pin/keepalive/remove"| M
-    K -.->|"READY / 补发 BlockStored"| R
-
-    R -->|"目标容量/期望状态"| O["外部编排（K8s / HPA / KEDA / WVA）"]
-    O -->|"provision / drain"| W1
-    O --> W2
-    O --> W3
+flowchart LR
+    L0["L0 请求<br/>µs–ms"] --> L1["L1 会话/KV<br/>100ms–1s"] --> L2["L2 容量<br/>5–60s"]
+    L2 -.->|"价格/预算"| L0
+    L2 -.->|"保留预算"| L1
+    L0 -.->|"实际命中/负载"| L2
+    L1 -.->|"KV 水位/READY"| L2
 ```
 
-### 3.2 角色边界
+把三者塞进一个在线优化器会有三个问题：
 
-| 角色 | 负责 | 不负责 |
-|---|---|---|
-| **Gateway** | 鉴权、限流、过载准入、hook 透传/签名 | 选路、KV 决策、扩缩决策 |
-| **Router** | KVT、hook 编译、L0/L1/L2 决策、intent 下发、决策日志 | 直接读写 KV、直接操作 master、真实 provision |
-| **kvcm** | KV 操作执行、READY 核验、补发事件、台账/会话/保活、反熵 | 请求选路、扩缩决策、持有前缀索引 |
-| **vLLM-Ascend** | 执行、产生 KV events、本地 APC | 不承担跨实例调度 |
-| **Mooncake** | KV 数据/副本/lease/驱逐/offload | 不解释 token/hash（key 是不透明字符串） |
-| **外部编排** | 起停实例、资源配额 | 不做逐请求路由 |
+- 算不动：候选节点 × 前缀块 × KV 动作 × 扩缩组合；
+- 抖动传导：扩缩慢决策让请求路径抖动；
+- 不可解释：出错无法判断是索引错、打分错还是扩缩错。
 
-### 3.3 版本基线
+### 2.3 用“价格”做耦合
 
-设计必须同时支持 0.3.11.post1 与 mooncake main（D2 F13）：
-
-| 能力 | 0.3.11.post1 | main | 对 D8 的影响 |
-|---|---|---|---|
-| 引擎 KV events（`BlockStored`/`BlockRemoved`，medium） | 有 | 有 | KVT 的 HBM 事实来源 |
-| 池 publisher（removed/cleared） | **无** | 有 | 删除面降级：TTL + miss 反馈 + 抽样核验 |
-| `GetReplicaListForAdmin`（零副作用） | 无 | 有 | 反熵优先用 main；0.3.11 用普通查询但注意 lease 副作用 |
-| `ProbeKey` | 无 | 有 | 轻量核验；0.3.11 用 `ExistKey`（会续租） |
-| 空写 upsert（soft pin） | 绑定缺通道 | 绑定缺通道 | MVP 先用 lease 延长 + keepalive，不依赖空写 |
-| copy/move 任务取消 | 无 | 无 | intent 带 deadline；超时 abandon，不假设能止损 |
-| per-key 立即降层 | 无 | 无 | demote 走“停保活 + 等驱逐”软路径，或 kvcm 自挂段 |
-
-> 结论：**先把“事件 + READY + miss 反馈”这条链做实**；删除面和 pin 的缺口用降级策略兜住，不要让调度中心依赖不存在的 RPC。
-
----
-
-## 4. 总体架构
-
-### 4.1 组件图
-
-```mermaid
-flowchart TB
-    subgraph SC["Router / SchedulingCore"]
-        direction TB
-        ING["事实摄入<br/>Fact Ingest"]
-        KVT["KVT<br/>block hash → 实例 × 介质 × 状态"]
-        HK["Hook 编译器<br/>信封 → Demand"]
-        SES["Session Registry<br/>会话/分支/保留/预算"]
-        CAP["Capacity & Price<br/>容量图 + 快慢环 + 影子价格"]
-        L0["L0 请求环<br/><5ms"]
-        L1["L1 会话/KV 环<br/>100ms–1s"]
-        L2["L2 容量环<br/>5–60s"]
-        LOG["Decision Log<br/>输入/候选/价格/选择/版本"]
-    end
-
-    SRC1["vLLM-Ascend<br/>KV events"] --> ING
-    SRC2["kvcm<br/>READY / 补发"] --> ING
-    SRC3["Mooncake publisher<br/>（main 可选）"] --> ING
-    SRC4["Worker<br/>miss 反馈"] --> ING
-
-    HK --> L0
-    HK --> L1
-    HK --> L2
-    KVT <--> L0
-    KVT <--> L1
-    CAP <--> L2
-    SES <--> L1
-    L0 --> LOG
-    L1 --> LOG
-    L2 --> LOG
-
-    L0 -->|"RouteDecision"| W["vLLM-Ascend"]
-    L0 -->|"KVIntent（异步）"| K["kvcm"]
-    L1 -->|"KVIntent"| K
-    L2 -->|"ScaleDecision / CapacityAdvice"| O["外部编排"]
-```
-
-### 4.2 四条数据流
-
-| 流 | 方向 | 内容 | 频率 |
-|---|---|---|---|
-| **事实流** | 引擎/kvcm/池 → KVT | `BlockStored/Removed/Ready/Miss` | 高频、异步 |
-| **需求流** | Gateway/Agent → Router | HookEnvelope | 每请求/每 turn |
-| **决策流** | Router → worker/kvcm/编排 | Route / Intent / Scale | 每请求 / 周期 |
-| **反馈流** | worker/kvcm/编排 → Router | READY/FAILED/miss/容量 | 异步 |
-
-### 4.3 逻辑分层仍然是“索引 / 查询”两层
-
-D1 §1 的分层不能因为“同进程”就丢掉：
-
-- **摄入层**：后台 goroutine/线程消费事件、合并事实、维护 KVT；
-- **查询层**：L0 只做只读快照/原子读，不在请求路径里边收事件边算；
-- **写入层**：L1/L2 只写 intent/decision，不直接改 KVT 的权威事实（READY 事实由摄入层统一 apply）。
-
----
-
-## 5. 状态层
-
-### 5.1 KVT：KV 索引树
-
-#### 5.1.1 事实模型
-
-所有源统一成 `KVFact`：
+L2 根据全局需求算容量/带宽/预取的**影子价格**；L0/L1 在价格下做局部最优。价格是三条环之间唯一的耦合信号：
 
 ```text
-KVFact {
-  source:     ENGINE | KVCM | POOL | ROUTE | MISS | MASTER_VERIFY
-  seq:        uint64        // 每源独立
-  at:         timestamp
-  kind:       STORED | REMOVED | CLEARED | READY | LOST | LEASE | PIN
-  ns:         (model_id, revision, pool_kind)
-  hashes:     [32]byte[]    // 链式 block hash
-  parent:     [32]byte
-  node:       instance_id   // 事件归属实例
-  tier:       HBM | DRAM | NVMe | DFS
-  scope:      NODE | POOL_TIERS | ALL
-  ttl:        duration
-  confidence: uint8
-}
+λ_gpu      每 GPU 秒的边际成本
+λ_hbm      每 GB HBM/DRAM 占用的边际成本
+λ_bw       每 GB 传输的边际成本
+λ_prewarm  预取预算的边际成本
+λ_slo      SLO 违约的边际成本
 ```
 
-字段要点：
+这样既“联合”，又保持每层可解释、可回滚、可单独限流。
 
-- `hashes` 是 vLLM-Ascend 的链式 block hash（DP/TP 的 per-rank key 在摄入层按逻辑块去重，D1 F2/F8）；
-- `node` 是事件归属实例：引擎事件按端点归属，kvcm 补发按目标实例端点归属（D1 §2「身份 = 端点」）；
-- `tier` 区分 HBM（gpu 事件）与池 DRAM（cpu 事件/kvcm READY）；
-- `scope` 决定删除的作用域：引擎 `BlockRemoved` 只清该节点 HBM；池 `removed` 清池层（DRAM/NVMe/DFS），不清某实例 HBM；`AllBlocksCleared` 按 scope 清。
+---
 
-#### 5.1.2 索引结构
+## 3. 统一决策状态
 
-```text
-KVT
-├── namespace: (model_id, revision, pool_kind)
-│   └── block: hash → Node
-│       ├── parent / children        // 逻辑 radix 链
-│       ├── locs: instance → Loc     // 每个实例一条
-│       │   ├── tier: HBM/DRAM/NVMe/DFS
-│       │   ├── state: Speculative/Confirmed/Stale
-│       │   ├── source / seq / as_of / expire
-│       │   └── confidence
-│       ├── demand: 热度/ETA/复用概率
-│       └── retain: NONE/SESSION/PIN + 到期
-```
+### 3.1 KVT：KV 索引树
 
-为什么“逻辑树、物理 map”：
+KVT 不是第二权威，是**决策视图**：
 
-- 请求自带 hash 链，逐块查 map 就能得到连续命中长度，不需要每次从根遍历；
-- 树只在需要“某前缀族/分支/聚合”时用 parent/children 指针；
-- 索引规模由 block 数决定，不由字节数决定；一个逻辑块只存一条，rank 维度在摄入层消除。
+- **权威**：Mooncake master 记副本；引擎记 HBM/APC；kvcm 记操作与核验。
+- **KVT**：把“哪里可能有这个前缀、以什么置信度”整理成可查询的树，服务选路与预取。
+- **允许陈旧**：陈旧只损性能，不损正确性（读路径会远端读/重算兜底）。
 
-#### 5.1.3 位置状态机
+#### 介质分层
+
+| 层 | 含义 | 事件来源 | 对调度的意义 |
+|---|---|---|---|
+| **HBM** | 实例 APC/显存里的块 | 引擎 `BlockStored(medium=GPU)` | 真本地命中；D-direct 的唯一依据 |
+| **本机 DRAM** | 本机 Mooncake seg | 引擎 `BlockStored(medium=CPU)` / kvcm READY | 本地读，省跨机传输；仍要拷进 HBM |
+| **远端 DRAM/SSD/DFS** | 池内其他节点/介质 | 池事件、kvcm 核验 | Pool 命中，省重算但要传输 |
+
+**关键区分**：kvcm 预取到目标 seg，得到的是“本机 DRAM”，不是 HBM。它让请求走本地读，避免跨机 RDMA；但第一次使用仍要把 KV 从 DRAM 拷进 HBM。**D-direct 需要 HBM 证据**（引擎 GPU 事件，或方案 A 壳请求把 KV 带进 HBM）。这个区分决定了性能收益的量级（见 §7）。
+
+#### 状态与置信度
 
 ```mermaid
 stateDiagram-v2
     [*] --> Speculative: 路由决策/预取 intent
-    Speculative --> Confirmed: 引擎 BlockStored / kvcm READY / 核验
+    Speculative --> Confirmed: 引擎事件 / kvcm READY / 核验
     Speculative --> Expired: TTL 到期
     Confirmed --> Stale: worker miss / 源 gap / 核验失败
-    Stale --> Confirmed: 重新核验 / BlockStored
-    Confirmed --> Removed: BlockRemoved / AllCleared / Remove
+    Stale --> Confirmed: 重新核验 / 事件
+    Confirmed --> Removed: 删除/驱逐事件 / Remove
     Stale --> Removed: 删除事实
-    Removed --> [*]: 墓碑 TTL 到期
+    Removed --> [*]: 墓碑到期
     Expired --> [*]
 ```
 
-规则：
+- `Speculative` 只做亲和排序，不做 D-direct；
+- `Confirmed` 才可作为“可路由”的依据；
+- 删除/失效事实带墓碑，防止延迟到达的 `Stored` 复活；
+- 置信度随时间衰减；低于阈值只做亲和，不做 D-direct。
 
-- **D-direct 只认 `Confirmed` + `HBM`**；`Speculative` 只用于亲和排序。
-- **本机 DRAM 不是 D-direct**：它是 local fetch，省跨机传输但不省本地拷贝；打分按 tier 权重处理。
-- **负事实优先**：`Removed/LOST/MISS` 带墓碑 TTL，防止延迟到达的 `Stored` 把条目“复活”。
-- **墓碑不是删除数据**：KVT 只影响选路；真正删除由 kvcm/D2 的 release 流程决定。
+#### 合并规则（概念）
 
-#### 5.1.4 多源合并
+- 每个源独立序号；gap → replay/snapshot；拿不到就标 stale。
+- 同一块同一实例同一介质只保留一条位置；不同介质可并存。
+- 负事实优先；源信任级：核验 > kvcm READY > 引擎事件 ≈ 池事件 > 推测 > miss 反馈（负事实最高）。
+- `miss` 反馈是最便宜的反熵：worker 说没有，就降级该条；不需要全量轮询 master。
 
-```mermaid
-flowchart TB
-    F["收到 KVFact"] --> S{"source seq 连续?"}
-    S -->|"否"| G["gap：请求 replay / snapshot"]
-    G -->|"成功"| A["apply"]
-    G -->|"失败"| ST["标 source stale，降置信度"]
-    S -->|"是"| A
-    A --> K{"kind 是负事实?"}
-    K -->|"是"| T["写墓碑 + 清对应 loc"]
-    K -->|"否"| P{"已有墓碑且未过期?"}
-    P -->|"是"| D["丢弃（防复活）"]
-    P -->|"否"| M["按 (sourceRank, seq, at) 合并 loc"]
-    M --> C["更新 demand/retain 关联"]
-```
+### 3.2 Session / Demand
 
-源信任级建议：
+会话状态回答四个问题：
 
-```text
-MASTER_VERIFY (kvcm 反熵核验)  = 4
-KVCM_READY                     = 3
-ENGINE_EVENT                   = 2
-POOL_PUBLISHER                 = 2
-ROUTE_SPEC                     = 1
-MISS_FEEDBACK                  = 4（负事实）
-```
+- 这个会话上一轮在哪个实例、前缀到哪；
+- 下一轮大概什么时候来、还会不会来；
+- 前缀值不值得保留、保留多久；
+- 已经花了多少预取/保留预算。
 
-同一 block 同一实例同一 tier 只保留一条 loc；不同 tier 可以并存（HBM + 本地 DRAM + 远端池）。跨源冲突时，高信任级优先；同信任级按 seq/at；负事实优先。
+**权威在 kvcm ledger 的 sessions 表**（D2 的“不可丢”状态），Router 持缓存；Router 重启后回读，不丢会话。
 
-#### 5.1.5 前缀匹配与命中定义
+### 3.3 Capacity / Price
 
-`Match(ns, hashes, node)` 返回：
+容量视图包括：
+
+- 实例：角色、队列、in-flight、prefill/decode 速率、HBM/DRAM 余量、NIC 利用率；
+- 池：DRAM/SSD/DFS 水位、驱逐率、promote 速率、shard 环；
+- 预算：GPU/节点上限、后台带宽上限、pin 字节上限。
+
+价格是这些约束的“影子”：
 
 ```text
-Hit {
-  contiguous_blocks:    连续满块命中数（任意介质）
-  contiguous_hbm:       连续 HBM confirmed 块数
-  contiguous_local_dram:连续本机 DRAM 块数
-  pool_hit_blocks:      池内（任意节点）连续块数
-  tiers:                每块的分层
-  confidence:           min(路径上各块置信度)
-  as_of:                min(as_of)
-}
+λ_{t+1} = clip(λ_t + η × (u_t − u*), 0, λ_max)     （对偶上升）
+λ = λ_base × (u / u*)^k                             （工程比例式）
 ```
 
-- **命中长度** = `contiguous_blocks × block_size`；不满一块的尾巴由引擎重算（D1 §3）。
-- **D-direct 资格** = `contiguous_hbm ≥ prompt_blocks - 1`（末 token 通常要重算，vLLM 的 `get_num_new_matched_tokens` 会少记 1 个 token）；至少要求“前缀连续”，中段有空洞不算。
-- **Pool 命中 ≠ 本地命中**：Pool 命中省重算但要传输；本地命中（HBM）才省传输。
-
-#### 5.1.6 gap、ghost 与置信度
-
-- **gap**：每源独立 seq；跳号先 replay；replay 不可用则请求 snapshot；再不行标 stale。没有 snapshot 的源（如池 publisher 0.3.11）直接不订阅，用降级策略。
-- **ghost**：事件派生索引的固有风险。后果是“路由到一个其实没有副本的实例”→ 跨机读/重算，只损性能（D1 F3/F10）。
-- **置信度衰减**：
-
-```text
-conf(t) = conf0 × exp(-(t - t0) / τ)
-```
-
-`τ` 按源类型取（引擎事件较长，推测条目很短）。`conf < 0.9` 不允许 D-direct；`conf < 0.5` 只作亲和排序。
-
-- **ghost 概率**（用于打分/验证据优先级）：
-
-```text
-P_ghost ≈ 1 - exp(-λ_delete × age)
-```
-
-`λ_delete` 由历史删除率估计；`P_ghost × C_miss` 进入 L0 的 risk 项。热条目优先抽样核验，而不是全量 diff（D1 §2 已否决轮询比对）。
-
-#### 5.1.7 规模与内存
-
-粗略：
-
-```text
-M ≈ N_blocks × (32B hash + L × 24B loc + ~60B overhead)
-```
-
-`L` = 该块的平均位置数（通常 1–3）。举例：100 万块 × 2 loc ≈ 140MB；1 亿块 ≈ 14GB。控制手段：
-
-- 一个逻辑块一条，不按 rank/key 展开；
-- 冷块只留 hash + 一个 loc，demand 聚合到前缀级；
-- 可选“实例级条目”（只记块在哪个实例，不记精确地址），地址由实例 agent 管；
-- 超过阈值时 Router 只留热集，冷前缀查 kvcm/Conductor（D1 §1 的 remote indexer 形态）。
-
-### 5.2 Session / Demand
-
-```text
-Session {
-  session_id, workflow_id, branch_id
-  model_id, revision
-  last_node
-  prefix_frontier: hash[]        // 已知的前缀链
-  last_seen, eta_ms
-  retention: NONE | SESSION | PIN
-  ttl_ms, budget_used
-  pending_intents: intent_id[]
-  hook_confidence
-}
-```
-
-- 会话状态以 **kvcm ledger 的 sessions 表为权威**（D2 L5“不可丢”），Router 持本地缓存；Router 重启后从 kvcm 回读。
-- `prefix_frontier` 是“已知的上一轮前缀”，不是“下一轮完整 prompt”；下一轮新增部分由 hook/请求补。
-- `eta_ms` 是预测值，不是承诺；过期后按普通请求处理。
-
-### 5.3 Capacity / Price
-
-```text
-NodeCapacity {
-  node_id, role (P/D/HYBRID)
-  ready | warming | draining
-  queue_len, in_flight, tokens_per_s
-  hbm_free, dram_free, prefill_rate, decode_rate
-  nic_util, bw_to_peers
-}
-
-PoolCapacity {
-  dram_used/total, ssd_used/total, dfs_used/total
-  eviction_rate, promote_rate
-  shard_ring_generation
-}
-
-PriceVector {
-  λ_gpu, λ_hbm, λ_dram, λ_bw, λ_prewarm, λ_slo
-}
-```
-
-价格不是“钱”，是**边际成本信号**：L0/L1 用它把全局约束（容量、带宽、预算）局部化。更新方式见 §7.4。
-
-### 5.4 Decision Log
-
-每次 L0/L1/L2 决策记录：
-
-```text
-DecisionRecord {
-  id, at, policy_version
-  input_digest          // 请求/hook/KVT 版本/价格版本
-  candidates[]          // 每个候选的分数与关键项
-  chosen
-  intents[]             // 发了哪些 KV intent
-  scale                 // 是否触发扩缩
-  budget_after
-  reason                // 人可读的原因
-}
-```
-
-用途：回放、A/B、事故复盘、策略调参。没有它，联合调度无法定位“为什么选了这条”。
+`u` 是利用率/水位，`u*` 是目标。L0/L1 只读价格；L2 单点更新。
 
 ---
 
-## 6. Hook 协议：把意图变成需求
+## 4. Hook：把意图变成需求
 
-### 6.1 信封
-
-```text
-HookEnvelope {
-  version: 1
-  hook_id: string              // 幂等键
-  session_id, workflow_id, step, branch_id
-  model_id, revision
-  prefix: {
-    token_ids?: uint32[]
-    block_hashes?: bytes32[]
-    prefix_len?: uint32
-    append_estimate?: uint32   // 预计还会追加多少 token
-  }
-  timing: PRE_ANNOUNCE | ATTACHED | POST
-  eta_ms?: uint64              // 预计请求到达时间
-  expected_turns?: uint32
-  reuse_prob?: float           // 0..1
-  retention?: NONE | SESSION | PIN
-  ttl_ms?: uint64
-  prefetch?: AUTO | ALLOW | DENY
-  demote_after_ms?: uint64
-  affinity?: { node?, zone?, strict? }
-  deadline_ms?: uint64
-  priority?: 0..7
-  budget?: { max_transfer_bytes?, max_prewarm_ms?, max_pin_bytes? }
-  signature?: string           // gateway 签名
-}
-```
-
-### 6.2 三个时序
+### 4.1 三个时序
 
 ```mermaid
 sequenceDiagram
@@ -486,637 +264,548 @@ sequenceDiagram
     participant W as vLLM-Ascend
 
     Note over A,R: PRE_ANNOUNCE（请求前）
-    A->>G: hook(session, prefix, eta, retention)
+    A->>G: 会话/前缀/ETA/保留意图
     G->>R: 透传 + 签名
     R->>R: 编译成 Demand
-    R->>K: PREFETCH / RETAIN intent
-    K-->>R: READY（异步）
-    Note over R: KVT 写 Confirmed
+    R->>K: PREFETCH / RETAIN（异步）
 
     Note over A,W: ATTACHED（请求）
     A->>G: request + hook
     G->>R: request + hook
-    R->>W: Generate(mode, node, hint)
-    W-->>R: 结果 + 可选 miss 反馈
+    R->>W: Generate(mode,node,hint)
 
     Note over A,R: POST（会话后）
-    A->>G: hook(close/pause/branch)
+    A->>G: pause / resume / close / branch
     G->>R: hook
     R->>K: RETAIN / DEMOTE / RELEASE
 ```
 
-### 6.3 编译成 Demand
+### 4.2 信封（概念字段）
 
-`HookEnvelope → Demand`：
+| 字段 | 作用 | 约束 |
+|---|---|---|
+| `version` / `hook_id` | 兼容/幂等 | 未知版本降级为 observe |
+| `session_id` / `workflow_id` / `step` / `branch` | 会话/分支定位 | 与路由键对齐 |
+| `prefix`（token_ids 或 hash 链） | 要预取/保留的前缀 | 优先 hash；必须与引擎口径一致 |
+| `timing` / `eta_ms` / `expected_turns` / `reuse_prob` | 请求前/中/后；预计到达 | ETA 决定提前量 |
+| `retention` / `ttl_ms` / `prefetch` | 保留等级与生命周期 | TTL/pin 上限可裁剪 |
+| `affinity`（node/zone/strict） | 会话亲和 | strict 也不能违反容量/SLO |
+| `deadline` / `priority` | SLO/优先级 | 优先级只影响排队，不做准入 |
+| `budget` | 预取/保留/字节上限 | 超预算裁剪或拒绝 |
+| `signature` | 网关签名 | 匿名来源只能 observe |
 
-```text
-Demand {
-  session_id, prefix_hashes
-  target_nodes: []          // 亲和/预计节点
-  eta_ms, window_ms
-  reuse_prob
-  value_class: LOW | NORMAL | HIGH
-  retention, ttl_ms
-  prefetch_policy
-  budget
-}
-```
+### 4.3 语义
 
-编译规则：
-
-- `PRE_ANNOUNCE`：不产生请求，只产生 L1/L2 的输入；
-- `ATTACHED`：主要影响 L0 的亲和/保留；
-- `POST`：主要影响 L1 的 retain/demote/release；
-- 没有 `prefix` 的 hook 只能做会话级提示（会话粘性、TTL），不能做前缀预取。
-
-### 6.4 预算与信任
-
-- **来源信任**：只有 Gateway 签名/内部 agent 的 hook 才能触发 PIN/扩缩预测；匿名用户只能 observe。
-- **预算**：每 session/租户有 `max_transfer_bytes`、`max_pin_bytes`、`max_ttl`；超出裁剪或拒绝该 hook。
-- **防滥用**：pin/预取是共享资源，必须有 rate limit 和配额；否则一个用户可以把池 pin 满。
-- **失败**：解析失败/版本不认识/预算超限 → 丢弃 + metric，不影响请求（fail-open）。
-
-### 6.5 key 口径
-
-Router 必须能算出与 vLLM-Ascend **逐字节一致**的 block hash 链：
-
-- vLLM 是链式 `hash_block_tokens`（`parent_hash`、`block_size`、模型类型、初始种子参与）；
-- vLLM-Ascend 的 PoolKey 还带 `head_or_tp_rank`（`model@hash@head_or_tp_rank`），TP 下同一逻辑块多把 key；
-- kvcm 的 `KeyComputer` 已按引擎规则复算（D1 §2 方案 a）；
-- Router 侧建议实现一个 `KeyComputer` 适配器（Go/Rust/Python 均可），用 kvcm/keys.py 的测试向量做跨语言一致性校验；不要自己发明 hash；
-- Hook 优先带 `block_hashes` 或 `token_ids`；只带文本时，Router 需要 tokenizer 或调用 Gateway 的 tokenize 服务。**不要用估算 token 数**——hash 对不上等于全 miss。
+- **hint ≠ command**：Router/kvcm 可裁剪、推迟、拒绝；请求正确性不依赖 hook。
+- **fail-open**：解析失败/版本不认识/预算超限 → 丢弃 + metric，不影响请求。
+- **预算与审计**：每 session/租户有 pin/预取/带宽上限；hook 可审计。
+- **key 口径**：vLLM-Ascend 是链式 block hash（`parent_hash`、block_size、模型类型、初始种子参与），TP 下同一逻辑块多把 key。Router 必须用与引擎逐字节一致的 hash 算法；hook 优先带 hash/token_ids，不要用估算 token 数。
+- **不等待**：pre_announce 只影响未来；attached 请求走当前最优路径，不等 READY。
 
 ---
 
-## 7. 三条决策环
+## 5. 三条决策环
 
-### 7.1 时间尺度
-
-```mermaid
-flowchart LR
-    subgraph L0["L0 请求环（µs–ms）"]
-        A["Match KVT"] --> B["打分/约束"] --> C["选 mode+node"]
-        C --> D["Speculative + 异步 intent"]
-    end
-    subgraph L1["L1 会话/KV 环（100ms–1s）"]
-        E["Session 定时器"] --> F["prefetch/retain/demote/release"]
-        F --> G["READY/FAILED 回写"]
-    end
-    subgraph L2["L2 容量环（5–60s）"]
-        H["预测需求"] --> I["容量/价格"] --> J["扩缩/warm/drain"]
-    end
-    L2 -.->|"价格"| L0
-    L2 -.->|"预算/容量"| L1
-    L0 -.->|"实际命中/负载"| L2
-    L1 -.->|"KV 水位/READY"| L2
-```
-
-### 7.2 L0 请求环
-
-#### 7.2.1 流程
+### 5.1 L0 请求环（<5ms）
 
 ```mermaid
 flowchart TB
-    S["请求 + Hook"] --> P["解析前缀 hash"]
+    S["请求 + Hook"] --> P["前缀 hash"]
     P --> M["KVT.Match 逐候选"]
-    M --> C{"D-direct 资格?"}
-    C -->|"是"| DD["D_DIRECT"]
-    C -->|"否"| T{"Pool 命中 + 带宽够?"}
-    T -->|"是"| PD["PD_DISAGG / 本地 fetch"]
+    M --> D{"连续 HBM 命中够?<br/>置信度够?"}
+    D -->|"是"| DD["D_DIRECT"]
+    D -->|"否"| T{"Pool 命中 + 带宽够?"}
+    T -->|"是"| PD["PD / 本地读"]
     T -->|"否"| CO["COLOCATED"]
     DD --> SC["打分/约束/选择"]
     PD --> SC
     CO --> SC
-    SC --> D["RouteDecision + Speculative"]
-    D --> I["异步 KVIntent"]
-    D --> Q["入队/执行"]
+    SC --> O["下发 + Speculative"]
+    SC --> I["异步 KVIntent"]
 ```
 
-#### 7.2.2 打分
-
-对候选 `(node n, mode m)`：
+打分（示意）：
 
 ```text
-U(r,n,m) =
-    w_hit   × H(r,n) × c_prefill
-  + w_pool  × P(r,n) × c_prefill × κ_tier
-  − w_bw    × (B(r,n) / BW_eff(n)) × c_bw
-  − w_q     × Q(n) × c_queue
-  − w_slo   × max(0, TTFT(r,n,m) − D_r) × c_slo
-  + w_future× F(r,n)
-  − w_risk  × R(r,n)
+U = w_hit·H·c_prefill + w_pool·P·c_prefill·κ
+  − w_bw·(B/BW)·c_bw − w_q·Q·c_queue
+  − w_slo·max(0, TTFT−D)·c_slo
+  + w_future·F − w_risk·R
 ```
-
-其中：
-
-- `H` = 连续 HBM 命中 token 数；`P` = 连续 Pool 命中 token 数；`κ_tier` 是 DRAM/NVMe/DFS 的折扣；
-- `B` = 需要传输的字节；`BW_eff` = 有效带宽（EWMA/池视图）；
-- `Q` = 队列等待估计；`D_r` = TTFT 目标；`F` = hook 的未来价值；`R` = 陈旧/ghost 风险；
-- 权重 `w_*` 由 L2 的价格/策略给出，不在热路径学习。
 
 TTFT 估算：
 
 ```text
-TTFT(r,n,m) = Q(n)
-            + residual(r,n) / v_prefill(n)
-            + B(r,n) / BW_eff(n)
-            + T_handoff(m)
+TTFT = Q + residual/v_prefill + B/BW + T_handoff
 ```
 
-D-direct 时 `B≈0`、`residual = prompt − H`（通常还剩 1 个 token）；PD 时再加 P 队列与 handoff。
-
-#### 7.2.3 传 vs 算
+传 vs 算：
 
 ```text
-C_transfer  = B / BW × c_bw
+C_transfer  = B/BW × c_bw
 C_recompute = residual × c_prefill
-BW*         = B × c_bw / (residual × c_prefill)
+BW*         = B×c_bw / (residual×c_prefill)
 ```
 
-- `BW < BW*` → 重算/混部更划算；
-- `BW ≥ BW*` → 传输/PD 更划算；
-- 全前缀命中（`residual=0`）时传输几乎总是赢，但仍要比较 `B/BW` 与 decode 启动开销。
+约束：
 
-#### 7.2.4 约束
+- D-direct 仅当连续 HBM confirmed 命中 ≥ 阈值（通常整段，末 token 可能重算）；
+- PD 仅当角色/拓扑允许、残差 prefill 足够大；
+- 不拒绝请求；优先级只影响排队；
+- 选择后写 Speculative，异步 intent 不阻塞。
 
-- D-direct：`contiguous_hbm ≥ prompt_blocks − 1` 且 `confidence ≥ 0.9`；
-- PD：角色允许、P/D 队列可接受、handoff 时间在预算内；
-- 不拒绝请求；优先级只影响排队顺序；
-- 选择后写 `Speculative`（短 TTL），`in-flight++`；异步 intent 不阻塞。
+**重要**：kvcm READY 是“本机 DRAM 副本就绪”，不是“HBM 命中”。L0 不能因为 kvcm READY 就选 D-direct；D-direct 要有 HBM 事件或方案 A 壳请求的证据。
 
-### 7.3 L1 会话与 KV 环
-
-#### 7.3.1 生命周期
+### 5.2 L1 会话与 KV 环（100ms–1s）
 
 ```mermaid
 stateDiagram-v2
     [*] --> Observed: hook pre_announce
     Observed --> Active: 请求到达
-    Active --> Paused: tool call / 会话停顿
-    Paused --> Retained: retain/pin 成功
-    Retained --> Active: 下一轮请求
-    Active --> Releasing: 会话结束/超时
+    Active --> Paused: tool call / 停顿
+    Paused --> Retained: retain/pin + keepalive
+    Retained --> Active: 下一轮
+    Active --> Releasing: 结束/超时
     Paused --> Releasing: TTL 到期
     Releasing --> Closed: 停保活/remove
     Active --> Migrating: 节点 drain
     Migrating --> Active: move 完成
 ```
 
-#### 7.3.2 定时器
+动作：
 
-| 定时器 | 周期 | 动作 |
-|---|---|---|
-| keepalive | lease TTL / 3 | `ExistKey/BatchExistKey` 续租（有界） |
-| retention 到期 | TTL | 降级/停保活 |
-| prefetch deadline | intent 截止 | abandon；按最新 KVT 重算 |
-| verification | 抽样/热条目 | 核验副本，发 `LOST/REMOVED` |
-| session idle | idle 阈值 | 软释放/降层 |
-
-#### 7.3.3 保留等级
-
-| 等级 | 语义 | 机制 | 用途 |
+| 动作 | 触发 | 机制 | 预算 |
 |---|---|---|---|
-| `NONE` | 默认 | 池 LRU/TTL | 普通请求 |
-| `SESSION` | 软保留 | keepalive/lease 延长；soft pin（若可用） | 工具调用停顿、多轮 |
-| `PIN` | 硬保留 | hard pin 或 lease 延长 + 持续续租 | 高价值会话/关键前缀 |
-| `DURABLE` | 持久 | demote 到 SSD / DFS retain | 长停顿、节点下线 |
+| keepalive | 会话活跃/保留 | 周期续租（有界） | lease TTL 的 1/3 左右 |
+| prefetch | hook/预测 | copy 到目标 seg | 后台带宽 <10%；按 EV/bytes |
+| retain | 停顿/长会话 | soft pin（条件可用）或 lease 延长 | TTL/字节上限 |
+| promote | 只剩盘副本且预期复用 | 池 promotion 或读删写 | 触发式，非确定 |
+| demote | 冷/水位高 | 停保活 + 等驱逐/落盘 | 写回模式时机不可控 |
+| release | 会话结束 | 停 keepalive；确认没人用才 Remove | 默认软释放 |
+| move | drain/迁移 | 指定源→目标 | 源在线；无取消 |
 
-MVP 建议：
-
-- 先用 **lease 延长 + keepalive** 做 `SESSION`，避开 D2 §2 空写/client_id 的未决问题；
-- `PIN` 先用“lease 延长 + 高频续租”，并设 TTL/字节上限；需要“kvcm 失联也安全”时再评估 hard pin（读删写/空写）；
-- `DURABLE` 只在 kvcm 挂段挂盘或 DFS 可用时启用（D2 §3/§4）。
-
-#### 7.3.4 预取价值
-
-未来请求按 Poisson 到达，窗口 `T` 内至少一次的概率：
+预取价值（Poisson 近似）：
 
 ```text
-Λ = ∫_t^{t+T} λ(s) ds
-P_use = 1 − exp(−Λ)
-```
-
-期望收益：
-
-```text
-S = p_hit × (C_transfer_saved + C_recompute_saved)
-C_copy = B / BW × c_bw + bytes × c_hbm × T
+Λ = ∫λ; P_use = 1 − e^{−Λ}
 EV = P_use × S − C_copy − C_occupancy
 ```
 
-已知会话下一轮在 `t+Δ`：
+保留 TTL：
 
 ```text
-EV = p_resume × S − C_copy − c_hbm × bytes × TTL
+Net(T) = p_resume(T)×S − c_h×bytes×T − C_risk
+break-even: μ·p0·e^{−μT}×S = c_h×bytes
 ```
 
-触发条件：`EV > θ` 且 `EV/bytes` 排名靠前（预算内按价值密度贪心）。没有未来需求信号的预取，只在“顺手补”场景（本次请求跨机读后异步补）使用。
-
-#### 7.3.5 保留 TTL 的盈亏平衡
-
-保留不是越久越好。设恢复概率指数衰减 `p(T)=p0·e^{−μT}`，保留成本 `c_h·bytes·T`，则保留到 `T` 的净收益：
+预算：
 
 ```text
-Net(T) = p0·e^{−μT}·S − c_h·bytes·T − C_evict_risk
+Σ bytes_i / deadline_i ≤ B_budget
+Σ pinned_bytes ≤ B_pin
+TTL ≤ T_max
 ```
 
-- `Net(T) > 0` 才保留；`T` 上限由预算/`T_max` 卡住；
-- 最优 TTL 是“边际收益 = 边际成本”的点：
-
-```text
-μ·p0·e^{−μT}·S = c_h·bytes
-```
-
-解出 `T*` 后与 `T_max` 取小；解不出就退化为固定窗口。这个公式的意义：**TTL 应由恢复概率和占用成本共同决定，不是拍脑袋的“保留 30 分钟”**。
-
-#### 7.3.6 预算
-
-```text
-Σ_{prefetch i} bytes_i / deadline_i ≤ B_budget
-Σ_{pinned j} bytes_j ≤ B_pin
-TTL_i ≤ T_max
-```
-
-`B_budget` = 后台带宽预算（建议 <10% 链路）；按 `EV/bytes` 或最早 deadline 做准入。
-
-### 7.4 L2 容量环
-
-#### 7.4.1 双环
+### 5.3 L2 容量环（5–60s）
 
 ```mermaid
 flowchart TB
-    O["OBSERVE<br/>队列/SLO/水位/hook 预测"] --> P["PREDICT<br/>未来 5–15 分钟需求"]
+    O["OBSERVE<br/>队列/SLO/水位/hook"] --> P["PREDICT<br/>5–15 分钟需求"]
     P --> SL["慢环：容量下限"]
-    O --> FL["快环：SLO 偏差 ±1"]
+    O --> FL["快环：SLO ±1"]
     SL --> R["RECONCILE<br/>预算/最小副本/冷却"]
     FL --> R
     R --> C["CONSTRAIN<br/>min/max/GPU/带宽"]
     C --> E["EXECUTE<br/>provision / warm / drain"]
-    E --> F["FEEDBACK<br/>Ready/失败/命中"]
+    E --> F["FEEDBACK"]
     F --> O
 ```
 
-- 慢环：预测需求 / 单副本容量 = 下限；
-- 快环：当前 SLO 偏差在 [下限, 上限] 内 ±1；
-- 冷却 `T_cool ≥ T_provision + T_warm + T_drain`，避免扩缩振荡。
-
-#### 7.4.2 容量公式
-
-对每个池（P/D/混部/KV）：
+容量公式：
 
 ```text
-ρ = λ / (c × μ)
-c_min = ceil(λ / (μ × ρ_target))
-L = λ × W                    （Little 定律）
+ρ = λ/(c×μ)
+c_min = ceil(λ/(μ×ρ_target))
+L = λ×W                （Little 定律）
 ```
 
-- `λ` = 到达率（请求/s 或 token/s）；`μ` = 单副本服务率；`ρ_target` 建议 0.7–0.8；
-- 队列长度阈值可由 `L* = λ × W_target` 推；
-- 快环：
+扩缩维度：计算池（P/D/混部）、KV 池（shard/节点）、模型 revision。按瓶颈选择：
 
-```text
-if p99(TTFT) > D for N 个周期: c += 1
-if p99(TTFT) < 0.7D and ρ < 0.5 for M 个周期: c -= 1
-```
-
-#### 7.4.3 扩哪个池
-
-按瓶颈选择：
-
-| 信号 | 优先扩 |
+| 信号 | 优先 |
 |---|---|
-| P 队列长、TTFT 高、prefill 利用率高 | P 池 |
-| D ITL 高、decode 利用率高 | D 池 |
-| 池 DRAM 水位高、驱逐率高 | KV 池 / 加 DRAM 节点 |
-| 带宽利用率高、传输排队 | 网络/更多 KV 副本 |
-| 本地命中率低、预取 ROI 高 | 先预取，不扩 |
+| P 队列长 / TTFT 高 / prefill 满 | P 池 |
+| D ITL 高 / decode 满 | D 池 |
+| 池 DRAM 水位高 / 驱逐高 | KV 池 |
+| 带宽满 / 传输排队 | 更多本地副本或网络 |
+| 本地命中低但池命中高 | 先预取，不扩 |
 
-**预取 vs 扩容**：如果需求是短时突发、前缀已在池，预取更便宜；如果需求持续、单节点容量饱和，扩容。比较边际成本：
+扩容 warm gate：
 
 ```text
-C_prefetch = bytes / BW × c_bw + c_hbm × bytes × T
-C_scale    = c_capacity × T_scale + C_warm
+coverage = Σw_b×1[b confirmed] / Σw_b
+ready if coverage ≥ W_min or t ≥ deadline
+route_weight = min(1, coverage/W_min)
 ```
 
-只有 `C_prefetch < C_scale` 且能在 deadline 前完成，才选预取。
+新实例先 `warming`，不接或低权重接流量；warm 可与权重加载重叠。`T_ready = provision + gate + warm` 必须满足 <10s 目标。
 
-#### 7.4.4 扩容：warm gate
+缩容 victim：
+
+```text
+loss(v) = uniqueHotKV(v)×refill + sessionRisk(v) + migrationCost(v)
+gain(v) = idleCapacity(v)×c_capacity
+choose max(gain − loss)
+```
+
+不要 LIFO；有活跃会话/唯一热 KV 的节点优先保留；drain 卡住不硬删。
+
+### 5.4 三条环的协调
+
+- **冷却**：`T_cool ≥ T_provision + T_warm + T_drain`，防扩缩振荡。
+- **滞回**：扩容阈值 > 缩容阈值；连续 N 周期才动作。
+- **优先级**：L0 永远不被 L1/L2 阻塞；L1 intent 异步；L2 只发目标容量。
+- **价格**：L2 单点更新；L0/L1 只读；多 Router 时 L2 走 leader。
+
+---
+
+## 6. 联合闭环场景
+
+### 6.1 Agent 多轮：预取 → 本地读 → 可选 HBM → 保留 → 恢复
+
+```mermaid
+sequenceDiagram
+    participant A as Agent
+    participant R as Router
+    participant K as kvcm
+    participant M as Mooncake
+    participant W as vLLM-Ascend
+
+    A->>R: PRE_ANNOUNCE(P, target B, eta 30s)
+    R->>R: KVT：P 在 A，B 无
+    R->>K: PREFETCH(P→B) + RETAIN
+    K->>M: create_copy_task
+    M-->>K: CopyEnd
+    K->>K: verify 全 rank
+    K-->>R: READY（B 的本机 DRAM 就绪）
+    R->>R: KVT：B.DRAM Confirmed
+
+    A->>R: 请求
+    R->>W: 路由到 B（本地 DRAM 读）
+    W-->>R: 首 token；之后 HBM 可能有 APC 副本
+
+    A->>R: POST(pause)
+    R->>K: RETAIN(TTL)
+    Note over K: 有界 keepalive
+
+    A->>R: 恢复
+    R->>W: 路由到 B
+```
+
+要点：
+
+- kvcm READY 只保证“本机 DRAM 有副本”，第一次请求仍然要把 KV 从 DRAM 读进 HBM；它省的是跨机 RDMA，不是本地拷贝，更不是 prefill（prefill 已在池命中时省掉）。
+- 若 B 的引擎在请求后把块放进 APC，下一次才可能 D-direct；这由引擎事件/KVT 决定，不由 kvcm 保证。
+- 若预取没赶上，请求照常走远端读；下一次受益。
+
+### 6.2 扩容：warm gate
 
 ```mermaid
 sequenceDiagram
     participant L2 as L2
-    participant O as 外部编排
+    participant O as 编排
     participant N as 新实例
     participant K as kvcm
     participant R as Router
 
-    L2->>O: ScaleOut(pool, +1)
-    O->>N: provision + load weights
-    N->>R: register（warming）
-    R->>K: 预热 hot/hook 前缀
-    K->>K: copy + verify
-    K-->>R: READY
-    R->>R: coverage = 加权 confirmed 比例
-    alt coverage ≥ W_min 或 deadline 到
+    L2->>O: ScaleOut
+    O->>N: provision + weights
+    N->>R: register(warming)
+    L2->>K: 预热 hot/hook 前缀
+    K-->>R: READY（DRAM）
+    R->>R: coverage
+    alt coverage ≥ W_min
         R->>R: ready，route_weight=1
     else 未达标
         R->>R: 低权重/延迟加入
     end
 ```
 
-```text
-coverage = Σ w_b × 1[b confirmed] / Σ w_b
-ready if coverage ≥ W_min or t ≥ T_deadline
-route_weight = min(1, coverage / W_min)
-```
-
-- `w_b` 由 hook 价值/热度决定；
-- 新节点在 `warming` 期间不接（或低权重接）流量；
-- `T_ready = T_provision + T_gate + T_warm` 必须满足 <10s 目标；warm 可以与权重加载重叠。
-
-#### 7.4.5 缩容：victim 选择
-
-不要 LIFO。对每个候选：
-
-```text
-loss(v) = Σ_{b∈uniqueHot(v)} h_b × (1 − replica_elsewhere(b)) × c_refill(b)
-        + Σ_{s∈sessions(v)} p_s × c_recompute(s)
-        + migration_cost(v)
-
-gain(v) = idle_capacity(v) × c_capacity
-```
-
-选择 `gain(v) − loss(v)` 最大且满足 min replicas/负载约束的节点。
-
-```mermaid
-sequenceDiagram
-    participant L2 as L2
-    participant R as Router
-    participant K as kvcm
-    participant O as 外部编排
-
-    L2->>R: mark draining(victim)
-    R->>R: 停止新请求（在途继续）
-    R->>K: move/retain 热前缀
-    K-->>R: READY / 完成
-    R->>O: remove(victim)
-    O-->>R: 完成
-    R->>R: 更新 KVT / 价格
-```
-
-- 有活跃会话的节点优先保留；
-- drain 卡住就保留 draining，不硬删；
-- 迁移失败按 F4/最新状态重算，不写 fallback 链。
-
-#### 7.4.6 价格更新
-
-用对偶上升/比例控制：
-
-```text
-λ_{t+1} = clip(λ_t + η × (u_t − u*), 0, λ_max)
-```
-
-或工程上更稳的比例式：
-
-```text
-λ = λ_base × (u / u*)^k
-```
-
-- `u` = 利用率/水位；`u*` = 目标；`k` 控制灵敏度；
-- `λ_bw`、`λ_hbm`、`λ_prewarm`、`λ_gpu` 分别更新；
-- L0/L1 只读价格，不反向改价格；L2 单点更新，避免多 Router 打架。
-
----
-
-## 8. 联合闭环
-
-### 8.1 Agent 多轮：预取 → D-direct → 保留 → 恢复
-
-```mermaid
-sequenceDiagram
-    participant A as Agent
-    participant G as Gateway
-    participant R as Router
-    participant K as kvcm
-    participant W as vLLM-Ascend
-    participant M as Mooncake
-
-    A->>G: PRE_ANNOUNCE(prefix P, target B, eta 30s)
-    G->>R: hook
-    R->>R: KVT 查询：P 在 A，B 没有
-    R->>K: PREFETCH(P → B) + RETAIN
-    K->>M: create_copy_task
-    M-->>K: CopyEnd
-    K->>K: verify 全 rank
-    K-->>R: READY
-    R->>R: KVT 写 B.HBM Confirmed
-
-    A->>G: 请求（P + 新内容）
-    G->>R: request
-    R->>R: Match：B HBM 连续命中
-    R->>W: Generate(D_DIRECT, B)
-    W-->>R: 首 token
-
-    A->>G: POST(pause)
-    G->>R: hook
-    R->>K: RETAIN(session, ttl)
-    Note over K: keepalive 续租，防驱逐
-
-    A->>G: 恢复请求
-    G->>R: request
-    R->>W: 路由到 B
-```
-
-关键点：
-
-- 预取在请求前发生，但请求**不等** READY；
-- 如果预取没赶上，L0 仍选 A/远端读，下一次再受益；
-- 保留有 TTL/预算，不是永久 pin。
-
-### 8.2 扩缩与预取的联合
-
-```mermaid
-flowchart TB
-    H["Hook：未来 10 分钟同前缀 ×2"] --> L2["L2 预测"]
-    L2 --> Q{"前缀已在池?"}
-    Q -->|"是，短突发"| P["预取到现有节点"]
-    Q -->|"否/持续"| S["扩容 + warm"]
-    P --> C{"EV > C_scale?"}
-    C -->|"是"| P
-    C -->|"否"| S
-    S --> W["warm gate"]
-    W --> R["加入路由"]
-```
-
-### 8.3 缩容与会话
+### 6.3 缩容：KV-aware victim
 
 ```mermaid
 flowchart LR
-    V["候选 victim"] --> U{"有活跃会话?"}
-    U -->|"是"| KEEP["保留/换 victim"]
-    U -->|"否"| H{"持有 unique hot KV?"}
+    V["候选 victim"] --> S{"有活跃会话?"}
+    S -->|"是"| KEEP["保留/换 victim"]
+    S -->|"否"| H{"有唯一热 KV?"}
     H -->|"是"| MOVE["move/retain 后缩"]
-    H -->|"否"| DRAIN["直接 drain"]
+    H -->|"否"| DRAIN["drain"]
 ```
 
-### 8.4 池压与降级
+### 6.4 池压：降层/扩池
 
 ```mermaid
 flowchart TB
-    W["DRAM 水位 > 阈值"] --> D["L1：冷前缀 demote/停保活"]
+    W["DRAM 水位高"] --> D["冷前缀 demote/停保活"]
     D --> K["KVT 更新"]
-    K --> R["L0：不再 D-direct，改传输/重算"]
-    R --> S["L2：若持续，扩 KV 池"]
+    K --> R["L0 不再本地读，改远端/重算"]
+    R --> S["持续则扩 KV 池"]
 ```
 
----
-
-## 9. 一致性与多实例
-
-### 9.1 KVT 的定位
-
-- **不是权威**：Mooncake master 是副本权威；引擎是 HBM 事实源；kvcm 是操作/核验权威。
-- **是决策视图**：允许陈旧，允许 ghost；读路径兜底。
-- **可重建**：从事件 replay / snapshot / 抽样核验重建；重建期间降级（不做 D-direct）。
-
-### 9.2 多 Router
+### 6.5 Ghost：miss 反馈
 
 ```mermaid
-flowchart TB
-    subgraph R1["Router-1"]
-        K1["KVT-1"]
-        L01["L0/L1"]
-    end
-    subgraph R2["Router-2"]
-        K2["KVT-2"]
-        L02["L0/L1"]
-    end
-    E["事件源"] --> K1
-    E --> K2
-    R1 -.->|"etcd lease"| L["L2 leader"]
-    R2 -.->|"etcd lease"| L
-    L -->|"ScaleDecision"| O["编排"]
-    R1 -->|"KVIntent"| KC["kvcm"]
-    R2 -->|"KVIntent"| KC
+sequenceDiagram
+    participant R as Router
+    participant KVT as KVT
+    participant W as 实例 B
+    participant K as kvcm
+
+    KVT-->>R: B 有 P（Confirmed）
+    R->>W: 请求
+    W-->>R: 本地 miss
+    R->>KVT: MISS(P,B)
+    KVT->>KVT: B 的 loc → Stale
+    R->>K: VERIFY（抽样/热条目）
+    K-->>KVT: LOST / OK
+    R->>R: 本次远端读/重算；下次换节点
 ```
 
-- 每个 Router 从同一事件源建 KVT，确定性合并；
-- 会话按 `session_id` HRW 粘到某 Router（或任意 Router + kvcm ledger 回读）；
-- **L2 只有 leader 发扩缩**；所有 Router 可发 KV intent，kvcm 侧按 `(prefix,target,op)` 幂等去重；
-- 决策带 epoch；leader 切换后新 leader 从最新 KVT/价格继续，不重放旧决策。
-
-### 9.3 与 kvcm 的一致性
-
-- Router 发 intent 后不假设成功；以 kvcm READY 为准；
-- kvcm READY 是“全 rank 齐备、可路由”的语义（D1 §2）；
-- kvcm 失败/超时 → Router 清 pending，按最新 KVT 重算；
-- kvcm 的 ledger 是会话/保活权威；Router 重启后回读，不丢会话。
-
 ---
 
-## 10. 失败处理
+## 7. 性能模型与整体收益
 
-| 失败 | 处理 |
-|---|---|
-| hook 解析失败/超预算 | 丢弃该 hook，请求照常；记 metric |
-| KVT gap | replay → snapshot → 标 stale；stale 不做 D-direct |
-| ghost/miss | worker 回写 `MISS`，KVT 降级；下次换节点；只损性能 |
-| kvcm 不可达 | intent 失败/排队；路由不受影响；恢复后重发（幂等） |
-| copy 失败/超时 | 不重试到死；按最新 KVT 重算；必要时 abandon + 清理 |
-| 源实例下线 | copy 失败；换源/放弃；不写 fallback 链 |
-| CP/编排不可达 | 不扩缩/不迁移；路由继续；告警 |
-| 扩缩失败 | 回滚期望状态；保持 draining；下周期重试 |
-| 多 Router 冲突 | leader/epoch；intent 幂等；不并发改同一目标 |
+这一节回答：“联合调度到底赚什么、赚多少、什么时候不赚”。
 
-原则：**任何失败都不阻塞已准入请求**；KV 侧失败最多让本次请求多一次远端读/重算。
+### 7.1 收益分解
 
----
+```mermaid
+flowchart LR
+    A["无命中<br/>T_prefill 秒级"] --> B["远端池命中<br/>T_transfer 十毫秒级"]
+    B --> C["本机 DRAM<br/>T_local 毫秒级"]
+    C --> D["HBM 命中<br/>≈0"]
+```
 
-## 11. SLO 与预算
+一次请求的 KV 相关成本可以拆成四段：
 
-> 下表是参考目标，具体数值按业务/真机校准；约束关系（预算/门限/不阻塞）是硬的。
+```text
+T_total ≈ Q + T_prefill + T_transfer + T_local_copy
+```
 
-| 指标 | 目标 | 对设计的约束 |
+> 这不是四项同时发生：miss 有 `T_prefill`；远端池命中只有很小的残差 prefill、有 `T_transfer`；本机 DRAM 有 `T_local_copy`；HBM 命中两者都接近 0。按命中层级取项。
+
+| 段 | 由什么决定 | 调度能做什么 | 量级（见 §7.3） |
+|---|---|---|---|
+| `Q` 队列 | 实例负载/扩缩 | L0 负载打分、L2 扩容 | ms–s |
+| `T_prefill` | 残差 token / 算力 | 命中/保留（避免重算） | **秒级** |
+| `T_transfer` | 跨机字节 / 网络 | 本地放置、预取 | **十毫秒级** |
+| `T_local_copy` | 本地字节 / HBM 带宽 | HBM 命中、D-direct | **毫秒级** |
+
+**收益优先级**：
+
+1. **命中/保留**（省 `T_prefill`）——最大；
+2. **本地放置**（省 `T_transfer`）——次之；
+3. **HBM 命中/D-direct**（省 `T_local_copy`）——再次；
+4. **队列/弹性**（省 `Q`）——尾部与吞吐。
+
+这解释了为什么“D-direct”不是终局的核心：它是第三层优化，真正决定 TTFT 的是“KV 还在不在、能不能命中”。
+
+### 7.2 公式
+
+```text
+T_prefill   = P / v_prefill
+T_transfer  = S / BW_wan
+T_local     = S / BW_local
+S = P × bytes_per_token
+```
+
+其中 `P` 是 prompt token 数，`S` 是前缀字节数。
+
+命中的收益：
+
+```text
+Benefit = p_miss_avoided × T_prefill
+        + p_remote_to_local × (T_transfer − T_local)
+        + p_hbm × T_local
+```
+
+- `p_miss_avoided`：本来会 miss/重算，现在命中（保留/预取防驱逐）；
+- `p_remote_to_local`：本来是远端池命中，现在本机 DRAM；
+- `p_hbm`：本来是本地 DRAM，现在 HBM。
+
+预取 ROI：
+
+```text
+ROI = Benefit / (S/BW_copy × c_bw + S×T_hold×c_hbm + waste)
+```
+
+保留 TTL：
+
+```text
+Net(T) = p_resume(T)×T_prefill − c_h×S×T − C_risk
+```
+
+### 7.3 量化示例（模型估算，非真机）
+
+假设（只用于说明量级，真机替换）：
+
+- `bytes_per_token = 20KB`（薄 KV/MLA 类；胖 GQA 会更大）
+- `v_prefill = 5000 token/s/GPU`
+- `BW_wan = 25 GB/s`
+- `BW_local = 100 GB/s`
+
+| 指标 | 8K prompt | 70K prompt |
+|---|---:|---:|
+| 前缀字节 `S` | 160 MB | 1.4 GB |
+| 重算 `T_prefill` | 1.6 s | 14 s |
+| 跨机传输 `T_transfer` | 6.4 ms | 56 ms |
+| 本地拷贝 `T_local` | 1.6 ms | 14 ms |
+
+由此：
+
+| 优化 | 8K 收益 | 70K 收益 | 说明 |
+|---|---:|---:|---|
+| 命中 vs 重算 | ~1.6 s | ~14 s | 最大杠杆：保留/防驱逐 |
+| 本机 DRAM vs 远端 | ~4.8 ms | ~42 ms | 预取/本地放置 |
+| HBM vs 本机 DRAM | ~1.6 ms | ~14 ms | D-direct/APC 命中 |
+| 队列/扩容 | 看负载 | 看负载 | 尾部与吞吐 |
+
+> 表中“命中”按整段前缀命中估算；实际 vLLM 可能仍重算末 token，残差很小。真机要按模型/并行配置替换 `bytes_per_token`、`v_prefill`、`BW_wan`、`BW_local`。
+
+**读数**：
+
+- 命中的收益是“秒级”，本地放置是“十毫秒级”，HBM 是“毫秒级”。**不要为了毫秒级优化牺牲命中率**。
+- 预取如果只是把“远端命中”变成“本地命中”，收益是 4.8ms/42ms；如果它防止了一次驱逐/重算，收益是 1.6s/14s。**预取的真正价值在“防 miss”，不是“搬家”**。
+- 保留一个 70K 会话的前缀（1.4GB）10 分钟，换一次 14s 重算，通常非常划算；但要有 TTL/预算，不能无限 pin。
+
+### 7.4 吞吐与成本
+
+命中率提升的吞吐价值：
+
+```text
+节省的 GPU 时间/秒 = QPS × Δhit_rate × T_prefill
+等效 GPU 数 ≈ 节省的 GPU 时间/秒
+```
+
+示例（说明量级）：
+
+- 8K、100 QPS、命中率 +10% → `100×0.1×1.6 = 16 GPU·s/s` ≈ 16 张卡的 prefill 产能；
+- 70K、10 QPS、命中率 +10% → `10×0.1×14 = 14 GPU·s/s`。
+
+成本侧：
+
+```text
+C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失败/浪费
+```
+
+通常 `c_gpu` 远高于 `c_bw/c_mem`，所以“用带宽/内存换 GPU 时间”是合算的；但带宽有上限（后台 <10%），所以要有预算和优先级。
+
+### 7.5 什么时候不赚
+
+| 场景 | 为什么不赚 | 策略 |
 |---|---|---|
-| D-direct 模式选择 | <5ms | L0 只读 KVT/价格，不做 RPC；摄入异步 |
-| TTFT P99 | 按业务 SLO | L0 打分含队列/传输；L2 快环 |
-| 扩容 → Ready | <10s | provision ≤5s + gate ≤2.5s + 余量；warm 后台 |
-| 缩容 → KV 写回/迁移 | <5s | drain 预算；卡住不硬删 |
-| 后台带宽 | <10% | 预取/迁移共享预算；按 EV/bytes 准入 |
-| 本地命中率 | 按业务目标（参考 lake P7.6 的 >40%） | 亲和 + 预取 + 保留；L2 不缩热节点 |
-| 请求成功率（非过载） | 99.9% | 读路径兜底；不因 KVT 错拒请求 |
+| prompt 很短 | prefill 小，传输/队列占比高 | 少预取，优先队列/负载 |
+| 复用率低 | 保留/预取浪费内存和带宽 | 短 TTL；按 EV/bytes 准入 |
+| 带宽已满 | 预取与请求争带宽，TTFT 反而变差 | 后台预算 <10%；避让/限速 |
+| HBM 压力大 | pin 太多挤掉其他前缀，全局命中率下降 | pin 预算；soft 优先；TTL |
+| hook 不准 | 预取到错误实例/前缀 | 置信度、ETA 过期、只 observe |
+| 扩容急 | warm gate 延迟接流量 | 老节点先接；warm 后台；低权重 |
 
-预算分层：
+### 7.6 要观测的收益指标
 
-```text
-B_total = B_request + B_prefetch + B_migration + B_gc
-B_prefetch + B_migration + B_gc ≤ 10% × B_total
-```
-
----
-
-## 12. 指标
-
-| 类别 | 指标 |
+| 指标 | 回答 |
 |---|---|
-| KVT | 条目数、内存、gap 次数、ghost 率、核验命中率、事件延迟 p99 |
-| Hook | 覆盖率、有效率、预取命中率、预算拒绝率、ETA 误差 |
-| L0 | 决策延迟 p99、D-direct 比例、本地命中率、TTFT、mode 分布 |
-| L1 | READY 延迟、预取 ROI、保留命中率、pin 字节、过期/浪费 |
-| L2 | 扩容 Ready 时延、warm coverage、缩容失败率、振荡次数、预测误差 |
-| 全局 | 每请求成本、每 token 成本、传输字节、驱逐率、SLO 违约率 |
+| `hit_rate`（pool/local/HBM 分层） | 命中率是否提升 |
+| `prefill_saved_tokens` | 省了多少重算 |
+| `transfer_saved_bytes` | 省了多少跨机传输 |
+| `prefetch_hit_rate` / `waste_bytes` | 预取是否值 |
+| `retention_hit_rate` / `wasted_retention` | 保留是否值 |
+| `TTFT_p99` / `ITL_p99` | 用户感知 |
+| `gpu_seconds_saved` / `cost_per_1k_tokens` | 成本 |
+| `scale_ready_latency` / `warm_coverage` | 弹性 |
+| `ghost_ratio` / `verify_miss_rate` | 索引可信度 |
 
 ---
 
-## 13. 路线图
+## 8. 一致性与失效
 
-| 阶段 | 内容 | 验收 |
+- KVT 陈旧只损性能；读路径兜底（远端读/重算）。
+- 删除面：0.3.13.post1 的 publisher 需构建+运行开启；默认无删除事件，用 TTL + miss + 抽样核验。
+- 源 gap：replay → snapshot → stale；stale 不做 D-direct。
+- kvcm 挂：intent 失败/排队，路由不受影响；ledger 持久化，恢复后继续。
+- 编排挂：不扩缩，告警；已发决策幂等重试。
+- 多 Router：KVT 各一份；会话粘性；L2 leader；intent 幂等。
+- 失败不写 mode-to-mode fallback；按最新状态重跑。
+
+---
+
+## 9. 版本与能力基线（v0.3.13.post1）
+
+### 9.1 关键事实
+
+| 能力 | v0.3.13.post1 | 对 D8 的影响 |
 |---|---|---|
-| **M0 契约 + 观测** | `HookEnvelope` / `KVFact` / `KVIntent` 扩展 / `DecisionRecord`；KVT 先接引擎事件；hook 只 observe | 契约测试；KVT 合并/墓碑；L0 延迟 <5ms；不改变行为 |
-| **M1 请求 + KV 环** | kvcm READY 回写；speculative；miss 反馈；hook 驱动预取；session retain；预算 | 预取命中率、TTFT、浪费率；A/B hook on/off |
-| **M2 容量环** | L2 leader；双环；warm gate；KV-aware victim；价格；KV 池扩缩 | 扩容 Ready <10s 且 coverage 达标；缩容零丢失；无振荡 |
-| **M3 服务化** | 反熵、账本归因、容量顾问、回放；分支/跨集群后置 | ghost 率、ROI、预测误差、回放一致 |
+| 引擎 KV events | vLLM-Ascend `enable_kv_cache_events`；`BlockStored/Removed` + `medium` | KVT 的 HBM/池 put 来源 |
+| master publisher | 代码有；CMake `ENABLE_KV_EVENTS` 默认 OFF，运行 `--enable_kv_events` 默认 false；copy 路径零发布 | 删除面需显式开启；预复制放置仍靠 kvcm 补发 |
+| admin 查询 | `GET /batch_query_keys` / `GetReplicaListForAdmin`（零副作用） | 反熵/核验可用，不污染 lease |
+| soft pin 空写 | **有条件可用**（PR73）：Case B、单 slice、key 存在、无盘副本；`exists` 持 lease；地址检查 | 会话保留可用；有边界 |
+| hard pin 事后设置 | **拒绝**（创建时固化） | 只能用 keepalive 做 lease 保护 |
+| keepalive | 注册/注销 + 周期 `renew_once`（有界） | 会话保留的基础 |
+| demote | 停保活 + 等一个 lease TTL + 查盘；写回模式池不满仍失败 | 不是确定性降层 |
+| promote | 反复 `GetReplicaList`/触发；READY 较弱（看到内存副本，不保证任务完成） | 只能当“可尝试路由” |
+| remove | 全局删 key，不支持 target；force 只跳过 lease | 释放走软释放优先 |
+| retain | 未实现；无 `AddReplicaForRetainedClient`；可登记 move 到活 seg / kvcm 自挂 SSD | 跨引擎存亡还不能完全兜 |
+| copy/move 取消 | 无 | 预取改道只能 abandon + 事后清理 |
+| 实例注册 | E13 设计已定；代码归 E13 | 端点/seg 映射仍靠启动参数 |
+| 段容量准入 | PR72：提交前查目标段剩余 | 预取可能因段满失败 |
+| 带宽限速（E15） | 未做；只有并发窗口 | 预取/迁移要预算 |
 
-M0 的代码落点（建议，不绑定语言）：
+### 9.2 0.3.13.post1 的 soft pin 边界
 
-```text
-router/
-├── kvt/          # 事实摄入、索引、匹配、状态机
-├── hook/         # 信封解析、校验、Demand 编译
-├── sched/        # L0/L1/L2 环
-├── intent/       # kvcm gRPC client
-├── capacity/     # 容量图、价格
-└── decisionlog/  # 记录/回放
-```
+- **版本前提**：v0.3.13.post1 使用 `SoftPinAction` 三态，**没有** `has_read_lease` 门槛；Case B 只看尺寸。
+- **安全前提**：Case B（同尺寸、单 slice、key 存在、无盘副本）；`put_step=1`；soft pin 前 `exists` 持 lease。
+- **不保证**：Case C-by-size/Case A、Start/End 崩溃、读者短暂不可读、`client_id` 改写、30min 不续期、并发重写。
+- **取消**：`SoftPinAction::DISABLE`；或用 keepalive + lease，不依赖空写。
+- **升级陷阱**：0.3.14/main 有 `has_read_lease` 门槛；有租约且全内存时同尺寸也会走 Case C，当前空写不可用。升级时必须重新评估，不能默认沿用。
 
-kvcm 侧：
+### 9.3 分支现状（截至 2026-11-04）
 
-```text
-kvcm/
-├── api/intents.py      # op/deadline/ttl/budget 扩展
-├── flows/session.py    # 会话保留/恢复
-├── ops/verify.py       # 反熵/核验
-└── ledger.py           # 归因字段
-```
-
----
-
-## 14. 开放问题
-
-1. **Mooncake publisher 升级节奏**：0.3.11 无删除事件，先靠 TTL/miss/抽样核验；升级到 main 后是否直接启用 publisher，还是 kvcm 翻译？
-2. **hook 标准**：agent 框架各自发 hook，是否需要一个 SDK/中间件？pre_announce 端点是否走 Gateway 还是独立服务？
-3. **hash 口径**：vLLM-Ascend 版本升级/模型类型变化会改 block hash；Router 的 KeyComputer 如何跟版本绑定、如何做漂移哨兵？
-4. **pin 可达性**：soft pin 的空写通道、hard pin 的 client_id 问题未决；MVP 用 lease 延长是否满足业务？
-5. **任务取消**：copy/move 无取消 RPC；预取改道只能 abandon + 事后清理，是否需要池侧扩展？
-6. **多 Router leader**：etcd 还是复用现有控制面？leader 故障时扩缩暂停的容忍时间？
-7. **成本权重**：`w_*`/`λ_*` 需要真机校准；是否需要在线学习/离线仿真？
-8. **layerwise**：vLLM-Ascend 的 layerwise 读路径会改变传输成本；D6 选型未定，L0 成本模型要留接口。
-9. **跨集群/DFS**：retain 到 DFS/对象存储的延迟和成本，是否纳入 L1/L2？
-10. **安全**：hook 伪造/滥用 pin 的防护；签名、配额、审计的边界。
+- `feat/kvcm-ops-mainline`（PR73）：soft pin 空写、hard pin 拒绝、keepalive 拆分、demote/promote/remove 语义、admin 核验；**未合入 main**。
+- `feat/kvcm-e14-publish`：READY 后按实例端点补发 `BlockStored`，真机验证；move/remove 事件未接；**未合入 main**。
+- `feat/kvcm-segment-admission`（PR72）：段容量准入；**未合入 main**。
+- E13（InstanceWatcher）、E15（带宽限速）、retain：未做。
+- 设计以 `summary.md` / `D1` / `D2` 的最新合入状态为准；本文不把分支能力当成已合入。
 
 ---
 
-## 15. 参考实现
+## 10. 实施节奏（目标形态分阶段）
+
+| 阶段 | 目标 | 验收 |
+|---|---|---|
+| **P0 观测与索引** | 引擎事件 + kvcm READY + miss 反馈接入 KVT；hook 只 observe；L0 用 KVT 选路；决策日志 | KVT 合并/墓碑/置信度；L0 <5ms；不改变现有行为 |
+| **P1 命中与保留** | 会话表；keepalive/soft pin（条件可用）；预取预算；反熵抽样；账本归因 | 命中率、resume TTFT、预取 ROI、ghost 率 |
+| **P2 容量与弹性** | L2 双环；warm gate；KV-aware victim；池扩缩；价格 | 扩容 Ready <10s 且 warm 达标；缩容零丢失；无振荡 |
+| **P3 服务化** | 会话 KV、预热服务、容量顾问、Drain、治理、回放 | 服务 SLA；ROI；容量预测误差；回放一致 |
+
+原则：**先把“命中/保留”做对，再优化“本地放置”，最后才做 D-direct 微优化**。这与 §7 的收益量级一致。
+
+---
+
+## 11. 开放问题
+
+1. **publisher 是否开启**：0.3.13.post1 默认 OFF；生产构建/运行是否开？不开则删除面靠 TTL/miss/核验。
+2. **实例注册与端点**：E13 未接；生产怎么分配/回收端点？kind 为空时是否接受“不补发”？
+3. **soft pin 前置**：生产能否保证 Case B（单 slice、无盘副本、key 存在）？不能则退回 keepalive。
+4. **retain**：move 到活 seg / kvcm 自挂 SSD 是否足够？是否等 0.3.14/main 的 retained client/DFS？
+5. **E15 带宽限速**：预取/迁移与在线流量怎么隔离？是否需要网卡采样？
+6. **多 Router leader**：etcd 还是复用现有控制面？leader 故障时扩缩暂停容忍多久？
+7. **权重/阈值**：`w_*`/`λ_*`、warm gate、TTL 需真机校准。
+8. **layerwise**：vLLM-Ascend layerwise 读路径改变传输成本；D6 未定，L0 成本模型要留接口。
+9. **hook 标准**：agent 框架怎么发？header/body/独立端点？谁签名？
+10. **安全**：hook 伪造、pin 滥用、跨模型误删的防护边界。
+
+---
+
+## 12. 参考实现
 
 > 说明：三环 + 影子价格的整体组合没有一一对应的参考实现；下面按部件列锚点。**kvcm 独立于 lake**，lake 仅作参考文档。
 
@@ -1129,7 +818,7 @@ kvcm/
 | **AIBrix** | `pkg/kvevent/manager.go::Manager`；`pkg/controller/podautoscaler/context/context.go`（`gpu_cache_usage_perc`） | ZMQ 事件→前缀索引；KV 使用率/排队长度扩缩 | AIBrix 各副本各自收敛；本文 KVT 单实例内合并 + L2 leader |
 | **SGLang** | `sgl-model-gateway/src/policies/cache_aware.rs::CacheAwarePolicy`；`policies/tree.rs::Tree`；`srt/managers/kv_hints.py::KvHintsEnvelope`；`unified_cache/session_ref_tracker.py::UnifiedSessionRefTracker` | 近似树 + 最短队列；带版本 hint；session 软保护 | 目标部署用 vLLM-Ascend；session 保留落 kvcm，不落引擎 |
 | **vLLM** | `vllm/v1/kv_hints/protocol.py::KvHintsEnvelope`；`vllm/v1/core/sched/scheduler.py::Scheduler` | hint 动词表；节点级 scheduler 分层 | hint 在本文被编译成 Demand；仍 hint ≠ command |
-| **Mooncake** | `master_service.cpp::CopyStart`、`BatchEvict`、`CreateDrainJob`、`GetReplicaListForAdmin`；`KvEventPublisher`（D1 F14） | copy 幂等、lease/驱逐、drain、零副作用核验、池事件 | Router 不碰 PoolKey/seg；全部经 kvcm intent |
+| **Mooncake** | `master_service.cpp::CopyStart`、`BatchEvict`、`CreateDrainJob`、`GetReplicaListForAdmin`；`KvEventPublisher` | copy 幂等、lease/驱逐、drain、零副作用核验、池事件 | Router 不碰 PoolKey/seg；全部经 kvcm intent |
 | **KVCR** | `src/kvcr/remote_fw_dram.py::fetch` / `query` / `_try_release_pin` | 目的地发起 fetch、传输窗口 pin | kvcm 集中式 + master 权威；不需要 fencing |
 | **TensorCast** | `tensorcast/api/_config.py::StorePolicyProfile` | 声明式 policy 预设 | 仅借用 retention class 命名，不照搬存储后端 |
 
@@ -1142,7 +831,7 @@ kvcm/
 
 ---
 
-## 附录 A：公式速查
+## 附录：公式速查
 
 ```text
 # 请求收益
@@ -1183,100 +872,3 @@ choose max(gain−loss)
 conf(t) = conf0·e^{−(t−t0)/τ}
 P_ghost ≈ 1−e^{−λ_delete·age}
 ```
-
-## 附录 B：接口草案
-
-### B.1 HookEnvelope（proto 示意）
-
-```proto
-message HookEnvelope {
-  uint32 version = 1;
-  string hook_id = 2;
-  string session_id = 3;
-  string workflow_id = 4;
-  uint32 step = 5;
-  string branch_id = 6;
-  string model_id = 7;
-  string revision = 8;
-
-  PrefixRef prefix = 9;       // token_ids 或 block_hashes
-  Timing timing = 10;         // PRE_ANNOUNCE / ATTACHED / POST
-  uint64 eta_ms = 11;
-  uint32 expected_turns = 12;
-  double reuse_prob = 13;
-
-  Retention retention = 14;   // NONE / SESSION / PIN
-  uint64 ttl_ms = 15;
-  Prefetch prefetch = 16;     // AUTO / ALLOW / DENY
-  uint64 demote_after_ms = 17;
-
-  Affinity affinity = 18;
-  uint64 deadline_ms = 19;
-  uint32 priority = 20;
-  Budget budget = 21;
-  string signature = 22;
-}
-```
-
-### B.2 KVFact（proto 示意）
-
-```proto
-message KVFact {
-  Source source = 1;
-  uint64 seq = 2;
-  int64 at_unix_ms = 3;
-  Kind kind = 4;
-  Namespace ns = 5;
-  repeated bytes hashes = 6;
-  bytes parent = 7;
-  string node = 8;
-  Tier tier = 9;
-  Scope scope = 10;
-  uint64 ttl_ms = 11;
-  uint32 confidence = 12;
-}
-```
-
-### B.3 KVIntent（在现有 `kvcm/proto/kvcm_intent.proto` 上扩展）
-
-```proto
-enum Op {
-  PREFETCH = 0;
-  RETAIN = 1;
-  PIN = 2;
-  KEEPALIVE = 3;
-  DEMOTE = 4;
-  PROMOTE = 5;
-  RELEASE = 6;
-  MOVE = 7;
-}
-
-message SubmitIntentRequest {
-  string intent_id = 1;      // 调用方幂等键
-  Prefix prefix = 2;
-  string target = 3;
-  Op op = 4;
-  uint64 deadline_ms = 5;
-  uint64 ttl_ms = 6;
-  uint64 max_transfer_bytes = 7;
-  uint32 priority = 8;
-  string session_id = 9;
-  string reason = 10;
-  string source = 11;        // MOVE 用
-}
-```
-
-> kvcm 按 capability 声明决定是否受理；`intent ≠ command`，可推迟/拒绝；READY/FAILED 由 `GetTask` 或事件回执。
-
-## 附录 C：术语
-
-| 术语 | 含义 |
-|---|---|
-| KVT | KV Index Tree，Router 侧的多源物化索引 |
-| Fact | 一条索引事实（stored/removed/ready/miss…） |
-| Loc | 某 block 在某实例某 tier 的位置记录 |
-| Demand | hook 编译后的需求预测 |
-| L0/L1/L2 | 请求环 / 会话与 KV 环 / 容量环 |
-| warm gate | 新实例预热达标后才接流量的门 |
-| victim | 缩容候选节点 |
-| shadow price | 容量/带宽/预取的边际成本信号 |
