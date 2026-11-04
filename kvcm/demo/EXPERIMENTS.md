@@ -331,7 +331,8 @@ pid。途中根出 8 个坑，全部对代码验证：
 - master `:50088`；A=Qwen3.8-27B hybrid TP2 卡0/1 `:8001`，`--block-size 1536`，`PYTHONHASHSEED=0`
 - 目标：**本机合成 seg**（卡 6/7，TransferEngine `rpc_port` 作 seg 名，各 2GiB）——不依赖 225
 - 控制面：进程内 `TaskEngine` + `MooncakeBackend`（非 gRPC daemon）；物理卡 2 给控制面 ACL
-- 复现脚本：[`tools/e14_mooncake_smoke.py`](tools/e14_mooncake_smoke.py)（**真机手工**；不进 GitHub Actions。Actions 只跑假发布器单测 `kvcm/tests/test_kv_events.py`）
+- 复现脚本：[`tools/e14_mooncake_smoke.py`](tools/e14_mooncake_smoke.py)；pytest 入口 [`../tests/test_e14_npu_smoke.py`](../tests/test_e14_npu_smoke.py)（`@pytest.mark.npu`，**不进 Actions**；本地 `KVCM_NPU_SMOKE=1 pytest -m npu`）
+- 无 NPU 单测：`kvcm/tests/test_kv_events.py`（`@pytest.mark.smoke`，CI / 本地都可跑）
 - 环境变量见脚本头（`E14_HOST` / `E14_MASTER` / `E14_MODEL_PATH` 等）；缺省仍为本床 45 机口径
 
 ### 判定口径（避免空转 READY）

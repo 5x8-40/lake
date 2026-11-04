@@ -1,6 +1,7 @@
 """E14 发布端：READY 后按目标实例补发一条 BlockStored。
 
 注入假的 Zmq 发布器，不绑端口，也不 import vllm。
+无 NPU：CI 与本地都可跑（``pytest -m smoke``）。
 """
 
 from __future__ import annotations
@@ -11,6 +12,8 @@ import queue
 import pytest
 
 from conftest import run
+
+pytestmark = pytest.mark.smoke
 from kvcm.engines.vllm.keys import TokenBlockChain, hash_token_block_chain
 from kvcm.api.events import (
     EventPublisher,

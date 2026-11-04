@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """E14 + 真 Mooncake：本机合成空 seg 作目标，强制新鲜 create_copy_task。
 
-真机手工冒烟，不进 GitHub Actions（需 NPU + master + 引擎 warm）。
-Actions 只覆盖假发布器单测 ``kvcm/tests/test_kv_events.py``。
+真机冒烟：不进 GitHub Actions（需 NPU + master + 引擎 warm）。
+本地经 pytest 跑（默认 skip）::
+
+    KVCM_NPU_SMOKE=1 python -m pytest tests/test_e14_npu_smoke.py -m npu -q
+
+无 NPU 的发布端单测打 ``@pytest.mark.smoke``，CI / 本地都可跑。
 
 A 近满时 warm 会 spill 到其它机 seg（本床曾见 225）——池放置，不是
 补发 bug。目标用本机空合成 seg，只验 copy + ZMQ ``BlockStored``。
