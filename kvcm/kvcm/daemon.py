@@ -59,10 +59,14 @@ from kvcm.api.grpc_server import IntentGrpcServer
 from kvcm.api.events import EventPublisher, parse_kv_event_endpoints
 from kvcm.backends.mooncake.backend import MooncakeBackend
 from kvcm.backends.mooncake.capability import mooncake_main, mooncake_v0311
+from kvcm.backends.mooncake.admin_main import (
+    AdminMainError,
+    validate_configured_segs,
+)
 from kvcm.backends.mooncake.http_admin import AdminClient
 from kvcm.backends.mooncake.client import StoreClient
 from kvcm.engines.vllm.keys import KeyComputer
-from kvcm.instances import directory_from_specs
+from kvcm.instances import directory_from_specs, parse_instance_segs
 from kvcm.ledger import Ledger
 from kvcm.loops import KeepaliveLoop
 from kvcm.task_engine import TaskEngine
@@ -75,7 +79,11 @@ def build_backend(
     executor: ThreadPoolExecutor | None = None,
 ) -> MooncakeBackend:
     """按参数组装 backend。独立成函数便于测试注入（fake client 即可起
-    进程壳）。实例目录在这里装一次，locate 走这份目录。"""
+    进程壳）。实例目录在这里装一次，locate 走这份目录。
+
+    段名与 te_endpoint 的启动核对在 ``_serve`` 里做（``_check_instance_segs_against_admin``），
+    不在这里打 admin，避免装配单测误连真实 master。
+    """
     keys = KeyComputer(
         model_name=args.model_name,
         block_size=args.block_size,
@@ -105,6 +113,26 @@ def build_backend(
         executor=executor,
         admin=AdminClient(admin_base),
     )
+
+
+def _check_instance_segs_against_admin(
+    args: argparse.Namespace, backend: MooncakeBackend
+) -> None:
+    """启动门禁：``--instance-segs`` 必须等于 master 上的 te_endpoint。"""
+    if getattr(backend, "_skip_seg_endpoint_check", False):
+        # 测试壳 FakeBackend 不连真实 master；生产 MooncakeBackend 无此属性。
+        return
+    admin = getattr(backend, "_admin", None)
+    if admin is None:
+        raise AdminMainError(
+            "副本核验需要 admin；无法核对 --instance-segs 与 te_endpoint"
+        )
+    configured: list[str] = []
+    for spec in args.instance_segs:
+        _, segs = parse_instance_segs(spec)
+        configured.extend(segs)
+    details = admin.get_segments_detail()
+    validate_configured_segs(configured, details)
 
 
 def _wait_executor(executor: ThreadPoolExecutor, timeout_s: float) -> bool:
@@ -217,6 +245,11 @@ async def _serve(args: argparse.Namespace, stop: asyncio.Event) -> int:
             print(f"[kvcm] startup: connect failed: {e}", file=sys.stderr)
             raise
         backend = build_backend(args, client, ledger, executor=executor)
+        # R06：启动时核对 --instance-segs 与 master 段端点同名。
+        # copy 认 segment_name，核验认 te_endpoint；两套名字不一致会一直缺副本。
+        await loop.run_in_executor(
+            executor, _check_instance_segs_against_admin, args, backend
+        )
         keepalive = KeepaliveLoop(
             backend,
             ledger,
@@ -448,7 +481,9 @@ def main(argv: list[str] | None = None) -> int:
         metavar="INSTANCE=SEG0,SEG1",
         help="进程拉起时的初始登记：实例=rank 有序 seg 列表，可重复。"
         "不是 SubmitIntent / copy / move / remove 的参数；"
-        "locate 只返回这一实例的段，没登记就报错",
+        "locate 只返回这一实例的段，没登记就报错。"
+        "每个 seg 必须等于 master 上的 te_endpoint（通常即 ip:rpc_port）；"
+        "启动时会打 /get_segments_detail 核对，对不上直接失败",
     )
     p.add_argument(
         "--capability",

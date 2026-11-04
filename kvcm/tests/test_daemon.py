@@ -41,6 +41,9 @@ class FakeBackend:
     """记录 rebuild 调用；恢复 handle 脚本化；任务面（query/abandon）
     支持 track 轮询与退出收口剧本。"""
 
+    # 测试壳不打真实 /get_segments_detail（见 daemon._check_instance_segs_against_admin）
+    _skip_seg_endpoint_check = True
+
     def __init__(self, restored=()) -> None:
         self._restored = list(restored)
         self.rebuild_calls = 0
@@ -535,6 +538,8 @@ def test_drain_timeout_hard_exits_without_close(monkeypatch, tmp_path) -> None:
             events.append("client.close")
 
     class FakeBackend:
+        _skip_seg_endpoint_check = True
+
         def rebuild(self):
             return []
 

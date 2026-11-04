@@ -8,6 +8,9 @@
   走绑定的 ``GetReplicaList``。
 - ``GET /api/v1/tenant_quotas``：租户配额快照（requested / effective /
   charged）。这是租户记账，不是段剩余空间，不能拿来当段剩余容量。
+- ``GET /get_segments_detail``：全池段明细（``segment_name`` /
+  ``te_endpoint`` 等）。启动时用来核对 ``--instance-segs`` 是否和
+  传输端点同名（核验比的是端点，不是另一套外号）。
 
 0.3.11 没有零副作用核验，也没有租户配额；本模块不服务那个版本。
 写类端点（配额 PUT/DELETE）不在这里。
@@ -85,6 +88,20 @@ class TenantQuotaSnapshot:
     has_explicit_policy: bool
 
 
+@dataclass(frozen=True)
+class SegmentDetail:
+    """一条段明细（``GET /get_segments_detail`` 的一项）。
+
+    核验契约：``--instance-segs`` 填的字符串必须等于 ``te_endpoint``，
+    且 master 上 ``segment_name`` 与之相同（正确挂段姿势下二者本就同名）。
+    """
+
+    segment_name: str
+    te_endpoint: str
+    protocol: str = ""
+    status: str = ""
+
+
 def parse_batch_query_keys(body: str) -> dict[str, KeyReplicaQuery]:
     """解析 ``GET /batch_query_keys`` 的 JSON 正文。
 
@@ -129,6 +146,87 @@ def parse_batch_query_keys(body: str) -> dict[str, KeyReplicaQuery]:
             local_disk_endpoints=local_disk,
         )
     return out
+
+
+def parse_segments_detail(body: str) -> tuple[SegmentDetail, ...]:
+    """解析 ``GET /get_segments_detail`` 的 JSON 正文。
+
+    主线直接序列化 ``{total_segments, segments:[...]}``，没有
+    ``success/data`` 信封（与 batch_query_keys 不同）。
+    """
+    payload = _load_object(body)
+    rows = payload.get("segments")
+    if not isinstance(rows, list):
+        raise AdminMainError("get_segments_detail: segments is not a list")
+    out: list[SegmentDetail] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            raise AdminMainError("get_segments_detail: segment row is not an object")
+        name = row.get("segment_name")
+        endpoint = row.get("te_endpoint")
+        if not isinstance(name, str) or not name.strip():
+            raise AdminMainError(
+                f"get_segments_detail: bad segment_name: {name!r}"
+            )
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            raise AdminMainError(
+                f"get_segments_detail: bad te_endpoint for {name!r}: {endpoint!r}"
+            )
+        protocol = row.get("protocol")
+        status = row.get("status")
+        out.append(
+            SegmentDetail(
+                segment_name=name.strip(),
+                te_endpoint=endpoint.strip(),
+                protocol=protocol if isinstance(protocol, str) else "",
+                status=status if isinstance(status, str) else "",
+            )
+        )
+    return tuple(out)
+
+
+def validate_configured_segs(
+    configured: Sequence[str], details: Sequence[SegmentDetail]
+) -> None:
+    """核对启动登记的 seg 能否用于副本核验。
+
+    对每个配置名 ``S``：master 上必须有 ``segment_name == S``，且该行
+    ``te_endpoint == S``。否则 copy 认段名、核验认端点，会一直缺副本。
+    """
+    by_name = {d.segment_name: d for d in details}
+    missing: list[str] = []
+    mismatched: list[str] = []
+    seen: set[str] = set()
+    for raw in configured:
+        seg = str(raw).strip()
+        if not seg or seg in seen:
+            continue
+        seen.add(seg)
+        row = by_name.get(seg)
+        if row is None:
+            missing.append(seg)
+            continue
+        if row.te_endpoint != seg:
+            mismatched.append(
+                f"{seg!r} te_endpoint={row.te_endpoint!r}"
+            )
+    if not missing and not mismatched:
+        return
+    parts: list[str] = []
+    if missing:
+        parts.append(
+            "master 上没有这些 segment_name: " + ", ".join(repr(s) for s in missing)
+        )
+    if mismatched:
+        parts.append(
+            "segment_name 与 te_endpoint 不一致（核验会失败）: "
+            + "; ".join(mismatched)
+        )
+    parts.append(
+        "请把 --instance-segs 写成与传输端点相同的字符串"
+        "（正确姿势：挂段名 = ip:rpc_port = te_endpoint）"
+    )
+    raise AdminMainError("; ".join(parts))
 
 
 def parse_tenant_quotas(body: str) -> tuple[TenantQuotaSnapshot, ...]:
@@ -210,6 +308,10 @@ class MainlineAdmin:
                 raise AdminMainError("tenant_id must not be empty")
             path += "?tenant_id=" + urllib.parse.quote(tenant_id, safe="")
         return parse_tenant_quotas(self._get(path))
+
+    def get_segments_detail(self) -> tuple[SegmentDetail, ...]:
+        """``GET /get_segments_detail``：段名与 ``te_endpoint`` 等明细。"""
+        return parse_segments_detail(self._get("/get_segments_detail"))
 
     def _get(self, path: str) -> str:
         url = f"{self._base}{path}"

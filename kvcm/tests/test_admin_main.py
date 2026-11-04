@@ -10,7 +10,9 @@ from kvcm.backends.mooncake.admin_main import (
     AdminMainError,
     MainlineAdmin,
     parse_batch_query_keys,
+    parse_segments_detail,
     parse_tenant_quotas,
+    validate_configured_segs,
 )
 from kvcm.backends.mooncake.capability import mooncake_main, mooncake_v0311
 from kvcm.ops.capability import Support
@@ -143,6 +145,38 @@ def test_parse_rejects_unsuccessful_and_incomplete() -> None:
         )
 
 
+_SEGMENTS = """
+{
+  "total_segments": 2,
+  "segments": [
+    {
+      "segment_name": "10.0.0.1:50051",
+      "te_endpoint": "10.0.0.1:50051",
+      "protocol": "tcp",
+      "status": "COMPLETE"
+    },
+    {
+      "segment_name": "friendly-name",
+      "te_endpoint": "10.0.0.2:60001",
+      "protocol": "tcp",
+      "status": "COMPLETE"
+    }
+  ]
+}
+"""
+
+
+def test_parse_segments_detail_and_validate() -> None:
+    details = parse_segments_detail(_SEGMENTS)
+    assert details[0].segment_name == "10.0.0.1:50051"
+    assert details[0].te_endpoint == "10.0.0.1:50051"
+    validate_configured_segs(["10.0.0.1:50051"], details)
+    with pytest.raises(AdminMainError, match="没有这些 segment_name"):
+        validate_configured_segs(["missing"], details)
+    with pytest.raises(AdminMainError, match="te_endpoint"):
+        validate_configured_segs(["friendly-name"], details)
+
+
 def test_mainline_admin_paths_with_fake_body() -> None:
     seen: list[str] = []
 
@@ -150,6 +184,8 @@ def test_mainline_admin_paths_with_fake_body() -> None:
         seen.append(url)
         if "batch_query_keys" in url:
             return _BATCH
+        if "get_segments_detail" in url:
+            return _SEGMENTS
         return _ONE
 
     admin = MainlineAdmin("http://127.0.0.1:9003/", fetcher=fetch)
@@ -165,6 +201,9 @@ def test_mainline_admin_paths_with_fake_body() -> None:
     )
     admin.get_tenant_quotas()
     assert seen[2] == "http://127.0.0.1:9003/api/v1/tenant_quotas"
+    details = admin.get_segments_detail()
+    assert details[0].te_endpoint == "10.0.0.1:50051"
+    assert seen[3] == "http://127.0.0.1:9003/get_segments_detail"
 
 
 def test_batch_query_keys_splits_long_request_line() -> None:

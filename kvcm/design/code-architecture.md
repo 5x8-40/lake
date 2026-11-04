@@ -307,7 +307,7 @@ stateDiagram-v2
 
 先解释三个容易混淆的东西：
 
-- **locate**：进程内一份目录，实例 → rank 有序段名单（`InstanceDirectory`）。intent 和 copy / move / remove 的入参没有 segment，操作内部自己 locate。没登记的实例报错，不退回别人的段。`--instance-segs` 只在进程拉起时做初始登记。生产环境的上下线仍归 InstanceWatcher（本次不做）
+- **locate**：进程内一份目录，实例 → rank 有序段名单（`InstanceDirectory`）。intent 和 copy / move / remove 的入参没有 segment，操作内部自己 locate。没登记的实例报错，不退回别人的段。`--instance-segs` 只在进程拉起时做初始登记；启动时打 `GET /get_segments_detail`，要求每个配置值满足 `segment_name == te_endpoint == 配置`（否则 copy 认段名、核验认端点会对不上）。生产环境的上下线仍归 InstanceWatcher（本次不做）
 - **SegTopology**：查 master 当前挂了哪些 seg（HTTP `/get_all_segments`）——存储池视角的 seg 全量名单。它不知道 seg 属于哪个实例、哪个 rank
 - **RankTopology**：demo 环境推断「rank ↔ seg」对应关系的探测机制。做法：从启动脚本写的 pidfile 找到 worker 进程树 → 读每个进程监听的 TCP 端口（`ss` 或 `/proc`，带超时）→ 拿端口与 SegTopology 给的 seg 名单比对（端口匹配上的 seg 就是这个进程的）→ 从进程名 `VLLM::Worker_TP<N>` 读出 rank 号 → 得到每个 rank 对应哪个 seg。任何一步对不上都直接报错（拿错对应关系 = 把 KV 复制到错误的机器内存）。生产环境不需要它——实例启动时自己把拓扑注册上来
 

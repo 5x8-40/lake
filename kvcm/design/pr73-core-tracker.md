@@ -114,10 +114,10 @@
 
 ### 2. admin / 部署
 
-- **R06 段名 vs transport endpoint（OPEN）**
-  - `_verify_missing` 用配置里的 seg 名比 admin 返回的 `transport_endpoint_`；`instances.py` 只存段名。
-  - 段名/端点没有映射，部署错误时会误核验。
-  - 方向：启动时校验段名与 admin 返回一致，或建立映射。
+- **R06 段名 vs transport endpoint（已修）**
+  - 启动时 `GET /get_segments_detail`，要求每个 `--instance-segs` 值在
+    master 上 `segment_name == te_endpoint == 配置值`；对不上直接启失败。
+  - `_verify_missing` 仍用配置名比副本 `transport_endpoint`；契约由启动门禁保证。
 - **R18 8KB 分批依据（OPEN）**
   - `_MAX_BATCH_QUERY_REQUEST_BYTES = 8192` 只算请求行，不含 header；上游实际限制未校准。
   - 方向：按 master 实际限制校准，或改 POST。
@@ -147,7 +147,7 @@
 ## 合入门禁
 
 1. **core 基线**：自测全绿；`move` / `remove` / keepalive / prefetch / admin 核验可用。
-2. **admin**：R06 / R18 写进文档或后续修。
+2. **admin**：R06 已修（启动核对）；R18 写进文档或后续修。
 3. **保活**：A03 已修（await 落账）；R16 写进文档或后续修。
 4. **跨 PR**：A06 / A16 / A17 继续 DEFER；PR2/PR3 的 tracker 各自记录。
 
@@ -162,3 +162,4 @@
 
 - **2026-11-04**：从全量 PR73 tracker 拆出 core 部分；A01/A07/A08 已关闭；demote/promote 与 soft pin 移到后续 stacked PR。
 - **2026-11-04**：A03 关闭：`register_await` + `_on_ready` await；写失败仍不改判预热失败。
+- **2026-11-04**：R06 关闭：启动拉 `/get_segments_detail`，要求配置 seg = segment_name = te_endpoint。
