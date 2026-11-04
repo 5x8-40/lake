@@ -53,18 +53,9 @@ def fake_store_module(monkeypatch):
     pkg = types.ModuleType("mooncake")
     monkeypatch.setitem(sys.modules, "mooncake", pkg)
     monkeypatch.setitem(sys.modules, "mooncake.store", mod)
+    from test_backend import _install_verify_admin
 
-    class _RoomyAdmin:
-        def query_segment(self, segment):
-            return (0, 1 << 62)
-
-    orig_init = MooncakeBackend.__init__
-
-    def _init(self, *args, **kwargs):
-        kwargs.setdefault("admin", _RoomyAdmin())
-        orig_init(self, *args, **kwargs)
-
-    monkeypatch.setattr(MooncakeBackend, "__init__", _init)
+    _install_verify_admin(monkeypatch)
     return mod
 
 
