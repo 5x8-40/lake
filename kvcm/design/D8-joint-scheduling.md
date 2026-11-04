@@ -5,6 +5,7 @@
 - 归属: **kvcm 的管理面（Management Plane）**。kvcm 当前只有控制面（KV 执行/核验/记账/发布），管理面负责调度；SC 是管理面的逻辑角色，可独立部署，也可嵌入 Router/控制面内置
 - 控制面/管理面: [D1](D1-router-scheduling.md) / [D2](D2-kv-operations.md) / [D9](D9-kv-services.md) 是**控制面**（KV 操作与服务）；本文是**管理面**（请求 × KV × 扩缩的调度）
 - 流程: [scheduling.md](scheduling.md)（L0/L1/L2 的时序与场景；与本文同级，不单独建 flows/ 目录）
+- 算法: [D8a-scheduling-algorithms.md](D8a-scheduling-algorithms.md)（公式、图、收益模型）
 - 适用部署: **vLLM-Ascend + Mooncake Store + kvcm** 独立部署；SC 是 kvcm 管理面的请求/容量决策角色（实现语言不限）
 - 关系声明: **kvcm 是独立项目，本文不依赖 lake 运行时**。lake 仓库只提供参考文档与原型经验；文中引用 lake 的地方都是“可借鉴”，不是依赖
 - 非目标:
@@ -743,6 +744,8 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 ---
 
 ### 7.7 算法与技术清单
+
+> 公式、图和收益推导见 [D8a-scheduling-algorithms.md](D8a-scheduling-algorithms.md)。本节只列清单。
 
 每个算法都对应一个具体失效模式，不是“技术堆砌”：
 

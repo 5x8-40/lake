@@ -1,0 +1,522 @@
+# D8a: 调度算法与收益模型
+
+- 状态: **设计草案**（算法与公式；数值为模型估算，待真机校准）
+- 版本基线: **Mooncake v0.3.13.post1**（master / client 同版本）
+- 上游: [D8-joint-scheduling.md](D8-joint-scheduling.md) 管理面；[D2-kv-operations.md](D2-kv-operations.md) 控制面操作
+- 定位: D8 的算法附录——把“为什么这样决策”拆成可计算的公式、图和收益账
+- 非目标: 不写代码结构；不重复 D8 的架构/边界，只讲算法本身和收益怎么来
+
+---
+
+## 0. 算法地图
+
+```mermaid
+flowchart TB
+    F["事实流<br/>引擎事件 / kvcm READY / 池事件 / miss"] --> KVT["1. KVT<br/>事件溯源 + 前缀匹配 + 合并"]
+    KVT --> L0["2. 请求打分<br/>命中 / 传输 / 队列 / SLO"]
+    KVT --> L1["3-4. 预取 + 保留<br/>EV / TTL / 预算"]
+    KVT --> L2["5. 扩缩<br/>排队 / 双环 / warm gate / victim"]
+    L0 -->|"命中/延迟反馈"| L2
+    L1 -->|"KV 水位/READY"| L2
+    L2 -->|"价格/预算"| L0
+    L2 -->|"预算"| L1
+    L0 -->|"决策日志"| LOG["6. 回放/归因"]
+    L1 --> LOG
+    L2 --> LOG
+```
+
+三类算法，分别回答：
+
+1. **看什么**：KVT 怎么把多源事件变成可查询的命中视图；
+2. **怎么选**：请求、预取、保留、扩缩各自怎么算；
+3. **怎么证明赚**：每个决策对应哪个指标、多少量级。
+
+---
+
+## 1. 记号与收益定义
+
+| 记号 | 含义 |
+|---|---|
+| `P` | prompt token 数 |
+| `B` | block token 数（128） |
+| `S_bytes` | 前缀字节数 = `P × bytes_per_token` |
+| `S_saved` | 预期节省的时间（命中/防 miss） |
+| `v` | prefill 速率（token/s/GPU） |
+| `BW` | 有效带宽 |
+| `T_prefill` | 重算时间 = `P/v` |
+| `T_transfer` | 跨机传输 = `S_bytes/BW_wan` |
+| `T_local` | 本机 DRAM→HBM 拷贝 = `S_bytes/BW_local` |
+| `Q` | 队列等待 |
+| `D` | TTFT 目标 |
+
+收益拆成四段：
+
+```text
+T_total ≈ Q + T_prefill + T_transfer + T_local
+```
+
+> 不是四项同时发生：miss 有 `T_prefill`；远端池命中只有很小的残差 prefill、有 `T_transfer`；本机 DRAM 有 `T_local`；HBM 命中两者都接近 0。按命中层级取项。
+
+---
+
+## 2. KVT：把事件变成命中视图
+
+### 2.1 事件溯源 + 物化视图
+
+```mermaid
+flowchart LR
+    E["引擎 KV events"] --> Q["事实队列"]
+    R["kvcm READY"] --> Q
+    P["池 publisher"] --> Q
+    M["worker miss"] --> Q
+    Q --> A["按源序号 apply"]
+    A --> K["KVT 物化视图"]
+    K --> L["L0/L1/L2 查询"]
+```
+
+**算法**：
+
+1. 每个源独立维护 `seq`；
+2. 事件到达按 `(source, seq)` 应用；跳号先 replay，再 snapshot，最后标 stale；
+3. 负事实（删除/失效）写墓碑，墓碑 TTL 内禁止 `Stored` 复活；
+4. 同一 block 同一实例同一介质只保留一条位置，不同介质可并存。
+
+**复杂度**：事件 apply `O(1)`/块（哈希查表）；请求 match `O(P/B)`（逐块查表）；内存约 `N_blocks × (32B + L×24B + overhead)`。
+
+**收益**：选路零 RPC；命中长度精确；多源不打架。
+
+### 2.2 链式 block hash + 前缀匹配
+
+vLLM 的 key 是链式 hash：`h_i = H(h_{i-1}, tokens_i)`。请求自带一条 hash 链，KVT 逐块查：
+
+```text
+match(P) = 从第一块开始，连续命中同一实例的块数
+```
+
+```mermaid
+flowchart LR
+    H0["h0"] --> H1["h1"] --> H2["h2"] --> H3["h3"]
+    H1 --> A["实例 A: HBM"]
+    H2 --> A
+    H3 --> B["实例 B: DRAM"]
+    H3 --> C["远端池"]
+```
+
+命中定义：
+
+```text
+hit_tokens = contiguous_blocks × B
+local_hbm  = 连续 HBM confirmed 块数 × B
+local_dram = 连续本机 DRAM 块数 × B
+pool_hit   = 连续池内块数 × B
+```
+
+**收益**：只把“连续命中”算作可复用前缀，避免中段空洞导致的错误 D-direct/HBM 判断。
+
+### 2.3 多源合并：source rank + seq + 墓碑
+
+```mermaid
+flowchart TB
+    F["新事实"] --> S{"源 seq 连续?"}
+    S -->|"否"| G["replay / snapshot"]
+    G -->|"失败"| ST["标 stale，降置信度"]
+    S -->|"是"| N{"负事实?"}
+    N -->|"是"| T["写墓碑 + 清 loc"]
+    N -->|"否"| P{"已有未过期墓碑?"}
+    P -->|"是"| D["丢弃（防复活）"]
+    P -->|"否"| M["按 (sourceRank, seq, at) 合并"]
+```
+
+源信任级：
+
+```text
+MASTER_VERIFY = 4
+KVCM_READY    = 3
+ENGINE_EVENT  = 2
+POOL_EVENT    = 2
+ROUTE_SPEC    = 1
+MISS_FEEDBACK = 4（负事实）
+```
+
+**收益**：池删除能覆盖引擎旧事件；延迟到达的 `Stored` 不会复活已删条目。
+
+### 2.4 推测索引 + 置信度
+
+请求刚路由、引擎事件还没到 → 写短 TTL 推测条目：
+
+```text
+TTL_spec = E[event_delay] + 3σ[event_delay]    // 默认 2s，经验值
+conf(t) = conf0 × exp(−(t − t0)/τ)
+P_ghost ≈ 1 − exp(−λ_delete × age)
+```
+
+用途：
+
+- 推测条目只用于**亲和排序**，不作为 HBM 命中证据；
+- `conf < 0.9` 不允许 D-direct/HBM 判定；
+- `P_ghost × C_miss` 进入 L0 的 risk 项，优先对账热条目。
+
+**收益**：降低批内竞态导致的假 miss；ghost 只损性能，不损正确性。
+
+---
+
+## 3. 请求打分：选哪个实例
+
+### 3.1 效用函数
+
+```text
+U(r,n) =
+    w_hit   × H(r,n) × c_prefill
+  + w_pool  × P(r,n) × c_prefill × κ_tier
+  − w_bw    × (B(r,n) / BW_eff(n)) × c_bw
+  − w_q     × Q(n) × c_queue
+  − w_slo   × max(0, TTFT(r,n) − D) × c_slo
+  + w_future× F(r,n)
+  − w_risk  × R(r,n)
+```
+
+- `H`：连续 HBM 命中 token；`P`：连续池命中 token；
+- `B`：要传的字节；`Q`：队列等待；`F`：hook 未来价值；`R`：陈旧/ghost 风险；
+- `κ_tier`：DRAM/NVMe/DFS 的折扣。
+
+### 3.2 TTFT 估算
+
+```text
+TTFT(r,n) = Q(n)
+          + residual(r,n) / v_prefill(n)
+          + B(r,n) / BW_eff(n)
+          + T_handoff
+```
+
+`residual = P − H`；HBM 命中时 `B≈0`，通常只剩末 token 残差。
+
+### 3.3 决策流程
+
+```mermaid
+flowchart TB
+    S["请求 + Hook"] --> M["KVT.Match 逐候选"]
+    M --> H{"连续 HBM 命中够?<br/>置信度够?"}
+    H -->|"是"| HB["HBM 命中<br/>跳池加载 + 残差 prefill"]
+    H -->|"否"| P{"Pool 命中 + BW ≥ BW*?"}
+    P -->|"是"| PD["PD / 本地读"]
+    P -->|"否"| CO["COLOCATED"]
+    HB --> SEL["打分/约束"]
+    PD --> SEL
+    CO --> SEL
+    SEL --> D["目标节点 + hint"]
+```
+
+**收益**：把“命中、传输、队列、SLO、未来复用”放进同一个可解释分数；不追求全局最优，追求 5ms 内足够好。
+
+---
+
+## 4. 预取：值不值得搬
+
+### 4.1 期望价值
+
+未来请求按 Poisson 到达，窗口 `T` 内至少一次：
+
+```text
+Λ = ∫_0^T λ(s) ds
+P_use = 1 − exp(−Λ)
+S_saved = p_miss_avoided × T_prefill
+        + p_remote_to_local × (T_transfer − T_local)
+EV = P_use × S_saved − C_copy − C_occupancy
+C_copy = S_bytes / BW_copy × c_bw
+C_occupancy = S_bytes × T × c_mem
+```
+
+一个重要的读数：
+
+- 如果预取只是把“远端命中”变“本机 DRAM”，收益是 `T_transfer − T_local`（十毫秒级）；
+- 如果它防止了一次驱逐/重算，收益是 `T_prefill`（秒级）。
+- **所以预取要和保留一起做**。
+
+### 4.2 预算背包
+
+```text
+max Σ x_i × EV_i
+s.t. Σ x_i × bytes_i ≤ B_budget
+     Σ x_i × bytes_i / deadline_i ≤ BW_budget
+     x_i ∈ {0,1}
+```
+
+贪心排序：`EV_i / bytes_i` 从高到低；同价值按 deadline 早优先。
+
+### 4.3 EV 曲线
+
+![预取 EV 与保留时间](figures/algo-prefetch-ev.svg)
+
+> 参数：`S_saved=14000ms`、`λ=1/300`、`C_copy=56ms`、占用成本 `2ms/s`。曲线先升后降：太早预取会白占内存，太晚赶不上请求。峰值就是“最佳提前量”的模型解释。
+
+**收益**：预取 ROI 可算；带宽按价值密度分配，不被低价值预热打爆。
+
+---
+
+## 5. 保留：保多久
+
+### 5.1 Net(T) 与盈亏平衡
+
+```text
+Net(T) = p_resume(T) × T_prefill − c_h × bytes × T − C_risk
+p_resume(T) = p0 × exp(−μT)
+break-even: μ × p0 × exp(−μT) × T_prefill = c_h × bytes
+```
+
+- `p0`：会话恢复概率；`μ`：恢复概率衰减率；
+- `c_h`：每字节每秒的占用成本；
+- 解出的 `T*` 与 `T_max` 取小；解不出就退化为固定窗口。
+
+![保留 TTL 盈亏平衡](figures/algo-retention-ttl.svg)
+
+> 参数：`T_prefill=14000ms`、`p0=1`、`μ=1/600`、占用成本 `0.5ms/s`。超过约 28 分钟，继续保留的期望收益低于占用成本。
+
+### 5.2 等级选择
+
+| 等级 | 判据 | 机制 |
+|---|---|---|
+| `NONE` | `Net(T) < 0` | 池 LRU/TTL |
+| `SESSION` | `Net(T) > 0` 且预算允许 | keepalive/soft pin |
+| `PIN` | 高价值且 `T` 有上限 | hard pin 或 lease 延长 + 持续续租 |
+| `DURABLE` | 停顿长/节点将下线 | demote 到 SSD / DFS retain |
+
+**收益**：把“保留多久”从拍脑袋变成“恢复概率 vs 占用成本”的盈亏平衡；避免无限 pin 把池子占满。
+
+---
+
+## 6. 扩缩：加几个、缩哪个
+
+### 6.1 排队与容量
+
+```text
+ρ = λ / (c × μ)
+c_min = ceil(λ / (μ × ρ_target))
+L = λ × W                （Little 定律）
+```
+
+![副本数与延迟](figures/algo-scaling-queue.svg)
+
+> 参数：`λ=100 req/s`、`μ=30 req/s/副本`、目标 `ρ_target=0.8`。`c_min≈5`；低于 5 会进入不稳定区，延迟迅速上升。
+
+### 6.2 双环控制
+
+```mermaid
+flowchart TB
+    O["OBSERVE<br/>队列/SLO/水位/hook"] --> P["PREDICT<br/>未来 5–15 分钟"]
+    P --> SL["慢环：容量下限"]
+    O --> FL["快环：SLO ±1"]
+    SL --> R["RECONCILE<br/>预算/最小副本/冷却"]
+    FL --> R
+    R --> C["CONSTRAIN<br/>min/max/GPU/带宽"]
+    C --> E["EXECUTE<br/>provision / warm / drain"]
+    E --> F["FEEDBACK"]
+    F --> O
+```
+
+```text
+if p99(TTFT) > D for N 个周期: c += 1
+if p99(TTFT) < 0.7D and ρ < 0.5 for M 个周期: c -= 1
+T_cool ≥ T_provision + T_warm + T_drain
+```
+
+**收益**：慢环防预测错误，快环保突发；冷却防振荡。
+
+### 6.3 warm gate
+
+```text
+coverage = Σ w_b × 1[b confirmed] / Σ w_b
+ready if coverage ≥ W_min or t ≥ T_deadline
+route_weight = min(1, coverage / W_min)
+```
+
+```mermaid
+sequenceDiagram
+    participant L2 as D8
+    participant O as 编排
+    participant N as 新实例
+    participant K as kvcm
+    L2->>O: ScaleOut
+    O->>N: provision + weights
+    L2->>K: 预热 hot/hook 前缀
+    K-->>L2: READY（DRAM）
+    L2->>L2: coverage
+    alt coverage ≥ W_min
+        L2->>L2: ready，route_weight=1
+    else 未达标
+        L2->>L2: 低权重/延迟加入
+    end
+```
+
+**收益**：新节点不是“起来就接流量”，避免冷 miss 和 TTFT 抖动。
+
+### 6.4 victim 选择
+
+```text
+loss(v) = uniqueHotKV(v) × refill
+        + sessionRisk(v)
+        + migrationCost(v)
+gain(v) = idleCapacity(v) × c_capacity
+choose max(gain − loss)
+```
+
+```mermaid
+flowchart LR
+    V["候选 victim"] --> S{"有活跃会话?"}
+    S -->|"是"| KEEP["保留/换 victim"]
+    S -->|"否"| H{"有唯一热 KV?"}
+    H -->|"是"| MOVE["move/retain 后缩"]
+    H -->|"否"| DRAIN["drain"]
+```
+
+**收益**：不用 LIFO，避免缩掉持有热前缀/活跃会话的节点。
+
+### 6.5 影子价格
+
+```text
+λ_{t+1} = clip(λ_t + η × (u_t − u*), 0, λ_max)
+```
+
+L2 出价格；L0/L1 读价格：
+
+- `λ_bw` 高 → 少传、多本地/重算；
+- `λ_hbm` 高 → 少保留、短 TTL；
+- `λ_prewarm` 高 → 只预取高 EV；
+- `λ_slo` 高 → 更激进扩容/预取。
+
+**收益**：三条环不用做全局在线优化，也能朝同一方向走。
+
+---
+
+## 7. 一致性与 HA 算法
+
+| 问题 | 算法 | 收益 |
+|---|---|---|
+| 多实例同时扩缩 | etcd lease 选 leader；只有 leader 出 ScaleDecision | 不打架 |
+| 重复 intent | 幂等键 `(prefix,target,op)`；kvcm 去重 | 不重复搬 |
+| 事件丢失 | 每源 seq + gap replay/snapshot | 索引可恢复 |
+| 决策不可复盘 | 决策日志记录输入/候选/价格/选择/版本 | 可回放/可 A/B |
+| leader 故障 | lease 过期重选；新 leader 从最新 KVT/价格继续 | 短暂停、不丢状态 |
+
+---
+
+## 8. 整体收益：从算法到账
+
+### 8.1 延迟量级
+
+![KV 路径成本](figures/algo-latency-stack.svg)
+
+> 参数：`bytes_per_token=20KB`、`v=5000 token/s`、`BW_wan=25GB/s`、`BW_local=100GB/s`。
+
+| 优化 | 8K | 70K | 说明 |
+|---|---:|---:|---|
+| 命中 vs 重算 | ~1.6 s | ~14 s | 最大杠杆：保留/防驱逐 |
+| 本机 DRAM vs 远端 | ~4.8 ms | ~42 ms | 预取/本地放置 |
+| HBM vs 本机 DRAM | ~1.6 ms | ~14 ms | HBM 命中（APC） |
+
+### 8.2 吞吐/成本
+
+```text
+节省的 GPU 时间/秒 = QPS × Δhit_rate × T_prefill
+等效 GPU 数 ≈ 节省的 GPU 时间/秒
+C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 浪费
+ROI = saved / cost
+```
+
+例子：
+
+- 8K、100 QPS、命中率 +10% → `100×0.1×1.6 = 16 GPU·s/s`；
+- 70K、10 QPS、命中率 +10% → `10×0.1×14 = 14 GPU·s/s`。
+
+### 8.3 算法 → 指标 → 收益
+
+| 算法 | 主要指标 | 收益怎么来 |
+|---|---|---|
+| KVT/前缀匹配 | 命中率、选路延迟 | 零 RPC 查命中；避免中段空洞误判 |
+| 多源合并/墓碑 | ghost 率、误路由 | 删除能覆盖旧事件；不复活 |
+| 推测索引/置信度 | 批内假 miss、TTFT | 补事件传播窗口；只做亲和 |
+| 请求打分 | TTFT、SLO 违约 | 命中/传输/队列/未来价值一起算 |
+| 传 vs 算阈值 | 传输字节、TTFT | 慢网络时重算，快网络时传 |
+| 预取 EV/背包 | 预取 ROI、浪费 | 只搬高价值；带宽不被打爆 |
+| 保留 TTL | resume 命中、内存占用 | 盈亏平衡，不无限 pin |
+| 排队/双环 | Ready 时延、振荡次数 | 慢环定下限、快环救突发 |
+| warm gate | 冷 miss、TTFT 抖动 | 新节点预热达标才接流 |
+| victim loss/gain | 缩容后命中率 | 不缩热节点/活跃会话 |
+| 影子价格 | 成本、全局协调 | 三环用同一价格信号 |
+| leader/幂等/日志 | 冲突、恢复时间、可复盘 | 不打架、可重试、可回放 |
+
+### 8.4 收益的边界
+
+- 短 prompt：prefill 小，传输/队列占比高，预取未必值；
+- 低复用：保留/预取浪费内存，TTL 要短；
+- 带宽满：预取与请求争带宽，必须限速；
+- HBM 压力：pin 太多会挤掉其他前缀，全局命中率可能下降；
+- hook 不准：预取到错前缀/错实例，ROI 为负；
+- 参数未校准：权重/阈值/价格只是起点，必须真机校准。
+
+---
+
+## 9. 参数与校准
+
+| 参数 | 初值 | 校准方式 |
+|---|---|---|
+| `w_hit/w_bw/w_q/w_slo` | 量纲归一后 1.0 | 离线回放 + 真机 A/B |
+| `BW*` | 由公式算 | 网卡/链路实测 |
+| `P_use` / `λ` | 历史 ETA/复用率 | trace 拟合 |
+| `TTL` | 由 `Net(T)` 算 | 会话恢复分布 |
+| `ρ_target` | 0.7–0.8 | 真机压测 |
+| `W_min` | 0.6–0.8 | 冷启动/命中权衡 |
+| `T_cool` | `provision+warm+drain` | 扩缩实测 |
+| `λ_*` | 比例控制 | 利用率/水位 |
+
+---
+
+## 10. 参考实现
+
+| 参考 | 锚点 | 借了什么 | 差异 |
+|---|---|---|---|
+| Dynamo | `lib/kv-router/src/protocols.rs::WorkerSelectionResult`；`planner/core/load_scaling.py::LoadScalingMixin` | overlap 打分；双环 | 我们多源 KVT + 池侧事实 |
+| llm-d | `pkg/kvcache/prefix_match.go::SpeculativeTier`；`preciseprefixcache/prerequest.go::defaultSpeculativeTTL` | 推测索引/TTL | 推测只做亲和 |
+| AIBrix | `pkg/kvevent/manager.go::Manager`；`podautoscaler/context/context.go` | 事件索引；KV 指标扩缩 | 决策在 D8，不在网关副本 |
+| Mooncake | `master_service.cpp::CopyStart`、`BatchEvict`、`CreateDrainJob`、`GetReplicaListForAdmin` | 池操作/核验 | D8 不直连 |
+| LMCache | `lmcache/observability.py::LMCStatsMonitor` | 字节/请求指标 | 账本归因由 D9 补 |
+| Conductor | `prefixindex/prefix_indexer.cpp::PrefixCacheTable::Query/Register` | 前缀索引 | 对账循环由 D9 补 |
+
+---
+
+## 附录：公式速查
+
+```text
+# 命中
+hit_tokens = contiguous_blocks × B
+
+# TTFT
+TTFT = Q + residual/v + B/BW + T_handoff
+
+# 传 vs 算
+BW* = B×c_bw / (residual×c_prefill)
+
+# 预取
+P_use = 1 − exp(−∫λ)
+EV = P_use×S_saved − C_copy − C_occupancy
+
+# 保留
+Net(T) = p0×exp(−μT)×T_prefill − c_h×bytes×T − C_risk
+break-even: μ×p0×exp(−μT)×T_prefill = c_h×bytes
+
+# 容量
+ρ = λ/(c×μ); c_min = ceil(λ/(μ×ρ_target)); L = λ×W
+
+# warm gate
+coverage = Σw_b×1[b confirmed]/Σw_b
+
+# victim
+loss = uniqueHotRefill + sessionRisk + migrationCost
+gain = idleCapacity×c_capacity
+
+# 价格
+λ_{t+1} = clip(λ_t + η(u−u*), 0, λ_max)
+
+# 收益
+saved_gpu_s = QPS × Δhit × T_prefill
+ROI = saved / cost
+```
