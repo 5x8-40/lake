@@ -4,7 +4,7 @@
 - 版本基线: **Mooncake v0.3.13.post1**（master / client 同版本）；vLLM-Ascend 0.26 系（kvcm D1 的事实基线）
 - 归属: **kvcm 的管理面（Management Plane）**。kvcm 当前只有控制面（KV 执行/核验/记账/发布），管理面负责调度；SC 是管理面的逻辑角色，可独立部署，也可嵌入 Router/控制面内置
 - 控制面/管理面: [D1](D1-router-scheduling.md) / [D2](D2-kv-operations.md) / [D9](D9-kv-services.md) 是**控制面**（KV 操作与服务）；本文是**管理面**（请求 × KV × 扩缩的调度）
-- 流程: [scheduling.md](scheduling.md)（L0/L1/L2 的时序与场景；与本文同级，不单独建 flows/ 目录）
+- 时序: [D8b-scheduling-sequences.md](D8b-scheduling-sequences.md)（L0/L1/L2 的全部时序图与场景）
 - 算法: [D8a-scheduling-algorithms.md](D8a-scheduling-algorithms.md)（公式、图、收益模型）
 - 适用部署: **vLLM-Ascend + Mooncake Store + kvcm** 独立部署；SC 是 kvcm 管理面的请求/容量决策角色（实现语言不限）
 - 关系声明: **kvcm 是独立项目，本文不依赖 lake 运行时**。lake 仓库只提供参考文档与原型经验；文中引用 lake 的地方都是“可借鉴”，不是依赖
@@ -24,7 +24,7 @@
 2. **索引是事件派生的决策视图，不是第二权威**：引擎 KV events、kvcm READY、Mooncake publisher、SC 推测条目、worker miss 反馈，合成一棵 KVT；Mooncake master 仍是副本权威。
 3. **最大的性能杠杆是“命中/保留”，不是 HBM 命中后的本地拷贝优化**：命中省掉的是秒级 prefill；本地放置省掉的是十毫秒级跨机传输；HBM 命中再省掉毫秒级本地拷贝。三者的量级差一个数量级以上，调度优先级必须按这个顺序设计。
 4. **kvcm 控制面的定位是“KV 执行 + 核验 + 记账 + 发布”**：不做选路、不做扩缩决策、不持有前缀索引；这些归管理面（D8）。控制面为会话/预热提供执行接口；KV 对账、用量账本、容量建议、下线搬迁、保留规则等独立运营能力见 D9。
-5. **v0.3.13.post1 下，soft pin 空写已“有条件可用”**（PR73）；hard pin 事后设置已明确拒绝；copy/move 仍无取消；retain 仍未实现；池 publisher 代码有、但默认构建/运行都不开。设计必须按这个基线写，而不是按 main。
+5. **设计必须按当前能力写，不能按 main 写**：soft pin 事后加有条件、hard pin 不能事后加、copy/move 无取消、retain 未实现、池 publisher 默认关。具体边界见 §9。
 
 ---
 
@@ -104,20 +104,19 @@ flowchart TB
 
 ### 1.4 现状与终局的差距
 
-截至 2026-11-04，按分支现状（**以合入 main 为准**）：
+终局形态可以现在设计，但**落地要按当前能力写**。差距分三类：
 
-| 能力 | 现状 | 对 D8 的影响 |
+| 差距 | 具体是什么 | 影响 |
 |---|---|---|
-| E10/E11/E12 | 已合入 main：五层重构、常驻进程、gRPC intent（仅预热） | L0/L1 可以先接 intent；其他操作还没有 intent |
-| E14 补发 | 已合入 main（#71）：READY 后按实例端点发 `BlockStored`（`medium=CPU`、`full_attention`、低 64 位 hash） | KVT 的“预复制放置”有来源；move/remove 事件仍未接 |
-| soft pin | `feat/kvcm-ops-mainline`（PR73）：空写 **有条件可用**；hard pin 拒绝 | 会话保留可以先用 soft pin；有前置条件 |
-| 实例注册 | E13 设计已定：实例 id、rank 有序段、端点、DP、kind 一次交全；代码归 E13 | 端点/seg 映射仍靠启动参数；生产要多一次注册 |
-| 段容量准入 | 已合入 main（#72）：提交前查目标段剩余；不够不发 | 预取会因段满失败；L1 要有退避 |
-| E15 带宽限速 | 未做：只有并发窗口，没有网卡利用率感知 | 预取/迁移会争带宽；L1 要预算 |
-| retain | 未实现：没有 `AddReplicaForRetainedClient`；可登记 move 到活 seg / kvcm 自挂 SSD | 会话跨实例存亡还不能完全兜住 |
-| publisher | v0.3.13.post1 有代码，但构建默认 OFF、运行默认 false；copy 路径零发布 | 删除面要么开启 publisher，要么靠 TTL/miss/核验 |
+| **intent 只覆盖预热** | gRPC 通道只有 `SubmitIntent`（前缀 × 目标实例），没有 move/remove/pin 的意图类型 | L1 的预取/保留能接；其他操作要等协议扩展 |
+| **删除面没有原生事件** | 池 publisher 默认关、copy 路径零发布 | 删除只能靠 TTL/miss/抽样核验；KV 对账是 P0 |
+| **跨引擎存活不完整** | retain 未实现 | 会话跨实例存亡只能靠 move 到活 seg 或自挂 SSD |
+| **实例拓扑靠启动参数** | E13 未接 | 端点/seg 映射要手工配；多实例场景不可用 |
+| **没有带宽感知** | E15 未做 | 预取/迁移与在线流量抢带宽，只能靠固定预算 |
 
-> 结论：D8 的终局形态可以现在设计，但**落地必须按 v0.3.13.post1 的能力写**；不能把 main/0.3.14 的 `has_read_lease`、retained client、DFS 当成已具备。
+能力事实见 [D2](D2-kv-operations.md)，实现状态见 [summary.md](../summary.md)。
+
+> 原则：**不能把 main/0.3.14 的能力当成已具备**。写设计时按 v0.3.13.post1 的实际边界写。
 
 ### 1.5 明确不做
 
@@ -340,28 +339,7 @@ flowchart TB
     SEL --> I["异步 KVIntent"]
 ```
 
-打分（示意）：
-
-```text
-U = w_hit·H·c_prefill + w_pool·P·c_prefill·κ
-  − w_bw·(B/BW)·c_bw − w_q·Q·c_queue
-  − w_slo·max(0, TTFT−D)·c_slo
-  + w_future·F − w_risk·R
-```
-
-TTFT 估算：
-
-```text
-TTFT = Q + residual/v_prefill + B/BW + T_handoff
-```
-
-传 vs 算：
-
-```text
-C_transfer  = B/BW × c_bw
-C_recompute = residual × c_prefill
-BW*         = B×c_bw / (residual×c_prefill)
-```
+打分、TTFT 估算、传 vs 算阈值（`BW*`）的公式见 [D8a §3](D8a-scheduling-algorithms.md)。
 
 约束：
 
@@ -402,27 +380,7 @@ stateDiagram-v2
 | release | 会话结束 | 停 keepalive；确认没人用才 Remove | 默认软释放 |
 | move | drain/迁移 | 指定源→目标 | 源在线；无取消 |
 
-预取价值（Poisson 近似）：
-
-```text
-Λ = ∫λ; P_use = 1 − e^{−Λ}
-EV = P_use × S − C_copy − C_occupancy
-```
-
-保留 TTL：
-
-```text
-Net(T) = p_resume(T)×S − c_h×bytes×T − C_risk
-break-even: μ·p0·e^{−μT}×S = c_h×bytes
-```
-
-预算：
-
-```text
-Σ bytes_i / deadline_i ≤ B_budget
-Σ pinned_bytes ≤ B_pin
-TTL ≤ T_max
-```
+预取的价值（`P_use`、`EV`）、保留的盈亏平衡（`Net(T)`）与预算约束，见 [D8a §4–§5](D8a-scheduling-algorithms.md)。
 
 ### 5.3 L2 容量环（5–60s）
 
@@ -439,13 +397,7 @@ flowchart TB
     F --> O
 ```
 
-容量公式：
-
-```text
-ρ = λ/(c×μ)
-c_min = ceil(λ/(μ×ρ_target))
-L = λ×W                （Little 定律）
-```
+容量公式（`ρ`、`c_min`、Little 定律）见 [D8a §6.1](D8a-scheduling-algorithms.md)。
 
 扩缩维度：计算池（P/D/混部）、KV 池（shard/节点）、模型 revision。按瓶颈选择：
 
@@ -457,29 +409,13 @@ L = λ×W                （Little 定律）
 | 带宽满 / 传输排队 | 更多本地副本或网络 |
 | 本地命中低但池命中高 | 先预取，不扩 |
 
-扩容 warm gate：
+扩容 warm gate（`coverage`、`route_weight`）见 [D8a §6.3](D8a-scheduling-algorithms.md)。新实例先 `warming`，不接或低权重接流量；warm 可与权重加载重叠。`T_ready = provision + gate + warm` 必须满足 <10s 目标。
 
-```text
-coverage = Σw_b×1[b confirmed] / Σw_b
-ready if coverage ≥ W_min or t ≥ deadline
-route_weight = min(1, coverage/W_min)
-```
-
-新实例先 `warming`，不接或低权重接流量；warm 可与权重加载重叠。`T_ready = provision + gate + warm` 必须满足 <10s 目标。
-
-缩容 victim：
-
-```text
-loss(v) = uniqueHotKV(v)×refill + sessionRisk(v) + migrationCost(v)
-gain(v) = idleCapacity(v)×c_capacity
-choose max(gain − loss)
-```
-
-不要 LIFO；有活跃会话/唯一热 KV 的节点优先保留；drain 卡住不硬删。
+缩容 victim（`loss(v)` / `gain(v)`）见 [D8a §6.4](D8a-scheduling-algorithms.md)。不要 LIFO；有活跃会话/唯一热 KV 的节点优先保留；drain 卡住不硬删。
 
 ### 5.4 三条环的协调
 
-- **冷却**：`T_cool ≥ T_provision + T_warm + T_drain`，防扩缩振荡。
+- **冷却**：冷却时间 ≥ 供给+预热+排水之和，防扩缩振荡（D8a §6.2 有公式）。
 - **滞回**：扩容阈值 > 缩容阈值；连续 N 周期才动作。
 - **优先级**：L0 永远不被 L1/L2 阻塞；L1 intent 异步；L2 只发目标容量。
 - **价格**：L2 单点更新；L0/L1 只读；多 SC 实例时 L2 走 leader。
@@ -488,311 +424,67 @@ choose max(gain − loss)
 
 ## 6. 联合闭环场景
 
-### 6.1 Agent 多轮：预取 → 本地读 → 可选 HBM → 保留 → 恢复
+五个关键场景的完整时序图在 [D8b-scheduling-sequences.md](D8b-scheduling-sequences.md)：
 
-```mermaid
-sequenceDiagram
-    participant A as Agent
-    participant R as SC
-    participant K as kvcm
-    participant M as Mooncake
-    participant W as vLLM-Ascend
+| 场景 | 说明 |
+|---|---|
+| 6.1 Agent 多轮 | 预取 → 本地读 → 可选 HBM → 保留 → 恢复 |
+| 6.2 扩容 | warm gate：新实例预热达标才加权接流 |
+| 6.3 缩容 | KV-aware victim：不缩热节点/活跃会话 |
+| 6.4 池压 | 降层/扩池：先 demote 冷的，持续不够才扩 |
+| 6.5 Ghost | miss 反馈：最便宜的反熵，降级该条不动全局 |
 
-    A->>R: PRE_ANNOUNCE(P, target B, eta 30s)
-    R->>R: KVT：P 在 A，B 无
-    R->>K: PREFETCH(P→B) + RETAIN
-    K->>M: create_copy_task
-    M-->>K: CopyEnd
-    K->>K: verify 全 rank
-    K-->>R: READY（B 的本机 DRAM 就绪）
-    R->>R: KVT：B.DRAM Confirmed
+三条要点（图里都有，这里只提最容易记错的）：
 
-    A->>R: 请求
-    R->>W: 路由到 B（本地 DRAM 读）
-    W-->>R: 首 token；之后 HBM 可能有 APC 副本
-
-    A->>R: POST(pause)
-    R->>K: RETAIN(TTL)
-    Note over K: 有界 keepalive
-
-    A->>R: 恢复
-    R->>W: 路由到 B
-```
-
-要点：
-
-- kvcm READY 只保证“本机 DRAM 有副本”，第一次请求仍然要把 KV 从 DRAM 读进 HBM；它省的是跨机 RDMA，不是本地拷贝，更不是 prefill（prefill 已在池命中时省掉）。
-- 若 B 的引擎在请求后把块放进 APC，下一次才可能 HBM 命中；这由引擎事件/KVT 决定，不由 kvcm 保证。
-- 若预取没赶上，请求照常走远端读；下一次受益。
-
-### 6.2 扩容：warm gate
-
-```mermaid
-sequenceDiagram
-    participant L2 as L2
-    participant O as 编排
-    participant N as 新实例
-    participant K as kvcm
-    participant R as SC
-
-    L2->>O: ScaleOut
-    O->>N: provision + weights
-    N->>R: register(warming)
-    L2->>K: 预热 hot/hook 前缀
-    K-->>R: READY（DRAM）
-    R->>R: coverage
-    alt coverage ≥ W_min
-        R->>R: ready，route_weight=1
-    else 未达标
-        R->>R: 低权重/延迟加入
-    end
-```
-
-### 6.3 缩容：KV-aware victim
-
-```mermaid
-flowchart LR
-    V["候选 victim"] --> S{"有活跃会话?"}
-    S -->|"是"| KEEP["保留/换 victim"]
-    S -->|"否"| H{"有唯一热 KV?"}
-    H -->|"是"| MOVE["move/retain 后缩"]
-    H -->|"否"| DRAIN["drain"]
-```
-
-### 6.4 池压：降层/扩池
-
-```mermaid
-flowchart TB
-    W["DRAM 水位高"] --> D["冷前缀 demote/停保活"]
-    D --> K["KVT 更新"]
-    K --> R["L0 不再本地读，改远端/重算"]
-    R --> S["持续则扩 KV 池"]
-```
-
-### 6.5 Ghost：miss 反馈
-
-```mermaid
-sequenceDiagram
-    participant R as SC
-    participant KVT as KVT
-    participant W as 实例 B
-    participant K as kvcm
-
-    KVT-->>R: B 有 P（Confirmed）
-    R->>W: 请求
-    W-->>R: 本地 miss
-    R->>KVT: MISS(P,B)
-    KVT->>KVT: B 的 loc → Stale
-    R->>K: VERIFY（抽样/热条目）
-    K-->>KVT: LOST / OK
-    R->>R: 本次远端读/重算；下次换节点
-```
+1. **kvcm READY 是"本机 DRAM 就绪"，不是"HBM 命中"**。第一次请求仍要把 KV 从 DRAM 读进 HBM；它省的是跨机 RDMA。
+2. **预取赶不上不影响正确性**。请求照常走远端读，下次受益。
+3. **缩容不硬删**。drain 卡住保留 draining 下周期重试；有活跃会话或有唯一热 KV 的节点优先保留。
 
 ---
 
-## 7. 性能模型与整体收益
+## 7. 收益从哪来
 
-这一节回答：“联合调度到底赚什么、赚多少、什么时候不赚”。
+这一节只回答一个问题：**为什么调度优先级是"命中 > 本地放置 > HBM 命中"**。公式、量化示例、收益指标、算法清单都在 [D8a](D8a-scheduling-algorithms.md)。
 
-### 7.1 收益分解
+### 7.1 四个量级差一个数量级
 
-```mermaid
-flowchart LR
-    A["无命中<br/>T_prefill 秒级"] --> B["远端池命中<br/>T_transfer 十毫秒级"]
-    B --> C["本机 DRAM<br/>T_local 毫秒级"]
-    C --> D["HBM 命中<br/>≈0"]
-```
+一次请求的 KV 相关成本按命中层级取项：
 
-一次请求的 KV 相关成本可以拆成四段：
+| 层级 | 代价 | 量级（8K / 70K prompt） |
+|---|---|---|
+| 无命中（重算） | `T_prefill` | **1.6 s / 14 s** |
+| 远端池命中 | `T_transfer` | 6.4 ms / 56 ms |
+| 本机 DRAM 命中 | `T_local` | 1.6 ms / 14 ms |
+| HBM 命中 | ≈0 | — |
 
-```text
-T_total ≈ Q + T_prefill + T_transfer + T_local_copy
-```
+**秒级 vs 十毫秒级 vs 毫秒级**——差一到两个数量级。所以：
 
-> 这不是四项同时发生：miss 有 `T_prefill`；远端池命中只有很小的残差 prefill、有 `T_transfer`；本机 DRAM 有 `T_local_copy`；HBM 命中两者都接近 0。按命中层级取项。
+1. 命中/保留（省 `T_prefill`）是最大杠杆；
+2. 本地放置（省 `T_transfer`）次之；
+3. HBM 命中（省 `T_local`）再次；
+4. 队列/弹性只影响尾部与吞吐。
 
-| 段 | 由什么决定 | 调度能做什么 | 量级（见 §7.3） |
-|---|---|---|---|
-| `Q` 队列 | 实例负载/扩缩 | L0 负载打分、L2 扩容 | ms–s |
-| `T_prefill` | 残差 token / 算力 | 命中/保留（避免重算） | **秒级** |
-| `T_transfer` | 跨机字节 / 网络 | 本地放置、预取 | **十毫秒级** |
-| `T_local_copy` | 本地字节 / HBM 带宽 | HBM 命中 | **毫秒级** |
+**不要为了毫秒级优化牺牲命中率。**
 
-**收益优先级**：
+### 7.2 两条容易记错的结论
 
-1. **命中/保留**（省 `T_prefill`）——最大；
-2. **本地放置**（省 `T_transfer`）——次之；
-3. **HBM 命中**（省 `T_local_copy`）——再次；
-4. **队列/弹性**（省 `Q`）——尾部与吞吐。
+1. **预取的真正价值在"防 miss"，不是"搬家"**。只把远端命中变本机命中，收益是 `T_transfer − T_local`（十毫秒级）；防止一次驱逐/重算，收益是 `T_prefill`（秒级）。所以预取要和保留一起做。
+2. **保留要用盈亏平衡定 TTL，不能无限 pin**。保留收益随恢复概率指数衰减，占用成本线性增长，一定有一个最优 TTL。用错 TTL 两边都亏：短了白丢，长了占着内存不还。
 
-这解释了为什么“HBM 命中后的本地拷贝优化”不是终局的核心：它是第三层优化，真正决定 TTFT 的是“KV 还在不在、能不能命中”。
-
-### 7.2 公式
-
-```text
-T_prefill   = P / v_prefill
-T_transfer  = S / BW_wan
-T_local     = S / BW_local
-S = P × bytes_per_token
-```
-
-其中 `P` 是 prompt token 数，`S` 是前缀字节数。
-
-命中的收益：
-
-```text
-Benefit = p_miss_avoided × T_prefill
-        + p_remote_to_local × (T_transfer − T_local)
-        + p_hbm × T_local
-```
-
-- `p_miss_avoided`：本来会 miss/重算，现在命中（保留/预取防驱逐）；
-- `p_remote_to_local`：本来是远端池命中，现在本机 DRAM；
-- `p_hbm`：本来是本地 DRAM，现在 HBM。
-
-预取 ROI：
-
-```text
-ROI = Benefit / (S/BW_copy × c_bw + S×T_hold×c_hbm + waste)
-```
-
-保留 TTL：
-
-```text
-Net(T) = p_resume(T)×T_prefill − c_h×S×T − C_risk
-```
-
-### 7.3 量化示例（模型估算，非真机）
-
-假设（只用于说明量级，真机替换）：
-
-- `bytes_per_token = 20KB`（薄 KV/MLA 类；胖 GQA 会更大）
-- `v_prefill = 5000 token/s/GPU`
-- `BW_wan = 25 GB/s`
-- `BW_local = 100 GB/s`
-
-| 指标 | 8K prompt | 70K prompt |
-|---|---:|---:|
-| 前缀字节 `S` | 160 MB | 1.4 GB |
-| 重算 `T_prefill` | 1.6 s | 14 s |
-| 跨机传输 `T_transfer` | 6.4 ms | 56 ms |
-| 本地拷贝 `T_local` | 1.6 ms | 14 ms |
-
-由此：
-
-| 优化 | 8K 收益 | 70K 收益 | 说明 |
-|---|---:|---:|---|
-| 命中 vs 重算 | ~1.6 s | ~14 s | 最大杠杆：保留/防驱逐 |
-| 本机 DRAM vs 远端 | ~4.8 ms | ~42 ms | 预取/本地放置 |
-| HBM vs 本机 DRAM | ~1.6 ms | ~14 ms | HBM 命中（APC） |
-| 队列/扩容 | 看负载 | 看负载 | 尾部与吞吐 |
-
-> 表中“命中”按整段前缀命中估算；实际 vLLM 可能仍重算末 token，残差很小。真机要按模型/并行配置替换 `bytes_per_token`、`v_prefill`、`BW_wan`、`BW_local`。
-
-**读数**：
-
-- 命中的收益是“秒级”，本地放置是“十毫秒级”，HBM 是“毫秒级”。**不要为了毫秒级优化牺牲命中率**。
-- 预取如果只是把“远端命中”变成“本地命中”，收益是 4.8ms/42ms；如果它防止了一次驱逐/重算，收益是 1.6s/14s。**预取的真正价值在“防 miss”，不是“搬家”**。
-- 保留一个 70K 会话的前缀（1.4GB）10 分钟，换一次 14s 重算，通常非常划算；但要有 TTL/预算，不能无限 pin。
-
-### 7.4 吞吐与成本
-
-命中率提升的吞吐价值：
-
-```text
-节省的 GPU 时间/秒 = QPS × Δhit_rate × T_prefill
-等效 GPU 数 ≈ 节省的 GPU 时间/秒
-```
-
-示例（说明量级）：
-
-- 8K、100 QPS、命中率 +10% → `100×0.1×1.6 = 16 GPU·s/s` ≈ 16 张卡的 prefill 产能；
-- 70K、10 QPS、命中率 +10% → `10×0.1×14 = 14 GPU·s/s`。
-
-成本侧：
-
-```text
-C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失败/浪费
-```
-
-通常 `c_gpu` 远高于 `c_bw/c_mem`，所以“用带宽/内存换 GPU 时间”是合算的；但带宽有上限（后台 <10%），所以要有预算和优先级。
-
-### 7.5 什么时候不赚
+### 7.3 什么时候不赚
 
 | 场景 | 为什么不赚 | 策略 |
 |---|---|---|
-| prompt 很短 | prefill 小，传输/队列占比高 | 少预取，优先队列/负载 |
-| 复用率低 | 保留/预取浪费内存和带宽 | 短 TTL；按 EV/bytes 准入 |
-| 带宽已满 | 预取与请求争带宽，TTFT 反而变差 | 后台预算 <10%；避让/限速 |
-| HBM 压力大 | pin 太多挤掉其他前缀，全局命中率下降 | pin 预算；soft 优先；TTL |
-| hook 不准 | 预取到错误实例/前缀 | 置信度、ETA 过期、只 observe |
-| 扩容急 | warm gate 延迟接流量 | 老节点先接；warm 后台；低权重 |
+| prompt 很短 | prefill 小，传输/队列占比高 | 少预取，优先队列 |
+| 复用率低 | 保留/预取浪费内存带宽 | 短 TTL；按 EV/bytes 准入 |
+| 带宽已满 | 预取与请求争带宽 | 后台预算 <10%；避让/限速 |
+| HBM 压力大 | pin 太多挤掉其他前缀 | pin 预算；soft 优先 |
+| hook 不准 | 预取到错实例/前缀 | 置信度、ETA 过期、只 observe |
+| 扩容急 | warm gate 延迟接流量 | 老节点先接；warm 后台 |
 
-### 7.6 要观测的收益指标
-
-| 指标 | 回答 |
-|---|---|
-| `hit_rate`（pool/local/HBM 分层） | 命中率是否提升 |
-| `prefill_saved_tokens` | 省了多少重算 |
-| `transfer_saved_bytes` | 省了多少跨机传输 |
-| `prefetch_hit_rate` / `waste_bytes` | 预取是否值 |
-| `retention_hit_rate` / `wasted_retention` | 保留是否值 |
-| `TTFT_p99` / `ITL_p99` | 用户感知 |
-| `gpu_seconds_saved` / `cost_per_1k_tokens` | 成本 |
-| `scale_ready_latency` / `warm_coverage` | 弹性 |
-| `ghost_ratio` / `verify_miss_rate` | 索引可信度 |
+收益指标、吞吐/成本换算、算法与技术清单见 [D8a §8](D8a-scheduling-algorithms.md)。
 
 ---
-
-### 7.7 算法与技术清单
-
-> 公式、图和收益推导见 [D8a-scheduling-algorithms.md](D8a-scheduling-algorithms.md)。本节只列清单。
-
-每个算法都对应一个具体失效模式，不是“技术堆砌”：
-
-| 技术/算法 | 解决什么 | 怎么用 | 主要收益 | 边界/风险 |
-|---|---|---|---|---|
-| **事件溯源 + 物化视图** | 全局 KV 位置不可每请求查 master | 引擎事件/kvcm READY/池事件 → KVT；查询走内存 | 选路零 RPC、低延迟 | 最终一致，需要墓碑/对账 |
-| **链式 block hash + 前缀链匹配** | 前缀复用要精确到块 | 按引擎 hash 链逐块查 KVT，取连续命中 | 命中长度准确；支持 TP/DP 去重 | hash 口径必须与引擎逐字节一致 |
-| **推测索引 + TTL** | 请求已路由、引擎事件还没到 | 路由后写短 TTL 推测条目，只做亲和 | 降低批内竞态导致的假 miss | 不能作为 HBM 命中证据 |
-| **多源合并：source rank + seq + 墓碑** | 引擎/池/kvcm 事件互相覆盖 | 每源独立序号；负事实优先；墓碑防复活 | 多源不打架；删除可收敛 | 源 gap 时要 replay/snapshot |
-| **gap 检测 + replay** | 事件丢失/乱序 | 跳号重放；不可用则 snapshot；再不行标 stale | 索引可恢复 | replay buffer 有界 |
-| **效用打分/成本模型** | 多目标（命中/传输/队列/SLO） | 分层权重 + TTFT 估算 + SLO 惩罚 | 选路可解释、可调 | 权重需真机校准 |
-| **传 vs 算阈值 `BW*`** | 远端命中是否值得传 | `BW* = B·c_bw/(residual·c_prefill)` | 避免“为了省重算反而更慢” | 带宽要有效测量 |
-| **预取 EV + 预算背包** | 预取可能白做 | Poisson 到达估 `P_use`；按 `EV/bytes` 贪心 | 预取 ROI 可控；带宽不被打爆 | ETA/复用率是估计 |
-| **保留 TTL 盈亏平衡** | 保留太久浪费内存 | `p_resume(T)·S` vs 占用成本；指数衰减求 break-even | 会话保留可量化 | 恢复概率难估 |
-| **Little 定律 + 利用率目标** | 扩缩只看队列会滞后 | `L=λW`、`ρ=λ/(cμ)`、`c_min` | 容量有公式、可解释 | 突发/长尾需快环 |
-| **双环控制 + 滞回/冷却** | 扩缩振荡 | 慢环定下限、快环 ±1；cooldown > ready+warm+drain | 少抖动、少反复扩缩 | 参数需调 |
-| **warm gate coverage** | 新节点没 KV 就接流量 | 加权 confirmed 比例；未达标低权重 | 减少冷 miss | 会延迟新节点接流 |
-| **KV-aware victim** | LIFO 缩掉热节点 | `loss/gain` 比较 unique hot KV、会话风险、迁移成本 | 缩容不砸命中率 | 需要 KVT/会话视图 |
-| **影子价格/对偶分解** | 三环各自为政 | L2 出价格，L0/L1 局部最优 | 联合但不做全局在线优化 | 价格更新需稳定 |
-| **leader lease + 幂等** | 多 SC 实例同时扩缩 | etcd lease 选主；intent 幂等键 | 不打架、可重试 | leader 故障有短暂停 |
-| **决策日志/回放** | 事故无法复盘、参数不敢调 | 记录输入/候选/价格/选择/版本 | 可解释、可 A/B、可回放 | 日志成本 |
-
-**技术栈（与算法分开看）**：
-
-| 层 | 技术 | 用途 |
-|---|---|---|
-| 事件 | ZMQ（引擎 KV events / Mooncake publisher） | 高频、best-effort 的位置/删除事件 |
-| 决策接口 | gRPC | SC ↔ kvcm intent、READY/失败回执 |
-| 池操作 | Mooncake master RPC / HTTP admin | copy/move/lease/核验 |
-| 状态 | sqlite（kvcm ledger）/ 进程内 KVT | 会话/任务/副本；索引 |
-| 编排 | K8s HPA/KEDA/WVA 或自研 connector | 真实 provision |
-| 观测 | Prometheus/结构化日志/决策日志 | 命中、ROI、延迟、回放 |
-
-### 7.8 收益汇总
-
-| 指标 | 主要来源 | 预期方向 | 说明 |
-|---|---|---|---|
-| **TTFT** | 命中/保留、预取、HBM 命中 | 降 | 命中省秒级 prefill；本地放置省十毫秒级传输 |
-| **命中率** | KVT 选路、保留、预取、warm gate | 升 | 分层统计：HBM / 本机 DRAM / 远端池 |
-| **吞吐/GPU 效率** | 少重算、扩缩、batch 填满 | 升 | 命中率 +10% 可能等价于多张卡的 prefill 产能 |
-| **成本** | 少 GPU 时间、带宽预算、pin 预算 | 降 | 用带宽/内存换 GPU 时间通常合算 |
-| **弹性** | 双环、warm gate、KV-aware victim | 快/稳 | 扩容 Ready 更快、缩容不丢热 KV |
-| **风险** | KV 对账、leader、幂等、决策日志 | 降 | ghost 少、扩缩不打架、可复盘 |
-| **可运维性** | 账本、ROI、回放 | 升 | 从“拍脑袋”到“可测量/可调参” |
-
-> 收益不是单点算法带来的，而是“索引可信 + 决策有预算 + 执行有反馈”这条链。单独拿出一个算法，收益通常有限；链断了，调参也救不回来。
 
 ## 8. 一致性与失效
 
@@ -806,45 +498,23 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 
 ---
 
-## 9. 版本与能力基线（v0.3.13.post1）
+## 9. 能力前提
 
-### 9.1 关键事实
+D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处，不在本文重复**：
 
-| 能力 | v0.3.13.post1 | 对 D8 的影响 |
-|---|---|---|
-| 引擎 KV events | vLLM-Ascend `enable_kv_cache_events`；`BlockStored/Removed` + `medium` | KVT 的 HBM/池 put 来源 |
-| master publisher | 代码有；CMake `ENABLE_KV_EVENTS` 默认 OFF，运行 `--enable_kv_events` 默认 false；copy 路径零发布 | 删除面需显式开启；预复制放置仍靠 kvcm 补发 |
-| admin 查询 | `GET /batch_query_keys` / `GetReplicaListForAdmin`（零副作用） | KV 对账/核验可用，不污染 lease |
-| soft pin 空写 | **有条件可用**（PR73）：Case B、单 slice、key 存在、无盘副本；`exists` 持 lease；地址检查 | 会话保留可用；有边界 |
-| hard pin 事后设置 | **拒绝**（创建时固化） | 只能用 keepalive 做 lease 保护 |
-| keepalive | 注册/注销 + 周期 `renew_once`（有界） | 会话保留的基础 |
-| demote | 停保活 + 等一个 lease TTL + 查盘；写回模式池不满仍失败 | 不是确定性降层 |
-| promote | 反复 `GetReplicaList`/触发；READY 较弱（看到内存副本，不保证任务完成） | 只能当“可尝试路由” |
-| remove | 全局删 key，不支持 target；force 只跳过 lease | 释放走软释放优先 |
-| retain | 未实现；无 `AddReplicaForRetainedClient`；可登记 move 到活 seg / kvcm 自挂 SSD | 跨引擎存亡还不能完全兜 |
-| copy/move 取消 | 无 | 预取改道只能 abandon + 事后清理 |
-| 实例注册 | E13 设计已定；代码归 E13 | 端点/seg 映射仍靠启动参数 |
-| 段容量准入 | 已合入 main（#72）：提交前查目标段剩余 | 预取可能因段满失败 |
-| 带宽限速（E15） | 未做；只有并发窗口 | 预取/迁移要预算 |
+| 要知道什么 | 去哪看 |
+|---|---|
+| Mooncake 每个操作有没有 RPC、什么前提、版本差异 | [D2](D2-kv-operations.md)（soft pin 的 Case B 边界在 §2，retain 在 §4，demote/promote 在 §3） |
+| 事件、放置权威、lease、复制的池层事实 | [D1](D1-router-scheduling.md)（F1 放置权威 / F7 事件 schema / F9–F10 盲区 / F14 池 publisher） |
+| kvcm 自己哪些实现了、哪些还没 | [summary.md](../summary.md)（E 编号的工程项状态） |
 
-### 9.2 0.3.13.post1 的 soft pin 边界
+几条最容易记错、直接影响 D8 边界的前提：
 
-- **版本前提**：v0.3.13.post1 使用 `SoftPinAction` 三态，**没有** `has_read_lease` 门槛；Case B 只看尺寸。
-- **安全前提**：Case B（同尺寸、单 slice、key 存在、无盘副本）；`put_step=1`；soft pin 前 `exists` 持 lease。
-- **不保证**：Case C-by-size/Case A、Start/End 崩溃、读者短暂不可读、`client_id` 改写、30min 不续期、并发重写。
-- **取消**：`SoftPinAction::DISABLE`；或用 keepalive + lease，不依赖空写。
-- **升级陷阱**：0.3.14/main 有 `has_read_lease` 门槛；有租约且全内存时同尺寸也会走 Case C，当前空写不可用。升级时必须重新评估，不能默认沿用。
-
-### 9.3 合入状态（截至 2026-11-04，rebase 到 main 后）
-
-- **已合入 main**：
-  - #71：READY 后按实例端点补发 `BlockStored`（`medium=CPU`、`full_attention`、低 64 位 hash）。
-  - #72：段容量准入（提交前查目标段剩余；不够不发）。
-  - #74：retain 的三种做法重写（设计；实现仍未接）。
-- **未合入 main**：
-  - `feat/kvcm-ops-mainline`（PR73）：soft pin 空写、hard pin 拒绝、keepalive 拆分、demote/promote/remove 语义、admin 核验。
-- **仍未做**：E13（InstanceWatcher 代码）、E15（带宽限速）、retain 实现。
-- 设计以 `summary.md` / `D1` / `D2` 的最新合入状态为准；本文不把未合入能力当成已具备。
+1. **soft pin 事后加是有条件的**（Case B：同尺寸、单 slice、key 存在、无盘副本）。不满足就退回 keepalive + lease。硬钉不能事后加。
+2. **retain 没有实现**。跨引擎存活目前只能靠 move 到活着的 seg，或 kvcm 自挂 SSD。
+3. **copy/move 不能取消**。预取改道只能 abandon + 事后清理副本。
+4. **池 publisher 默认关闭**（构建 OFF、运行 false），且 copy 路径零发布。删除面要么显式开启，要么靠 TTL/miss/抽样核验。
+5. **vLLM-Ascend 的 key 是链式 block hash，TP 下同一逻辑块多把 key**。SC 必须用与引擎逐字节一致的算法，不能用估算 token 数。
 
 ---
 
@@ -900,45 +570,3 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 - vLLM-Ascend 的 TP/DP per-rank key、Mooncake 的 key 不透明性，决定了“索引必须按逻辑块去重、SC 不能碰 PoolKey”——这是与通用 vLLM router 最大的工程差异。
 
 ---
-
-## 附录：公式速查
-
-```text
-# 请求收益
-U = w_hit·H·c_prefill + w_pool·P·c_prefill·κ
-  − w_bw·(B/BW)·c_bw − w_q·Q·c_queue
-  − w_slo·max(0,TTFT−D)·c_slo + w_future·F − w_risk·R
-
-# TTFT
-TTFT = Q + residual/v_prefill + B/BW + T_handoff
-
-# 传 vs 算
-BW* = B·c_bw / (residual·c_prefill)
-
-# 预取 EV（Poisson）
-Λ = ∫λ; P_use = 1−e^{−Λ}
-EV = P_use·S − C_copy − C_occupancy
-
-# 保留 TTL
-Net(T) = p0·e^{−μT}·S − c_h·bytes·T − C_risk
-break-even: μ·p0·e^{−μT}·S = c_h·bytes
-
-# 容量
-ρ = λ/(c·μ); c_min = ceil(λ/(μ·ρ_target)); L = λ·W
-
-# warm gate
-coverage = Σw_b·1[b confirmed]/Σw_b
-ready if coverage ≥ W_min or t ≥ deadline
-
-# victim
-loss(v) = uniqueHotRefill + sessionRisk + migrationCost
-gain(v) = idleCapacity·c_capacity
-choose max(gain−loss)
-
-# 价格
-λ_{t+1} = clip(λ_t + η(u−u*), 0, λ_max)
-
-# 置信度/ghost
-conf(t) = conf0·e^{−(t−t0)/τ}
-P_ghost ≈ 1−e^{−λ_delete·age}
-```
