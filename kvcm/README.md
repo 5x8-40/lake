@@ -8,9 +8,12 @@ KV 管理控制面：独立于推理引擎与 KV 池的第三进程，管 KV 全
 |----|------|------|
 | **全局设计** | [design/D1-router-scheduling.md](design/D1-router-scheduling.md) | Router 集成与请求调度（选路面） |
 | | [design/D2-kv-operations.md](design/D2-kv-operations.md) | KV 调度操作集（八项操作语义 + mooncake 机制事实） |
+| | [design/D8-joint-scheduling.md](design/D8-joint-scheduling.md) | **统一调度中心**：hook + KVT + L0/L1/L2 三环，请求 × KV × 扩缩容联合决策 |
+| | [design/D9-kv-services.md](design/D9-kv-services.md) | **基于 kvcm 的服务地图**：会话 KV / 预热 / 反熵 / 账本 / 容量 / 迁移 |
 | | [design/code-architecture.md](design/code-architecture.md) | 服务化代码架构（五层；E10/E11/E15 设计依据） |
 | **专项设计** | [design/kv-prefetch.md](design/kv-prefetch.md) | copy/prefetch 详细方案（A 壳请求 / B 显式副本复制权衡与时序） |
 | **流程文档** | [design/flows/prefetch.md](design/flows/prefetch.md) | 预热流程步骤与数据流（每流程一篇，新增流程同目录另立） |
+| | [design/flows/scheduling.md](design/flows/scheduling.md) | 调度流程时序（L0 选路 / L1 预取与会话 / L2 扩缩与 drain） |
 | **demo 记录** | [demo/](demo/README.md) | precopy 预热验证：仅覆盖八项中 **copy** 一项的端到端链路（vllm-ascend + Mooncake 实测通过） |
 | **登记处** | [summary.md](summary.md) | 设计决策 D / 潜在问题 P / 工程项 E 全状态总表 |
 
