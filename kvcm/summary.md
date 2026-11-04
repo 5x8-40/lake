@@ -246,6 +246,7 @@
 - 优先级：P0 = KV 对账 + 用量账本；P1 = 容量规划建议 + 下线搬迁 + 保留/删除规则；P2 = 历史回放、会话分支/跨地域/模型灰度。
 - **收益**：KV 对账/用量账本让 D8 的命中/保留决策可信、可算 ROI；容量建议/下线搬迁是“保命中率”的防守型收益；保留规则/回放让策略可控、可回归。
 - 关键约束：soft pin 有条件可用、hard pin 拒绝；retain 未实现；KV 对账用 v0.3.13.post1 的零副作用 admin 查询；copy/move 无取消。
+- **不重写轮子**：索引/查询复用 Conductor/Dynamo indexer/Mooncake admin；字节/指标复用 LMCache observability/Prometheus；D9 补的是抽样比对、intent→命中的归因、与 D8 的联动。
 - 工作文档：[D9-kv-services.md](design/D9-kv-services.md)。
 - 待定：KV 对账采样成本、用量账本回传、容量建议边界、下线搬迁/retain、保留/删除默认策略。
 
