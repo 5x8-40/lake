@@ -212,6 +212,12 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - kvcm 要实现空写
     - 用编译型语言客户端库（C++/Go/Rust）或直接按协议发 master RPC → 不用改 mooncake
     - 继续用 Python → 需要给绑定层打补丁（改 mooncake）
+- **F12b 空写的前提与升级陷阱**（落地时必须对照）
+  - **版本前提**：v0.3.13.post1 使用 `SoftPinAction` 三态，**没有** `has_read_lease` 门槛；Case B 只看尺寸
+  - **安全前提**：Case B（同尺寸、单 slice、key 存在、无盘副本）；`put_step=1`；soft pin 前 `exists` 持 lease
+  - **不保证**：Case C-by-size / Case A、Start/End 中途崩溃、读者短暂不可读、`client_id` 改写、30min 不续期、并发重写
+  - **取消**：`SoftPinAction::DISABLE`；或用 keepalive + lease，不依赖空写
+  - **升级陷阱**：0.3.14-pre / main 有 `has_read_lease` 门槛——**有租约且全内存时，同尺寸也会走 Case C**，当前的空写路径不可用。升级 mooncake 时必须重新评估 soft pin 方案，不能默认沿用
 
 ### F13 main 相对 0.3.11 的能力增量（按「对 kvcm 有什么用」分六组；各处引用统一指向本条）
 
