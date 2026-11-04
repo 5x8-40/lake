@@ -45,6 +45,26 @@
 
 > “反熵”是分布式系统术语（熵=混乱，反熵=对抗系统越来越乱）。日常沟通建议直接叫 **“KV 对账”**，本文两种写法都保留。
 
+### 0.3 现成组件能做什么，我们补什么
+
+这些能力不是“从零自研”，大部分有现成组件。关键区别是：**组件给的是“零件”，不是“这个拓扑下的成品”**。
+
+| 能力 | 现成组件 | 已覆盖 | 还缺的“胶水” |
+|---|---|---|---|
+| **KV 对账** | Mooncake Conductor（`prefix_indexer.cpp::PrefixCacheTable::Query/Register`）建前缀索引；Dynamo standalone indexer（`listener.rs::handle_gap`）做事件/gap; Mooncake admin `GET /batch_query_keys` 给副本真相 | 索引、查询、gap replay、副本查询 | 抽样策略（热/老/可疑）、索引 vs master 的比对循环、`LOST/REMOVED` 失效事实回写、限速/HA |
+| **用量账本** | LMCache `lmcache/observability.py::LMCStatsMonitor`（本地/远端/存储字节、请求统计）；Prometheus/OTel 存指标；AIBrix 有 usage/TPM 类指标 | 字节/请求级指标、监控存储 | 把 intent、copy bytes、READY、命中、引擎 APC 命中串成一条链；算预热 ROI/归因；这不是监控系统自带的语义 |
+| **容量建议** | Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler；Mooncake 容量/水位指标 | 扩缩算法、指标源、目标副本数 | 池侧 KV footprint/tier mix/shard 建议；和 D8 的决策接口对齐（只给事实/区间） |
+| **下线搬迁** | Mooncake `CreateDrainJob`、`CancelDrainJob`；K8s drain | seg 级搬迁、job 级取消 | 与 D8 摘流/选 victim 联动；session-aware；搬完 verify 再停实例 |
+| **保留/删除规则** | Mooncake pin/lease/tenant quota；K8s ResourceQuota | 单 key/tenant 的容量与租约 | 跨模型的保留策略、pin 预算、删除审计、ROI 约束 |
+| **历史回放** | 没有 turnkey；可用 trace + 模拟器自建 | 事件/指标存储 | 决策日志 schema、反事实重放、策略版本对比 |
+
+结论：
+
+- **KV 对账**：索引和查询可以复用 Conductor/Dynamo/Mooncake admin；我们补的是“抽样比对 + 失效回写”，不是重写索引。
+- **用量账本**：监控和字节统计可以复用 LMCache/Prometheus/OTel；我们补的是“intent → 命中”的归因语义，不是重写 TSDB。
+- **容量/下线/治理**：算法和池操作大多有现成实现；我们补的是“和 D8 管理面/会话视图的联动”。
+- 所以 D9 的价值不是“发明新轮子”，而是**把现成轮子装到这条链上**。
+
 ---
 
 ## 1. 控制面服务地图
