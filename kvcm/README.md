@@ -1,6 +1,19 @@
 # KVCM（KV Centric Manager）
 
-KV 管理控制面：独立于推理引擎与 KV 池的第三进程。当前版本只有**控制面**——八项操作 **copy / move / keepalive / pin / demote / promote / retain / remove**、核验、记账、事件发布；使命两条：**让 KV 到位**（预热/保活/降层/驻留）+ **告诉 Router KV 在哪**。**管理面（调度）**是 D8 的目标形态，可独立部署或嵌入 Router。Mooncake 为首个接入后端；能力按版本显式声明，后端可替换。**当前目标版本：Mooncake v0.3.13.post1**（master / client 同版本）。
+KV 管理控制面：独立于推理引擎与 KV 池的第三进程。使命两条：**让 KV 到位**（预热/保活/降层/驻留）+ **告诉 Router KV 在哪**。Mooncake 为首个接入后端；能力按版本显式声明，后端可替换。**当前目标版本：Mooncake v0.3.13.post1**（master / client 同版本）。
+
+## kvcm 分两个平面
+
+像 Kubernetes 的 kube-controller-manager 和 kube-scheduler 是两个进程、但都属于 K8s 控制面体系——kvcm 也分两半，**归属同一体系，职责不同**：
+
+| 平面 | 职责 | 状态 | 文档 |
+|---|---|---|---|
+| **控制面**（Control Plane） | **执行**：八项操作 copy / move / keepalive / pin / demote / promote / retain / remove、核验、记账、事件发布 | 已实现（copy 通，其余随能力接线） | [D1](design/D1-router-scheduling.md) / [D2](design/D2-kv-operations.md) / [D9](design/D9-kv-services.md) |
+| **管理面**（Management Plane） | **决策**：请求选路、会话保留、KV 放置、扩缩容 | 设计稿（D8 系列） | [D8](design/D8-joint-scheduling.md) / [D8a](design/D8a-scheduling-algorithms.md) / [D8b](design/D8b-scheduling-sequences.md) |
+
+**部署形态是另一层**，不影响归属：管理面可以独立进程、可以嵌入 Router、也可以和控制面同进程。控制面不做选路、不做扩缩、不持有前缀索引——那些是管理面的事。
+
+**KV Fabric** 是这两个平面**合起来的终局形态**：用户只声明需求（"我要这段记忆、这个延迟、这个预算"），系统决定放置。它不是第三个平面，也没有自己的代码——见 [D10](design/D10-kv-fabric-roadmap.md) §0。
 
 ## 文档导航
 
