@@ -45,7 +45,7 @@ from kvcm.ops.base import (
     VerifyError,
 )
 from kvcm.ops.capability import BackendCapability, Support
-from kvcm.ops.types import InstanceId, IntentInputError, Prefix
+from kvcm.ops.types import InstanceId, IntentInputError, PinKind, Prefix
 
 logger = logging.getLogger(__name__)
 
@@ -1110,6 +1110,90 @@ class MooncakeBackend(KvOps):
         返回是否全部 key 仍在池；RPC 失败按 exists 的约定抛 QueryError。
         """
         return await self.exists(prefix)
+
+    async def pin(
+        self, prefix: Prefix, kind: PinKind = PinKind.SOFT, *, enable: bool = True
+    ) -> None:
+        if kind is PinKind.HARD:
+            # hard pin 标记创建时固化，事后设置不了。登记保活不是 hard pin，
+            # 只是有窗口的 lease 保护；不要用 pin(HARD) 冒充它。
+            raise UnsupportedCapabilityError(
+                "hard pin 不能事后设置；要 lease 保护请显式调 register_keepalive()"
+            )
+        # soft pin 空写是“有条件可用”：本 PR 目标版本没有 has_read_lease
+        # 门槛，同尺寸会走 Case B；这里只保证 Case B 的前置条件。
+        # **未确认假设**：单 slice（put_step=1）、admin 的 size_/buffer_address_
+        # 与 metadata.size/旧 buffer 一致、key 不被并发重写。native 扩展会在
+        # UpsertStart 后比较地址；不一致就 Revoke，不 End。
+        # admin 的 memory 只含 DRAM values；NoF 单独存 nof，不再混入。
+        # memory+NoF 可以空写（UpsertEnd(ALL) 含 nof）；NoF-only 会在
+        # len(memory)!=1 处拒绝，因为 native 地址检查只认 MemDesc。
+        # lease 能挡驱逐和非 force Remove，挡不了 force Remove、lease 过期
+        # 后的驱逐或 Case C；这里只 renew_once 一次，不登记保活。
+        # Case C 的旧 buffer 进 discarded_replicas_ 延迟释放
+        # （put_start_release_timeout，默认 600s），所以检查时新 buffer
+        # 不会立即复用旧地址；地址复用残余主要来自 exists 后发生 force
+        # remove / stale 清理 / lease 过期驱逐，或 UpsertStart 惰性清理 /
+        # processing 抢占后无 COMPLETE 副本的 Case A，以及
+        # CallResult/descriptor 的 ABI 不确定性。
+        if self._cap.soft_pin_after.channel is not Support.YES:
+            raise UnsupportedCapabilityError(
+                "soft pin 事后加：这个能力集的通道不具备"
+            )
+        if getattr(self._keys, "put_step", 1) != 1:
+            raise UnsupportedCapabilityError(
+                "soft pin 空写只支持 put_step=1（单 slice）；当前 put_step="
+                f"{getattr(self._keys, 'put_step', '?')}"
+            )
+        # 先拿一个读租约，防止查尺寸与 UpsertStart 之间 key 被驱逐。
+        # 注意：目标 v0.3.13.post1 没有 has_read_lease gate，所以这里仍是
+        # Case B。升级到 main/0.3.14-pre+ 后，这个 exists 自己授的 lease
+        # 就会让同尺寸空写走 Case C；不是只防外部读者。升级前必须改 pin
+        # 路径或关闭空写。
+        if not await self.exists(prefix):
+            raise VerifyError("soft pin: prefix not fully in pool")
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        if self._admin is None:
+            raise QueryError("软钉取尺寸需要主线 GET /batch_query_keys")
+        try:
+            parsed = await self._rpc(self._admin.batch_query_keys, keys)
+        except (AdminMainError, StoreClientError) as e:
+            raise QueryError(str(e)) from e
+        self._require_admin_rows(keys, parsed)
+        blocked = [
+            key
+            for key in keys
+            if parsed[key].disk_replicas > 0
+            or bool(parsed[key].local_disk_endpoints)
+        ]
+        if blocked:
+            raise StoreClientError(
+                "有盘副本，空写收尾盖不住它们: " + ", ".join(blocked[:4])
+            )
+        sizes: list[int] = []
+        addresses: list[int] = []
+        for key in keys:
+            memory = list(parsed[key].memory)
+            if len(memory) != 1:
+                raise StoreClientError(
+                    f"soft pin 只支持单内存副本，没有钉上: {key} memory={len(memory)}"
+                )
+            view = memory[0]
+            if view.size is None or view.buffer_address is None:
+                raise QueryError(
+                    f"软钉读不到原尺寸/地址，没有钉上: {key}"
+                )
+            sizes.append(view.size)
+            addresses.append(view.buffer_address)
+        await self._rpc(
+            functools.partial(
+                self._client.soft_pin, keys, sizes, addresses, enable=enable
+            )
+        )
 
     async def demote(self, prefix: Prefix) -> None:
         """先确认能展开成 key、并且 admin 已配置，再注销保活。
