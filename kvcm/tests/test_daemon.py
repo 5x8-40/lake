@@ -126,6 +126,7 @@ def _args(tmp: str) -> argparse.Namespace:
         ledger=f"{tmp}/ledger.sqlite",
         max_concurrent=4,
         copy_submit_concurrency=4,
+        promote_hits=2,
         listen="",
         keepalive_interval_s=0.05,
         lease_ttl_s=10.0,
