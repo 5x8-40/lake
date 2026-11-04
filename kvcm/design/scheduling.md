@@ -1,8 +1,8 @@
-# 调度流程（L0 / L1 / L2）
+# 调度时序（L0 / L1 / L2）
 
-- 定位: [D8-joint-scheduling.md](D8-joint-scheduling.md) 的流程视图——每张图对应一个决策环或联合场景
+- 定位: [D8-joint-scheduling.md](D8-joint-scheduling.md) 的时序/场景配套——每张图对应一个决策环或联合场景
 - 状态: 设计草案；版本基线 v0.3.13.post1
-- 归属: 调度中心（SC），不属于 kvcm；SC 可以是独立组件，也可以嵌入 Router。图中 `R` 表示 SC。
+- 归属: **kvcm 管理面（调度中心 SC）**；SC 可以是独立组件，也可以嵌入 Router。图中 `R` 表示 SC。
 - 读法: `->>` 调用/数据流；`-->>` 响应/异步回执；`--x` 失败/断线；`rect` 底色区分并列场景
 
 > **先记住一个区分**：kvcm 预取到目标 seg，得到的是**本机 DRAM**，不是 HBM。它让请求走本地读、省跨机 RDMA；第一次使用仍要把 KV 从 DRAM 拷进 HBM。**要认定 HBM 命中，需要 HBM 证据**（引擎 GPU 事件，或方案 A 壳请求）。
