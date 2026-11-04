@@ -2,15 +2,15 @@
 
 来源：[issue #54](https://github.com/5x8-40/lake/issues/54)（KV-CM 遗留问题总清单）。本文是 kvcm 预复制生产化的总结文档：设计决策、潜在问题、工程项三类条目的总登记处——已闭环条目在原地标 ✅、结论指向正式文档，待定条目随讨论与实验更新。
 
-文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D9/code-architecture）与专项设计（kv-prefetch，仅 copy）；调度中心不在 kvcm，见 [../scheduling/](../scheduling/)；`demo/` = precopy demo 记录（仅验证 copy 一项的端到端链路）；本文 = 登记处。
+文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D8/D9/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（仅验证 copy 一项的端到端链路）；本文 = 登记处。
 
 编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环后在原位置标 ✅，结论落对应正式文档（`design/` 系设计文档 / `demo/` 系 demo 文档）。
 
-依赖主线：D1（已闭环）/ D2 是操作面主线，D9 是 kvcm 服务面扩展；调度中心（D8）属于外部组件/Router（E5 已闭环，结论见本文 E 节）；E10→E11→E12/E13/E14 是服务化主线（重构先行、协议随后）；P1-P9 大多随 D1/D2/D9 定型一并回答；D8 的调度问题在 `scheduling/` 里回答。
+依赖主线：D1（已闭环）/ D2 是控制面操作主线，D8 是管理面（调度），D9 是控制面服务扩展（E5 已闭环，结论见本文 E 节）；E10→E11→E12/E13/E14 是服务化主线（重构先行、协议随后）；P1-P9 大多随 D1/D2/D8/D9 定型一并回答。
 
 状态标记：✅ 已闭环（附结论写在哪个文档）｜🟡 部分闭环｜无标记 = 待定。
 
-**当前目标版本：Mooncake v0.3.13.post1（master / client 同版本）。** 文中出现的 0.3.11 / main 对照是版本差异记录，不代表当前部署基线；D9 与新增服务设计按 v0.3.13.post1 写；调度中心 D8 也按同一版本，但不在本登记处。
+**当前目标版本：Mooncake v0.3.13.post1（master / client 同版本）。** 文中出现的 0.3.11 / main 对照是版本差异记录，不代表当前部署基线；D8/D9 与新增设计按 v0.3.13.post1 写。
 
 ## 一、设计决策
 
@@ -223,14 +223,19 @@
 
 - 待定：壳请求（方案 A 的预取请求：`max_tokens=1`、不真正生成、只为把 KV 带进 HBM，定义见 [kv-prefetch.md](design/kv-prefetch.md)）这条路是否保留、与 B2 的叠加顺序。
 
-**D8. 统一调度中心** — 外部设计，不在 kvcm 登记
+**D8. 管理面：统一调度中心（请求 × KV × 扩缩容）** — 🟡 设计草案
 
-- 调度中心（SC）不属于 kvcm：可以是独立组件，也可以嵌入 Router（或编排/控制面内置）。设计见 [../scheduling/README.md](../scheduling/README.md) 与 [../scheduling/design/D8-joint-scheduling.md](../scheduling/design/D8-joint-scheduling.md)。
-- kvcm 只执行 intent、核验、记账、发布事件；不选路、不扩缩、不持有前缀索引。D8 的能力事实与 D9 共用同一版本基线。
+- 定位：kvcm 当前只有**控制面**（D1/D2/D9：KV 执行/核验/记账/发布）；**管理面**是调度。SC 可以是独立组件、嵌入 Router，或控制面内置。
+- 目标形态：KVT（多源 KV 索引树）+ HookEnvelope + L0/L1/L2 三环，联合决策“请求去哪、KV 怎么动、集群扩不扩”。
+- 原则：hint ≠ command；KV 动作只走 intent；请求不等 READY；不设固定降级链；索引是派生视图；预算先行；决策与执行分离。
+- **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是十毫秒级跨机传输；HBM 命中只省毫秒级本地拷贝。预取单独做往往只值十毫秒级，必须和保留/防驱逐一起做。
+- **版本基线 v0.3.13.post1**：publisher 代码有但构建默认 OFF、运行默认 false、copy 路径零发布；soft pin 空写有条件可用（PR73），hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入 PR72；E15 带宽限速未做。
+- 工作文档：[D8-joint-scheduling.md](design/D8-joint-scheduling.md)；时序配套：[scheduling.md](design/scheduling.md)。
+- 待定：publisher 是否开启、hook 通道与信任、扩缩 actuator、多 SC 实例 leader、权重/阈值真机校准。
 
-**D9. 基于 kvcm 的服务地图（调度中心之外）** — 🟡 设计草案
+**D9. 控制面：基于 kvcm 的服务地图** — 🟡 设计草案
 
-- 定位：kvcm 不做选路、不做扩缩决策、不持有前缀索引；在“执行 + 核验 + 记账 + 发布”边界内，把八项操作组合成服务。
+- 定位：kvcm 控制面不做选路、不做扩缩决策、不持有前缀索引；在“执行 + 核验 + 记账 + 发布”边界内，把八项操作组合成服务。
 - 服务面：会话 KV（Session）、预热（Prewarm）、反熵/核验（Anti-entropy）、账本/归因（Ledger）、容量/放置顾问（Capacity Advisor）、下线/迁移（Drain）、治理（Governance）、回放/仿真（Replay）、分支/跨集群（Branch/Geo）。
 - 优先级：P0 = 会话 KV（SESSION 级）+ 预热 + 反熵 + 账本最小集；P1 = 容量顾问 + Drain + 治理；P2 = 回放/仿真、分支/跨集群/rollout。
 - **收益排序**：会话保留（避免 resume 重算）> 预热（避免跨机传输/防 miss）> 反熵/账本（让 ROI 可信）> 容量/Drain（保命中率）。
@@ -313,11 +318,13 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 - **E15. copy 并行与限速**——🟡 **网卡利用率限速仍然不做**。并行窗口已落地（E11：`asyncio.Semaphore`，默认 4，`--copy-submit-concurrency`）。10 月 29 日跨机（[demo/EXPERIMENTS.md](demo/EXPERIMENTS.md) #17，与 #16 单机 `TRANSFER_FAIL` 不是同一次实验）：42 条 `create_copy_task` 在窗口 4 下约一半失败，主错误是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），master 留内存失败；14 条全成。提交前只查计划第一条的目标段，只加落在这一段上的新字节；其它段的剩余和字节都不参与，这一段不够就一个 key 都不发。没查的段仍可能在 `CopyStart` 时 `NO_AVAILABLE_HANDLE`。这已经在本分支落地；它不代替 E15，也不做网卡采样。实验当时也没跑这条预检。另一条前缀已经提交、但还没在目标段划出缓冲区时，剩余里看不见，两条都可能放行。彻底避开代价高，接受这个窗口。Router 侧用网卡信号打分归 D1 §5。
 - **E16. 生产化缺口**——EP 拓扑实测、master HA、监控指标（READY 延迟、copy 失败率、external hit；命中率归因口径与 P8 耦合）。
 
-### D. 服务化（D9）
+### D. 管理面与服务化（D8/D9）
 
-- **E17. 反熵 + 账本最小集**——按 [D9](design/D9-kv-services.md)：热条目抽样核验（v0.3.13.post1 用 `GET /batch_query_keys` / `GetReplicaListForAdmin`，零副作用）；`LOST/REMOVED` 事实回写；ledger 增加 bytes/ROI/归因字段。
+- **E17. 管理面调度中心 MVP**——按 [D8](design/D8-joint-scheduling.md)：hook 信封 / KV 事实 / KV intent / 决策日志 契约；KVT（先接引擎事件 + kvcm READY + speculative + miss 反馈）；L0 选路接入；L1 预取/保留最小集；时序见 [scheduling.md](design/scheduling.md)。
+  - 验收：KVT 合并/墓碑/置信度单测；L0 决策延迟 p99 <5ms；hook observe 模式不改变现有行为；READY/miss 回写闭环。
+- **E18. 反熵 + 账本最小集**——按 [D9](design/D9-kv-services.md)：热条目抽样核验（v0.3.13.post1 用 `GET /batch_query_keys` / `GetReplicaListForAdmin`，零副作用）；`LOST/REMOVED` 事实回写；ledger 增加 bytes/ROI/归因字段。
   - 验收：ghost 检出率、误判率、查询 QPS 预算；预取/保留 ROI 可算；不因核验阻塞请求。
-- **E18. 会话 KV 服务（SESSION 级）**——Open/Attach/Pause/Resume/Close；keepalive 有界续租；TTL/预算；默认软释放。
+- **E19. 会话 KV 服务（SESSION 级）**——Open/Attach/Pause/Resume/Close；keepalive 有界续租；TTL/预算；默认软释放。
   - 验收：resume hit rate、resume TTFT、wasted retention；PIN/DURABLE 随 D2 能力后置。
 
 ## 参考锚点

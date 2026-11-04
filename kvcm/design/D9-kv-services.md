@@ -1,8 +1,8 @@
-# D9: 基于 kvcm 的服务地图——目标形态与收益
+# D9: 控制面：基于 kvcm 的服务地图——目标形态与收益
 
 - 状态: **设计草案**（服务边界与优先级；收益为模型估算，待真机校准）
 - 版本基线: **Mooncake v0.3.13.post1**（master / client 同版本）
-- 上游: [summary.md](../summary.md) D9；[D2-kv-operations.md](D2-kv-operations.md) 的操作集；相关（**外部**调度中心）：[D8](../../scheduling/design/D8-joint-scheduling.md)
+- 上游: [summary.md](../summary.md) D9；[D2-kv-operations.md](D2-kv-operations.md) 的操作集；管理面（调度）：[D8](D8-joint-scheduling.md)
 - 适用部署: **vLLM-Ascend + Mooncake Store + kvcm** 独立部署
 - 关系声明: **kvcm 是独立项目，本文不依赖 lake 运行时**；lake 文档仅作参考
 - 一句话: 调度中心回答“请求/KV/扩缩怎么一起决策”；本文回答“除了调度中心，kvcm 还能对外提供哪些服务，收益在哪”。
