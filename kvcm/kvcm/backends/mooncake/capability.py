@@ -38,9 +38,10 @@ def mooncake_v0311() -> BackendCapability:
             "通道不具备，demote 在停保活前拒绝",
         ),
         has_promotion=Capability(
-            Support.NO,
-            Support.NO,
-            "promote 不在本 PR；留到后续 stacked PR",
+            Support.YES,
+            Support.YES,
+            "打 GetReplicaList 累计命中，再用内存副本传输端点对 locate(target)。"
+            "不拿 offload 端点对 seg 名：两套端口不同",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
@@ -84,14 +85,16 @@ def mooncake_main() -> BackendCapability:
         ),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
         has_offload=Capability(
-            Support.NO,
-            Support.NO,
-            "demote 不在本 PR；留到后续 stacked PR",
+            Support.YES,
+            Support.YES,
+            "主线：停保活、等满 lease TTL、再用 GET /batch_query_keys 查盘副本；没有就失败",
         ),
         has_promotion=Capability(
-            Support.NO,
-            Support.NO,
-            "promote 不在本 PR；留到后续 stacked PR",
+            Support.YES,
+            Support.YES,
+            "打 GetReplicaList，默认 2 次，再用内存副本传输端点对 locate(target)。"
+            "不能在打次数之前证明 target 是盘副本登记实例："
+            "offload 端点和 seg 名不是同一套。同步核验，不轮询，不做读删写",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),

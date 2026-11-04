@@ -127,6 +127,7 @@ class MooncakeBackend(KvOps):
         executor: ThreadPoolExecutor | None = None,
         rpc_timeout_s: float = 30.0,
         admin: AdminClient | None = None,
+        promote_hits: int = 2,
         lease_ttl_s: float = 10.0,
     ) -> None:
         """
@@ -159,12 +160,15 @@ class MooncakeBackend(KvOps):
         """
         if submit_concurrency <= 0:
             raise ValueError("submit_concurrency must be positive")
+        if promote_hits < 1:
+            raise ValueError("promote_hits must be positive")
         if lease_ttl_s < 0:
             raise ValueError("lease_ttl_s must be >= 0")
         self._client = client
         # 副本核验走主线 GET /batch_query_keys。不设则核验失败，不退回
         # batch_get_replica_desc。
         self._admin = admin
+        self._promote_hits = promote_hits
         # 与 master 的 default_kv_lease_ttl 对齐。main 默认 10s
         # （DEFAULT_DEFAULT_KV_LEASE_TTL = 10000ms）。kvcm 不改 master 的这个值。
         # demote 等满这一段：没有马上撤销 lease 的调用，也不查剩余租约。
@@ -1107,6 +1111,106 @@ class MooncakeBackend(KvOps):
         返回是否全部 key 仍在池；RPC 失败按 exists 的约定抛 QueryError。
         """
         return await self.exists(prefix)
+
+    async def demote(self, prefix: Prefix) -> None:
+        """先确认能展开成 key、并且 admin 已配置，再注销保活。
+
+        然后等满一个 lease TTL，再查是否已有盘副本。没有马上撤销
+        lease 的调用，也不查剩余租约，所以睡满 ``lease_ttl_s``
+        （须与 master 的 ``default_kv_lease_ttl`` 一致）。
+        然后用已有的 ``GET /batch_query_keys`` 看 disk / local_disk 条数。
+        不用 ``GetReplicaList`` / ``batch_get_replica_desc``，那会续租，
+        把刚停的保活又续上。每个 key 都有盘副本才算成功。
+        写回且池不满时仍会失败：不读数据落盘，不调 ``MountLocalDiskSegment``。
+        展开不出 key、或没配 admin，在注销保活之前就失败。
+        失败或取消只恢复原本就有的保活行，并写回原来的
+        ``registered_at``。原来没有行不新建。成功不加回。
+        """
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        if self._admin is None:
+            raise QueryError("降层查盘副本需要主线 GET /batch_query_keys")
+        if self._cap.has_offload.channel is not Support.YES:
+            raise UnsupportedCapabilityError(
+                "当前能力集没有盘副本字段，不能降层"
+            )
+        await self._require_ledger()
+        registered_at = await self._in_ledger(
+            self._ledger.keepalive_registered_at, prefix
+        )
+        await self.unregister_keepalive(prefix)
+        try:
+            await asyncio.sleep(self._lease_ttl_s)
+            try:
+                parsed = await self._rpc(self._admin.batch_query_keys, keys)
+            except (AdminMainError, StoreClientError) as e:
+                raise QueryError(str(e)) from e
+            self._require_admin_rows(keys, parsed)
+            missing = [key for key in keys if parsed[key].local_disk_replicas < 1]
+            if missing:
+                raise VerifyError(
+                    "demote: 还没有 LOCAL_DISK 副本，不能提回: "
+                    + ", ".join(missing[:4])
+                )
+        except asyncio.CancelledError:
+            try:
+                await self._restore_demote_keepalive(prefix, registered_at)
+            except BaseException:
+                pass
+            raise
+        except (QueryError, VerifyError):
+            await self._restore_demote_keepalive(prefix, registered_at)
+            raise
+
+    async def _restore_demote_keepalive(
+        self, prefix: Prefix, registered_at: float | None
+    ) -> None:
+        """只把停之前就有的保活行按原 registered_at 插回去。"""
+        if registered_at is None:
+            return
+        await self._in_ledger(
+            self._ledger.restore_keepalive, prefix, registered_at
+        )
+
+    def _require_promotion(self) -> None:
+        if self._cap.has_promotion.channel is not Support.YES:
+            raise UnsupportedCapabilityError("提回通道不具备")
+
+    async def promote(self, prefix: Prefix, target: InstanceId) -> None:
+        """只触发提回：打 ``promote_hits`` 次 GetReplicaList，不验证、不等待。
+
+        `PromoteFlow.run()` 用 `check_promote` 轮询；L3 没有 TaskStatus.READY。
+        target 仅保留给上层 flow 的验证语义，触发本身是 key 级。
+        """
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        self._require_promotion()
+        for _ in range(self._promote_hits):
+            await self._rpc(self._client.batch_memory_replica_endpoints, keys)
+
+    async def check_promote(self, prefix: Prefix, target: InstanceId) -> bool:
+        """查 target 是否已有该前缀全部 key 的 memory replica。
+
+        用 GetReplicaList 的返回端点对 locate(target)；查询本身也会继续
+        累计 promotion 命中，属于预期副作用。
+        """
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        self._require_promotion()
+        plan = self._keys.build_plan(keys, list(self._locate(target)))
+        last = await self._rpc(
+            self._client.batch_memory_replica_endpoints, keys
+        )
+        return all(seg in last.get(key, []) for key, seg in plan)
 
     async def retain(self, prefix: Prefix, target: InstanceId | None = None) -> TaskHandle:
         raise NotImplementedError("retain：做法见 D2 §4，尚未接通")

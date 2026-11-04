@@ -567,6 +567,7 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
         master="127.0.0.1:50088",
         admin=None,
         lease_ttl_s=11.0,
+        promote_hits=3,
     )
     daemon.build_backend(args, client=object(), ledger=object())
     assert seen["submit_concurrency"] == 7, (
@@ -574,6 +575,7 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
     )
     assert seen["admin"]._base == "http://127.0.0.1:9003"
     assert seen["lease_ttl_s"] == 11.0
+    assert seen["promote_hits"] == 3
     assert list(seen["locate"]("inst-B")) == ["seg-A"]
     with pytest.raises(IntentInputError, match="not registered"):
         seen["locate"]("other")
@@ -2100,6 +2102,7 @@ def test_admin_url_explicit_overrides_master(monkeypatch) -> None:
         master="master.internal:50088",
         admin="http://10.1.2.3:9999",
         lease_ttl_s=10.0,
+        promote_hits=2,
     )
     daemon.build_backend(args, client=object(), ledger=object())
     assert seen["admin"]._base == "http://10.1.2.3:9999"
@@ -2705,6 +2708,361 @@ def test_register_keepalive_uses_ledger_table(fake_store_module, monkeypatch) ->
         import os
 
         os.unlink(path)
+
+
+def _demote_backend(monkeypatch, led, admin, *, lease_ttl_s: float):
+    client = FakeClient()
+
+    def batch_get_replica_desc(keys):
+        raise AssertionError("demote 不能走 GetReplicaList，那会续租")
+
+    client.batch_get_replica_desc = batch_get_replica_desc
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    return MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        ledger=led,
+        admin=admin,
+        lease_ttl_s=lease_ttl_s,
+    )
+
+
+def test_demote_v0311_refuses_before_unregister_keepalive(
+    fake_store_module, monkeypatch
+) -> None:
+    """0.3.11 查不到盘副本字段。通道 NO，停保活之前就拒绝。"""
+    assert mooncake_v0311().has_offload.channel is Support.NO
+    assert mooncake_main().has_offload.channel is Support.YES
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, object(), lease_ttl_s=0)
+        b._cap = mooncake_v0311()
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        with pytest.raises(UnsupportedCapabilityError, match="盘副本"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_fails_without_disk_replica(fake_store_module, monkeypatch) -> None:
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    steps: list[tuple] = []
+
+    async def fake_sleep(seconds):
+        steps.append(("sleep", seconds, list(led.list_keepalive())))
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            steps.append(("query", list(keys)))
+            return {k: KeyReplicaQuery(key=k, ok=True, disk_replicas=0) for k in keys}
+
+    monkeypatch.setattr(
+        "kvcm.backends.mooncake.backend.asyncio.sleep", fake_sleep
+    )
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        with pytest.raises(VerifyError, match="还没有 LOCAL_DISK"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+        assert steps == [("sleep", 0, []), ("query", ["k0"])]
+        kept = led.list_keepalive_records()[0].registered_at
+        led._backdate_keepalive(seconds=50)
+        old = led.list_keepalive_records()[0].registered_at
+        assert old != kept
+        with pytest.raises(VerifyError, match="还没有 LOCAL_DISK"):
+            run(b.demote(prefix))
+        assert led.list_keepalive_records()[0].registered_at == old
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_short_response_is_query_error(fake_store_module, monkeypatch) -> None:
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {}
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        with pytest.raises(QueryError, match="短回"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_ok_false_is_query_error(fake_store_module, monkeypatch) -> None:
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {
+                k: KeyReplicaQuery(key=k, ok=False, error="OBJECT_NOT_FOUND")
+                for k in keys
+            }
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        with pytest.raises(QueryError, match="OBJECT_NOT_FOUND"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_without_prior_keepalive_does_not_create_row(
+    fake_store_module, monkeypatch
+) -> None:
+    """原本没有保活行，失败后不新建。"""
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {k: KeyReplicaQuery(key=k, ok=True, disk_replicas=0) for k in keys}
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        assert led.list_keepalive() == []
+        with pytest.raises(VerifyError, match="还没有 LOCAL_DISK"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == []
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_dfs_only_is_not_success(fake_store_module, monkeypatch) -> None:
+    """DFS 副本不算 demote 成功：promotion 只从 LOCAL_DISK 提回。"""
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {
+                k: KeyReplicaQuery(
+                    key=k, ok=True, disk_replicas=1, local_disk_replicas=0
+                )
+                for k in keys
+            }
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        with pytest.raises(VerifyError, match="LOCAL_DISK"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_succeeds_when_every_key_has_local_disk(
+    fake_store_module, monkeypatch
+) -> None:
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    steps: list[tuple] = []
+
+    async def fake_sleep(seconds):
+        steps.append(("sleep", seconds))
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            steps.append(("query", list(keys)))
+            return {
+                k: KeyReplicaQuery(key=k, ok=True, local_disk_replicas=1)
+                for k in keys
+            }
+
+    monkeypatch.setattr(
+        "kvcm.backends.mooncake.backend.asyncio.sleep", fake_sleep
+    )
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0.01)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        run(b.demote(prefix))
+        assert led.list_keepalive() == []
+        assert steps == [("sleep", 0.01), ("query", ["k0"])]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_keeps_keepalive_until_preconditions_hold(
+    fake_store_module, monkeypatch
+) -> None:
+    """没有 admin、或展开不出 key 时，还没停保活。"""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, object(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        b._admin = None
+        with pytest.raises(QueryError, match="batch_query_keys"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+
+        monkeypatch.setattr(b._keys, "keys_for_tokens", lambda ids: [])
+        b._admin = object()
+        with pytest.raises(IntentInputError, match="shorter than one block"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> None:
+    client = FakeClient(replicas_on=["seg-A"])
+    hits = {"n": 0}
+    original = client.batch_memory_replica_endpoints
+
+    def wrapped(keys):
+        hits["n"] += 1
+        return original(keys)
+
+    client.batch_memory_replica_endpoints = wrapped
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k, ok=True, local_disk_endpoints=("seg-A",)
+                )
+                for k in keys
+            }
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.promote(prefix, InstanceId("inst"))) is None
+    assert hits["n"] == 2
+    assert run(b.check_promote(prefix, InstanceId("inst"))) is True
+
+    client._replicas_on = ["seg-ELSE"]
+    assert run(b.check_promote(prefix, InstanceId("inst"))) is False
+
+
+def test_promote_offload_endpoint_does_not_skip_replica_list(
+    fake_store_module, monkeypatch
+) -> None:
+    """offload 端点不是 seg 名，不能据此跳过 GetReplicaList。
+
+    promote 只触发；check_promote 看到 seg-ELSE 时返回 False。
+    """
+    hits = {"n": 0}
+
+    class Client(FakeClient):
+        def batch_memory_replica_endpoints(self, keys):
+            hits["n"] += 1
+            return {k: ["seg-ELSE"] for k in keys}
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            raise AssertionError("提回不该拿 local_disk 端点对 seg 名")
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]) if ids else [])
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        admin=Admin(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.promote(prefix, InstanceId("inst"))) is None
+    assert hits["n"] == 2
+    assert run(b.check_promote(prefix, InstanceId("inst"))) is False
+
+
+def test_promote_v0311_hits_without_admin(fake_store_module, monkeypatch) -> None:
+    assert mooncake_v0311().has_promotion.channel is Support.YES
+    assert mooncake_main().has_promotion.channel is Support.YES
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            raise AssertionError("提回不该查 admin")
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]) if ids else [])
+    b = MooncakeBackend(
+        client=FakeClient(replicas_on=["seg-A"]),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        admin=Admin(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.promote(prefix, InstanceId("inst"))) is None
+    assert run(b.check_promote(prefix, InstanceId("inst"))) is True
 
 
 def test_retain_not_implemented(fake_store_module, monkeypatch) -> None:
