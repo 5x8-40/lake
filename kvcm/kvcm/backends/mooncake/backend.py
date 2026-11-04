@@ -9,9 +9,10 @@
 本类不组装 SegTopology。任务标识（mooncake 为整数对）在本实现内原样
 透传，不做字符串化；需要写入 Ledger 时由本实现做可逆编码（"hi:lo"）。
 
-copy / move / remove / exists / query_task / pin / register_keepalive /
-unregister_keepalive / renew_once / demote / promote 已接线。retain
-通道关闭，开头直接拒绝。基类未接线的操作抛 UnsupportedCapabilityError。
+本 PR（core）已接线：copy / move / remove / exists / query_task /
+register_keepalive / unregister_keepalive / renew_once。pin / demote /
+promote / check_promote 仍走基类 UnsupportedCapabilityError，由后续
+stacked PR 实现。retain 通道关闭，开头直接 NotImplementedError。
 """
 
 from __future__ import annotations

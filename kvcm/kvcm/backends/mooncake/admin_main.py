@@ -33,14 +33,11 @@ _MAX_BATCH_QUERY_REQUEST_BYTES = 8192
 
 @dataclass(frozen=True)
 class MemoryReplicaView:
-    """一条内存副本里核验/空写检查用得上的字段。
+    """一条内存副本里核验用得上的字段。
 
     ``transport_endpoint`` 是传输端点，不是 seg 名。核验用它和计划里的
-    段比，判断这份副本还在不在那个端点上。``buffer_address`` 是空写
-    soft pin 用来判断「UpsertStart 是否原位复用」的依据：查询时读到的
-    旧地址，和 ``UpsertStart`` 返回的 memory descriptor 比较。它不是锁，
-    挡不了 force remove / Case C；Case C 的旧 buffer 延迟释放，检查时
-    不会立即复用地址。地址复用残余见 D2 §2。
+    段比，判断这份副本还在不在那个端点上。``size`` / ``buffer_address``
+    一并解析出来；core 核验只用端点，地址字段留给后续 soft pin PR。
     """
 
     transport_endpoint: str

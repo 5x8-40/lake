@@ -35,7 +35,7 @@ from kvcm.ops.base import (
     UnsupportedCapabilityError,
     VerifyError,
 )
-from kvcm.ops.types import InstanceId, Prefix
+from kvcm.ops.types import InstanceId, PinKind, Prefix
 
 # ---------------------------------------------------------------------------
 # fake mooncake.store 绑定
@@ -2721,3 +2721,20 @@ def test_retain_not_implemented(fake_store_module, monkeypatch) -> None:
         run(b.retain(prefix))
     with pytest.raises(NotImplementedError, match="D2 §4"):
         run(b.retain(prefix, InstanceId("inst")))
+
+
+def test_core_leaves_pin_demote_promote_unsupported(
+    fake_store_module, monkeypatch
+) -> None:
+    """core 不接线 pin/demote/promote/check_promote，走基类 Unsupported。"""
+    b = _backend(FakeClient(), KeyComputer(model_name="qwen", tp_size=1), monkeypatch)
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    target = InstanceId("inst-B")
+    with pytest.raises(UnsupportedCapabilityError):
+        run(b.pin(prefix, PinKind.SOFT))
+    with pytest.raises(UnsupportedCapabilityError):
+        run(b.demote(prefix))
+    with pytest.raises(UnsupportedCapabilityError):
+        run(b.promote(prefix, target))
+    with pytest.raises(UnsupportedCapabilityError):
+        run(b.check_promote(prefix, target))
