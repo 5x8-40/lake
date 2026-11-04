@@ -1,6 +1,6 @@
-# 调度时序（L0 / L1 / L2）
+# D8b: 调度时序（L0 / L1 / L2）
 
-- 定位: [D8-joint-scheduling.md](D8-joint-scheduling.md) 的时序/场景配套——每张图对应一个决策环或联合场景
+- 定位: [D8](D8-joint-scheduling.md) 的**时序图全集**——每张图对应一个决策环或联合场景。D8 正文只讲形态与边界，图都在这里；公式见 [D8a](D8a-scheduling-algorithms.md)
 - 状态: 设计草案；版本基线 v0.3.13.post1
 - 归属: **kvcm 管理面（调度中心 SC）**；SC 可以是独立组件，也可以嵌入 Router。图中 `R` 表示 SC。
 - 读法: `->>` 调用/数据流；`-->>` 响应/异步回执；`--x` 失败/断线；`rect` 底色区分并列场景
