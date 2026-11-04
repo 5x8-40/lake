@@ -258,6 +258,7 @@
 - 值得做的方向：KV 负载整形、Agent Memory OS、KV FinOps/QoS、容量数字孪生、KV HA/DR、跨集群 KV Fabric、KV 感知模型路由、KV 存储效率、生态/SDK。
 - 三阶段：H1 省（命中+负载整形+会话记忆+FinOps 最小集）；H2 稳/省（容量孪生+HA/DR+QoS）；H3 新（跨集群+模型路由+生态）。
 - 建议下注：KV 负载整形、Agent Memory OS、KV FinOps/QoS。
+- **边界之外（D10 §3.1）**：四条扩展轴——同层（管权重/checkpoint/draft/会话元数据）、垂直（沉到数据面）、横向（多池联邦）、时间（被动→主动）；以及不在轴上的两件（KV 事务、KV 内容一致性）。其中「提前告知赶不上」与「动态保活窗口」是轴四里性价比最高的两条。
 - 工作文档：[D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md)。
 
 ## 二、潜在问题
