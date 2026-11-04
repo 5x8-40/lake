@@ -4,6 +4,7 @@
 - 版本基线: **Mooncake v0.3.13.post1**（master / client 同版本）；vLLM-Ascend 0.26 系（kvcm D1 的事实基线）
 - 归属: **调度中心（Scheduling Center，SC）**，不属于 kvcm；可以是独立组件，也可以嵌入 Router（或在编排/控制面内置）。本文用“SC”这一逻辑角色，不绑定进程形态
 - 相关: kvcm 的 [D1](../../kvcm/design/D1-router-scheduling.md) / [D2](../../kvcm/design/D2-kv-operations.md)（KV 执行语义）、[D9](../../kvcm/design/D9-kv-services.md)（kvcm 服务面）
+- 流程: [scheduling.md](scheduling.md)（L0/L1/L2 的时序与场景；与本文同级，不单独建 flows/ 目录）
 - 适用部署: **vLLM-Ascend + Mooncake Store + kvcm** 独立部署；SC 是请求/容量决策面（实现语言不限）
 - 关系声明: **kvcm 是独立项目，本文不依赖 lake 运行时**。lake 仓库只提供参考文档与原型经验；文中引用 lake 的地方都是“可借鉴”，不是依赖
 - 非目标:

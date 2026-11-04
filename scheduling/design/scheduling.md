@@ -1,6 +1,6 @@
 # 调度流程（L0 / L1 / L2）
 
-- 定位: [D8-joint-scheduling.md](../D8-joint-scheduling.md) 的流程视图——每张图对应一个决策环或联合场景
+- 定位: [D8-joint-scheduling.md](D8-joint-scheduling.md) 的流程视图——每张图对应一个决策环或联合场景
 - 状态: 设计草案；版本基线 v0.3.13.post1
 - 归属: 调度中心（SC），不属于 kvcm；SC 可以是独立组件，也可以嵌入 Router。图中 `R` 表示 SC。
 - 读法: `->>` 调用/数据流；`-->>` 响应/异步回执；`--x` 失败/断线；`rect` 底色区分并列场景
