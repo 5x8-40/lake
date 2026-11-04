@@ -6,9 +6,10 @@
 - 目的型：retain——由其他操作组合实现，对外仍呈现单步语义
 
 完成信号：copy / move / promote 有 READY（任务状态完成 + 目标侧副本
-核验通过）；retain 返回空句柄（task_ids=()，无异步工作的路径）时
-query_task 立即 READY；其余方法（keepalive / stop_keepalive / pin /
-demote / remove）无 READY。任务状态经 query_task 查询。
+核验通过）。retain 的 READY 跟着做法走：用 copy/move 搬某实例时按
+copy/move 的规则上报 READY；搬进 kvcm 自己的段盘、用旧 client_id 接管、DFS
+则不上报 READY。其余方法（keepalive / stop_keepalive / pin / demote /
+remove）无 READY。任务状态经 query_task 查询。
 
 幂等：**本层不去重**——`copy` 每次调用都发起任务，同一前缀重复调用会产生
 重复传输。去重归编排层（TaskEngine 以 intent_id = 前缀 × 目标实例 为键：
@@ -211,15 +212,18 @@ class KvOps(ABC):
         「放弃位置」不对称是刻意的）。READY 同 copy。"""
         raise self._unsupported("promote")
 
-    async def retain(self, prefix: Prefix) -> TaskHandle:
-        """目的型：让前缀 KV 在源引擎下线后仍存活。目标基线 = 后端主线
-        能力：主路径 = 保留身份注册（mooncake main 的 retained client，
-        一次注册 RPC 即完成，无异步工作）——返回空句柄 task_ids=()，
-        query_task 立即 READY。过渡替代 = move 到存活节点（0.3.11 无
-        retained 能力时的登记实现）则是任务型，返回真实句柄。
+    async def retain(self, prefix: Prefix, target: InstanceId | None = None) -> TaskHandle:
+        """目的型：让前缀 KV 在源引擎下线后仍存活。
+
+        做法决定完成信号（D2 §4）：
+        - 给了 target、用 copy/move 搬到那台实例：返回搬运任务号，
+          完成后那台实例具备服务这份前缀的条件（READY，可切流、停源实例）
+        - 搬进 kvcm 自己的段盘 / 用旧 client_id 接管盘上数据 / DFS：
+          副本不落在某台引擎的 DRAM 上，没有可切流的实例；返回的任务号
+          用于跟这次搬运，完成后用副本查询确认在册
 
         返回 TaskHandle 而非 None：结果必须可观测（「保住了没有」是
-        本操作存在的全部意义）；空句柄与真句柄由实现按路径给出。
+        本操作存在的全部意义）。
         """
         raise self._unsupported("retain")
 
@@ -232,7 +236,8 @@ class KvOps(ABC):
         """查询任务状态。任务管理面，非第九项 KV 操作。
 
         失败语义：核验失败抛 VerifyError（终态）；查询本身失败抛
-        QueryError（可重试）；未知句柄抛 KeyError（编程错误，直接传播）。
+        QueryError（可重试）；未知句柄抛 KeyError（编程错误，直接传播）；
+        空任务号抛 ValueError（契约错误，直接传播）。
         """
 
     @abstractmethod

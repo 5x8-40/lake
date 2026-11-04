@@ -634,10 +634,9 @@ class MooncakeBackend(KvOps):
         """
         from mooncake.store import TaskStatus as StoreTaskStatus
 
-        # 空句柄（task_ids=()）：无异步工作的路径（如保留身份注册一次
-        # RPC 即完成）——立即 READY，不查登记、不做副本核验。
+        # 空任务号不是「已经完成」。
         if not handle.task_ids:
-            return TaskStatus.READY
+            raise ValueError("task handle has no task ids")
         entry = self._plans.get(handle)
         if entry is None:
             raise KeyError(f"unknown task handle: {handle}")
@@ -926,8 +925,8 @@ class MooncakeBackend(KvOps):
     async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         raise NotImplementedError("promote：随提回流程落地")
 
-    async def retain(self, prefix: Prefix) -> TaskHandle:
-        raise NotImplementedError("retain：随保留流程落地（能力集 has_retained_client）")
+    async def retain(self, prefix: Prefix, target: InstanceId | None = None) -> TaskHandle:
+        raise NotImplementedError("retain：做法见 D2 §4，尚未接通")
 
     async def remove(self, prefix: Prefix) -> None:
         raise NotImplementedError("remove：随删除流程落地")
