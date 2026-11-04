@@ -19,6 +19,35 @@
 
 ---
 
+
+### 0.1 什么是 Fabric
+
+Fabric 不是某个协议或产品，而是一层**把分散资源织成一张可统一访问/调度的网**的架构抽象：
+
+- 应用不用关心资源在哪、怎么连、有几份；
+- Fabric 负责连接、寻址、放置、复制、迁移、隔离、QoS、可观测；
+- 资源可以横向扩、异构混部、跨域，但对上层表现为一个池。
+
+常见用法：
+
+| Fabric | 把什么织在一起 | 典型场景 |
+|---|---|---|
+| **Network Fabric** | 交换机/网卡/链路 | 数据中心 leaf-spine、InfiniBand/RoCE、any-to-any 低延迟 |
+| **Storage Fabric** | 主机与存储阵列/卷 | SAN、NVMe-oF、多路径、zoning、QoS |
+| **Data Fabric** | 多个数据源/湖/仓 | 数据虚拟化、目录、治理、跨域查询 |
+| **Memory Fabric** | 多机内存 | CXL 内存池化、disaggregated memory |
+| **Service Fabric** | 微服务实例 | service mesh：流量、mTLS、重试、可观测 |
+| **GPU Fabric** | 多机 GPU/NPU | NVLink/NVSwitch、NCCL、跨节点集合通信 |
+| **KV Fabric** | 多实例/多介质/多集群的 KV | Agent 记忆、热点多副本、跨区复制、KV FinOps |
+
+判断“该不该叫 Fabric”：
+
+- 只是单机/单实例的缓存优化 → 叫 cache 就好；
+- 资源是**分布、可池化、需要移动/复制/隔离/计价**的 → 才配叫 fabric；
+- Fabric 的价值在“统一控制面 + 数据面 + 策略”，不是多画一层架构图。
+
+**KV Fabric 在我们这里不是网络协议**，而是：全局前缀命名 + 放置/副本控制 + 数据面 copy/move + 会话/保留/QoS + 账本/治理。它和“KV cache”的区别是：cache 是局部加速，Fabric 是可编程、可运营的资源层。
+
 ## 1. 为什么现在值得做
 
 - **Agent workload 把 KV 变成长期状态**：多轮复用高、工具调用停顿长、resume 可能重算 70K–200K token；KV 的生命周期从“请求内”变成“会话级/天级”。
