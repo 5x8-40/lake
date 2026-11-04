@@ -3,8 +3,13 @@
 三条通道全部单向：intent 下行、事件上行、实例事件接入。
 """
 
-from kvcm.api.events import EventPublisher
+from kvcm.api.events import EventPublisher, parse_kv_event_endpoints
 from kvcm.api.intents import IntentReceiver
 from kvcm.api.watcher import InstanceWatcher
 
-__all__ = ["IntentReceiver", "EventPublisher", "InstanceWatcher"]
+__all__ = [
+    "IntentReceiver",
+    "EventPublisher",
+    "InstanceWatcher",
+    "parse_kv_event_endpoints",
+]

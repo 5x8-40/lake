@@ -513,6 +513,12 @@ class MooncakeBackend(KvOps):
         entry = self._plans.get(handle)
         return entry[0] if entry is not None else None
 
+    def target_of(self, handle: TaskHandle) -> InstanceId | None:
+        """句柄登记的目标实例（_plans 第二项）。终态删除登记后为 None——
+        调用方（TaskEngine.track）需在轮询前取，READY 时才能按实例补发。"""
+        entry = self._plans.get(handle)
+        return entry[1] if entry is not None else None
+
     # ------------------------------------------------------------------
     # 任务状态记录（归实现侧，不归编排层）
     #
