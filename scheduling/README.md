@@ -34,7 +34,7 @@ flowchart LR
 | 文档 | 内容 |
 |---|---|
 | [design/D8-joint-scheduling.md](design/D8-joint-scheduling.md) | 调度中心的目标形态、KVT、Hook、L0/L1/L2、性能模型与收益 |
-| [design/flows/scheduling.md](design/flows/scheduling.md) | L0 选路、L1 预取/保留、L2 扩缩/drain、ghost、多实例、Agent 全链路时序 |
+| [design/scheduling.md](design/scheduling.md) | L0 选路、L1 预取/保留、L2 扩缩/drain、ghost、多实例、Agent 全链路时序 |
 
 ## 与 kvcm 的关系
 
