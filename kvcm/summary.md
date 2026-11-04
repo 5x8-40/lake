@@ -242,12 +242,12 @@
 **D9. 控制面：执行与运营能力** — 🟡 设计草案
 
 - 定位：kvcm 控制面不做选路、不做扩缩决策、不持有前缀索引；在“执行 + 核验 + 记账 + 发布”边界内提供运营能力。**会话 KV、预热、选路、扩缩是 D8 管理面的动作，D9 不重复**；D9 只提供执行接口。
-- 控制面独立能力：反熵/核验（Anti-entropy）、账本/归因（Ledger）、容量/放置顾问（Capacity Advisor）、Drain/迁移、治理（Governance）、回放/仿真（Replay）、分支/跨集群/rollout。
-- 优先级：P0 = 反熵 + 账本；P1 = 容量顾问 + Drain + 治理；P2 = 回放/仿真、分支/跨集群/rollout。
-- **收益**：反熵/账本让 D8 的命中/保留决策可信、可算 ROI；容量/Drain 是“保命中率”的防守型收益；治理/回放让策略可控、可回归。
-- 关键约束：soft pin 有条件可用、hard pin 拒绝；retain 未实现；反熵用 v0.3.13.post1 的零副作用 admin 查询；copy/move 无取消。
+- 控制面独立能力：KV 对账（反熵/核验）、用量账本（成本归因）、容量规划建议、下线搬迁（Drain）、保留/删除规则（治理）、历史回放/策略试算、会话分支/跨地域/模型灰度。
+- 优先级：P0 = KV 对账 + 用量账本；P1 = 容量规划建议 + 下线搬迁 + 保留/删除规则；P2 = 历史回放、会话分支/跨地域/模型灰度。
+- **收益**：KV 对账/用量账本让 D8 的命中/保留决策可信、可算 ROI；容量建议/下线搬迁是“保命中率”的防守型收益；保留规则/回放让策略可控、可回归。
+- 关键约束：soft pin 有条件可用、hard pin 拒绝；retain 未实现；KV 对账用 v0.3.13.post1 的零副作用 admin 查询；copy/move 无取消。
 - 工作文档：[D9-kv-services.md](design/D9-kv-services.md)。
-- 待定：反熵采样成本、账本归因回传、容量建议边界、Drain/retain、治理默认策略。
+- 待定：KV 对账采样成本、用量账本回传、容量建议边界、下线搬迁/retain、保留/删除默认策略。
 
 ## 二、潜在问题
 
@@ -328,7 +328,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 - **E17. 管理面调度中心 MVP**——按 [D8](design/D8-joint-scheduling.md)：hook 信封 / KV 事实 / KV intent / 决策日志 契约；KVT（先接引擎事件 + kvcm READY + speculative + miss 反馈）；L0 选路接入；L1 预取/保留最小集；时序见 [scheduling.md](design/scheduling.md)。
   - 验收：KVT 合并/墓碑/置信度单测；L0 决策延迟 p99 <5ms；hook observe 模式不改变现有行为；READY/miss 回写闭环。
-- **E18. 反熵 + 账本最小集**——按 [D9](design/D9-kv-services.md)：热条目抽样核验（v0.3.13.post1 用 `GET /batch_query_keys` / `GetReplicaListForAdmin`，零副作用）；`LOST/REMOVED` 事实回写；ledger 增加 bytes/ROI/归因字段。
+- **E18. KV 对账 + 用量账本最小集**——按 [D9](design/D9-kv-services.md)：热条目抽样核验（v0.3.13.post1 用 `GET /batch_query_keys` / `GetReplicaListForAdmin`，零副作用）；`LOST/REMOVED` 事实回写；ledger 增加 bytes/ROI/归因字段。
   - 验收：ghost 检出率、误判率、查询 QPS 预算；预取/保留 ROI 可算；不因核验阻塞请求。
 
 ## 参考锚点

@@ -22,7 +22,7 @@
 1. **终局不是“再加一个控制面进程”，而是给 kvcm 补管理面（调度中心 SC）**：SC 可以是独立组件，也可以嵌入 Router；逻辑上是一个共享状态 + 三条时间尺度不同的决策环，把“请求去哪、KV 怎么动、集群扩不扩”放进同一套目标与预算。
 2. **索引是事件派生的决策视图，不是第二权威**：引擎 KV events、kvcm READY、Mooncake publisher、SC 推测条目、worker miss 反馈，合成一棵 KVT；Mooncake master 仍是副本权威。
 3. **最大的性能杠杆是“命中/保留”，不是 HBM 命中后的本地拷贝优化**：命中省掉的是秒级 prefill；本地放置省掉的是十毫秒级跨机传输；HBM 命中再省掉毫秒级本地拷贝。三者的量级差一个数量级以上，调度优先级必须按这个顺序设计。
-4. **kvcm 控制面的定位是“KV 执行 + 核验 + 记账 + 发布”**：不做选路、不做扩缩决策、不持有前缀索引；这些归管理面（D8）。控制面为会话/预热提供执行接口；反熵、账本、容量、迁移、治理等独立运营能力见 D9。
+4. **kvcm 控制面的定位是“KV 执行 + 核验 + 记账 + 发布”**：不做选路、不做扩缩决策、不持有前缀索引；这些归管理面（D8）。控制面为会话/预热提供执行接口；KV 对账、用量账本、容量建议、下线搬迁、保留规则等独立运营能力见 D9。
 5. **v0.3.13.post1 下，soft pin 空写已“有条件可用”**（PR73）；hard pin 事后设置已明确拒绝；copy/move 仍无取消；retain 仍未实现；池 publisher 代码有、但默认构建/运行都不开。设计必须按这个基线写，而不是按 main。
 
 ---
@@ -79,7 +79,7 @@ flowchart TB
 | 角色 | 终局职责 | 不做什么 |
 |---|---|---|
 | **Scheduling Center (SC)<br/>kvcm 管理面** | KVT、hook 编译、L0/L1/L2、intent、决策日志 | 不直连 master、不读写 KV、不开机器；控制面仍在 kvcm |
-| **kvcm 控制面** | KV 执行、READY 核验、补发事件、会话/保活/台账、反熵 | 不选路、不扩缩、不持有前缀索引；调度归管理面 |
+| **kvcm 控制面** | KV 执行、READY 核验、补发事件、会话/保活/台账、KV 对账 | 不选路、不扩缩、不持有前缀索引；调度归管理面 |
 | **vLLM-Ascend** | 执行、产生 KV events、本地 APC | 不做跨实例调度 |
 | **Mooncake** | KV 数据/副本/lease/驱逐/offload | 不解释 token/hash |
 
@@ -88,7 +88,7 @@ flowchart TB
 1. **需求前置**：hook 在请求前给出会话、前缀、ETA、保留意图；SC 提前预取/保留/扩容，而不是等请求到了再反应。
 2. **视图统一**：请求、KV 位置、会话、容量、价格在同一决策状态里；不是“路由看一套、KV 看一套、扩缩看一套”。
 3. **决策分层**：L0 <5ms、L1 100ms–1s、L2 5–60s；三条环通过价格/预算耦合，不互相阻塞。
-4. **KV 生命周期服务化**：会话保留、预热、反熵、账本、迁移是长期运行的服务，不是一次性脚本。
+4. **KV 生命周期服务化**：会话保留、预热、KV 对账、用量账本、迁移是长期运行的服务，不是一次性脚本。
 5. **弹性闭环**：扩缩不只看队列，还看 KV 价值、warm gate、会话风险；缩容不丢热 KV。
 
 ### 1.3 终局能力清单
@@ -233,7 +233,7 @@ stateDiagram-v2
 - 每个源独立序号；gap → replay/snapshot；拿不到就标 stale。
 - 同一块同一实例同一介质只保留一条位置；不同介质可并存。
 - 负事实优先；源信任级：核验 > kvcm READY > 引擎事件 ≈ 池事件 > 推测 > miss 反馈（负事实最高）。
-- `miss` 反馈是最便宜的反熵：worker 说没有，就降级该条；不需要全量轮询 master。
+- `miss` 反馈是最便宜的 KV 对账：worker 说没有，就降级该条；不需要全量轮询 master。
 
 ### 3.2 Session / Demand
 
@@ -748,7 +748,7 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 
 | 技术/算法 | 解决什么 | 怎么用 | 主要收益 | 边界/风险 |
 |---|---|---|---|---|
-| **事件溯源 + 物化视图** | 全局 KV 位置不可每请求查 master | 引擎事件/kvcm READY/池事件 → KVT；查询走内存 | 选路零 RPC、低延迟 | 最终一致，需要墓碑/反熵 |
+| **事件溯源 + 物化视图** | 全局 KV 位置不可每请求查 master | 引擎事件/kvcm READY/池事件 → KVT；查询走内存 | 选路零 RPC、低延迟 | 最终一致，需要墓碑/对账 |
 | **链式 block hash + 前缀链匹配** | 前缀复用要精确到块 | 按引擎 hash 链逐块查 KVT，取连续命中 | 命中长度准确；支持 TP/DP 去重 | hash 口径必须与引擎逐字节一致 |
 | **推测索引 + TTL** | 请求已路由、引擎事件还没到 | 路由后写短 TTL 推测条目，只做亲和 | 降低批内竞态导致的假 miss | 不能作为 HBM 命中证据 |
 | **多源合并：source rank + seq + 墓碑** | 引擎/池/kvcm 事件互相覆盖 | 每源独立序号；负事实优先；墓碑防复活 | 多源不打架；删除可收敛 | 源 gap 时要 replay/snapshot |
@@ -785,7 +785,7 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 | **吞吐/GPU 效率** | 少重算、扩缩、batch 填满 | 升 | 命中率 +10% 可能等价于多张卡的 prefill 产能 |
 | **成本** | 少 GPU 时间、带宽预算、pin 预算 | 降 | 用带宽/内存换 GPU 时间通常合算 |
 | **弹性** | 双环、warm gate、KV-aware victim | 快/稳 | 扩容 Ready 更快、缩容不丢热 KV |
-| **风险** | 反熵、leader、幂等、决策日志 | 降 | ghost 少、扩缩不打架、可复盘 |
+| **风险** | KV 对账、leader、幂等、决策日志 | 降 | ghost 少、扩缩不打架、可复盘 |
 | **可运维性** | 账本、ROI、回放 | 升 | 从“拍脑袋”到“可测量/可调参” |
 
 > 收益不是单点算法带来的，而是“索引可信 + 决策有预算 + 执行有反馈”这条链。单独拿出一个算法，收益通常有限；链断了，调参也救不回来。
@@ -810,7 +810,7 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 |---|---|---|
 | 引擎 KV events | vLLM-Ascend `enable_kv_cache_events`；`BlockStored/Removed` + `medium` | KVT 的 HBM/池 put 来源 |
 | master publisher | 代码有；CMake `ENABLE_KV_EVENTS` 默认 OFF，运行 `--enable_kv_events` 默认 false；copy 路径零发布 | 删除面需显式开启；预复制放置仍靠 kvcm 补发 |
-| admin 查询 | `GET /batch_query_keys` / `GetReplicaListForAdmin`（零副作用） | 反熵/核验可用，不污染 lease |
+| admin 查询 | `GET /batch_query_keys` / `GetReplicaListForAdmin`（零副作用） | KV 对账/核验可用，不污染 lease |
 | soft pin 空写 | **有条件可用**（PR73）：Case B、单 slice、key 存在、无盘副本；`exists` 持 lease；地址检查 | 会话保留可用；有边界 |
 | hard pin 事后设置 | **拒绝**（创建时固化） | 只能用 keepalive 做 lease 保护 |
 | keepalive | 注册/注销 + 周期 `renew_once`（有界） | 会话保留的基础 |
@@ -846,7 +846,7 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 | 阶段 | 目标 | 验收 |
 |---|---|---|
 | **P0 观测与索引** | 引擎事件 + kvcm READY + miss 反馈接入 KVT；hook 只 observe；L0 用 KVT 选路；决策日志 | KVT 合并/墓碑/置信度；L0 <5ms；不改变现有行为 |
-| **P1 命中与保留** | 会话表；keepalive/soft pin（条件可用）；预取预算；反熵抽样；账本归因 | 命中率、resume TTFT、预取 ROI、ghost 率 |
+| **P1 命中与保留** | 会话表；keepalive/soft pin（条件可用）；预取预算；KV 对账抽样；用量账本归因 | 命中率、resume TTFT、预取 ROI、ghost 率 |
 | **P2 容量与弹性** | L2 双环；warm gate；KV-aware victim；池扩缩；价格 | 扩容 Ready <10s 且 warm 达标；缩容零丢失；无振荡 |
 | **P3 服务化** | 会话 KV、预热服务、容量顾问、Drain、治理、回放 | 服务 SLA；ROI；容量预测误差；回放一致 |
 
