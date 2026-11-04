@@ -502,3 +502,55 @@ def test_register_failure_is_counted_and_logged(capsys) -> None:
     err = capsys.readouterr().err
     assert "keepalive register failed" in err, f"没打日志: {err!r}"
     assert "db gone" in err, f"日志没根因: {err!r}"
+
+
+def test_register_await_row_present_when_returns() -> None:
+    """register_await 返回时 keepalive 行已在账本里（消掉路上空窗）。"""
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            loop = KeepaliveLoop(FakeOps(), led, interval_s=999, window_s=600)
+            loop.start()
+            await loop.register_await(_P)
+            assert led.list_keepalive() == [_P]
+            assert loop.register_failures == 0
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+
+
+def test_register_await_failure_counted_not_raised(capsys) -> None:
+    """register_await 写失败：不抛、计数、打日志（预热侧仍可 READY）。"""
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            class BrokenLedger(type(led)):
+                def register_keepalive(self, prefix):
+                    raise RuntimeError("db gone")
+
+            broken = BrokenLedger.__new__(BrokenLedger)
+            broken.__dict__.update(led.__dict__)
+            loop = KeepaliveLoop(FakeOps(), broken, interval_s=999, window_s=600)
+            loop.start()
+            await loop.register_await(_P)  # 不抛
+            assert loop.register_failures >= 1
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+    err = capsys.readouterr().err
+    assert "keepalive register failed" in err
+    assert "db gone" in err

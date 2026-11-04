@@ -8,7 +8,7 @@
 2. `backend.rebuild()`：重启恢复 running 任务的跟踪登记，恢复的 handle
    交 TaskEngine.track 收编（只轮询到终态，不重跑流程）
 3. KeepaliveLoop 启动（协程定时器，固定窗口占位策略）；TaskEngine 就绪
-   （READY 后经 KeepaliveLoop.register 接线保活，并按目标实例补发
+   （READY 前经 KeepaliveLoop.register_await 落账保活，并按目标实例补发
    BlockStored；发送失败不改变 READY）
 4. IntentReceiver gRPC 服务（--listen，E12 协议见 proto/）启动
    —— gRPC 用普通版（自己的线程池接请求），servicer 只做「入队即返」，

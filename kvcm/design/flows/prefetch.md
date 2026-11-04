@@ -11,7 +11,7 @@
    计划第一条的目标段还放不放得下 → 放得下才逐 key 提交复制任务。等剩余
    的循环在 TaskEngine、前缀闸外面；进闸后再查一次，不够就回到闸外
 3. **query_task 轮询到 READY**：任务全部完成 + 副本核验通过
-4. **流程返回之后**（`TaskEngine._on_ready`，不在本流程里）：注册保活，并按目标实例补发一条 `BlockStored`。恢复跟踪在轮询前用 `target_of` 取目标，READY 后同样补发。没有端点或发送失败只记日志，预热仍成功
+4. **流程返回之后**（`TaskEngine._on_ready`，不在本流程里）：先 `await register_await` 等保活落账，再按目标实例补发一条 `BlockStored`；然后才把 intent 记成 READY。恢复跟踪在轮询前用 `target_of` 取目标，副本 READY 后同样等落账再补发。写入失败 / 没有端点 / 发送失败只记日志，预热仍成功
 
 ## 数据流
 

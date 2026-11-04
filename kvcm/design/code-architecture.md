@@ -78,7 +78,7 @@ flowchart TB
 ```
 
 - `IntentReceiver`、`InstanceWatcher` 只接收，箭头从进程外进来。`EventPublisher` 只发送，箭头从进程里出去。三者互不调用
-- **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`，再在闸外等目标段放得下，放得下才占一个前缀闸名额跑 `PrefetchFlow.run_after_exists`，终态才还。`copy` 里每个 key 另过进程级提交信号量，`create_copy_task` 返回即还。回执由调用方 `GetTask` 主动查。READY 且前缀闸已还之后，`TaskEngine._on_ready` 注册保活并补发一条 `BlockStored`；没有端点或发送失败只记日志。`SubmitIntent` 现在只有预热。move / pin / demote / promote / remove 没有 intent，当前不扩协议
+- **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`，再在闸外等目标段放得下，放得下才占一个前缀闸名额跑 `PrefetchFlow.run_after_exists`，终态才还。`copy` 里每个 key 另过进程级提交信号量，`create_copy_task` 返回即还。回执由调用方 `GetTask` 主动查。前缀闸已还之后、intent 记 READY 之前，`TaskEngine._on_ready` 先 `await register_await` 等保活落账，再补发一条 `BlockStored`；写入失败 / 没有端点 / 发送失败只记日志，不把预热打成 FAILED。`SubmitIntent` 现在只有预热。move / pin / demote / promote / remove 没有 intent，当前不扩协议
 - 已接通的驱动是 `PrefetchFlow` 调 `KvOps`——运行时这个对象就是 `MooncakeBackend`，不是中间再转一跳。它写 `Ledger`，账本落在圈外的 sqlite 文件上；`rebuild` 再把 running 行读回来
 - **实例拓扑的两条来路**：demo 环境没有注册通道，`RankTopology` 用探测法推断「哪个 rank 对应哪个 seg」（见 L4 节）；生产环境由实例启动时把自己的拓扑（TP 配置、rank 与 seg 对应表）经 `InstanceWatcher` 注册进来（D1 §3、E13）——两条来路汇成一个 `locate` 函数注入 backend
 - `StoreClient` 走 master 的 RPC `:50088`。`SegTopology` 自己会打 HTTP `:9003` 的 `/get_all_segments`（查存储池当前挂了哪些 seg）。`RankTopology` 用这份名单做 demo 探测，这条探测装配还没接进进程。现在的进程入口是 `InstanceDirectory`：daemon 用 `--instance-segs` 做初始登记，locate 只返回该实例的段
@@ -582,7 +582,7 @@ sequenceDiagram
   - promote 只打 N 次 GetReplicaList 触发；PromoteFlow 用 check_promote 轮询目标 memory replica。不拿 offload 端点对 seg 名。不过闸。
   - D2 §3 的另一条主动路径（读删写，数据经 kvcm）若启用，属 kvcm 发起的传输，要占闸。
 - **重启恢复不占闸（已知窗口）**：`TaskEngine._track` 只轮询 `rebuild` 捞回的 handle，不 acquire 传输闸。重启后旧前缀全部仍在 master 上搬，新预热仍可占满名额。接受这个叠加——让恢复任务去等闸，轮询会被串行化。轮询前用 `target_of` 取出目标实例，READY 后与正常路径一样补发
-- **READY 补发（E14，闸外）**：正常路径在前缀闸释放之后，`_on_ready` 注册保活并按目标实例补一条 `BlockStored`。没有端点或发送抛错只记日志，已经 READY 的预热仍成功，保活照常登记。发布器按实例懒绑定，只在 `TaskEngine.shutdown`（进程退出）时关，不跟实例下线
+- **READY 补发（E14，闸外）**：正常路径在前缀闸释放之后、intent READY 之前，`_on_ready` 先等保活落账（`register_await`），再按目标实例补一条 `BlockStored`。写入失败 / 没有端点 / 发送抛错只记日志，预热仍成功。发布器按实例懒绑定，只在 `TaskEngine.shutdown`（进程退出）时关，不跟实例下线
 - **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
 - **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；`session_end` 类可延迟任务排队无妨
 - **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。窗口上限来自两次分开的真机实验，不是一件事（[../demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md) #16、#17）。10 月 26 日单机（#16）：连不上是 `TRANSFER_FAIL`；窗口 4 节奏化 42/42 全成。10 月 29 日跨机（#17）：主错误是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），master 留内存失败；14 条全成，42 条大约一半失败。这次实验的错误是 master 留内存失败；段剩余预检对得上这个错误类型；它不代替 E15；实验当时也没跑这条预检。#16 的 `TRANSFER_FAIL` 与 #17 不是同一种失败。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过实测打爆的点。网卡利用率限速（网卡计数器采样）仍归 E15，仍不做，接在同一层信号量上

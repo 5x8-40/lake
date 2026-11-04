@@ -517,8 +517,10 @@ class TaskEngine:
                 "则 effective 空间 key 全 miss）"
             )
         await self._wait_then_run(prefix, target, poll_s, timeout_s)
-        # READY 接线：副本已核验到位 → 注册保活，并按目标实例补发
-        self._on_ready(prefix, target)
+        # READY 接线：副本已核验到位 → 等保活落账，再按目标实例补发。
+        # 调用方之后才 _finish(READY)，所以 GetTask 看到 READY 时名单
+        # 要么已写入，要么已确定写失败（仍不把预热打成 FAILED）。
+        await self._on_ready(prefix, target)
 
     async def _wait_then_run(
         self,
@@ -640,21 +642,28 @@ class TaskEngine:
                 # READY 接线（恢复侧）：重启前没来得及注册的保活、没发出的
                 # BlockStored 在这里补上。target 必须在轮询前取好。
                 if status is TaskStatus.READY:
-                    self._on_ready(prefix, target)
+                    await self._on_ready(prefix, target)
                 return
             if loop.time() >= deadline:
                 await self._ops.abandon(handle)  # 超时收口（与流程同语义）
                 return
             await asyncio.sleep(poll_s)
 
-    def _on_ready(self, prefix: Prefix | None, target: InstanceId | None) -> None:
-        """第一次看到 READY：注册保活，并按目标实例补发一条 BlockStored。
+    async def _on_ready(
+        self, prefix: Prefix | None, target: InstanceId | None
+    ) -> None:
+        """第一次看到副本 READY：等保活落账，再补发一条 BlockStored。
 
-        正常路径与恢复路径共用这一跃迁。没有端点、或补发抛错，都不把
-        已经核验通过的预热打成失败——保活照常注册，异常只记日志。
+        正常路径与恢复路径共用。保活用 ``register_await``：写完（或
+        写失败已记账）之后才返回，这样 intent 的 READY 不会早于名单
+        落盘尝试。写入失败 / 补发失败都不把预热打成 FAILED。
         """
         if prefix is not None and self._keepalive is not None:
-            self._keepalive.register(prefix)
+            await_reg = getattr(self._keepalive, "register_await", None)
+            if await_reg is not None:
+                await await_reg(prefix)
+            else:
+                self._keepalive.register(prefix)
         if self._events is None or prefix is None or target is None:
             return
         try:

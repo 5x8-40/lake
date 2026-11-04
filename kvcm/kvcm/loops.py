@@ -68,16 +68,26 @@ class KeepaliveLoop:
     # ------------------------------------------------------------------
 
     def register(self, prefix: Prefix) -> None:
-        """登记保活。
+        """登记保活（不等待写入结束）。
 
-        调用场景：TaskEngine 在副本 READY 后注册。终态后再提交会再次
-        注册。行已存在时保留原来的 ``registered_at``，不把窗口拨回现在。
+        生产路径请用 ``register_await``：TaskEngine 在对外 READY 前要
+        等名单落盘。本方法留给测试和不在事件循环里的调用方。
 
-        **不抛异常**：保活失败只意味着副本可能提前变冷，不是预热失败。
-        这里吞掉并计数（`register_failures`），避免把已经 READY 的 intent
-        误记成 FAILED。
+        行已存在时保留原来的 ``registered_at``，不把窗口拨回现在。
+        **不抛异常**：失败只计数，避免把已经成功的预热打成 FAILED。
         """
         self._submit_ledger(self._ledger.register_keepalive, prefix)
+
+    async def register_await(self, prefix: Prefix) -> None:
+        """登记保活，并等到写入结束。
+
+        消掉「intent 已 READY、保活行还在路上」的空窗。写入失败不抛：
+        只计数 / 打日志——预热仍算成功，副本可能提前变冷。
+        """
+        try:
+            await self._ledger_call(self._ledger.register_keepalive, prefix)
+        except Exception as e:
+            self._note_failure(e)
 
     def unregister(self, prefix: Prefix) -> None:
         self._submit_ledger(self._ledger.unregister_keepalive, prefix)

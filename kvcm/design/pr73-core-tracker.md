@@ -102,10 +102,11 @@
 
 ### 1. 重启 / 保活
 
-- **A03 保活注册 fire-and-forget（OPEN）**
-  - `TaskEngine` READY 后调 `KeepaliveLoop.register`；`_submit_ledger` 不等待。
-  - READY 可能先于 keepalive 行落盘；副本可能提前变冷。
-  - 方向：接受并写明，或 READY 前 await 落账。
+- **A03 保活注册（已修）**
+  - `TaskEngine._on_ready` 改 `await KeepaliveLoop.register_await`：对外
+    `_finish(READY)` 之前先等名单写入结束。
+  - 写入失败仍不抛、只计数——预热成功，副本可能提前变冷（语义保留）。
+  - 消掉的是「READY 已可见、行还在路上」的空窗，不是写失败本身。
 - **R16 保活量未算（OPEN）**
   - `KeepaliveLoop.sweep_once` 每 5s 逐前缀 `renew_once`（全 key `batch_is_exist`）。
   - 请求量/延迟未测量；长前缀可能拖慢 sweep。
@@ -147,7 +148,7 @@
 
 1. **core 基线**：自测全绿；`move` / `remove` / keepalive / prefetch / admin 核验可用。
 2. **admin**：R06 / R18 写进文档或后续修。
-3. **保活**：A03 / R16 写进文档或后续修。
+3. **保活**：A03 已修（await 落账）；R16 写进文档或后续修。
 4. **跨 PR**：A06 / A16 / A17 继续 DEFER；PR2/PR3 的 tracker 各自记录。
 
 ## 合入前删除清单
@@ -160,3 +161,4 @@
 ## 维护日志
 
 - **2026-11-04**：从全量 PR73 tracker 拆出 core 部分；A01/A07/A08 已关闭；demote/promote 与 soft pin 移到后续 stacked PR。
+- **2026-11-04**：A03 关闭：`register_await` + `_on_ready` await；写失败仍不改判预热失败。

@@ -88,6 +88,9 @@ class FakeKeepalive:
     def register(self, prefix: Prefix) -> None:
         self.registered.append(prefix)
 
+    async def register_await(self, prefix: Prefix) -> None:
+        self.registered.append(prefix)
+
 
 def _engine(ops, **kw) -> TaskEngine:
     return TaskEngine(ops, **kw)
@@ -113,6 +116,28 @@ def test_run_once_ready_registers_keepalive() -> None:
     eng = _engine(FakeOps(seq=[TaskStatus.READY]), keepalive=ka)
     run(eng.run_once(_P, _T, poll_s=0.01))
     assert ka.registered == [_P]  # READY 接线：保活注册
+
+
+def test_run_once_ready_despite_keepalive_write_failure() -> None:
+    """保活落账失败不把预热打成失败（A03 方案 2）。
+
+    生产路径由 KeepaliveLoop.register_await 吞异常；这里用「计数但不抛、
+    不落名单」的假实现，确认 run_once 仍成功。
+    """
+
+    class SoftFailKeepalive(FakeKeepalive):
+        def __init__(self) -> None:
+            super().__init__()
+            self.failures = 0
+
+        async def register_await(self, prefix: Prefix) -> None:
+            self.failures += 1
+
+    ka = SoftFailKeepalive()
+    eng = _engine(FakeOps(seq=[TaskStatus.READY]), keepalive=ka)
+    run(eng.run_once(_P, _T, poll_s=0.01))
+    assert ka.failures == 1
+    assert ka.registered == []
 
 
 def test_run_once_failure_does_not_register() -> None:
