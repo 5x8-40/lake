@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import logging
+import sqlite3
+
 import pytest
 
 from conftest import run
@@ -61,10 +64,13 @@ class FakeOps(KvOps):
     async def move(self, prefix, target, source=None):
         raise NotImplementedError
 
-    async def keepalive(self, prefix):
+    async def register_keepalive(self, prefix):
         raise NotImplementedError
 
-    async def stop_keepalive(self, prefix):
+    async def unregister_keepalive(self, prefix):
+        raise NotImplementedError
+
+    async def renew_once(self, prefix):
         raise NotImplementedError
 
     async def pin(self, prefix, kind: PinKind = PinKind.SOFT):
@@ -74,6 +80,9 @@ class FakeOps(KvOps):
         raise NotImplementedError
 
     async def promote(self, prefix, target):
+        raise NotImplementedError
+
+    async def check_promote(self, prefix, target):
         raise NotImplementedError
 
     async def retain(self, prefix):
@@ -97,12 +106,25 @@ def test_exists_false_fails_before_copy() -> None:
 
 
 def test_submit_error_wrapped_as_prefetch_error() -> None:
-    """copy 提交失败（SubmitError 带明细）统一出口为 PrefetchError。"""
-    ops = FakeOps(
-        exists=True, seq=[], copy_error=SubmitError("1/2 tasks submitted: [(1, 101)]")
+    """copy 提交失败（SubmitError 带明细）统一出口为 PrefetchError。
+
+    已经落账的句柄先 abandon。账本写失败不盖掉原来的提交失败。
+    """
+    handle = TaskHandle(op=OpKind.COPY, task_ids=((1, 101),))
+
+    class Ops(FakeOps):
+        async def abandon(self, handle):
+            self.calls.append("abandon")
+            raise sqlite3.Error("ledger write failed")
+
+    ops = Ops(
+        exists=True,
+        seq=[],
+        copy_error=SubmitError("1/2 tasks submitted: [(1, 101)]", handle=handle),
     )
     with pytest.raises(PrefetchError, match=r"copy submit failed.*\(1, 101\)"):
         run(PrefetchFlow(ops).run(_P, _T, poll_s=0))
+    assert "abandon" in ops.calls
 
 
 _PARTIAL = TaskHandle(op=OpKind.COPY, task_ids=((1, 101),))
@@ -189,6 +211,29 @@ def test_query_error_retries_then_ready() -> None:
     ops = FakeOps(exists=True, seq=[QueryError("rpc boom"), TaskStatus.READY])
     run(PrefetchFlow(ops).run(_P, _T, poll_s=0))
     assert ops.calls.count("query_task") == 2
+
+
+def test_query_error_logs_key_once(caplog) -> None:
+    """查询失败要留日志，坏 key 信息不能只在超时里丢。"""
+    ops = FakeOps(
+        exists=True,
+        seq=[QueryError("key-237 has no transport_endpoint_"), TaskStatus.READY],
+    )
+    with caplog.at_level(logging.WARNING):
+        run(PrefetchFlow(ops).run(_P, _T, poll_s=0))
+    assert "key-237 has no transport_endpoint_" in caplog.text
+    assert caplog.text.count("query_task failed") == 1
+
+
+def test_timeout_includes_last_query_error(caplog) -> None:
+    ops = FakeOps(
+        exists=True,
+        seq=[QueryError("key-237 has no transport_endpoint_")],
+    )
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(PrefetchError, match="key-237"):
+            run(PrefetchFlow(ops).run(_P, _T, poll_s=0, timeout_s=0.01))
+    assert "query_task failed" in caplog.text
 
 
 def test_programming_error_propagates_not_swallowed() -> None:

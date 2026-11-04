@@ -6,8 +6,10 @@ __pycache__/
 .eggs/
 build/
 dist/
-.venv/
+.venv
 venv/
+kvcm/kvcm/native/_empty_pin*.so
+kvcm/kvcm/native/third_party/
 env/
 .python-version
 
