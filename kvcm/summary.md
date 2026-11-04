@@ -229,7 +229,7 @@
 - 目标形态：KVT（多源 KV 索引树）+ HookEnvelope + L0/L1/L2 三环，联合决策“请求去哪、KV 怎么动、集群扩不扩”。
 - 原则：hint ≠ command；KV 动作只走 intent；请求不等 READY；不设固定降级链；索引是派生视图；预算先行；决策与执行分离。
 - **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是十毫秒级跨机传输；HBM 命中只省毫秒级本地拷贝。预取单独做往往只值十毫秒级，必须和保留/防驱逐一起做。
-- **版本基线 v0.3.13.post1**：publisher 代码有但构建默认 OFF、运行默认 false、copy 路径零发布；soft pin 空写有条件可用（PR73），hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入 PR72；E15 带宽限速未做。
+- **版本基线 v0.3.13.post1**：publisher 代码有但构建默认 OFF、运行默认 false、copy 路径零发布；soft pin 空写有条件可用（PR73），hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入已合入（#72）；E15 带宽限速未做。
 - 工作文档：[D8-joint-scheduling.md](design/D8-joint-scheduling.md)；算法：[D8a-scheduling-algorithms.md](design/D8a-scheduling-algorithms.md)；时序配套：[scheduling.md](design/scheduling.md)。
 - 待定：publisher 是否开启、hook 通道与信任、扩缩 actuator、多 SC 实例 leader、权重/阈值真机校准。
 

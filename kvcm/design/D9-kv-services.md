@@ -378,10 +378,10 @@ flowchart LR
 | retain | 未实现；move 到活 seg / kvcm 自挂 SSD 是登记手段 | 跨引擎存亡还不能完全兜 |
 | copy/move 取消 | 无 | 预取改道只能 abandon + 事后清理 |
 | publisher | v0.3.13.post1 有代码，但构建默认 OFF、运行默认 false；copy 路径零发布 | 删除面靠 TTL/miss/核验，或显式开启 |
-| kvcm 补发 | `feat/kvcm-e14-publish` 已实现 READY 后按实例端点发 `BlockStored`；未合入 main | 预热 READY 可回写 KVT |
+| kvcm 补发 | 已合入 main（#71）：READY 后按实例端点发 `BlockStored` | 预热 READY 可回写 KVT |
 | admin 查询 | `GET /batch_query_keys` / `GetReplicaListForAdmin` 零副作用 | KV 对账/核验可用 |
 | 实例注册 | E13 设计已定；代码归 E13 | 端点/seg 映射仍靠启动参数 |
-| 段容量准入 | PR72：提交前查目标段剩余 | 预取可能因段满失败 |
+| 段容量准入 | 已合入 main（#72）：提交前查目标段剩余 | 预取可能因段满失败 |
 | 带宽限速（E15） | 未做 | 预取/迁移要预算 |
 
 **升级陷阱**：0.3.14/main 有 `has_read_lease` 门槛；有租约且全内存时同尺寸走 Case C，当前空写不可用。升级时必须重新评估 soft pin。

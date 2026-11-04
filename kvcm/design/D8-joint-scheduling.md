@@ -109,10 +109,10 @@ flowchart TB
 | 能力 | 现状 | 对 D8 的影响 |
 |---|---|---|
 | E10/E11/E12 | 已合入 main：五层重构、常驻进程、gRPC intent（仅预热） | L0/L1 可以先接 intent；其他操作还没有 intent |
-| E14 补发 | `feat/kvcm-e14-publish` 已实现真机补发：READY 后按实例端点发 `BlockStored`（`medium=CPU`、`full_attention`、低 64 位 hash） | KVT 的“预复制放置”有来源；move/remove 事件仍未接 |
+| E14 补发 | 已合入 main（#71）：READY 后按实例端点发 `BlockStored`（`medium=CPU`、`full_attention`、低 64 位 hash） | KVT 的“预复制放置”有来源；move/remove 事件仍未接 |
 | soft pin | `feat/kvcm-ops-mainline`（PR73）：空写 **有条件可用**；hard pin 拒绝 | 会话保留可以先用 soft pin；有前置条件 |
 | 实例注册 | E13 设计已定：实例 id、rank 有序段、端点、DP、kind 一次交全；代码归 E13 | 端点/seg 映射仍靠启动参数；生产要多一次注册 |
-| 段容量准入 | PR72：提交前查目标段剩余；不够不发 | 预取会因段满失败；L1 要有退避 |
+| 段容量准入 | 已合入 main（#72）：提交前查目标段剩余；不够不发 | 预取会因段满失败；L1 要有退避 |
 | E15 带宽限速 | 未做：只有并发窗口，没有网卡利用率感知 | 预取/迁移会争带宽；L1 要预算 |
 | retain | 未实现：没有 `AddReplicaForRetainedClient`；可登记 move 到活 seg / kvcm 自挂 SSD | 会话跨实例存亡还不能完全兜住 |
 | publisher | v0.3.13.post1 有代码，但构建默认 OFF、运行默认 false；copy 路径零发布 | 删除面要么开启 publisher，要么靠 TTL/miss/核验 |
@@ -824,7 +824,7 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 | retain | 未实现；无 `AddReplicaForRetainedClient`；可登记 move 到活 seg / kvcm 自挂 SSD | 跨引擎存亡还不能完全兜 |
 | copy/move 取消 | 无 | 预取改道只能 abandon + 事后清理 |
 | 实例注册 | E13 设计已定；代码归 E13 | 端点/seg 映射仍靠启动参数 |
-| 段容量准入 | PR72：提交前查目标段剩余 | 预取可能因段满失败 |
+| 段容量准入 | 已合入 main（#72）：提交前查目标段剩余 | 预取可能因段满失败 |
 | 带宽限速（E15） | 未做；只有并发窗口 | 预取/迁移要预算 |
 
 ### 9.2 0.3.13.post1 的 soft pin 边界
@@ -835,13 +835,16 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 - **取消**：`SoftPinAction::DISABLE`；或用 keepalive + lease，不依赖空写。
 - **升级陷阱**：0.3.14/main 有 `has_read_lease` 门槛；有租约且全内存时同尺寸也会走 Case C，当前空写不可用。升级时必须重新评估，不能默认沿用。
 
-### 9.3 分支现状（截至 2026-11-04）
+### 9.3 合入状态（截至 2026-11-04，rebase 到 main 后）
 
-- `feat/kvcm-ops-mainline`（PR73）：soft pin 空写、hard pin 拒绝、keepalive 拆分、demote/promote/remove 语义、admin 核验；**未合入 main**。
-- `feat/kvcm-e14-publish`：READY 后按实例端点补发 `BlockStored`，真机验证；move/remove 事件未接；**未合入 main**。
-- `feat/kvcm-segment-admission`（PR72）：段容量准入；**未合入 main**。
-- E13（InstanceWatcher）、E15（带宽限速）、retain：未做。
-- 设计以 `summary.md` / `D1` / `D2` 的最新合入状态为准；本文不把分支能力当成已合入。
+- **已合入 main**：
+  - #71：READY 后按实例端点补发 `BlockStored`（`medium=CPU`、`full_attention`、低 64 位 hash）。
+  - #72：段容量准入（提交前查目标段剩余；不够不发）。
+  - #74：retain 的三种做法重写（设计；实现仍未接）。
+- **未合入 main**：
+  - `feat/kvcm-ops-mainline`（PR73）：soft pin 空写、hard pin 拒绝、keepalive 拆分、demote/promote/remove 语义、admin 核验。
+- **仍未做**：E13（InstanceWatcher 代码）、E15（带宽限速）、retain 实现。
+- 设计以 `summary.md` / `D1` / `D2` 的最新合入状态为准；本文不把未合入能力当成已具备。
 
 ---
 
