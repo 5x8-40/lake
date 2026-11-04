@@ -2,7 +2,7 @@
 
 - 状态: **设计草案**（目标形态与收益模型；数值为模型估算，待真机校准）
 - 版本基线: **Mooncake v0.3.13.post1**（master / client 同版本）；vLLM-Ascend 0.26 系（kvcm D1 的事实基线）
-- 归属: **kvcm 的管理面（Management Plane）**。kvcm 当前只有控制面（KV 执行/核验/记账/发布），管理面负责调度；SC 是管理面的逻辑角色，可独立部署，也可嵌入 Router/控制面内置
+- 归属: **kvcm 的管理面（Management Plane）**——与**控制面**（KV 执行/核验/记账/发布）同属 kvcm 体系，职责不同。像 K8s 的 kube-controller-manager 与 kube-scheduler：两个进程，一套控制面体系。SC 是管理面的逻辑角色，**部署形态可选**（独立进程 / 嵌入 Router / 与控制面同进程），不影响归属
 - 控制面/管理面: [D1](D1-router-scheduling.md) / [D2](D2-kv-operations.md) / [D9](D9-kv-services.md) 是**控制面**（KV 操作与服务）；本文是**管理面**（请求 × KV × 扩缩的调度）
 - 时序: [D8b-scheduling-sequences.md](D8b-scheduling-sequences.md)（L0/L1/L2 的全部时序图与场景）
 - 算法: [D8a-scheduling-algorithms.md](D8a-scheduling-algorithms.md)（公式、图、收益模型）

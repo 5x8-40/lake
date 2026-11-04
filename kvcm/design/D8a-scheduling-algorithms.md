@@ -504,6 +504,8 @@ ROI = saved / cost
 
 ### 8.3 算法 → 指标 → 收益
 
+> 这一节只回答「用哪个指标衡量」。**每个算法解决什么失效模式、边界在哪，见 §8.6。**
+
 | 算法 | 主要指标 | 收益怎么来 |
 |---|---|---|
 | KVT/前缀匹配 | 命中率、选路延迟 | 零 RPC 查命中；避免中段空洞误判 |
@@ -527,6 +529,72 @@ ROI = saved / cost
 - HBM 压力：pin 太多会挤掉其他前缀，全局命中率可能下降；
 - hook 不准：预取到错前缀/错实例，ROI 为负；
 - 参数未校准：权重/阈值/价格只是起点，必须真机校准。
+
+---
+
+### 8.5 要观测的收益指标
+
+| 指标 | 回答 |
+|---|---|
+| `hit_rate`（pool/local/HBM 分层） | 命中率是否提升 |
+| `prefill_saved_tokens` | 省了多少重算 |
+| `transfer_saved_bytes` | 省了多少跨机传输 |
+| `prefetch_hit_rate` / `waste_bytes` | 预取是否值 |
+| `retention_hit_rate` / `wasted_retention` | 保留是否值 |
+| `TTFT_p99` / `ITL_p99` | 用户感知 |
+| `gpu_seconds_saved` / `cost_per_1k_tokens` | 成本 |
+| `scale_ready_latency` / `warm_coverage` | 弹性 |
+| `ghost_ratio` / `verify_miss_rate` | 索引可信度 |
+
+---
+
+### 8.6 算法与技术清单
+
+每个算法都对应一个具体失效模式，不是“技术堆砌”：
+
+| 技术/算法 | 解决什么 | 怎么用 | 主要收益 | 边界/风险 |
+|---|---|---|---|---|
+| **事件溯源 + 物化视图** | 全局 KV 位置不可每请求查 master | 引擎事件/kvcm READY/池事件 → KVT；查询走内存 | 选路零 RPC、低延迟 | 最终一致，需要墓碑/对账 |
+| **链式 block hash + 前缀链匹配** | 前缀复用要精确到块 | 按引擎 hash 链逐块查 KVT，取连续命中 | 命中长度准确；支持 TP/DP 去重 | hash 口径必须与引擎逐字节一致 |
+| **推测索引 + TTL** | 请求已路由、引擎事件还没到 | 路由后写短 TTL 推测条目，只做亲和 | 降低批内竞态导致的假 miss | 不能作为 HBM 命中证据 |
+| **多源合并：source rank + seq + 墓碑** | 引擎/池/kvcm 事件互相覆盖 | 每源独立序号；负事实优先；墓碑防复活 | 多源不打架；删除可收敛 | 源 gap 时要 replay/snapshot |
+| **gap 检测 + replay** | 事件丢失/乱序 | 跳号重放；不可用则 snapshot；再不行标 stale | 索引可恢复 | replay buffer 有界 |
+| **效用打分/成本模型** | 多目标（命中/传输/队列/SLO） | 分层权重 + TTFT 估算 + SLO 惩罚 | 选路可解释、可调 | 权重需真机校准 |
+| **传 vs 算阈值 `BW*`** | 远端命中是否值得传 | `BW* = B·c_bw/(residual·c_prefill)` | 避免“为了省重算反而更慢” | 带宽要有效测量 |
+| **预取 EV + 预算背包** | 预取可能白做 | Poisson 到达估 `P_use`；按 `EV/bytes` 贪心 | 预取 ROI 可控；带宽不被打爆 | ETA/复用率是估计 |
+| **保留 TTL 盈亏平衡** | 保留太久浪费内存 | `p_resume(T)·S` vs 占用成本；指数衰减求 break-even | 会话保留可量化 | 恢复概率难估 |
+| **Little 定律 + 利用率目标** | 扩缩只看队列会滞后 | `L=λW`、`ρ=λ/(cμ)`、`c_min` | 容量有公式、可解释 | 突发/长尾需快环 |
+| **双环控制 + 滞回/冷却** | 扩缩振荡 | 慢环定下限、快环 ±1；cooldown > ready+warm+drain | 少抖动、少反复扩缩 | 参数需调 |
+| **warm gate coverage** | 新节点没 KV 就接流量 | 加权 confirmed 比例；未达标低权重 | 减少冷 miss | 会延迟新节点接流 |
+| **KV-aware victim** | LIFO 缩掉热节点 | `loss/gain` 比较 unique hot KV、会话风险、迁移成本 | 缩容不砸命中率 | 需要 KVT/会话视图 |
+| **影子价格/对偶分解** | 三环各自为政 | L2 出价格，L0/L1 局部最优 | 联合但不做全局在线优化 | 价格更新需稳定 |
+| **leader lease + 幂等** | 多 SC 实例同时扩缩 | etcd lease 选主；intent 幂等键 | 不打架、可重试 | leader 故障有短暂停 |
+| **决策日志/回放** | 事故无法复盘、参数不敢调 | 记录输入/候选/价格/选择/版本 | 可解释、可 A/B、可回放 | 日志成本 |
+
+**技术栈（与算法分开看）**：
+
+| 层 | 技术 | 用途 |
+|---|---|---|
+| 事件 | ZMQ（引擎 KV events / Mooncake publisher） | 高频、best-effort 的位置/删除事件 |
+| 决策接口 | gRPC | SC ↔ kvcm intent、READY/失败回执 |
+| 池操作 | Mooncake master RPC / HTTP admin | copy/move/lease/核验 |
+| 状态 | sqlite（kvcm ledger）/ 进程内 KVT | 会话/任务/副本；索引 |
+| 编排 | K8s HPA/KEDA/WVA 或自研 connector | 真实 provision |
+| 观测 | Prometheus/结构化日志/决策日志 | 命中、ROI、延迟、回放 |
+
+### 8.7 收益汇总
+
+| 指标 | 主要来源 | 预期方向 | 说明 |
+|---|---|---|---|
+| **TTFT** | 命中/保留、预取、HBM 命中 | 降 | 命中省秒级 prefill；本地放置省十毫秒级传输 |
+| **命中率** | KVT 选路、保留、预取、warm gate | 升 | 分层统计：HBM / 本机 DRAM / 远端池 |
+| **吞吐/GPU 效率** | 少重算、扩缩、batch 填满 | 升 | 命中率 +10% 可能等价于多张卡的 prefill 产能 |
+| **成本** | 少 GPU 时间、带宽预算、pin 预算 | 降 | 用带宽/内存换 GPU 时间通常合算 |
+| **弹性** | 双环、warm gate、KV-aware victim | 快/稳 | 扩容 Ready 更快、缩容不丢热 KV |
+| **风险** | KV 对账、leader、幂等、决策日志 | 降 | ghost 少、扩缩不打架、可复盘 |
+| **可运维性** | 账本、ROI、回放 | 升 | 从“拍脑袋”到“可测量/可调参” |
+
+> 收益不是单点算法带来的，而是“索引可信 + 决策有预算 + 执行有反馈”这条链。单独拿出一个算法，收益通常有限；链断了，调参也救不回来。
 
 ---
 
