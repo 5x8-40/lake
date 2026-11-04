@@ -218,6 +218,12 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - kvcm 的空写是单独的 `_empty_pin.so`。它只链已安装 wheel 里的 `store.so`（`mooncake-transfer-engine==0.3.13.post1`）。这个 wheel 不带 C++ 头文件。扩展用本地 `kvcm/kvcm/native/mooncake_pin_api.h` 声明要用的类型，调用 `client->master_client_.UpsertStart` / `UpsertEnd`，成员地址由编译器计算。链接这一步读的是 `store.so` 的导出符号，不读 mooncake 的头文件
   - `get_real_client()` 是退路，不是当前实现。只有以后真实的 `UpsertStart` 调用失败，才改为包含 `pyclient.h`，在 Python 对象还原成 `MooncakeStorePyWrapper` 之后用 `get_real_client()` 取出已建 client。拿到对象之后，这个函数只是返回成员。现在不走这条，也不把 pybind 跨模块转换写进当前扩展
   - `MasterClient::UpsertStart` 发出的是这个 client 自己的 UUID。当前路径是方案一：空写会把 key 的 client_id 写成 kvcm 的 UUID。借名（方案二）这条 API 做不到，不是当前路径（§2）
+- **F12b 空写的前提与升级陷阱**（落地时必须对照）
+  - **版本前提**：v0.3.13.post1 使用 `SoftPinAction` 三态，**没有** `has_read_lease` 门槛；Case B 只看尺寸
+  - **安全前提**：Case B（同尺寸、单 slice、key 存在、无盘副本）；`put_step=1`；soft pin 前 `exists` 持 lease
+  - **不保证**：Case C-by-size / Case A、Start/End 中途崩溃、读者短暂不可读、`client_id` 改写、30min 不续期、并发重写
+  - **取消**：`SoftPinAction::DISABLE`；或用 keepalive + lease，不依赖空写
+  - **升级陷阱**：0.3.14-pre / main 有 `has_read_lease` 门槛——**有租约且全内存时，同尺寸也会走 Case C**，当前的空写路径不可用。升级 mooncake 时必须重新评估 soft pin 方案，不能默认沿用
 
 ### F13 main 相对 0.3.11 的能力增量（按「对 kvcm 有什么用」分六组；各处引用统一指向本条）
 

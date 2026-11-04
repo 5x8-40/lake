@@ -2,8 +2,9 @@
 
 - 状态: **设计草案**（算法与公式；数值为模型估算，待真机校准）
 - 版本基线: **Mooncake v0.3.13.post1**（master / client 同版本）
-- 上游: [D8-joint-scheduling.md](D8-joint-scheduling.md) 管理面；[D2-kv-operations.md](D2-kv-operations.md) 控制面操作
-- 时序: [D8b-scheduling-sequences.md](D8b-scheduling-sequences.md)（D8 的全部时序图）
+- 上游: [D8](D8-joint-scheduling.md)（管理面形态与边界——本文的每个算法对应它某一节的决策）；[D2](D2-kv-operations.md)（控制面操作语义）
+- 时序: [D8b](D8b-scheduling-sequences.md)（算法跑起来长什么样）
+- 下游: 规划引用 [D10](D10-kv-fabric-roadmap.md)；运营侧对应 [D9](D9-kv-services.md)
 - 定位: D8 的**算法全集**——所有公式、推导、参数与收益账都在这里；D8 正文只保留定性结论
 - 非目标: 不写代码结构；不重复 D8 的架构/边界，只讲算法本身和收益怎么来
 

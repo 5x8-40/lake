@@ -23,7 +23,7 @@
 1. **终局不是“再加一个控制面进程”，而是给 kvcm 补管理面（调度中心 SC）**：SC 可以是独立组件，也可以嵌入 Router；逻辑上是一个共享状态 + 三条时间尺度不同的决策环，把“请求去哪、KV 怎么动、集群扩不扩”放进同一套目标与预算。
 2. **索引是事件派生的决策视图，不是第二权威**：引擎 KV events、kvcm READY、Mooncake publisher、SC 推测条目、worker miss 反馈，合成一棵 KVT；Mooncake master 仍是副本权威。
 3. **最大的性能杠杆是“命中/保留”，不是 HBM 命中后的本地拷贝优化**：命中省掉的是秒级 prefill；本地放置省掉的是十毫秒级跨机传输；HBM 命中再省掉毫秒级本地拷贝。三者的量级差一个数量级以上，调度优先级必须按这个顺序设计。
-4. **kvcm 控制面的定位是“KV 执行 + 核验 + 记账 + 发布”**：不做选路、不做扩缩决策、不持有前缀索引；这些归管理面（D8）。控制面为会话/预热提供执行接口；KV 对账、用量账本、容量建议、下线搬迁、保留规则等独立运营能力见 D9。
+4. **两个平面的分工**（同属 kvcm 体系）：**控制面**做“KV 执行 + 核验 + 记账 + 发布”，不做选路、不做扩缩、不持有前缀索引；**管理面**（本文）做选路、会话保留、KV 放置、扩缩。控制面为管理面提供执行接口；KV 对账、用量账本、容量建议、下线搬迁、保留规则等运营能力见 D9。
 5. **设计必须按当前能力写，不能按 main 写**：soft pin 事后加有条件、hard pin 不能事后加、copy/move 无取消、retain 未实现、池 publisher 默认关。具体边界见 §9。
 
 ---
@@ -323,23 +323,7 @@ sequenceDiagram
 
 ### 5.1 L0 请求环（<5ms）
 
-```mermaid
-flowchart TB
-    S["请求 + Hook"] --> P["前缀 hash"]
-    P --> M["KVT.Match 逐候选"]
-    M --> D{"连续 HBM 命中够?<br/>置信度够?"}
-    D -->|"是"| DD["HBM 命中<br/>跳池加载 + 残差 prefill"]
-    D -->|"否"| T{"Pool 命中 + 带宽够?"}
-    T -->|"是"| PD["PD / 本地读"]
-    T -->|"否"| CO["COLOCATED"]
-    DD --> SEL["打分/约束/选择"]
-    PD --> SEL
-    CO --> SEL
-    SEL --> O["下发 + Speculative"]
-    SEL --> I["异步 KVIntent"]
-```
-
-打分、TTFT 估算、传 vs 算阈值（`BW*`）的公式见 [D8a §3](D8a-scheduling-algorithms.md)。
+分支流程（HBM 命中 / PD / 混部）见 [D8b §2](D8b-scheduling-sequences.md)；打分、TTFT 估算、传 vs 算阈值（`BW*`）的公式见 [D8a §3](D8a-scheduling-algorithms.md)。
 
 约束：
 
