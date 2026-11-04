@@ -38,12 +38,86 @@
 - A07：`rebuild` 跳过 task 行数 != 全量 plan 的 partial handle；在途任务重启后不跟踪，由下一次 `exists` / 预热重判。
 - A08 源码审计：当前 StoreClient RPC 路径只读共享 client；master RPC 走 `RpcClientPool`（`send_request` 线程安全）+ `hot_cache` 自有锁；未加全局锁。真机并发压测归 A14。
 
+## 评审摘要（Step 1–6 压缩版）
+
+> 只留判断、证据和结论；完整过程在 backup 分支 `backup/pr73-pre-rebase-20261104`（提交 `9661169`）和 git 历史里。
+
+### 评审基线（Step 1）
+
+- 分层：L2 只调 L3；L3 不出现 seg / lease / client_id / PoolKey / rank。
+- 八项操作：copy / move / keepalive / pin / demote / promote / retain / remove；READY 只给 copy / move / promote，retain 跟做法走。
+- Ledger 四表（tasks / keepalive / replicas / sessions）；rebuild 恢复 copy / move；keepalive 注册表不可丢。
+- E11：单事件循环 + 协程 + RPC executor + Ledger 单线程；E12：SubmitIntent / GetTask。
+- E13 / E14 / E15 未做；ReleaseLoop / RetainLoop 骨架；限速器只留接口。
+
+### 设计改动（Step 2）
+
+- **事实修正**：retained client 在 `1fc27b6` 不存在；`/batch_query_keys` 主线零副作用；promote 不能用 offload 端点对 seg 名；官方绑定没有空写 start/end；demote 查盘改走 admin；0.3.11 soft pin 通道 NO。
+- **语义变更**：`pin(HARD)` 拒绝；demote 统一“停保活 → 等满 TTL → 查盘”；remove 总是先停保活；promote 只触发、由 PromoteFlow 验证；keepalive 拆成 register/unregister/renew_once；capability 增 tenant/DFS 字段。
+- **新约定**：`--admin` 缺省从 master host 推 `:9003`；`--instance-segs` 做启动登记；intent 只覆盖预热；move/remove 事件推迟到 E14；Release/Retain 只留骨架。
+
+### 代码地图（Step 4）
+
+| 文件 | 职责 |
+|---|---|
+| `kvcm/ops/base.py` | L3 八操作接口 + query_task / exists / abandon；默认 Unsupported |
+| `kvcm/backends/mooncake/backend.py` | L4 适配：copy/move/remove、keepalive、demote/promote、pin、Ledger、rebuild |
+| `kvcm/backends/mooncake/client.py` | store 绑定封装：copy/move/remove/query/exists + soft_pin |
+| `kvcm/backends/mooncake/admin_main.py` / `http_admin.py` | 主线只读 admin：batch_query_keys / tenant_quota；段容量准入 |
+| `kvcm/flows/prefetch.py` / `flows/promote.py` | L2 编排：预热、提回 |
+| `kvcm/loops.py` | KeepaliveLoop；Release/Retain 骨架 |
+| `kvcm/task_engine.py` | intent 队列 + 传输闸 + READY 后保活/补发事件 |
+| `kvcm/daemon.py` | 进程壳：装配、启动、优雅退出 |
+| `kvcm/ledger.py` / `instances.py` | sqlite 状态；实例→seg 目录 |
+| `kvcm/native/` | 空写 soft pin 扩展（`_empty_pin.so`） |
+
+### 设计判断（Step 3：原设计不合理 / 已拍板）
+
+| 原判断 | 结论 | 证据 |
+|---|---|---|
+| hard pin 可以事后设置 | 不可行；`pin(HARD)` 拒绝，lease 保护走显式 `register_keepalive()` | D2 §2 |
+| demote 写完就完成 | 写穿/写回都要先停保活、等满 lease TTL，再查 LOCAL_DISK；DFS 不算成功 | D2 §3 |
+| remove 可以按 target 删 | mooncake 没有可用接口；remove 只做全局删；force 只跳 lease，不跳 replication task | D2 §4 / F6② |
+| promote 立即 READY | 只打 N 次 `GetReplicaList` 触发；READY 由 `PromoteFlow` + `check_promote` 轮询，L3 不返回 TaskHandle | D2 §3 |
+| 保活按 target | lease 是 key 级，target 不是保活维度；保活按前缀窗口 | D2 F9 / R08 N/A |
+| admin 短回/NoF 当不存在 | 短回、`ok=false`、坏描述符都转 `QueryError`；NoF 与 DRAM memory 分离 | D2 F11b / R07/R10/A11/R17 |
+| soft pin 默认不可用 | 目标版本 v0.3.13.post1 有条件可用；Case B 前置 + 地址检查 + `UpsertRevoke` | D2 §2 / native |
+| retain 靠 retained client | `1fc27b6` 没有 `AddReplicaForRetainedClient`；按 PR74 的四条路（DFS / move / kvcm 自挂段盘 / 旧 client_id） | D2 §4 |
+| capability 是运行时探测 | 是显式声明，不做版本探测；版本要求由文档约束 | R15 / capability.py |
+
+### 代码 vs 设计（Step 5）
+
+| 检查项 | 结果 | 证据 |
+|---|---|---|
+| L2 只调 L3；L3 不出现 seg/lease/client_id | ✅ | `flows/prefetch.py`、`task_engine.py` |
+| move READY + source 必填 | ✅（rebase 后 `_admit_new_bytes` 已接上） | `backend.move`、PR72 |
+| keepalive 是周期续租 | ✅ 拆成 register/unregister + renew_once | `ops/base.py`、`loops.py`、`backend.py` |
+| pin SOFT = 空写标记 | ⚠️ 通道可用；ABI / Case C / NoF 真机仍是残余 | 剩余项 soft pin |
+| demote 只认 LOCAL_DISK | ✅ | `backend.demote` |
+| promote READY = 目标可调度 | ✅ L3 只触发，flow 轮询 | `backend.promote`、`flows/promote.py` |
+| remove 全局删 | ✅ 不支持 target | `backend.remove`、D2 §4 |
+| admin 零副作用核验 | ✅ 走 `/batch_query_keys`；R17/R18 边界保留 | `backend._verify_missing` |
+| READY 只给 copy/move/promote | ✅ 空任务号抛 `ValueError` | `ops/base.py`、`backend.query_task` |
+| Ledger rebuild 恢复 copy/move | ✅ A07 后 partial handle 跳过 | `backend.rebuild`、`test_rebuild_skips_partial_handle` |
+| InstanceWatcher / EventPublisher / Release / Retain / limiter | ⚠️ 已知缺口 | 范围 / 已知缺口 |
+| 多模型 rebuild 归属 | ⚠️ 未按 model_id 过滤 | 范围 / 已知缺口 |
+
+### 代码问题与已解决（Step 6）
+
+| 项 | 结论 | 证据 |
+|---|---|---|
+| A01 move 依赖 PR72 | 已 rebase 到 main，A01 关闭 | `6a227c7` |
+| A07 partial handle rebuild | rebuild 跳过 task 行数 != 全量 plan 的 handle | `test_rebuild_skips_partial_handle` |
+| A08 StoreClient 并发 | 源码审计：`RpcClientPool::send_request` + `hot_cache` 锁；未加全局锁；真机压测归 A14 | 本期结论 |
+| R07/R10/R11/R12/R13/A09–A13/R17 | 已修；分别见 D2、backend、loops、capability 与测试 | git 历史 / 编码 |
+| A06 / A16 / A17 | DEFER | 剩余项 / 已知缺口 |
+
 ## 范围 / 已知缺口（不阻塞）
 
-- `retain` 未实现：接口保留，直接 `UnsupportedCapabilityError`；`ReleaseLoop` / `RetainLoop` 只有骨架。
+- `retain` 未实现：`backend.retain` 直接 `NotImplementedError`（D2 §4 已登记四条路）；`ReleaseLoop` / `RetainLoop` 只有骨架。
 - intent 只覆盖预热；其他操作没有 intent（E13 / E14 / E15 未做）。
 - `InstanceWatcher` 未接；实例目录只做启动登记。
-- `EventPublisher` 未接通；move/remove 事件等 E14（A06）。
+- `EventPublisher` 已接通：prefetch READY 后按目标实例补发 `BlockStored`；move/remove 事件等 E14（A06）。
 - 限速器只有接口，daemon 未接线（E15 接入点）。
 - `rebuild` 不区分任务归属：多模型/多后端共用一个 Ledger 时会按本实例 KeyComputer 错算；单实例单模型无此问题，多模型前必须加 `model_id` 归属判定。
 - 提交并发默认 4 是进程级；单机窗口实验 #16 的结论，跨机 #17 仍半挂，未纳入 PR 验收。
