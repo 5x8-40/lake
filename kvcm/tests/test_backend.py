@@ -1167,6 +1167,44 @@ def test_rebuild_skips_empty_inputs(fake_store_module, monkeypatch) -> None:
         os.unlink(path)
 
 
+def test_rebuild_skips_partial_handle(fake_store_module, monkeypatch) -> None:
+    """部分提交的 handle 不按全量 plan 恢复（A07）。
+
+    只落了已发出的任务号；若 rebuild 按 token_ids 重算全量 plan，会把
+    从未提交的 key 当成缺副本，误报 VerifyError / 超时。
+    """
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    import os
+
+    led = Ledger(path)
+    try:
+        prefix = Prefix(model_id="qwen", token_ids=(1, 2, 3))
+        kc = KeyComputer(model_name="qwen", tp_size=2)
+        monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+        # 全量 plan 至少两个任务；这里只落一个，模拟提交中途失败。
+        led.upsert_task(
+            "1:101",
+            handle_id="h-partial",
+            op="copy",
+            prefix=prefix,
+            target="inst-B",
+            status="running",
+        )
+        b = MooncakeBackend(
+            client=FakeClient(),
+            key_computer=kc,
+            locate=lambda _inst: ["seg-A", "seg-B"],
+            capability=mooncake_v0311(),
+            ledger=led,
+        )
+        assert b.rebuild() == []
+        assert not b._plans
+    finally:
+        led.close()
+        os.unlink(path)
+
+
 def test_rebuild_restores_watch_state(fake_store_module, monkeypatch) -> None:
     """观测态恢复：同组冲突 failed 兄弟进 _watch——缺副本保持 RUNNING
     （不抛 VerifyError），副本到位后 READY 且冲突行保持 failed。"""

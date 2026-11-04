@@ -10,10 +10,10 @@
 | 项 | 值 |
 |---|---|
 | PR | [#73 feat(kvcm): 接上主线 move、remove 与只读管理端点](https://github.com/5x8-40/lake/pull/73) |
-| 分支 | `feat/kvcm-ops-mainline` |
-| base | `main` |
-| 本地 worktree | `/home/witcher/lake-wt-ops` @ `feat/kvcm-ops-mainline` |
-| 当前结论 | 语义和主要代码已收口；等 PR72 / PR74 合入后 rebase，再处理剩余项；**暂不合并** |
+| 分支 | `wip/kvcm-ops-rebased`（旧 PR73 分支保留为 backup） |
+| base | `main` @ `296f166`（PR71/72/74 已合入） |
+| 本地 worktree | `/home/witcher/lake-wt-ops` @ `wip/kvcm-ops-rebased` |
+| 当前结论 | 已 rebase 到 main；A01/A07/A08 已处理；下一步拆 3 个 stacked PR |
 
 ## 版本基线
 
@@ -35,6 +35,8 @@
 - NoF 与 DRAM memory 分离；NoF-only 拒绝（R07 / A04）。
 - `demote` 统一“停保活 → 等满 TTL → 查盘”，写穿部署也等；没有剩余租约查询。
 - `remove` 失败 / 取消不把保活加回；副本可能提前变冷（已接受）。
+- A07：`rebuild` 跳过 task 行数 != 全量 plan 的 partial handle；在途任务重启后不跟踪，由下一次 `exists` / 预热重判。
+- A08 源码审计：当前 StoreClient RPC 路径只读共享 client；master RPC 走 `RpcClientPool`（`send_request` 线程安全）+ `hot_cache` 自有锁；未加全局锁。真机并发压测归 A14。
 
 ## 范围 / 已知缺口（不阻塞）
 
@@ -48,23 +50,8 @@
 
 ## 剩余问题
 
-### 0. 合并顺序
-
-- **A01 / PR72 依赖（OPEN）**
-  - `feat/kvcm-segment-admission` 不是当前 HEAD 的祖先，`main` 也没有 `_admit_new_bytes`。
-  - `backend.move` 会直接抛 `RuntimeError`，move 实际不可用。
-  - 结论：先合 PR72 / PR74，再把 PR73 rebase；不 cherry-pick `_admit_new_bytes`。
-
 ### 1. 重启 / 并发 / 保活
 
-- **A07 partial handle rebuild（OPEN）**
-  - copy 部分失败只把已发任务号写 `_plans` / Ledger；`rebuild` 从 token_ids 重算全量 plan。
-  - 重启后 partial handle 会核验从未提交的 key，误报 `VerifyError` / 超时；部分已成功的任务也被拖死。
-  - 方向：Ledger 记已提交的 key/seg 子集，或 partial handle 不参与 rebuild；补重启 partial 用例。
-- **A08 StoreClient 多线程并发（OPEN）**
-  - `backend._rpc` 用 4~8 线程 executor；同一个 `MooncakeDistributedStore` 被 copy/query/exists/keepalive 并发使用。
-  - 绑定内部是否线程安全未验证；可能出现竞态/崩溃。
-  - 方向：查 binding/Client 线程安全；不行就给控制面 RPC 加锁；补并发压测。
 - **A03 保活注册 fire-and-forget（OPEN）**
   - `TaskEngine` READY 后调 `KeepaliveLoop.register`；`_submit_ledger` 不等待。
   - READY 可能先于 keepalive 行落盘；副本可能提前变冷。
@@ -145,19 +132,19 @@
 
 ## 合入门禁
 
-1. **A01**：等 PR72 / PR74 合入后 rebase PR73；不 cherry-pick `_admit_new_bytes`。
-2. **prefetch 主路径**：A07 / A08 / A03 / R16 / R06 / R18。
+1. **基线**：已 rebase 到 `main`（PR71/72/74）；旧 PR73 分支只作 backup。
+2. **prefetch 主路径**：A03 / R16 / R06 / R18。
 3. **soft pin**：真机 ABI / NoF / Case A/C；版本按 v0.3.13.post1 部署。
 4. **已知边界**：R02 / R03 / R04 / A04 / A15 / R05 / R14 / R15 / A06 / A16 / A17 写进文档即可。
 
-建议按 **A01 → A07/A08 → A03/R16 → R06/R18 → A14 真机** 推进；A16 / A17 / A06 不阻塞。
+建议按 **A03/R16 → R06/R18 → A14 真机** 推进；A16 / A17 / A06 不阻塞。
 
 ## PR 体量与拆分
 
-- 当前相对 `main`：约 52 commits、44 files、4974 行新增 / 575 行删除。
+- 当前相对 `github/main`：约 45 files、4729 行新增 / 552 行删除（squash rebase 后）。
 - 体量主要来自：测试约 42%、生产代码约 27%、design 文档约 14%、native 约 6%。
 - 原因：move/remove/admin、soft pin native、keepalive/demote/promote、E11/E12 修复和测试/文档混在一个长分支。
-- 计划：先把剩余问题收完，再按 feature 拆 PR（core / soft pin / keepalive-demote-promote / 文档测试），不在问题未收口时切。
+- 计划：拆 3 个 stacked PR（core / keepalive-demote-promote / soft pin）；测试和文档跟随各自 feature，不单独拆 docs/test PR。
 
 ## 合入前删除清单
 
@@ -171,3 +158,6 @@
 
 - **2026-11-04**：整理 tracker：移除已关闭项（NoF/admin、pin HARD、keepalive 拆名、move source、demote LOCAL_DISK、promote flow、remove 全局、R17 日志），只保留剩余问题、DEFER 和合并门禁；补 PR 体量与拆分计划。
 - **2026-11-04**：对照 HEAD 原文件逐项复核：原 18 条 review + 17 条额外发现中，所有 OPEN / DEFER / ACCEPT 残余均保留；补回 Case C 旧 buffer 600s、外部 offload 竞态、0.3.14-rc1 未验证、已拍板结论和推进顺序。
+- **2026-11-04**：PR71/72/74 已合入 main；旧分支 squash rebase 到 `wip/kvcm-ops-rebased`，A01 关闭。
+- **2026-11-04**：A07 关闭：`rebuild` 跳过 task 行数 != 全量 plan 的 partial handle，补 `test_rebuild_skips_partial_handle`。
+- **2026-11-04**：A08 源码审计关闭：当前 RPC 路径只读共享 client，`MasterClient::invoke_rpc` 走 `RpcClientPool::send_request`（线程安全）+ `hot_cache` 锁；真机并发压测归 A14。

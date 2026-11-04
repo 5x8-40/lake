@@ -941,6 +941,19 @@ class MooncakeBackend(KvOps):
                 continue
             if not plan:
                 continue
+            # 部分提交的 handle 只落了已发出的任务号；rebuild 按 token_ids
+            # 重算的是全量 plan，若按全量核验会把从未提交的 key 当成缺副本。
+            # 这类 handle 不参与重建（在途任务重启后不再跟踪，下一次
+            # exists / 预热重新判断；见 A07）。
+            all_rows = self._ledger.list_tasks_by_handle(handle_id)
+            if len(all_rows) != len(plan):
+                logger.warning(
+                    "rebuild: skip partial handle %s (%d/%d tasks)",
+                    handle_id,
+                    len(all_rows),
+                    len(plan),
+                )
+                continue
             handle = TaskHandle(
                 op=OpKind(r0.op),
                 task_ids=tuple(decode_task_id(r.task_id) for r in rows),
