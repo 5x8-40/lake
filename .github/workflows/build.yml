@@ -53,9 +53,9 @@ jobs:
           if echo "$files" | grep -qE '^tools/cmx-sim/'; then
             cmx=true
           fi
-          # kvcm 隔离：产品代码/测试改动才跑单测；demo 改动才跑 demo 冒烟；
-          # kvcm/design、README、summary 等纯文档改动两个 job 都不触发。
-          if echo "$files" | grep -qE '^kvcm/(kvcm|tests)/'; then
+          # kvcm 隔离：产品代码/测试/proto/脚本/依赖改动才跑单测；demo 改动才跑
+          # demo 冒烟；kvcm/design、README、summary 等纯文档改动两个 job 都不触发。
+          if echo "$files" | grep -qE '^kvcm/(kvcm|tests|proto|scripts)/|^kvcm/requirements'; then
             kvcm_pkg=true
           fi
           if echo "$files" | grep -qE '^kvcm/demo/'; then
@@ -78,7 +78,7 @@ jobs:
           python-version: "3.12"
       - run: python scripts/check_doc_links.py
 
-  # kvcm 产品单测:kvcm/kvcm 与 kvcm/tests 改动才触发（pytest；E12 起有
+  # kvcm 产品单测:kvcm/kvcm、tests、proto、scripts、requirements 改动才触发（pytest；E12 起有
   # grpcio/protobuf 运行时依赖，见下方 pip install）。
   kvcm:
     needs: filter

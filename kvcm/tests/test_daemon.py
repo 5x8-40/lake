@@ -120,13 +120,15 @@ def _args(tmp: str) -> argparse.Namespace:
         peer_tp_size=None,
         put_step=1,
         hash_algo="sha256",
-        segs="127.0.0.1:10001,127.0.0.1:10002",
-        capability="v0311",
+        instance_segs=["inst=127.0.0.1:10001,127.0.0.1:10002"],
+        capability="main",
+        admin="http://127.0.0.1:9003",
         ledger=f"{tmp}/ledger.sqlite",
         max_concurrent=4,
         copy_submit_concurrency=4,
         listen="",
         keepalive_interval_s=0.05,
+        lease_ttl_s=10.0,
         keepalive_window_s=600.0,
         shutdown_timeout_s=2.0,
         rpc_timeout_s=30.0,
@@ -633,6 +635,52 @@ def test_startup_failure_still_cancels_recovery_tasks(monkeypatch, tmp_path) -> 
 
 
 @pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
+def test_startup_failure_after_keepalive_start_stops_loop(monkeypatch, tmp_path) -> None:
+    """keepalive.start 成功之后，后面的启动步骤失败，finally 要先 stop 再 close。"""
+    events: list[str] = []
+
+    class RecordingKeepalive(FakeKeepalive):
+        def start(self) -> None:
+            super().start()
+            events.append("keepalive.start")
+
+        async def stop(self, *, timeout_s: float = 10.0) -> None:
+            events.append("keepalive.stop")
+            await super().stop(timeout_s=timeout_s)
+
+        def close(self) -> None:
+            events.append("keepalive.close")
+            super().close()
+
+    class BoomEngine(daemon.TaskEngine):
+        def start(self) -> None:
+            raise RuntimeError("engine start boom")
+
+        async def shutdown(self, *, timeout_s: float = 5.0) -> None:
+            events.append("engine.shutdown")
+
+    real_wait = daemon._wait_executor
+
+    def wait(executor, timeout):
+        events.append("executor.close")
+        return real_wait(executor, timeout)
+
+    monkeypatch.setattr(daemon, "TaskEngine", BoomEngine)
+    monkeypatch.setattr(daemon, "KeepaliveLoop", lambda *a, **kw: RecordingKeepalive())
+    monkeypatch.setattr(daemon, "StoreClient", lambda: FakeClient(events))
+    monkeypatch.setattr(daemon, "build_backend", lambda *a, **kw: FakeBackend())
+    monkeypatch.setattr(daemon, "_wait_executor", wait)
+
+    t, _stop = _run_daemon_in_thread(_args(tmp_path))
+    t.join(timeout=5)
+    assert not t.is_alive()
+    assert events.index("keepalive.start") < events.index("keepalive.stop")
+    assert events.index("keepalive.stop") < events.index("keepalive.close")
+    assert events.index("keepalive.stop") < events.index("executor.close")
+    assert events.index("keepalive.stop") < events.index("client.close")
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnhandledThreadExceptionWarning")
 def test_connect_plain_error_closes_cleanly(monkeypatch, tmp_path, capsys) -> None:
     """connect 抛普通异常（不是超时）：不硬退出，走 finally 正常收尾。
 
@@ -808,3 +856,118 @@ def test_shutdown_signal_interrupts_connect_wait(monkeypatch, tmp_path, capsys) 
     assert "got shutdown signal during connect" in err, (
         f"走的是超时分支而不是信号分支: {err!r}"
     )
+
+
+def test_cli_repeats_instance_segs(monkeypatch) -> None:
+    """一次启动可以登记多个实例。旧的单一 --segs 不再接受。"""
+    captured: dict = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return 0
+
+    monkeypatch.setattr(daemon, "run", fake_run)
+    rc = daemon.main(
+        [
+            "--master", "127.0.0.1:50088",
+            "--local-hostname", "127.0.0.1:13021",
+            "--model-name", "qwen",
+            "--admin", "http://127.0.0.1:9003",
+            "--instance-segs", "A=seg-A0,seg-A1",
+            "--instance-segs", "B=seg-B0",
+            "--ledger", "/tmp/ledger.sqlite",
+        ]
+    )
+    assert rc == 0
+    assert captured["args"].instance_segs == [
+        "A=seg-A0,seg-A1",
+        "B=seg-B0",
+    ]
+    assert captured["args"].lease_ttl_s == 10.0
+    with pytest.raises(SystemExit):
+        daemon.main(
+            [
+                "--master", "127.0.0.1:50088",
+                "--local-hostname", "127.0.0.1:13021",
+                "--model-name", "qwen",
+                "--segs", "seg0,seg1",
+                "--ledger", "/tmp/ledger.sqlite",
+            ]
+        )
+
+
+def test_empty_admin_exits_before_serve(monkeypatch, capsys) -> None:
+    """没配管理端口就启动：报错返回，不进服务循环。"""
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应进入服务循环")
+
+    monkeypatch.setattr(daemon, "_serve", boom)
+    rc = daemon.main(
+        [
+            "--master", "127.0.0.1:50088",
+            "--local-hostname", "127.0.0.1:13021",
+            "--model-name", "qwen",
+            "--instance-segs", "A=seg-A0",
+            "--ledger", "/tmp/ledger.sqlite",
+        ]
+    )
+    assert rc == 1
+    assert "管理端口" in capsys.readouterr().err
+
+
+def test_v0311_capability_exits_before_serve(monkeypatch, capsys) -> None:
+    """0.3.11 能力集对不上零副作用核验，启动直接失败。"""
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应进入服务循环")
+
+    monkeypatch.setattr(daemon, "_serve", boom)
+    rc = daemon.main(
+        [
+            "--master", "127.0.0.1:50088",
+            "--local-hostname", "127.0.0.1:13021",
+            "--model-name", "qwen",
+            "--admin", "http://127.0.0.1:9003",
+            "--capability", "v0311",
+            "--instance-segs", "A=seg-A0",
+            "--ledger", "/tmp/ledger.sqlite",
+        ]
+    )
+    assert rc == 1
+    assert "零副作用" in capsys.readouterr().err
+
+
+def test_admin_without_scheme_exits_before_serve(monkeypatch, capsys) -> None:
+    """--admin 没有 http:// 或 https:// 时启动直接失败。"""
+
+    def boom(*_args, **_kwargs):
+        raise AssertionError("不应进入服务循环")
+
+    monkeypatch.setattr(daemon, "_serve", boom)
+    rc = daemon.main(
+        [
+            "--master", "127.0.0.1:50088",
+            "--local-hostname", "127.0.0.1:13021",
+            "--model-name", "qwen",
+            "--admin", "127.0.0.1:9003",
+            "--instance-segs", "A=seg-A0",
+            "--ledger", "/tmp/ledger.sqlite",
+        ]
+    )
+    assert rc == 1
+    assert "http://" in capsys.readouterr().err
+
+
+def test_directory_rejects_duplicate_and_empty() -> None:
+    from kvcm.instances import InstanceDirectory, directory_from_specs
+
+    directory = InstanceDirectory()
+    directory.register("A", ["seg-A0"])
+    with pytest.raises(ValueError, match="already registered"):
+        directory.register("A", ["seg-A1"])
+    assert directory.locate("A") == ("seg-A0",)
+    with pytest.raises(ValueError, match="都不能空"):
+        directory_from_specs(["A="])
+    with pytest.raises(ValueError, match="至少要有一条"):
+        directory_from_specs([])

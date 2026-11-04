@@ -169,6 +169,7 @@ class PrefetchFlow:
             raise
         if handle_sink is not None:
             handle_sink(handle)
+        last_query_error: QueryError | None = None
         try:
             while True:
                 try:
@@ -176,9 +177,16 @@ class PrefetchFlow:
                 except VerifyError as e:
                     # 任务完成但副本不到位：终态，带明细
                     raise PrefetchError(f"replica verify failed: {e}") from e
-                except QueryError:
+                except QueryError as e:
                     # 查询 RPC 失败：可重试，超时兜底。只捕获 QueryError——
                     # 编程错误（KeyError/TypeError 等）直接传播，不得吞成超时。
+                    if last_query_error is None:
+                        logger.warning(
+                            "query_task failed; retrying (handle=%s): %s",
+                            handle,
+                            e,
+                        )
+                    last_query_error = e
                     status = None
                 if status is TaskStatus.READY:
                     return
@@ -188,8 +196,14 @@ class PrefetchFlow:
                     # 超时收口：放弃跟踪（删登记 + 记 abandoned）；后端任务
                     # 可能仍在进行，副本清理由 remove 负责。
                     await self._abandon(handle)
+                    detail = (
+                        f"; last query error: {last_query_error}"
+                        if last_query_error is not None
+                        else ""
+                    )
                     raise PrefetchError(
-                        f"copy not READY after {timeout_s}s (handle={handle})"
+                        f"copy not READY after {timeout_s}s "
+                        f"(handle={handle}){detail}"
                     )
                 await asyncio.sleep(poll_s)
         except asyncio.CancelledError:
