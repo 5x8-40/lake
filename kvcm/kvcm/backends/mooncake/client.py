@@ -251,6 +251,58 @@ class StoreClient:
             )
         return raw
 
+    def soft_pin(
+        self,
+        keys: Sequence[str],
+        sizes: Sequence[int],
+        addresses: Sequence[int],
+        *,
+        enable: bool = True,
+    ) -> None:
+        """空写软钉。用官方包已经建好的 client，不第二次 create。
+
+        ``sizes`` / ``addresses`` 由调用方从 ``GET /batch_query_keys``
+        的 ``size_`` / ``buffer_address_`` 传入。扩展在 ``UpsertStart``
+        后比较返回的 buffer 地址：只有原位复用（Case B）才 ``UpsertEnd``；
+        新 buffer（Case A/C）直接 ``UpsertRevoke``，不把空副本标成完成。
+        lease 挡驱逐 / 非 force ``Remove``，挡不了 ``Remove(force=True)``
+        或 Case C；Case C 旧 buffer 延迟释放（默认 600s），检查时不会
+        立即复用旧地址，地址复用残余主要来自 exists 后被 force remove /
+        stale 清理 / lease 过期驱逐，或 UpsertStart 惰性清理 / processing 抢占
+        后无 COMPLETE 副本的 Case A。
+
+        ``_get_pyclient_capsule`` 拿回 setup 时放进 ``store_`` 的 PyClient。
+        扩展在这个对象上调 ``MasterClient::UpsertStart`` / ``UpsertEnd``，
+        中间不 ``TransferWrite``。不用 ``upsert_tensor`` 重写数据。
+        """
+        store = self._s()
+        keys = list(keys)
+        sizes = [int(s) for s in sizes]
+        addresses = [int(a) for a in addresses]
+        if (
+            len(keys) != len(sizes)
+            or len(keys) != len(addresses)
+            or not keys
+            or any(s <= 0 for s in sizes)
+        ):
+            raise StoreClientError("软钉读不到唯一的原尺寸/地址，没有钉上")
+        capsule_fn = getattr(store, "_get_pyclient_capsule", None)
+        if not callable(capsule_fn):
+            raise StoreClientError(
+                "官方包没有 _get_pyclient_capsule，拿不回已建 client，没有钉上"
+            )
+        capsule = capsule_fn()
+        if capsule is None:
+            raise StoreClientError("已建 client 的 capsule 是空的，没有钉上")
+        from kvcm.native.empty_pin import empty_soft_pin
+
+        try:
+            empty_soft_pin(capsule, keys, sizes, addresses, enable)
+        except ImportError as e:
+            raise StoreClientError(
+                "空写扩展还没加载，没有钉上"
+            ) from e
+
     def query_task(self, task_id: object) -> object:
         """查询任务状态（QueryTaskResponse）。"""
         resp, err = self._s().query_task(task_id)
