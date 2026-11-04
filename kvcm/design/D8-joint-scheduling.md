@@ -19,7 +19,7 @@
 
 1. **终局不是“再加一个调度器”，而是给 Router 补一个决策内核**：一个共享状态 + 三条时间尺度不同的决策环，把“请求去哪、KV 怎么动、集群扩不扩”放进同一套目标与预算。
 2. **索引是事件派生的决策视图，不是第二权威**：引擎 KV events、kvcm READY、Mooncake publisher、Router 推测条目、worker miss 反馈，合成一棵 KVT；Mooncake master 仍是副本权威。
-3. **最大的性能杠杆是“命中/保留”，不是 D-direct**：命中省掉的是秒级 prefill；本地放置省掉的是十毫秒级跨机传输；HBM 命中再省掉毫秒级本地拷贝。三者的量级差一个数量级以上，调度优先级必须按这个顺序设计。
+3. **最大的性能杠杆是“命中/保留”，不是 HBM 命中后的本地拷贝优化**：命中省掉的是秒级 prefill；本地放置省掉的是十毫秒级跨机传输；HBM 命中再省掉毫秒级本地拷贝。三者的量级差一个数量级以上，调度优先级必须按这个顺序设计。
 4. **kvcm 的定位是“KV 执行 + 核验 + 记账 + 发布”**：不做选路、不做扩缩决策、不持有前缀索引。它的八项操作组合成会话、预热、反熵、账本、容量、迁移等服务。
 5. **v0.3.13.post1 下，soft pin 空写已“有条件可用”**（PR73）；hard pin 事后设置已明确拒绝；copy/move 仍无取消；retain 仍未实现；池 publisher 代码有、但默认构建/运行都不开。设计必须按这个基线写，而不是按 main。
 
@@ -47,7 +47,7 @@ flowchart TB
     R --> L0
     R --> L1
     R --> L2
-    L0 -->|"Generate(mode,node,hint)"| W["vLLM-Ascend P/D/混部"]
+    L0 -->|"Dispatch(node, hint)"| W["vLLM-Ascend P/D/混部"]
     L0 -->|"intent（异步）"| K["kvcm"]
     L1 -->|"intent"| K
     L2 -->|"目标容量"| O["外部编排<br/>K8s / HPA / KEDA / WVA"]
@@ -81,7 +81,7 @@ flowchart TB
 
 | 面 | 终局能力 | 关键输入 | 关键输出 |
 |---|---|---|---|
-| 请求 | 三模式选路（PD/混部/D-direct）+ 节点/队列 | KVT、负载、SLO、价格 | mode + node + hint |
+| 请求 | 两模式选路（PD 分离/混部）+ HBM 命中利用；节点/队列 | KVT、负载、SLO、价格 | target + hint |
 | KV | 预取、保留、释放、降层、迁移 | hook、会话、KVT、预算 | intent（异步） |
 | 扩缩 | 计算池 + KV 池；扩容 warm gate；缩容 KV-aware victim | 需求预测、SLO、水位、KV 价值 | 目标容量/期望状态 |
 | 观测 | 命中归因、预热 ROI、决策回放 | KVT、intent、READY、请求结果 | 指标/账本/策略版本 |
@@ -108,7 +108,7 @@ flowchart TB
 - 不做“全局在线优化器”：请求路径算不动，也会把扩缩抖动带进 TTFT。
 - 不让 Router 直读 Mooncake master：Router 会变成池感知组件，且每请求多一跳；D1 §2 已排除。
 - 不让 kvcm 持有前缀索引：索引是在线服务，kvcm 是后台控制面（D1 §4）。
-- 不做 mode-to-mode 固定降级链：失败按最新状态重跑（D1/F4 原则）。
+- 不做固定降级链：失败按最新状态重跑。
 - 不做“无限 pin/无限预取”：没有预算的保留等于没有策略。
 
 ---
@@ -188,11 +188,11 @@ KVT 不是第二权威，是**决策视图**：
 
 | 层 | 含义 | 事件来源 | 对调度的意义 |
 |---|---|---|---|
-| **HBM** | 实例 APC/显存里的块 | 引擎 `BlockStored(medium=GPU)` | 真本地命中；D-direct 的唯一依据 |
+| **HBM** | 实例 APC/显存里的块 | 引擎 `BlockStored(medium=GPU)` | 真本地命中；HBM 命中的唯一依据 |
 | **本机 DRAM** | 本机 Mooncake seg | 引擎 `BlockStored(medium=CPU)` / kvcm READY | 本地读，省跨机传输；仍要拷进 HBM |
 | **远端 DRAM/SSD/DFS** | 池内其他节点/介质 | 池事件、kvcm 核验 | Pool 命中，省重算但要传输 |
 
-**关键区分**：kvcm 预取到目标 seg，得到的是“本机 DRAM”，不是 HBM。它让请求走本地读，避免跨机 RDMA；但第一次使用仍要把 KV 从 DRAM 拷进 HBM。**D-direct 需要 HBM 证据**（引擎 GPU 事件，或方案 A 壳请求把 KV 带进 HBM）。这个区分决定了性能收益的量级（见 §7）。
+**关键区分**：kvcm 预取到目标 seg，得到的是“本机 DRAM”，不是 HBM。它让请求走本地读，避免跨机 RDMA；但第一次使用仍要把 KV 从 DRAM 拷进 HBM。**要认定 HBM 命中，需要 HBM 证据**（引擎 GPU 事件，或方案 A 壳请求把 KV 带进 HBM）。这个区分决定了性能收益的量级（见 §7）。
 
 #### 状态与置信度
 
@@ -209,10 +209,10 @@ stateDiagram-v2
     Expired --> [*]
 ```
 
-- `Speculative` 只做亲和排序，不做 D-direct；
+- `Speculative` 只做亲和排序，不当作 HBM 命中；
 - `Confirmed` 才可作为“可路由”的依据；
 - 删除/失效事实带墓碑，防止延迟到达的 `Stored` 复活；
-- 置信度随时间衰减；低于阈值只做亲和，不做 D-direct。
+- 置信度随时间衰减；低于阈值只做亲和，不当作 HBM 命中。
 
 #### 合并规则（概念）
 
@@ -272,7 +272,7 @@ sequenceDiagram
     Note over A,W: ATTACHED（请求）
     A->>G: request + hook
     G->>R: request + hook
-    R->>W: Generate(mode,node,hint)
+    R->>W: Dispatch(node, hint)
 
     Note over A,R: POST（会话后）
     A->>G: pause / resume / close / branch
@@ -313,7 +313,7 @@ flowchart TB
     S["请求 + Hook"] --> P["前缀 hash"]
     P --> M["KVT.Match 逐候选"]
     M --> D{"连续 HBM 命中够?<br/>置信度够?"}
-    D -->|"是"| DD["D_DIRECT"]
+    D -->|"是"| DD["HBM 命中<br/>跳池加载 + 残差 prefill"]
     D -->|"否"| T{"Pool 命中 + 带宽够?"}
     T -->|"是"| PD["PD / 本地读"]
     T -->|"否"| CO["COLOCATED"]
@@ -349,12 +349,12 @@ BW*         = B×c_bw / (residual×c_prefill)
 
 约束：
 
-- D-direct 仅当连续 HBM confirmed 命中 ≥ 阈值（通常整段，末 token 可能重算）；
+- HBM 命中判定仅当连续 HBM confirmed 命中 ≥ 阈值（通常整段，末 token 可能重算）；
 - PD 仅当角色/拓扑允许、残差 prefill 足够大；
 - 不拒绝请求；优先级只影响排队；
 - 选择后写 Speculative，异步 intent 不阻塞。
 
-**重要**：kvcm READY 是“本机 DRAM 副本就绪”，不是“HBM 命中”。L0 不能因为 kvcm READY 就选 D-direct；D-direct 要有 HBM 事件或方案 A 壳请求的证据。
+**重要**：kvcm READY 是“本机 DRAM 副本就绪”，不是“HBM 命中”。L0 不能因为 kvcm READY 就认定 HBM 命中；HBM 命中要有 HBM 事件或方案 A 壳请求的证据。
 
 ### 5.2 L1 会话与 KV 环（100ms–1s）
 
@@ -504,7 +504,7 @@ sequenceDiagram
 要点：
 
 - kvcm READY 只保证“本机 DRAM 有副本”，第一次请求仍然要把 KV 从 DRAM 读进 HBM；它省的是跨机 RDMA，不是本地拷贝，更不是 prefill（prefill 已在池命中时省掉）。
-- 若 B 的引擎在请求后把块放进 APC，下一次才可能 D-direct；这由引擎事件/KVT 决定，不由 kvcm 保证。
+- 若 B 的引擎在请求后把块放进 APC，下一次才可能 HBM 命中；这由引擎事件/KVT 决定，不由 kvcm 保证。
 - 若预取没赶上，请求照常走远端读；下一次受益。
 
 ### 6.2 扩容：warm gate
@@ -598,16 +598,16 @@ T_total ≈ Q + T_prefill + T_transfer + T_local_copy
 | `Q` 队列 | 实例负载/扩缩 | L0 负载打分、L2 扩容 | ms–s |
 | `T_prefill` | 残差 token / 算力 | 命中/保留（避免重算） | **秒级** |
 | `T_transfer` | 跨机字节 / 网络 | 本地放置、预取 | **十毫秒级** |
-| `T_local_copy` | 本地字节 / HBM 带宽 | HBM 命中、D-direct | **毫秒级** |
+| `T_local_copy` | 本地字节 / HBM 带宽 | HBM 命中 | **毫秒级** |
 
 **收益优先级**：
 
 1. **命中/保留**（省 `T_prefill`）——最大；
 2. **本地放置**（省 `T_transfer`）——次之；
-3. **HBM 命中/D-direct**（省 `T_local_copy`）——再次；
+3. **HBM 命中**（省 `T_local_copy`）——再次；
 4. **队列/弹性**（省 `Q`）——尾部与吞吐。
 
-这解释了为什么“D-direct”不是终局的核心：它是第三层优化，真正决定 TTFT 的是“KV 还在不在、能不能命中”。
+这解释了为什么“HBM 命中后的本地拷贝优化”不是终局的核心：它是第三层优化，真正决定 TTFT 的是“KV 还在不在、能不能命中”。
 
 ### 7.2 公式
 
@@ -666,7 +666,7 @@ Net(T) = p_resume(T)×T_prefill − c_h×S×T − C_risk
 |---|---:|---:|---|
 | 命中 vs 重算 | ~1.6 s | ~14 s | 最大杠杆：保留/防驱逐 |
 | 本机 DRAM vs 远端 | ~4.8 ms | ~42 ms | 预取/本地放置 |
-| HBM vs 本机 DRAM | ~1.6 ms | ~14 ms | D-direct/APC 命中 |
+| HBM vs 本机 DRAM | ~1.6 ms | ~14 ms | HBM 命中（APC） |
 | 队列/扩容 | 看负载 | 看负载 | 尾部与吞吐 |
 
 > 表中“命中”按整段前缀命中估算；实际 vLLM 可能仍重算末 token，残差很小。真机要按模型/并行配置替换 `bytes_per_token`、`v_prefill`、`BW_wan`、`BW_local`。
@@ -730,11 +730,11 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 
 - KVT 陈旧只损性能；读路径兜底（远端读/重算）。
 - 删除面：0.3.13.post1 的 publisher 需构建+运行开启；默认无删除事件，用 TTL + miss + 抽样核验。
-- 源 gap：replay → snapshot → stale；stale 不做 D-direct。
+- 源 gap：replay → snapshot → stale；stale 不当作 HBM 命中。
 - kvcm 挂：intent 失败/排队，路由不受影响；ledger 持久化，恢复后继续。
 - 编排挂：不扩缩，告警；已发决策幂等重试。
 - 多 Router：KVT 各一份；会话粘性；L2 leader；intent 幂等。
-- 失败不写 mode-to-mode fallback；按最新状态重跑。
+- 失败不写固定降级链；按最新状态重跑。
 
 ---
 
@@ -786,7 +786,7 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 | **P2 容量与弹性** | L2 双环；warm gate；KV-aware victim；池扩缩；价格 | 扩容 Ready <10s 且 warm 达标；缩容零丢失；无振荡 |
 | **P3 服务化** | 会话 KV、预热服务、容量顾问、Drain、治理、回放 | 服务 SLA；ROI；容量预测误差；回放一致 |
 
-原则：**先把“命中/保留”做对，再优化“本地放置”，最后才做 D-direct 微优化**。这与 §7 的收益量级一致。
+原则：**先把“命中/保留”做对，再优化“本地放置”，最后才做 HBM 命中微优化**。这与 §7 的收益量级一致。
 
 ---
 
@@ -812,9 +812,8 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 | 参考 | 锚点 | 借了什么 | 关键差异 |
 |---|---|---|---|
 | **kvcm D1/D2** | `D1-router-scheduling.md` §2/§4；`D2-kv-operations.md` §1/§4 | intent ≠ command、READY、补发事件、单向边界、八操作/状态四类 | 本文补 hook/KVT/L2；不改变 kvcm actuator 定位 |
-| **lake Router** | `go/router/affinity.go::pickNodeForRequest`；`go/router/autoscale.go::Autoscaler.Evaluate`；`go/router/mirror.go::Apply` | 亲和两段式、in-flight 护栏、镜像 apply | lake 有 CP 权威；目标部署没有 CP，KVT 以事件为主 |
 | **Dynamo** | `lib/kv-router/src/protocols.rs::WorkerSelectionResult`；`components/src/dynamo/planner/core/load_scaling.py::LoadScalingMixin`；`lib/kv-router/src/services/indexer/listener.rs::handle_gap` | overlap 作为一等输入；慢/快双环；gap + replay | Dynamo 索引是事件派生副本；本文用多源 + 墓碑 + 置信度 |
-| **llm-d** | `pkg/kvcache/prefix_match.go::SpeculativeTier`；`.../preciseprefixcache/prerequest.go::defaultSpeculativeTTL`；`pkg/epp/scheduling/scheduler.go::Scheduler.Schedule` | 推测索引补窗口；scorer 插件化 | 推测只做亲和，不做 D-direct；不依赖“逼近引擎真相” |
+| **llm-d** | `pkg/kvcache/prefix_match.go::SpeculativeTier`；`.../preciseprefixcache/prerequest.go::defaultSpeculativeTTL`；`pkg/epp/scheduling/scheduler.go::Scheduler.Schedule` | 推测索引补窗口；scorer 插件化 | 推测只做亲和，不当作 HBM 命中；不依赖“逼近引擎真相” |
 | **AIBrix** | `pkg/kvevent/manager.go::Manager`；`pkg/controller/podautoscaler/context/context.go`（`gpu_cache_usage_perc`） | ZMQ 事件→前缀索引；KV 使用率/排队长度扩缩 | AIBrix 各副本各自收敛；本文 KVT 单实例内合并 + L2 leader |
 | **SGLang** | `sgl-model-gateway/src/policies/cache_aware.rs::CacheAwarePolicy`；`policies/tree.rs::Tree`；`srt/managers/kv_hints.py::KvHintsEnvelope`；`unified_cache/session_ref_tracker.py::UnifiedSessionRefTracker` | 近似树 + 最短队列；带版本 hint；session 软保护 | 目标部署用 vLLM-Ascend；session 保留落 kvcm，不落引擎 |
 | **vLLM** | `vllm/v1/kv_hints/protocol.py::KvHintsEnvelope`；`vllm/v1/core/sched/scheduler.py::Scheduler` | hint 动词表；节点级 scheduler 分层 | hint 在本文被编译成 Demand；仍 hint ≠ command |
