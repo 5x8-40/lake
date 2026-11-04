@@ -4,7 +4,7 @@
 - 状态: 设计草案；版本基线 v0.3.13.post1
 - 读法: `->>` 调用/数据流；`-->>` 响应/异步回执；`--x` 失败/断线；`rect` 底色区分并列场景
 
-> **先记住一个区分**：kvcm 预取到目标 seg，得到的是**本机 DRAM**，不是 HBM。它让请求走本地读、省跨机 RDMA；第一次使用仍要把 KV 从 DRAM 拷进 HBM。**D-direct 需要 HBM 证据**（引擎 GPU 事件，或方案 A 壳请求）。
+> **先记住一个区分**：kvcm 预取到目标 seg，得到的是**本机 DRAM**，不是 HBM。它让请求走本地读、省跨机 RDMA；第一次使用仍要把 KV 从 DRAM 拷进 HBM。**要认定 HBM 命中，需要 HBM 证据**（引擎 GPU 事件，或方案 A 壳请求）。
 
 ---
 
@@ -25,10 +25,10 @@ sequenceDiagram
     R->>R: 解析前缀 hash 链
     R->>KVT: Match(ns, hashes, 候选节点)
     KVT-->>R: 命中/tier/置信度/as-of
-    R->>R: 过滤约束（D-direct/PD/混部）
+    R->>R: 过滤约束（HBM 命中/PD/混部）
     R->>R: 打分（命中/传输/队列/SLO/future/risk）
     R->>Q: 入队（优先级）
-    R->>W: Dispatch(mode, node, hint)
+    R->>W: Dispatch(node, hint)
     R->>KVT: 写 Speculative（短 TTL）
     R-->>K: 异步 KVIntent（prefetch/retain）
     W-->>R: 首 token/结果
@@ -40,17 +40,17 @@ sequenceDiagram
 
 - KVT 查询是纯内存，<5ms；miss 回退权威不在 L0 热路径（可选异步）。
 - 预取 intent 不阻塞本次请求；READY 回写由 L1/摄入层处理。
-- `Speculative` 只用于同批请求的亲和，不参与 D-direct。
+- `Speculative` 只用于同批请求的亲和，不参与 HBM 命中判定。
 
 ---
 
-## 2. L0：D-direct / PD / 混部分支
+## 2. L0：HBM 命中 / PD / 混部分支
 
 ```mermaid
 flowchart TB
     S["请求"] --> H["KVT.Match"]
     H --> D{"连续 HBM 命中 ≥ 阈值<br/>且置信度 ≥ 0.9?"}
-    D -->|"是"| DD["D_DIRECT<br/>残差 prefill + decode"]
+    D -->|"是"| DD["HBM 命中<br/>跳池加载 + 残差 prefill"]
     D -->|"否"| P{"Pool 命中且 BW ≥ BW*?"}
     P -->|"是"| PD["PD_DISAGG / 本地读<br/>P 产出 → 传输 → D"]
     P -->|"否"| CO["COLOCATED<br/>同节点完成"]
@@ -62,7 +62,7 @@ flowchart TB
 注意：
 
 - “Pool 命中”包括本机 DRAM 与远端池；本机 DRAM 走本地读，省跨机传输。
-- kvcm READY 只说明本机 DRAM 有副本；它不能直接让 L0 选 D_DIRECT。
+- kvcm READY 只说明本机 DRAM 有副本；它不能直接让 L0 认定 HBM 命中。
 
 ---
 
@@ -260,7 +260,7 @@ sequenceDiagram
     participant O as 外部编排
     participant K as kvcm
 
-    R1->>E: 抢 lease /lake/scheduling/leader
+    R1->>E: 抢 lease /scheduling/leader
     R2->>E: 抢 lease（失败，standby）
     loop leader 任期
         R1->>R1: L2 决策
@@ -308,7 +308,7 @@ sequenceDiagram
 
     A->>G: 恢复请求
     G->>R: request
-    R->>W: 路由到 B（若 HBM 命中则可 D-direct）
+    R->>W: 路由到 B（若 HBM 命中则跳池加载）
 ```
 
 ---
@@ -316,7 +316,7 @@ sequenceDiagram
 ## 11. 读图要点
 
 - **L0 不阻塞**：所有 KV intent 都是异步；请求走当前最优路径。
-- **READY 是 DRAM 回写事件**：KVT 的 `Confirmed(DRAM)` 以 kvcm READY/引擎事件为准；D-direct 需要 HBM。
+- **READY 是 DRAM 回写事件**：KVT 的 `Confirmed(DRAM)` 以 kvcm READY/引擎事件为准；HBM 命中需要 HBM 证据。
 - **L2 只出决策**：provision 在外部编排；kvcm 只执行 KV 搬迁。
 - **失败不 fallback**：按最新 KVT/价格重算；读路径兜底不叫 fallback。
 - **多 Router**：请求环可水平扩；L2 单 leader；intent 幂等。
