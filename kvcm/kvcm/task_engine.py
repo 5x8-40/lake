@@ -6,7 +6,7 @@
         → 协程消费者出队
         → 过传输闸（Semaphore，限同时没做完的预热前缀数）
         → 执行 PrefetchFlow.run
-        → 终态记账 + READY 后注册保活
+        → 终态记账 + READY 后注册保活并按实例补发 BlockStored
 
 无优先级、不分轻重通道——轻任务本来就不经此队列（保活走
 KeepaliveLoop，查询由各自调用方直接 await）。
@@ -16,11 +16,12 @@ KeepaliveLoop，查询由各自调用方直接 await）。
 线程池下等待也把线程占死；协程下等待只是挂起——100 个任务挂着也只占
 RPC executor 那几个线程。
 
-**传输闸的语义**：一个名额 = 一个前缀正停在 `run_after_exists`
-（copy 提交 + 轮询 + 副本核验），终态才 release。默认 4。闸满时在传的
-不是 4 个任务：每个前缀的全部 key 都会交给 master（32K token、tp=2
-时大约 512 个 key，4 个满额前缀大约 4×512）。闸外只有 exists；keepalive
-注册在 release 之后。不按 key 计，也不是带宽管控（带宽归还没做的 E15）。
+**传输闸的语义**：名额在复查之前就 acquire；复查失败立刻 release。
+复查通过之后占到该前缀终态（提交 + 轮询 + 副本核验）。
+默认 4。闸满时在传的不是 4 个任务：每个前缀的全部 key 都会交给
+master（32K token、tp=2 时大约 512 个 key，4 个满额前缀大约 4×512）。
+闸外是 exists，以及目标段放不下时的等待；keepalive 注册在 release
+之后。不按 key 计，也不是带宽管控（带宽归还没做的 E15）。
 
 它和进程级 `submit_concurrency`（默认 4）不重复。那把只包住
 `create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受——
@@ -42,18 +43,31 @@ from __future__ import annotations
 
 import asyncio
 import enum
+import logging
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Callable
 
+from kvcm.api.events import EventPublisher
 from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
 from kvcm.ledger import prefix_key
 from kvcm.loops import KeepaliveLoop
-from kvcm.ops.base import KvOps, QueryError, TaskHandle, TaskStatus, VerifyError
+from kvcm.ops.base import (
+    AdmissionStop,
+    AdmissionWait,
+    KvOps,
+    QueryError,
+    TaskHandle,
+    TaskStatus,
+    VerifyError,
+)
 from kvcm.ops.types import InstanceId, Prefix
 
 # 限速器钩子：() -> bool，False = 暂缓发起（E15 接入点，提交前询问）
 RateLimiter = Callable[[], bool]
+
+logger = logging.getLogger(__name__)
 
 
 class IntentStatus(enum.Enum):
@@ -111,14 +125,15 @@ class TaskEngine:
         queue_size: int = 0,
         consumer_count: int | None = None,
         finished_max: int = 25600,
+        events: EventPublisher | None = None,
     ) -> None:
         """
-        max_concurrent：传输闸名额。一个名额 = 一个前缀正停在
-        `run_after_exists`（提交 + 轮询 + 核验），终态才还。不是线程数，
-        也不按 key 计：闸满时 master 上是这几个前缀的全部 key（32K、tp=2
-        大约 4×512），不是 4 个任务。与 `submit_concurrency` 不重复——
-        那把在 `create_copy_task` 返回时就还，只限建链速率；没有这把闸，
-        排队前缀会以每次 4 个 RPC 的速度全部提交完。
+        max_concurrent：传输闸名额。一个名额 = 一个已经决定提交、还没
+        终态的前缀（提交 + 轮询 + 核验），终态才还。目标段放不下时在闸外
+        等，不占名额。不是线程数，也不按 key 计：闸满时 master 上是这几个
+        前缀的全部 key（32K、tp=2 大约 4×512），不是 4 个任务。与
+        `submit_concurrency` 不重复——那把在 `create_copy_task` 返回时就还，
+        只限建链速率；没有这把闸，排队前缀会以每次 4 个 RPC 的速度全部提交完。
         limiter：限速器钩子（E15 接入点）；False 时等待后重试。
         queue_size：队列容量；0 = 不限（排队是协程挂起，不占资源）。限容量
         时满了**不阻塞**——`_admit` 用 `put_nowait`，`QueueFull` 直接把这条
@@ -141,6 +156,7 @@ class TaskEngine:
         self._ops = ops
         self._flow = PrefetchFlow(ops)
         self._keepalive = keepalive
+        self._events = events
         self._limiter = limiter
         self._queue: asyncio.Queue[_IntentRecord] = asyncio.Queue(maxsize=queue_size)
         self._gate = asyncio.Semaphore(max_concurrent)
@@ -223,6 +239,9 @@ class TaskEngine:
                 self._finish(
                     rec, IntentStatus.FAILED, "cancelled (shutdown, never started)"
                 )
+        # 进程退出才关发布器。实例下线不关——那不是本对象的生命周期。
+        if self._events is not None:
+            self._events.shutdown()
 
     # ------------------------------------------------------------------
     # intent 入口（同步，供 gRPC servicer 线程调用）
@@ -453,10 +472,14 @@ class TaskEngine:
     ) -> None:
         """跑一次预热。
 
-        传输闸的范围（定稿）：**exists 探测在闸外**（毫秒级操作不该被
-        堵住）。名额从 copy 提交前占到该前缀终态——这段时间 master 上
-        有这个前缀的全部 key，轮询也占着名额。`submit_concurrency`
-        在建链 RPC 返回时就还，替不了这一段。
+        传输闸的范围：**exists 和等目标段空间在闸外**。名额在复查之前就
+        `acquire`；复查失败立刻 `release`，回到闸外再等。复查通过之后，
+        这个名额占到该前缀终态——这段时间 master 上有这个前缀的全部
+        key，轮询也占着名额。放不下就在闸外睡 0.5 秒再查，不占名额。
+        `submit_concurrency` 在建链 RPC 返回时就还，替不了这一段。
+
+        timeout_s 从这里开始，覆盖等空间、等前缀闸、提交和轮询。还没有
+        任务号就到点：这次预热停止，不记成复制失败。
         """
         await self._throttle()
         # 闸外：存在性检查（毫秒级 RPC，读即续租）
@@ -466,22 +489,100 @@ class TaskEngine:
                 "或异构前提未满足（源引擎未开 tp_mismatch / PEER_TP_SIZE 两端错位，"
                 "则 effective 空间 key 全 miss）"
             )
-        async with self._gate:
-            await self._flow.run_after_exists(
-                prefix, target, poll_s=poll_s, timeout_s=timeout_s
+        await self._wait_then_run(prefix, target, poll_s, timeout_s)
+        # READY 接线：副本已核验到位 → 注册保活，并按目标实例补发
+        self._on_ready(prefix, target)
+
+    async def _wait_then_run(
+        self,
+        prefix: Prefix,
+        target: InstanceId,
+        poll_s: float,
+        timeout_s: float,
+    ) -> None:
+        """闸外等到放得下，再进闸提交并轮询。
+
+        预算从进入本函数起算。查剩余、排队等前缀闸都吃这段时间：到点还
+        没有任务号就停，不进 `create_copy_task`。
+        """
+        deadline = time.monotonic() + timeout_s
+        token = self._ops.open_segment_budget()
+
+        def _stopped() -> PrefetchError:
+            return PrefetchError(
+                f"prefetch stopped before submit after {timeout_s}s"
             )
-        # READY 接线：副本已核验到位 → 注册保活（窗口策略归 Loop）
-        if self._keepalive is not None:
-            self._keepalive.register(prefix)
+
+        try:
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise _stopped()
+                try:
+                    await self._ops.check_segment_room(
+                        prefix, target, timeout_s=left
+                    )
+                except QueryError:
+                    # 闸外这一次查询吃剩余预算。到点之后的 QueryError
+                    # 就是预算用完，按「还没提交就停」处理，不改准入比较。
+                    if deadline - time.monotonic() <= 0:
+                        raise _stopped() from None
+                    raise
+                except AdmissionWait:
+                    # 闸外等。0.5 秒，但不超过剩余预算。
+                    # 剩余按查完之后重算：慢查询不能把预算又加回去。
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise _stopped()
+                    await asyncio.sleep(min(0.5, left))
+                    continue
+                except AdmissionStop as e:
+                    raise PrefetchError(
+                        f"segment missing, prefetch stopped: {e}"
+                    ) from e
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    raise _stopped()
+                # 等名额也不能越过截止时间。取消正在等的 acquire 时，
+                # Semaphore 自己把名额交回去，这里不再 release。
+                try:
+                    await asyncio.wait_for(self._gate.acquire(), timeout=left)
+                except TimeoutError:
+                    raise _stopped() from None
+                try:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        raise _stopped()
+                    await self._flow.run_after_exists(
+                        prefix,
+                        target,
+                        poll_s=poll_s,
+                        timeout_s=left,
+                    )
+                except AdmissionWait:
+                    # 进闸后复查不够：下面的 finally 还名额，回到闸外。
+                    continue
+                except AdmissionStop as e:
+                    raise PrefetchError(
+                        f"segment missing, prefetch stopped: {e}"
+                    ) from e
+                else:
+                    return
+                finally:
+                    self._gate.release()
+        finally:
+            self._ops.close_segment_budget(token)
 
     async def _track(self, handle: TaskHandle, poll_s: float, timeout_s: float) -> None:
         """轮询恢复的句柄到终态。不占传输闸（已知窗口，见设计文档）。"""
-        # 轮询前取 prefix：终态即删核验登记，READY 后再取就是 None
+        # 轮询前取 prefix / target：终态即删核验登记，READY 后再取就是 None
         prefix = self._ops.prefix_of(handle)
+        target_of = getattr(self._ops, "target_of", None)
+        target = target_of(handle) if target_of is not None else None
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout_s
         try:
-            await self._track_loop(handle, prefix, loop, deadline, poll_s)
+            await self._track_loop(handle, prefix, target, loop, deadline, poll_s)
         except asyncio.CancelledError:
             # 进程退出取消：断开跟踪并记账（否则账本留 running，重启又
             # 被 rebuild 捞回来跟）。后端任务不取消（无此能力）。
@@ -491,7 +592,7 @@ class TaskEngine:
                 pass
             raise
 
-    async def _track_loop(self, handle, prefix, loop, deadline, poll_s):
+    async def _track_loop(self, handle, prefix, target, loop, deadline, poll_s):
         """轮询恢复的句柄到终态。
 
         三种异常各有明确结局（前一种是「继续」，后两种是「停止」）：
@@ -509,15 +610,32 @@ class TaskEngine:
             except KeyError:
                 return  # 句柄已被收口（shutdown abandon），预期内
             if status in (TaskStatus.READY, TaskStatus.FAILED):
-                # READY 接线（恢复侧）：重启前没来得及注册的保活在这里补上
-                if status is TaskStatus.READY and self._keepalive is not None:
-                    if prefix is not None:
-                        self._keepalive.register(prefix)
+                # READY 接线（恢复侧）：重启前没来得及注册的保活、没发出的
+                # BlockStored 在这里补上。target 必须在轮询前取好。
+                if status is TaskStatus.READY:
+                    self._on_ready(prefix, target)
                 return
             if loop.time() >= deadline:
                 await self._ops.abandon(handle)  # 超时收口（与流程同语义）
                 return
             await asyncio.sleep(poll_s)
+
+    def _on_ready(self, prefix: Prefix | None, target: InstanceId | None) -> None:
+        """第一次看到 READY：注册保活，并按目标实例补发一条 BlockStored。
+
+        正常路径与恢复路径共用这一跃迁。没有端点、或补发抛错，都不把
+        已经核验通过的预热打成失败——保活照常注册，异常只记日志。
+        """
+        if prefix is not None and self._keepalive is not None:
+            self._keepalive.register(prefix)
+        if self._events is None or prefix is None or target is None:
+            return
+        try:
+            self._events.publish_block_stored(prefix, target)
+        except Exception:
+            logger.exception(
+                "kvcm 补发 BlockStored 失败 target=%s（预热仍成功）", target
+            )
 
     async def _throttle(self) -> None:
         """限速器钩子（E15 接入点）：False = 等下一轮再试。"""

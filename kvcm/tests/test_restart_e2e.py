@@ -53,6 +53,18 @@ def fake_store_module(monkeypatch):
     pkg = types.ModuleType("mooncake")
     monkeypatch.setitem(sys.modules, "mooncake", pkg)
     monkeypatch.setitem(sys.modules, "mooncake.store", mod)
+
+    class _RoomyAdmin:
+        def query_segment(self, segment):
+            return (0, 1 << 62)
+
+    orig_init = MooncakeBackend.__init__
+
+    def _init(self, *args, **kwargs):
+        kwargs.setdefault("admin", _RoomyAdmin())
+        orig_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(MooncakeBackend, "__init__", _init)
     return mod
 
 
@@ -75,6 +87,11 @@ class FakeClient(StoreClient):
 
     def batch_memory_replica_endpoints(self, keys):
         return {k: list(self._replicas_on) for k in keys}
+
+    def batch_memory_replica_sizes(self, keys):
+        if not self._replicas_on:
+            return {k: [("__source__", 1024, ())] for k in keys}
+        return {k: [(ep, 1024, ()) for ep in self._replicas_on] for k in keys}
 
 
 class FakeKeepalive:

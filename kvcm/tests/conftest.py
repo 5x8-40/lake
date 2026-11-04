@@ -5,12 +5,32 @@
 代价：IDE / 类型检查器对 ``import kvcm`` 的解析依赖编辑器自身的
 rootdir 推断。日后 kvcm 打包（加 pyproject.toml）时删本文件、CI 改
 ``pip install -e .``。
+
+标记：
+- ``smoke``：无 NPU 核心单测，CI / 本地都可跑
+- ``npu``：真机冒烟；未设 ``KVCM_NPU_SMOKE=1`` 时自动 skip（CI 不跑）
 """
+
+from __future__ import annotations
 
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+
+def pytest_collection_modifyitems(config, items):
+    """未显式打开时跳过 ``npu``，避免 GitHub Actions 误拉真机床。"""
+    if os.environ.get("KVCM_NPU_SMOKE") == "1":
+        return
+    skip_npu = pytest.mark.skip(
+        reason="NPU 真机冒烟：本地设 KVCM_NPU_SMOKE=1 后 pytest -m npu"
+    )
+    for item in items:
+        if "npu" in item.keywords:
+            item.add_marker(skip_npu)
 
 
 def run(coro):
