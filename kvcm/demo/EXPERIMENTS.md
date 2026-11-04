@@ -31,7 +31,7 @@
 | 21 | 11/02 | NAH 源码诊断：给 `OffsetBufferAllocator::allocate` / `CopyStart` 打 `largest_free` | **方案已定、真机未跑成**（需改 Mooncake 打 `largest_free`；出网无法编换 .so / 装 gdb；当时卡被占）——不阻塞 #18/#22 结论 | — |
 | 22 | 11/02 | **seg 容量剂量**：同风暴半占用(~50%) + window=4 ×42，B **1GB vs 4GB** | **1GB：25/42、17 NAH**（失败时 B free≈449MB）；**4GB：42/42、0 NAH**。加大 segment 后 NAH 消失 → 运营上「segment 太小/有效空间不够」成立；但失败瞬间仍有数百 MB free，**不等于**字节已见底（与 #18 一致） | 见「实验实录 · 2026-11-02 · #22」 |
 | 23 | 11/02 | 单机 45：A=TP2(:8001) + 本机合成目标 seg（卡6/7）+ **PR71 E14** （真 Mooncake `create_copy_task` + 真 `ZmqEventPublisher`） | **发件人侧通过**：warm→拷前 0→`create_copy_task=2`→拷后 2/2→`BlockStored(CPU, full_attention)`；warm 落 225 = A 近满 spill（非代码错）；真机脚本手工不进 Actions；**未验**索引/选路/gRPC/注册 | 见「实验实录 · 2026-11-02 · #23」 |
-| 24 | 11/02 | 单机 45：A=TP2(:8001) + **16MiB 合成空段**（卡6/7）+ **PR72 段容量准入**（真 warm / 真副本大小 / 真 `/query_segment`） | **通过**：need≈50MiB > remaining=16MiB → 闸外等待 → `stopped before submit`，`create_copy_task=0`；真机脚本**手工**（不进 Actions）；**未验**：腾出后再拷、TP>1 只查第一段漏放、gRPC | 见「实验实录 · 2026-11-02 · #24」；[`tools/admission_real_smoke.py`](tools/admission_real_smoke.py) |
+| 24 | 11/02 | 单机 45：A=TP2(:8001) + **16MiB 合成空段**（卡6/7）+ **PR72 段容量准入**（真 warm / 真副本大小 / 真 `/query_segment`） | **通过**：need≈50MiB > remaining → `stopped before submit`；假 admin `@pytest.mark.smoke`（CI 可跑）；真机 `@pytest.mark.npu`（`KVCM_NPU_SMOKE=1`，不进 Actions）；**未验**：腾出后再拷、TP>1 漏放、gRPC | 见「实验实录 · 2026-11-02 · #24」；[`tools/admission_real_smoke.py`](tools/admission_real_smoke.py) |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
 
@@ -377,7 +377,8 @@ pid。途中根出 8 个坑，全部对代码验证：
 - A=Qwen3.8-27B hybrid TP2 卡0/1 `:8001`，`--block-size 1536`，`PYTHONHASHSEED=0`
 - 目标：本机合成空段卡 6/7，各 **16MiB**（master 段大小下限；远小于单 block）
 - 控制面：进程内 `TaskEngine` + `MooncakeBackend(admin=AdminClient)`（非 gRPC daemon）；卡 2 给控制面 ACL
-- 复现：[`tools/admission_real_smoke.py`](tools/admission_real_smoke.py)（**真机手工**；不进 GitHub Actions。Actions 只跑假 admin 单测）
+- 复现：[`tools/admission_real_smoke.py`](tools/admission_real_smoke.py)；pytest 入口 [`../tests/test_admission_npu_smoke.py`](../tests/test_admission_npu_smoke.py)（`@pytest.mark.npu`，**不进 Actions**；本地 `KVCM_NPU_SMOKE=1 pytest -m npu`）
+- 无 NPU 单测：`test_backend.py` 中 `test_admit_*`（`@pytest.mark.smoke`，CI / 本地都可跑）
 - 环境变量见脚本头（`ADMIT_HOST` / `ADMIT_MASTER` / `ADMIT_MODEL_PATH` 等）；缺省仍为本床 45 机口径
 
 ### 判定口径

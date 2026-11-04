@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """PR72 #24 真测：段剩余 = master Capacity−Used；need 来自真副本大小。
 
-真机手工冒烟，不进 GitHub Actions（需 NPU + master + 引擎 warm）。
-Actions 只覆盖假 admin 单测（``kvcm/tests/test_backend.py`` 准入用例）。
+真机冒烟：不进 GitHub Actions（需 NPU + master + 引擎 warm）。
+本地经 pytest 跑（默认 skip）::
+
+    KVCM_NPU_SMOKE=1 python -m pytest tests/test_admission_npu_smoke.py -m npu -q
+
+假 admin 准入单测打 ``@pytest.mark.smoke``，CI / 本地都可跑。
 
 做法：
   1) 合成空段（默认卡 6/7，各 16MiB，远小于一个 KV block）

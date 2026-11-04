@@ -1557,6 +1557,7 @@ def _forbid_wait(monkeypatch) -> None:
     monkeypatch.setattr("kvcm.backends.mooncake.backend.asyncio.sleep", _sleep)
 
 
+@pytest.mark.smoke
 def test_admit_submits_when_segment_has_room(fake_store_module, monkeypatch) -> None:
     """放得下才发。"""
     key = _rank_key("a", 0)
@@ -1568,6 +1569,7 @@ def test_admit_submits_when_segment_has_room(fake_store_module, monkeypatch) -> 
     assert [k for k, _segs in client.created] == [key]
 
 
+@pytest.mark.smoke
 def test_admit_waits_outside_the_prefix_gate(fake_store_module, monkeypatch) -> None:
     """放不下时在前缀闸外等：睡眠时闸是空的，整批还没发；空间下来再进闸提交。
 
@@ -1601,6 +1603,7 @@ def test_admit_waits_outside_the_prefix_gate(fake_store_module, monkeypatch) -> 
     assert client.measure_calls == 1
 
 
+@pytest.mark.smoke
 def test_admit_ignores_keys_already_on_target(fake_store_module, monkeypatch) -> None:
     """已在目标段上的 key 不计入新占用。
 
@@ -1624,6 +1627,7 @@ def test_admit_ignores_keys_already_on_target(fake_store_module, monkeypatch) ->
     assert [k for k, _segs in client.created] == [on_seg, fresh]
 
 
+@pytest.mark.smoke
 def test_admit_queries_segment_once(fake_store_module, monkeypatch) -> None:
     """只查计划里的第一个目标段，一次 /query_segment。这一段放不下，整批不发。"""
     from kvcm.ops.base import AdmissionWait
@@ -1651,6 +1655,7 @@ def test_admit_queries_segment_once(fake_store_module, monkeypatch) -> None:
     assert admin.calls == ["seg-A"]
 
 
+@pytest.mark.smoke
 def test_admit_ignores_bytes_on_other_segments(
     fake_store_module, monkeypatch
 ) -> None:
@@ -1677,6 +1682,7 @@ def test_admit_ignores_bytes_on_other_segments(
     assert admin.calls == ["seg-A"]
 
 
+@pytest.mark.smoke
 def test_admit_estimates_missing_sizes(fake_store_module, monkeypatch, caplog) -> None:
     """缺大小时用本批已拿到的一个 key 的大小估算，日志里能看到。
 
@@ -1714,6 +1720,7 @@ def test_admit_estimates_missing_sizes(fake_store_module, monkeypatch, caplog) -
     assert "估算" in caplog.text
 
 
+@pytest.mark.smoke
 def test_admit_missing_segment_fails_immediately(fake_store_module, monkeypatch) -> None:
     """段名找不到：立即停，不空等。容量为 0 同样当找不到。不是复制失败。"""
     from kvcm.backends.mooncake.http_admin import SegmentNotFound
@@ -1737,6 +1744,7 @@ def test_admit_missing_segment_fails_immediately(fake_store_module, monkeypatch)
     assert client2.created == []
 
 
+@pytest.mark.smoke
 def test_admit_retries_transient_admin_error(fake_store_module, monkeypatch, caplog) -> None:
     """管理端口暂时 5xx：闸外等待后重查，不盲提交。大小不随每轮重取。"""
     import logging
@@ -1781,6 +1789,7 @@ def test_admit_retries_transient_admin_error(fake_store_module, monkeypatch, cap
     assert "重试" in caplog.text
 
 
+@pytest.mark.smoke
 def test_admit_refuses_when_batch_has_no_size(fake_store_module, monkeypatch) -> None:
     """整批一个大小都没有：报出描述上的属性名，不用 0，也不提交。"""
     key = _rank_key("a", 0)
@@ -1818,6 +1827,7 @@ def test_buffer_size_reads_pybind_name() -> None:
     assert "buffer_address" in attrs
 
 
+@pytest.mark.smoke
 def test_admit_without_admin_refuses(fake_store_module, monkeypatch) -> None:
     """没有管理端口就不知道剩余，拒绝提交。"""
     key = _rank_key("a", 0)
@@ -1829,6 +1839,7 @@ def test_admit_without_admin_refuses(fake_store_module, monkeypatch) -> None:
     assert client.created == []
 
 
+@pytest.mark.smoke
 def test_admit_timeout_covers_gate_wait(fake_store_module, monkeypatch) -> None:
     """等前缀闸也吃从开始等待算起的预算。到点还没有任务号就停，不提交。
 
@@ -1866,6 +1877,7 @@ def test_admit_timeout_covers_gate_wait(fake_store_module, monkeypatch) -> None:
     assert client.created == []
 
 
+@pytest.mark.smoke
 def test_admit_slow_query_does_not_extend_timeout(
     fake_store_module, monkeypatch
 ) -> None:
@@ -1897,6 +1909,7 @@ def test_admit_slow_query_does_not_extend_timeout(
     assert elapsed < 2.0, f"到点之后还在等: {elapsed:.2f}s"
 
 
+@pytest.mark.smoke
 def test_admit_cancel_before_submit_records_nothing(
     fake_store_module, monkeypatch
 ) -> None:
