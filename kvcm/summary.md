@@ -239,15 +239,15 @@
 - 工作文档：[D8-joint-scheduling.md](design/D8-joint-scheduling.md)；时序配套：[scheduling.md](design/scheduling.md)。
 - 待定：publisher 是否开启、hook 通道与信任、扩缩 actuator、多 SC 实例 leader、权重/阈值真机校准。
 
-**D9. 控制面：基于 kvcm 的服务地图** — 🟡 设计草案
+**D9. 控制面：执行与运营能力** — 🟡 设计草案
 
-- 定位：kvcm 控制面不做选路、不做扩缩决策、不持有前缀索引；在“执行 + 核验 + 记账 + 发布”边界内，把八项操作组合成服务。
-- 服务面：会话 KV（Session）、预热（Prewarm）、反熵/核验（Anti-entropy）、账本/归因（Ledger）、容量/放置顾问（Capacity Advisor）、下线/迁移（Drain）、治理（Governance）、回放/仿真（Replay）、分支/跨集群（Branch/Geo）。
-- 优先级：P0 = 会话 KV（SESSION 级）+ 预热 + 反熵 + 账本最小集；P1 = 容量顾问 + Drain + 治理；P2 = 回放/仿真、分支/跨集群/rollout。
-- **收益排序**：会话保留（避免 resume 重算）> 预热（避免跨机传输/防 miss）> 反熵/账本（让 ROI 可信）> 容量/Drain（保命中率）。
-- 关键约束：session 权威在 kvcm ledger；保留默认软释放（停 keepalive）；soft pin 有条件可用、hard pin 拒绝；反熵用 v0.3.13.post1 的零副作用 admin 查询。
+- 定位：kvcm 控制面不做选路、不做扩缩决策、不持有前缀索引；在“执行 + 核验 + 记账 + 发布”边界内提供运营能力。**会话 KV、预热、选路、扩缩是 D8 管理面的动作，D9 不重复**；D9 只提供执行接口。
+- 控制面独立能力：反熵/核验（Anti-entropy）、账本/归因（Ledger）、容量/放置顾问（Capacity Advisor）、Drain/迁移、治理（Governance）、回放/仿真（Replay）、分支/跨集群/rollout。
+- 优先级：P0 = 反熵 + 账本；P1 = 容量顾问 + Drain + 治理；P2 = 回放/仿真、分支/跨集群/rollout。
+- **收益**：反熵/账本让 D8 的命中/保留决策可信、可算 ROI；容量/Drain 是“保命中率”的防守型收益；治理/回放让策略可控、可回归。
+- 关键约束：soft pin 有条件可用、hard pin 拒绝；retain 未实现；反熵用 v0.3.13.post1 的零副作用 admin 查询；copy/move 无取消。
 - 工作文档：[D9-kv-services.md](design/D9-kv-services.md)。
-- 待定：pin 前置条件、反熵成本、prewarm 取消、多模型/多租户、retain/跨集群。
+- 待定：反熵采样成本、账本归因回传、容量建议边界、Drain/retain、治理默认策略。
 
 ## 二、潜在问题
 
@@ -330,8 +330,6 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
   - 验收：KVT 合并/墓碑/置信度单测；L0 决策延迟 p99 <5ms；hook observe 模式不改变现有行为；READY/miss 回写闭环。
 - **E18. 反熵 + 账本最小集**——按 [D9](design/D9-kv-services.md)：热条目抽样核验（v0.3.13.post1 用 `GET /batch_query_keys` / `GetReplicaListForAdmin`，零副作用）；`LOST/REMOVED` 事实回写；ledger 增加 bytes/ROI/归因字段。
   - 验收：ghost 检出率、误判率、查询 QPS 预算；预取/保留 ROI 可算；不因核验阻塞请求。
-- **E19. 会话 KV 服务（SESSION 级）**——Open/Attach/Pause/Resume/Close；keepalive 有界续租；TTL/预算；默认软释放。
-  - 验收：resume hit rate、resume TTFT、wasted retention；PIN/DURABLE 随 D2 能力后置。
 
 ## 参考锚点
 

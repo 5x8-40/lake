@@ -9,7 +9,7 @@ KV 管理控制面：独立于推理引擎与 KV 池的第三进程。当前版�
 | **全局设计** | [design/D1-router-scheduling.md](design/D1-router-scheduling.md) | 控制面：Router 集成（选路面的外部接口） |
 | | [design/D2-kv-operations.md](design/D2-kv-operations.md) | 控制面：KV 操作集（八项操作语义 + mooncake 机制事实） |
 | | [design/D8-joint-scheduling.md](design/D8-joint-scheduling.md) | **管理面：统一调度中心（目标形态 + 性能模型）**：hook + KVT + L0/L1/L2，请求 × KV × 扩缩容 |
-| | [design/D9-kv-services.md](design/D9-kv-services.md) | **控制面：服务地图（目标形态 + 收益）**：会话 KV / 预热 / 反熵 / 账本 / 容量 / 迁移（不含调度） |
+| | [design/D9-kv-services.md](design/D9-kv-services.md) | **控制面：执行与运营能力**：反熵 / 账本 / 容量顾问 / Drain / 治理 / 回放 / 分支（会话/预热属 D8，不重复） |
 | | [design/code-architecture.md](design/code-architecture.md) | 服务化代码架构（五层；E10/E11/E15 设计依据） |
 | **专项设计** | [design/kv-prefetch.md](design/kv-prefetch.md) | copy/prefetch 详细方案（A 壳请求 / B 显式副本复制权衡与时序） |
 | | [design/scheduling.md](design/scheduling.md) | 管理面调度时序（L0 选路 / L1 预取与保留 / L2 扩缩与 drain；D8 的配套） |
