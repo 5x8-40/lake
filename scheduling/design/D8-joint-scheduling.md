@@ -1,9 +1,10 @@
 # D8: 统一调度中心——目标形态与性能模型
 
 - 状态: **设计草案**（目标形态与收益模型；数值为模型估算，待真机校准）
-- 版本基线: **Mooncake v0.3.13.post1**（master / client 同版本）；vLLM-Ascend 0.26 系（D1 的事实基线）
-- 上游: [summary.md](../summary.md) D8；[D1-router-scheduling.md](D1-router-scheduling.md)、[D2-kv-operations.md](D2-kv-operations.md) 的决策层扩展
-- 适用部署: **vLLM-Ascend + Mooncake Store + kvcm** 独立部署；Router 是请求控制面（实现语言不限）
+- 版本基线: **Mooncake v0.3.13.post1**（master / client 同版本）；vLLM-Ascend 0.26 系（kvcm D1 的事实基线）
+- 归属: **调度中心（Scheduling Center，SC）**，不属于 kvcm；可以是独立组件，也可以嵌入 Router（或在编排/控制面内置）。本文用“SC”这一逻辑角色，不绑定进程形态
+- 相关: kvcm 的 [D1](../../kvcm/design/D1-router-scheduling.md) / [D2](../../kvcm/design/D2-kv-operations.md)（KV 执行语义）、[D9](../../kvcm/design/D9-kv-services.md)（kvcm 服务面）
+- 适用部署: **vLLM-Ascend + Mooncake Store + kvcm** 独立部署；SC 是请求/容量决策面（实现语言不限）
 - 关系声明: **kvcm 是独立项目，本文不依赖 lake 运行时**。lake 仓库只提供参考文档与原型经验；文中引用 lake 的地方都是“可借鉴”，不是依赖
 - 非目标:
   - 不重新定义 kvcm 八项操作的语义（归 D2）；本文只定义“何时、对谁、花多少预算”发 intent
@@ -17,8 +18,8 @@
 
 ## 0. 结论
 
-1. **终局不是“再加一个调度器”，而是给 Router 补一个决策内核**：一个共享状态 + 三条时间尺度不同的决策环，把“请求去哪、KV 怎么动、集群扩不扩”放进同一套目标与预算。
-2. **索引是事件派生的决策视图，不是第二权威**：引擎 KV events、kvcm READY、Mooncake publisher、Router 推测条目、worker miss 反馈，合成一棵 KVT；Mooncake master 仍是副本权威。
+1. **终局不是“再加一个调度器进程”，而是建一个调度中心（SC）**：可以是独立组件，也可以嵌入 Router；逻辑上是一个共享状态 + 三条时间尺度不同的决策环，把“请求去哪、KV 怎么动、集群扩不扩”放进同一套目标与预算。
+2. **索引是事件派生的决策视图，不是第二权威**：引擎 KV events、kvcm READY、Mooncake publisher、SC 推测条目、worker miss 反馈，合成一棵 KVT；Mooncake master 仍是副本权威。
 3. **最大的性能杠杆是“命中/保留”，不是 HBM 命中后的本地拷贝优化**：命中省掉的是秒级 prefill；本地放置省掉的是十毫秒级跨机传输；HBM 命中再省掉毫秒级本地拷贝。三者的量级差一个数量级以上，调度优先级必须按这个顺序设计。
 4. **kvcm 的定位是“KV 执行 + 核验 + 记账 + 发布”**：不做选路、不做扩缩决策、不持有前缀索引。它的八项操作组合成会话、预热、反熵、账本、容量、迁移等服务。
 5. **v0.3.13.post1 下，soft pin 空写已“有条件可用”**（PR73）；hard pin 事后设置已明确拒绝；copy/move 仍无取消；retain 仍未实现；池 publisher 代码有、但默认构建/运行都不开。设计必须按这个基线写，而不是按 main。
@@ -27,14 +28,26 @@
 
 ## 1. 目标形态
 
+### 1.0 进程形态：SC 不是 kvcm，也不一定是 Router
+
+SC 是逻辑角色，进程形态三选一（也可以组合：请求环嵌 Router、容量环独立）：
+
+| 形态 | 请求路径 | 状态归属 | 适用 |
+|---|---|---|---|
+| **嵌入 Router** | 无额外一跳 | Router 进程内 | 强延迟敏感、Router 已是唯一入口 |
+| **独立组件** | 多一跳（可异步/缓存/批量） | SC 自己持有 KVT/会话缓存 | 多消费者、独立 HA/扩缩、请求环与容量环解耦 |
+| **编排/控制面内置** | 不接在线请求（批量/离线） | 控制面持有 | 离线调度、容量规划、非交互场景 |
+
+三种形态的**决策逻辑相同**；差别在“谁持有 KVT/会话状态、请求路径是否多一跳、HA/扩缩单元是谁”。本文用 SC 这个逻辑角色，不绑定进程；如果放 Router 里，它也只是 Router 的一个模块，不是 kvcm 的一部分。
+
 ### 1.1 一张图
 
 ```mermaid
 flowchart TB
     A["Agent / 前端 / Coder"] --> G["Gateway<br/>鉴权 / 准入 / 过载"]
-    G -->|"请求 + HookEnvelope"| R["Router / SchedulingCore"]
+    G -->|"请求 + HookEnvelope"| R["Scheduling Center (SC)<br/>独立组件 / Router 内"]
 
-    subgraph R1["Router 内"]
+    subgraph R1["SC 逻辑组件（进程形态可变）"]
         KVT["KVT<br/>block hash → 实例 × 介质 × 状态"]
         HK["Hook 编译<br/>意图 → 需求"]
         SES["Session / Budget<br/>会话 / 保留 / 预算"]
@@ -64,14 +77,14 @@ flowchart TB
 
 | 角色 | 终局职责 | 不做什么 |
 |---|---|---|
-| **Router** | KVT、hook 编译、L0/L1/L2、intent、决策日志 | 不直连 master、不读写 KV、不开机器 |
+| **Scheduling Center (SC)** | KVT、hook 编译、L0/L1/L2、intent、决策日志 | 不直连 master、不读写 KV、不开机器；不归 kvcm |
 | **kvcm** | KV 执行、READY 核验、补发事件、会话/保活/台账、反熵 | 不选路、不扩缩、不持有前缀索引 |
 | **vLLM-Ascend** | 执行、产生 KV events、本地 APC | 不做跨实例调度 |
 | **Mooncake** | KV 数据/副本/lease/驱逐/offload | 不解释 token/hash |
 
 ### 1.2 终局的五个特征
 
-1. **需求前置**：hook 在请求前给出会话、前缀、ETA、保留意图；Router 提前预取/保留/扩容，而不是等请求到了再反应。
+1. **需求前置**：hook 在请求前给出会话、前缀、ETA、保留意图；SC 提前预取/保留/扩容，而不是等请求到了再反应。
 2. **视图统一**：请求、KV 位置、会话、容量、价格在同一决策状态里；不是“路由看一套、KV 看一套、扩缩看一套”。
 3. **决策分层**：L0 <5ms、L1 100ms–1s、L2 5–60s；三条环通过价格/预算耦合，不互相阻塞。
 4. **KV 生命周期服务化**：会话保留、预热、反熵、账本、迁移是长期运行的服务，不是一次性脚本。
@@ -106,7 +119,7 @@ flowchart TB
 ### 1.5 明确不做
 
 - 不做“全局在线优化器”：请求路径算不动，也会把扩缩抖动带进 TTFT。
-- 不让 Router 直读 Mooncake master：Router 会变成池感知组件，且每请求多一跳；D1 §2 已排除。
+- 不让 SC 直读 Mooncake master：SC 会变成池感知组件，且每请求多一跳；kvcm D1 §2 已排除。
 - 不让 kvcm 持有前缀索引：索引是在线服务，kvcm 是后台控制面（D1 §4）。
 - 不做固定降级链：失败按最新状态重跑。
 - 不做“无限 pin/无限预取”：没有预算的保留等于没有策略。
@@ -119,7 +132,7 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    subgraph R["Router（只做前缀亲和/负载）"]
+    subgraph R["传统 Router（只做前缀亲和/负载）"]
         R1["查前缀索引"] --> R2["选实例"]
     end
     subgraph K["kvcm（只做 KV 操作）"]
@@ -136,7 +149,7 @@ flowchart LR
 
 典型互相抵消：
 
-- Router 把请求发到 A，kvcm 把 KV 预取到 B——预取白做；
+- 传统 Router 把请求发到 A，kvcm 把 KV 预取到 B——预取白做；
 - 扩缩把持有热前缀的节点缩掉——命中率下降，再扩回来；
 - hook 说“30 秒后还要用”，但没人把它变成预取/保留/不缩容；
 - kvcm READY 只写日志，没回写索引——下一次还是不知道 B 有了。
@@ -230,7 +243,7 @@ stateDiagram-v2
 - 前缀值不值得保留、保留多久；
 - 已经花了多少预取/保留预算。
 
-**权威在 kvcm ledger 的 sessions 表**（D2 的“不可丢”状态），Router 持缓存；Router 重启后回读，不丢会话。
+**权威在 kvcm ledger 的 sessions 表**（kvcm D2 的“不可丢”状态），SC 持缓存；SC 重启后回读，不丢会话。
 
 ### 3.3 Capacity / Price
 
@@ -259,7 +272,7 @@ stateDiagram-v2
 sequenceDiagram
     participant A as Agent/前端
     participant G as Gateway
-    participant R as Router
+    participant R as SC
     participant K as kvcm
     participant W as vLLM-Ascend
 
@@ -296,10 +309,10 @@ sequenceDiagram
 
 ### 4.3 语义
 
-- **hint ≠ command**：Router/kvcm 可裁剪、推迟、拒绝；请求正确性不依赖 hook。
+- **hint ≠ command**：SC/kvcm 可裁剪、推迟、拒绝；请求正确性不依赖 hook。
 - **fail-open**：解析失败/版本不认识/预算超限 → 丢弃 + metric，不影响请求。
 - **预算与审计**：每 session/租户有 pin/预取/带宽上限；hook 可审计。
-- **key 口径**：vLLM-Ascend 是链式 block hash（`parent_hash`、block_size、模型类型、初始种子参与），TP 下同一逻辑块多把 key。Router 必须用与引擎逐字节一致的 hash 算法；hook 优先带 hash/token_ids，不要用估算 token 数。
+- **key 口径**：vLLM-Ascend 是链式 block hash（`parent_hash`、block_size、模型类型、初始种子参与），TP 下同一逻辑块多把 key。SC 必须用与引擎逐字节一致的 hash 算法；hook 优先带 hash/token_ids，不要用估算 token 数。
 - **不等待**：pre_announce 只影响未来；attached 请求走当前最优路径，不等 READY。
 
 ---
@@ -317,11 +330,11 @@ flowchart TB
     D -->|"否"| T{"Pool 命中 + 带宽够?"}
     T -->|"是"| PD["PD / 本地读"]
     T -->|"否"| CO["COLOCATED"]
-    DD --> SC["打分/约束/选择"]
-    PD --> SC
-    CO --> SC
-    SC --> O["下发 + Speculative"]
-    SC --> I["异步 KVIntent"]
+    DD --> SEL["打分/约束/选择"]
+    PD --> SEL
+    CO --> SEL
+    SEL --> O["下发 + Speculative"]
+    SEL --> I["异步 KVIntent"]
 ```
 
 打分（示意）：
@@ -464,7 +477,7 @@ choose max(gain − loss)
 - **冷却**：`T_cool ≥ T_provision + T_warm + T_drain`，防扩缩振荡。
 - **滞回**：扩容阈值 > 缩容阈值；连续 N 周期才动作。
 - **优先级**：L0 永远不被 L1/L2 阻塞；L1 intent 异步；L2 只发目标容量。
-- **价格**：L2 单点更新；L0/L1 只读；多 Router 时 L2 走 leader。
+- **价格**：L2 单点更新；L0/L1 只读；多 SC 实例时 L2 走 leader。
 
 ---
 
@@ -475,7 +488,7 @@ choose max(gain − loss)
 ```mermaid
 sequenceDiagram
     participant A as Agent
-    participant R as Router
+    participant R as SC
     participant K as kvcm
     participant M as Mooncake
     participant W as vLLM-Ascend
@@ -515,7 +528,7 @@ sequenceDiagram
     participant O as 编排
     participant N as 新实例
     participant K as kvcm
-    participant R as Router
+    participant R as SC
 
     L2->>O: ScaleOut
     O->>N: provision + weights
@@ -555,7 +568,7 @@ flowchart TB
 
 ```mermaid
 sequenceDiagram
-    participant R as Router
+    participant R as SC
     participant KVT as KVT
     participant W as 实例 B
     participant K as kvcm
@@ -733,7 +746,7 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 - 源 gap：replay → snapshot → stale；stale 不当作 HBM 命中。
 - kvcm 挂：intent 失败/排队，路由不受影响；ledger 持久化，恢复后继续。
 - 编排挂：不扩缩，告警；已发决策幂等重试。
-- 多 Router：KVT 各一份；会话粘性；L2 leader；intent 幂等。
+- 多 SC 实例：KVT 各一份；会话粘性；L2 leader；intent 幂等。
 - 失败不写固定降级链；按最新状态重跑。
 
 ---
@@ -797,7 +810,7 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 3. **soft pin 前置**：生产能否保证 Case B（单 slice、无盘副本、key 存在）？不能则退回 keepalive。
 4. **retain**：move 到活 seg / kvcm 自挂 SSD 是否足够？是否等 0.3.14/main 的 retained client/DFS？
 5. **E15 带宽限速**：预取/迁移与在线流量怎么隔离？是否需要网卡采样？
-6. **多 Router leader**：etcd 还是复用现有控制面？leader 故障时扩缩暂停容忍多久？
+6. **多 SC 实例 leader**：etcd 还是复用现有控制面？leader 故障时扩缩暂停容忍多久？
 7. **权重/阈值**：`w_*`/`λ_*`、warm gate、TTL 需真机校准。
 8. **layerwise**：vLLM-Ascend layerwise 读路径改变传输成本；D6 未定，L0 成本模型要留接口。
 9. **hook 标准**：agent 框架怎么发？header/body/独立端点？谁签名？
@@ -811,22 +824,22 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 失�
 
 | 参考 | 锚点 | 借了什么 | 关键差异 |
 |---|---|---|---|
-| **kvcm D1/D2** | `D1-router-scheduling.md` §2/§4；`D2-kv-operations.md` §1/§4 | intent ≠ command、READY、补发事件、单向边界、八操作/状态四类 | 本文补 hook/KVT/L2；不改变 kvcm actuator 定位 |
+| **kvcm D1/D2** | `kvcm/design/D1-router-scheduling.md` §2/§4；`kvcm/design/D2-kv-operations.md` §1/§4 | intent ≠ command、READY、补发事件、单向边界、八操作/状态四类 | 本文补 hook/KVT/L2；不改变 kvcm actuator 定位 |
 | **Dynamo** | `lib/kv-router/src/protocols.rs::WorkerSelectionResult`；`components/src/dynamo/planner/core/load_scaling.py::LoadScalingMixin`；`lib/kv-router/src/services/indexer/listener.rs::handle_gap` | overlap 作为一等输入；慢/快双环；gap + replay | Dynamo 索引是事件派生副本；本文用多源 + 墓碑 + 置信度 |
 | **llm-d** | `pkg/kvcache/prefix_match.go::SpeculativeTier`；`.../preciseprefixcache/prerequest.go::defaultSpeculativeTTL`；`pkg/epp/scheduling/scheduler.go::Scheduler.Schedule` | 推测索引补窗口；scorer 插件化 | 推测只做亲和，不当作 HBM 命中；不依赖“逼近引擎真相” |
 | **AIBrix** | `pkg/kvevent/manager.go::Manager`；`pkg/controller/podautoscaler/context/context.go`（`gpu_cache_usage_perc`） | ZMQ 事件→前缀索引；KV 使用率/排队长度扩缩 | AIBrix 各副本各自收敛；本文 KVT 单实例内合并 + L2 leader |
 | **SGLang** | `sgl-model-gateway/src/policies/cache_aware.rs::CacheAwarePolicy`；`policies/tree.rs::Tree`；`srt/managers/kv_hints.py::KvHintsEnvelope`；`unified_cache/session_ref_tracker.py::UnifiedSessionRefTracker` | 近似树 + 最短队列；带版本 hint；session 软保护 | 目标部署用 vLLM-Ascend；session 保留落 kvcm，不落引擎 |
 | **vLLM** | `vllm/v1/kv_hints/protocol.py::KvHintsEnvelope`；`vllm/v1/core/sched/scheduler.py::Scheduler` | hint 动词表；节点级 scheduler 分层 | hint 在本文被编译成 Demand；仍 hint ≠ command |
-| **Mooncake** | `master_service.cpp::CopyStart`、`BatchEvict`、`CreateDrainJob`、`GetReplicaListForAdmin`；`KvEventPublisher` | copy 幂等、lease/驱逐、drain、零副作用核验、池事件 | Router 不碰 PoolKey/seg；全部经 kvcm intent |
+| **Mooncake** | `master_service.cpp::CopyStart`、`BatchEvict`、`CreateDrainJob`、`GetReplicaListForAdmin`；`KvEventPublisher` | copy 幂等、lease/驱逐、drain、零副作用核验、池事件 | SC 不碰 PoolKey/seg；全部经 kvcm intent |
 | **KVCR** | `src/kvcr/remote_fw_dram.py::fetch` / `query` / `_try_release_pin` | 目的地发起 fetch、传输窗口 pin | kvcm 集中式 + master 权威；不需要 fencing |
 | **TensorCast** | `tensorcast/api/_config.py::StorePolicyProfile` | 声明式 policy 预设 | 仅借用 retention class 命名，不照搬存储后端 |
 
 关键差异：
 
 - 参考实现的索引多是大规模事件派生、最终一致；本文承认这一点，用 **墓碑 + 置信度 + miss 反馈 + 抽样核验** 把“不精确”控制在性能层。
-- 参考实现的扩缩多在独立组件；本文把决策放进 Router 的共享状态，但**执行仍分离**（kvcm 执行 KV，编排执行 provision）。
+- 参考实现的扩缩多在独立组件；本文把决策放进 SC 的共享状态，但**执行仍分离**（kvcm 执行 KV，编排执行 provision）。
 - 参考实现的 hint/session 多在引擎内；本文把 session/retention 放到 kvcm，worker 保持无状态。
-- vLLM-Ascend 的 TP/DP per-rank key、Mooncake 的 key 不透明性，决定了“索引必须按逻辑块去重、Router 不能碰 PoolKey”——这是与通用 vLLM router 最大的工程差异。
+- vLLM-Ascend 的 TP/DP per-rank key、Mooncake 的 key 不透明性，决定了“索引必须按逻辑块去重、SC 不能碰 PoolKey”——这是与通用 vLLM router 最大的工程差异。
 
 ---
 

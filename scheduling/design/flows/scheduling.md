@@ -2,6 +2,7 @@
 
 - 定位: [D8-joint-scheduling.md](../D8-joint-scheduling.md) 的流程视图——每张图对应一个决策环或联合场景
 - 状态: 设计草案；版本基线 v0.3.13.post1
+- 归属: 调度中心（SC），不属于 kvcm；SC 可以是独立组件，也可以嵌入 Router。图中 `R` 表示 SC。
 - 读法: `->>` 调用/数据流；`-->>` 响应/异步回执；`--x` 失败/断线；`rect` 底色区分并列场景
 
 > **先记住一个区分**：kvcm 预取到目标 seg，得到的是**本机 DRAM**，不是 HBM。它让请求走本地读、省跨机 RDMA；第一次使用仍要把 KV 从 DRAM 拷进 HBM。**要认定 HBM 命中，需要 HBM 证据**（引擎 GPU 事件，或方案 A 壳请求）。
@@ -14,7 +15,7 @@
 sequenceDiagram
     participant C as Client/Agent
     participant G as Gateway
-    participant R as Router
+    participant R as SC
     participant KVT as KVT
     participant Q as 队列
     participant W as vLLM-Ascend
@@ -70,7 +71,7 @@ flowchart TB
 
 ```mermaid
 sequenceDiagram
-    participant R as Router
+    participant R as SC
     participant K as kvcm
     participant M as Mooncake
     participant W as 目标实例
@@ -102,7 +103,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant A as Agent
-    participant R as Router
+    participant R as SC
     participant K as kvcm
     participant M as Mooncake
 
@@ -133,11 +134,11 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant L2 as Router L2
+    participant L2 as SC L2
     participant O as 外部编排
     participant N as 新实例
     participant K as kvcm
-    participant R as Router L0
+    participant R as SC L0
     participant KVT as KVT
 
     L2->>L2: 预测需求 / 选池 / 预算约束
@@ -167,8 +168,8 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant L2 as Router L2
-    participant R as Router L0
+    participant L2 as SC L2
+    participant R as SC L0
     participant K as kvcm
     participant M as Mooncake
     participant O as 外部编排
@@ -204,8 +205,8 @@ sequenceDiagram
 sequenceDiagram
     participant M as Mooncake
     participant K as kvcm
-    participant L2 as Router L2
-    participant R as Router L0
+    participant L2 as SC L2
+    participant R as SC L0
     participant KVT as KVT
 
     M-->>K: 水位/驱逐事件（或 admin 查询）
@@ -227,7 +228,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant R as Router
+    participant R as SC
     participant KVT as KVT
     participant W as 实例 B
     participant K as kvcm
@@ -250,12 +251,12 @@ sequenceDiagram
 
 ---
 
-## 9. 多 Router：L2 leader
+## 9. 多 SC 实例：L2 leader
 
 ```mermaid
 sequenceDiagram
-    participant R1 as Router-1
-    participant R2 as Router-2
+    participant R1 as SC-1
+    participant R2 as SC-2
     participant E as etcd
     participant O as 外部编排
     participant K as kvcm
@@ -281,7 +282,7 @@ sequenceDiagram
 sequenceDiagram
     participant A as Agent
     participant G as Gateway
-    participant R as Router
+    participant R as SC
     participant K as kvcm
     participant W as vLLM-Ascend
     participant M as Mooncake
@@ -319,4 +320,4 @@ sequenceDiagram
 - **READY 是 DRAM 回写事件**：KVT 的 `Confirmed(DRAM)` 以 kvcm READY/引擎事件为准；HBM 命中需要 HBM 证据。
 - **L2 只出决策**：provision 在外部编排；kvcm 只执行 KV 搬迁。
 - **失败不 fallback**：按最新 KVT/价格重算；读路径兜底不叫 fallback。
-- **多 Router**：请求环可水平扩；L2 单 leader；intent 幂等。
+- **多 SC 实例**：请求环可水平扩；L2 单 leader；intent 幂等。
