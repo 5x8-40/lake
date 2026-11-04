@@ -11,7 +11,7 @@ KV 管理控制面：独立于推理引擎与 KV 池的第三进程。当前版�
 | | [design/D8-joint-scheduling.md](design/D8-joint-scheduling.md) | **管理面：统一调度中心（目标形态 + 性能模型）**：hook + KVT + L0/L1/L2，请求 × KV × 扩缩容 |
 | | [design/D8a-scheduling-algorithms.md](design/D8a-scheduling-algorithms.md) | **管理面：调度算法**：KVT/打分/预取/保留/扩缩的公式、图和收益模型 |
 | | [design/D9-kv-services.md](design/D9-kv-services.md) | **控制面：执行与运营能力**：KV 对账 / 用量账本 / 容量建议 / 下线搬迁 / 保留规则 / 回放 / 分支（会话/预热属 D8，不重复） |
-| | [design/D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md) | **规划：KV Fabric 路线图**：价值金字塔、值得做的方向、三阶段、画饼场景 |
+| | [design/D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md) | **规划：KV Fabric 路线图**：价值金字塔、值得做的方向、三阶段、目标场景 |
 | | [design/code-architecture.md](design/code-architecture.md) | 服务化代码架构（五层；E10/E11/E15 设计依据） |
 | **专项设计** | [design/kv-prefetch.md](design/kv-prefetch.md) | copy/prefetch 详细方案（A 壳请求 / B 显式副本复制权衡与时序） |
 | | [design/scheduling.md](design/scheduling.md) | 管理面调度时序（L0 选路 / L1 预取与保留 / L2 扩缩与 drain；D8 的配套） |
