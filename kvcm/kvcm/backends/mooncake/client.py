@@ -29,6 +29,38 @@ def entry_exists(e) -> bool:
     return e == 1 or e is True or (isinstance(e, int) and e > 0)
 
 
+def _is_memory_replica(desc: object) -> bool:
+    """内存副本判定。绑定上 is_memory_replica 是方法；测试桩可能是布尔。"""
+    flag = getattr(desc, "is_memory_replica", None)
+    if flag is None:
+        return False
+    if callable(flag):
+        try:
+            return bool(flag())
+        except Exception:
+            return False
+    return bool(flag)
+
+
+def _buffer_size(buf: object) -> tuple[int | None, tuple[str, ...]]:
+    """读副本字节数。成功返回 (size, ())；失败返回 (None, 可见属性名)。"""
+    try:
+        attrs = tuple(sorted(n for n in dir(buf) if not n.startswith("_")))
+    except Exception:
+        attrs = ()
+    for name in ("size", "size_"):
+        if not hasattr(buf, name):
+            continue
+        val = getattr(buf, name)
+        # bool 是 int 的子类，不能当成字节数。
+        if callable(val) or isinstance(val, bool) or not isinstance(val, int):
+            continue
+        if val < 0:
+            continue
+        return int(val), ()
+    return None, attrs
+
+
 class StoreClientError(RuntimeError):
     """store 绑定调用失败（rc/err 非零、任务终态非成功）。"""
 
@@ -221,6 +253,37 @@ class StoreClient:
                     mem = desc.get_memory_descriptor()
                     eps.append(mem.buffer_descriptor.transport_endpoint)
             out[str(key)] = eps
+        return out
+
+    def batch_memory_replica_sizes(
+        self, keys: Sequence[str]
+    ) -> dict[str, list[tuple[str, int | None, tuple[str, ...]]]]:
+        """一次 batch_get_replica_desc：每个内存副本的 (端点, 字节数, 属性名)。
+
+        字节数在 buffer_descriptor 上。C++ 字段是 AllocatedBuffer::Descriptor::size_
+        （allocator.h）；pybind 把它暴露成属性名 size（store_py.cpp
+        def_readwrite("size", &size_)，0.3.11 与主线同）。两个名字都读。
+        读不到非负整数时字节数为 None，第三项是描述对象上实际看到的属性名
+        ——调用方用来报错，不许拿 0 或常数顶上。
+
+        不改 batch_memory_replica_endpoints 的返回类型，也不逐 key get_size。
+        """
+        out: dict[str, list[tuple[str, int | None, tuple[str, ...]]]] = {
+            k: [] for k in keys
+        }
+        descs = self._s().batch_get_replica_desc(list(keys))
+        items = descs.items() if isinstance(descs, dict) else zip(keys, descs)
+        for key, replicas in items:
+            rows: list[tuple[str, int | None, tuple[str, ...]]] = []
+            for desc in replicas or []:
+                if not _is_memory_replica(desc):
+                    continue
+                mem = desc.get_memory_descriptor()
+                buf = mem.buffer_descriptor
+                endpoint = str(getattr(buf, "transport_endpoint", "") or "")
+                size, attrs = _buffer_size(buf)
+                rows.append((endpoint, size, attrs))
+            out[str(key)] = rows
         return out
 
     def assert_targets_have_replicas(

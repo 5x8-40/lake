@@ -2,7 +2,7 @@
 
 > **demo 记录**：precopy 预热验证（kvcm 八项操作中仅 **copy** 一项）的实验史。生产化设计见 [../design/](../design/)；kvcm 全貌见 [../README.md](../README.md)。
 
-2026-10-08 ~ 11-02 全量实验史（含已撤回证据），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。
+2026-10-08 ~ 11-02 全量实验史（含已撤回证据；总表至 #24），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。
 
 模型除注明外均为 `/data/models/Qwen3-VL-8B-w8a8c16`（GQA 8 KV head，block_size 128，`PYTHONHASHSEED=0`）；主机 245=7.242.105.245，217=7.242.105.217（**#17 起另用** 45=`7.242.104.45`，225=`7.242.110.225`）；容器镜像 `quay.io/ascend/vllm-ascend:v0.26.0rc1`；mooncake wheel `mooncake_transfer_engine_npu-0.3.11.post1`（除注明外）；master 在源机宿主机 `:50088`。
 
@@ -23,7 +23,7 @@
 | 13 | 10/12 上午 | 跨机 245→217 异构，**bc6b5be 单入口控制面 + 两端 #15835 完整补丁** | 正向回归（升级后首测）：warm A → 单入口 precopy（32 keys=8 满块×4 eff）READY → B 首中 external **88.2%**（从实例启动起累计，不是单请求）、零 invalid、16-tok ×6 + 64-tok ×2 **8/8 逐字一致**（1-token 翻转未复现）。B 机容器无 `ss`：用 admin `:9003/get_all_segments` + 显式 `--targets` | 本次会话记录；见「实验实录 · 10-12 回归 · 正向」 |
 | 14 | 10/12 下午 | 跨机 **反向 217(TP4)→245(TP2)，A 同步 load（无 LOAD_ASYNC）** | **通过**：36/36 key 对号入 A 两 seg（18+18）；每 rank `get keys=18`（9 块×2 sub-key 拼回）、`load_async=False` 证 hunk3 同步分发生效；8/8 token 与 B(TP4) 参考逐字一致；external hit 74.6→79.7%、零 invalid。踩坑：首跑 A 侧 peer 误配成 2（=自身 TP）→ mismatch 静默禁用 → `-800`（指纹 `Failed to get 9 keys`=每块 1 key）；改回 `PEER=4` 即通——同步 load 的 mismatch 路径由此验证通过 | 见「实验实录 · 10-12 回归 · 反向（同步 load）」 |
 | 15 | 10/20 | 跨机正向 keys（#13 的 32 keys）不动，**kill 写入者 A 全进程树 → 等 client TTL 过期 → 复验** | **「副本随属主消失」不成立（纠正踩坑 3 早期误判）**：基线 32/32 → kill（17:06:51）→ 17:08:57 master `client_expired` + unmount A 两 seg（**零驱逐零 remove**）→ `batch_is_exist` **32/32**、副本全在 B 四 seg → 裸 client 跨机 `get` **3/3 字节级读回**（各 4.5MB）→ A 复活后终态仍 32/32。结论：副本存亡绑定 seg 所在 client，key 的 client_id 下线只清其 seg 内副本，远端副本保留 | master 日志切片（本机 `va-precopy/logs/`，不入仓）；见踩坑 3 |
-| 16 | 10/26 | 单机 245：源引擎 TP2 + 合成目标 seg + **kvcm daemon（E11/E12）** | PR70 进程化首验：**e2e 全绿**（warm → SubmitIntent → READY）；踩出 copy 连发打爆 adxl 建链（坑 2：14 连发半挂、窗口 4 节奏化 42/42） | 见「实验实录 · 2026-10-26」 |
+| 16 | 10/26 | 单机 245：源引擎 TP2 + 合成目标 seg + **kvcm daemon（E11/E12）** | PR70 进程化首验：**e2e 全绿**（warm → SubmitIntent → READY）；踩出 copy 连发打爆 adxl 建链（坑 2：14 连发是 `TRANSFER_FAIL`，窗口 4 节奏化 42/42）。与 #17 的 `NO_AVAILABLE_HANDLE` 不是同一次失败 | 见「实验实录 · 2026-10-26」 |
 | 17 | 10/29 | 跨机 **45↔225**，Qwen3.8-27B（hybrid，`--block-size 1536`），**同构 TP2↔TP2**（异构 TP2↔TP4 被 hybrid gate 关掉），PR70 daemon | **主链路通过**（SubmitIntent ~11s READY，B External prefix hit 59.1%）；**并发度压力：14 `create_copy_task` 全成，42 约半挂**——窗口 4+0.2s 节奏在 42 规模仍扛不住；工程风险高，E15 限速为刚需 | 见「实验实录 · 2026-10-29」 |
 | 18 | 10/30 | 先单机 put 填满；后清 225 占卡、拉回 B(TP2)，跨机 42-key 风暴 + `/metrics` 余量 | **驳回「B 物理空间装不下」单因说**：跨机 gate4×42 → 25 成 / **17 全是 NAH**，失败当下 **B 合计仍有 448–525MB free**；专打较空 seg 时 **free≈164MB 仍 NAH**（单对象 ~32MB 装得下）。put 填满对照给的是 `-800` 不是 `-200`。NAH 与**并发/分配压力**相关，不是「字节容量见底」 | 见「实验实录 · 2026-10-30 · #18」 |
 | 19 | 11/02 | 同拓扑 **空闲 B segment** 上 42 key × **window=1 vs window=4**（分轮 warm，每轮前重启 A/B 防 spill） | **两边皆 42/42、0 NAH**（W1≈42s，W4≈11s）。B segment 空闲 + 闸=4 **复现不出** #17/#18 的 NAH →「纯 window=4 并发预留」不是充分条件；#18 半挂需叠加更高连发/已有占用/节奏等因素 | 见「实验实录 · 2026-11-02 · #19」 |
@@ -31,6 +31,7 @@
 | 21 | 11/02 | NAH 源码诊断：给 `OffsetBufferAllocator::allocate` / `CopyStart` 打 `largest_free` | **方案已定、真机未跑成**（需改 Mooncake 打 `largest_free`；出网无法编换 .so / 装 gdb；当时卡被占）——不阻塞 #18/#22 结论 | — |
 | 22 | 11/02 | **seg 容量剂量**：同风暴半占用(~50%) + window=4 ×42，B **1GB vs 4GB** | **1GB：25/42、17 NAH**（失败时 B free≈449MB）；**4GB：42/42、0 NAH**。加大 segment 后 NAH 消失 → 运营上「segment 太小/有效空间不够」成立；但失败瞬间仍有数百 MB free，**不等于**字节已见底（与 #18 一致） | 见「实验实录 · 2026-11-02 · #22」 |
 | 23 | 11/02 | 单机 45：A=TP2(:8001) + 本机合成目标 seg（卡6/7）+ **PR71 E14** （真 Mooncake `create_copy_task` + 真 `ZmqEventPublisher`） | **发件人侧通过**：warm→拷前 0→`create_copy_task=2`→拷后 2/2→`BlockStored(CPU, full_attention)`；warm 落 225 = A 近满 spill（非代码错）；真机脚本手工不进 Actions；**未验**索引/选路/gRPC/注册 | 见「实验实录 · 2026-11-02 · #23」 |
+| 24 | 11/02 | 单机 45：A=TP2(:8001) + **16MiB 合成空段**（卡6/7）+ **PR72 段容量准入**（真 warm / 真副本大小 / 真 `/query_segment`） | **通过**：need≈50MiB > remaining → `stopped before submit`；假 admin `@pytest.mark.smoke`（CI 可跑）；真机 `@pytest.mark.npu`（`KVCM_NPU_SMOKE=1`，不进 Actions）；**未验**：腾出后再拷、TP>1 漏放、gRPC | 见「实验实录 · 2026-11-02 · #24」；[`tools/admission_real_smoke.py`](tools/admission_real_smoke.py) |
 
 ## 实验实录（异构 TP e2e，2026-10-09，A2 RoCE）
 
@@ -189,17 +190,17 @@ pid。途中根出 8 个坑，全部对代码验证：
 
 失败形态（42 规模主导）：
 
-- **`NO_AVAILABLE_HANDLE (max retries reached: 10)`** → 最终 `TRANSFER_FAIL`：源 worker 向目标 adxl **并发建链**资源不够；store 只对这类错误重试有限次，**不是排队变慢，是硬失败终态**。
+- **`NO_AVAILABLE_HANDLE (max retries reached: 10)`**：master 留内存失败，不是 #16 那种建链连不上（`ConnectToPeer FAILED` → `TRANSFER_FAIL`）。store 对这个错误有限次重试，**不是排队变慢，是硬失败终态**。
 - 偶发 **`OBJECT_NOT_FOUND`**：master `--default_kv_lease_ttl 11000`（≈11s）；大批量跑久了 key 过期（与建链风暴叠加）。
 - 方法陷阱：同一批 key 先跑窗口 4 再跑窗口 14 → 第二轮大量 `replica_copy_skipped` 假全成；**对比必须用互不重叠的 fresh key**。
 - 风暴后遗症：即便改回串行，仍可能半挂（信道缓存中毒，同 #16 坑 5/8）；需**重启源引擎**才能复原。
 
-对照 #16 坑 2（单机、合成目标 seg）：当时「窗口 4 节奏化 = 42/42 全成」。**本次跨机双真实引擎 TP2 上，同样 42 任务 + 窗口 4+0.2s 仍约半挂**——说明「闸=4」不是跨拓扑的充分条件，E15 正式限速 / 背压仍缺。
+对照 #16 坑 2（单机、合成目标 seg）：当时连不上是 `TRANSFER_FAIL`，窗口 4 节奏化 42/42 全成。**本次跨机是另一件事**：主错误是 `NO_AVAILABLE_HANDLE`（master 留内存失败）；同样 42 任务 + 窗口 4+0.2s 仍约半挂。「闸=4」限的是在飞建链，不看目标段剩余。E15 的网卡限速仍然不做。
 
 ### 工程含义（供 PR70 reviewer）
 
 1. **异步编排 ≠ 无限并发安全**。`asyncio` 只让调用方不堵；Mooncake/Ascend 路径在句柄耗尽时直接 `FAILED`，不会自动排队到成功。
-2. **公开 wheel 未暴露「建链上限 = N」配置**；能确定的是：kvcm 软闸默认 **4**；底层对 `NO_AVAILABLE_HANDLE` **最多重试 10 次**；有效安全区靠实测——本拓扑 **14 任务全成、42 任务不可靠**。
+2. 本床 **14 任务全成、42 任务不可靠**。42 的主错误是 `NO_AVAILABLE_HANDLE`（master 留内存失败，最多重试 10 次），不是 #16 的建链 `TRANSFER_FAIL`。软闸默认 4 限的是在飞建链 RPC，不看段剩余。
 3. **生产风险**：一个稍长前缀在 TP≥2 时很容易展开到数十 key；若 Router 突发多个 prefetch intent，或单 intent 内一次铺开全部 key，会稳定踩到本崖。PR70 现状（`max_concurrent=4` + 进程级 `submit_concurrency`）是止血，**不是**可承诺的 SLO 级吞吐。
 4. **E15 为阻塞项**：需要按窗口推进的限速器 + 明确背压/重试语义；仅靠协程多开会把传输子系统打进降级态（连带打伤引擎自身 put，见 #16 坑 8）。
 5. **异构 TP2↔TP4 本轮未测**：Qwen3.8-27B hybrid 被 gate；要复验异构需换非 hybrid 模型（或上游解除 gate）。
@@ -363,4 +364,48 @@ pid。途中根出 8 个坑，全部对代码验证：
 ### 结论
 
 **E14 发件人侧（READY → 真端口补发 `BlockStored`）在真 Mooncake 路径上通过。** 选路闭环与注册面仍归后续。
+代码锚点：`kvcm/backends/mooncake/backend.py`（`submit_interval_s` 注释与连发止血）、`kvcm/task_engine.py`（`max_concurrent` 传输闸）、Mooncake `client_service` 对 `NO_AVAILABLE_HANDLE` 有限重试（错误文案 `max retries reached: 10`）。
 
+## 实验实录 · 2026-11-02 · #24（PR72 段容量准入）
+
+动机：PR72 在 `create_copy_task` 前用 master `GET /query_segment` 的 **Capacity−Used（段剩余）** 与本批真副本大小比较；放不下则闸外等待，不提交。验证「真剩余 + 真 need」能否拦住拷贝。
+
+
+### 环境
+
+- 容器 `vllm-ascend-lake-test`，主机 45=`7.242.104.45`；master `:50088` / admin `:9003`
+- A=Qwen3.8-27B hybrid TP2 卡0/1 `:8001`，`--block-size 1536`，`PYTHONHASHSEED=0`
+- 目标：本机合成空段卡 6/7，各 **16MiB**（master 段大小下限；远小于单 block）
+- 控制面：进程内 `TaskEngine` + `MooncakeBackend(admin=AdminClient)`（非 gRPC daemon）；卡 2 给控制面 ACL
+- 复现：[`tools/admission_real_smoke.py`](tools/admission_real_smoke.py)；pytest 入口 [`../tests/test_admission_npu_smoke.py`](../tests/test_admission_npu_smoke.py)（`@pytest.mark.npu`，**不进 Actions**；本地 `KVCM_NPU_SMOKE=1 pytest -m npu`）
+- 无 NPU 单测：`test_backend.py` 中 `test_admit_*`（`@pytest.mark.smoke`，CI / 本地都可跑）
+- 环境变量见脚本头（`ADMIT_HOST` / `ADMIT_MASTER` / `ADMIT_MODEL_PATH` 等）；缺省仍为本床 45 机口径
+
+### 判定口径
+
+1. `/query_segment` 读出合成段 `used=0, capacity=16MiB, remaining=16MiB`
+2. 新鲜前缀 warm 后 plan key 全在池；`batch_memory_replica_sizes` 给出真大小（本轮 rank0 目标段 need≈**50MiB**）
+3. `need > remaining`
+4. `run_once` 在预算内以 `PrefetchError: … stopped before submit` 结束
+5. 全程 **`create_copy_task=0`**，合成段上副本仍为 0
+
+### 结果
+
+| 步骤 | 结果 |
+|------|------|
+| 容器内 admission 单测（Py3.12） | 17/17 PASS（宿主机 Py3.9 的 `TaskEngine`/`asyncio.Queue` 构造受事件循环限制，非逻辑回归） |
+| 挂 16MiB 合成段 | `remaining=16777216` |
+| warm 后真 need | `need_bytes=50331648`（> remaining） |
+| `run_once` timeout_s=3 | 日志反复「准入等待：需要 50331648，剩余 16777216」→ **`stopped before submit`** |
+| 提交与落位 | **`create_copy_task=0`**，`replicas on synth=0/2` |
+
+### 未覆盖
+
+- 段剩余变大后继续等待并成功 `create_copy_task`（本轮只验「塞不下则不提交」）
+- 只查计划第一条目标段时，其它 rank 段满导致的漏放/误放
+- gRPC `SubmitIntent` / daemon 装配路径
+
+### 结论
+
+**段容量准入在真 Mooncake 路径上按设计拦住了必败拷贝**：真 `/query_segment` 剩余 + 真副本大小 → 闸外等待 → 超时停在提交前，零 `create_copy_task`。与 #18/#22「NAH 不等于字节见底」不矛盾——本特性只挡「客户端已能看见 need>remaining」的明显塞不下，挡不住分配洞/并发预留类 NAH。
+ (docs(kvcm): 登记 #24 段容量准入真测——need>remaining 不提交)
