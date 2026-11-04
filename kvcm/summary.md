@@ -2,7 +2,7 @@
 
 来源：[issue #54](https://github.com/5x8-40/lake/issues/54)（KV-CM 遗留问题总清单）。本文是 kvcm 预复制生产化的总结文档：设计决策、潜在问题、工程项三类条目的总登记处——已闭环条目在原地标 ✅、结论指向正式文档，待定条目随讨论与实验更新。
 
-文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D8/D9/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（仅验证 copy 一项的端到端链路）；本文 = 登记处。
+文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D8/D9/D10/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（仅验证 copy 一项的端到端链路）；本文 = 登记处。
 
 编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环后在原位置标 ✅，结论落对应正式文档（`design/` 系设计文档 / `demo/` 系 demo 文档）。
 
@@ -249,6 +249,16 @@
 - **不重写轮子**：索引/查询复用 Conductor/Dynamo indexer/Mooncake admin；字节/指标复用 LMCache observability/Prometheus；D9 补的是抽样比对、intent→命中的归因、与 D8 的联动。
 - 工作文档：[D9-kv-services.md](design/D9-kv-services.md)。
 - 待定：KV 对账采样成本、用量账本回传、容量建议边界、下线搬迁/retain、保留/删除默认策略。
+
+
+**D10. KV Fabric 路线图（规划草案）** — 🟡 规划/画饼
+
+- 北极星：把 KV 从“缓存”变成一等云资源——可放置、可复制、可迁移、可计价、可治理。
+- 价值金字塔：L1 省算力（命中/保留/预取）→ L2 省传输/负载（热点多副本/迁移）→ L3 新体验（Agent Memory/分支/共享）→ L4 新商业（FinOps/QoS/记忆服务）。
+- 值得做的方向：KV 负载整形、Agent Memory OS、KV FinOps/QoS、容量数字孪生、KV HA/DR、跨集群 KV Fabric、KV 感知模型路由、KV 存储效率、生态/SDK。
+- 三阶段：H1 省（命中+负载整形+会话记忆+FinOps 最小集）；H2 稳/省（容量孪生+HA/DR+QoS）；H3 新（跨集群+模型路由+生态）。
+- 建议下注：KV 负载整形、Agent Memory OS、KV FinOps/QoS。
+- 工作文档：[D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md)。
 
 ## 二、潜在问题
 
