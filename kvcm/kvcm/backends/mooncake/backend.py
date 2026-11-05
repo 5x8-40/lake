@@ -11,9 +11,8 @@
 
 已接线：copy / move / remove / exists / query_task /
 register_keepalive / unregister_keepalive / renew_once / demote /
-promote / check_promote / memory_instance。pin 仍走基类
-UnsupportedCapabilityError（soft pin 后续 PR）。retain 通道关闭，
-开头直接 NotImplementedError。
+promote / check_promote / memory_instance / pin(SOFT)。pin(HARD)
+拒绝。retain 通道关闭，开头直接 NotImplementedError。
 """
 
 from __future__ import annotations

@@ -2,28 +2,34 @@
 
 > **性质：临时文档。** 本文件只属于 `feat/kvcm-soft-pin` 这个 stacked PR；**合入前必须删除**，PR 描述注明“临时跟踪文档已删除”。
 >
-> 本 PR 基于 `feat/kvcm-demote-promote`；core / demote 的 tracker 仍在树里，本文件只列 soft pin 增量。
+> 本 PR 基于已推送的 #81（`feat/kvcm-demote-promote`）；只列 soft pin 增量。
 
 ## Stack
 
 | PR | 分支 | base | 内容 |
 |---|---|---|---|
-| core | `feat/kvcm-ops-core` | `github/main` | move/remove/admin、prefetch/TaskEngine/daemon、keepalive、A07 |
-| demote/promote | `feat/kvcm-demote-promote` | core | demote / promote / PromoteFlow |
-| soft pin | `feat/kvcm-soft-pin` | demote/promote | native 空写、pin(SOFT)、NoF 收尾 |
+| core | #80 已合入 main | — | move/remove/admin、prefetch/TaskEngine/daemon、keepalive |
+| demote/promote | #81 | `main`（含 #80） | demote / promote / PromoteFlow |
+| soft pin | `feat/kvcm-soft-pin` | #81 | native 空写、pin(SOFT)、NoF |
 
 ## Scope
+
+**能力范围（库能力，未接线）**
+
+- 有 L3 `pin(SOFT)` / native / 单测；daemon / TaskEngine / intent **不会**自动调用。
+- prefetch READY 后是否 pin：不在本 PR。
 
 **包含**
 
 - `kvcm/kvcm/native/`：`_empty_pin.so`、`mooncake_pin_api.h`、构建脚本。
 - `client.soft_pin` + `backend.pin`：空写 upsert、地址检查、`UpsertRevoke`。
-- `capability.soft_pin_after` YES；NoF 与 DRAM memory 分离。
+- `capability.soft_pin_after` YES（main）；NoF 与 DRAM memory 分离。
 - soft pin 测试与版本依赖文档。
 
 **不包含**
 
-- core 的 move/remove/admin/prefetch；demote/promote；两者见前两个 PR。
+- core / demote/promote（#80 / #81）
+- TaskEngine / intent / SessionEnd 接线
 
 ## 设计判断（本 PR）
 
