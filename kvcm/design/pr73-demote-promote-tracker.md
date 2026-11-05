@@ -73,9 +73,18 @@
     查清了但成功条件不满足（终态）。
   - 要不要改名/拆类型（例如操作失败统一名，或 demote 专用），未决；
     见 `code-architecture.md` L3「失败语义」。
-- **A16 / A17（DEFER，跨 PR）**
-  - 同前缀操作串行化、操作粒度统一不在本 PR；core 已合入后见本文件 /
-    后续跨 PR 记录。
+- **A16 同前缀操作串行化（OPEN，本 PR 不修；必须后续修）**
+  - **demote 场景现状**：unregister 后 KeepaliveLoop 不再续该前缀；但同前缀上任意
+    `exists` / `batch_is_exist`（预热前置、PromoteFlow.exists、外部调用等）仍会在
+    **master 上续租**，不依赖保活表。demote 的 `sleep(lease_ttl_s)` 窗口内被续一次，
+    lease 被拉长 → LOCAL_DISK 更难出现 → 易 `VerifyError` 并恢复保活。
+  - **危害**：合法 demote 与同前缀预热/查询并发时，表现成「降层偶发失败」，不是配置错。
+  - **不是**：可接受产品边界；也不是「调用方别并发」就关项。
+  - **以后怎么修**：前缀级串行（A16）——demote 进行中同前缀不得再走会续租或
+    `register_keepalive` 的路径（至少 prefetch / exists 续租侧）。只拦 Loop 或
+    只加长 sleep 不够。不在本 PR / 不在 #82；归属跨操作编排（TaskEngine 或等价）。
+  - **A17**（操作粒度：demote 在 L3 sleep+核验 vs promote 等待在 L2）仍 DEFER，
+    与 A16 相关但不是同一缺口。
 - **A06（DEFER，跨 PR）**
   - move/remove 事件发布在 E14；promote 不涉及事件。
 
@@ -98,3 +107,4 @@
 - **2026-11-05**：#80 squash 合入 main 后，本分支 rebase 到 `origin/main`（仅重放 demote 增量）。
 - **2026-11-05**：登记遗留：demote 用 `VerifyError` 表示「没 LOCAL_DISK」，命名是否统一未决。
 - **2026-11-05**：R05 写清：现状 / 错 target 行为 / 必须跟 E13 修（含 client_id），不是可接受边界。
+- **2026-11-05**：A16 写清（demote×exists 续租）：现状 / 危害 / 必须跟前缀串行修，不是可接受边界。
