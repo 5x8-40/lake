@@ -2,14 +2,14 @@
 
 > **性质：临时文档。** 本文件只属于 `feat/kvcm-demote-promote` 这个 stacked PR；**合入前必须删除**，PR 描述注明“临时跟踪文档已删除”。
 >
-> 代码状态以 git 为准；本 PR 基于 `feat/kvcm-ops-core`，core 的 tracker 仍在树里，本文件只列 demote/promote 的增量。
+> 代码状态以 git 为准；本 PR 基于已合入 main 的 #80（squash `5e2e120`），只列 demote/promote 增量。
 
 ## Stack
 
 | PR | 分支 | base | 内容 |
 |---|---|---|---|
-| core | `feat/kvcm-ops-core` | `github/main` | move/remove/admin、prefetch/TaskEngine/daemon、keepalive、A07 |
-| demote/promote | `feat/kvcm-demote-promote` | core | `demote` / `promote` / `check_promote`、PromoteFlow、lease/promote 参数 |
+| core | #80 已合入 main | — | move/remove/admin、prefetch/TaskEngine/daemon、keepalive、A07；A03/R06 等收口 |
+| demote/promote | `feat/kvcm-demote-promote` | `main`（含 #80） | `demote` / `promote` / `check_promote`、PromoteFlow、lease/promote 参数 |
 | soft pin | `feat/kvcm-soft-pin` | demote/promote | native 空写、pin(SOFT)、NoF 收尾 |
 
 ## Scope
@@ -75,3 +75,4 @@
 ## 维护日志
 
 - **2026-11-04**：从 core tracker 拆出；补 demote 消息、promote 重复检查、promote 返回语义三项清理。
+- **2026-11-05**：#80 squash 合入 main 后，本分支 rebase 到 `origin/main`（仅重放 demote 增量）。
