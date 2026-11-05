@@ -284,6 +284,7 @@ stateDiagram-v2
 
 - L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 里仍登记的 DFS 前提，本质就是能力分支——本层把它落成显式声明。retained client 在这份主线上没有 RPC，通道关闭，L2 不选它
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
+- **声明，不探测**：`--capability` / 构造参数选哪张能力表，启动不探 master、不按版本号分叉。目标版本写在文档与部署约定里；flag 与真实 master 不一致时，运行到核验/操作才失败（daemon 对显式 `v0311` 会在进服务前拒启，因为那个 admin 查询有续租副作用）
 
 **接口演进：KeySet（已定方向，待实施）**
 
@@ -325,7 +326,7 @@ stateDiagram-v2
 - **copy 实现**（发起式）：前缀 → KeyComputer 算 key → locate 得 seg → `KeyComputer.build_plan` 做 rank 映射（异构 TP 反向展开）→ 逐 key 提交；`query_task` 聚合判定 READY。**rank 映射归引擎侧**——存储适配零 key 格式依赖（换引擎本类不动）
 - **exists 与 copy 目前各自独立算 key**：两个操作在接口上相互独立，同一前缀在一次预热里算两遍。短序列时成本可忽略，但长序列下不是——链式块 hash 逐块串行（token 数 ÷ block_size 次，不能并行），外加 块数 × rank 数 个 key 字符串。不设缓存（长驻进程的缓存增长管理问题更大）；正解见下「接口演进：KeySet」
 - **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——放通用层会把后端概念带进通用接口
-- **一个后端实例 = 一种 (源 TP, 目标 TP, put_step) 组合**：KeyComputer 的「key 按多少 rank 展开」规则在构造期定死（`kvcm/engines/vllm/keys.py::KeyComputer` docstring 记了完整前提链），换组合必须新建实例——编排层持多组合时按组合各建一个，不复用
+- **一个后端实例 = 一种 (源 TP, 目标 TP, put_step) 组合**：KeyComputer 的「key 按多少 rank 展开」规则在构造期定死（`kvcm/engines/vllm/keys.py::KeyComputer` docstring 记了完整前提链），换组合必须新建实例——编排层持多组合时按组合各建一个，不复用。**daemon 也是一种**：`--tp-size` / `--peer-tp-size` / `--put-step` 进程级，只建一个 KeyComputer；要服务多种组合就起多个进程，或编排层自持多 backend（本进程不做）
 - **第二后端候选已登记在案**：昇腾 MemCache（`3rdparty/memcache`；kv-prefetch.md 待定项「生产默认走 MemCache，还是留 Mooncake」）——L3 抽象现在建正是时候；但只建一层接口，第二后端真接入时再修接口，不为假想后端过度设计
 
 #### 三条接入通道（mooncake）
@@ -340,6 +341,7 @@ stateDiagram-v2
    - `ForAdmin` 系列（零副作用核验）只在这面：它们是 master 进程内方法，不注册到 client RPC 面——RPC 调不到，HTTP 是唯一通道
    - 查询类走这面的好处：不用注册 client，kvcm 进程死了也不在 master 留任何状态
    - 版本差异：0.3.11 的 `/batch_query_keys` 走普通 `BatchGetReplicaList`（有续租副作用）；main 走 `BatchGetReplicaListForAdmin`（零副作用）
+   - **客户端分批**：长前缀按请求行约 8KB 切 `GET`（只计 `GET {path} HTTP/1.1`，不含 header）。这是保守上限，**未与 master 真实限制校准**；单 key 编码后超限仍单独发出。超长 key / 极密前缀若踩到上游硬限，整批可能失败——要改就按目标版本实测或改 POST，不在 core 里猜
 3. **C 接口**（`mooncake-store/include/store_c.h`，ctypes 可直调）
    - 数据面操作：put / get / is_exist / remove / register_buffer
    - put 的 config 带完整 pin 支持（`with_hard_pin`、`soft_pin_action` ENABLE/DISABLE/PRESERVE、TTL）——但注释明确这只是发布时的行为，即「写新 key 时挂 pin」：写新 key 是引擎的活，kvcm 不写新 key；kvcm 要的 pin 全是**事后操作**（key 已在池里）
@@ -596,6 +598,7 @@ sequenceDiagram
 - **占位策略 = 固定窗口**（READY 后续租一个可配置窗口，窗口到即停租注销）：会话期（依赖 E12 会话信号）与首次命中后停（依赖 E13/E14 命中信号）现在都没有信号，做不了；固定窗口什么都不依赖，且有明确终点（不会把副本变相钉死在热层）。窗口时长参数化，默认 10 分钟只是起步值（真机观察「预热完成到首次流量」的典型间隔后再调）
 - **实现通道**：`KeepaliveLoop` 定期调 `renew_once` → `exists`（`batch_is_exist` / BatchExistKey，读即续租）。`MooncakeBackend.register_keepalive` / `unregister_keepalive` 只登记/注销同一张 Ledger 表，不改成 ProbeKey
 - **形态**：协程定时器（事件循环内 `asyncio.sleep` 周期触发），不是独立线程
+- **已知限制（量未测）**：默认约每 5s `sweep_once`，对表里每个前缀做一次全 key `batch_is_exist`。请求量与 sweep 延迟没有基线；保活前缀多或单前缀很长时，sweep 可能拖过周期。限流 / 分批 / 按前缀错峰要等真机量过再改，core 不先加策略
 
 ### ReleaseLoop / RetainLoop
 
@@ -603,7 +606,7 @@ sequenceDiagram
 
 ### 进程生命周期
 
-- **启动**：`--admin` 必填，空则在进服务循环前返回 1。`--capability` 默认 `main`（核验走主线零副作用 `GET /batch_query_keys`）；显式 `v0311` 同样在进服务循环前返回 1，那个端点有续租副作用，能力集对不上。然后 `rebuild()` 接通——重启后恢复 running 任务的跟踪（见 L5 节）
+- **启动**：`--admin` 必填，空则在进服务循环前返回 1。`--capability` 默认 `main`（核验走主线零副作用 `GET /batch_query_keys`）；显式 `v0311` 同样在进服务循环前返回 1，那个端点有续租副作用，能力集对不上（能力表是声明，见上「capability 声明」）。`--instance-segs` 启动核对 `segment_name == te_endpoint`。然后 `rebuild()` 接通——重启后恢复 running 任务的跟踪（见 L5 节）
 - **优雅退出**（SIGTERM/SIGINT）五步：
   1. **停收 intent**——gRPC 入口关闭（`IntentGrpcServer.stop()`），`TaskEngine._accepting` 置假，`SubmitIntent` 返回 UNAVAILABLE
   2. **取消在途协程**（`task.cancel()`）——协程在 `await` 点收到 `CancelledError`；flow 捕获后做 abandon 处理（Ledger 记 abandoned；后端无任务取消能力 P9，传输不取消，副本清理归 remove）

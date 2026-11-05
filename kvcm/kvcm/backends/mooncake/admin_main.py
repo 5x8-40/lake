@@ -30,7 +30,9 @@ class AdminMainError(RuntimeError):
     """主线管理端点调用失败，或响应不是约定的 JSON。"""
 
 
-# 单批 GET 的请求行上限。长前缀把全部 key 拼进一条 URL 会到几十 KB。
+# 单批 GET 的请求行上限（只计 ``GET {path} HTTP/1.1``，不含 header）。
+# 长前缀把全部 key 拼进一条 URL 会到几十 KB。8KB 是保守值，未与 master
+# 真实限制校准；要改就按目标版本实测或改 POST。
 _MAX_BATCH_QUERY_REQUEST_BYTES = 8192
 
 
@@ -268,9 +270,9 @@ class MainlineAdmin:
     def batch_query_keys(self, keys: Sequence[str]) -> dict[str, KeyReplicaQuery]:
         """``GET /batch_query_keys?keys=k1,k2``。key 逐个百分号编码，逗号作分隔。
 
-        按请求行长度分批。单批 ``GET {path} HTTP/1.1`` 不超过 8KB，
-        各批结果合并后返回。一把 key 自己就超过上限时仍单独发出
-        （切不开）。空列表报错。
+        按请求行长度分批。单批 ``GET {path} HTTP/1.1`` 不超过 8KB
+        （见模块常量注释），各批结果合并后返回。一把 key 自己就超过
+        上限时仍单独发出（切不开）。空列表报错。
         """
         if not keys:
             raise AdminMainError("batch_query_keys requires at least one key")

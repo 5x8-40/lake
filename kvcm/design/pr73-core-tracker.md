@@ -107,10 +107,9 @@
     `_finish(READY)` 之前先等名单写入结束。
   - 写入失败仍不抛、只计数——预热成功，副本可能提前变冷（语义保留）。
   - 消掉的是「READY 已可见、行还在路上」的空窗，不是写失败本身。
-- **R16 保活量未算（OPEN）**
+- **R16 保活量未算（已接受）**
   - `KeepaliveLoop.sweep_once` 每 5s 逐前缀 `renew_once`（全 key `batch_is_exist`）。
-  - 请求量/延迟未测量；长前缀可能拖慢 sweep。
-  - 方向：测量、限流、分批或按前缀错峰。
+  - 量未测；已知限制写进 `code-architecture.md` KeepaliveLoop 节。真机量过再限流/分批。
 
 ### 2. admin / 部署
 
@@ -118,15 +117,15 @@
   - 启动时 `GET /get_segments_detail`，要求每个 `--instance-segs` 值在
     master 上 `segment_name == te_endpoint == 配置值`；对不上直接启失败。
   - `_verify_missing` 仍用配置名比副本 `transport_endpoint`；契约由启动门禁保证。
-- **R18 8KB 分批依据（OPEN）**
-  - `_MAX_BATCH_QUERY_REQUEST_BYTES = 8192` 只算请求行，不含 header；上游实际限制未校准。
-  - 方向：按 master 实际限制校准，或改 POST。
-- **R14 一进程一种 TP 组合（OPEN，文档边界）**
-  - `daemon.py` 只建一个 `KeyComputer`；`--tp-size` / `--peer-tp-size` / `--put-step` 是进程级。
-  - 多组合需要多 backend，文档写清即可。
-- **R15 capability 是声明不是探测（OPEN，文档约束）**
-  - `--capability` 按 flag 选能力集，启动不探 master。
-  - 版本由文档约束，不做运行时探测/分叉；是否给通用启动项加警告另议。
+- **R18 8KB 分批依据（已接受）**
+  - 客户端按请求行约 8KB 分批，不含 header；未与 master 校准。
+  - 写进 `code-architecture.md` HTTP 通道、`D2` F11b、`admin_main.py` 注释。
+- **R14 一进程一种 TP 组合（已接受，文档边界）**
+  - daemon 只建一个 `KeyComputer`；多组合多进程/多 backend。
+  - 写进 `code-architecture.md`「一个后端实例 = 一种组合」。
+- **R15 capability 是声明不是探测（已接受，文档约束）**
+  - `--capability` 选表，不探 master；版本靠文档/部署约定。
+  - 写进 `code-architecture.md` capability 节与启动节。
 
 ### 3. 范围 / 已知缺口
 
@@ -138,7 +137,7 @@
 - `rebuild` 不区分任务归属：多模型/多后端共用一个 Ledger 时会按本实例 KeyComputer 错算；单实例单模型无此问题，多模型前必须加 `model_id` 归属判定。
 - 提交并发默认 4 是进程级；单机窗口实验 #16 的结论，跨机 #17 仍半挂，未纳入 PR 验收。
 
-### 4. DEFER
+### 4. DEFER（本 PR 明确接受，不挡合入）
 
 - **A06 move/remove 成功后不发事件（DEFER）**：发布端在 E14。
 - **A16 同前缀操作串行化（DEFER）**：TaskEngine 全局闸不是前缀互斥；R09/A05 归入此项；外部 offload 竞态也不能完全挡。
@@ -147,19 +146,21 @@
 ## 合入门禁
 
 1. **core 基线**：自测全绿；`move` / `remove` / keepalive / prefetch / admin 核验可用。
-2. **admin**：R06 已修（启动核对）；R18 写进文档或后续修。
-3. **保活**：A03 已修（await 落账）；R16 写进文档或后续修。
-4. **跨 PR**：A06 / A16 / A17 继续 DEFER；PR2/PR3 的 tracker 各自记录。
+2. **admin**：R06 已修；R18 已写进文档（接受未校准）。
+3. **保活**：A03 已修；R16 已写进文档（接受量未测）。
+4. **文档边界**：R14 / R15 已写进 `code-architecture.md`。
+5. **跨 PR**：A06 / A16 / A17 明确接受 DEFER。
 
 ## 合入前删除清单
 
-- [ ] 本 PR 的 OPEN / DEFER 已关闭或明确接受
+- [x] 本 PR 的 OPEN / DEFER 已关闭或明确接受
 - [ ] `git rm kvcm/design/pr73-core-tracker.md`
 - [ ] 最后一个 commit 说明“删除 core 临时跟踪文档”
-- [ ] PR 描述注明“临时跟踪文档已删除”
+- [ ] PR 描述注明“临时跟踪文档已删除”（含 R14/R15/R16/R18 接受说明）
 
 ## 维护日志
 
 - **2026-11-04**：从全量 PR73 tracker 拆出 core 部分；A01/A07/A08 已关闭；demote/promote 与 soft pin 移到后续 stacked PR。
 - **2026-11-04**：A03 关闭：`register_await` + `_on_ready` await；写失败仍不改判预热失败。
 - **2026-11-04**：R06 关闭：启动拉 `/get_segments_detail`，要求配置 seg = segment_name = te_endpoint。
+- **2026-11-05**：R14/R15/R16/R18 文档收口；A06/A16/A17 明确接受 DEFER。
