@@ -190,7 +190,7 @@ local_dram = 连续本机 DRAM 块数 × B
 pool_hit   = 连续池内块数 × B
 ```
 
-**收益**：只把“连续命中”算作可复用前缀，避免中段空洞导致的错误 D-direct/HBM 判断。
+**收益**：只把“连续命中”算作可复用前缀，避免中段空洞导致的错误 HBM 命中判断。
 
 ### 2.3 多源合并：source rank + seq + 墓碑
 
@@ -232,7 +232,7 @@ P_ghost ≈ 1 − exp(−λ_delete × age)
 用途：
 
 - 推测条目只用于**亲和排序**，不作为 HBM 命中证据；
-- `conf < 0.9` 不允许 D-direct/HBM 判定；
+- `conf < 0.9` 不允许 HBM 命中判定；
 - `P_ghost × C_miss` 进入 L0 的 risk 项，优先对账热条目。
 
 **收益**：降低批内竞态导致的假 miss；ghost 只损性能，不损正确性。
