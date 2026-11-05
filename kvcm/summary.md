@@ -275,6 +275,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 - **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC，与仓内跨语言 RPC 选型一致）。✅ **已落地**：`SubmitIntent` / `GetTask`。协议字段里仍依赖 D4 定型的部分没有扩。
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例启动 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3 耦合；D5 已闭环，见本文）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
   - **实例注册一次交全**（D1 §3b，已定，代码未接）：字段 = 实例 id、rank 有序段列表、补发端点、DP 编号、kind（可空）。管理面分配端点，kvcm 只校验不分配。
+  - **R05（必带）**：注册还须能对上引擎 mooncake `client_id`（或等价「盘副本登记 client」身份）。demote/promote 切片已落地提回，但**触发前无法证明 promote 的 target 就是 LOCAL_DISK 所在实例**；E13 接通后必须补前置校验，不得当作可接受边界。详见 D2 §3 / demote-promote tracker R05。
   - 与现有启动参数的关系：`--instance-segs` / `--kv-event-endpoint` 保留成 demo 兜底；同一实例不允许两处都登记，启动时报错。
   - kind 留空的实例，READY 后不发 `BlockStored`（只记日志）。宁缺一条，也不发一条 kind 错的。
   - 通知索引与实例注册同一流程：注册是别人告诉 kvcm，通知是 kvcm 告诉别人。通知失败只记日志、不回滚注册。

@@ -34,7 +34,7 @@
 | demote 写完就完成 | 停保活 → 等满 lease TTL → 查 LOCAL_DISK；DFS 不算成功；没有剩余租约查询 | D2 §3 / `backend.demote` |
 | promote 立即 READY | L3 只触发，不返回 TaskHandle；`PromoteFlow.run()` 轮询 `check_promote` 为真才返回 | D2 §3 / `flows/promote.py` |
 | promote 可以用 offload 端点对 seg 名 | 不能；offload 端点与 seg 名不是同一套 | D2 §3 / `check_promote` |
-| 没有实例→client_id 也能保证落点 | 不能事先证明；open，见 R05 | R05 |
+| 没有实例→client_id 也能保证落点 | **不能**；本 PR 不修，必跟 E13 修，见 R05 | R05 |
 
 ## 代码 vs 设计
 
@@ -51,9 +51,21 @@
 
 ## 剩余问题
 
-- **R05 没有实例 → client_id（OPEN）**
-  - promote 无法事先证明 target 是盘副本登记实例；现在靠 `PromoteFlow` 轮询 target memory replica。
-  - 方向：开放 promote 前加注册表，或明确写成假阴性边界。
+- **R05 没有实例 → client_id（OPEN，本 PR 不修；必须后续修，归 E13）**
+  - **要证明什么**：`promote(prefix, target)` 的 target 必须是「这份
+    LOCAL_DISK 所在引擎」（盘副本登记 client），不能是任意实例。
+  - **现状**：只有 `InstanceDirectory`（实例 → seg/传输端点）。admin 能看到
+    `local_disk_endpoints`（offload 端口）和盘侧 `client_id`，但 **offload
+    端口 ≠ seg 名**，且 **没有「实例 → client_id」登记**，触发前无法比对。
+  - **当前行为**：L3 `promote` 的 target 几乎不参与触发；`PromoteFlow` 只靠
+    事后 `check_promote`（target 的 memory seg 是否出现）。target 选错 →
+    池可能在别的机器提回，本 flow 一直 False 直到 `PromoteError` 超时。
+  - **不是**：可长期接受的产品边界；也不是「调用方保证就行」就关项。
+  - **以后怎么修**：E13 实例注册交出身份（至少实例 id ↔ 引擎 `client_id`，
+    或等价可对上盘副本登记 client 的字段）；promote / PromoteFlow 在触发前
+    （或首轮 check 前）校验 target 与盘副本登记一致，对不上直接失败，
+    不要空等超时。不在 #82 soft pin。登记见 `summary.md` E13、
+    `code-architecture.md` / D2 §3 promote。
 - **VerifyError 命名（遗留，未决）**
   - demote 查清后「没有 LOCAL_DISK」业务上就是 demote 失败，类型却叫
     `VerifyError`（历史名偏 copy/move 的 READY 副本核验）。
@@ -85,3 +97,4 @@
 - **2026-11-04**：从 core tracker 拆出；补 demote 消息、promote 重复检查、promote 返回语义三项清理。
 - **2026-11-05**：#80 squash 合入 main 后，本分支 rebase 到 `origin/main`（仅重放 demote 增量）。
 - **2026-11-05**：登记遗留：demote 用 `VerifyError` 表示「没 LOCAL_DISK」，命名是否统一未决。
+- **2026-11-05**：R05 写清：现状 / 错 target 行为 / 必须跟 E13 修（含 client_id），不是可接受边界。

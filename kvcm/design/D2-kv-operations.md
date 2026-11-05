@@ -1096,7 +1096,8 @@ sequenceDiagram
 ### promote 实现
 
 - **被动路径（流量驱动）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本登记 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
-- **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——L3 `promote` 只打 `promote_hits` 次 `GetReplicaList`（默认 2），不验证、不等待；`PromoteFlow` 随后调 `check_promote` 轮询目标 memory replica，成功才产出 READY，超时才失败。不能在打次数之前证明 target 是盘副本登记实例：offload 端点和 seg 名不是同一套（seg 名是挂段时的传输引擎端口，local_disk 端点是 offload RPC 端口）。计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），kvcm 的调用与真实流量同池累计，到线即触发上面的被动路径
+- **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——L3 `promote` 只打 `promote_hits` 次 `GetReplicaList`（默认 2），不验证、不等待；`PromoteFlow` 随后调 `check_promote` 轮询目标 memory replica，成功才产出 READY，超时才失败。计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），kvcm 的调用与真实流量同池累计，到线即触发上面的被动路径。
+  - **R05（缺口，必须修；归 E13，不在 demote/promote / soft pin 切片）**：要保证 `target` 是 LOCAL_DISK 所在引擎（盘副本登记 client）。现状只有实例→seg；admin 的 `local_disk_endpoints` 是 offload 端口，与挂段 seg 名不是一套，且无实例→`client_id` 表，**触发前无法校验落点**。错 target → 事后轮询空等到超时。E13 实例注册交出引擎 `client_id`（或等价字段）后，promote 前必须校验，失败立即返回，不得长期依赖「调用方保证」或假阴性超时。
   - 前提：`promotion_on_hit` 开启 + DRAM 还没满到要驱逐的程度（内存紧张时 master 不批——提回来也马上被逐）+ 盘副本所在引擎在线
   - 触发必须用 `GetReplicaList`——`ExistKey` 触发不了（只授 lease、不计命中次数，`master_service.cpp:752-770` @0.3.11）；触发顺带授 lease（F11b 的副作用在此是正作用：提回期间防逐）
 - **kvcm 主动路径二：读删写（重，确定性自搬）**——读盘副本数据 → `Remove` → `PutStart` 新建 DRAM 副本 → 写数据 → `PutEnd` → 校验

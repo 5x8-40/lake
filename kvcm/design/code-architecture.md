@@ -192,7 +192,8 @@ flowchart LR
 - **任务凭据（TaskHandle）**：一次 `copy(前缀)` 在 mooncake 上是逐条 key 各发一个复制任务——一个前缀通常对应多条 key（块数 × rank 数），所以一次操作会产生多个任务。凭据里的 `task_ids` 装着这次操作的全部任务号，查询时一起查。任务号的类型对 L3 不透明（`tuple[object, ...]`）：mooncake 的任务号是两个整数组成的整数对，L3 原样保存、原样回传，不做字符串化（`str()` 化后真实绑定的 `query_task` 会报 TypeError）；要写进 Ledger 时由实现侧编码成 `"整数:整数"` 的字符串（`encode_task_id`/`decode_task_id`，重启可还原）
 - **READY 规则**（本义 =「可以把请求调度过来」，D2 §1）：
   - copy / move：任务完成 + 目标侧副本核验通过（任务型，凭据里有任务号）
-  - promote：L3 `promote` 只打 N 次 `GetReplicaList`（默认 2）触发，不验证、不返回 `TaskHandle`。`PromoteFlow` 用 `check_promote` 轮询目标 memory replica，看到才返回（flow 返回，不是 `TaskStatus.READY`）；超时 `PromoteError`。不能在打次数之前证明 target 是盘副本登记实例：offload 端点和 seg 名不是同一套，这道比较已删。不做读删写。搬运是池自主行为，**不占传输闸**
+  - promote：L3 `promote` 只打 N 次 `GetReplicaList`（默认 2）触发，不验证、不返回 `TaskHandle`。`PromoteFlow` 用 `check_promote` 轮询目标 memory replica，看到才返回（flow 返回，不是 `TaskStatus.READY`）；超时 `PromoteError`。不做读删写。搬运是池自主行为，**不占传输闸**。
+  - **R05（必修，归 E13，本切片未修）**：当前没有「实例 → 引擎 client_id」登记；offload 端点与 seg 名又不是一套，**触发前无法证明 target 就是 LOCAL_DISK 登记实例**。错 target 时只能空等到 `PromoteError`。E13 实例注册补上身份后，promote 路径必须加前置校验，不得当作可接受边界搁置。
   - **retain 返回 TaskHandle**——这个方法只表达 move/copy（D2 §4），返回这次搬运的任务号。DFS 不走这个返回值。空任务号抛 `ValueError`
   - 其余方法（register_keepalive / unregister_keepalive / renew_once / pin / demote / remove）无 READY
 - **exists（查询，不是第九项管理操作）**：实现是 `batch_is_exist`，它有个副作用——被查到的 key 会被续租，所以预热前的存在性检查顺便就起了保活作用。两种结果必须分清：「不在池里」（key 确实没有 → 该预热）和「查询本身失败」（返回值不是 0/1/True/False，或列表长度和 key 数不一致 → 转成 QueryError 等一会儿重查）——把查询失败当成「不在池里」会误判成需要重新计算
