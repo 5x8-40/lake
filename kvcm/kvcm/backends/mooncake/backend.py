@@ -129,6 +129,7 @@ class MooncakeBackend(KvOps):
         admin: AdminClient | None = None,
         promote_hits: int = 2,
         lease_ttl_s: float = 10.0,
+        list_instances: Callable[[], Sequence[InstanceId]] | None = None,
     ) -> None:
         """
         client：已 connect 的 StoreClient（控制面身份，global_segment_size=0）。
@@ -136,6 +137,8 @@ class MooncakeBackend(KvOps):
             抛 QueryError，不盲提交。
         key_computer：引擎侧 key 计算器（持展开配置与 rank 映射知识）。
         locate：实例 → rank 有序 seg 列表（targets[i] = rank i 的本机 seg）。
+        list_instances：已登记实例列表，供 ``memory_instance`` 反查；不传则
+            反查恒为 None。
         capability：按连接上的后端版本填充的能力集（必填——能力宣告不
             允许默认冒充，填错版本 = 编排层选错路径）。
         ledger：任务状态记录（可选；不注入则任务状态只留进程内）。
@@ -175,6 +178,7 @@ class MooncakeBackend(KvOps):
         self._lease_ttl_s = lease_ttl_s
         self._keys = key_computer
         self._locate = locate
+        self._list_instances = list_instances
         self._cap = capability
         self._ledger = ledger
         self._submit_concurrency = submit_concurrency
@@ -1174,11 +1178,11 @@ class MooncakeBackend(KvOps):
         if self._cap.has_promotion.channel is not Support.YES:
             raise UnsupportedCapabilityError("提回通道不具备")
 
-    async def promote(self, prefix: Prefix, target: InstanceId) -> None:
-        """打 ``promote_hits`` 次 GetReplicaList 触发提回；不验证、不等待。
+    async def promote(self, prefix: Prefix) -> None:
+        """打 ``promote_hits`` 次 GetReplicaList 触发提回；不验证、不等待、不带 target。
 
-        完成由 ``PromoteFlow`` 轮询 ``check_promote``。触发按 key；``target``
-        留给上层核验（R05：触发前尚证不了落点）。
+        落点由池派给盘副本登记 client。完成由 ``PromoteFlow`` 轮询
+        ``check_promote``（每 key 至少一处 memory）。
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
@@ -1189,11 +1193,10 @@ class MooncakeBackend(KvOps):
         for _ in range(self._promote_hits):
             await self._rpc(self._client.batch_memory_replica_endpoints, keys)
 
-    async def check_promote(self, prefix: Prefix, target: InstanceId) -> bool:
-        """查 target 是否已有该前缀全部 key 的 memory replica。
+    async def check_promote(self, prefix: Prefix) -> bool:
+        """前缀每个 key 是否至少有一处 memory replica（不限实例）。
 
-        用 GetReplicaList 的返回端点对 locate(target)；查询本身也会继续
-        累计 promotion 命中，属于预期副作用。
+        查询本身会继续累计 promotion 命中，属于预期副作用。
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
@@ -1201,11 +1204,34 @@ class MooncakeBackend(KvOps):
                 "prefix expands to no keys (shorter than one block?)"
             )
         self._require_promotion()
-        plan = self._keys.build_plan(keys, list(self._locate(target)))
         last = await self._rpc(
             self._client.batch_memory_replica_endpoints, keys
         )
-        return all(seg in last.get(key, []) for key, seg in plan)
+        return all(bool(last.get(key)) for key in keys)
+
+    async def memory_instance(self, prefix: Prefix) -> InstanceId | None:
+        """返回任一已登记且对每个 key 都持有至少一处 memory 的实例。
+
+        未注入 ``list_instances``、或目录对不上 seg，返回 None。
+        """
+        if self._list_instances is None:
+            return None
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        self._require_promotion()
+        last = await self._rpc(
+            self._client.batch_memory_replica_endpoints, keys
+        )
+        if not all(bool(last.get(key)) for key in keys):
+            return None
+        for inst in self._list_instances():
+            segs = set(self._locate(inst))
+            if all(segs.intersection(last.get(key, [])) for key in keys):
+                return inst
+        return None
 
     async def retain(self, prefix: Prefix, target: InstanceId | None = None) -> TaskHandle:
         raise NotImplementedError("retain：做法见 D2 §4，尚未接通")

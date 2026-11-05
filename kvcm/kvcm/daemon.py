@@ -105,6 +105,7 @@ def build_backend(
         client=client,
         key_computer=keys,
         locate=directory.locate,
+        list_instances=directory.ids,
         capability=capability,
         ledger=ledger,
         submit_concurrency=args.copy_submit_concurrency,

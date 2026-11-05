@@ -79,10 +79,10 @@ class FakeOps(KvOps):
     async def demote(self, prefix):
         raise NotImplementedError
 
-    async def promote(self, prefix, target):
+    async def promote(self, prefix):
         raise NotImplementedError
 
-    async def check_promote(self, prefix, target):
+    async def check_promote(self, prefix):
         raise NotImplementedError
 
     async def retain(self, prefix):

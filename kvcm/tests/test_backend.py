@@ -3098,26 +3098,26 @@ def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> 
         client=client,
         key_computer=kc,
         locate=lambda _inst: ["seg-A"],
+        list_instances=lambda: (InstanceId("inst"),),
         capability=mooncake_main(),
         admin=Admin(),
         promote_hits=2,
     )
     prefix = Prefix(model_id="qwen", token_ids=(1,))
-    assert run(b.promote(prefix, InstanceId("inst"))) is None
+    assert run(b.promote(prefix)) is None
     assert hits["n"] == 2
-    assert run(b.check_promote(prefix, InstanceId("inst"))) is True
+    assert run(b.check_promote(prefix)) is True
+    assert run(b.memory_instance(prefix)) == InstanceId("inst")
 
-    client._replicas_on = ["seg-ELSE"]
-    assert run(b.check_promote(prefix, InstanceId("inst"))) is False
+    client._replicas_on = []
+    assert run(b.check_promote(prefix)) is False
+    assert run(b.memory_instance(prefix)) is None
 
 
-def test_promote_offload_endpoint_does_not_skip_replica_list(
+def test_promote_any_memory_counts_even_if_not_registered(
     fake_store_module, monkeypatch
 ) -> None:
-    """offload 端点不是 seg 名，不能据此跳过 GetReplicaList。
-
-    promote 只触发；check_promote 看到 seg-ELSE 时返回 False。
-    """
+    """有 memory 即 check 成功；seg 不在目录则 memory_instance 为 None。"""
     hits = {"n": 0}
 
     class Client(FakeClient):
@@ -3135,14 +3135,16 @@ def test_promote_offload_endpoint_does_not_skip_replica_list(
         client=Client(),
         key_computer=kc,
         locate=lambda _inst: ["seg-A"],
+        list_instances=lambda: (InstanceId("inst"),),
         capability=mooncake_main(),
         admin=Admin(),
         promote_hits=2,
     )
     prefix = Prefix(model_id="qwen", token_ids=(1,))
-    assert run(b.promote(prefix, InstanceId("inst"))) is None
+    assert run(b.promote(prefix)) is None
     assert hits["n"] == 2
-    assert run(b.check_promote(prefix, InstanceId("inst"))) is False
+    assert run(b.check_promote(prefix)) is True
+    assert run(b.memory_instance(prefix)) is None
 
 
 def test_promote_v0311_hits_without_admin(fake_store_module, monkeypatch) -> None:
@@ -3164,8 +3166,8 @@ def test_promote_v0311_hits_without_admin(fake_store_module, monkeypatch) -> Non
         promote_hits=2,
     )
     prefix = Prefix(model_id="qwen", token_ids=(1,))
-    assert run(b.promote(prefix, InstanceId("inst"))) is None
-    assert run(b.check_promote(prefix, InstanceId("inst"))) is True
+    assert run(b.promote(prefix)) is None
+    assert run(b.check_promote(prefix)) is True
 
 
 def test_retain_not_implemented(fake_store_module, monkeypatch) -> None:

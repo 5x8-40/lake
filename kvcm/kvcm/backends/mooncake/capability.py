@@ -40,8 +40,8 @@ def mooncake_v0311() -> BackendCapability:
         has_promotion=Capability(
             Support.YES,
             Support.YES,
-            "打 GetReplicaList 累计命中，再用内存副本传输端点对 locate(target)。"
-            "不拿 offload 端点对 seg 名：两套端口不同",
+            "打 GetReplicaList 累计命中；check_promote 看每 key 是否已有 memory。"
+            "不带 target；落点反查见 memory_instance",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
@@ -92,9 +92,9 @@ def mooncake_main() -> BackendCapability:
         has_promotion=Capability(
             Support.YES,
             Support.YES,
-            "打 GetReplicaList（默认 2）触发；check_promote 用内存副本传输端点对 "
-            "locate(target)。offload 端点与 seg 不是一套；无实例→client_id 时触发前 "
-            "证不了落点（R05）。L3 单次核验，轮询在 PromoteFlow；不做读删写",
+            "打 GetReplicaList（默认 2）触发；check_promote：每 key≥1 memory。"
+            "不带 target；memory_instance 用目录反查持有实例（可空）。"
+            "L3 单次核验，轮询在 PromoteFlow；不做读删写",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),

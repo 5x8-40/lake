@@ -5,6 +5,12 @@
 """
 
 from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
-from kvcm.flows.promote import PromoteError, PromoteFlow
+from kvcm.flows.promote import PromoteError, PromoteFlow, PromoteResult
 
-__all__ = ["PrefetchFlow", "PrefetchError", "PromoteFlow", "PromoteError"]
+__all__ = [
+    "PrefetchFlow",
+    "PrefetchError",
+    "PromoteFlow",
+    "PromoteError",
+    "PromoteResult",
+]
