@@ -3081,18 +3081,15 @@ def test_retain_not_implemented(fake_store_module, monkeypatch) -> None:
         run(b.retain(prefix, InstanceId("inst")))
 
 
-def test_core_leaves_pin_demote_promote_unsupported(
+def test_demote_promote_pr_leaves_pin_unsupported(
     fake_store_module, monkeypatch
 ) -> None:
-    """core 不接线 pin/demote/promote/check_promote，走基类 Unsupported。"""
+    """本 PR 接上 demote/promote；pin 仍走基类 Unsupported（soft pin PR）。"""
     b = _backend(FakeClient(), KeyComputer(model_name="qwen", tp_size=1), monkeypatch)
     prefix = Prefix(model_id="qwen", token_ids=(1,))
-    target = InstanceId("inst-B")
     with pytest.raises(UnsupportedCapabilityError):
         run(b.pin(prefix, PinKind.SOFT))
-    with pytest.raises(UnsupportedCapabilityError):
-        run(b.demote(prefix))
-    with pytest.raises(UnsupportedCapabilityError):
-        run(b.promote(prefix, target))
-    with pytest.raises(UnsupportedCapabilityError):
-        run(b.check_promote(prefix, target))
+    assert "demote" in MooncakeBackend.__dict__
+    assert "promote" in MooncakeBackend.__dict__
+    assert "check_promote" in MooncakeBackend.__dict__
+    assert "pin" not in MooncakeBackend.__dict__
