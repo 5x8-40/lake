@@ -54,10 +54,59 @@ flowchart TB
 收益拆成四段：
 
 ```text
-T_total ≈ Q + T_prefill + T_transfer + T_local
+T_total ≈ Q + T_kv + T_local
 ```
 
-> 不是四项同时发生：miss 有 `T_prefill`；远端池命中只有很小的残差 prefill、有 `T_transfer`；本机 DRAM 有 `T_local`；HBM 命中两者都接近 0。按命中层级取项。
+其中 `T_kv` 是「拿到前缀 KV」的代价，**不能简单写成 `T_prefill + T_transfer`**：
+
+```text
+can_overlap 时：T_kv = max(T_compute(residual), T_transfer)
+不能掩盖时   ：T_kv = T_compute(residual) + T_transfer
+```
+
+## 1.1 传输能否被计算掩盖
+
+vLLM 的 KV connector 是逐层的（`KVConnectorBase_V1::start_load_kv` 启动异步加载，`wait_for_layer_load` 在每层 attention 内阻塞等该层到位）。所以重叠的形态是「第 N 层算的时候，第 N+1 层在传」。
+
+**掩盖的前提是有计算可跑。** 当命中率很高、残差很小时，这个前提不成立：
+
+| 情形 | residual | 能否掩盖 | `T_kv` |
+|---|---|---|---|
+| 无命中 | `P` | 能（计算远超传输） | `T_prefill` |
+| 中等命中 | 几百 token | 能 | `max(T_compute, T_transfer)` |
+| **高命中** | **几十 token** | **不能** | `T_compute + T_transfer` |
+
+临界点：
+
+```text
+residual_crit = T_transfer × v_prefill
+若 residual < residual_crit：传输主导，且无法掩盖
+```
+
+**高 APC 命中率恰恰把请求推到残差很小的一侧**——这是 DualPath（arXiv:2602.21548v2）的出发点：agentic 多轮命中率 ≥95%，瓶颈从计算转成 KV 加载 I/O。
+
+### 对 batch 的影响
+
+跨机访问不只影响这一个请求。continuous batching 的 forward 按层推进，某层没就绪就整体等。所以：
+
+```text
+一个高命中率的跨机请求 → 它那一层的等待 → 整个 batch 这一步变慢
+```
+
+`T_batch_step = max over requests(自身 T_kv)` —— 最慢的那个决定整步。
+
+这条改变了本地放置的收益口径：不是「省 42 ms 传输」，而是「避免拖慢整个 batch 一步」。batch 越大、命中率越高，收益越大。
+
+---
+
+## 1.2 命中层级的取项
+
+按命中层级选 `T_kv`：
+
+- **miss（无命中）**：`T_kv = T_prefill`
+- **远端池命中**：残差很小，通常落在「不能掩盖」区间，`T_kv ≈ T_transfer`
+- **本机 DRAM 命中**：`T_kv = T_local`（仍有，但没有跨机那一段）
+- **HBM 命中**：`T_kv ≈ 0`
 
 ---
 
@@ -179,7 +228,14 @@ U(r,n) =
 
 - `H`：连续 HBM 命中 token；`P`：连续池命中 token；
 - `B`：要传的字节；`Q`：队列等待；`F`：hook 未来价值；`R`：陈旧/ghost 风险；
-- `κ_tier`：DRAM/NVMe/DFS 的折扣。
+- `κ_tier`：DRAM/NVMe/DFS 的折扣；
+- `BW_eff(n)`：到节点 n 的**当前可用带宽**，不是理论带宽。两类网络要分开取：
+  - 从池读 KV 走 storage network（`BW_storage`）
+  - 实例间 KV 传走 compute network（`BW_compute`）
+  - 详见 D8 §3.4
+- `c_bw` 也应分开：storage 与 compute 的每 GB 成本不同（compute 更贵，因为它和集合通信共享）
+
+**不能用估算的带宽**：§1.1 的掩盖判据依赖 `T_transfer` 的准确性，估高了会把「不能掩盖」误判成「能掩盖」，选出一个实际更慢的节点。
 
 ### 3.2 TTFT 估算
 
@@ -191,6 +247,16 @@ TTFT(r,n) = Q(n)
 ```
 
 `residual = P − H`；HBM 命中时 `B≈0`，通常只剩末 token 残差。
+
+**这个式子假设传输能被计算掩盖**（两项相加，不是取 max）。按 §1.1，残差很小时不成立：
+
+```text
+可以掩盖：TTFT = Q + max(residual/v, B/BW_eff) + T_handoff
+不能掩盖：TTFT = Q + residual/v + B/BW_eff + T_handoff   ← 上式
+判据：residual < B/BW_eff × v_prefill
+```
+
+选路时应按节点分别判断：同一个请求，走节点 A 可能能掩盖（A 带宽高），走节点 B 不能。
 
 ### 3.3 决策流程
 
@@ -486,8 +552,24 @@ L2 出价格；L0/L1 读价格：
 | 优化 | 8K | 70K | 说明 |
 |---|---:|---:|---|
 | 命中 vs 重算 | ~1.6 s | ~14 s | 最大杠杆：保留/防驱逐 |
-| 本机 DRAM vs 远端 | ~4.8 ms | ~42 ms | 预取/本地放置 |
+| 本机 DRAM vs 远端 | ~4.8 ms | ~42 ms | 预取/本地放置（见下方修正） |
 | HBM vs 本机 DRAM | ~1.6 ms | ~14 ms | HBM 命中（APC） |
+
+**「本机 DRAM vs 远端」这一行会低估高命中场景。**
+
+上表按「传输能被计算掩盖」算，即 `4.8 ms = T_transfer − T_local`。但 §1.1 的判据是：残差很小时不能掩盖，`T_kv = T_compute + T_transfer`。
+
+| 场景 | residual | 能否掩盖 | 跨机 `T_kv`（70K，命中 99%） | 本机 `T_kv` | 差值 |
+|---|---:|---|---:|---:|---:|
+| 低命中 | 7000 | 能 | 14 s（重算） | — | — |
+| 中命中 | 700 | 能 | max(140 ms, 56 ms) = 140 ms | 140 ms | ~0 |
+| **高命中** | **70** | **不能** | 14 ms + 56 ms = **70 ms** | 14 ms + 0.98 ms ≈ **15 ms** | **55 ms** |
+
+也就是说：**命中率越高，本地放置的相对收益越大**（从 ~0 到 55 ms），因为传输那一段越来越藏不住。
+
+再叠上 batch 效应：跨机的那 56 ms 不是只拖慢这一个请求，是拖慢整个 batch 这一步。批量 N 个请求时，实际损失按「最慢的那一个」计。
+
+**结论修正**：预取的价值不只是「防驱逐」，还包括「把高命中率请求从跨机挪到本机」——后者在命中率 ≥95% 的 agentic 负载下反而是主项。
 
 ### 8.2 吞吐/成本
 
@@ -633,8 +715,10 @@ ROI = saved / cost
 # 命中
 hit_tokens = contiguous_blocks × B
 
-# TTFT
-TTFT = Q + residual/v + B/BW + T_handoff
+# TTFT（区分能否掩盖）
+can_overlap: TTFT = Q + max(residual/v, B/BW) + T_handoff
+otherwise:   TTFT = Q + residual/v + B/BW + T_handoff
+判据: residual < B/BW × v_prefill
 
 # 传 vs 算
 BW* = B×c_bw / (residual×c_prefill)
