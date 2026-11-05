@@ -158,7 +158,7 @@ flowchart LR
 | 流程 | 编排 | 状态 |
 |------|------|------|
 | PrefetchFlow | exists 前置检查 → copy → query_task 轮询到 READY。保活注册与 `BlockStored` 补发在流程返回后由 `TaskEngine._on_ready` 做（恢复路径用 `target_of`） | 已实现（`flows/prefetch.py`） |
-| PromoteFlow | exists 前置检查 → promote 触发 → check_promote 轮询到目标 memory replica 后返回（flow 返回，不是 `TaskStatus.READY`） | 已实现（`flows/promote.py`），未接 TaskEngine |
+| PromoteFlow | exists 前置检查 → promote 触发 → check_promote 轮询到目标 memory replica 后返回（flow 返回，不是 `TaskStatus.READY`） | **库已实现**（`flows/promote.py`）：可单测/进程内直接调；**未接** TaskEngine、未扩 intent、daemon 无自动入口。demote 同属 L3 库能力、同样未接线。见 demote-promote tracker「能力范围」 |
 | SessionEndFlow | `unregister_keepalive` + demote | 未实现（D1 §6） |
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
 | RetainFlow | retain（死前 move/copy 到还活着的段；DFS 另编，不走这个返回值） | 未实现（D2 §4） |

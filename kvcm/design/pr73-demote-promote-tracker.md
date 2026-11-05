@@ -14,7 +14,18 @@
 
 ## Scope
 
-**包含**
+**本 PR 能力范围（库能力，未接线）**
+
+- 落地的是 **L3/L2 可调用实现 + 单测 + daemon 装配参数**，不是对外服务入口。
+- **有**：`MooncakeBackend.demote` / `promote` / `check_promote`；`PromoteFlow.run`；
+  `--promote-hits`；`has_offload` / `has_promotion` 主线 YES；`--lease-ttl-s` 复用于 demote。
+- **没有接上**：
+  - 不进 `TaskEngine` 队列（没有 demote/promote 消费者）
+  - 不扩 `SubmitIntent`（协议仍只有预热）
+  - daemon 跑起来后，Router/运维**不会**自动调到这些 API；要调用方持 backend/flow 自调
+- 接进进程 / intent / SessionEnd 等编排，另开工作，不在本 PR。
+
+**包含（实现清单）**
 
 - `backend.demote`：先 `unregister_keepalive`，等满 `lease_ttl_s`，再用 `GET /batch_query_keys` 确认每个 key 的 LOCAL_DISK；DFS 不算成功。
 - `backend.promote`：只打 `promote_hits` 次 `GetReplicaList` 触发。
@@ -25,7 +36,8 @@
 **不包含**
 
 - soft pin / native / NoF 收尾（soft pin PR）。
-- core 的 move/remove/admin/prefetch（core PR）。
+- core 的 move/remove/admin/prefetch（已在 #80）。
+- E13 实例注册 / R05 落点前置校验；A16 前缀串行；TaskEngine/intent 接线。
 
 ## 设计判断（本 PR）
 
@@ -108,3 +120,4 @@
 - **2026-11-05**：登记遗留：demote 用 `VerifyError` 表示「没 LOCAL_DISK」，命名是否统一未决。
 - **2026-11-05**：R05 写清：现状 / 错 target 行为 / 必须跟 E13 修（含 client_id），不是可接受边界。
 - **2026-11-05**：A16 写清（demote×exists 续租）：现状 / 危害 / 必须跟前缀串行修，不是可接受边界。
+- **2026-11-05**：Scope 写明「库能力、未接 TaskEngine/intent」；补 demote 恢复时间戳/取消与 PromoteFlow exists 单测。

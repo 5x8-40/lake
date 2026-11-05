@@ -52,6 +52,17 @@ def test_promote_flow_polls_until_ready() -> None:
     assert ops.promote_calls == 1
 
 
+def test_promote_flow_rejects_when_not_in_pool() -> None:
+    class MissingOps(FakeOps):
+        async def exists(self, prefix) -> bool:
+            return False
+
+    ops = MissingOps([])
+    with pytest.raises(PromoteError, match="没有可提回"):
+        run(PromoteFlow(ops).run(_P, _T, poll_s=0.001, timeout_s=1.0))
+    assert ops.promote_calls == 0
+
+
 def test_promote_flow_retries_query_error() -> None:
     ops = FakeOps([QueryError("rpc"), True])
     run(PromoteFlow(ops).run(_P, _T, poll_s=0.001, timeout_s=1.0))

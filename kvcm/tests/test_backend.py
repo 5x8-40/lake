@@ -2939,6 +2939,109 @@ def test_demote_succeeds_when_every_key_has_local_disk(
         os.unlink(path)
 
 
+def test_demote_failure_restores_original_registered_at(
+    fake_store_module, monkeypatch
+) -> None:
+    """失败恢复插回原来的 registered_at，不把窗口拨到现在。"""
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {k: KeyReplicaQuery(key=k, ok=True, disk_replicas=0) for k in keys}
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        before = led.keepalive_registered_at(prefix)
+        assert before is not None
+        with pytest.raises(VerifyError, match="LOCAL_DISK"):
+            run(b.demote(prefix))
+        assert led.keepalive_registered_at(prefix) == before
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_cancel_restores_keepalive(fake_store_module, monkeypatch) -> None:
+    """sleep 期间 CancelledError：尽量按原 registered_at 恢复保活。"""
+    import asyncio
+
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            raise AssertionError("取消应发生在 sleep，不应查盘")
+
+    async def boom_sleep(_seconds):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "kvcm.backends.mooncake.backend.asyncio.sleep", boom_sleep
+    )
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=1.0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        before = led.keepalive_registered_at(prefix)
+        assert before is not None
+        with pytest.raises(asyncio.CancelledError):
+            run(b.demote(prefix))
+        assert led.keepalive_registered_at(prefix) == before
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_cancel_still_raises_if_restore_fails(
+    fake_store_module, monkeypatch
+) -> None:
+    """取消路径上 restore 失败被吞掉，CancelledError 仍要抛出。"""
+    import asyncio
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            raise AssertionError("取消应发生在 sleep")
+
+    async def boom_sleep(_seconds):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "kvcm.backends.mooncake.backend.asyncio.sleep", boom_sleep
+    )
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=1.0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+
+        def boom_restore(*_a, **_k):
+            raise RuntimeError("restore boom")
+
+        monkeypatch.setattr(led, "restore_keepalive", boom_restore)
+        with pytest.raises(asyncio.CancelledError):
+            run(b.demote(prefix))
+        # restore 失败：行可能仍缺；关键是取消继续往外走
+        assert led.list_keepalive() == []
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
 def test_demote_keeps_keepalive_until_preconditions_hold(
     fake_store_module, monkeypatch
 ) -> None:
