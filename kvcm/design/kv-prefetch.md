@@ -42,12 +42,13 @@
 
 本机 DRAM 层（池副本）的现状——分两种场景：
 
-- **场景一：同机写读**（chunked prefill 主场景）——写路径 local-first，天然有本机副本
+- **场景一：同机写读**（chunked prefill 主场景）——写路径可配 local-first；只有 `preferred_segment:true` 才偏好本机
   - 写：`_build_replicate_config` 带两个放置参数（`mooncake_backend.py:346-351`；layerwise PutStart 同，L376-383）：
     - `prefer_alloc_in_same_node`：默认 true
     - `preferred_segment=local_seg`：需 mooncake.json 显式配 `preferred_segment:true`（默认 false——不配则 local-first 落空）
   - 读：副本选择 local-first（`replica_selection.h:122` `SelectBestReplica`，L149-151 本机内存副本优先）
-  - 结果：本节点写出的 KV 落本机 segment，后续读（含 chunk 间重读，见下）命中本机副本，无跨机流量
+  - 两个放置参数不是一回事：`preferred_segment` 指定本 seg（偏好，容量不足会退）；`prefer_alloc_in_same_node` 只保证同批 key 跟随第一把 key 的 seg（不保证本机）；`kv_consumer` 且 `consumer_is_to_put=false` 是 save 总开关，与放置无关
+  - 结果：`preferred_segment:true` 时本节点写出的 KV 优先落本机 segment；默认 false 时 `prefer_alloc_in_same_node` 只让同批 key 跟随第一把 key 选的 seg，不保证本机，后续读可能仍跨机
 - **场景二：跨机**（副本在别的节点：他机写入的会话复用、P≠D、故障迁移）——默认代码没有任何机制把读到的 KV 留在本机 DRAM
   - 读路径只进 HBM，不建本机 DRAM 副本：`BatchGetWhenPreferSameNode` 名字有 prefer，实际只是按源 segment 聚合批量传输，不建副本（`client_service.cpp:1493`）
   - 加载过的前缀不回写本机：`skip_save`（`metadata.py:1150-1151`）
