@@ -227,10 +227,15 @@
 
 **D8. 管理面：统一调度中心（请求 × KV × 扩缩容）** — 🟡 设计草案
 
-- 定位：kvcm 当前只有**控制面**（D1/D2/D9：KV 执行/核验/记账/发布）；**管理面**是调度。SC 可以是独立组件、嵌入 Router，或控制面内置。
+- 定位：kvcm 分两个平面（像 K8s 的 controller-manager 与 scheduler）。**控制面**执行（D1/D2/D9），**管理面**决策（本文）。部署形态可选（独立进程/嵌入 Router/同进程），不影响归属。
 - 目标形态：KVT（多源 KV 索引树）+ HookEnvelope + L0/L1/L2 三环，联合决策“请求去哪、KV 怎么动、集群扩不扩”。
 - 原则：hint ≠ command；KV 动作只走 intent；请求不等 READY；不设固定降级链；索引是派生视图；预算先行；决策与执行分离。
-- **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是十毫秒级跨机传输；HBM 命中只省毫秒级本地拷贝。预取单独做往往只值十毫秒级，必须和保留/防驱逐一起做。
+- **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是跨机传输；HBM 命中只省毫秒级本地拷贝。
+  - **传输能否被计算掩盖，取决于残差**（D8a §1.1）：`residual_crit = T_transfer × v_prefill`，残差低于它时不能掩盖，`T_kv = T_compute + T_transfer`。
+  - **高命中率反而放大本地放置的价值**：命中率越高，残差越小，跨机那段传输越来越藏不住。70K、命中 99% 的例子里，跨机 70 ms vs 本机 15 ms，差 55 ms；中命中（residual=700）时几乎无差。
+  - **batch 效应**：forward 按层推进，某层没就绪整个 batch 等，损失按 `max over requests(T_kv)` 计。
+  - 所以预取的价值不只是防驱逐，还包括把高命中率请求从跨机挪到本机。
+- **网卡是决策输入**（D8 §3.4）：区分 compute network（集合通信/实例间传，带宽大、间歇突发）与 storage network（存储访问，带宽小、易打满）。三处用到——L0 选路、L1 预取时机、L2 扩容判断（带宽满但池空时该加网络不是加节点）。`BW_eff` 必须实测，估高会误判「能掩盖」。参考 DualPath（arXiv:2602.21548v2）的双网络隔离。
 - **版本基线 v0.3.13.post1**：publisher 代码有但构建默认 OFF、运行默认 false、copy 路径零发布；soft pin 空写有条件可用（PR73），hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入已合入（#72）；E15 带宽限速未做。
 - 工作文档：[D8-joint-scheduling.md](design/D8-joint-scheduling.md)；算法：[D8a-scheduling-algorithms.md](design/D8a-scheduling-algorithms.md)；时序：[D8b-scheduling-sequences.md](design/D8b-scheduling-sequences.md)。
 - 待定：publisher 是否开启、hook 通道与信任、扩缩 actuator、多 SC 实例 leader、权重/阈值真机校准。
@@ -255,6 +260,10 @@
 - 三阶段：H1 省（命中+负载整形+会话记忆+FinOps 最小集）；H2 稳/省（容量孪生+HA/DR+QoS）；H3 新（跨集群+模型路由+生态）。
 - 建议下注：KV 负载整形、Agent Memory OS、KV FinOps/QoS。
 - **边界之外（D10 §3.1）**：四条扩展轴——同层（管权重/checkpoint/draft/会话元数据）、垂直（沉到数据面）、横向（多池联邦）、时间（被动→主动）；以及不在轴上的两件（KV 事务、KV 内容一致性）。其中「提前告知赶不上」与「动态保活窗口」是轴四里性价比最高的两条。
+- **不是组件也不是第三个平面**（D10 §0.2）：是管理面+控制面合起来的终局形态。判据三件（§0.5）：API 声明式、决策自动、执行完备。
+- **一等资源要五层**（D10 §0.3）：声明（KVRef）/ 放置 / 生命周期 / 治理 / 数据。越往上越空，而越往上的层才决定是不是 Fabric。
+- **只有一等资源才做得到的五件事**（D10 §0.4）：分支（缺块级 CoW）、checkpoint/回滚（APC 已留 KV，缺进度状态与多版本）、可寻址（现在只能算 hash）、订阅（只有下行）、市场（跨租户共享+引用计费）。
+- **与 SOTA 的差异**（D10 §6）：链式 hash/逐块匹配/事件→索引/推测索引都是标准做法；差异在索引地位（直连权威 vs 派生副本）、放置主动权（能改变放置 vs 只路由）、视图精度（字节位置 vs pod 粒度）。
 - 工作文档：[D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md)。
 
 ## 二、潜在问题
