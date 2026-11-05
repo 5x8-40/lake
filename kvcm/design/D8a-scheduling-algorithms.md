@@ -43,13 +43,16 @@ flowchart TB
 | `B` | block token 数（128） |
 | `S_bytes` | 前缀字节数 = `P × bytes_per_token` |
 | `S_saved` | 预期节省的时间（命中/防 miss） |
-| `v` | prefill 速率（token/s/GPU） |
+| `v_prefill` | **整实例**有效 prefill 吞吐（token/s），不是每 GPU；随上下文长度与命中率非线性下降 |
 | `BW` | 有效带宽 |
-| `T_prefill` | 重算时间 = `P/v` |
-| `T_transfer` | 跨机传输 = `S_bytes/BW_wan` |
-| `T_local` | 本机 DRAM→HBM 拷贝 = `S_bytes/BW_local` |
+| `T_prefill` | 重算时间 = `P / v_prefill` |
+| `T_transfer` | 跨机传输 = `S_bytes / BW_wan` |
+| `T_local` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_local` |
 | `Q` | 队列等待 |
 | `D` | TTFT 目标 |
+| `L` | 模型层数（含 MTP 层） |
+
+`v_prefill` 不能当常数：attention 是 O(P²)，长上下文下每 token 的 prefill 成本上升；命中率高时 residual 虽小，仍要 attend 全部缓存 KV，同样不是常数。校准必须按实际上下文长度分档。
 
 收益拆成四段：
 
@@ -68,13 +71,22 @@ can_overlap 时：T_kv = max(T_compute(residual), T_transfer)
 
 vLLM 的 KV connector 是逐层的（`KVConnectorBase_V1::start_load_kv` 启动异步加载，`wait_for_layer_load` 在每层 attention 内阻塞等该层到位）。所以重叠的形态是「第 N 层算的时候，第 N+1 层在传」。
 
-**掩盖的前提是有计算可跑。** 当命中率很高、残差很小时，这个前提不成立：
+**掩盖的前提是有计算可跑。** 逐层流水成立的条件是「每层传输时间 < 每层计算时间」：
 
-| 情形 | residual | 能否掩盖 | `T_kv` |
+```text
+每层传输 = S_bytes / L / BW
+每层计算 ≈ T_compute(residual) / L
+成立条件：S_bytes / BW < T_compute(residual)
+```
+
+这个条件在长上下文下会随命中率翻转：
+
+| 场景 | residual | `T_compute` | 能否掩盖 |
 |---|---|---|---|
-| 无命中 | `P` | 能（计算远超传输） | `T_prefill` |
-| 中等命中 | 几百 token | 能 | `max(T_compute, T_transfer)` |
-| **高命中** | **几十 token** | **不能** | `T_compute + T_transfer` |
+| **1M 全 miss** | 1M | 分钟级（attention O(P²)） | 能，传输可忽略 |
+| **1M 命中 99.9%** | 1K | 几百 ms | **不能**，传输主导 |
+
+**关键：命中率高不等于快。** 它把计算压掉了，却把传输量留在满额。这是 DualPath（arXiv:2602.21548v2）的出发点：agentic 多轮命中率 ≥95%，瓶颈从计算转成 KV 加载 I/O。
 
 临界点：
 
@@ -83,19 +95,35 @@ residual_crit = T_transfer × v_prefill
 若 residual < residual_crit：传输主导，且无法掩盖
 ```
 
-**高 APC 命中率恰恰把请求推到残差很小的一侧**——这是 DualPath（arXiv:2602.21548v2）的出发点：agentic 多轮命中率 ≥95%，瓶颈从计算转成 KV 加载 I/O。
+### 逐层失败后的两种选择
+
+逐层拉取在功能上永远可行，代价是 GPU 空转。发现掩不住时有两条路：
+
+| 选择 | TTFT | 吞吐 | 何时选 |
+|---|---|---|---|
+| **仍然逐层拉** | 更短（第一层到位即开始） | **差**：某层没跟上，整个 batch 这一步空转 | 单请求、batch 小、延迟优先 |
+| **先搬到本机 DRAM 再调度** | 更长（等搬完） | 好：搬运期间 GPU 去服务别的请求 | 高并发、吞吐优先 |
+
+第二条不需要搬到 HBM。DRAM→HBM 比跨机快约 4 倍，多数场景能重新藏进计算。
+
+### 胖 KV 的例外
+
+GLM-5.2（93 KB/token）这类模型的 KV 特别大，即使搬到本机 DRAM 也可能藏不住：
+
+- 1M 上下文 = 97 GB，本机 DRAM→HBM（100 GB/s）= 0.97 s
+- 此时只有**HBM 驻留**（命中即零拷贝）才够
+
+这解释了为什么长上下文 + 胖 KV 场景下，HBM 命中率是硬指标。
 
 ### 对 batch 的影响
 
-跨机访问不只影响这一个请求。continuous batching 的 forward 按层推进，某层没就绪就整体等。所以：
+跨机访问不只影响这一个请求。continuous batching 的 forward 按层推进，某层没就绪就整体等：
 
 ```text
-一个高命中率的跨机请求 → 它那一层的等待 → 整个 batch 这一步变慢
+T_batch_step = max over requests(自身 T_kv)
 ```
 
-`T_batch_step = max over requests(自身 T_kv)` —— 最慢的那个决定整步。
-
-这条改变了本地放置的收益口径：不是「省 42 ms 传输」，而是「避免拖慢整个 batch 一步」。batch 越大、命中率越高，收益越大。
+最慢的那个决定整步。所以损失不是「省 X ms 传输」，而是「避免拖慢整个 batch 一步」，batch 越大、命中率越高，收益越大。
 
 ---
 
@@ -315,7 +343,9 @@ s.t. Σ x_i × bytes_i ≤ B_budget
 
 ![预取 EV 与保留时间](figures/algo-prefetch-ev.svg)
 
-> 参数：`S_saved=14000ms`、`λ=1/300`、`C_copy=56ms`、占用成本 `2ms/s`。曲线先升后降：太早预取会白占内存，太晚赶不上请求。峰值就是“最佳提前量”的模型解释。
+> 参数：128K 上下文（GLM-5.2，`S_bytes=11.4GB`）、`S_saved≈2200ms`（命中率 +10% 省下的 prefill）、`λ=1/300`、`C_copy=454ms`（跨机一次搬运）。曲线先升后降：太早预取白占内存，太晚赶不上请求。
+
+**注意 `C_copy` 与 `S_saved` 的量级**：128K 时一次跨机搬运 454 ms，而防住一次重算省 2200 ms——比值约 5:1。到 1M 时两者都放大，但比值不变（都随 `P` 线性）。
 
 **收益**：预取 ROI 可算；带宽按价值密度分配，不被低价值预热打爆。
 
@@ -337,7 +367,7 @@ break-even: μ × p0 × exp(−μT) × T_prefill = c_h × bytes
 
 ![保留 TTL 盈亏平衡](figures/algo-retention-ttl.svg)
 
-> 参数：`T_prefill=14000ms`、`p0=1`、`μ=1/600`、占用成本 `0.5ms/s`。超过约 28 分钟，继续保留的期望收益低于占用成本。
+> 参数：128K 上下文、`S_saved≈2200ms`、`p0=1`、`μ=1/600`、占用成本按 11.4 GB × 0.5 ms/(GB·s) 计。曲线的零点就是最优 TTL 上界。
 
 ### 5.2 等级选择
 
@@ -547,29 +577,59 @@ L2 出价格；L0/L1 读价格：
 
 ![KV 路径成本](figures/algo-latency-stack.svg)
 
-> 参数：`bytes_per_token=20KB`、`v=5000 token/s`、`BW_wan=25GB/s`、`BW_local=100GB/s`。
+> 参数：GLM-5.2 口径 `bytes_per_token=93KB`、`L=79`（含 1 层 MTP）、`v_prefill=5900 token/s`（整实例）、`BW_wan=25GB/s`、`BW_local=100GB/s`。
 
-| 优化 | 8K | 70K | 说明 |
-|---|---:|---:|---|
-| 命中 vs 重算 | ~1.6 s | ~14 s | 最大杠杆：保留/防驱逐 |
-| 本机 DRAM vs 远端 | ~4.8 ms | ~42 ms | 预取/本地放置（见下方修正） |
-| HBM vs 本机 DRAM | ~1.6 ms | ~14 ms | HBM 命中（APC） |
+#### KV 大小与传输时间
 
-**「本机 DRAM vs 远端」这一行会低估高命中场景。**
+| context | `S_bytes` | 跨机 25GB/s | 本机 100GB/s | 每层跨机（79 层） |
+|---|---:|---:|---:|---:|
+| 32K | 2.8 GB | 114 ms | 28 ms | 1.4 ms |
+| 64K | 5.7 GB | 227 ms | 57 ms | 2.9 ms |
+| 128K | 11.4 GB | 454 ms | 114 ms | 5.7 ms |
+| 256K | 22.7 GB | 908 ms | 227 ms | 11.5 ms |
+| 512K | 45.4 GB | 1816 ms | 454 ms | 23.0 ms |
+| 1M | 88.7 GB | 3548 ms | 887 ms | 44.9 ms |
 
-上表按「传输能被计算掩盖」算，即 `4.8 ms = T_transfer − T_local`。但 §1.1 的判据是：残差很小时不能掩盖，`T_kv = T_compute + T_transfer`。
+#### 能不能掩盖，只看命中率
 
-| 场景 | residual | 能否掩盖 | 跨机 `T_kv`（70K，命中 99%） | 本机 `T_kv` | 差值 |
-|---|---:|---|---:|---:|---:|
-| 低命中 | 7000 | 能 | 14 s（重算） | — | — |
-| 中命中 | 700 | 能 | max(140 ms, 56 ms) = 140 ms | 140 ms | ~0 |
-| **高命中** | **70** | **不能** | 14 ms + 56 ms = **70 ms** | 14 ms + 0.98 ms ≈ **15 ms** | **55 ms** |
+按 §1.1 的判据（`T_compute(residual) > T_transfer` 才能掩盖）：
 
-也就是说：**命中率越高，本地放置的相对收益越大**（从 ~0 到 55 ms），因为传输那一段越来越藏不住。
+| 命中率 | 跨机 | 本机 DRAM |
+|---|---|---|
+| 90% | 能 | 能 |
+| 95% | 能 | 能 |
+| **99%** | **不能**（所有长度） | 能 |
+| **99.9%** | **不能** | **不能**（所有长度） |
 
-再叠上 batch 效应：跨机的那 56 ms 不是只拖慢这一个请求，是拖慢整个 batch 这一步。批量 N 个请求时，实际损失按「最慢的那一个」计。
+**分界线与上下文长度无关，只与命中率有关。** 原因是 `T_compute` 和 `T_transfer` 都随 `P` 线性增长，比值只由 `(1−hit) × v_prefill` 与 `BW` 决定：
 
-**结论修正**：预取的价值不只是「防驱逐」，还包括「把高命中率请求从跨机挪到本机」——后者在命中率 ≥95% 的 agentic 负载下反而是主项。
+```text
+掩盖条件改写： (1 − hit) × P / v_prefill > P × bytes_per_token / BW
+                约去 P：  (1 − hit) > v_prefill × bytes_per_token / BW
+```
+
+代入 GLM-5.2：`5900 × 93KB / 25GB/s ≈ 0.021`，即 **hit < 97.9% 才能跨机掩盖**。本机 DRAM 的阈值是 `5900 × 93KB / 100GB/s ≈ 0.0054`，即 **hit < 99.46%**。
+
+#### 高命中率下的实际代价
+
+命中 99% 时（agentic 典型区间的上沿）：
+
+| context | residual | 跨机 `T_kv` | 本机 `T_kv` | 差值 |
+|---|---:|---:|---:|---:|
+| 32K | 320 | 168 ms | 54 ms | 114 ms |
+| 128K | 1,280 | 671 ms | 217 ms | 454 ms |
+| 512K | 5,120 | 2684 ms | 868 ms | 1816 ms |
+| 1M | 10,000 | 5243 ms | 1695 ms | 3548 ms |
+
+差值就等于 `T_transfer`：**一旦不能掩盖，跨机那一段是纯加项。**
+
+再叠上 batch 效应（§1.1）：跨机的那 1.8 s（512K）不是只拖慢这一个请求，是拖慢整个 batch 这一步。
+
+#### 结论
+
+1. **预取的价值在命中率 ≥99% 时才是主项。** 中低命中率下，计算足以掩盖传输，本地放置收益接近零。
+2. **高命中率场景下，本机 DRAM 就够**，不必追 HBM——除命中率 ≥99.5% 的情形。
+3. **胖 KV（GLM-5.2 这类）把分界定在 97.9%（跨机）与 99.46%（本机）**，比 MLA 类薄 KV 低得多，因为它每 token 的字节数大。
 
 ### 8.2 吞吐/成本
 
@@ -580,10 +640,12 @@ C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 浪�
 ROI = saved / cost
 ```
 
-例子：
+例子（命中率 +10%）：
 
-- 8K、100 QPS、命中率 +10% → `100×0.1×1.6 = 16 GPU·s/s`；
-- 70K、10 QPS、命中率 +10% → `10×0.1×14 = 14 GPU·s/s`。
+- 128K、2 QPS：每请求省 `0.1 × 128000 / 5900 ≈ 2.2 s`，合计 **4.3 GPU·s/s**；
+- 1M、0.5 QPS：每请求省 `0.1 × 1M / 5900 ≈ 16.9 s`，合计 **8.5 GPU·s/s**。
+
+长上下文的单请求收益大，但 QPS 天然低；短上下文 QPS 高但单请求收益小。两者相乘后的量级接近。
 
 ### 8.3 算法 → 指标 → 收益
 
