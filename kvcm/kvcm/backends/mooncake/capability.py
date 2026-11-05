@@ -21,17 +21,26 @@ def mooncake_v0311() -> BackendCapability:
         soft_pin_after=Capability(
             Support.YES,
             Support.NO,
-            "绑定只有一步式 upsert_tensor，HTTP 无写类端点；自封装 .so 候选",
+            "空写扩展对着主线 SoftPinAction。这个能力集不把通道标成已有",
         ),
-        hard_pin_after=Capability(Support.NO, Support.NO, "pin 写入时固化、无 unpin"),
+        hard_pin_after=Capability(
+            Support.NO,
+            Support.NO,
+            "标记创建时固化；pin(HARD) 拒绝，要 lease 保护请显式调 register_keepalive()。"
+            "lease 时长是 master 的 default_kv_lease_ttl，kvcm 不改这个配置",
+        ),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
         has_offload=Capability(
-            Support.YES, Support.YES, "降层 = 停保活即可，无需调后端"
+            Support.NO,
+            Support.NO,
+            "0.3.11 的 /batch_query_keys 只有内存副本，没有 disk_values / "
+            "local_disk_values（主线 #2685 才加）。按它查盘会判定成没有盘副本。"
+            "通道不具备，demote 在停保活前拒绝",
         ),
         has_promotion=Capability(
-            Support.YES,
-            Support.YES,
-            "提回 = HTTP /query_key，其续租副作用即提回语义",
+            Support.NO,
+            Support.NO,
+            "promote 不在本 PR；留到后续 stacked PR",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
@@ -45,11 +54,16 @@ def mooncake_v0311() -> BackendCapability:
         has_admin_query=Capability(
             Support.NO, Support.NO, "HTTP 查询有副作用（续租 + 计命中）"
         ),
+        has_tenant_quota=Capability(
+            Support.NO,
+            Support.NO,
+            "0.3.11 无租户配额接口；不是段剩余空间",
+        ),
     )
 
 
 def mooncake_main() -> BackendCapability:
-    """mooncake 最新主线（目标基线）。"""
+    """本 PR 目标版本的能力集（代码沿用 main 名字；版本基线见文档）。"""
 
     return BackendCapability(
         has_lease=Capability(
@@ -58,12 +72,27 @@ def mooncake_main() -> BackendCapability:
             "通道 = is_exist，读即续租（预热前置检查的 exists 调用同样续租——保活免费搭车）",
         ),
         soft_pin_after=Capability(
-            Support.YES, Support.NO, "同 0.3.11；自封装 .so 候选"
+            Support.NO,
+            Support.NO,
+            "soft pin 不在本 PR；native 空写留到后续 PR",
         ),
-        hard_pin_after=Capability(Support.NO, Support.NO, "pin 写入时固化、无 unpin"),
+        hard_pin_after=Capability(
+            Support.NO,
+            Support.NO,
+            "标记创建时固化；pin(HARD) 拒绝，要 lease 保护请显式调 register_keepalive()。"
+            "lease 时长是 master 的 default_kv_lease_ttl，kvcm 不改这个配置",
+        ),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
-        has_offload=Capability(Support.YES, Support.YES, "同 0.3.11"),
-        has_promotion=Capability(Support.YES, Support.YES, "同 0.3.11"),
+        has_offload=Capability(
+            Support.NO,
+            Support.NO,
+            "demote 不在本 PR；留到后续 stacked PR",
+        ),
+        has_promotion=Capability(
+            Support.NO,
+            Support.NO,
+            "promote 不在本 PR；留到后续 stacked PR",
+        ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
         has_local_segment=Capability(
@@ -76,8 +105,13 @@ def mooncake_main() -> BackendCapability:
         has_admin_query=Capability(
             Support.YES,
             Support.YES,
-            "HTTP /batch_query_keys 走零副作用核验路径；消费点 = "
-            "MooncakeBackend._verify_missing 的 TODO（当前写死绑定通道，"
-            "本版本接线后切 HTTP）",
+            "副本核验走 HTTP GET /batch_query_keys，用传输端点比段还在不在。"
+            "提回删掉了用 offload 端点对 seg 名的检查，仍打 GetReplicaList",
+        ),
+        has_tenant_quota=Capability(
+            Support.YES,
+            Support.YES,
+            "HTTP GET /api/v1/tenant_quotas 读租户配额"
+            "（requested/effective/charged）；不是段剩余空间，不能拿来当段剩余容量",
         ),
     )
