@@ -3,6 +3,7 @@
 - 状态: **已闭环**——事实基线（F1-F15）已核实；六个设计问题全部闭环
 - 上游问题: [summary.md](../summary.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
 - 角色约定: kvcm 目前没有 router 组件。本文选路面逻辑上分两层（§1）：**索引**（订阅事件流建索引）与 **Router**（查索引、决定请求发往哪个实例；gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能）。索引进程形态（内置 Router / 独立组件）归 D4
+- 平面归属: 本文是**两个平面之间的契约**——控制面侧定义「kvcm 补发什么事件、什么格式、身份怎么算」（§2 方案 a）；管理面侧定义「Router/索引怎么用这些事件选路」（F1–F15 的池层事实与 §5 分层成本）。所以它既不是纯控制面文档，也不是纯管理面文档
 
 ## 参考实现
 
@@ -325,3 +326,5 @@ flowchart LR
 - **D5**：故障衔接（源 seg 所在 client 掉线 copy 失败（F4）、与重路由的先后）
 - **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../../docs/research/vllm-ascend/layerwise-taxonomy.md)）
 - **D7**：方案 A（壳请求进 HBM）去留与叠加顺序
+- **D8（管理面）**：统一调度中心（请求 × KV × 扩缩容；hook + KVT + L0/L1/L2 三环；目标形态 + 性能模型）——kvcm 的管理面（可独立组件/嵌入 Router）；把本文的选路面扩展成联合决策，[D8-joint-scheduling.md](D8-joint-scheduling.md)
+- **D9**：基于 kvcm 能力的服务地图（会话 KV / 预热 / 反熵 / 账本 / 容量 / 迁移；目标形态 + 收益）——把 D2 的操作集组合成服务，[D9-kv-services.md](D9-kv-services.md)
