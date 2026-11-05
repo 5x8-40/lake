@@ -1,4 +1,4 @@
-"""PromoteFlow：触发后轮询 check_promote 到 READY。"""
+"""PromoteFlow：触发后轮询 check_promote，看到目标 memory replica 即返回。"""
 
 from __future__ import annotations
 

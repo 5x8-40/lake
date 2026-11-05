@@ -9,10 +9,10 @@
 本类不组装 SegTopology。任务标识（mooncake 为整数对）在本实现内原样
 透传，不做字符串化；需要写入 Ledger 时由本实现做可逆编码（"hi:lo"）。
 
-本 PR（core）已接线：copy / move / remove / exists / query_task /
-register_keepalive / unregister_keepalive / renew_once。pin / demote /
-promote / check_promote 仍走基类 UnsupportedCapabilityError，由后续
-stacked PR 实现。retain 通道关闭，开头直接 NotImplementedError。
+已接线：copy / move / remove / exists / query_task /
+register_keepalive / unregister_keepalive / renew_once / demote /
+promote / check_promote。pin 仍走基类 UnsupportedCapabilityError
+（soft pin 后续 PR）。retain 通道关闭，开头直接 NotImplementedError。
 """
 
 from __future__ import annotations
@@ -1152,7 +1152,7 @@ class MooncakeBackend(KvOps):
             missing = [key for key in keys if parsed[key].local_disk_replicas < 1]
             if missing:
                 raise VerifyError(
-                    "demote: 还没有 LOCAL_DISK 副本，不能提回: "
+                    "demote: 还没有 LOCAL_DISK 副本，降层未完成: "
                     + ", ".join(missing[:4])
                 )
         except asyncio.CancelledError:
