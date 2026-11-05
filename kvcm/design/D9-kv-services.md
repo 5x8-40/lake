@@ -377,7 +377,7 @@ D9 的能力都依赖具体机制。**事实写在各处，本文不重复**：
 
 影响 D9 的四条前提：
 
-1. **soft pin 有条件**（Case B）。治理规则不能假设"随时能 pin"；不满足就退 keepalive。
+1. **soft pin 有条件**（Case B），且当前 core 未接线（后续 stacked PR）。治理规则不能假设"随时能 pin"；不满足就退 keepalive。
 2. **hard pin 不能事后加**。所以「保留等级」里 PIN 一档只能用 lease 延长模拟。
 3. **retain 未实现**。跨引擎存亡要靠 move 到活 seg 或自挂 SSD，Drain 和 HA 的能力上限受此约束。
 4. **删除面没有原生事件**（publisher 默认关、copy 路径零发布）。所以 KV 对账是 P0，不是可选项。

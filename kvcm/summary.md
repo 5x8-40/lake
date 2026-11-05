@@ -243,7 +243,7 @@
   - **batch 效应**：forward 按层推进，某层没就绪整个 batch 等，损失按 `max over requests(T_kv)` 计。
   - 所以预取的价值不只是防驱逐，还包括把高命中率请求从跨机挪到本机。
 - **网卡是决策输入**（D8 §3.4）：区分 compute network（集合通信/实例间传，带宽大、间歇突发）与 storage network（存储访问，带宽小、易打满）。三处用到——L0 选路、L1 预取时机、L2 扩容判断（带宽满但池空时该加网络不是加节点）。`BW_eff` 必须实测，估高会误判「能掩盖」。参考 DualPath（arXiv:2602.21548v2）的双网络隔离。
-- **版本基线 v0.3.13.post1**：publisher 代码有但构建默认 OFF、运行默认 false、copy 路径零发布；soft pin 空写有条件可用（PR73），hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入已合入（#72）；E15 带宽限速未做。
+- **版本基线 v0.3.13.post1**：publisher 代码有但构建默认 OFF、运行默认 false、copy 路径零发布；soft pin 空写设计完成、后续 stacked PR（core 未接线），hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入已合入（#72）；E15 带宽限速未做。
 - 工作文档：[D8-joint-scheduling.md](design/D8-joint-scheduling.md)；算法：[D8a-scheduling-algorithms.md](design/D8a-scheduling-algorithms.md)；时序：[D8b-scheduling-sequences.md](design/D8b-scheduling-sequences.md)。
 - 待定：publisher 是否开启、hook 通道与信任、扩缩 actuator、多 SC 实例 leader、权重/阈值真机校准。
 
@@ -253,7 +253,7 @@
 - 控制面独立能力：KV 对账（反熵/核验）、用量账本（成本归因）、容量规划建议、下线搬迁（Drain）、保留/删除规则（治理）、历史回放/策略试算、会话分支/跨地域/模型灰度。
 - 优先级：P0 = KV 对账 + 用量账本；P1 = 容量规划建议 + 下线搬迁 + 保留/删除规则；P2 = 历史回放、会话分支/跨地域/模型灰度。
 - **收益**：KV 对账/用量账本让 D8 的命中/保留决策可信、可算 ROI；容量建议/下线搬迁是“保命中率”的防守型收益；保留规则/回放让策略可控、可回归。
-- 关键约束：soft pin 有条件可用、hard pin 拒绝；retain 未实现；KV 对账用 v0.3.13.post1 的零副作用 admin 查询；copy/move 无取消。
+- 关键约束：soft pin 有条件（当前 core 未接线、后续 stacked PR）、hard pin 拒绝；retain 未实现；KV 对账用 v0.3.13.post1 的零副作用 admin 查询；copy/move 无取消。
 - **不重写轮子**：索引/查询复用 Conductor/Dynamo indexer/Mooncake admin；字节/指标复用 LMCache observability/Prometheus；D9 补的是抽样比对、intent→命中的归因、与 D8 的联动。
 - 工作文档：[D9-kv-services.md](design/D9-kv-services.md)。
 - 待定：KV 对账采样成本、用量账本回传、容量建议边界、下线搬迁/retain、保留/删除默认策略。

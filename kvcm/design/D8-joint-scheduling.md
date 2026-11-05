@@ -397,7 +397,7 @@ stateDiagram-v2
 |---|---|---|---|
 | keepalive | 会话活跃/保留 | 周期续租（有界） | lease TTL 的 1/3 左右 |
 | prefetch | hook/预测 | copy 到目标 seg | 后台带宽 <10%；按 EV/bytes |
-| retain | 停顿/长会话 | soft pin（条件可用）或 lease 延长 | TTL/字节上限 |
+| retain | 停顿/长会话 | soft pin（设计；当前 core 未接线）或 lease 延长 | TTL/字节上限 |
 | promote | 只剩盘副本且预期复用 | 池 promotion 或读删写 | 触发式，非确定 |
 | demote | 冷/水位高 | 停保活 + 等驱逐/落盘 | 写回模式时机不可控 |
 | release | 会话结束 | 停 keepalive；确认没人用才 Remove | 默认软释放 |
@@ -550,7 +550,7 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 | 阶段 | 目标 | 验收 |
 |---|---|---|
 | **P0 观测与索引** | 引擎事件 + kvcm READY + miss 反馈接入 KVT；hook 只 observe；L0 用 KVT 选路；决策日志 | KVT 合并/墓碑/置信度；L0 <5ms；不改变现有行为 |
-| **P1 命中与保留** | 会话表；keepalive/soft pin（条件可用）；预取预算；KV 对账抽样；用量账本归因 | 命中率、resume TTFT、预取 ROI、ghost 率 |
+| **P1 命中与保留** | 会话表；keepalive/soft pin（设计，后续 PR）；预取预算；KV 对账抽样；用量账本归因 | 命中率、resume TTFT、预取 ROI、ghost 率 |
 | **P2 容量与弹性** | L2 双环；warm gate；KV-aware victim；池扩缩；价格 | 扩容 Ready <10s 且 warm 达标；缩容零丢失；无振荡 |
 | **P3 服务化** | 会话 KV、预热服务、容量顾问、Drain、治理、回放 | 服务 SLA；ROI；容量预测误差；回放一致 |
 
