@@ -191,7 +191,7 @@ Fabric 形态：`subscribe(prefix_pattern, events=[evicted, replicated, ready])`
 
 ## 1. 时机
 
-- **Agent workload 把 KV 变成长期状态**：多轮复用高、工具调用停顿长、resume 可能重算 70K–200K token；KV 的生命周期从“请求内”变成“会话级/天级”。
+- **Agent workload 把 KV 变成长期状态**：多轮复用高、工具调用停顿长；长上下文模型（256K–1M）下 resume 一次可能要重算数十万 token，GLM-5.2 这类胖 KV 单请求就是几十 GB。KV 的生命周期从请求内变成会话级/天级。
 - **GPU 贵、带宽/内存相对便宜**：用 KV 放置换 GPU 时间，ROI 通常成立；但“无限复制/无限保留”会反噬，所以需要 economics。
 - **已有控制面**：kvcm 已经能 copy/move/keepalive/pin/demote/promote/retain/remove；D8 已有管理面决策；缺的是**产品化/价值闭环**，不是再写一个 RPC。
 - **开源组件只覆盖零件**：Conductor/Dynamo indexer 做索引，Mooncake 做池/副本，LMCache/Prometheus 做指标；**跨层放置、会话记忆、计价治理**没有成品。
