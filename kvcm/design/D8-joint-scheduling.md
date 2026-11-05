@@ -260,6 +260,49 @@ stateDiagram-v2
 
 `u` 是利用率/水位，`u*` 是目标。L0/L1 只读价格；L2 单点更新。
 
+### 3.4 网卡是决策输入，不只是背景指标
+
+前面 §3.3 把 NIC 利用率列为容量视图的一项，但只当观测指标。它应该进决策，理由来自 KV 加载的物理事实。
+
+#### 两类带宽，要分开算
+
+参考 DualPath（arXiv:2602.21548v2）：节点上有两类物理隔离的网络。
+
+| | 用途 | 带宽量级 | 流量形态 |
+|---|---|---|---|
+| **compute network**（东西向） | GPU 间集合通信、KV 跨实例传输 | 大（如 8×400Gbps） | 间歇性突发（集合操作亚毫秒级 burst），有大量空隙 |
+| **storage network**（南北向） | 访问存储、checkpoint、落盘 KV | 小（如每节点 400Gbps） | 持续，容易被打满 |
+
+**关键观察**：两类带宽的瓶颈位置不同。agentic 多轮高命中率时，prefill 侧 storage NIC 被打满，而 compute NIC 有间隙、decode 侧的 storage NIC 闲置。DualPath 的贡献就是把 KV 从「prefill 自己的 storage NIC 加载」改成「借 decode 闲置的 storage NIC 加载，再走 compute NIC 回传 prefill」。
+
+对我们的意义：**调度不能只看「带宽还剩多少」一个数，要看是哪类网络的带宽**。
+
+#### 三处用法
+
+| 用在哪 | 现在 | 应该 |
+|---|---|---|
+| **L0 选路打分** | `w_bw × (B/BW_eff) × c_bw`，`BW_eff` 只能估 | 读实测，且区分这次要走哪类网络 |
+| **L1 预取时机** | 按 `EV/bytes` 排序，不知道现在传不传得动 | 目标网络忙时推迟，避免和在线流量抢 |
+| **L2 扩容判断** | 只看池水位 | 带宽满但池空 → 该加网络或改放置，不是加节点 |
+
+第三行是最容易做错的：**带宽满和容量满的处置完全不同**。
+
+#### 和「能否掩盖」的关系
+
+§1.1（D8a）要算 `residual_crit = T_transfer × v_prefill`，判断这次跨机访问会不会拖垮 batch。`T_transfer` 里的带宽必须是**当前可用带宽**：
+
+```text
+BW_eff = 链路理论带宽 × (1 − 当前利用率)
+```
+
+估的带宽会让判据失效：估高了以为能掩盖，实际不能。这也说明网卡采样的价值不在「监控」，在**让调度判断准**。
+
+#### 代价与边界
+
+- 采样频率与精度要权衡：太粗看不出突发，太细本身成为开销
+- compute network 的「空隙」难以精确测量（亚毫秒级 burst），只能估趋势
+- 跨机迁移的带宽预算和在线流量共享，必须设上限（后台 <10%）
+
 ---
 
 ## 4. Hook：把意图变成需求
@@ -541,6 +584,7 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 | **Mooncake** | `master_service.cpp::CopyStart`、`BatchEvict`、`CreateDrainJob`、`GetReplicaListForAdmin`；`KvEventPublisher` | copy 幂等、lease/驱逐、drain、零副作用核验、池事件 | SC 不碰 PoolKey/seg；全部经 kvcm intent |
 | **KVCR** | `src/kvcr/remote_fw_dram.py::fetch` / `query` / `_try_release_pin` | 目的地发起 fetch、传输窗口 pin | kvcm 集中式 + master 权威；不需要 fencing |
 | **TensorCast** | `tensorcast/api/_config.py::StorePolicyProfile` | 声明式 policy 预设 | 仅借用 retention class 命名，不照搬存储后端 |
+| **DualPath**（arXiv:2602.21548v2） | 双网络隔离（compute NIC / storage NIC）；storage-to-decode + CNIC 回传 prefill；global scheduler 均衡 | 「高命中率下 KV 加载 I/O 成为瓶颈」的问题定义；两类带宽分开算 | DualPath 从引擎视角「借用」对端闲置带宽；我们的带宽归池统一分配。分析见 [`docs/research/dualpath.md`](../../docs/research/dualpath.md) |
 
 关键差异：
 
