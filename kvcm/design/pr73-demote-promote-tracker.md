@@ -54,8 +54,16 @@
 - **R05 没有实例 → client_id（OPEN）**
   - promote 无法事先证明 target 是盘副本登记实例；现在靠 `PromoteFlow` 轮询 target memory replica。
   - 方向：开放 promote 前加注册表，或明确写成假阴性边界。
+- **VerifyError 命名（遗留，未决）**
+  - demote 查清后「没有 LOCAL_DISK」业务上就是 demote 失败，类型却叫
+    `VerifyError`（历史名偏 copy/move 的 READY 副本核验）。
+  - 分类意图仍成立：`QueryError` = 没得到可用查询结果；`VerifyError` =
+    查清了但成功条件不满足（终态）。
+  - 要不要改名/拆类型（例如操作失败统一名，或 demote 专用），未决；
+    见 `code-architecture.md` L3「失败语义」。
 - **A16 / A17（DEFER，跨 PR）**
-  - 同前缀操作串行化、操作粒度统一不在本 PR；见 core tracker。
+  - 同前缀操作串行化、操作粒度统一不在本 PR；core 已合入后见本文件 /
+    后续跨 PR 记录。
 - **A06（DEFER，跨 PR）**
   - move/remove 事件发布在 E14；promote 不涉及事件。
 
@@ -76,3 +84,4 @@
 
 - **2026-11-04**：从 core tracker 拆出；补 demote 消息、promote 重复检查、promote 返回语义三项清理。
 - **2026-11-05**：#80 squash 合入 main 后，本分支 rebase 到 `origin/main`（仅重放 demote 增量）。
+- **2026-11-05**：登记遗留：demote 用 `VerifyError` 表示「没 LOCAL_DISK」，命名是否统一未决。
