@@ -14,7 +14,7 @@ L1 接口层     IntentReceiver / EventPublisher / InstanceWatcher        kvcm/a
               进程对外通道；不含任何存储概念（IntentReceiver 已实现 gRPC。
               BlockStored 补发在 api/events.py 的 EventPublisher，由 daemon
               注入 TaskEngine。把地址交给索引与 InstanceWatcher 归 E13）
-L2 编排层     PrefetchFlow / PromoteFlow 已实现；SessionEnd/Drain/Retain 未实现    kvcm/flows/
+L2 编排层     PrefetchFlow 已接 TaskEngine；PromoteFlow 库已实现未接线；SessionEnd/Drain/Retain 未实现    kvcm/flows/
               只调 L3 接口；代码里不出现 seg / lease / client_id / PoolKey / rank
 L3 原子操作层 KvOps：八操作 + query_task / exists / abandon          kvcm/ops/
               抽象接口（语义规格 = D2 §1）+ capability 声明结构
@@ -158,7 +158,7 @@ flowchart LR
 | 流程 | 编排 | 状态 |
 |------|------|------|
 | PrefetchFlow | exists 前置检查 → copy → query_task 轮询到 READY。保活注册与 `BlockStored` 补发在流程返回后由 `TaskEngine._on_ready` 做（恢复路径用 `target_of`） | 已实现（`flows/prefetch.py`） |
-| PromoteFlow | exists 前置检查 → promote 触发 → check_promote 轮询到目标 memory replica 后返回（flow 返回，不是 `TaskStatus.READY`） | **库已实现**（`flows/promote.py`）：可单测/进程内直接调；**未接** TaskEngine、未扩 intent、daemon 无自动入口。demote 同属 L3 库能力、同样未接线。见 demote-promote tracker「能力范围」 |
+| PromoteFlow | exists → promote 触发 → `check_promote` 轮询到目标 memory replica 后返回（不是 `TaskStatus.READY`） | 库已实现（`flows/promote.py`）；未接 TaskEngine / intent；daemon 无自动入口。demote 同为 L3 库能力、未接线 |
 | SessionEndFlow | `unregister_keepalive` + demote | 未实现（D1 §6） |
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
 | RetainFlow | retain（死前 move/copy 到还活着的段；DFS 另编，不走这个返回值） | 未实现（D2 §4） |
@@ -192,8 +192,8 @@ flowchart LR
 - **任务凭据（TaskHandle）**：一次 `copy(前缀)` 在 mooncake 上是逐条 key 各发一个复制任务——一个前缀通常对应多条 key（块数 × rank 数），所以一次操作会产生多个任务。凭据里的 `task_ids` 装着这次操作的全部任务号，查询时一起查。任务号的类型对 L3 不透明（`tuple[object, ...]`）：mooncake 的任务号是两个整数组成的整数对，L3 原样保存、原样回传，不做字符串化（`str()` 化后真实绑定的 `query_task` 会报 TypeError）；要写进 Ledger 时由实现侧编码成 `"整数:整数"` 的字符串（`encode_task_id`/`decode_task_id`，重启可还原）
 - **READY 规则**（本义 =「可以把请求调度过来」，D2 §1）：
   - copy / move：任务完成 + 目标侧副本核验通过（任务型，凭据里有任务号）
-  - promote：L3 `promote` 只打 N 次 `GetReplicaList`（默认 2）触发，不验证、不返回 `TaskHandle`。`PromoteFlow` 用 `check_promote` 轮询目标 memory replica，看到才返回（flow 返回，不是 `TaskStatus.READY`）；超时 `PromoteError`。不做读删写。搬运是池自主行为，**不占传输闸**。
-  - **R05（必修，归 E13，本切片未修）**：当前没有「实例 → 引擎 client_id」登记；offload 端点与 seg 名又不是一套，**触发前无法证明 target 就是 LOCAL_DISK 登记实例**。错 target 时只能空等到 `PromoteError`。E13 实例注册补上身份后，promote 路径必须加前置校验，不得当作可接受边界搁置。
+  - promote：L3 `promote` 只打 N 次 `GetReplicaList`（默认 2）触发，不验证、不返回 `TaskHandle`。`PromoteFlow` 用 `check_promote` 轮询目标 memory replica，见到才返回（不是 `TaskStatus.READY`）；超时 `PromoteError`。不做读删写。搬运是池自主行为，**不占传输闸**。
+  - **R05（必修，归 E13，未修）**：无「实例 → 引擎 `client_id`」；offload 端点与 seg 名不是一套，触发前证不了 target 即 LOCAL_DISK 登记实例。错 target → 空等到 `PromoteError`。E13 补身份后，promote 须前置校验。
   - **retain 返回 TaskHandle**——这个方法只表达 move/copy（D2 §4），返回这次搬运的任务号。DFS 不走这个返回值。空任务号抛 `ValueError`
   - 其余方法（register_keepalive / unregister_keepalive / renew_once / pin / demote / remove）无 READY
 - **exists（查询，不是第九项管理操作）**：实现是 `batch_is_exist`，它有个副作用——被查到的 key 会被续租，所以预热前的存在性检查顺便就起了保活作用。两种结果必须分清：「不在池里」（key 确实没有 → 该预热）和「查询本身失败」（返回值不是 0/1/True/False，或列表长度和 key 数不一致 → 转成 QueryError 等一会儿重查）——把查询失败当成「不在池里」会误判成需要重新计算
@@ -208,10 +208,10 @@ flowchart LR
 |------|-----------|-------------|
 | SubmitError | 提交任务的中途出错。已经落账的号由流程 `abandon`，账本是 abandoned；池里的传输不取消 | 视为失败；重试与否由编排层决定（重复提交有幂等保护，见下） |
 | QueryError | 查任务状态、查副本时得不到可用结果（RPC / 短回 / `ok=false` 等） | 轮询阶段：等一会儿重查，不算失败；exists 阶段：不包装，直接上抛给调用方 |
-| VerifyError | 已查清，成功条件不满足（终态，带明细）。copy/move：任务完成但目标缺内存副本；demote：每个 key 的 `local_disk_replicas` 不够 | 视为失败 |
-
-**遗留（命名未决）**：`VerifyError` 名字偏 READY 核验；demote「没盘 = 降层失败」复用同一类型后，口头上不像「demote 失败」。分类（查不清 vs 查清不合格）先保持；是否改名或拆类型另定，demote PR tracker 有登记。
+| VerifyError | 已查清，成功条件不满足（终态，带明细）。copy/move：任务完成但目标缺内存副本；demote：每 key 的 `local_disk_replicas` 不够 | 视为失败 |
 | ValueError | 任务号是空的。空任务号不是完成信号 | 编程错误，直接传播，不包装 |
+
+**命名未决**：`VerifyError` 原偏 copy/move 核验；demote 无盘也用它。分类（`QueryError`=查不清 / `VerifyError`=查清不合格）保留；是否改名另定。
 
 **重复提交不视为失败（等副本状态，代码里叫 `_watch`）**
 
@@ -274,13 +274,13 @@ stateDiagram-v2
 | soft pin 事后加（用 upsert 空写的方式） | RPC ✓ 通道 ✗（0.3.11/0.3.12 的 soft_pin 通道不适用） | **后续 stacked PR**：RPC ✓ 通道 ✓（**有条件可用**：目标版本有 `SoftPinAction`、无 `has_read_lease` 门槛；要求 Case B——尺寸一致、单 slice、key 存在、无盘副本；pin 前 `exists` 持 lease；`UpsertStart` 后地址检查，不一致就 `UpsertRevoke`。lease 挡驱逐/非 force Remove，不挡 force Remove、lease 过期后的驱逐或 Case C；`pin(SOFT)` 不 `register_keepalive`。Case C 旧 buffer 延迟释放（默认 600s），地址复用残余主要来自 exists 后发生 force remove / stale 清理 / lease 过期驱逐，或 UpsertStart 惰性清理 / processing 抢占后无 COMPLETE 副本的 Case A。ABI 仍需真机验证；Start-End 崩溃 / 读者短暂不可读 / client_id 改写 / 不续期 / 并发重写是已知边界） | D2 F1/F12、D2 §2 |
 | hard pin 事后改标记 | ✗（创建时固化，`pin(HARD)` 拒绝；要 lease 保护用显式 `register_keepalive()` + `renew_once`。lease 是 master 的 `default_kv_lease_ttl`，kvcm 不改） | ✗ | D2 §2 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源，且 `source` 必填） | ✗ | D2 F7 |
-| has_offload / has_promotion（池通道降层/提回） | 降层通道 ✗（`/batch_query_keys` 没有 `disk_values` / `local_disk_values`，主线 #2685 才加）。提回通道 ✓（打 `GetReplicaList`，再用内存副本传输端点对 `locate(target)`；不拿 offload 端点对 seg 名） | 降层通道 ✓（停保活、等满一个 lease TTL、再用 `GET /batch_query_keys` 确认 LOCAL_DISK 副本；不用 `GetReplicaList`，那会续租）。提回：L3 `promote` 只打 N 次 `GetReplicaList` 触发；`PromoteFlow` 用 `check_promote` 轮询目标 memory replica。已删掉用 offload 端点对 seg 名的检查 | D2 §3 |
+| has_offload / has_promotion（池通道降层/提回） | 降层通道 ✗（`/batch_query_keys` 没有 `disk_values` / `local_disk_values`，主线 #2685 才加）。提回通道 ✓（打 `GetReplicaList`，内存副本传输端点对 `locate(target)`；不用 offload 端点对 seg） | 降层 ✓：停保活 → 满 lease TTL → `GET /batch_query_keys` 确认 LOCAL_DISK（不用会续租的 `GetReplicaList`）。提回：L3 打 N 次 `GetReplicaList`；`PromoteFlow` 轮询 `check_promote` | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
 | has_local_segment（kvcm 自己挂 DRAM 段） | RPC ✓ 通道 ✓（`setup(global_segment_size)` 启动时挂） | 同左 | D2 §4 |
 | has_local_disk_mount（挂本机盘） | RPC ✓ 通道 ✓（`setup(enable_ssd_offload, ssd_offload_path)` 启动时挂，另有 `unmount_local_disk_segment`） | 同左 | D2 §4 |
 | has_dfs_replica（共享 3FS 副本） | ✗ | RPC ✓ 通道 △（写入路径待 E6 核对） | D2 F13② |
-| has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**。副本核验走 `GET /batch_query_keys`，用传输端点比段还在不在。提回删掉了用 offload 端点对 seg 名的检查，仍打 `GetReplicaList` | D2 F11b |
+| has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**。副本核验走 `GET /batch_query_keys`，用传输端点比段还在不在。提回打 `GetReplicaList`，用内存副本传输端点对 `locate(target)`，不用 offload 端点对 seg | D2 F11b |
 | has_tenant_quota（租户配额读） | ✗（channel NO；不是段剩余空间） | HTTP ✓（GET `/api/v1/tenant_quotas`）。租户配额记账，不能当段剩余空间用 | D2 F13 |
 
 空写扩展的版本依赖不止 `SoftPinAction`：`UpsertEnd` 从 0.3.13 起改成 `ObjectMeta`，0.3.14-pre 起有 `has_read_lease` gate；完整版本表见 D2 §2「4. 版本依赖」。
@@ -602,7 +602,7 @@ sequenceDiagram
 - **实现通道**：`KeepaliveLoop` 定期调 `renew_once` → `exists`（`batch_is_exist` / BatchExistKey，读即续租）。`MooncakeBackend.register_keepalive` / `unregister_keepalive` 只登记/注销同一张 Ledger 表，不改成 ProbeKey
 - **形态**：协程定时器（事件循环内 `asyncio.sleep` 周期触发），不是独立线程
 - **已知限制（量未测）**：默认约每 5s `sweep_once`，对表里每个前缀做一次全 key `batch_is_exist`。请求量与 sweep 延迟没有基线；保活前缀多或单前缀很长时，sweep 可能拖过周期。限流 / 分批 / 按前缀错峰要等真机量过再改，core 不先加策略
-- **A16（必修，本切片未修）**：demote 已 unregister 后，同前缀上其它路径的 `exists` 仍会续 master lease，可把 demote 的 TTL 等待打穿。完整修法是前缀级串行，见 demote-promote tracker A16；不得当作「别并发」边界搁置。
+- **A16（必修，未修）**：demote 已 unregister 后，同前缀其它路径的 `exists` 仍会续 master lease，可打穿 demote 的 TTL 等待。修法：前缀级串行（`summary.md` A16）。
 
 ### ReleaseLoop / RetainLoop
 

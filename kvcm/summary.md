@@ -71,12 +71,14 @@
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
 - 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。tasks 与 keepalive 有写入方。replicas 与 sessions 表在，还没有写入方。
-- 遗留：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。
-- 遗留：`SubmitIntent` 现在只有预热（前缀 × 目标实例）。move / pin / demote / promote / remove 只有操作，没有 intent。这是大遗留，当前不扩协议、不加流程。同前缀操作串行化（prefetch / demote / remove / pin）也未做，归 A16，后续单独设计。操作粒度也未统一（copy 核验仍在 query_task；move/demote/remove 未拆 flow），归 A17，后续逐步改造。
+- 遗留（A06，归 E14）：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。promote 不发事件。
+- 遗留：`SubmitIntent` 现在只有预热（前缀 × 目标实例）。move / pin / demote / promote / remove 只有操作，没有 intent。这是大遗留，当前不扩协议、不加流程。
+- **A16（必修，未修）**：同前缀操作串行化（prefetch / demote / remove / pin）。demote 已 unregister 后，同前缀 `exists` / 预热仍会在 master 续租，可打穿 demote 的 lease 等待。
+- **A17（DEFER）**：操作粒度未统一——copy 核验在 `query_task`；demote sleep+盘核验在 L3；promote 等待在 L2 `PromoteFlow`；move/remove 未拆 flow。与 A16 不同项。
 - locate：进程内「实例 → rank 有序段名单」。intent 和操作入参没有 segment。没登记的实例报错。
 - remove：**全局删所有副本，不支持 target**。无论 force 都先注销保活。`force=False` 再等满一个 lease TTL，然后 `batch_remove(..., force=False)`。`force=True` 注销保活后立刻 `batch_remove(..., force=True)`，不等；但它只跳过 lease，未完成副本和在途 copy/move 仍会拒删。失败或取消不把登记加回去，注销过就留注销，调用方自己重试，租约可以过期。
 - 保活续租用 BatchExistKey（`renew_once` → `exists` → `batch_is_exist`），不用 ProbeKey。`register_keepalive` / `unregister_keepalive` 只登记或注销 Ledger 里的同一张表；续租由 `KeepaliveLoop` 调 `renew_once`。**lease 是 key 级，保这个 key 的所有副本；target 不是保活维度。**
-- 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回删掉了用 offload 端点对 seg 名的检查（offload RPC 用 port 0 由内核分配，seg 名是 `local_hostname_`，不是同一次真机测量），仍打会累计命中的 GetReplicaList（默认 2 次），再用内存副本传输端点对 `locate(target)`，同步核验，不轮询。daemon `--admin` 必填；`--capability` 默认 `main`。`v0311` 启动直接失败：那个端点有续租副作用，也没有盘副本字段。
+- 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回打 GetReplicaList（默认 2 次，累计命中），再用内存副本传输端点对 `locate(target)`；不用 offload 端点对 seg（offload RPC 端口与 `local_hostname_` seg 名不是一套）。L3 同步核验；等待在 `PromoteFlow`。daemon `--admin` 必填；`--capability` 默认 `main`。`v0311` 启动直接失败：那个端点有续租副作用，也没有盘副本字段。
 - 软钉空写（设计；实现见后续 stacked PR）：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据；要求 Case B（尺寸一致、单 slice、key 存在、无盘副本），pin 前 `exists` 持 lease，`UpsertStart` 后做 buffer 地址检查，不一致就 `UpsertRevoke`。lease 挡驱逐/非 force `Remove`，不挡 `Remove(force=true)` 或 Case C；Case C 旧 buffer 进 `discarded_replicas_` 延迟释放（默认 600s），检查时不会地址复用，地址复用残余主要来自 `exists` 后发生 force remove / stale 清理 / lease 过期驱逐，或 `UpsertStart` 惰性清理 / processing 抢占后无 COMPLETE 副本的 Case A。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。wheel 不带 C++ 头文件，扩展只链 `store.so`。`get_real_client()` 是退路：只有以后真实调用失败，才包含 `pyclient.h`，在对象还原成 `MooncakeStorePyWrapper` 之后取出已建 client。现在不走这条。client_id 用方案一：`UpsertStart` 发出的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时副本留在 PROCESSING。扫任务记录再补 End/Revoke 的崩溃恢复当前不做（D2 F5）。保留身份先不动。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
 - pin：READY 后防驱逐——设计；soft pin 实现在后续 stacked PR，core/demote 当前 `soft_pin_after = NO`。`pin(HARD)` 拒绝，hard 级 lease 保护用显式 `register_keepalive()`，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
@@ -275,7 +277,7 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 - **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC，与仓内跨语言 RPC 选型一致）。✅ **已落地**：`SubmitIntent` / `GetTask`。协议字段里仍依赖 D4 定型的部分没有扩。
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例启动 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3 耦合；D5 已闭环，见本文）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
   - **实例注册一次交全**（D1 §3b，已定，代码未接）：字段 = 实例 id、rank 有序段列表、补发端点、DP 编号、kind（可空）。管理面分配端点，kvcm 只校验不分配。
-  - **R05（必带）**：注册还须能对上引擎 mooncake `client_id`（或等价「盘副本登记 client」身份）。demote/promote 切片已落地提回，但**触发前无法证明 promote 的 target 就是 LOCAL_DISK 所在实例**；E13 接通后必须补前置校验，不得当作可接受边界。详见 D2 §3 / demote-promote tracker R05。
+  - **R05（必带）**：注册还须能对上引擎 mooncake `client_id`（或等价盘副本登记 client）。已有 promote 库能力，但触发前证不了 target 即 LOCAL_DISK 所在实例；E13 接通后须前置校验。见 D2 §3。
   - 与现有启动参数的关系：`--instance-segs` / `--kv-event-endpoint` 保留成 demo 兜底；同一实例不允许两处都登记，启动时报错。
   - kind 留空的实例，READY 后不发 `BlockStored`（只记日志）。宁缺一条，也不发一条 kind 错的。
   - 通知索引与实例注册同一流程：注册是别人告诉 kvcm，通知是 kvcm 告诉别人。通知失败只记日志、不回滚注册。

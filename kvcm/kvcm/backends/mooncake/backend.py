@@ -1113,18 +1113,13 @@ class MooncakeBackend(KvOps):
         return await self.exists(prefix)
 
     async def demote(self, prefix: Prefix) -> None:
-        """先确认能展开成 key、并且 admin 已配置，再注销保活。
+        """停保活 → 睡满 ``lease_ttl_s`` → 用 ``GET /batch_query_keys`` 确认 LOCAL_DISK。
 
-        然后等满一个 lease TTL，再查是否已有盘副本。没有马上撤销
-        lease 的调用，也不查剩余租约，所以睡满 ``lease_ttl_s``
-        （须与 master 的 ``default_kv_lease_ttl`` 一致）。
-        然后用已有的 ``GET /batch_query_keys`` 看 disk / local_disk 条数。
-        不用 ``GetReplicaList`` / ``batch_get_replica_desc``，那会续租，
-        把刚停的保活又续上。每个 key 都有盘副本才算成功。
-        写回且池不满时仍会失败：不读数据落盘，不调 ``MountLocalDiskSegment``。
-        展开不出 key、或没配 admin，在注销保活之前就失败。
-        失败或取消只恢复原本就有的保活行，并写回原来的
-        ``registered_at``。原来没有行不新建。成功不加回。
+        ``lease_ttl_s`` 须与 master ``default_kv_lease_ttl`` 一致；无立即撤租、
+        不查剩余租约。不用 ``GetReplicaList`` / ``batch_get_replica_desc``（会续租）。
+        每 key 须有 LOCAL_DISK；DFS 不算。不读数据落盘、不挂盘。展开失败或无
+        admin 在 unregister 前就失败。失败/取消只恢复原先保活行与原
+        ``registered_at``；原先无行不新建；成功不加回。
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
@@ -1180,10 +1175,10 @@ class MooncakeBackend(KvOps):
             raise UnsupportedCapabilityError("提回通道不具备")
 
     async def promote(self, prefix: Prefix, target: InstanceId) -> None:
-        """只触发提回：打 ``promote_hits`` 次 GetReplicaList，不验证、不等待。
+        """打 ``promote_hits`` 次 GetReplicaList 触发提回；不验证、不等待。
 
-        `PromoteFlow.run()` 用 `check_promote` 轮询；L3 没有 TaskStatus.READY。
-        target 仅保留给上层 flow 的验证语义，触发本身是 key 级。
+        完成由 ``PromoteFlow`` 轮询 ``check_promote``。触发按 key；``target``
+        留给上层核验（R05：触发前尚证不了落点）。
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
