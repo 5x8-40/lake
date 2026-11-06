@@ -11,13 +11,14 @@ KeepaliveLoop 调 `renew_once`；登记由 TaskEngine 触发
 `KeepaliveLoop.register`（内部写 Ledger，也可直接调 L3 的
 `register_keepalive`）。不再提供一个既登记又续租的 `keepalive`。
 
-完成信号：copy / move 有 READY（任务状态完成 + 目标侧副本核验通过）；
-promote 只负责触发，不返回 TaskHandle，READY 由 PromoteFlow 用
-check_promote 轮询判定；retain 的 READY 跟着做法走：用 copy/move 搬某
-实例时按 copy/move 的规则上报 READY；搬进 kvcm 自己的段盘、用旧
-client_id 接管、DFS 则不上报 READY。其余方法（register_keepalive /
-unregister_keepalive / renew_once / pin / demote / remove）无 READY。
-任务状态经 query_task 查询。
+完成信号：copy / move 有 READY（任务完成 + 目标侧副本核验，经
+``TaskStatus.READY``）。promote 也有 READY（D2：某实例可调度），但 L3
+``promote`` 只触发、无 TaskHandle；READY 由 PromoteFlow 的
+``PromoteResult.ready`` 表达。是否已有 memory 由 ``check_promote``
+判定；不传 target 时落点反查 ``memory_instance``（对不上则
+ready=False）。传 target 则落在该实例后 ready=True（必要时经
+PrefetchFlow copy）。retain 的 READY 跟着做法走。其余方法无 READY。
+任务状态经 query_task 查询（仅任务类操作）。
 
 幂等：**本层不去重**——`copy` 每次调用都发起任务，同一前缀重复调用会产生
 重复传输。去重归编排层（TaskEngine 以 intent_id = 前缀 × 目标实例 为键：
@@ -223,19 +224,35 @@ class KvOps(ABC):
         GET /batch_query_keys 确认盘副本。写回且池不满时失败。无 READY。"""
         raise self._unsupported("demote")
 
-    async def promote(self, prefix: Prefix, target: InstanceId) -> None:
-        """触发前缀 KV 提回到 target：只做 N 次访问，不验证、不返回句柄。
+    async def promote(self, prefix: Prefix) -> None:
+        """触发池提回：只打 N 次访问，不验证、不等待、不带 target。
 
-        是否提回成功由 PromoteFlow 用 ``check_promote`` 轮询判定。
+        落点由池派给盘副本登记 client。是否已有 memory、落在哪台实例，
+        分别由 ``check_promote`` / ``memory_instance`` 查询。
         """
         raise self._unsupported("promote")
 
-    async def check_promote(self, prefix: Prefix, target: InstanceId) -> bool:
-        """查询 target 上是否已有该前缀全部 key 的 memory replica。
+    async def check_promote(
+        self, prefix: Prefix, target: InstanceId | None = None
+    ) -> bool:
+        """前缀 memory 是否就绪。
 
-        只读检查；失败抛 QueryError。供 PromoteFlow 轮询。
+        - ``target is None``：每个 key 至少有一处 memory（不限实例）。
+        - ``target`` 给定：每个 key 按 ``build_plan`` 落在该实例对应 seg。
+
+        查询本身有副作用（mooncake：授 lease、累计命中、可能触发
+        promotion / dynamic replication）。失败抛 QueryError。供
+        PromoteFlow 轮询。
         """
         raise self._unsupported("check_promote")
+
+    async def memory_instance(self, prefix: Prefix) -> InstanceId | None:
+        """若每 key 已有 memory，返回任一可按 rank 映射服务全前缀的实例。
+
+        对不上目录 / 反查失败则 ``None``（提回仍算成功）。默认不实现则
+        返回 ``None``。
+        """
+        return None
 
     async def retain(self, prefix: Prefix, target: InstanceId | None = None) -> TaskHandle:
         """目的型：让前缀 KV 在源引擎下线后仍存活。
