@@ -8,7 +8,7 @@
   - §2 pin：`pin(HARD)` **拒绝**（hard pin 创建时固化，不能事后设置）；要 lease 保护用显式 `register_keepalive()`（续租由 `KeepaliveLoop` 调 `renew_once`）。候选 ② 读删写代价太大，不做。soft pin = **有条件可用空写**（目标版本无 lease gate；Case B 前置；main/0.3.14 有 gate 时不适用）；client_id 用方案一
   - **易混淆澄清**：[lease-pin-eviction.md](lease-pin-eviction.md)——lease / soft pin / hard pin / 驱逐分界（不替代本节 F1/F8/F9 与 §2）
   - §3 demote / promote：demote 先停保活，等满一个 lease TTL，再用 `GET /batch_query_keys` 确认盘副本。写回且池不满仍会失败
-  - 遗留：`SubmitIntent` 现在只有预热（前缀 × 目标实例）。move / pin / demote / promote / remove 只有操作，没有 intent。这是大遗留，当前不扩协议、不加流程
+  - 协议：`SubmitIntent` 仍是前缀 × 目标；执行走 `PromoteFlow(target=)`。move / pin / demote / remove 无独立 intent，不扩协议
   - §4 retain / release：release 定型。retain 的留存机制靠「副本挂在谁身上」——搬到活 seg、或 kvcm 自己收进名下、或 DFS 副本。不存在保留身份注册；`#2991` 只是同一个 `client_id` 的重连窗口
   - 未决问题（详见 summary）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）
 - **版本基线**：mooncake **v0.3.13.post1**（master / client 同版本）；main / v0.3.14 的 `has_read_lease` 门槛不在当前目标版本内，升级时再按那时设计。
@@ -290,7 +290,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 - **操作集八项**：copy / move / keepalive / pin / demote / promote / retain / remove
   - keepalive 在 L3 拆成三个方法：`register_keepalive` / `unregister_keepalive` 管理 Ledger 登记，`renew_once` 执行一次续租；周期续租由 `KeepaliveLoop` 调 `renew_once`，不再有一个既登记又续租的 `keepalive()`
   - 按性质分三类
-    - **原子动作**：copy / move / keepalive / demote / promote / remove——原子指**语义**：一个操作一个效果、无中间态对外。实现上 copy/move/remove 各对应单 RPC；keepalive 是登记 + 续租两个动作；demote 是组合动作；promote 只触发 N 次访问（不带 target），完成由 PromoteFlow 查 memory / 可选反查实例（§3）
+    - **原子动作**：copy / move / keepalive / demote / promote / remove——原子指**语义**：一个操作一个效果、无中间态对外。实现上 copy/move/remove 各对应单 RPC；keepalive 是登记 + 续租两个动作；demote 是组合动作；L3 promote 只触发 N 次访问（不带 target），完成由 PromoteFlow（无/有 target 两种，§3）
     - **元数据标记**：pin 的 soft 是设一次标记。`pin(HARD)` 拒绝；hard 级不通过 pin，要 lease 保护用显式 `register_keepalive()`（§2）
     - **目的型**：retain——「源引擎下线后副本还在」是目的不是机制。做法是死前把副本搬到别的 client 名下（move/copy 到活 seg，或搬进 kvcm 自己的段再落盘），或用旧 `client_id` 接管盘上数据，或写成 DFS 副本（§4）。降到源引擎自己的盘、pin、keepalive 都不改变副本所在 client
   - 复合流程由原子操作编排而成（策略层组合），不写成一体状态机
@@ -302,12 +302,12 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 | 会话结束降层 | demote（自己先 `unregister_keepalive`，再等满一个 lease TTL，然后确认盘副本；§3） |
 | 下线迁移 | copy + remove（或 move 一步完成） |
 
-- **操作完成信号**：copy/move 查 `QueryTask` 再核验副本；promote 由 `PromoteFlow` 调 `check_promote` 轮询到每 key ≥1 memory；copy/move 走 `GET /batch_query_keys`，promote 走 `GetReplicaList`（该查询授 lease、累计命中，不是零副作用）
+- **操作完成信号**：copy/move 查 `QueryTask` 再核验副本；promote：L3 只触发；`PromoteFlow` 不传 target 时轮询到每 key ≥1 memory，传 target 时可能再 copy 落到该实例；copy/move 走 `GET /batch_query_keys`，promote/`check_promote` 走 `GetReplicaList`（该查询授 lease、累计命中，不是零副作用）
 - **READY** 是完成信号里特指「可以把请求调度过来」的那一类
   - 含义：目标实例的 DRAM 副本已写好、kvcm 核验通过后，上报 Router（D1 §4）
   - 有 READY（3 个）：**copy（预热）、move、promote**
     - 共同点：做完之后，某个实例新具备了「请求发过来就能直接用本机 KV」的条件
-    - 核验方式：copy / move 查 `QueryTask` 确认任务结束，副本位置用 `GET /batch_query_keys`。promote：L3 只触发、不带 target；`PromoteFlow` 等到每 key ≥1 memory（已有则不触发），返回可选持有实例（`build_plan` 反查，可空）。`check_promote` / 触发同走 `GetReplicaList`，有授 lease / 累计命中副作用。可调度实例来自查询，不是入参。只有盘副本时 copy 不能直接从 LOCAL_DISK 取源（无 seg 名）：先 promote 提回盘主 memory，再 copy 到目标机（无 `TaskStatus.READY`；未接 TaskEngine / intent）
+    - 核验方式：copy / move 查 `QueryTask` + `GET /batch_query_keys` → `TaskStatus.READY`。promote：L3 只触发、无 TaskHandle；`PromoteResult.ready`。不传 target：任意 memory + 反查持有方可空。传 `target`：`check_promote(target)`（已在 / copy / 先提回再 copy；copy 后再核验；`QueryError` 当未就绪）。intent 经 TaskEngine 一律走带 target 的 PromoteFlow
     - move 多一件事：源副本被删，要同步通知索引「源实例不再有这份 KV」
   - 无 READY（4 个）：register_keepalive / unregister_keepalive / renew_once / pin / demote / remove
     - keepalive / pin：不动数据，登记或 RPC 返回即完成，记台账即可
@@ -1096,8 +1096,11 @@ sequenceDiagram
 ### promote 实现
 
 - **被动路径（流量驱动）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本登记 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
-- **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——L3 `promote(prefix)` 只打 `promote_hits` 次 `GetReplicaList`（默认 2），不带 target、不验证、不等待。落点由池派给盘副本登记 client。`PromoteFlow`：已有 memory（每 key ≥1）则直接成功；否则触发后轮询 `check_promote`，返回 `PromoteResult.instance`（`build_plan` 反查，可空；反查失败不影响成功）。超时 `PromoteError`。`check_promote` 本身也走 `GetReplicaList`，会授 lease、累计命中（可能再触发 promotion），不是只读。不要用 promote 点名机器。库能力，未接 TaskEngine / intent。计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），与真实流量同池累计，到线即触发上面的被动路径。
-  - **指定机器两步**：`CreateCopyTask` 不能以 LOCAL_DISK 为源（`get_segment_names` 对盘副本返回空，见 F7）。只有盘副本、目标是 A 时：① `promote(prefix)` 把盘提回盘主 B 的 memory；② `copy(prefix, A)` 从 B 的 memory 再到 A。已有 memory 时可直接 copy。
+- **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——L3 `promote(prefix)` 只打 `promote_hits` 次 `GetReplicaList`（默认 2），不带 target、不验证、不等待。落点由池派给盘副本登记 client。`check_promote(prefix, target=None)`：无 target 看每 key ≥1 memory；有 target 看 `build_plan` 是否落在该实例。查询走 `GetReplicaList`，授 lease、累计命中（可能再触发 promotion），不是只读。
+  - **PromoteFlow（L2）**（READY = `PromoteResult.ready`，不是 `TaskStatus`）：
+    - `run(prefix)`：已有任意 memory 或 L3 promote 后轮询到齐；反查 `memory_instance`——有持有方 → `ready=True`，对不上 → `ready=False`。超时 `PromoteError`。
+    - `run(prefix, *, target=A)`：完成 = `check_promote(A)`。已在 A → ready；有 memory → Prefetch copy 后再核验；仅盘 → promote 等 memory 再 copy 再核验（LOCAL_DISK 不能当 copy 源，F7）。copy 任务 READY 不够。`QueryError` 当未就绪。库默认直调 Prefetch；intent 由 TaskEngine 注入闸路径（只挡 copy）。带 target 时 `timeout_s` 须够 copy（intent 常用 120s；默认 30s 偏紧）。
+  - TaskEngine：`PromoteFlow.run(..., target=)`。计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` @0.3.11），与真实流量同池累计。
   - 前提：`promotion_on_hit` 开启 + DRAM 还没满到要驱逐的程度（内存紧张时 master 不批——提回来也马上被逐）+ 盘副本所在引擎在线
   - 触发必须用 `GetReplicaList`——`ExistKey` 触发不了（只授 lease、不计命中次数，`master_service.cpp:752-770` @0.3.11）；触发顺带授 lease（F11b 的副作用在此是正作用：提回期间防逐）
 - **kvcm 主动路径二：读删写（重，确定性自搬）**——读盘副本数据 → `Remove` → `PutStart` 新建 DRAM 副本 → 写数据 → `PutEnd` → 校验

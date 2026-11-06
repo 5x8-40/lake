@@ -4,9 +4,14 @@
 
     intent 入队（asyncio.Queue）
         → 协程消费者出队
-        → 过传输闸（Semaphore，限同时没做完的预热前缀数）
-        → 执行 PrefetchFlow.run
-        → 终态记账 + READY 后注册保活并按实例补发 BlockStored
+        → PromoteFlow.run(prefix, target=…)
+            已在 target → 直接 ready（不过闸）
+            仅盘 → L3 promote 等到 memory（不过闸）
+            需搬到 target → 闸外等段空间，过前缀闸跑 PrefetchFlow
+        → PromoteResult.ready 后注册保活并按实例补发 BlockStored
+
+SubmitIntent 不扩协议。闸只挡真要 copy 之前。
+check_promote 的 QueryError 当未就绪。
 
 无优先级、不分轻重通道——轻任务本来就不经此队列（保活走
 KeepaliveLoop，查询由各自调用方直接 await）。
@@ -53,6 +58,7 @@ from typing import Callable
 
 from kvcm.api.events import EventPublisher
 from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
+from kvcm.flows.promote import PromoteError, PromoteFlow
 from kvcm.ledger import prefix_key
 from kvcm.loops import KeepaliveLoop
 from kvcm.ops.base import (
@@ -157,6 +163,8 @@ class TaskEngine:
             raise ValueError("max_concurrent must be positive")
         self._ops = ops
         self._flow = PrefetchFlow(ops)
+        # 闸只包 copy：注入 _wait_then_run，已在 target / 只提回不走它
+        self._promote = PromoteFlow(ops, prefetch=self._gated_prefetch)
         self._keepalive = keepalive
         self._events = events
         self._limiter = limiter
@@ -400,8 +408,8 @@ class TaskEngine:
         poll_s: float = 0.5,
         timeout_s: float = 120.0,
     ) -> None:
-        """直接执行一次预热（不排队、不记账；脚本与测试用）。"""
-        await self._run_prefetch(prefix, target, poll_s, timeout_s)
+        """直接执行一次 intent（不排队、不记账；脚本与测试用）。"""
+        await self._run_intent(prefix, target, poll_s, timeout_s)
 
     async def track(
         self,
@@ -429,11 +437,14 @@ class TaskEngine:
     # ------------------------------------------------------------------
 
     async def _consume_loop(self) -> None:
-        """消费者：出队 → 过闸 → 执行 → 记终态。"""
+        """消费者：出队 → PromoteFlow(target=) → 记终态。
+
+        闸只在 Promote 需要 copy 时经 ``_gated_prefetch`` 占用。
+        """
         while True:
             rec = await self._queue.get()
             try:
-                await self._run_prefetch(
+                await self._run_intent(
                     rec.prefix, rec.target, rec.poll_s, rec.timeout_s
                 )
                 self._finish(rec, IntentStatus.READY)
@@ -441,12 +452,13 @@ class TaskEngine:
             except asyncio.CancelledError:
                 self._finish(rec, IntentStatus.FAILED, "cancelled (shutdown)")
                 raise
-            except (PrefetchError, QueryError, IntentInputError) as e:
+            except (PromoteError, PrefetchError, QueryError, IntentInputError) as e:
                 # 这一次 intent 失败。不能向上抛，否则消费者退出，
                 # 几次之后新 intent 永远 PENDING。
-                # QueryError 是 exists 查询失败，不包成 PrefetchError。
-                # IntentInputError 是未登记实例、前缀不足一块、段名单和
-                # TP 对不上、PYTHONHASHSEED 未设。
+                # PromoteError：提回/搬到 target 业务失败。
+                # PrefetchError：闸内 copy 路径（经 Promote 包装前也可能冒出）。
+                # QueryError：exists 等查询失败。
+                # IntentInputError：未登记实例、前缀不足一块等。
                 self._programming_errors = 0
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
             except Exception as e:  # 编程错误也留原因，再往上抛（不吞）
@@ -490,36 +502,46 @@ class TaskEngine:
             finally:
                 self._queue.task_done()
 
-    async def _run_prefetch(
+    async def _gated_prefetch(
+        self,
+        prefix: Prefix,
+        target: InstanceId,
+        *,
+        poll_s: float,
+        timeout_s: float,
+    ) -> None:
+        """供 PromoteFlow 注入：闸外等段空间 → 过前缀闸 → PrefetchFlow。"""
+        await self._wait_then_run(prefix, target, poll_s, timeout_s)
+
+    async def _run_intent(
         self,
         prefix: Prefix,
         target: InstanceId,
         poll_s: float,
         timeout_s: float,
     ) -> None:
-        """跑一次预热。
+        """PromoteFlow(target=…)。闸只在真要 copy 时经注入路径。
 
-        传输闸的范围：**exists 和等目标段空间在闸外**。名额在复查之前就
-        `acquire`；复查失败立刻 `release`，回到闸外再等。复查通过之后，
-        这个名额占到该前缀终态——这段时间 master 上有这个前缀的全部
-        key，轮询也占着名额。放不下就在闸外睡 0.5 秒再查，不占名额。
-        `submit_concurrency` 在建链 RPC 返回时就还，替不了这一段。
-
-        timeout_s 从这里开始，覆盖等空间、等前缀闸、提交和轮询。还没有
-        任务号就到点：这次预热停止，不记成复制失败。
+        timeout_s 覆盖提回、等段空间、过闸、copy、核验。已在 target 则
+        不过闸。PromoteResult.ready 后 ``_on_ready``。
         """
         await self._throttle()
-        # 闸外：存在性检查（毫秒级 RPC，读即续租）
         if not await self._ops.exists(prefix):
             raise PrefetchError(
                 "prefix not fully in pool — warm 未覆盖该前缀、key 口径与引擎漂移，"
                 "或异构前提未满足（源引擎未开 tp_mismatch / PEER_TP_SIZE 两端错位，"
                 "则 effective 空间 key 全 miss）"
             )
-        await self._wait_then_run(prefix, target, poll_s, timeout_s)
-        # READY 接线：副本已核验到位 → 等保活落账，再按目标实例补发。
-        # 调用方之后才 _finish(READY)，所以 GetTask 看到 READY 时名单
-        # 要么已写入，要么已确定写失败（仍不把预热打成 FAILED）。
+        result = await self._promote.run(
+            prefix,
+            target=target,
+            poll_s=poll_s,
+            timeout_s=timeout_s,
+        )
+        if not result.ready:
+            raise PromoteError(
+                f"promote finished but not schedulable on target={target}"
+            )
         await self._on_ready(prefix, target)
 
     async def _wait_then_run(

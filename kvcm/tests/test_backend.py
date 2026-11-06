@@ -3194,6 +3194,49 @@ def test_memory_instance_requires_rank_mapped_seg(
     assert run(b2.memory_instance(prefix)) == InstanceId("inst")
 
 
+def test_check_promote_with_target_uses_build_plan(
+    fake_store_module, monkeypatch
+) -> None:
+    """check_promote(target=…) 与 memory_instance 同一套 rank 映射。"""
+    from kvcm.engines.vllm.keys import parse_key_rank
+
+    kc = KeyComputer(model_name="qwen", tp_size=2)
+    keys = kc.expand(["h0"])
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: list(keys) if ids else [])
+
+    class Client(FakeClient):
+        def batch_memory_replica_endpoints(self, req_keys):
+            return {
+                k: ["seg0"] if parse_key_rank(k) == 0 else ["seg1"]
+                for k in req_keys
+            }
+
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg0", "seg1"],
+        capability=mooncake_main(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.check_promote(prefix)) is True
+    assert run(b.check_promote(prefix, InstanceId("ok"))) is True
+
+    class WrongClient(FakeClient):
+        def batch_memory_replica_endpoints(self, req_keys):
+            return {k: ["seg1"] for k in req_keys}
+
+    b2 = MooncakeBackend(
+        client=WrongClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg0", "seg1"],
+        capability=mooncake_main(),
+        promote_hits=2,
+    )
+    assert run(b2.check_promote(prefix)) is True
+    assert run(b2.check_promote(prefix, InstanceId("bad"))) is False
+
+
 def test_memory_instance_picks_rank_matched_among_instances(
     fake_store_module, monkeypatch
 ) -> None:

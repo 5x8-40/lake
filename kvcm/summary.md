@@ -72,13 +72,13 @@
 
 - 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。tasks 与 keepalive 有写入方。replicas 与 sessions 表在，还没有写入方。
 - 遗留（A06，归 E14）：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。promote 不发事件。
-- 遗留：`SubmitIntent` 现在只有预热（前缀 × 目标实例）。move / pin / demote / promote / remove 只有操作，没有 intent。这是大遗留，当前不扩协议、不加流程。
+- 协议：`SubmitIntent` 仍是前缀 × 目标实例；执行走 `PromoteFlow(target=)`（可提回 + copy）。move / pin / demote / remove 无独立 intent，不扩协议。
 - **A16（必修，未修）**：同前缀操作串行化（prefetch / demote / remove / pin）。demote 已 unregister 后，同前缀 `exists` / 预热仍会在 master 续租，可打穿 demote 的 lease 等待。
 - **A17（DEFER）**：操作粒度未统一——copy 核验在 `query_task`；demote sleep+盘核验在 L3；promote 等待在 L2 `PromoteFlow`；move/remove 未拆 flow。与 A16 不同项。
 - locate：进程内「实例 → rank 有序段名单」。intent 和操作入参没有 segment。没登记的实例报错。
 - remove：**全局删所有副本，不支持 target**。无论 force 都先注销保活。`force=False` 再等满一个 lease TTL，然后 `batch_remove(..., force=False)`。`force=True` 注销保活后立刻 `batch_remove(..., force=True)`，不等；但它只跳过 lease，未完成副本和在途 copy/move 仍会拒删。失败或取消不把登记加回去，注销过就留注销，调用方自己重试，租约可以过期。
 - 保活续租用 BatchExistKey（`renew_once` → `exists` → `batch_is_exist`），不用 ProbeKey。`register_keepalive` / `unregister_keepalive` 只登记或注销 Ledger 里的同一张表；续租由 `KeepaliveLoop` 调 `renew_once`。**lease 是 key 级，保这个 key 的所有副本；target 不是保活维度。**
-- 副本核验用主线 `GET /batch_query_keys`，用传输端点比段还在不在。提回：`promote(prefix)` 打 GetReplicaList（默认 2 次）；`check_promote` 看每 key 是否已有 memory（同路径有授 lease / 命中副作用）；`memory_instance` 用 `build_plan` 反查可调度持有方（可空；反查失败不影响成功）。等待在 `PromoteFlow`（已有 memory 不触发）。只有盘副本时先 promote 再 copy（LOCAL_DISK 不能当 copy 源）。daemon `--admin` 必填；`--capability` 默认 `main`。`v0311` 启动直接失败：那个端点有续租副作用，也没有盘副本字段。
+- 副本核验用主线 `GET /batch_query_keys`。提回：L3 `promote` 不带 target；`PromoteFlow` 无 target 等 memory，有 target 整包（可套 Prefetch）；TaskEngine intent 一律 `PromoteFlow(target=)`，闸只挡 copy；`check_promote` 的 `QueryError` 当未就绪。daemon `--admin` 必填；`--capability` 默认 `main`。
 - 软钉空写（设计；实现见后续 stacked PR）：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据；要求 Case B（尺寸一致、单 slice、key 存在、无盘副本），pin 前 `exists` 持 lease，`UpsertStart` 后做 buffer 地址检查，不一致就 `UpsertRevoke`。lease 挡驱逐/非 force `Remove`，不挡 `Remove(force=true)` 或 Case C；Case C 旧 buffer 进 `discarded_replicas_` 延迟释放（默认 600s），检查时不会地址复用，地址复用残余主要来自 `exists` 后发生 force remove / stale 清理 / lease 过期驱逐，或 `UpsertStart` 惰性清理 / processing 抢占后无 COMPLETE 副本的 Case A。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。wheel 不带 C++ 头文件，扩展只链 `store.so`。`get_real_client()` 是退路：只有以后真实调用失败，才包含 `pyclient.h`，在对象还原成 `MooncakeStorePyWrapper` 之后取出已建 client。现在不走这条。client_id 用方案一：`UpsertStart` 发出的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时副本留在 PROCESSING。扫任务记录再补 End/Revoke 的崩溃恢复当前不做（D2 F5）。保留身份先不动。
 - prefetch：✅ 已验证（`CreateCopyTask` → READY）。
 - pin：READY 后防驱逐——设计；soft pin 实现在后续 stacked PR，core/demote 当前 `soft_pin_after = NO`。`pin(HARD)` 拒绝，hard 级 lease 保护用显式 `register_keepalive()`，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
@@ -108,13 +108,13 @@
   - `#2991` 只是同一个 client_id 的重连窗口。窗口内 Ping 保住的是登记，字节仍在死进程里
   - 长期未命中 → demote 到 SSD，由策略层定。这是防驱逐，不是换 client
 - demote / promote：结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
-  - 框架：demote 是组合动作；promote 的 L3 只触发（不带 target），完成由 PromoteFlow 查 memory / 可选 `build_plan` 反查实例。指定机器：已有 memory 直接 copy；仅盘副本则 promote→盘主 memory 再 copy。存储统一归 mooncake（引擎实例挂本机 SSD 做分层，kvcm 自己不持存储）
+  - 框架：demote 是组合动作；promote 的 L3 只触发；PromoteFlow 整包（有 target 可套 Prefetch）；intent 经 TaskEngine 走整包，闸仅 copy。存储统一归 mooncake
   - demote：先确认前缀能展开成 key、并且 admin 已配置，再 `unregister_keepalive`。然后等满一个 lease TTL（`--lease-ttl-s`，默认 10，须与 master 的 `default_kv_lease_ttl` 一致；测试床实配过 11s；0.3.11 代码默认 5s，main 默认 10s）。kvcm 不改 master 的这个值。再用 `GET /batch_query_keys` 确认每个 key 的 `local_disk`；DFS（`disk_values`）不算成功，因为 promotion 只从 LOCAL_DISK 提回。不用 `GetReplicaList`（会续租）。没有立刻搬到盘上的 RPC。写回且池不满时仍失败。不读数据落盘，不调 `MountLocalDiskSegment`。失败或取消只恢复原本就有的保活行，且不重置窗口；原来没有保活行不会新建。成功不加回
   - 池侧前提仍是 `enable_offload`：
     - 写穿 / 写回两模式（≈ HiCache write_through / write_back）
   - promote 三条路：
     - `promotion_on_hit`：命中时池被动提回
-    - kvcm 主动①：L3 `promote(prefix)` 只打 N 次 `GetReplicaList` 触发；`PromoteFlow` 等到每 key ≥1 memory（已有则不触发），返回可选实例
+    - kvcm 主动①：L3 `promote(prefix)` 触发；`PromoteFlow` 无 target 等 memory，有 target 则可再 Prefetch；intent 经 TaskEngine 走带 target 整包
     - kvcm 主动②：读删写自己搬
     - promote 执行端 = 引擎来取（`PromotionObjectHeartbeat`，两版本都有，触发链不变）
   - copy/move 到不了 SSD（disk seg 没有 seg 名，两版本同）

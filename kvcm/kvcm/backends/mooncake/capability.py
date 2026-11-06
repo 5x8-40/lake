@@ -40,8 +40,8 @@ def mooncake_v0311() -> BackendCapability:
         has_promotion=Capability(
             Support.YES,
             Support.YES,
-            "打 GetReplicaList 累计命中（非只读）；check_promote 看每 key 是否"
-            "已有 memory。不带 target；落点 build_plan 反查见 memory_instance",
+            "打 GetReplicaList 累计命中；check_promote ±target；"
+            "PromoteFlow 可传 target（intent 经 TaskEngine，闸仅 copy）",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
@@ -92,10 +92,9 @@ def mooncake_main() -> BackendCapability:
         has_promotion=Capability(
             Support.YES,
             Support.YES,
-            "打 GetReplicaList（默认 2）触发；check_promote：每 key≥1 memory"
-            "（授 lease / 累计命中，非只读）。不带 target；memory_instance 用"
-            "build_plan 反查可调度实例（可空）。L3 单次核验，轮询在"
-            "PromoteFlow；不做读删写",
+            "打 GetReplicaList（默认 2）触发；check_promote ±target。"
+            "PromoteFlow 传 target 时可 Prefetch；TaskEngine 闸仅 copy。"
+            "memory_instance 反查可空。不做读删写",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),

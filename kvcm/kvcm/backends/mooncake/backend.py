@@ -1194,10 +1194,14 @@ class MooncakeBackend(KvOps):
         for _ in range(self._promote_hits):
             await self._rpc(self._client.batch_memory_replica_endpoints, keys)
 
-    async def check_promote(self, prefix: Prefix) -> bool:
-        """前缀每个 key 是否至少有一处 memory replica（不限实例）。
+    async def check_promote(
+        self, prefix: Prefix, target: InstanceId | None = None
+    ) -> bool:
+        """前缀 memory 是否就绪（见 ``KvOps.check_promote``）。
 
         查询本身会继续累计 promotion 命中，属于预期副作用。
+        ``target`` 给定且 locate/build_plan 失败时返回 False（不当作
+        任意 memory 命中）。
         """
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
@@ -1208,7 +1212,9 @@ class MooncakeBackend(KvOps):
         last = await self._rpc(
             self._client.batch_memory_replica_endpoints, keys
         )
-        return all(bool(last.get(key)) for key in keys)
+        if target is None:
+            return all(bool(last.get(key)) for key in keys)
+        return self._memory_matches_instance(keys, last, target)
 
     async def memory_instance(self, prefix: Prefix) -> InstanceId | None:
         """返回任一已登记、且 ``build_plan`` 下每 key 落在对应 rank seg 的实例。
@@ -1231,13 +1237,21 @@ class MooncakeBackend(KvOps):
         if not all(bool(last.get(key)) for key in keys):
             return None
         for inst in self._list_instances():
-            try:
-                plan = self._keys.build_plan(keys, list(self._locate(inst)))
-            except IntentInputError:
-                continue
-            if all(seg in last.get(key, []) for key, seg in plan):
+            if self._memory_matches_instance(keys, last, inst):
                 return inst
         return None
+
+    def _memory_matches_instance(
+        self,
+        keys: list[str],
+        last: dict[str, list[str]],
+        inst: InstanceId,
+    ) -> bool:
+        try:
+            plan = self._keys.build_plan(keys, list(self._locate(inst)))
+        except IntentInputError:
+            return False
+        return all(seg in last.get(key, []) for key, seg in plan)
 
     async def retain(self, prefix: Prefix, target: InstanceId | None = None) -> TaskHandle:
         raise NotImplementedError("retain：做法见 D2 §4，尚未接通")

@@ -8,59 +8,50 @@
 | PR | 分支 | base | 内容 |
 |---|---|---|---|
 | core | #80 已合入 main | — | move/remove/admin、prefetch/TaskEngine/daemon、keepalive |
-| demote/promote | `feat/kvcm-demote-promote` | `main`（含 #80） | `demote` / `promote` / `check_promote`、PromoteFlow、参数 |
+| demote/promote | `feat/kvcm-demote-promote` | `main`（含 #80） | demote/promote、PromoteFlow 整包、TaskEngine 接线 |
 | soft pin | `feat/kvcm-soft-pin` | demote/promote | native 空写、pin(SOFT)、NoF |
 
 ## 能力范围
 
-库能力，未接线：有 L3/L2 实现、单测、daemon 参数；无 TaskEngine 消费者、不扩 `SubmitIntent`、daemon 无自动入口。调用方持 backend / `PromoteFlow` 自调。SessionEnd 等编排另开。
+- L3 demote / promote / `check_promote(target=)`
+- PromoteFlow：无 target 提回；有 target 整包（可套 Prefetch）；可注入带闸 prefetch
+- TaskEngine：intent 一律 `PromoteFlow(target=)`；闸只挡 copy；不扩 proto
 
 **有**
 
-- `MooncakeBackend.demote`：`unregister_keepalive` → 等满 `lease_ttl_s` → `GET /batch_query_keys` 确认每 key `LOCAL_DISK`（DFS 不算）。失败/取消只恢复原先保活行与原 `registered_at`。
-- `promote(prefix)`：打 `promote_hits` 次 `GetReplicaList`，不带 target、无 `TaskHandle`。
-- `check_promote(prefix)`：每 key ≥1 memory（`GetReplicaList`，有授 lease / 命中副作用）；`memory_instance` 用 `build_plan` 反查可调度实例（可空；反查失败不影响成功）。
-- `PromoteFlow.run(prefix)` → `PromoteResult`：已有 memory 不触发；否则轮询到齐。`memory_instance` 的 `QueryError` 不拖垮 flow。
-- `--promote-hits`；`--lease-ttl-s`（core 已有，demote 复用）；`has_offload` / `has_promotion` 主线 YES。
+- `demote` / `promote` / `check_promote` / `memory_instance`
+- `PromoteFlow.run(prefix, *, target=None)` → `PromoteResult.ready`
+- TaskEngine → PromoteFlow；注入 `_gated_prefetch`（`check_segment_room` + 前缀闸 + PrefetchFlow）
+- copy 后 `check_promote` 的 `QueryError` → 未就绪重试；`AdmissionWait` 原样上抛
 
 **没有**
 
-- soft pin / native / NoF（#82）
-- move/remove/admin/prefetch（#80）
-- A16 前缀串行；TaskEngine / intent 接线
+- soft pin（#82）；SessionEnd 等；A16 前缀串行
 
 ## 结论
 
 | 项 | 结论 |
 |---|---|
-| demote 完成条件 | 停保活 → 满 lease TTL → 每 key 有 LOCAL_DISK；不查剩余租约 |
-| promote 完成条件 | 每 key ≥1 memory；不带 target；落点 `build_plan` 反查可空 |
-| 指定机器 | 已有 memory → `copy`；仅盘副本 → `promote` 到盘主 memory 再 `copy`（LOCAL_DISK 不能当 copy 源） |
-| R05 | **关闭**（不再要求调用方指定盘主 target） |
+| L3 promote | 不带 target，只触发 |
+| PromoteFlow 整包 | 传 target：已在 / promote / Prefetch；完成 = `check_promote(target)` |
+| 闸 | 只挡真要 copy；已在 target / 只提回不过闸 |
+| intent | TaskEngine 一律 PromoteFlow(target=) |
+| R05 | 关闭于 L3；实例可用靠 L2 整包 |
 
 ## 代码核对
 
 | 检查项 | 结果 |
 |---|---|
-| demote 只认 LOCAL_DISK | ✅ `backend.demote` |
-| 失败/取消恢复原保活、不重置窗口 | ✅ `_restore_demote_keepalive` |
-| promote 无 target、只触发 | ✅ `backend.promote` |
-| 已有 memory 不触发 | ✅ `flows/promote.py` |
-| `memory_instance` 可空 | ✅ |
-| `memory_instance` 用 `build_plan`（非 set 交集） | ✅ |
-| PromoteFlow：反查 `QueryError` → `instance=None` | ✅ |
-| `has_offload` / `has_promotion` | ✅ YES（main） |
+| demote / promote L3 | ✅ |
+| PromoteFlow 整包 + 软核验 | ✅ |
+| TaskEngine 注入闸 prefetch | ✅ |
+| intent 三条路径单测 | ✅ |
 
 ## 剩余（本 PR 不修）
 
-- **A16（OPEN，必修）**：demote 已 unregister 后，同前缀 `exists` / 预热仍在 master 续租，可打穿 lease 等待。要前缀级串行；只拦 KeepaliveLoop 或加长 sleep 不够。不在本 PR / #82。见 `summary.md` A16。
-- **A17（DEFER）**：demote sleep+核验在 L3，promote 等待在 L2；与 A16 不同项。
-- **A06（DEFER → E14）**：move/remove 事件；promote 不发事件。
-- **VerifyError 命名（未决）**：demote「无 LOCAL_DISK」复用 `VerifyError`；分类保留，是否改名另定。
+- A16 OPEN；A17 / A06 DEFER；VerifyError 命名未决
 
 ## 合入前
 
-OPEN/DEFER **不要求修完**即可合：A16 永久文档已挂；VerifyError 命名未决不挡；A17/A06 DEFER。
-
-- [ ] PR 描述写上表口径（含 promote 无 target、R05 关闭）
-- [ ] `git rm` 本文件；末 commit 说明删除；PR 描述注明已删
+- [ ] PR 描述写口径（整包 + 闸仅 copy + TaskEngine 接线）
+- [ ] `git rm` 本文件

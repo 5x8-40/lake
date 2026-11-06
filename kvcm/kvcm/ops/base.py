@@ -11,13 +11,14 @@ KeepaliveLoop 调 `renew_once`；登记由 TaskEngine 触发
 `KeepaliveLoop.register`（内部写 Ledger，也可直接调 L3 的
 `register_keepalive`）。不再提供一个既登记又续租的 `keepalive`。
 
-完成信号：copy / move 有 READY（任务状态完成 + 目标侧副本核验通过）；
-promote 只触发、不带 target、不返回 TaskHandle；是否已有 memory 由
-``check_promote`` 判定，落点实例由 ``memory_instance`` 反查（可空）。
-PromoteFlow 等到每 key 至少一处 memory 后返回可选实例——指定机器用
-copy，不要用 promote 点名。retain 的 READY 跟着做法走。其余方法
-（register_keepalive / unregister_keepalive / renew_once / pin /
-demote / remove）无 READY。任务状态经 query_task 查询。
+完成信号：copy / move 有 READY（任务完成 + 目标侧副本核验，经
+``TaskStatus.READY``）。promote 也有 READY（D2：某实例可调度），但 L3
+``promote`` 只触发、无 TaskHandle；READY 由 PromoteFlow 的
+``PromoteResult.ready`` 表达。是否已有 memory 由 ``check_promote``
+判定；不传 target 时落点反查 ``memory_instance``（对不上则
+ready=False）。传 target 则落在该实例后 ready=True（必要时经
+PrefetchFlow copy）。retain 的 READY 跟着做法走。其余方法无 READY。
+任务状态经 query_task 查询（仅任务类操作）。
 
 幂等：**本层不去重**——`copy` 每次调用都发起任务，同一前缀重复调用会产生
 重复传输。去重归编排层（TaskEngine 以 intent_id = 前缀 × 目标实例 为键：
@@ -231,8 +232,13 @@ class KvOps(ABC):
         """
         raise self._unsupported("promote")
 
-    async def check_promote(self, prefix: Prefix) -> bool:
-        """前缀每个 key 是否至少有一处 memory replica（不限实例）。
+    async def check_promote(
+        self, prefix: Prefix, target: InstanceId | None = None
+    ) -> bool:
+        """前缀 memory 是否就绪。
+
+        - ``target is None``：每个 key 至少有一处 memory（不限实例）。
+        - ``target`` 给定：每个 key 按 ``build_plan`` 落在该实例对应 seg。
 
         查询本身有副作用（mooncake：授 lease、累计命中、可能触发
         promotion / dynamic replication）。失败抛 QueryError。供
