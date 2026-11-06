@@ -11,8 +11,9 @@
 
 已接线：copy / move / remove / exists / query_task /
 register_keepalive / unregister_keepalive / renew_once / demote /
-promote / check_promote。pin 仍走基类 UnsupportedCapabilityError
-（soft pin 后续 PR）。retain 通道关闭，开头直接 NotImplementedError。
+promote / check_promote / memory_instance。pin 仍走基类
+UnsupportedCapabilityError（soft pin 后续 PR）。retain 通道关闭，
+开头直接 NotImplementedError。
 """
 
 from __future__ import annotations
@@ -1210,9 +1211,11 @@ class MooncakeBackend(KvOps):
         return all(bool(last.get(key)) for key in keys)
 
     async def memory_instance(self, prefix: Prefix) -> InstanceId | None:
-        """返回任一已登记且对每个 key 都持有至少一处 memory 的实例。
+        """返回任一已登记、且 ``build_plan`` 下每 key 落在对应 rank seg 的实例。
 
-        未注入 ``list_instances``、或目录对不上 seg，返回 None。
+        用 KeyComputer 做 key→rank→seg 映射，不只看「实例任意 seg 上有
+        memory」。未注入 ``list_instances``、locate 脏到 ``build_plan``
+        失败、或计划 seg 不在 memory 端点里，返回 None。
         """
         if self._list_instances is None:
             return None
@@ -1228,8 +1231,11 @@ class MooncakeBackend(KvOps):
         if not all(bool(last.get(key)) for key in keys):
             return None
         for inst in self._list_instances():
-            segs = set(self._locate(inst))
-            if all(segs.intersection(last.get(key, [])) for key in keys):
+            try:
+                plan = self._keys.build_plan(keys, list(self._locate(inst)))
+            except IntentInputError:
+                continue
+            if all(seg in last.get(key, []) for key, seg in plan):
                 return inst
         return None
 

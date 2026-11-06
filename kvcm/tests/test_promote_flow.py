@@ -17,7 +17,12 @@ _I = InstanceId("inst")
 
 
 class FakeOps(KvOps):
-    def __init__(self, checks, *, holder: InstanceId | None = _I) -> None:
+    def __init__(
+        self,
+        checks,
+        *,
+        holder: InstanceId | None | Exception = _I,
+    ) -> None:
         self._checks = list(checks)
         self.promote_calls = 0
         self._holder = holder
@@ -47,6 +52,8 @@ class FakeOps(KvOps):
         return result
 
     async def memory_instance(self, prefix) -> InstanceId | None:
+        if isinstance(self._holder, Exception):
+            raise self._holder
         return self._holder
 
 
@@ -100,3 +107,22 @@ def test_promote_flow_allows_unknown_instance() -> None:
     result = run(PromoteFlow(ops).run(_P, poll_s=0.001, timeout_s=1.0))
     assert result.instance is None
     assert ops.promote_calls == 0
+
+
+def test_promote_flow_memory_instance_query_error_still_succeeds(caplog) -> None:
+    """check 已成功时，反查 QueryError 不得拖成 timeout。"""
+    ops = FakeOps([True], holder=QueryError("directory rpc down"))
+    with caplog.at_level(logging.WARNING):
+        result = run(PromoteFlow(ops).run(_P, poll_s=0.001, timeout_s=1.0))
+    assert result == PromoteResult(instance=None)
+    assert ops.promote_calls == 0
+    assert "memory_instance failed" in caplog.text
+
+
+def test_promote_flow_memory_instance_error_after_trigger(caplog) -> None:
+    ops = FakeOps([False, True], holder=QueryError("lookup failed"))
+    with caplog.at_level(logging.WARNING):
+        result = run(PromoteFlow(ops).run(_P, poll_s=0.001, timeout_s=1.0))
+    assert result.instance is None
+    assert ops.promote_calls == 1
+    assert "memory_instance failed" in caplog.text

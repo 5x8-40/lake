@@ -19,8 +19,8 @@
 
 - `MooncakeBackend.demote`：`unregister_keepalive` → 等满 `lease_ttl_s` → `GET /batch_query_keys` 确认每 key `LOCAL_DISK`（DFS 不算）。失败/取消只恢复原先保活行与原 `registered_at`。
 - `promote(prefix)`：打 `promote_hits` 次 `GetReplicaList`，不带 target、无 `TaskHandle`。
-- `check_promote(prefix)`：每 key ≥1 memory；`memory_instance` 目录反查持有实例（可空）。
-- `PromoteFlow.run(prefix)` → `PromoteResult`：已有 memory 不触发；否则轮询到齐。
+- `check_promote(prefix)`：每 key ≥1 memory（`GetReplicaList`，有授 lease / 命中副作用）；`memory_instance` 用 `build_plan` 反查可调度实例（可空；反查失败不影响成功）。
+- `PromoteFlow.run(prefix)` → `PromoteResult`：已有 memory 不触发；否则轮询到齐。`memory_instance` 的 `QueryError` 不拖垮 flow。
 - `--promote-hits`；`--lease-ttl-s`（core 已有，demote 复用）；`has_offload` / `has_promotion` 主线 YES。
 
 **没有**
@@ -34,7 +34,8 @@
 | 项 | 结论 |
 |---|---|
 | demote 完成条件 | 停保活 → 满 lease TTL → 每 key 有 LOCAL_DISK；不查剩余租约 |
-| promote 完成条件 | 每 key ≥1 memory；不带 target；落点反查可空；指定机器用 copy |
+| promote 完成条件 | 每 key ≥1 memory；不带 target；落点 `build_plan` 反查可空 |
+| 指定机器 | 已有 memory → `copy`；仅盘副本 → `promote` 到盘主 memory 再 `copy`（LOCAL_DISK 不能当 copy 源） |
 | R05 | **关闭**（不再要求调用方指定盘主 target） |
 
 ## 代码核对
@@ -46,6 +47,8 @@
 | promote 无 target、只触发 | ✅ `backend.promote` |
 | 已有 memory 不触发 | ✅ `flows/promote.py` |
 | `memory_instance` 可空 | ✅ |
+| `memory_instance` 用 `build_plan`（非 set 交集） | ✅ |
+| PromoteFlow：反查 `QueryError` → `instance=None` | ✅ |
 | `has_offload` / `has_promotion` | ✅ YES（main） |
 
 ## 剩余（本 PR 不修）

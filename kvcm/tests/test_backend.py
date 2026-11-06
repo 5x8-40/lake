@@ -3147,6 +3147,94 @@ def test_promote_any_memory_counts_even_if_not_registered(
     assert run(b.memory_instance(prefix)) is None
 
 
+def test_memory_instance_requires_rank_mapped_seg(
+    fake_store_module, monkeypatch
+) -> None:
+    """set 交集不够：rank0 key 落在 seg1 时不得认该实例可调度。"""
+    from kvcm.engines.vllm.keys import parse_key_rank
+
+    kc = KeyComputer(model_name="qwen", tp_size=2)
+    keys = kc.expand(["h0"])
+    assert [parse_key_rank(k) for k in keys] == [0, 1]
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: list(keys) if ids else [])
+
+    class Client(FakeClient):
+        def batch_memory_replica_endpoints(self, req_keys):
+            # 两个 key 的 memory 都只在 seg1；set 交集会误判，build_plan 要求
+            # rank0→seg0、rank1→seg1，应返回 None。
+            return {k: ["seg1"] for k in req_keys}
+
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg0", "seg1"],
+        list_instances=lambda: (InstanceId("inst"),),
+        capability=mooncake_main(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.check_promote(prefix)) is True
+    assert run(b.memory_instance(prefix)) is None
+
+    class OkClient(FakeClient):
+        def batch_memory_replica_endpoints(self, req_keys):
+            return {
+                k: ["seg0"] if parse_key_rank(k) == 0 else ["seg1"]
+                for k in req_keys
+            }
+
+    b2 = MooncakeBackend(
+        client=OkClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg0", "seg1"],
+        list_instances=lambda: (InstanceId("inst"),),
+        capability=mooncake_main(),
+        promote_hits=2,
+    )
+    assert run(b2.memory_instance(prefix)) == InstanceId("inst")
+
+
+def test_memory_instance_picks_rank_matched_among_instances(
+    fake_store_module, monkeypatch
+) -> None:
+    """多实例：跳过 set 交集碰巧命中但 rank 不对的，返回 build_plan 可调度的。"""
+    from kvcm.engines.vllm.keys import parse_key_rank
+
+    kc = KeyComputer(model_name="qwen", tp_size=2)
+    keys = kc.expand(["h0"])
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: list(keys) if ids else [])
+    segs = {
+        InstanceId("wrong"): ["seg0", "seg1"],
+        # wrong：两 seg 都在目录，但 memory 全在 seg1 → rank0 对不上
+        InstanceId("right"): ["segA", "segB"],
+    }
+
+    class Client(FakeClient):
+        def batch_memory_replica_endpoints(self, req_keys):
+            return {
+                k: ["seg1", "segA"]
+                if parse_key_rank(k) == 0
+                else ["seg1", "segB"]
+                for k in req_keys
+            }
+
+    def locate(inst: InstanceId) -> list[str]:
+        return list(segs[inst])
+
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=locate,
+        # wrong 在前：旧 set 交集会先命中 wrong（每 key 都碰得到 seg1）
+        list_instances=lambda: (InstanceId("wrong"), InstanceId("right")),
+        capability=mooncake_main(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.check_promote(prefix)) is True
+    assert run(b.memory_instance(prefix)) == InstanceId("right")
+
+
 def test_promote_v0311_hits_without_admin(fake_store_module, monkeypatch) -> None:
     assert mooncake_v0311().has_promotion.channel is Support.YES
     assert mooncake_main().has_promotion.channel is Support.YES

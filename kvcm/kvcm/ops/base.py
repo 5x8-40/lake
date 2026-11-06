@@ -234,14 +234,17 @@ class KvOps(ABC):
     async def check_promote(self, prefix: Prefix) -> bool:
         """前缀每个 key 是否至少有一处 memory replica（不限实例）。
 
-        只读检查；失败抛 QueryError。供 PromoteFlow 轮询。
+        查询本身有副作用（mooncake：授 lease、累计命中、可能触发
+        promotion / dynamic replication）。失败抛 QueryError。供
+        PromoteFlow 轮询。
         """
         raise self._unsupported("check_promote")
 
     async def memory_instance(self, prefix: Prefix) -> InstanceId | None:
-        """若每 key 已有 memory，返回任一已登记且持有全前缀 memory 的实例。
+        """若每 key 已有 memory，返回任一可按 rank 映射服务全前缀的实例。
 
-        对不上目录则 ``None``（提回仍算成功）。默认不实现则返回 ``None``。
+        对不上目录 / 反查失败则 ``None``（提回仍算成功）。默认不实现则
+        返回 ``None``。
         """
         return None
 

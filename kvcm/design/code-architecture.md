@@ -158,7 +158,7 @@ flowchart LR
 | 流程 | 编排 | 状态 |
 |------|------|------|
 | PrefetchFlow | exists 前置检查 → copy → query_task 轮询到 READY。保活注册与 `BlockStored` 补发在流程返回后由 `TaskEngine._on_ready` 做（恢复路径用 `target_of`） | 已实现（`flows/prefetch.py`） |
-| PromoteFlow | exists → 已有 memory 则直接成功；否则 promote 触发 → `check_promote`（每 key≥1 memory）→ 返回可选 `instance` | 库已实现（`flows/promote.py`）；未接 TaskEngine / intent；daemon 无自动入口。demote 同为 L3 库能力、未接线 |
+| PromoteFlow | exists → 已有 memory 则直接成功；否则 promote 触发 → `check_promote`（每 key≥1 memory）→ 返回可选 `instance`（反查失败为 None，不超时） | 库已实现（`flows/promote.py`）；未接 TaskEngine / intent；daemon 无自动入口。demote 同为 L3 库能力、未接线 |
 | SessionEndFlow | `unregister_keepalive` + demote | 未实现（D1 §6） |
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
 | RetainFlow | retain（死前 move/copy 到还活着的段；DFS 另编，不走这个返回值） | 未实现（D2 §4） |
@@ -192,7 +192,7 @@ flowchart LR
 - **任务凭据（TaskHandle）**：一次 `copy(前缀)` 在 mooncake 上是逐条 key 各发一个复制任务——一个前缀通常对应多条 key（块数 × rank 数），所以一次操作会产生多个任务。凭据里的 `task_ids` 装着这次操作的全部任务号，查询时一起查。任务号的类型对 L3 不透明（`tuple[object, ...]`）：mooncake 的任务号是两个整数组成的整数对，L3 原样保存、原样回传，不做字符串化（`str()` 化后真实绑定的 `query_task` 会报 TypeError）；要写进 Ledger 时由实现侧编码成 `"整数:整数"` 的字符串（`encode_task_id`/`decode_task_id`，重启可还原）
 - **READY 规则**（本义 =「可以把请求调度过来」，D2 §1）：
   - copy / move：任务完成 + 目标侧副本核验通过（任务型，凭据里有任务号）
-  - promote：L3 `promote(prefix)` 只打 N 次 `GetReplicaList`（默认 2）触发，不带 target、不返回 `TaskHandle`。`check_promote`：每 key ≥1 memory；`memory_instance` 反查持有实例（可空）。`PromoteFlow` 已有 memory 则不触发，否则轮询到齐后返回 `PromoteResult`；超时 `PromoteError`。指定机器用 copy。不做读删写。搬运是池自主行为，**不占传输闸**。
+  - promote：L3 `promote(prefix)` 只打 N 次 `GetReplicaList`（默认 2）触发，不带 target、不返回 `TaskHandle`。`check_promote`：每 key ≥1 memory（同路径有授 lease / 累计命中副作用，非只读）。`memory_instance` 用 `build_plan` 反查可调度持有实例（可空；反查失败不影响成功）。`PromoteFlow` 已有 memory 则不触发，否则轮询到齐后返回 `PromoteResult`；超时 `PromoteError`。只有盘副本时先 promote 到盘主 memory，再 copy 到目标机（copy 不能以 LOCAL_DISK 为源）。不做读删写。搬运是池自主行为，**不占传输闸**。
   - **retain 返回 TaskHandle**——这个方法只表达 move/copy（D2 §4），返回这次搬运的任务号。DFS 不走这个返回值。空任务号抛 `ValueError`
   - 其余方法（register_keepalive / unregister_keepalive / renew_once / pin / demote / remove）无 READY
 - **exists（查询，不是第九项管理操作）**：实现是 `batch_is_exist`，它有个副作用——被查到的 key 会被续租，所以预热前的存在性检查顺便就起了保活作用。两种结果必须分清：「不在池里」（key 确实没有 → 该预热）和「查询本身失败」（返回值不是 0/1/True/False，或列表长度和 key 数不一致 → 转成 QueryError 等一会儿重查）——把查询失败当成「不在池里」会误判成需要重新计算
@@ -324,7 +324,7 @@ stateDiagram-v2
 | SegTopology | 查 master 的 seg 名单（见上）；seg、client_id、lease 语义归这里 | `topology.py` |
 | capability 填充 | 按连接上的版本填充（**构造必填**——不许默认冒充 main；目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | `capability.py` |
 
-- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger=None, submit_concurrency=4, executor=None, rpc_timeout_s=30, admin=None, promote_hits=2, lease_ttl_s=10)`。`locate`（实例 → rank 有序 seg 列表）以可调用注入。`admin` 是主线 `GET /batch_query_keys` 客户端，副本核验、降层查盘、软钉取尺寸都用它。提回不拿 offload 端点对 seg 名，仍打 `GetReplicaList`。当前 daemon 用 `InstanceDirectory`（`--instance-segs`）。`RankTopology` 仍是 demo 探测，不是现在的进程入口。生产环境的上下线仍是 L1 InstanceWatcher。backend 不关心来源，本类不 import `SegTopology` / `RankTopology` / `AdminClient`，这三件不是它的字段
+- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger=None, submit_concurrency=4, executor=None, rpc_timeout_s=30, admin=None, promote_hits=2, lease_ttl_s=10, list_instances=None)`。`locate`（实例 → rank 有序 seg 列表）以可调用注入；`list_instances` 供 `memory_instance` 反查。`admin` 是主线 `GET /batch_query_keys` 客户端，副本核验、降层查盘、软钉取尺寸都用它。提回不拿 offload 端点对 seg 名，仍打 `GetReplicaList`。当前 daemon 用 `InstanceDirectory`（`--instance-segs`）。`RankTopology` 仍是 demo 探测，不是现在的进程入口。生产环境的上下线仍是 L1 InstanceWatcher。backend 不关心来源，本类不 import `SegTopology` / `RankTopology` / `AdminClient`，这三件不是它的字段
 - **copy 实现**（发起式）：前缀 → KeyComputer 算 key → locate 得 seg → `KeyComputer.build_plan` 做 rank 映射（异构 TP 反向展开）→ 逐 key 提交；`query_task` 聚合判定 READY。**rank 映射归引擎侧**——存储适配零 key 格式依赖（换引擎本类不动）
 - **exists 与 copy 目前各自独立算 key**：两个操作在接口上相互独立，同一前缀在一次预热里算两遍。短序列时成本可忽略，但长序列下不是——链式块 hash 逐块串行（token 数 ÷ block_size 次，不能并行），外加 块数 × rank 数 个 key 字符串。不设缓存（长驻进程的缓存增长管理问题更大）；正解见下「接口演进：KeySet」
 - **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——放通用层会把后端概念带进通用接口

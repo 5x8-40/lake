@@ -302,12 +302,12 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 | 会话结束降层 | demote（自己先 `unregister_keepalive`，再等满一个 lease TTL，然后确认盘副本；§3） |
 | 下线迁移 | copy + remove（或 move 一步完成） |
 
-- **操作完成信号**：copy/move 查 `QueryTask` 再核验副本；promote 由 `PromoteFlow` 调 `check_promote` 轮询到内存副本；copy/move 走 `GET /batch_query_keys`，promote 走 `GetReplicaList`
+- **操作完成信号**：copy/move 查 `QueryTask` 再核验副本；promote 由 `PromoteFlow` 调 `check_promote` 轮询到每 key ≥1 memory；copy/move 走 `GET /batch_query_keys`，promote 走 `GetReplicaList`（该查询授 lease、累计命中，不是零副作用）
 - **READY** 是完成信号里特指「可以把请求调度过来」的那一类
   - 含义：目标实例的 DRAM 副本已写好、kvcm 核验通过后，上报 Router（D1 §4）
   - 有 READY（3 个）：**copy（预热）、move、promote**
     - 共同点：做完之后，某个实例新具备了「请求发过来就能直接用本机 KV」的条件
-    - 核验方式：copy / move 查 `QueryTask` 确认任务结束，副本位置用 `GET /batch_query_keys`。promote：L3 只触发、不带 target；`PromoteFlow` 等到每 key ≥1 memory（已有则不触发），返回可选持有实例（目录反查，可空）。可调度实例来自查询，不是入参；要指定机器用 copy（无 `TaskStatus.READY`；未接 TaskEngine / intent）
+    - 核验方式：copy / move 查 `QueryTask` 确认任务结束，副本位置用 `GET /batch_query_keys`。promote：L3 只触发、不带 target；`PromoteFlow` 等到每 key ≥1 memory（已有则不触发），返回可选持有实例（`build_plan` 反查，可空）。`check_promote` / 触发同走 `GetReplicaList`，有授 lease / 累计命中副作用。可调度实例来自查询，不是入参。只有盘副本时 copy 不能直接从 LOCAL_DISK 取源（无 seg 名）：先 promote 提回盘主 memory，再 copy 到目标机（无 `TaskStatus.READY`；未接 TaskEngine / intent）
     - move 多一件事：源副本被删，要同步通知索引「源实例不再有这份 KV」
   - 无 READY（4 个）：register_keepalive / unregister_keepalive / renew_once / pin / demote / remove
     - keepalive / pin：不动数据，登记或 RPC 返回即完成，记台账即可
@@ -1096,7 +1096,8 @@ sequenceDiagram
 ### promote 实现
 
 - **被动路径（流量驱动）**：池开 `promotion_on_hit=true`——master 统计读命中频率（CountMinSketch），只剩盘副本的 key 命中达阈值（`promotion_admission_threshold`，默认 2 次）时，自动把提升任务派给盘副本登记 client：该 client 读盘 → 写 DRAM → 上报完成。会话回来、引擎开始读，热的盘副本被自动提回
-- **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——L3 `promote(prefix)` 只打 `promote_hits` 次 `GetReplicaList`（默认 2），不带 target、不验证、不等待。落点由池派给盘副本登记 client。`PromoteFlow`：已有 memory（每 key ≥1）则直接成功；否则触发后轮询 `check_promote`，返回 `PromoteResult.instance`（目录反查，可空）。超时 `PromoteError`。指定实例可调度用 copy，不要用 promote 点名。库能力，未接 TaskEngine / intent。计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），与真实流量同池累计，到线即触发上面的被动路径。
+- **kvcm 主动路径一：触发池的自动提回（轻，不等真实流量）**——L3 `promote(prefix)` 只打 `promote_hits` 次 `GetReplicaList`（默认 2），不带 target、不验证、不等待。落点由池派给盘副本登记 client。`PromoteFlow`：已有 memory（每 key ≥1）则直接成功；否则触发后轮询 `check_promote`，返回 `PromoteResult.instance`（`build_plan` 反查，可空；反查失败不影响成功）。超时 `PromoteError`。`check_promote` 本身也走 `GetReplicaList`，会授 lease、累计命中（可能再触发 promotion），不是只读。不要用 promote 点名机器。库能力，未接 TaskEngine / intent。计数规则是「每次 `GetReplicaList` 调用 +1」（`TryPushPromotionQueue` 的频率门 @0.3.11），与真实流量同池累计，到线即触发上面的被动路径。
+  - **指定机器两步**：`CreateCopyTask` 不能以 LOCAL_DISK 为源（`get_segment_names` 对盘副本返回空，见 F7）。只有盘副本、目标是 A 时：① `promote(prefix)` 把盘提回盘主 B 的 memory；② `copy(prefix, A)` 从 B 的 memory 再到 A。已有 memory 时可直接 copy。
   - 前提：`promotion_on_hit` 开启 + DRAM 还没满到要驱逐的程度（内存紧张时 master 不批——提回来也马上被逐）+ 盘副本所在引擎在线
   - 触发必须用 `GetReplicaList`——`ExistKey` 触发不了（只授 lease、不计命中次数，`master_service.cpp:752-770` @0.3.11）；触发顺带授 lease（F11b 的副作用在此是正作用：提回期间防逐）
 - **kvcm 主动路径二：读删写（重，确定性自搬）**——读盘副本数据 → `Remove` → `PutStart` 新建 DRAM 副本 → 写数据 → `PutEnd` → 校验
