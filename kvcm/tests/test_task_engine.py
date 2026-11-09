@@ -261,6 +261,23 @@ def test_intent_detail_contains_failure_reason() -> None:
     run(scenario())
 
 
+def test_run_once_exists_once() -> None:
+    """TaskEngine 与 PromoteFlow 共用一次 exists，不重复 RPC。"""
+
+    class Counting(FakeOps):
+        def __init__(self):
+            super().__init__(seq=[TaskStatus.READY])
+            self.exists_n = 0
+
+        async def exists(self, prefix) -> bool:
+            self.exists_n += 1
+            return await super().exists(prefix)
+
+    ops = Counting()
+    run(_engine(ops).run_once(_P, _T, poll_s=0.01))
+    assert ops.exists_n == 1, f"exists 查了 {ops.exists_n} 次"
+
+
 def test_intent_status_unknown_returns_none() -> None:
     eng = TaskEngine(FakeOps())
     assert eng.intent_status("nope") is None

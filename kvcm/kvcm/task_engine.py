@@ -10,7 +10,7 @@
             需搬到 target → 闸外等段空间，过前缀闸跑 PrefetchFlow
         → PromoteResult.ready 后注册保活并按实例补发 BlockStored
 
-SubmitIntent 不扩协议。闸只挡真要 copy 之前。
+SubmitIntent 不扩协议。闸挡 copy 路径（目标已有副本时 copy 可为 no-op）。
 check_promote 的 QueryError 当未就绪。
 
 无优先级、不分轻重通道——轻任务本来就不经此队列（保活走
@@ -539,10 +539,10 @@ class TaskEngine:
         poll_s: float,
         timeout_s: float,
     ) -> None:
-        """PromoteFlow(target=…)。闸只在真要 copy 时经注入路径。
+        """PromoteFlow(target=…)。闸在 copy 路径经注入 prefetch。
 
         timeout_s 覆盖提回、等段空间、过闸、copy、核验。已在 target 则
-        不过闸。PromoteResult.ready 后 ``_on_ready``。
+        不过闸。``exists`` 只查一次，再走 ``run_after_exists``。
         """
         await self._throttle()
         if not await self._ops.exists(prefix):
@@ -551,7 +551,7 @@ class TaskEngine:
                 "或异构前提未满足（源引擎未开 tp_mismatch / PEER_TP_SIZE 两端错位，"
                 "则 effective 空间 key 全 miss）"
             )
-        result = await self._promote.run(
+        result = await self._promote.run_after_exists(
             prefix,
             target=target,
             poll_s=poll_s,

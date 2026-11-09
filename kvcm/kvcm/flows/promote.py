@@ -16,7 +16,11 @@ D2 READY（可调度）= ``PromoteResult.ready``：``instance`` 非空且核验
 ``check_promote`` 的 ``QueryError`` 当未就绪（含 copy 后核验）。
 ``IntentInputError`` 原样上抛。``AdmissionWait``：库直调 Prefetch 时原样
 上抛；TaskEngine 注入带闸 prefetch 时由闸循环消化，不记 intent 失败。
-copy 默认 ``PrefetchFlow``；生产注入闸路径（只挡真要 copy 之前）。
+copy 默认 ``PrefetchFlow``；生产注入闸路径（挡 copy 路径；目标已有
+副本时 copy 可为 no-op）。
+
+``run`` / ``run_after_exists`` 分层同 PrefetchFlow：编排层已查过
+``exists`` 时走后者，避免重复 RPC。
 """
 
 from __future__ import annotations
@@ -92,14 +96,30 @@ class PromoteFlow:
         ``timeout_s`` 覆盖提回等待与（若有）copy。带 ``target`` 时预算须
         够 copy（intent 常用 120s）；默认 30s 偏紧。
         """
-        if poll_s <= 0:
-            raise ValueError("poll_s must be positive")
-        if timeout_s < 0:
-            raise ValueError("timeout_s must be non-negative")
         if not await self._ops.exists(prefix):
             raise PromoteError(
                 "prefix not fully in pool — 没有可提回的副本"
             )
+        return await self.run_after_exists(
+            prefix, target=target, poll_s=poll_s, timeout_s=timeout_s
+        )
+
+    async def run_after_exists(
+        self,
+        prefix: Prefix,
+        *,
+        target: InstanceId | None = None,
+        poll_s: float = 0.5,
+        timeout_s: float = 30.0,
+    ) -> PromoteResult:
+        """``exists`` 已通过后的提回 / 搬到 target。
+
+        TaskEngine 先查一次 ``exists`` 再调本方法，避免与 ``run`` 重复。
+        """
+        if poll_s <= 0:
+            raise ValueError("poll_s must be positive")
+        if timeout_s < 0:
+            raise ValueError("timeout_s must be non-negative")
         if target is not None:
             return await self._run_to_target(
                 prefix, target, poll_s=poll_s, timeout_s=timeout_s

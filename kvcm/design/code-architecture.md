@@ -199,7 +199,7 @@ flowchart LR
 - **任务凭据（TaskHandle）**：一次 `copy(前缀)` 在 mooncake 上是逐条 key 各发一个复制任务——一个前缀通常对应多条 key（块数 × rank 数），所以一次操作会产生多个任务。凭据里的 `task_ids` 装着这次操作的全部任务号，查询时一起查。任务号的类型对 L3 不透明（`tuple[object, ...]`）：mooncake 的任务号是两个整数组成的整数对，L3 原样保存、原样回传，不做字符串化（`str()` 化后真实绑定的 `query_task` 会报 TypeError）；要写进 Ledger 时由实现侧编码成 `"整数:整数"` 的字符串（`encode_task_id`/`decode_task_id`，重启可还原）
 - **READY 规则**（本义 =「可以把请求调度过来」，D2 §1）：
   - copy / move：任务完成 + 目标侧副本核验通过（任务型，凭据里有任务号）
-  - promote：L3 `promote(prefix)` 只打 N 次 `GetReplicaList`（默认 2）触发，不带 target、无 `TaskHandle`。READY = `PromoteResult.ready`。`check_promote(prefix, target=None)`：无 target 看任意 memory；有 target 看 `build_plan`；`QueryError` 当未就绪。`PromoteFlow` 传 target 时：已在 / 提回 / Prefetch copy，最后 `check_promote(target)`。TaskEngine intent 一律走 `PromoteFlow(target=)`；闸只挡 copy（注入 prefetch）。L3 提回不过闸。不做读删写。
+  - promote：L3 `promote(prefix)` 只打 N 次 `GetReplicaList`（默认 2）触发，不带 target、无 `TaskHandle`。READY = `PromoteResult.ready`。`check_promote(prefix, target=None)`：无 target 看任意 memory；有 target 看 `build_plan`；`QueryError` 当未就绪。`PromoteFlow` 传 target 时：已在 / 提回 / Prefetch copy，最后 `check_promote(target)`。TaskEngine：`exists` 一次后 `run_after_exists(target=)`；闸挡 copy 路径（目标已有副本时 copy 可为 no-op）。L3 提回不过闸。不做读删写。
   - **retain 返回 TaskHandle**——这个方法只表达 move/copy（D2 §4），返回这次搬运的任务号。DFS 不走这个返回值。空任务号抛 `ValueError`
   - 其余方法（register_keepalive / unregister_keepalive / renew_once / pin / demote / remove）无 READY
 - **exists（查询，不是第九项管理操作）**：实现是 `batch_is_exist`，它有个副作用——被查到的 key 会被续租，所以预热前的存在性检查顺便就起了保活作用。两种结果必须分清：「不在池里」（key 确实没有 → 该预热）和「查询本身失败」（返回值不是 0/1/True/False，或列表长度和 key 数不一致 → 转成 QueryError 等一会儿重查）——把查询失败当成「不在池里」会误判成需要重新计算
@@ -609,7 +609,7 @@ sequenceDiagram
 - **实现通道**：`KeepaliveLoop` 定期调 `renew_once` → `exists`（`batch_is_exist` / BatchExistKey，读即续租）。`MooncakeBackend.register_keepalive` / `unregister_keepalive` 只登记/注销同一张 Ledger 表，不改成 ProbeKey
 - **形态**：协程定时器（事件循环内 `asyncio.sleep` 周期触发），不是独立线程
 - **已知限制（量未测）**：默认约每 5s `sweep_once`，对表里每个前缀做一次全 key `batch_is_exist`。请求量与 sweep 延迟没有基线；保活前缀多或单前缀很长时，sweep 可能拖过周期。限流 / 分批 / 按前缀错峰要等真机量过再改，core 不先加策略
-- **A16（必修，未修）**：demote 已 unregister 后，同前缀其它路径的 `exists` 仍会续 master lease，可打穿 demote 的 TTL 等待。修法：前缀级串行（`summary.md` A16）。
+- **A16（OPEN，上线前必修，不挡合入）**：demote 停保活后，同前缀 `exists` / 预热 / `check_promote` / `promote` 会授 lease，可打穿 TTL 等待。修法：前缀级串行（`summary.md` A16）。本 PR 不修。
 
 ### ReleaseLoop / RetainLoop
 
