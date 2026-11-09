@@ -643,8 +643,14 @@ V4-Pro 的 1M KV 约 9.85GB（≈9.6KiB/token），同样带宽下：
 #### 掩盖阈值
 
 ```text
-(1 − hit) > v_prefill × bytes_per_token / BW
+T_compute = (1 − hit) × P / v_prefill
+T_transfer = P × bytes_per_token / BW
+能掩盖 ⇔ T_compute ≥ T_transfer
+        ⇔ (1 − hit) ≥ v_prefill × bytes_per_token / BW
 ```
+
+左边 `1−hit` 是未命中比例；右边是“每 token 传输时间 / 每 token 重算时间”。
+`hit < 阈值` 表示“未命中比例足够大，有足够多计算可掩盖传输”；`hit > 阈值` 表示“传输主导，掩盖不住”。
 
 按 A3 ROCE 23.8GB/s、H2D 47GB/s、H2D 93GB/s：
 
@@ -670,8 +676,8 @@ V4-Pro 的 1M KV 约 9.85GB（≈9.6KiB/token），同样带宽下：
 
 #### 结论
 
-1. **V3.2 是带宽压力案例**：1M KV 约 86GB，跨机 ROCE 参考约 3.6s；高命中率下本地放置仍有价值。
-2. **V4-Pro 是压缩对照**：1M KV 约 9.85GB，同样带宽下只要约 0.41s；传输不再是主要矛盾。
+1. **V3.2 在 ≥99% 命中时是带宽压力案例**：1M KV 约 86GB，跨机 ROCE 参考约 3.6s；99% 命中时 residual 计算约 1.7s，传输 3.6s > 计算，掩盖不住。命中率更低时计算变多，传输可以被掩盖。
+2. **V4-Pro 是压缩对照，但“传输不是主矛盾”有条件**：1M KV 约 9.85GB，99% 命中时传输约 0.41s < residual 计算约 1.7s，可以掩盖；但命中率 >99.76% 后传输仍会主导。它是否成为主矛盾，取决于实际 `v_prefill` 和命中率。
 3. **掩盖阈值**：V3.2 跨机约 97.9%、本机 47GB/s 约 98.9%；V4-Pro 都在 99.7% 以上。不能把两套阈值混用。
 
 ### 8.2 吞吐/成本
