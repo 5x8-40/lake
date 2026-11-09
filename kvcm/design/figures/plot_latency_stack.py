@@ -22,8 +22,8 @@ MB = KB * 1024
 GB = MB * 1024
 
 BYTES_PER_TOKEN = 93 * KB  # GLM-5.2
-BW_WAN = 25 * GB  # 跨机，GB/s
-BW_LOCAL = 100 * GB  # 本机 DRAM→HBM，GB/s
+BW_WAN = 23.8 * GB  # 跨机 ROCE，GB/s（950 实测）
+BW_LOCAL = 47 * GB  # 本机 DRAM→HBM，GB/s（UB_CTP Server 实测）
 V_PREFILL = 5900  # token/s，整实例
 
 CONTEXTS = [32_000, 64_000, 128_000, 256_000, 512_000, 1_000_000]
@@ -38,8 +38,8 @@ def main() -> None:
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.plot(LABELS, prefill, marker="o", label="T_prefill (recompute)")
-    ax.plot(LABELS, transfer, marker="s", label="T_transfer (cross-host)")
-    ax.plot(LABELS, local, marker="^", label="T_local (DRAM->HBM)")
+    ax.plot(LABELS, transfer, marker="s", label="T_transfer (ROCE 23.8GB/s)")
+    ax.plot(LABELS, local, marker="^", label="T_h2d (DRAM->HBM, 47GB/s)")
     ax.set_yscale("log")
     ax.set_xlabel("context length")
     ax.set_ylabel("ms (log)")
