@@ -13,6 +13,7 @@ import pytest
 
 from conftest import run
 from kvcm.flows.prefetch import PrefetchError
+from kvcm.flows.promote import PromoteError
 from kvcm.ops.base import (
     IntentInputError,
     KvOps,
@@ -40,14 +41,21 @@ class FakeOps(KvOps):
         query_gate: threading.Event | None = None,
         handle_fn=None,
         on_copy=None,
+        on_target: bool = False,
+        any_memory: bool = True,
+        any_after_promote: bool = True,
     ):
         self._exists = exists
         self._seq = list(seq)
         self._gate = query_gate
         self._handle_fn = handle_fn or (lambda _p: _H)
         self._on_copy = on_copy
+        self._on_target = on_target
+        self._any_memory = any_memory
+        self._any_after_promote = any_after_promote
         self.abandoned: list[TaskHandle] = []
         self.copy_count = 0
+        self.promote_calls = 0
 
     def capability(self) -> BackendCapability:
         raise NotImplementedError
@@ -55,10 +63,21 @@ class FakeOps(KvOps):
     async def exists(self, prefix) -> bool:
         return self._exists
 
+    async def promote(self, prefix) -> None:
+        self.promote_calls += 1
+        if self._any_after_promote:
+            self._any_memory = True
+
+    async def check_promote(self, prefix, target=None) -> bool:
+        if target is not None:
+            return self._on_target
+        return self._any_memory
+
     async def copy(self, prefix, target) -> TaskHandle:
         self.copy_count += 1
         if self._on_copy is not None:
             self._on_copy(prefix)
+        self._on_target = True
         return self._handle_fn(prefix)
 
     async def query_task(self, handle) -> TaskStatus:
@@ -143,7 +162,7 @@ def test_run_once_ready_despite_keepalive_write_failure() -> None:
 def test_run_once_failure_does_not_register() -> None:
     ka = FakeKeepalive()
     eng = _engine(FakeOps(seq=[TaskStatus.FAILED]), keepalive=ka)
-    with pytest.raises(PrefetchError):
+    with pytest.raises(PromoteError):
         run(eng.run_once(_P, _T, poll_s=0.01))
     assert ka.registered == []
 
@@ -235,11 +254,28 @@ def test_intent_detail_contains_failure_reason() -> None:
                     break
                 await asyncio.sleep(0.01)
             assert eng.intent_status(key) is IntentStatus.FAILED
-            assert "PrefetchError" in eng.intent_detail(key)
+            assert "PromoteError" in eng.intent_detail(key)
         finally:
             await eng.shutdown(timeout_s=2)
 
     run(scenario())
+
+
+def test_run_once_exists_once() -> None:
+    """TaskEngine 与 PromoteFlow 共用一次 exists，不重复 RPC。"""
+
+    class Counting(FakeOps):
+        def __init__(self):
+            super().__init__(seq=[TaskStatus.READY])
+            self.exists_n = 0
+
+        async def exists(self, prefix) -> bool:
+            self.exists_n += 1
+            return await super().exists(prefix)
+
+    ops = Counting()
+    run(_engine(ops).run_once(_P, _T, poll_s=0.01))
+    assert ops.exists_n == 1, f"exists 查了 {ops.exists_n} 次"
 
 
 def test_intent_status_unknown_returns_none() -> None:
@@ -1220,7 +1256,7 @@ def test_finished_ring_evicts_oldest() -> None:
 
 
 def test_resubmit_same_key_after_terminal_restarts() -> None:
-    """终态后同键再提交 = 新意图（重新预热），旧回执被新一代覆盖。"""
+    """终态后同键再提交 = 新意图；仍在 target 则 Promote 短路，不再 copy。"""
 
     async def scenario():
         ops = FakeOps(seq=[TaskStatus.READY] * 2)
@@ -1235,19 +1271,57 @@ def test_resubmit_same_key_after_terminal_restarts() -> None:
                 await asyncio.sleep(0.01)
             assert ops.copy_count == 1
             k2 = eng.submit_intent(_P, _T, poll_s=0.01)
-            assert k1 == k2  # 幂等键相同
-            # 提交后立刻是 PENDING（占位）
+            assert k1 == k2
             assert eng.intent_status(k2) is IntentStatus.PENDING
             deadline = time.monotonic() + 3
             while time.monotonic() < deadline:
-                if ops.copy_count == 2:
+                if eng.intent_status(k2) is IntentStatus.READY:
                     break
                 await asyncio.sleep(0.01)
-            assert ops.copy_count == 2, "终态后同键提交没有重新执行"
-            # 环里只有一条（新代覆盖旧代）
+            assert eng.intent_status(k2) is IntentStatus.READY
+            assert ops.copy_count == 1
             assert len(eng._finished) == 1
         finally:
             await eng.shutdown(timeout_s=2)
+
+    run(scenario())
+
+
+def test_intent_already_on_target_skips_copy() -> None:
+    async def scenario():
+        ka = FakeKeepalive()
+        ops = FakeOps(on_target=True, any_memory=True)
+        eng = TaskEngine(ops, keepalive=ka)
+        await eng.run_once(_P, _T, poll_s=0.01)
+        assert ops.copy_count == 0
+        assert ops.promote_calls == 0
+        assert ka.registered == [_P]
+
+    run(scenario())
+
+
+def test_intent_promotes_then_copies_when_disk_only() -> None:
+    async def scenario():
+        ops = FakeOps(
+            any_memory=False,
+            any_after_promote=True,
+            seq=[TaskStatus.READY],
+        )
+        eng = TaskEngine(ops)
+        await eng.run_once(_P, _T, poll_s=0.01, timeout_s=2.0)
+        assert ops.promote_calls == 1
+        assert ops.copy_count == 1
+
+    run(scenario())
+
+
+def test_intent_prefetch_only_when_memory_elsewhere() -> None:
+    async def scenario():
+        ops = FakeOps(any_memory=True, on_target=False, seq=[TaskStatus.READY])
+        eng = TaskEngine(ops)
+        await eng.run_once(_P, _T, poll_s=0.01)
+        assert ops.promote_calls == 0
+        assert ops.copy_count == 1
 
     run(scenario())
 

@@ -38,9 +38,10 @@ def mooncake_v0311() -> BackendCapability:
             "通道不具备，demote 在停保活前拒绝",
         ),
         has_promotion=Capability(
-            Support.NO,
-            Support.NO,
-            "promote 不在本 PR；留到后续 stacked PR",
+            Support.YES,
+            Support.YES,
+            "打 GetReplicaList 累计命中；check_promote ±target；"
+            "PromoteFlow 可传 target（intent 经 TaskEngine，闸仅 copy）",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
@@ -74,7 +75,7 @@ def mooncake_main() -> BackendCapability:
         soft_pin_after=Capability(
             Support.NO,
             Support.NO,
-            "soft pin 不在本 PR；native 空写留到后续 PR",
+            "soft pin 未接线；native 空写见后续 soft pin PR",
         ),
         hard_pin_after=Capability(
             Support.NO,
@@ -84,14 +85,16 @@ def mooncake_main() -> BackendCapability:
         ),
         can_copy_with_source=Capability(Support.NO, Support.NO, "move 才能指定源"),
         has_offload=Capability(
-            Support.NO,
-            Support.NO,
-            "demote 不在本 PR；留到后续 stacked PR",
+            Support.YES,
+            Support.YES,
+            "主线：停保活、等满 lease TTL、再用 GET /batch_query_keys 查盘副本；没有就失败",
         ),
         has_promotion=Capability(
-            Support.NO,
-            Support.NO,
-            "promote 不在本 PR；留到后续 stacked PR",
+            Support.YES,
+            Support.YES,
+            "打 GetReplicaList（默认 2）触发；check_promote ±target。"
+            "PromoteFlow 传 target 时可 Prefetch；TaskEngine 闸仅 copy。"
+            "memory_instance 反查可空。不做读删写",
         ),
         has_per_key_demote=Capability(Support.NO, Support.NO, "无确定性立即降层"),
         has_task_cancel=Capability(Support.NO, Support.NO, "后端无任务取消能力"),
@@ -106,7 +109,7 @@ def mooncake_main() -> BackendCapability:
             Support.YES,
             Support.YES,
             "副本核验走 HTTP GET /batch_query_keys，用传输端点比段还在不在。"
-            "提回删掉了用 offload 端点对 seg 名的检查，仍打 GetReplicaList",
+            "提回用 GetReplicaList + 内存副本传输端点；不用 offload 端点对 seg",
         ),
         has_tenant_quota=Capability(
             Support.YES,

@@ -567,6 +567,7 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
         master="127.0.0.1:50088",
         admin=None,
         lease_ttl_s=11.0,
+        promote_hits=3,
     )
     daemon.build_backend(args, client=object(), ledger=object())
     assert seen["submit_concurrency"] == 7, (
@@ -574,6 +575,7 @@ def test_daemon_passes_copy_submit_concurrency(monkeypatch, tmp_path) -> None:
     )
     assert seen["admin"]._base == "http://127.0.0.1:9003"
     assert seen["lease_ttl_s"] == 11.0
+    assert seen["promote_hits"] == 3
     assert list(seen["locate"]("inst-B")) == ["seg-A"]
     with pytest.raises(IntentInputError, match="not registered"):
         seen["locate"]("other")
@@ -1641,6 +1643,19 @@ class _LayoutClient(FakeClient):
         super().__init__()
         self.layout = layout
 
+    def batch_memory_replica_endpoints(self, keys):
+        # layout 里有端点 = 池内已有 memory（常为 __source__）。已 create 的
+        # 目标段也并上，否则 PromoteFlow copy 后 check_promote(target) 仍 miss。
+        created = [seg for _, segs in self.created for seg in segs]
+        out: dict[str, list[str]] = {}
+        for k in keys:
+            eps = [ep for ep, _sz, _attrs in self.layout.get(k, [])]
+            for seg in created:
+                if seg not in eps:
+                    eps.append(seg)
+            out[k] = eps
+        return out
+
     def batch_memory_replica_sizes(self, keys):
         return {k: list(self.layout.get(k, [])) for k in keys}
 
@@ -1966,16 +1981,17 @@ def test_admit_timeout_covers_gate_wait(fake_store_module, monkeypatch) -> None:
     名额被占住超过 timeout 时必须停。停完把占住的名额还回去，闸仍是满的
     （取消等待不能把名额弄丢，也不能多还一个）。
     """
-    from kvcm.flows.prefetch import PrefetchError
+    from kvcm.flows.promote import PromoteError
     from kvcm.task_engine import TaskEngine
 
     key = _rank_key("a", 0)
     client = _LayoutClient({key: [("__source__", 100, ())]})
     admin = _TableAdmin({"seg-A": (0, 10**9)})
     b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
-    eng = TaskEngine(b, max_concurrent=1)
 
     async def scenario():
+        # 引擎必须在本循环里建（Semaphore/Queue 绑当前 loop；3.9 尤其敏感）
+        eng = TaskEngine(b, max_concurrent=1)
         await eng._gate.acquire()
         task = asyncio.create_task(
             eng.run_once(
@@ -1985,7 +2001,8 @@ def test_admit_timeout_covers_gate_wait(fake_store_module, monkeypatch) -> None:
             )
         )
         try:
-            with pytest.raises(PrefetchError, match="stopped before submit"):
+            # TaskEngine 闸路径仍抛 PrefetchError；PromoteFlow 包成 PromoteError
+            with pytest.raises(PromoteError, match="stopped before submit"):
                 await task
             assert eng._gate.locked()
         finally:
@@ -2002,7 +2019,7 @@ def test_admit_slow_query_does_not_extend_timeout(
     fake_store_module, monkeypatch
 ) -> None:
     """查剩余本身花掉的时间也算预算。查完已经到点就停，不再提交。"""
-    from kvcm.flows.prefetch import PrefetchError
+    from kvcm.flows.promote import PromoteError
     from kvcm.task_engine import TaskEngine
 
     key = _rank_key("a", 0)
@@ -2016,7 +2033,7 @@ def test_admit_slow_query_does_not_extend_timeout(
     b = _admit_backend(client, monkeypatch, admin=_Slow(), segs=["seg-A"], keys=[key])
     eng = TaskEngine(b, max_concurrent=1)
     start = time.monotonic()
-    with pytest.raises(PrefetchError, match="stopped before submit"):
+    with pytest.raises(PromoteError, match="stopped before submit"):
         run(
             eng.run_once(
                 Prefix(model_id="qwen", token_ids=(1,)),
@@ -2100,6 +2117,7 @@ def test_admin_url_explicit_overrides_master(monkeypatch) -> None:
         master="master.internal:50088",
         admin="http://10.1.2.3:9999",
         lease_ttl_s=10.0,
+        promote_hits=2,
     )
     daemon.build_backend(args, client=object(), ledger=object())
     assert seen["admin"]._base == "http://10.1.2.3:9999"
@@ -2707,6 +2725,597 @@ def test_register_keepalive_uses_ledger_table(fake_store_module, monkeypatch) ->
         os.unlink(path)
 
 
+def _demote_backend(monkeypatch, led, admin, *, lease_ttl_s: float):
+    client = FakeClient()
+
+    def batch_get_replica_desc(keys):
+        raise AssertionError("demote 不能走 GetReplicaList，那会续租")
+
+    client.batch_get_replica_desc = batch_get_replica_desc
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: ["k0"] if ids else [])
+    return MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_main(),
+        ledger=led,
+        admin=admin,
+        lease_ttl_s=lease_ttl_s,
+    )
+
+
+def test_demote_v0311_refuses_before_unregister_keepalive(
+    fake_store_module, monkeypatch
+) -> None:
+    """0.3.11 查不到盘副本字段。通道 NO，停保活之前就拒绝。"""
+    assert mooncake_v0311().has_offload.channel is Support.NO
+    assert mooncake_main().has_offload.channel is Support.YES
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, object(), lease_ttl_s=0)
+        b._cap = mooncake_v0311()
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        with pytest.raises(UnsupportedCapabilityError, match="盘副本"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_fails_without_disk_replica(fake_store_module, monkeypatch) -> None:
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    steps: list[tuple] = []
+
+    async def fake_sleep(seconds):
+        steps.append(("sleep", seconds, list(led.list_keepalive())))
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            steps.append(("query", list(keys)))
+            return {k: KeyReplicaQuery(key=k, ok=True, disk_replicas=0) for k in keys}
+
+    monkeypatch.setattr(
+        "kvcm.backends.mooncake.backend.asyncio.sleep", fake_sleep
+    )
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        with pytest.raises(VerifyError, match="还没有 LOCAL_DISK"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+        assert steps == [("sleep", 0, []), ("query", ["k0"])]
+        kept = led.list_keepalive_records()[0].registered_at
+        led._backdate_keepalive(seconds=50)
+        old = led.list_keepalive_records()[0].registered_at
+        assert old != kept
+        with pytest.raises(VerifyError, match="还没有 LOCAL_DISK"):
+            run(b.demote(prefix))
+        assert led.list_keepalive_records()[0].registered_at == old
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_short_response_is_query_error(fake_store_module, monkeypatch) -> None:
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {}
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        with pytest.raises(QueryError, match="短回"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_ok_false_is_query_error(fake_store_module, monkeypatch) -> None:
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {
+                k: KeyReplicaQuery(key=k, ok=False, error="OBJECT_NOT_FOUND")
+                for k in keys
+            }
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        with pytest.raises(QueryError, match="OBJECT_NOT_FOUND"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_without_prior_keepalive_does_not_create_row(
+    fake_store_module, monkeypatch
+) -> None:
+    """原本没有保活行，失败后不新建。"""
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {k: KeyReplicaQuery(key=k, ok=True, disk_replicas=0) for k in keys}
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        assert led.list_keepalive() == []
+        with pytest.raises(VerifyError, match="还没有 LOCAL_DISK"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == []
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_dfs_only_is_not_success(fake_store_module, monkeypatch) -> None:
+    """DFS 副本不算 demote 成功：promotion 只从 LOCAL_DISK 提回。"""
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {
+                k: KeyReplicaQuery(
+                    key=k, ok=True, disk_replicas=1, local_disk_replicas=0
+                )
+                for k in keys
+            }
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        with pytest.raises(VerifyError, match="LOCAL_DISK"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_succeeds_when_every_key_has_local_disk(
+    fake_store_module, monkeypatch
+) -> None:
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    steps: list[tuple] = []
+
+    async def fake_sleep(seconds):
+        steps.append(("sleep", seconds))
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            steps.append(("query", list(keys)))
+            return {
+                k: KeyReplicaQuery(key=k, ok=True, local_disk_replicas=1)
+                for k in keys
+            }
+
+    monkeypatch.setattr(
+        "kvcm.backends.mooncake.backend.asyncio.sleep", fake_sleep
+    )
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0.01)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        run(b.demote(prefix))
+        assert led.list_keepalive() == []
+        assert steps == [("sleep", 0.01), ("query", ["k0"])]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_failure_restores_original_registered_at(
+    fake_store_module, monkeypatch
+) -> None:
+    """失败恢复插回原来的 registered_at，不把窗口拨到现在。"""
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            return {k: KeyReplicaQuery(key=k, ok=True, disk_replicas=0) for k in keys}
+
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        before = led.keepalive_registered_at(prefix)
+        assert before is not None
+        with pytest.raises(VerifyError, match="LOCAL_DISK"):
+            run(b.demote(prefix))
+        assert led.keepalive_registered_at(prefix) == before
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_cancel_restores_keepalive(fake_store_module, monkeypatch) -> None:
+    """sleep 期间 CancelledError：尽量按原 registered_at 恢复保活。"""
+    import asyncio
+
+    from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            raise AssertionError("取消应发生在 sleep，不应查盘")
+
+    async def boom_sleep(_seconds):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "kvcm.backends.mooncake.backend.asyncio.sleep", boom_sleep
+    )
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=1.0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        before = led.keepalive_registered_at(prefix)
+        assert before is not None
+        with pytest.raises(asyncio.CancelledError):
+            run(b.demote(prefix))
+        assert led.keepalive_registered_at(prefix) == before
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_cancel_still_raises_if_restore_fails(
+    fake_store_module, monkeypatch
+) -> None:
+    """取消路径上 restore 失败被吞掉，CancelledError 仍要抛出。"""
+    import asyncio
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            raise AssertionError("取消应发生在 sleep")
+
+    async def boom_sleep(_seconds):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(
+        "kvcm.backends.mooncake.backend.asyncio.sleep", boom_sleep
+    )
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, Admin(), lease_ttl_s=1.0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+
+        def boom_restore(*_a, **_k):
+            raise RuntimeError("restore boom")
+
+        monkeypatch.setattr(led, "restore_keepalive", boom_restore)
+        with pytest.raises(asyncio.CancelledError):
+            run(b.demote(prefix))
+        # restore 失败：行可能仍缺；关键是取消继续往外走
+        assert led.list_keepalive() == []
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_demote_keeps_keepalive_until_preconditions_hold(
+    fake_store_module, monkeypatch
+) -> None:
+    """没有 admin、或展开不出 key 时，还没停保活。"""
+    with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as f:
+        path = f.name
+    led = Ledger(path)
+    try:
+        b = _demote_backend(monkeypatch, led, object(), lease_ttl_s=0)
+        prefix = Prefix(model_id="qwen", token_ids=(1,))
+        run(b.register_keepalive(prefix))
+        b._admin = None
+        with pytest.raises(QueryError, match="batch_query_keys"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+
+        monkeypatch.setattr(b._keys, "keys_for_tokens", lambda ids: [])
+        b._admin = object()
+        with pytest.raises(IntentInputError, match="shorter than one block"):
+            run(b.demote(prefix))
+        assert led.list_keepalive() == [prefix]
+    finally:
+        led.close()
+        import os
+
+        os.unlink(path)
+
+
+def test_promote_hits_replica_list_not_admin(fake_store_module, monkeypatch) -> None:
+    client = FakeClient(replicas_on=["seg-A"])
+    hits = {"n": 0}
+    original = client.batch_memory_replica_endpoints
+
+    def wrapped(keys):
+        hits["n"] += 1
+        return original(keys)
+
+    client.batch_memory_replica_endpoints = wrapped
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            from kvcm.backends.mooncake.admin_main import KeyReplicaQuery
+
+            return {
+                k: KeyReplicaQuery(
+                    key=k, ok=True, local_disk_endpoints=("seg-A",)
+                )
+                for k in keys
+            }
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
+    b = MooncakeBackend(
+        client=client,
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        list_instances=lambda: (InstanceId("inst"),),
+        capability=mooncake_main(),
+        admin=Admin(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.promote(prefix)) is None
+    assert hits["n"] == 2
+    assert run(b.check_promote(prefix)) is True
+    assert run(b.memory_instance(prefix)) == InstanceId("inst")
+
+    client._replicas_on = []
+    assert run(b.check_promote(prefix)) is False
+    assert run(b.memory_instance(prefix)) is None
+
+
+def test_promote_any_memory_counts_even_if_not_registered(
+    fake_store_module, monkeypatch
+) -> None:
+    """有 memory 即 check 成功；seg 不在目录则 memory_instance 为 None。"""
+    hits = {"n": 0}
+
+    class Client(FakeClient):
+        def batch_memory_replica_endpoints(self, keys):
+            hits["n"] += 1
+            return {k: ["seg-ELSE"] for k in keys}
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            raise AssertionError("提回不该拿 local_disk 端点对 seg 名")
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]) if ids else [])
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        list_instances=lambda: (InstanceId("inst"),),
+        capability=mooncake_main(),
+        admin=Admin(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.promote(prefix)) is None
+    assert hits["n"] == 2
+    assert run(b.check_promote(prefix)) is True
+    assert run(b.memory_instance(prefix)) is None
+
+
+def test_memory_instance_requires_rank_mapped_seg(
+    fake_store_module, monkeypatch
+) -> None:
+    """set 交集不够：rank0 key 落在 seg1 时不得认该实例可调度。"""
+    from kvcm.engines.vllm.keys import parse_key_rank
+
+    kc = KeyComputer(model_name="qwen", tp_size=2)
+    keys = kc.expand(["h0"])
+    assert [parse_key_rank(k) for k in keys] == [0, 1]
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: list(keys) if ids else [])
+
+    class Client(FakeClient):
+        def batch_memory_replica_endpoints(self, req_keys):
+            # 两个 key 的 memory 都只在 seg1；set 交集会误判，build_plan 要求
+            # rank0→seg0、rank1→seg1，应返回 None。
+            return {k: ["seg1"] for k in req_keys}
+
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg0", "seg1"],
+        list_instances=lambda: (InstanceId("inst"),),
+        capability=mooncake_main(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.check_promote(prefix)) is True
+    assert run(b.memory_instance(prefix)) is None
+
+    class OkClient(FakeClient):
+        def batch_memory_replica_endpoints(self, req_keys):
+            return {
+                k: ["seg0"] if parse_key_rank(k) == 0 else ["seg1"]
+                for k in req_keys
+            }
+
+    b2 = MooncakeBackend(
+        client=OkClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg0", "seg1"],
+        list_instances=lambda: (InstanceId("inst"),),
+        capability=mooncake_main(),
+        promote_hits=2,
+    )
+    assert run(b2.memory_instance(prefix)) == InstanceId("inst")
+
+
+def test_check_promote_with_target_uses_build_plan(
+    fake_store_module, monkeypatch
+) -> None:
+    """check_promote(target=…) 与 memory_instance 同一套 rank 映射。"""
+    from kvcm.engines.vllm.keys import parse_key_rank
+
+    kc = KeyComputer(model_name="qwen", tp_size=2)
+    keys = kc.expand(["h0"])
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: list(keys) if ids else [])
+
+    class Client(FakeClient):
+        def batch_memory_replica_endpoints(self, req_keys):
+            return {
+                k: ["seg0"] if parse_key_rank(k) == 0 else ["seg1"]
+                for k in req_keys
+            }
+
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg0", "seg1"],
+        capability=mooncake_main(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.check_promote(prefix)) is True
+    assert run(b.check_promote(prefix, InstanceId("ok"))) is True
+
+    class WrongClient(FakeClient):
+        def batch_memory_replica_endpoints(self, req_keys):
+            return {k: ["seg1"] for k in req_keys}
+
+    b2 = MooncakeBackend(
+        client=WrongClient(),
+        key_computer=kc,
+        locate=lambda _inst: ["seg0", "seg1"],
+        capability=mooncake_main(),
+        promote_hits=2,
+    )
+    assert run(b2.check_promote(prefix)) is True
+    assert run(b2.check_promote(prefix, InstanceId("bad"))) is False
+
+
+def test_memory_instance_picks_rank_matched_among_instances(
+    fake_store_module, monkeypatch
+) -> None:
+    """多实例：跳过 set 交集碰巧命中但 rank 不对的，返回 build_plan 可调度的。"""
+    from kvcm.engines.vllm.keys import parse_key_rank
+
+    kc = KeyComputer(model_name="qwen", tp_size=2)
+    keys = kc.expand(["h0"])
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: list(keys) if ids else [])
+    segs = {
+        InstanceId("wrong"): ["seg0", "seg1"],
+        # wrong：两 seg 都在目录，但 memory 全在 seg1 → rank0 对不上
+        InstanceId("right"): ["segA", "segB"],
+    }
+
+    class Client(FakeClient):
+        def batch_memory_replica_endpoints(self, req_keys):
+            return {
+                k: ["seg1", "segA"]
+                if parse_key_rank(k) == 0
+                else ["seg1", "segB"]
+                for k in req_keys
+            }
+
+    def locate(inst: InstanceId) -> list[str]:
+        return list(segs[inst])
+
+    b = MooncakeBackend(
+        client=Client(),
+        key_computer=kc,
+        locate=locate,
+        # wrong 在前：旧 set 交集会先命中 wrong（每 key 都碰得到 seg1）
+        list_instances=lambda: (InstanceId("wrong"), InstanceId("right")),
+        capability=mooncake_main(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.check_promote(prefix)) is True
+    assert run(b.memory_instance(prefix)) == InstanceId("right")
+
+
+def test_promote_v0311_hits_without_admin(fake_store_module, monkeypatch) -> None:
+    assert mooncake_v0311().has_promotion.channel is Support.YES
+    assert mooncake_main().has_promotion.channel is Support.YES
+
+    class Admin:
+        def batch_query_keys(self, keys):
+            raise AssertionError("提回不该查 admin")
+
+    kc = KeyComputer(model_name="qwen", tp_size=1)
+    monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]) if ids else [])
+    b = MooncakeBackend(
+        client=FakeClient(replicas_on=["seg-A"]),
+        key_computer=kc,
+        locate=lambda _inst: ["seg-A"],
+        capability=mooncake_v0311(),
+        admin=Admin(),
+        promote_hits=2,
+    )
+    prefix = Prefix(model_id="qwen", token_ids=(1,))
+    assert run(b.promote(prefix)) is None
+    assert run(b.check_promote(prefix)) is True
+
+
 def test_retain_not_implemented(fake_store_module, monkeypatch) -> None:
     kc = KeyComputer(model_name="qwen", tp_size=1)
     monkeypatch.setattr(kc, "keys_for_tokens", lambda ids: kc.expand(["h0"]))
@@ -2723,18 +3332,15 @@ def test_retain_not_implemented(fake_store_module, monkeypatch) -> None:
         run(b.retain(prefix, InstanceId("inst")))
 
 
-def test_core_leaves_pin_demote_promote_unsupported(
+def test_demote_promote_pr_leaves_pin_unsupported(
     fake_store_module, monkeypatch
 ) -> None:
-    """core 不接线 pin/demote/promote/check_promote，走基类 Unsupported。"""
+    """本 PR 接上 demote/promote；pin 仍走基类 Unsupported（soft pin PR）。"""
     b = _backend(FakeClient(), KeyComputer(model_name="qwen", tp_size=1), monkeypatch)
     prefix = Prefix(model_id="qwen", token_ids=(1,))
-    target = InstanceId("inst-B")
     with pytest.raises(UnsupportedCapabilityError):
         run(b.pin(prefix, PinKind.SOFT))
-    with pytest.raises(UnsupportedCapabilityError):
-        run(b.demote(prefix))
-    with pytest.raises(UnsupportedCapabilityError):
-        run(b.promote(prefix, target))
-    with pytest.raises(UnsupportedCapabilityError):
-        run(b.check_promote(prefix, target))
+    assert "demote" in MooncakeBackend.__dict__
+    assert "promote" in MooncakeBackend.__dict__
+    assert "check_promote" in MooncakeBackend.__dict__
+    assert "pin" not in MooncakeBackend.__dict__

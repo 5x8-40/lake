@@ -48,6 +48,11 @@ class InstanceDirectory:
             except KeyError:
                 raise IntentInputError(f"instance not registered: {inst}") from None
 
+    def ids(self) -> tuple[InstanceId, ...]:
+        """已登记实例 id（顺序不稳定）。供 promote 落点反查。"""
+        with self._lock:
+            return tuple(InstanceId(k) for k in self._segs)
+
 
 def parse_instance_segs(spec: str) -> tuple[str, tuple[str, ...]]:
     """解析 ``实例=seg0,seg1``。实例名和段名单都不能空。"""
