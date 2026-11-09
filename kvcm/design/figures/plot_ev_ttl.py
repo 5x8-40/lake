@@ -1,6 +1,6 @@
 """生成 D8a 的预取 EV 曲线与保留 TTL 曲线。
 
-口径与 D8a §8.1 一致：GLM-5.2，93 KB/token，跨机 ROCE 23.8 GB/s。
+口径与 D8a §8.1 一致：DeepSeek V3.2，83.9 KiB/token，跨机 ROCE 23.8 GB/s。
 
 运行：
     python3 kvcm/design/figures/plot_ev_ttl.py
@@ -22,7 +22,7 @@ KB = 1024
 MB = KB * 1024
 GB = 1_000_000_000  # 十进制 GB（HIXL 带宽口径）
 
-BYTES_PER_TOKEN = 93 * KB
+BYTES_PER_TOKEN = 85_888  # DeepSeek V3.2: 61 × 1408B
 BW_WAN = 23.8 * GB  # 950 ROCE 实测
 V_PREFILL = 5900
 
@@ -49,7 +49,7 @@ def plot_ev() -> None:
     ax.set_xlabel("prefetch lead time (s)")
     ax.set_ylabel("EV (ms)")
     ax.set_title(
-        f"Prefetch EV vs lead time (128K ctx, 93KB/tok, copy={C_COPY_MS:.0f}ms (ROCE 23.8GB/s))"
+        f"Prefetch EV vs lead time (128K ctx, V3.2 83.9KiB/tok, copy={C_COPY_MS:.0f}ms (ROCE 23.8GB/s))"
     )
     ax.grid(True, alpha=0.3)
     fig.tight_layout()

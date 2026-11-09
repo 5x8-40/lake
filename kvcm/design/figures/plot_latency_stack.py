@@ -1,6 +1,6 @@
 """生成 D8a 的延迟量级图（KV 路径成本 vs 上下文长度）。
 
-口径与 D8a §8.1 一致：GLM-5.2，93 KB/token，79 层。
+口径与 D8a §8.1 一致：DeepSeek V3.2，83.9 KiB/token，61 层。
 
 运行：
     python3 kvcm/design/figures/plot_latency_stack.py
@@ -21,7 +21,7 @@ KB = 1024
 MB = KB * 1024
 GB = 1_000_000_000  # 十进制 GB（HIXL 带宽口径）
 
-BYTES_PER_TOKEN = 93 * KB  # GLM-5.2
+BYTES_PER_TOKEN = 85_888  # DeepSeek V3.2: 61 × 1408B
 BW_WAN = 23.8 * GB  # 跨机 ROCE，GB/s（950 实测）
 BW_LOCAL = 47 * GB  # 本机 DRAM→HBM，GB/s（UB_CTP Server 实测）
 V_PREFILL = 5900  # token/s，整实例
@@ -43,7 +43,7 @@ def main() -> None:
     ax.set_yscale("log")
     ax.set_xlabel("context length")
     ax.set_ylabel("ms (log)")
-    ax.set_title("KV path cost by context length (GLM-5.2, 93KB/token)")
+    ax.set_title("KV path cost by context length (DeepSeek V3.2, 83.9KiB/token)")
     ax.grid(True, which="both", alpha=0.3)
     ax.legend()
     fig.tight_layout()

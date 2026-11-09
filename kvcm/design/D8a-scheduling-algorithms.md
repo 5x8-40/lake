@@ -109,9 +109,9 @@ vLLM 的 KV connector 是逐层的（`KVConnectorBase_V1::start_load_kv` 启动�
 
 ### 胖 KV 的例外
 
-GLM-5.2（93 KB/token）这类模型的 KV 特别大，即使搬到本机 DRAM 也可能藏不住：
+DeepSeek V3.2（83.9 KiB/token）这类模型的 KV 仍然很大，即使搬到本机 DRAM 也可能藏不住：
 
-- 1M 上下文 ≈ 95.2 GB，本机 DRAM→HBM（47 GB/s）≈ 2.03 s（POD 93GB/s 约 1.02 s）
+- 1M 上下文 ≈ 85.9 GB，本机 DRAM→HBM（47 GB/s）≈ 1.83 s（POD 93GB/s 约 0.92 s）
 - 此时只有**HBM 驻留**（命中即零拷贝）才够
 
 这解释了为什么长上下文 + 胖 KV 场景下，HBM 命中率是硬指标。
@@ -341,7 +341,7 @@ C_occupancy = S_bytes × T × c_mem
 
 一个重要的读数：
 
-- 如果预取只是把“远端命中”变“本机 DRAM”，收益是 `T_transfer − T_h2d`，按实测：512K 约 1.04s（单机 47GB/s）/ 0.52s（POD 93GB/s）；1M 约 2.03s / 1.02s；跨机另算；
+- 如果预取只是把“远端命中”变“本机 DRAM”，收益是 `T_transfer − T_h2d`，按实测：512K 约 0.96s（单机 47GB/s）/ 0.48s（POD 93GB/s）；1M 约 1.92s / 0.97s；跨机另算；
 - 如果它防止了一次驱逐/重算，收益是 `T_prefill`（秒级）。
 - **所以预取要和保留一起做**。
 
@@ -360,9 +360,9 @@ s.t. Σ x_i × bytes_i ≤ B_budget
 
 ![预取 EV 与保留时间](figures/algo-prefetch-ev.svg)
 
-> 参数：128K 上下文（GLM-5.2，`S_bytes=12.2GB`）、`S_saved≈2200ms`（命中率 +10% 省下的 prefill）、`λ=1/300`、`C_copy≈512ms`（A3 ROCE 23.8GB/s 参考一次搬运）。曲线先升后降：太早预取白占内存，太晚赶不上请求。
+> 参数：128K 上下文（V3.2，`S_bytes≈11.0GB`）、`S_saved≈2200ms`（命中率 +10% 省下的 prefill）、`λ=1/300`、`C_copy≈462ms`（A3 ROCE 23.8GB/s 参考一次搬运）。曲线先升后降：太早预取白占内存，太晚赶不上请求。
 
-**注意 `C_copy` 与 `S_saved` 的量级**：128K 时一次跨机搬运约 512 ms，而防住一次重算省 2200 ms——比值约 4.3:1。到 1M 时两者都放大，但比值不变（都随 `P` 线性）。
+**注意 `C_copy` 与 `S_saved` 的量级**：128K 时一次跨机搬运约 462 ms，而防住一次重算省 2200 ms——比值约 4.8:1。到 1M 时两者都放大，但比值不变（都随 `P` 线性）。
 
 **收益**：预取 ROI 可算；带宽按价值密度分配，不被低价值预热打爆。
 
@@ -384,7 +384,7 @@ break-even: μ × p0 × exp(−μT) × T_prefill = c_h × bytes
 
 ![保留 TTL 盈亏平衡](figures/algo-retention-ttl.svg)
 
-> 参数：128K 上下文、`S_saved≈2200ms`、`p0=1`、`μ=1/600`、占用成本按 12.2 GB × 0.5 ms/(GB·s) 计。曲线的零点就是最优 TTL 上界。
+> 参数：128K 上下文、`S_saved≈2200ms`、`p0=1`、`μ=1/600`、占用成本按 11.0 GB × 0.5 ms/(GB·s) 计。曲线的零点就是最优 TTL 上界。
 
 ### 5.2 等级选择
 
@@ -606,67 +606,73 @@ L2 更新权重；L0/L1 只读：
 
 ### 8.1 延迟量级
 
-> 本机 H2D 按 950 实测：单机 UB_CTP 约 47GB/s、POD 约 93GB/s（两种场景，不并列成区间）。**950 跨机 H2D 没有实测数**；下表跨机列用 A3 910C 的 ROCE 23.8GB/s 作保守参考（A3 FabricMem 可到 78–107GB/s），不是 950 结论。`93KiB/token` 由 cmx-sim 的 GLM-5.2 BF16 布局推出（78×1152 + 21×256 = 95,232B）；FP8 logical 约 46.58GiB/1M，时间按比例减半；换模型/精度要重算。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
+> 本机 H2D 按 950 实测：单机 UB_CTP 约 47GB/s、POD 约 93GB/s（两种场景，不并列成区间）。**950 跨机 H2D 没有实测数**；下表跨机列用 A3 910C 的 ROCE 23.8GB/s 作保守参考（A3 FabricMem 可到 78–107GB/s），不是 950 结论。V3.2 的布局是 `61 层 × 1408B = 85,888B/token = 83.9KiB`（BF16）；FP8 约减半。V4-Pro 是 `≈9.6KiB/token`，1M 约 9.85GB。换模型/精度要重算。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
 
 ![KV 路径成本](figures/algo-latency-stack.svg)
 
-> 参数：GLM-5.2 口径 `bytes_per_token=93KiB`、`L=79`（含 1 层 MTP）、`v_prefill=5900 token/s`（整实例，**输入假设，不是实测**）、跨机 `BW_storage=23.8GB/s`（A3 ROCE 参考）、本机 `BW_h2d=47GB/s`（UB_CTP Server；POD 约 93GB/s）。
+> 参数：DeepSeek V3.2 口径 `bytes_per_token=83.9KiB`（85,888B）、`L=61`；`v_prefill=5900 token/s` 是示例输入，不是 V3.2 实测；跨机 `BW_storage=23.8GB/s`（A3 ROCE 参考）、本机 `BW_h2d=47GB/s`（UB_CTP Server；POD 约 93GB/s）。
 
-#### KV 大小与传输时间
+#### V3.2：KV 大小与传输时间
 
-`S_bytes` 按十进制 GB 计（93KiB/token × P / 1e9）；1M 约 95.2GB，不是 88.7GB。
+`S_bytes` 按十进制 GB 计（85,888B/token × P / 1e9）。
 
-93KiB 不是拍脑袋：cmx-sim 的 GLM-5.2 布局是 `78 层 × 1152B + 21 个 indexer × 256B = 95,232B = 93KiB/token`（BF16 logical）；FP8 logical 约 46.58GiB/1M，约为 BF16 的一半，时间也按比例减半。来源：[cmx-sim](../../tools/cmx-sim/README.md)。
-
-| context | `S_bytes` | 跨机 ROCE 23.8GB/s（A3 参考） | 本机 H2D 47GB/s | 每层跨机（79 层） |
+| context | `S_bytes` | 跨机 ROCE 23.8GB/s（A3 参考） | 本机 H2D 47GB/s | 每层跨机（61 层） |
 |---|---:|---:|---:|---:|
-| 32K | 3.05 GB | 128 ms | 65 ms | 1.6 ms |
-| 64K | 6.10 GB | 256 ms | 130 ms | 3.2 ms |
-| 128K | 12.19 GB | 512 ms | 259 ms | 6.5 ms |
-| 256K | 24.38 GB | 1024 ms | 519 ms | 13.0 ms |
-| 512K | 48.76 GB | 2049 ms | 1037 ms | 25.9 ms |
-| 1M | 95.23 GB | 4001 ms | 2026 ms | 50.6 ms |
+| 32K | 2.75 GB | 115 ms | 58 ms | 1.5 ms |
+| 64K | 5.50 GB | 231 ms | 117 ms | 2.9 ms |
+| 128K | 10.99 GB | 462 ms | 234 ms | 5.9 ms |
+| 256K | 21.99 GB | 924 ms | 468 ms | 11.7 ms |
+| 512K | 43.98 GB | 1848 ms | 936 ms | 23.4 ms |
+| 1M | 85.89 GB | 3609 ms | 1827 ms | 45.7 ms |
 
-#### 能不能掩盖，只看命中率
+V3.2 的 1M KV 仍近 86GB；高命中率下传输是纯加项，能不能掩盖仍由命中率决定。
 
-按 §1.1 的判据（`T_compute(residual) > T_transfer` 才能掩盖）：
+#### V4-Pro 对照：KV 小 8.7 倍
 
-| 命中率 | 跨机 | 本机 DRAM |
-|---|---|---|
-| 90% | 能 | 能 |
-| 95% | 能 | 能 |
-| **99%** | **不能**（所有长度） | **不能**（按 47GB/s）；POD 93GB/s 时能 |
-| **99.9%** | **不能** | **不能**（所有长度） |
+V4-Pro 的 1M KV 约 9.85GB（≈9.6KiB/token），同样带宽下：
 
-**分界线与上下文长度无关，只与命中率有关。** 原因是 `T_compute` 和 `T_transfer` 都随 `P` 线性增长，比值只由 `(1−hit) × v_prefill` 与 `BW` 决定：
+| context | `S_bytes` | 跨机 ROCE 23.8GB/s（A3 参考） | 本机 H2D 47GB/s |
+|---|---:|---:|---:|
+| 32K | 0.32 GB | 13 ms | 7 ms |
+| 128K | 1.26 GB | 53 ms | 27 ms |
+| 512K | 5.04 GB | 207 ms | 105 ms |
+| 1M | 9.85 GB | 414 ms | 210 ms |
+
+所以 V4-Pro 的传输瓶颈比 V3.2 小约 8.7 倍；它的主矛盾更可能在计算/队列，而不是 KV 搬运。
+
+#### 掩盖阈值
 
 ```text
-掩盖条件改写： (1 − hit) × P / v_prefill > P × bytes_per_token / BW
-                约去 P：  (1 − hit) > v_prefill × bytes_per_token / BW
+(1 − hit) > v_prefill × bytes_per_token / BW
 ```
 
-按 A3 ROCE 23.8GB/s 参考代入 GLM-5.2：`5900 × 93KiB / 23.8GB/s ≈ 0.023`，即 **hit < 97.7%**（950 跨机待测）。本机 H2D 47GB/s 的阈值是 `5900 × 93KiB / 47GB/s ≈ 0.0117`，即 **hit < 98.8%**；POD 93GB/s 时约 **99.4%**。
+按 A3 ROCE 23.8GB/s、H2D 47GB/s、H2D 93GB/s：
 
-#### 高命中率下的实际代价
+| 模型 | 跨机 ROCE | 本机 47GB/s | 本机 93GB/s |
+|---|---:|---:|---:|
+| V3.2（83.9KiB/token） | hit < 97.9% | hit < 98.9% | hit < 99.45% |
+| V4-Pro（≈9.6KiB/token） | hit < 99.76% | hit < 99.88% | hit < 99.94% |
 
-命中 99% 时（agentic 典型区间的上沿）：
+`v_prefill=5900` 是示例输入；它一变，阈值跟着变，必须用 V3.2/V4-Pro 各自的 950 真机 prefill 数据校准。
+
+#### 高命中率下的实际代价（V3.2，99%）
 
 | context | residual | 跨机 `T_kv`（A3 参考） | 本机 `T_kv` | 差值 |
 |---|---:|---:|---:|---:|
-| 32K | 320 | 182 ms | 119 ms | 63 ms |
-| 128K | 1,280 | 729 ms | 476 ms | 253 ms |
-| 512K | 5,120 | 2917 ms | 1905 ms | 1012 ms |
-| 1M | 10,000 | 5696 ms | 3721 ms | 1975 ms |
+| 32K | 320 | 169 ms | 113 ms | 57 ms |
+| 128K | 1,280 | 679 ms | 451 ms | 228 ms |
+| 512K | 5,120 | 2716 ms | 1804 ms | 912 ms |
+| 1M | 10,000 | 5304 ms | 3522 ms | 1782 ms |
 
-差值就等于 `T_transfer`：**一旦不能掩盖，跨机那一段是纯加项。**
+差值约等于 `T_transfer`：**一旦不能掩盖，跨机那一段是纯加项。**
 
-再叠上 batch 效应（§1.1）：跨机的那 2.0 s（512K）不是只拖慢这一个请求，是拖慢整个 batch 这一步。
+再叠上 batch 效应（§1.1）：跨机的那 1.85s（512K）不是只拖慢这一个请求，是拖慢整个 batch 这一步。
 
 #### 结论
 
-1. **预取的价值在命中率接近 99%（≥98.8%）时才是主项。** 中低命中率下，计算足以掩盖传输，本地放置收益接近零。
-2. **高命中率场景下，本机 DRAM 就够**，不必追 HBM——除命中率 ≥98.8%（POD 93GB/s 约 99.4%）的情形。
-3. **胖 KV（GLM-5.2 这类）把分界定在 98.8%（本机 H2D 47GB/s）**；POD H2D 93GB/s 时约 99.4%。跨机侧只有 A3 ROCE 23.8GB/s 参考（约 97.7%），950 跨机待测。比 MLA 类薄 KV 低得多，因为每 token 字节数大。
+1. **V3.2 是带宽压力案例**：1M KV 约 86GB，跨机 ROCE 参考约 3.6s；高命中率下本地放置仍有价值。
+2. **V4-Pro 是压缩对照**：1M KV 约 9.85GB，同样带宽下只要约 0.41s；传输不再是主要矛盾。
+3. **掩盖阈值**：V3.2 跨机约 97.9%、本机 47GB/s 约 98.9%；V4-Pro 都在 99.7% 以上。不能把两套阈值混用。
 
 ### 8.2 吞吐/成本
 
@@ -787,7 +793,7 @@ ROI = saved / cost
 | `w_hit/w_transfer/w_q/w_slo` | 量纲归一后 1.0 | 离线回放 + 真机 A/B |
 | `BW*` | 由公式算 | 网卡/链路实测 |
 | `P_use` / `λ` | 历史 ETA/复用率 | trace 拟合 |
-| `v_prefill` | 5900 token/s（整实例，**输入假设**） | 真机 prefill 压测：`tokens / prefill_step_time`；cmx-sim 设备 A（950）的 Qwen3-235B noCacheTPS 为 8741/5403 @4K/16K，GLM-5.2 需单独测，5900 不是 cmx-sim 直接值 |
+| `v_prefill` | 5900 token/s（整实例，**输入假设**） | 真机 prefill 压测：`tokens / prefill_step_time`；cmx-sim 设备 A（950）的 Qwen3-235B noCacheTPS 为 8741/5403 @4K/16K；V3.2/V4-Pro 需单独测，5900 是示例输入，不是 cmx-sim 直接值 |
 | `TTL` | 由 `Net(T)` 算 | 会话恢复分布 |
 | `ρ_target` | 0.7–0.8 | 真机压测 |
 | `W_min` | 0.6–0.8 | 冷启动/命中权衡 |
@@ -851,7 +857,7 @@ A3 的 Mooncake **推荐 FabricMem**（`ASCEND_ENABLE_USE_FABRIC_MEM=1`；CANN 9
 - Ascend 950DT 实测：https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md
 - MindIE 拓扑/带宽诊断：https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md
 - vLLM-Ascend KV cache pool：https://docs.vllm.ai/projects/ascend/zh-cn/v0.30.0/user_guide/feature_guide/kv_cache_pool_ascend_store.html
-- cmx-sim（GLM-5.2 布局/设备 A 实测）：https://github.com/5x8-40/lake/tree/main/tools/cmx-sim
+- cmx-sim（模型布局/设备 A 实测）：https://github.com/5x8-40/lake/tree/main/tools/cmx-sim
 
 ## 10. 参考实现
 
