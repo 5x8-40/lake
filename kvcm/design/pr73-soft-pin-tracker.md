@@ -89,3 +89,4 @@
 ## 维护日志
 
 - **2026-11-04**：从 core/demote tracker 拆出；补“`pin` 的 `exists` 自授 lease 在 gate 版本触发 Case C”的升级耦合，写入 D2 §2 和代码注释。
+- **2026-11-09**：rebase 到 #81 tip（PromoteFlow 整包 + CI 修复）；summary 冲突保留整包口径并把 soft pin 标为有条件可用；PrefetchFlow 超时在 3.9 接住 `asyncio.TimeoutError`。
