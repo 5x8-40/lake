@@ -251,7 +251,6 @@ sequenceDiagram
     A->>G: PRE_ANNOUNCE(S, P, eta 30s)
     G->>R: hook
     R->>K: PREFETCH(P→B) + RETAIN
-    K->>M: 预取（控制面内部，D9 展开）
     K-->>R: READY（B 的本机 DRAM）
     R->>R: KVT：B 的 DRAM 已确认
 

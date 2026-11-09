@@ -405,7 +405,7 @@ flowchart TB
 | 带宽满 / 传输排队 | 更多本地副本或网络 |
 | 本地命中低但池命中高 | 先预取，不扩 |
 
-扩容**预热门控**（覆盖率、接流权重）见 [D8a §6.3](D8a-scheduling-algorithms.md)。新实例先“预热中”，不接或低权重接流量；预热可与权重加载重叠。`T_ready = 扩容生效 + 预热门控 + 预热`，必须满足 <10s 目标。
+扩容**预热门控**（覆盖率、接流权重）见 [D8a §6.3](D8a-scheduling-algorithms.md)。新实例先“预热中”，不接或低权重接流量；预热可与权重加载重叠。`T_ready = 扩容生效 + 预热门控 + 预热`；目标由 SLO/部署决定，本文不设固定秒数。
 
 缩容时**按 KV 价值选节点**（损失/收益比较见 [D8a §6.4](D8a-scheduling-algorithms.md)）。不要按“最后扩容的节点”先缩；有活跃会话/唯一热 KV 的节点优先保留；下线卡住不硬删。
 
@@ -414,7 +414,7 @@ flowchart TB
 - **冷却**：冷却时间 ≥ 扩容生效 + 预热 + 下线搬迁，防扩缩振荡（D8a §6.2 有公式）。
 - **滞回**：扩容阈值 > 缩容阈值；连续 N 周期才动作。
 - **优先级**：L0 永远不被 L1/L2 阻塞；L1 intent 异步；L2 只发目标容量。
-- **资源权重**：L2 单点更新；L0/L1 只读；多 SC 实例时 L2 走 leader。
+- **资源权重**：L2 单点更新；L0/L1 只读；当前按单 SC 假设，多 SC 后续再定。
 
 ---
 
@@ -523,7 +523,7 @@ Mooncake 有热度驱动的动态副本（按读命中/热度加副本）。它�
 - **源 gap**：事件流的序号断档（漏了事件）。恢复顺序：先 replay 缺失事件；补不齐就加载快照；仍不确定就把条目标成**陈旧**。**陈旧**表示“这条不可信”，不能当作 HBM 命中依据；请求仍可走远端读/重算兜底。
 - kvcm 挂：intent 失败/排队，路由不受影响；ledger 持久化，恢复后继续。
 - 编排挂：不扩缩，告警；已发决策幂等重试。
-- 多 SC 实例：KVT 各一份；会话粘性；L2 leader；intent 幂等。
+- 单 SC 假设：KVT 单实例；多 SC 的 KVT 分片/leader 后续再定。
 - 失败不写固定降级链；按最新状态重跑。
 
 ---
@@ -554,7 +554,7 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 |---|---|---|
 | **P0 观测与索引** | 引擎事件 + kvcm READY + miss 反馈接入 KVT；hook 只 observe；L0 用 KVT 选路；决策日志 | KVT 合并/墓碑/置信度；L0 <5ms；不改变现有行为 |
 | **P1 命中与保留** | 会话表；keepalive/soft pin（设计；后续 PR）；预取预算；KV 对账抽样；用量账本归因 | 命中率、resume TTFT、预取 ROI、ghost 率 |
-| **P2 容量与弹性** | L2 双环；预热门控；按 KV 价值选缩容节点；池扩缩；资源权重 | 扩容 Ready <10s 且预热达标；缩容零丢失；无振荡 |
+| **P2 容量与弹性** | L2 双环；预热门控；按 KV 价值选缩容节点；池扩缩；资源权重 | 扩容 Ready 达到部署目标且预热达标；缩容零丢失；无振荡 |
 | **P3 服务化** | 会话 KV、预热服务、容量顾问、Drain、治理、回放 | 服务 SLA；ROI；容量预测误差；回放一致 |
 
 原则：**先把“命中/保留”做对，再优化“本地放置”，最后才做 HBM 命中微优化**。这与 §7 的收益量级一致。
@@ -568,7 +568,7 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 3. **soft pin 前置**：生产能否保证 Case B（单 slice、无盘副本、key 存在）？不能则退回 keepalive。
 4. **retain**：move 到活 seg / kvcm 自挂 SSD 是否足够？是否等 0.3.14/main 的 retained client/DFS？
 5. **E15 带宽限速**：预取/迁移与在线流量怎么隔离？是否需要网卡采样？
-6. **多 SC 实例 leader**：etcd 还是复用现有控制面？leader 故障时扩缩暂停容忍多久？
+6. **多 SC 后续**：当前按单 SC 假设，不设 leader；多 SC 的 KVT 分片/leader 选型后续再定。
 7. **权重/阈值**：各类资源权重、预热门槛、TTL 需真机校准。
 8. **layerwise**：vLLM-Ascend layerwise 读路径改变传输成本；D6 未定，L0 成本模型要留接口。
 9. **hook 标准**：agent 框架怎么发？header/body/独立端点？谁签名？
@@ -585,7 +585,7 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 | **kvcm D1/D2** | `kvcm/design/D1-router-scheduling.md` §2/§4；`kvcm/design/D2-kv-operations.md` §1/§4 | intent ≠ command、READY、补发事件、单向边界、八操作/状态四类 | 本文补 hook/KVT/L2；不改变 kvcm actuator 定位 |
 | **Dynamo** | `lib/kv-router/src/protocols.rs::WorkerSelectionResult`；`components/src/dynamo/planner/core/load_scaling.py::LoadScalingMixin`；`lib/kv-router/src/services/indexer/listener.rs::handle_gap` | overlap 作为一等输入；慢/快双环；gap + replay | Dynamo 索引是事件派生缓存；本文用多源 + 墓碑 + 置信度 |
 | **llm-d** | `pkg/kvcache/prefix_match.go::SpeculativeTier`；`.../preciseprefixcache/prerequest.go::defaultSpeculativeTTL`；`pkg/epp/scheduling/scheduler.go::Scheduler.Schedule` | 推测索引补窗口；scorer 插件化 | 推测只做亲和，不当作 HBM 命中；不依赖“逼近引擎真相” |
-| **AIBrix** | `pkg/kvevent/manager.go::Manager`；`pkg/controller/podautoscaler/context/context.go`（`gpu_cache_usage_perc`） | ZMQ 事件→前缀索引；KV 使用率/排队长度扩缩 | AIBrix 各副本各自收敛；本文 KVT 单实例内合并 + L2 leader |
+| **AIBrix** | `pkg/kvevent/manager.go::Manager`；`pkg/controller/podautoscaler/context/context.go`（`gpu_cache_usage_perc`） | ZMQ 事件→前缀索引；KV 使用率/排队长度扩缩 | AIBrix 各副本各自收敛；本文 KVT 单实例内合并（单 SC） |
 | **SGLang** | `sgl-model-gateway/src/policies/cache_aware.rs::CacheAwarePolicy`；`policies/tree.rs::Tree`；`srt/managers/kv_hints.py::KvHintsEnvelope`；`unified_cache/session_ref_tracker.py::UnifiedSessionRefTracker` | 近似树 + 最短队列；带版本 hint；session 软保护 | 目标部署用 vLLM-Ascend；session 保留落 kvcm，不落引擎 |
 | **vLLM** | `vllm/v1/kv_hints/protocol.py::KvHintsEnvelope`；`vllm/v1/core/sched/scheduler.py::Scheduler` | hint 动词表；节点级 scheduler 分层 | HookEnvelope 在本文被解析/归一化成 Demand；仍 hook ≠ command |
 | **Mooncake** | `master_service.cpp::CopyStart`、`BatchEvict`、`CreateDrainJob`、`GetReplicaListForAdmin`；`KvEventPublisher` | copy 幂等、lease/驱逐、drain、零副作用核验、池事件 | SC 不碰 PoolKey/seg；全部经 kvcm intent |

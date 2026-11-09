@@ -230,6 +230,7 @@ flowchart TB
 | Drain | 迁移完成率、命中率下降 | `T_drain ≈ bytes/BW + tasks/concurrency + verify` | 缩容不丢热 KV |
 | 治理 | pin 超限、误删、审计覆盖 | 配额/TTL/命名空间/审计 | 滥用可发现、误删 0 |
 | 回放 | 回放偏差、策略对比 | 决策日志 + 反事实重放 | 调参可回归 |
+| 分支/跨区/灰度 | 远期，暂不量化 | copy / DFS / 命名空间 | 暂不作为 P0/P1 验收 |
 
 ---
 
