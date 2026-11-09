@@ -71,13 +71,25 @@
 | DISABLE + get 比对 payload | PASS |
 | 错地址 → 异常 + Revoke→Erase（`got_len=0`） | PASS（方案 1 残余） |
 
-未测：NoF、跨机、并发、End 失败注入、`backend.pin` 真机（单测有）。  
 单测：`pytest -k pin_soft` → 11 passed。
+
+### A14 补测（2026-11-09 晚，tip `65c1c8a` 同源）
+
+环境同前；容器内路径 `/tmp/lake-a14` 从分支重拷并重编 so。
+
+| 用例 | 结果 |
+|---|---|
+| tip 重编 + client 正向/错地址 | PASS（同前） |
+| `backend.pin` 真机（monkeypatch keys→固定 key；exercises renew+二次 query） | PASS，`soft_pin_count` 0→1，payload/地址不变 |
+| NoF put（`nof_replica_num=1`） | SKIP：`INVALID_PARAMS` rc=-600（本 master 未配通 NoF） |
+| 跨机：225 put（ep=`7.242.110.225:…`）→ 45 client soft_pin | PASS，`0→1` |
+
+未测：并发、End 失败注入、A15 地址复用（已知残余，不挡合入）。
 
 ## 仍开着
 
-- A15 地址复用；不匹配 Revoke 删 key
-- NoF 真机、`put_step=1` 布局、ABI 无 static_assert
+- A15 地址复用；不匹配 Revoke 删 key（方案 1 接受）
+- NoF：本环境 put 未通，真机收尾未验
 - End/崩溃留 PROCESSING，无恢复
 - A16（#81，不挡合入）；A06/A17 DEFER
 
@@ -90,3 +102,4 @@
 
 - 2026-11-04：从 demote tracker 拆出；gate 版自授 lease→Case C
 - 2026-11-09：rebase #81；方案 1 + A14；文档与现实对齐（L2 明确不做）
+- 2026-11-09 晚：tip 复验 + `backend.pin` + 225 跨机 PASS；NoF put SKIP
