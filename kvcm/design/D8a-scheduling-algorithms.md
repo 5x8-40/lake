@@ -47,8 +47,8 @@ flowchart TB
 | `BW` / `BW_eff` | 本次/到节点 n 的实际有效带宽；按平面取 `BW_h2d` / `BW_storage` / `BW_compute` |
 | `BW_h2d` / `BW_storage` / `BW_compute` | 三类网络的有效带宽：本机 H2D、存储面、计算面 |
 | `T_prefill` | 重算时间 = `P / v_prefill` |
-| `T_transfer` | 跨机传输 = `S_bytes / BW_storage` 或 `BW_compute`（按实际平面） |
-| `T_h2d` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_h2d`；950 H2D 800Gbps≈100GB/s（另有 448Gbps 双链路口径，按部署确认） |
+| `T_transfer` | 跨机传输 = `S_bytes / BW_storage` 或 `BW_compute`；950 ROCE 实测约 23.8GB/s |
+| `T_h2d` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_h2d`；950 实测 H2D 约 46.9GB/s（UB_CTP Server）、93.4GB/s（POD），800Gbps 是链路口径 |
 | `Q` | 队列等待 |
 | `D` | TTFT 目标 |
 | `L` | 模型层数（含 MTP 层） |
@@ -105,13 +105,13 @@ vLLM 的 KV connector 是逐层的（`KVConnectorBase_V1::start_load_kv` 启动�
 | **仍然逐层拉** | 更短（第一层到位即开始） | **差**：某层没跟上，整个 batch 这一步空转 | 单请求、batch 小、延迟优先 |
 | **先搬到本机 DRAM 再调度** | 更长（等搬完） | 好：搬运期间 GPU 去服务别的请求 | 高并发、吞吐优先 |
 
-第二条不需要搬到 HBM。本机 DRAM→HBM 走 950 专用 UB（800Gbps≈100GB/s），通常比跨机快；具体倍数按部署实测，不能固定写 4 倍。
+第二条不需要搬到 HBM。本机 DRAM→HBM 走 950 专用 UB（800Gbps 是链路口径，实测约 47–93GB/s），通常比跨机 ROCE（≈23.8GB/s）快；具体倍数按部署实测，不能固定写 4 倍。
 
 ### 胖 KV 的例外
 
 GLM-5.2（93 KB/token）这类模型的 KV 特别大，即使搬到本机 DRAM 也可能藏不住：
 
-- 1M 上下文 = 97 GB，本机 DRAM→HBM（100 GB/s）= 0.97 s
+- 1M 上下文 ≈ 88.7 GB（按表口径），本机 DRAM→HBM（47 GB/s）≈ 1.89 s（POD 93GB/s 约 0.95 s）
 - 此时只有**HBM 驻留**（命中即零拷贝）才够
 
 这解释了为什么长上下文 + 胖 KV 场景下，HBM 命中率是硬指标。
@@ -270,7 +270,7 @@ U(r,n) =
 
 `BW_eff` 按三类网络分开取：
 
-- 本机 DRAM→HBM：`BW_h2d`（950 专用 UB，800Gbps≈100GB/s）；
+- 本机 DRAM→HBM：`BW_h2d`（950 专用 UB，实测约 47–93GB/s）；
 - 从池/远端读 KV：`BW_storage`；
 - 实例间 KV 传：`BW_compute`（和集合通信共享，要加竞争惩罚）。
 
@@ -602,22 +602,22 @@ L2 更新权重；L0/L1 只读：
 
 ### 8.1 延迟量级
 
-> 下表是旧模型估算，跨机按 25GB/s 示例；950 上本机 H2D 按 800Gbps≈100GB/s。跨机/本机数值都要用真机替换，不能把示例当固定值。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
+> 下表按 950 实测口径：ROCE 跨机约 23.8GB/s；本机 H2D 约 47GB/s（UB_CTP Server）/ 93GB/s（POD）。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
 
 ![KV 路径成本](figures/algo-latency-stack.svg)
 
-> 参数：GLM-5.2 口径 `bytes_per_token=93KB`、`L=79`（含 1 层 MTP）、`v_prefill=5900 token/s`（整实例）、跨机 `BW_storage=25GB/s`（示例，按部署实测）、本机 `BW_h2d=100GB/s`（950 H2D 800Gbps）。
+> 参数：GLM-5.2 口径 `bytes_per_token=93KB`、`L=79`（含 1 层 MTP）、`v_prefill=5900 token/s`（整实例）、跨机 `BW_storage=23.8GB/s`（950 ROCE 实测）、本机 `BW_h2d=47GB/s`（UB_CTP Server；POD 约 93GB/s）。
 
 #### KV 大小与传输时间
 
-| context | `S_bytes` | 跨机 25GB/s（示例） | 本机 H2D 100GB/s | 每层跨机（79 层） |
+| context | `S_bytes` | 跨机 ROCE 23.8GB/s | 本机 H2D 47GB/s | 每层跨机（79 层） |
 |---|---:|---:|---:|---:|
-| 32K | 2.8 GB | 114 ms | 28 ms | 1.4 ms |
-| 64K | 5.7 GB | 227 ms | 57 ms | 2.9 ms |
-| 128K | 11.4 GB | 454 ms | 114 ms | 5.7 ms |
-| 256K | 22.7 GB | 908 ms | 227 ms | 11.5 ms |
-| 512K | 45.4 GB | 1816 ms | 454 ms | 23.0 ms |
-| 1M | 88.7 GB | 3548 ms | 887 ms | 44.9 ms |
+| 32K | 2.8 GB | 118 ms | 60 ms | 1.5 ms |
+| 64K | 5.7 GB | 239 ms | 121 ms | 3.0 ms |
+| 128K | 11.4 GB | 479 ms | 243 ms | 6.1 ms |
+| 256K | 22.7 GB | 954 ms | 483 ms | 12.1 ms |
+| 512K | 45.4 GB | 1908 ms | 966 ms | 24.2 ms |
+| 1M | 88.7 GB | 3727 ms | 1887 ms | 47.2 ms |
 
 #### 能不能掩盖，只看命中率
 
@@ -637,7 +637,7 @@ L2 更新权重；L0/L1 只读：
                 约去 P：  (1 − hit) > v_prefill × bytes_per_token / BW
 ```
 
-代入 GLM-5.2：`5900 × 93KB / 25GB/s ≈ 0.021`，即 **hit < 97.9% 才能跨机掩盖**。本机 DRAM 的阈值是 `5900 × 93KB / 100GB/s ≈ 0.0054`，即 **hit < 99.46%**。
+代入 GLM-5.2：`5900 × 93KB / 23.8GB/s ≈ 0.023`，即 **hit < 97.7% 才能跨机掩盖**。本机 H2D 47GB/s 的阈值是 `5900 × 93KB / 47GB/s ≈ 0.0117`，即 **hit < 98.8%**；POD 93GB/s 时约 **99.4%**。
 
 #### 高命中率下的实际代价
 
@@ -645,20 +645,20 @@ L2 更新权重；L0/L1 只读：
 
 | context | residual | 跨机 `T_kv` | 本机 `T_kv` | 差值 |
 |---|---:|---:|---:|---:|
-| 32K | 320 | 168 ms | 54 ms | 114 ms |
-| 128K | 1,280 | 671 ms | 217 ms | 454 ms |
-| 512K | 5,120 | 2684 ms | 868 ms | 1816 ms |
-| 1M | 10,000 | 5243 ms | 1695 ms | 3548 ms |
+| 32K | 320 | 172 ms | 114 ms | 118 ms |
+| 128K | 1,280 | 696 ms | 460 ms | 479 ms |
+| 512K | 5,120 | 2776 ms | 1834 ms | 1908 ms |
+| 1M | 10,000 | 5422 ms | 3582 ms | 3727 ms |
 
 差值就等于 `T_transfer`：**一旦不能掩盖，跨机那一段是纯加项。**
 
-再叠上 batch 效应（§1.1）：跨机的那 1.8 s（512K）不是只拖慢这一个请求，是拖慢整个 batch 这一步。
+再叠上 batch 效应（§1.1）：跨机的那 1.9 s（512K）不是只拖慢这一个请求，是拖慢整个 batch 这一步。
 
 #### 结论
 
 1. **预取的价值在命中率 ≥99% 时才是主项。** 中低命中率下，计算足以掩盖传输，本地放置收益接近零。
 2. **高命中率场景下，本机 DRAM 就够**，不必追 HBM——除命中率 ≥99.5% 的情形。
-3. **胖 KV（GLM-5.2 这类）把分界定在 97.9%（跨机）与 99.46%（本机）**，比 MLA 类薄 KV 低得多，因为它每 token 的字节数大。
+3. **胖 KV（GLM-5.2 这类）把分界定在 97.7%（跨机 ROCE 23.8GB/s）与 98.8%（本机 H2D 47GB/s）**；POD H2D 93GB/s 时本机约 99.4%。比 MLA 类薄 KV 低得多，因为每 token 字节数大。
 
 ### 8.2 吞吐/成本
 
@@ -786,6 +786,22 @@ ROI = saved / cost
 | `λ_*` | 比例控制 | 利用率/水位 |
 
 ---
+
+
+### 9.1 950 实测带宽（先看这张表）
+
+来自 HIXL 性能表与 MindIE 拓扑诊断（同拓扑、同卡组；换机型/驱动要重测）：
+
+| 路径 | 实测有效带宽 | 用途 |
+|---|---:|---|
+| H2D UB_CTP（Server） | ≈46.9 GB/s | 本机 DRAM→HBM，保守值 |
+| H2D UB_CTP（POD） | ≈93.4 GB/s | 本机 DRAM→HBM，POD 口径 |
+| H2D UB_RTP | ≈38.2 GB/s | 本机 DRAM→HBM，另一协议 |
+| H2D UBOE | ≈35.9 GB/s | 本机 DRAM→HBM，另一协议 |
+| ROCE（跨机） | ≈23.8 GB/s | 池/跨机 KV |
+| UB alltoall 64MB | ≈132 GB/s（UB 岛）/ ≈86 GB/s（SYS 跨岛） | 计算面参考，不用于 KV |
+
+**关键**：`800Gbps` 是链路口径（≈100GB/s），不是有效 H2D；950 上 UB_CTP Server 实测约 47GB/s、POD 约 93GB/s。D8a 的公式与 D8 的表都按实测值算；不要把 100GB/s 当默认。
 
 ## 10. 参考实现
 
