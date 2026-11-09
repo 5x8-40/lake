@@ -823,7 +823,9 @@ HIXL 单机 `rH2D`（同机 target/initiator，HIXL 路径）：
 | FabricMem `rH2D` | ≈86–92 GB/s | ≈78–89 GB/s |
 | HCCS `H2D` | 不支持 | 不支持 |
 
-A3 的 ROCE 机内/跨机几乎一样（都约 23.8GB/s），瓶颈在 RoCE 路径；FabricMem 跨机会低一些（约 78–89 vs 86–92）。**A5 跨机需要按同样方法另测，不能直接套 A3。**
+A3 的 ROCE 机内/跨机几乎一样（都约 23.8GB/s），瓶颈在 RoCE 路径；FabricMem 跨机会低一些（约 78–89 vs 86–92）。
+
+**Mooncake 在 A3 上到底走哪个**：默认走 ROCE（`ASCEND_ENABLE_USE_FABRIC_MEM=0`）；FabricMem 是可选开关（A3 only，要求 CANN 9.0+/HDK 26.0+），设 `ASCEND_ENABLE_USE_FABRIC_MEM=1` 后才走 FabricMem 的 78–89GB/s。**A5 不支持 FabricMem；A5 跨机需要另测，不能直接套 A3。**
 
 ## 10. 参考实现
 
