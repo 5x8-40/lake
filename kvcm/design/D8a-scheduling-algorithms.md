@@ -795,30 +795,35 @@ ROI = saved / cost
 ---
 
 
-### 9.1 950 实测带宽（先看这张表）
+### 9.1 H2D 带宽：A5 实测 + A3 参考
 
-来自 HIXL 性能表与 MindIE 拓扑诊断；**Atlas 350 加速卡 = Ascend 950PR**，本文 950 数据同样适用于 Atlas 350；**950 结论只取 950PR/950DT（A5）数据**；A3 910C 仅作跨机参考，不混入 950 结论。同拓扑、同卡组；换机型/驱动要重测：
+来自 HIXL 性能表；**Atlas 350 加速卡 = Ascend 950PR**，A5 数据同样适用于 Atlas 350。
 
-| 路径 | 实测有效带宽 | 用途 |
-|---|---:|---|
-| H2D UB_CTP（Server） | ≈46.9 GB/s | 本机 DRAM→HBM，保守值 |
-| H2D UB_CTP（POD） | ≈93.4 GB/s | 本机 DRAM→HBM，POD 口径 |
-| H2D UB_RTP | ≈38.2 GB/s | 本机 DRAM→HBM，另一协议 |
-| H2D UBOE | ≈35.9 GB/s | 本机 DRAM→HBM，另一协议 |
-| 950 跨机 H2D | **未测** | 需要双机 950 RoCE/UBOE/UB_RTP 实测 |
+**A5 跨机 H2D 暂无数据，待双机实测**；A3 910C 只作量级参考，不能当 A5 结论。
+
+#### A5（950PR/950DT）本机 H2D
+
+HIXL 单机 `rH2D`（同机 target/initiator，HIXL 路径）：
+
+| 路径 | 机内 H2D | 跨机 H2D |
+|---|---:|---:|
+| UB_CTP Server | ≈46.9 GB/s | **暂无数据，待实测** |
+| UB_CTP POD | ≈93.4 GB/s | **暂无数据，待实测** |
+| UB_RTP | ≈38.2 GB/s | **暂无数据，待实测** |
+| UBOE | ≈35.9 GB/s | **暂无数据，待实测** |
 | UB alltoall 64MB | ≈132 GB/s（UB 岛）/ ≈86 GB/s（SYS 跨岛） | 计算面参考，不用于 KV |
 
-**关键**：`800Gbps` 是链路口径（≈100GB/s），不是有效 H2D；950 上 UB_CTP Server 实测约 47GB/s、POD 约 93GB/s。D8a 的公式与 D8 的表都按实测值算；不要把 100GB/s 当默认。
+> `800Gbps` 是链路口径（≈100GB/s），不是有效 H2D；A5 本机实测约 47/93GB/s。原生本机 H2D 建议用 `ascend-dmi --bw -t h2d` 复测。
 
-**A3 910C 参考（不是 950，不能当 950 结论）**：
+#### A3 910C 参考（机内 / 跨机）
 
-| A3 路径 | 单机 | 双机 |
+| 路径 | 机内 H2D | 跨机 H2D |
 |---|---:|---:|
 | ROCE `rH2D`（hixl_cs） | ≈23.8 GB/s | ≈23.7–23.9 GB/s |
 | FabricMem `rH2D` | ≈86–92 GB/s | ≈78–89 GB/s |
 | HCCS `H2D` | 不支持 | 不支持 |
 
-A3 的 ROCE 单/双机几乎一样（都约 23.8），说明瓶颈在 RoCE 路径而不是“单/双机”本身；950 的跨机需要另测。
+A3 的 ROCE 机内/跨机几乎一样（都约 23.8GB/s），瓶颈在 RoCE 路径；FabricMem 跨机会低一些（约 78–89 vs 86–92）。**A5 跨机需要按同样方法另测，不能直接套 A3。**
 
 ## 10. 参考实现
 
