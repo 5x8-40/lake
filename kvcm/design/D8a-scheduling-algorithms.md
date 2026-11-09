@@ -606,7 +606,7 @@ L2 更新权重；L0/L1 只读：
 
 ### 8.1 延迟量级
 
-> 本机 H2D 按 950 实测：单机 UB_CTP 约 47GB/s、POD 约 93GB/s（两种场景，不并列成区间）。**950 跨机 H2D 没有实测数**；下表跨机列用 A3 910C 的 ROCE 23.8GB/s 作参考，不是 950 结论。`93KiB/token` 来自 llm-d 架构文档的 GLM-5.2 估算；按模型配置的推导式是 `2 × 层数 × KV heads × head_dim × 精度字节`，本仓库没有逐项核对，换模型要重算。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
+> 本机 H2D 按 950 实测：单机 UB_CTP 约 47GB/s、POD 约 93GB/s（两种场景，不并列成区间）。**950 跨机 H2D 没有实测数**；下表跨机列用 A3 910C 的 ROCE 23.8GB/s 作保守参考（A3 FabricMem 可到 78–107GB/s），不是 950 结论。`93KiB/token` 来自 llm-d 架构文档的 GLM-5.2 估算；按模型配置的推导式是 `2 × 层数 × KV heads × head_dim × 精度字节`，本仓库没有逐项核对，换模型要重算。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
 
 ![KV 路径成本](figures/algo-latency-stack.svg)
 
@@ -797,9 +797,9 @@ ROI = saved / cost
 
 ### 9.1 H2D 带宽：A5 实测 + A3 参考
 
-来自 HIXL 性能表；**Atlas 350 加速卡 = Ascend 950PR**，A5 数据同样适用于 Atlas 350。
+来自 HIXL 性能表与 vLLM-Ascend Mooncake 文档；**Atlas 350 = Ascend 950PR**。
 
-**A5 跨机 H2D 暂无数据，待双机实测**；A3 910C 只作量级参考，不能当 A5 结论。
+**A5 跨机 H2D 暂无官方带宽数值，待实测**；A3 910C 只作量级参考，不能当 A5 结论。
 
 #### A5（950PR/950DT）本机 H2D
 
@@ -813,19 +813,34 @@ HIXL 单机 `rH2D`（同机 target/initiator，HIXL 路径）：
 | UBOE | ≈35.9 GB/s | **暂无数据，待实测** |
 | UB alltoall 64MB | ≈132 GB/s（UB 岛）/ ≈86 GB/s（SYS 跨岛） | 计算面参考，不用于 KV |
 
-> `800Gbps` 是链路口径（≈100GB/s），不是有效 H2D；A5 本机实测约 47/93GB/s。原生本机 H2D 建议用 `ascend-dmi --bw -t h2d` 复测。
+> `800Gbps` 是链路口径（≈100GB/s），不是有效 H2D；A5 本机实测约 47/93GB/s。HIXL 报告称 A5 默认 KV 传输为 UB（同实例 UB CTP）；原生本机 H2D 建议用 `ascend-dmi --bw -t h2d` 复测。
+
+#### A5 Mooncake：UBOE 或 UB，不用 FabricMem
+
+A5 **不支持 FabricMem**，不要设 `ASCEND_ENABLE_USE_FABRIC_MEM`。vLLM-Ascend 文档给 A5 两组配置，按实际网络二选一：
+
+| 协议 | 环境变量 | 定位 |
+|---|---|---|
+| **UBOE** | `ASCEND_GLOBAL_RESOURCE_CONFIG='{"comm_resource_config.protocol_desc":["uboe:device"]}'` | 跨超节点，UB over Ethernet |
+| **UB** | `ASCEND_LOCAL_COMM_RES='{"version":"1.3"}'` | 超节点内，原生 UB Link |
+
+**UB vs UBOE**：
+
+- **UB**：昇腾原生 UB Link，CNA 地址，scale-up，超节点内部；
+- **UBOE**：UB 协议跑在标准以太网/IP 上，scale-out，跨超节点；
+- 选择优先级（HIXL）：跨超节点 `UBOE > UBG > RoCE`；超节点内 `UB > HCCS > UBoE > UBG > RoCE`。
 
 #### A3 910C 参考（机内 / 跨机）
 
 | 路径 | 机内 H2D | 跨机 H2D |
 |---|---:|---:|
-| ROCE `rH2D`（hixl_cs） | ≈23.8 GB/s | ≈23.7–23.9 GB/s |
-| FabricMem `rH2D` | ≈86–92 GB/s | ≈78–89 GB/s |
+| FabricMem `rH2D`（AICPU 展开） | ≈86–92 GB/s | ≈78–89 GB/s |
+| FabricMem `rH2D`（Host 展开，4 流） | ≈101–107 GB/s | ≈103–107 GB/s |
+| FabricMem `D2rH`（Host 展开，4 流） | ≈54 GB/s | ≈62–66 GB/s |
+| ROCE `rH2D`（hixl_cs） | ≈23.8 GB/s | ≈23.7–23.9 GB/s（公开资料也有 ~20 的口径） |
 | HCCS `H2D` | 不支持 | 不支持 |
 
-A3 的 ROCE 机内/跨机几乎一样（都约 23.8GB/s），瓶颈在 RoCE 路径；FabricMem 跨机会低一些（约 78–89 vs 86–92）。
-
-**Mooncake 在 A3 上到底走哪个**：默认走 ROCE（`ASCEND_ENABLE_USE_FABRIC_MEM=0`）；FabricMem 是可选开关（A3 only，要求 CANN 9.0+/HDK 26.0+），设 `ASCEND_ENABLE_USE_FABRIC_MEM=1` 后才走 FabricMem 的 78–89GB/s。**A5 不支持 FabricMem；A5 跨机需要另测，不能直接套 A3。**
+A3 的 Mooncake **推荐 FabricMem**（`ASCEND_ENABLE_USE_FABRIC_MEM=1`；CANN 9.0+/HDK 26.0+）；不开启时走 ROCE。FabricMem 的 `rH2D` 跨机约 78–107GB/s，ROCE 约 20–24GB/s。**A5 跨机要按 UBOE/UB 另测，不能套 A3。**
 
 ## 10. 参考实现
 
