@@ -61,7 +61,7 @@ flowchart TB
     R --> L0
     R --> L1
     R --> L2
-    L0 -->|"Dispatch(node, hint)"| W["vLLM-Ascend P/D/混部"]
+    L0 -->|"Dispatch(node, mode)"| W["vLLM-Ascend P/D/混部"]
     L0 -->|"intent（异步）"| K["kvcm"]
     L1 -->|"intent"| K
     L2 -->|"目标容量"| O["外部编排<br/>K8s / HPA / KEDA / WVA"]
@@ -96,7 +96,7 @@ flowchart TB
 
 | 面 | 终局能力 | 关键输入 | 关键输出 |
 |---|---|---|---|
-| 请求 | 两模式选路（PD 分离/混部）+ HBM 命中利用；节点/队列 | KVT、负载、SLO、资源权重 | target + hint |
+| 请求 | 两模式选路（PD 分离/混部）+ HBM 命中利用；节点/队列 | KVT、负载、SLO、资源权重 | target + mode |
 | KV | 预取、保留、热点多副本、迁移、释放、降层 | hook、会话、KVT、负载、预算 | intent（异步） |
 | 扩缩 | 计算池 + KV 池；扩容预热门控；缩容按 KV 价值选节点 | 需求预测、SLO、水位、KV 价值 | 目标容量/期望状态 |
 | 观测 | 命中归因、预热 ROI、决策回放 | KVT、intent、READY、请求结果 | 指标/账本/策略版本 |
@@ -299,7 +299,7 @@ sequenceDiagram
     Note over A,W: ATTACHED（请求）
     A->>G: request + hook
     G->>R: request + hook
-    R->>W: Dispatch(node, hint)
+    R->>W: Dispatch(node, mode)
 
     Note over A,R: POST（会话后）
     A->>G: pause / resume / close / branch
@@ -323,7 +323,7 @@ sequenceDiagram
 
 ### 4.3 语义
 
-- **hint ≠ command**：SC/kvcm 可裁剪、推迟、拒绝；请求正确性不依赖 hook。
+- **hook ≠ command**：SC/kvcm 可裁剪、推迟、拒绝；请求正确性不依赖 hook。
 - **fail-open**：解析失败/版本不认识/预算超限 → 丢弃 + metric，不影响请求。
 - **预算与审计**：每 session/租户有 pin/预取/带宽上限；hook 可审计。
 - **key 口径**：vLLM-Ascend 是链式 block hash（`parent_hash`、block_size、模型类型、初始种子参与），TP 下同一逻辑块多把 key。SC 必须用与引擎逐字节一致的 hash 算法；hook 优先带 hash/token_ids，不要用估算 token 数。
@@ -587,7 +587,7 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 | **llm-d** | `pkg/kvcache/prefix_match.go::SpeculativeTier`；`.../preciseprefixcache/prerequest.go::defaultSpeculativeTTL`；`pkg/epp/scheduling/scheduler.go::Scheduler.Schedule` | 推测索引补窗口；scorer 插件化 | 推测只做亲和，不当作 HBM 命中；不依赖“逼近引擎真相” |
 | **AIBrix** | `pkg/kvevent/manager.go::Manager`；`pkg/controller/podautoscaler/context/context.go`（`gpu_cache_usage_perc`） | ZMQ 事件→前缀索引；KV 使用率/排队长度扩缩 | AIBrix 各副本各自收敛；本文 KVT 单实例内合并 + L2 leader |
 | **SGLang** | `sgl-model-gateway/src/policies/cache_aware.rs::CacheAwarePolicy`；`policies/tree.rs::Tree`；`srt/managers/kv_hints.py::KvHintsEnvelope`；`unified_cache/session_ref_tracker.py::UnifiedSessionRefTracker` | 近似树 + 最短队列；带版本 hint；session 软保护 | 目标部署用 vLLM-Ascend；session 保留落 kvcm，不落引擎 |
-| **vLLM** | `vllm/v1/kv_hints/protocol.py::KvHintsEnvelope`；`vllm/v1/core/sched/scheduler.py::Scheduler` | hint 动词表；节点级 scheduler 分层 | hint 在本文被解析/归一化成 Demand；仍 hint ≠ command |
+| **vLLM** | `vllm/v1/kv_hints/protocol.py::KvHintsEnvelope`；`vllm/v1/core/sched/scheduler.py::Scheduler` | hint 动词表；节点级 scheduler 分层 | HookEnvelope 在本文被解析/归一化成 Demand；仍 hook ≠ command |
 | **Mooncake** | `master_service.cpp::CopyStart`、`BatchEvict`、`CreateDrainJob`、`GetReplicaListForAdmin`；`KvEventPublisher` | copy 幂等、lease/驱逐、drain、零副作用核验、池事件 | SC 不碰 PoolKey/seg；全部经 kvcm intent |
 | **KVCR** | `src/kvcr/remote_fw_dram.py::fetch` / `query` / `_try_release_pin` | 目的地发起 fetch、传输窗口 pin | kvcm 集中式 + master 权威；不需要 fencing |
 | **TensorCast** | `tensorcast/api/_config.py::StorePolicyProfile` | 声明式 policy 预设 | 仅借用 retention class 命名，不照搬存储后端 |

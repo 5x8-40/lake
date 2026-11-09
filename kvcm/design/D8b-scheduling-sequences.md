@@ -11,7 +11,7 @@
 |---|---|
 | **HookEnvelope** | Agent/前端 → SC 的**独立消息**，不是请求；可在请求前、请求中、请求后到达 |
 | **KVIntent** | SC → kvcm 的**异步动作消息**（prefetch/retain/release 等），不是请求 |
-| **hint** | SC 给这次请求的**路由提示**（target/mode/prefix/session/affinity），来自 hook + KVT + 打分；不是 KVIntent |
+| **decision** | SC 的内部决策记录 `{target, mode, prefix, session, deadline}`；只进日志/指标，不传给引擎 |
 | **预测条目** | SC 在 Dispatch 后写入 KVT 的短 TTL 条目：“B 可能有 P”；只做同批亲和，不当作命中 |
 | **READY** | kvcm 的“本机 DRAM 副本就绪”，不是 HBM 命中 |
 
@@ -37,20 +37,20 @@ sequenceDiagram
     K-->>R: ACCEPTED（不阻塞后续）
 
     Note over C,W: 请求到达
-    C->>G: request + hint
+    C->>G: request
     G->>R: request
     R->>KVT: Match(prefix, 候选节点)
     KVT-->>R: 命中/介质/置信度
     R->>R: mode = policy(请求类型, 模型部署)
     R->>R: 打分（命中/传输/队列/SLO）
-    R->>W: Dispatch(target, mode, hint)
+    R->>W: Dispatch(target, mode)
     R->>KVT: 写“预测”条目（短 TTL）
 ```
 
 要点：
 
 - **hook 不是请求**：它可以在请求前触发预取/保留；请求到达后也可以补发 KVIntent，但不是唯一来源。
-- **hint 不是 KVIntent**：hint 是本次请求的路由提示；KVIntent 是给 kvcm 的异步动作。
+- **SC 的 decision 只记录，不传给引擎**：target/mode 在 Dispatch 时生效；prefix/session/deadline 留在 SC 的决策日志/指标里。
 - **预测条目**只用于同批请求的亲和，避免一批请求被全部打散；它不是 agent intent，也不参与 HBM 命中判定。
 - KVT 查询是纯内存；miss 当作“无命中”处理，异步对账只修索引，不在 L0 热路径查 master。
 
@@ -114,7 +114,7 @@ sequenceDiagram
     R->>K: RETAIN(S, TTL, class)
     K-->>R: ACCEPTED
     A->>R: 恢复请求
-    R->>W: Dispatch(会话亲和 / 本机 DRAM)
+    R->>W: Dispatch(B, mode)
     A->>R: POST(close, S)
     R->>K: RELEASE(S)
 ```
@@ -219,7 +219,7 @@ sequenceDiagram
     participant K as kvcm
 
     KVT-->>R: B 有前缀 P（已确认）
-    R->>W: Dispatch(P)
+    R->>W: Dispatch(B, mode)
     W-->>R: 本地 miss（副本不在了）
     R->>KVT: MISS_FEEDBACK(P, B)
     R->>R: 本次按“无命中”重选
@@ -254,7 +254,7 @@ sequenceDiagram
 
     A->>G: 请求（P + 新内容）
     G->>R: request
-    R->>W: Dispatch(B, 混部/本地读)
+    R->>W: Dispatch(B, mode)
     R->>KVT: 写“预测”条目（短 TTL）
 
     A->>G: POST(pause)
@@ -263,7 +263,7 @@ sequenceDiagram
 
     A->>G: 恢复请求
     G->>R: request
-    R->>W: Dispatch(B；HBM 命中则跳过池加载，只算剩余 token)
+    R->>W: Dispatch(B, mode；HBM 命中则跳过池加载)
 ```
 
 ---
@@ -271,7 +271,7 @@ sequenceDiagram
 ## 10. 读图要点
 
 - **hook 是独立消息**，不是请求；它可以在请求前触发 KVIntent。
-- **hint 是路由提示**，不是 KVIntent；“预测条目”也不是 hook。
+- **SC 的 decision 只记录**，不是 hook、不是 KVIntent；“预测条目”也不是 hook。
 - **调度时序不画首 token / 流式返回**；调度到 Dispatch 结束。
 - **READY 是 DRAM 回写事件**，不是 HBM 命中；HBM 命中需要 HBM 证据。
 - **PD 由请求类型/模型部署决定**，不是“拓扑可用”开关。

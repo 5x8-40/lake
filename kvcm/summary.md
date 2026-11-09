@@ -229,7 +229,7 @@
 
 - 定位：kvcm 分两个平面（像 K8s 的 controller-manager 与 scheduler）。**控制面**执行（D1/D2/D9），**管理面**决策（D8）。管理面可独立进程或嵌入 Router，但**必须看得到在线请求**；离线形态只能做容量规划。
 - 目标形态：KVT（多源 KV 索引树）+ HookEnvelope + L0/L1/L2 三环，联合决策“请求去哪、KV 怎么动、集群扩不扩”。
-- 原则：hint ≠ command；KV 动作只走 intent；请求不等 READY；不设固定降级链；索引是派生视图；预算先行；决策与执行分离。
+- 原则：hook ≠ command；KV 动作只走 intent；请求不等 READY；不设固定降级链；索引是派生视图；预算先行；决策与执行分离。
 - **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是跨机传输（950 跨机待测；A3 参考：FabricMem 78–107、ROCE 20–24GB/s）；HBM 命中只省本地 H2D 拷贝（950 单机 UB_CTP≈47GB/s、POD≈93GB/s，分开取值）。
   - **传输能否被计算掩盖，取决于残差**（D8a §1.1）：`可掩盖token数 = T_transfer × v_prefill`，残差低于它时不能掩盖，`T_kv = T_compute + T_transfer`。
   - **不再用单阈值**（D8a §8.1）：`v_prefill` 随上下文下降，改用设备 A 的拟合 `TTFT = c + (1−hit)(aN+bN²)`；99% 命中、1M 时 V3.2 跨机额外约 1.78s（约 8%），V4-Pro 约 0.20s（约 3.5%）。
