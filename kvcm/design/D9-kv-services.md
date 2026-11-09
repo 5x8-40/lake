@@ -53,7 +53,7 @@
 |---|---|---|---|
 | **KV 对账** | Mooncake Conductor（`prefix_indexer.cpp::PrefixCacheTable::Query/Register`）建前缀索引；Dynamo standalone indexer（`listener.rs::handle_gap`）做事件/gap; Mooncake admin `GET /batch_query_keys` 给副本真相 | 索引、查询、gap replay、副本查询 | 抽样策略（热/老/可疑）、索引 vs master 的比对循环、`LOST/REMOVED` 失效事实回写、限速/HA |
 | **用量账本** | LMCache `lmcache/observability.py::LMCStatsMonitor`（本地/远端/存储字节、请求统计）；Prometheus/OTel 存指标；AIBrix 有 usage/TPM 类指标 | 字节/请求级指标、监控存储 | 把 intent、copy bytes、READY、命中、引擎 APC 命中串成一条链；算预热 ROI/归因；这不是监控系统自带的语义 |
-| **容量建议** | Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler；Mooncake 容量/水位指标 | 扩缩算法、指标源、目标副本数 | 池侧 KV footprint/tier mix/分片建议；和 D8 的决策接口对齐（只给事实/区间） |
+| **容量建议** | Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler；Mooncake 容量/水位指标 | 扩缩算法、指标源、目标副本数 | 池侧 KV footprint/tier mix/容量建议；和 D8 的决策接口对齐（只给事实/区间） |
 | **下线搬迁** | Mooncake `CreateDrainJob`、`CancelDrainJob`；K8s drain | seg 级搬迁、job 级取消 | 与 D8 摘流/选缩容节点联动；session-aware；搬完 verify 再停实例 |
 | **保留/删除规则** | Mooncake pin/lease/tenant quota；K8s ResourceQuota | 单 key/tenant 的容量与租约 | 跨模型的保留策略、pin 预算、删除审计、ROI 约束 |
 | **历史回放** | 没有 turnkey；可用 trace + 模拟器自建 | 事件/指标存储 | 决策日志 schema、反事实重放、策略版本对比 |

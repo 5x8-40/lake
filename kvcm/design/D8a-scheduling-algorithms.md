@@ -341,7 +341,7 @@ C_occupancy = S_bytes × T × c_mem
 
 一个重要的读数：
 
-- 如果预取只是把“远端命中”变“本机 DRAM”，收益是 `T_transfer − T_h2d`，按实测：8K 约 16ms（单机 47GB/s）/ 8ms（POD 93GB/s），70K 约 142ms / 72ms；跨机另算；
+- 如果预取只是把“远端命中”变“本机 DRAM”，收益是 `T_transfer − T_h2d`，按实测：512K 约 1.04s（单机 47GB/s）/ 0.52s（POD 93GB/s）；1M 约 2.03s / 1.02s；跨机另算；
 - 如果它防止了一次驱逐/重算，收益是 `T_prefill`（秒级）。
 - **所以预取要和保留一起做**。
 
@@ -606,7 +606,7 @@ L2 更新权重；L0/L1 只读：
 
 ### 8.1 延迟量级
 
-> 本机 H2D 按 950 实测：单机 UB_CTP 约 47GB/s、POD 约 93GB/s（两种场景，不并列成区间）。**950 跨机 H2D 没有实测数**；下表跨机列用 A3 910C 的 ROCE 23.8GB/s 作保守参考（A3 FabricMem 可到 78–107GB/s），不是 950 结论。`93KiB/token` 来自 llm-d 架构文档的 GLM-5.2 估算；按模型配置的推导式是 `2 × 层数 × KV heads × head_dim × 精度字节`，本仓库没有逐项核对，换模型要重算。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
+> 本机 H2D 按 950 实测：单机 UB_CTP 约 47GB/s、POD 约 93GB/s（两种场景，不并列成区间）。**950 跨机 H2D 没有实测数**；下表跨机列用 A3 910C 的 ROCE 23.8GB/s 作保守参考（A3 FabricMem 可到 78–107GB/s），不是 950 结论。`93KiB/token` 由 cmx-sim 的 GLM-5.2 BF16 布局推出（78×1152 + 21×256 = 95,232B）；FP8 logical 约 46.58GiB/1M，时间按比例减半；换模型/精度要重算。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
 
 ![KV 路径成本](figures/algo-latency-stack.svg)
 
@@ -615,6 +615,8 @@ L2 更新权重；L0/L1 只读：
 #### KV 大小与传输时间
 
 `S_bytes` 按十进制 GB 计（93KiB/token × P / 1e9）；1M 约 95.2GB，不是 88.7GB。
+
+93KiB 不是拍脑袋：cmx-sim 的 GLM-5.2 布局是 `78 层 × 1152B + 21 个 indexer × 256B = 95,232B = 93KiB/token`（BF16 logical）；FP8 logical 约 46.58GiB/1M，约为 BF16 的一半，时间也按比例减半。来源：[cmx-sim](../../tools/cmx-sim/README.md)。
 
 | context | `S_bytes` | 跨机 ROCE 23.8GB/s（A3 参考） | 本机 H2D 47GB/s | 每层跨机（79 层） |
 |---|---:|---:|---:|---:|
@@ -785,7 +787,7 @@ ROI = saved / cost
 | `w_hit/w_transfer/w_q/w_slo` | 量纲归一后 1.0 | 离线回放 + 真机 A/B |
 | `BW*` | 由公式算 | 网卡/链路实测 |
 | `P_use` / `λ` | 历史 ETA/复用率 | trace 拟合 |
-| `v_prefill` | 5900 token/s（整实例，**输入假设**） | 真机 prefill 压测：`tokens / prefill_step_time`，按上下文长度分档 |
+| `v_prefill` | 5900 token/s（整实例，**输入假设**） | 真机 prefill 压测：`tokens / prefill_step_time`；cmx-sim 设备 A（950）的 Qwen3-235B noCacheTPS 为 8741/5403 @4K/16K，GLM-5.2 需单独测，5900 不是 cmx-sim 直接值 |
 | `TTL` | 由 `Net(T)` 算 | 会话恢复分布 |
 | `ρ_target` | 0.7–0.8 | 真机压测 |
 | `W_min` | 0.6–0.8 | 冷启动/命中权衡 |
@@ -841,6 +843,15 @@ A5 **不支持 FabricMem**，不要设 `ASCEND_ENABLE_USE_FABRIC_MEM`。vLLM-Asc
 | HCCS `H2D` | 不支持 | 不支持 |
 
 A3 的 Mooncake **推荐 FabricMem**（`ASCEND_ENABLE_USE_FABRIC_MEM=1`；CANN 9.0+/HDK 26.0+）；不开启时走 ROCE。FabricMem 的 `rH2D` 跨机约 78–107GB/s，ROCE 约 20–24GB/s。**A5 跨机要按 UBOE/UB 另测，不能套 A3。**
+
+参考链接：
+
+- HIXL 性能表：https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md
+- MindCluster ToolBox 带宽测试：https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html
+- Ascend 950DT 实测：https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md
+- MindIE 拓扑/带宽诊断：https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md
+- vLLM-Ascend KV cache pool：https://docs.vllm.ai/projects/ascend/zh-cn/v0.30.0/user_guide/feature_guide/kv_cache_pool_ascend_store.html
+- cmx-sim（GLM-5.2 布局/设备 A 实测）：https://github.com/5x8-40/lake/tree/main/tools/cmx-sim
 
 ## 10. 参考实现
 
