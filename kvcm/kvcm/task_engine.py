@@ -168,8 +168,12 @@ class TaskEngine:
         self._keepalive = keepalive
         self._events = events
         self._limiter = limiter
-        self._queue: asyncio.Queue[_IntentRecord] = asyncio.Queue(maxsize=queue_size)
-        self._gate = asyncio.Semaphore(max_concurrent)
+        # Queue/Semaphore 延到首次使用再建（3.9 在 __init__ 会
+        # get_event_loop 绑死；跨 asyncio.run 还会「不同 loop」）。
+        self._queue_maxsize = queue_size
+        self._max_concurrent = max_concurrent
+        self._queue_obj: asyncio.Queue[_IntentRecord] | None = None
+        self._gate_obj: asyncio.Semaphore | None = None
         # 只存在途（PENDING）。这是去重表：同键有 PENDING 记录就返回既有
         # id 不重复执行——**淘汰 PENDING 会让同键执行两次**，所以这里
         # 永不淘汰，终态即移走。
@@ -188,6 +192,18 @@ class TaskEngine:
         self._consumer_count = consumer_count or max(16, max_concurrent * 4)
         self._loop: asyncio.AbstractEventLoop | None = None
 
+    @property
+    def _queue(self) -> asyncio.Queue[_IntentRecord]:
+        if self._queue_obj is None:
+            self._queue_obj = asyncio.Queue(maxsize=self._queue_maxsize)
+        return self._queue_obj
+
+    @property
+    def _gate(self) -> asyncio.Semaphore:
+        if self._gate_obj is None:
+            self._gate_obj = asyncio.Semaphore(self._max_concurrent)
+        return self._gate_obj
+
     # ------------------------------------------------------------------
     # 生命周期（由 daemon 在事件循环内调用）
     # ------------------------------------------------------------------
@@ -195,6 +211,9 @@ class TaskEngine:
     def start(self) -> None:
         """启动协程消费者。必须在事件循环内调用（daemon 的 async main）。"""
         self._loop = asyncio.get_running_loop()
+        # 在本 loop 上预建，避免随后 put_nowait 绑到别的 loop
+        _ = self._queue
+        _ = self._gate
         for i in range(self._consumer_count):
             self._consumers.append(
                 asyncio.create_task(self._consume_loop(), name=f"kvcm-consumer-{i}")
@@ -598,7 +617,8 @@ class TaskEngine:
                 # Semaphore 自己把名额交回去，这里不再 release。
                 try:
                     await asyncio.wait_for(self._gate.acquire(), timeout=left)
-                except TimeoutError:
+                except asyncio.TimeoutError:
+                    # 3.9 里 asyncio.TimeoutError 尚非 builtin TimeoutError 别名
                     raise _stopped() from None
                 try:
                     left = deadline - time.monotonic()

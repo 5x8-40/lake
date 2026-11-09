@@ -61,8 +61,14 @@ def rpc():
 
     def _start(ops: FakeOps):
         loop_thread = _LoopThread()
-        engine = TaskEngine(ops)
-        loop_thread.call(_start_engine(engine))
+
+        async def _build_and_start():
+            # 在循环线程建引擎，避免 3.9 把 Queue/Semaphore 绑到主线程空 loop
+            engine = TaskEngine(ops)
+            engine.start()
+            return engine
+
+        engine = loop_thread.call(_build_and_start())
         server = IntentGrpcServer(("127.0.0.1", 0), engine)
         server.start()
         channel = grpc.insecure_channel(f"127.0.0.1:{server.port}")
@@ -79,10 +85,6 @@ def rpc():
     holder["server"].stop()
     holder["lt"].call(holder["engine"].shutdown(timeout_s=2))
     holder["lt"].stop()
-
-
-async def _start_engine(engine: TaskEngine) -> None:
-    engine.start()
 
 
 def _req(prefix: Prefix = _P, target: str = "inst-B") -> pb.SubmitIntentRequest:
@@ -142,7 +144,7 @@ def test_failed_status_and_detail(rpc) -> None:
         pb.GetTaskResponse.FAILED
     )
     detail = stub.GetTask(pb.GetTaskRequest(intent_id=resp.intent_id)).detail
-    assert "PrefetchError" in detail  # 失败必须带原因
+    assert "PromoteError" in detail  # 失败必须带原因
 
 
 def test_stop_closes_worker_pool(rpc) -> None:

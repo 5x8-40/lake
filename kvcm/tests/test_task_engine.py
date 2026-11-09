@@ -13,6 +13,7 @@ import pytest
 
 from conftest import run
 from kvcm.flows.prefetch import PrefetchError
+from kvcm.flows.promote import PromoteError
 from kvcm.ops.base import (
     IntentInputError,
     KvOps,
@@ -161,7 +162,7 @@ def test_run_once_ready_despite_keepalive_write_failure() -> None:
 def test_run_once_failure_does_not_register() -> None:
     ka = FakeKeepalive()
     eng = _engine(FakeOps(seq=[TaskStatus.FAILED]), keepalive=ka)
-    with pytest.raises(PrefetchError):
+    with pytest.raises(PromoteError):
         run(eng.run_once(_P, _T, poll_s=0.01))
     assert ka.registered == []
 
@@ -253,7 +254,7 @@ def test_intent_detail_contains_failure_reason() -> None:
                     break
                 await asyncio.sleep(0.01)
             assert eng.intent_status(key) is IntentStatus.FAILED
-            assert "PrefetchError" in eng.intent_detail(key)
+            assert "PromoteError" in eng.intent_detail(key)
         finally:
             await eng.shutdown(timeout_s=2)
 

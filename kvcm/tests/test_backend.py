@@ -1643,6 +1643,19 @@ class _LayoutClient(FakeClient):
         super().__init__()
         self.layout = layout
 
+    def batch_memory_replica_endpoints(self, keys):
+        # layout 里有端点 = 池内已有 memory（常为 __source__）。已 create 的
+        # 目标段也并上，否则 PromoteFlow copy 后 check_promote(target) 仍 miss。
+        created = [seg for _, segs in self.created for seg in segs]
+        out: dict[str, list[str]] = {}
+        for k in keys:
+            eps = [ep for ep, _sz, _attrs in self.layout.get(k, [])]
+            for seg in created:
+                if seg not in eps:
+                    eps.append(seg)
+            out[k] = eps
+        return out
+
     def batch_memory_replica_sizes(self, keys):
         return {k: list(self.layout.get(k, [])) for k in keys}
 
@@ -1968,16 +1981,17 @@ def test_admit_timeout_covers_gate_wait(fake_store_module, monkeypatch) -> None:
     名额被占住超过 timeout 时必须停。停完把占住的名额还回去，闸仍是满的
     （取消等待不能把名额弄丢，也不能多还一个）。
     """
-    from kvcm.flows.prefetch import PrefetchError
+    from kvcm.flows.promote import PromoteError
     from kvcm.task_engine import TaskEngine
 
     key = _rank_key("a", 0)
     client = _LayoutClient({key: [("__source__", 100, ())]})
     admin = _TableAdmin({"seg-A": (0, 10**9)})
     b = _admit_backend(client, monkeypatch, admin=admin, segs=["seg-A"], keys=[key])
-    eng = TaskEngine(b, max_concurrent=1)
 
     async def scenario():
+        # 引擎必须在本循环里建（Semaphore/Queue 绑当前 loop；3.9 尤其敏感）
+        eng = TaskEngine(b, max_concurrent=1)
         await eng._gate.acquire()
         task = asyncio.create_task(
             eng.run_once(
@@ -1987,7 +2001,8 @@ def test_admit_timeout_covers_gate_wait(fake_store_module, monkeypatch) -> None:
             )
         )
         try:
-            with pytest.raises(PrefetchError, match="stopped before submit"):
+            # TaskEngine 闸路径仍抛 PrefetchError；PromoteFlow 包成 PromoteError
+            with pytest.raises(PromoteError, match="stopped before submit"):
                 await task
             assert eng._gate.locked()
         finally:
@@ -2004,7 +2019,7 @@ def test_admit_slow_query_does_not_extend_timeout(
     fake_store_module, monkeypatch
 ) -> None:
     """查剩余本身花掉的时间也算预算。查完已经到点就停，不再提交。"""
-    from kvcm.flows.prefetch import PrefetchError
+    from kvcm.flows.promote import PromoteError
     from kvcm.task_engine import TaskEngine
 
     key = _rank_key("a", 0)
@@ -2018,7 +2033,7 @@ def test_admit_slow_query_does_not_extend_timeout(
     b = _admit_backend(client, monkeypatch, admin=_Slow(), segs=["seg-A"], keys=[key])
     eng = TaskEngine(b, max_concurrent=1)
     start = time.monotonic()
-    with pytest.raises(PrefetchError, match="stopped before submit"):
+    with pytest.raises(PromoteError, match="stopped before submit"):
         run(
             eng.run_once(
                 Prefix(model_id="qwen", token_ids=(1,)),

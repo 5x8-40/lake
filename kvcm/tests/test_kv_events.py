@@ -20,7 +20,7 @@ from kvcm.api.events import (
     convert_block_hash,
     parse_kv_event_endpoints,
 )
-from kvcm.flows.prefetch import PrefetchError
+from kvcm.flows.promote import PromoteError
 from kvcm.ops.base import TaskStatus
 from kvcm.ops.types import InstanceId
 from kvcm.task_engine import TaskEngine
@@ -172,7 +172,7 @@ def test_failure_does_not_publish() -> None:
     pub = _publisher({str(_T): _ENDPOINT}, sink)
     ka = FakeKeepalive()
     eng = TaskEngine(FakeOps(seq=[TaskStatus.FAILED]), keepalive=ka, events=pub)
-    with pytest.raises(PrefetchError):
+    with pytest.raises(PromoteError):
         run(eng.run_once(_P, _T, poll_s=0.01))
     assert ka.registered == []
     assert sink == []
