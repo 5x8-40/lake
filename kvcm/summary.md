@@ -230,9 +230,9 @@
 - 定位：kvcm 分两个平面（像 K8s 的 controller-manager 与 scheduler）。**控制面**执行（D1/D2/D9），**管理面**决策（D8）。管理面可独立进程或嵌入 Router，但**必须看得到在线请求**；离线形态只能做容量规划。
 - 目标形态：KVT（多源 KV 索引树）+ HookEnvelope + L0/L1/L2 三环，联合决策“请求去哪、KV 怎么动、集群扩不扩”。
 - 原则：hint ≠ command；KV 动作只走 intent；请求不等 READY；不设固定降级链；索引是派生视图；预算先行；决策与执行分离。
-- **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是跨机传输（950 ROCE≈23.8GB/s）；HBM 命中只省本地 H2D 拷贝（950 单机 UB_CTP≈47GB/s、POD≈93GB/s，分开取值）。
+- **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是跨机传输（950 跨机待测；A3 ROCE 参考≈23.8GB/s）；HBM 命中只省本地 H2D 拷贝（950 单机 UB_CTP≈47GB/s、POD≈93GB/s，分开取值）。
   - **传输能否被计算掩盖，取决于残差**（D8a §1.1）：`可掩盖token数 = T_transfer × v_prefill`，残差低于它时不能掩盖，`T_kv = T_compute + T_transfer`。
-  - **能否掩盖只看命中率，与上下文长度无关**（D8a §8.1）：掩盖条件可约化成 `(1 − hit) > v_prefill × bytes_per_token / BW`。按 950 实测：GLM-5.2（93 KiB/token）下，跨机 ROCE 23.8GB/s 要 hit < 97.7%，本机 H2D 47GB/s 要 hit < 98.8%（POD 93GB/s 约 99.4%）。
+  - **能否掩盖只看命中率，与上下文长度无关**（D8a §8.1）：掩盖条件可约化成 `(1 − hit) > v_prefill × bytes_per_token / BW`。按 A3 ROCE 23.8GB/s 参考：GLM-5.2（93 KiB/token）下，跨机要 hit < 97.7%（950 待测），本机 H2D 47GB/s 要 hit < 98.8%（POD 93GB/s 约 99.4%）。
   - **高命中率反而放大本地放置的价值**：命中 99% 时跨机传输是纯加项。512K 上下文跨机 `T_kv` 2.917 s vs 本机 1.905 s，差 1.012 s；1M 差 1.975 s。
   - **batch 效应**：forward 按层推进，某层没就绪整个 batch 等，损失按 `max over requests(T_kv)` 计。
   - 所以预取的价值不只是防驱逐，还包括把高命中率请求从跨机挪到本机。

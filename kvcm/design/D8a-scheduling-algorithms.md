@@ -47,7 +47,7 @@ flowchart TB
 | `BW` / `BW_eff` | 本次/到节点 n 的实际有效带宽；按平面取 `BW_h2d` / `BW_storage` / `BW_compute` |
 | `BW_h2d` / `BW_storage` / `BW_compute` | 三类网络的有效带宽：本机 H2D、存储面、计算面 |
 | `T_prefill` | 重算时间 = `P / v_prefill` |
-| `T_transfer` | 跨机传输 = `S_bytes / BW_storage` 或 `BW_compute`；950 ROCE 实测约 23.8GB/s |
+| `T_transfer` | 跨机传输 = `S_bytes / BW_storage` 或 `BW_compute`；950 跨机待测，A3 ROCE 参考约 23.8GB/s |
 | `T_h2d` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_h2d`；950 单机 UB_CTP≈46.9GB/s、POD≈93.4GB/s（两种场景）；800Gbps 是链路口径 |
 | `Q` | 队列等待 |
 | `D` | TTFT 目标 |
@@ -105,7 +105,7 @@ vLLM 的 KV connector 是逐层的（`KVConnectorBase_V1::start_load_kv` 启动�
 | **仍然逐层拉** | 更短（第一层到位即开始） | **差**：某层没跟上，整个 batch 这一步空转 | 单请求、batch 小、延迟优先 |
 | **先搬到本机 DRAM 再调度** | 更长（等搬完） | 好：搬运期间 GPU 去服务别的请求 | 高并发、吞吐优先 |
 
-第二条不需要搬到 HBM。本机 DRAM→HBM 走 950 专用 UB：单机 UB_CTP 实测≈47GB/s、POD≈93GB/s（两种场景）；通常比跨机 ROCE（≈23.8GB/s）快，具体倍数按部署实测。
+第二条不需要搬到 HBM。本机 DRAM→HBM 走 950 专用 UB：单机 UB_CTP 实测≈47GB/s、POD≈93GB/s（两种场景）；通常比 A3 ROCE 23.8GB/s 参考快，但 950 跨机未测，不能直接算倍数。
 
 ### 胖 KV 的例外
 
@@ -360,7 +360,7 @@ s.t. Σ x_i × bytes_i ≤ B_budget
 
 ![预取 EV 与保留时间](figures/algo-prefetch-ev.svg)
 
-> 参数：128K 上下文（GLM-5.2，`S_bytes=12.2GB`）、`S_saved≈2200ms`（命中率 +10% 省下的 prefill）、`λ=1/300`、`C_copy≈512ms`（ROCE 23.8GB/s 一次搬运）。曲线先升后降：太早预取白占内存，太晚赶不上请求。
+> 参数：128K 上下文（GLM-5.2，`S_bytes=12.2GB`）、`S_saved≈2200ms`（命中率 +10% 省下的 prefill）、`λ=1/300`、`C_copy≈512ms`（A3 ROCE 23.8GB/s 参考一次搬运）。曲线先升后降：太早预取白占内存，太晚赶不上请求。
 
 **注意 `C_copy` 与 `S_saved` 的量级**：128K 时一次跨机搬运约 512 ms，而防住一次重算省 2200 ms——比值约 4.3:1。到 1M 时两者都放大，但比值不变（都随 `P` 线性）。
 
@@ -606,17 +606,17 @@ L2 更新权重；L0/L1 只读：
 
 ### 8.1 延迟量级
 
-> 下表按 950 实测口径：ROCE 跨机约 23.8GB/s；本机 H2D 单机 UB_CTP 约 47GB/s、POD 约 93GB/s（两种场景，不并列成区间）。`93KiB/token` 来自 llm-d 架构文档的 GLM-5.2 估算；按模型配置的推导式是 `2 × 层数 × KV heads × head_dim × 精度字节`，本仓库没有逐项核对，换模型要重算。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
+> 本机 H2D 按 950 实测：单机 UB_CTP 约 47GB/s、POD 约 93GB/s（两种场景，不并列成区间）。**950 跨机 H2D 没有实测数**；下表跨机列用 A3 910C 的 ROCE 23.8GB/s 作参考，不是 950 结论。`93KiB/token` 来自 llm-d 架构文档的 GLM-5.2 估算；按模型配置的推导式是 `2 × 层数 × KV heads × head_dim × 精度字节`，本仓库没有逐项核对，换模型要重算。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
 
 ![KV 路径成本](figures/algo-latency-stack.svg)
 
-> 参数：GLM-5.2 口径 `bytes_per_token=93KiB`、`L=79`（含 1 层 MTP）、`v_prefill=5900 token/s`（整实例，**输入假设，不是实测**）、跨机 `BW_storage=23.8GB/s`（950 ROCE 实测）、本机 `BW_h2d=47GB/s`（UB_CTP Server；POD 约 93GB/s）。
+> 参数：GLM-5.2 口径 `bytes_per_token=93KiB`、`L=79`（含 1 层 MTP）、`v_prefill=5900 token/s`（整实例，**输入假设，不是实测**）、跨机 `BW_storage=23.8GB/s`（A3 ROCE 参考）、本机 `BW_h2d=47GB/s`（UB_CTP Server；POD 约 93GB/s）。
 
 #### KV 大小与传输时间
 
 `S_bytes` 按十进制 GB 计（93KiB/token × P / 1e9）；1M 约 95.2GB，不是 88.7GB。
 
-| context | `S_bytes` | 跨机 ROCE 23.8GB/s | 本机 H2D 47GB/s | 每层跨机（79 层） |
+| context | `S_bytes` | 跨机 ROCE 23.8GB/s（A3 参考） | 本机 H2D 47GB/s | 每层跨机（79 层） |
 |---|---:|---:|---:|---:|
 | 32K | 3.05 GB | 128 ms | 65 ms | 1.6 ms |
 | 64K | 6.10 GB | 256 ms | 130 ms | 3.2 ms |
@@ -643,13 +643,13 @@ L2 更新权重；L0/L1 只读：
                 约去 P：  (1 − hit) > v_prefill × bytes_per_token / BW
 ```
 
-代入 GLM-5.2：`5900 × 93KB / 23.8GB/s ≈ 0.023`，即 **hit < 97.7% 才能跨机掩盖**。本机 H2D 47GB/s 的阈值是 `5900 × 93KB / 47GB/s ≈ 0.0117`，即 **hit < 98.8%**；POD 93GB/s 时约 **99.4%**。
+按 A3 ROCE 23.8GB/s 参考代入 GLM-5.2：`5900 × 93KiB / 23.8GB/s ≈ 0.023`，即 **hit < 97.7%**（950 跨机待测）。本机 H2D 47GB/s 的阈值是 `5900 × 93KiB / 47GB/s ≈ 0.0117`，即 **hit < 98.8%**；POD 93GB/s 时约 **99.4%**。
 
 #### 高命中率下的实际代价
 
 命中 99% 时（agentic 典型区间的上沿）：
 
-| context | residual | 跨机 `T_kv` | 本机 `T_kv` | 差值 |
+| context | residual | 跨机 `T_kv`（A3 参考） | 本机 `T_kv` | 差值 |
 |---|---:|---:|---:|---:|
 | 32K | 320 | 182 ms | 119 ms | 63 ms |
 | 128K | 1,280 | 729 ms | 476 ms | 253 ms |
@@ -664,7 +664,7 @@ L2 更新权重；L0/L1 只读：
 
 1. **预取的价值在命中率接近 99%（≥98.8%）时才是主项。** 中低命中率下，计算足以掩盖传输，本地放置收益接近零。
 2. **高命中率场景下，本机 DRAM 就够**，不必追 HBM——除命中率 ≥98.8%（POD 93GB/s 约 99.4%）的情形。
-3. **胖 KV（GLM-5.2 这类）把分界定在 97.7%（跨机 ROCE 23.8GB/s）与 98.8%（本机 H2D 47GB/s）**；POD H2D 93GB/s 时本机约 99.4%。比 MLA 类薄 KV 低得多，因为每 token 字节数大。
+3. **胖 KV（GLM-5.2 这类）把分界定在 98.8%（本机 H2D 47GB/s）**；POD H2D 93GB/s 时约 99.4%。跨机侧只有 A3 ROCE 23.8GB/s 参考（约 97.7%），950 跨机待测。比 MLA 类薄 KV 低得多，因为每 token 字节数大。
 
 ### 8.2 吞吐/成本
 
@@ -797,7 +797,7 @@ ROI = saved / cost
 
 ### 9.1 950 实测带宽（先看这张表）
 
-来自 HIXL 性能表与 MindIE 拓扑诊断；**只取 950PR/950DT（A5）数据，不取 A2 910B / A3 910C**。同拓扑、同卡组；换机型/驱动要重测：
+来自 HIXL 性能表与 MindIE 拓扑诊断；**950 结论只取 950PR/950DT（A5）数据**；A3 910C 仅作跨机参考，不混入 950 结论。同拓扑、同卡组；换机型/驱动要重测：
 
 | 路径 | 实测有效带宽 | 用途 |
 |---|---:|---|
@@ -805,10 +805,20 @@ ROI = saved / cost
 | H2D UB_CTP（POD） | ≈93.4 GB/s | 本机 DRAM→HBM，POD 口径 |
 | H2D UB_RTP | ≈38.2 GB/s | 本机 DRAM→HBM，另一协议 |
 | H2D UBOE | ≈35.9 GB/s | 本机 DRAM→HBM，另一协议 |
-| ROCE（跨机） | ≈23.8 GB/s | 池/跨机 KV |
+| 950 跨机 H2D | **未测** | 需要双机 950 RoCE/UBOE/UB_RTP 实测 |
 | UB alltoall 64MB | ≈132 GB/s（UB 岛）/ ≈86 GB/s（SYS 跨岛） | 计算面参考，不用于 KV |
 
 **关键**：`800Gbps` 是链路口径（≈100GB/s），不是有效 H2D；950 上 UB_CTP Server 实测约 47GB/s、POD 约 93GB/s。D8a 的公式与 D8 的表都按实测值算；不要把 100GB/s 当默认。
+
+**A3 910C 参考（不是 950，不能当 950 结论）**：
+
+| A3 路径 | 单机 | 双机 |
+|---|---:|---:|
+| ROCE `rH2D`（hixl_cs） | ≈23.8 GB/s | ≈23.7–23.9 GB/s |
+| FabricMem `rH2D` | ≈86–92 GB/s | ≈78–89 GB/s |
+| HCCS `H2D` | 不支持 | 不支持 |
+
+A3 的 ROCE 单/双机几乎一样（都约 23.8），说明瓶颈在 RoCE 路径而不是“单/双机”本身；950 的跨机需要另测。
 
 ## 10. 参考实现
 
