@@ -30,7 +30,7 @@ sequenceDiagram
     R->>R: 打分（命中/传输/队列/SLO/future/risk）
     R->>Q: 入队（优先级）
     R->>W: Dispatch(node, hint)
-    R->>KVT: 写 Speculative（短 TTL）
+    R->>KVT: 写“预测”条目（短 TTL）
     R-->>K: 异步 KVIntent（prefetch/retain）
     W-->>R: 首 token/结果
     R-->>G: 流式返回
@@ -41,7 +41,7 @@ sequenceDiagram
 
 - KVT 查询是纯内存，<5ms；miss 回退权威不在 L0 热路径（可选异步）。
 - 预取 intent 不阻塞本次请求；READY 回写由 L1/摄入层处理。
-- `Speculative` 只用于同批请求的亲和，不参与 HBM 命中判定。
+- “预测”条目只用于同批请求的亲和，不参与 HBM 命中判定。
 
 ---
 
@@ -86,7 +86,7 @@ sequenceDiagram
     K->>M: batch_query_keys / 核验副本（全 rank）
     M-->>K: Ready
     K-->>R: READY / 补发 BlockStored（medium=CPU）
-    R->>KVT: 写 Confirmed(DRAM, B)
+    R->>KVT: 写“已确认（本机 DRAM, B）”
     Note over R,K: 超时：abandon + 按最新 KVT 重算
 ```
 
@@ -130,7 +130,7 @@ sequenceDiagram
 
 ---
 
-## 5. L2：扩容 + warm gate
+## 5. L2：扩容 + 预热门控
 
 ```mermaid
 sequenceDiagram
@@ -158,13 +158,13 @@ sequenceDiagram
 
 要点：
 
-- warm gate 的 coverage 默认按“本机 DRAM confirmed”算；HBM 覆盖是加分项，不是 Ready 的必要条件。
+- 预热门控的覆盖率默认按“本机 DRAM 已确认”算；HBM 覆盖是加分项，不是 Ready 的必要条件。
 - 新节点在 warming 期间不接/低权重接流量。
 - warm 可与权重加载重叠；`T_ready = provision + gate + warm` 要满足 <10s 目标。
 
 ---
 
-## 6. L2：缩容 + drain
+## 6. L2：缩容 + 下线
 
 ```mermaid
 sequenceDiagram
@@ -174,28 +174,28 @@ sequenceDiagram
     participant M as Mooncake
     participant O as 外部编排
 
-    L2->>L2: victim = argmax(gain − loss)
-    L2->>R: mark draining(victim)
+    L2->>L2: 缩容节点 = argmax(gain − loss)
+    L2->>R: 标记“下线中”(缩容节点)
     R->>R: 停止新请求；在途继续
-    L2->>K: DrainPlan(victim, targets, deadline)
+    L2->>K: DrainPlan(缩容节点, targets, deadline)
     K->>M: CreateDrainJob / move / retain
     loop 进度
         K->>K: 查询/重试/verify
     end
     alt 成功
-        K-->>L2: DRAINED
-        L2->>O: remove(victim)
+        K-->>L2: 已下线
+        L2->>O: remove(缩容节点)
     else 卡住/失败
         K-->>L2: 部分失败
-        L2->>R: 保留 draining，下周期重试
+        L2->>R: 保留“下线中”，下周期重试
     end
 ```
 
 要点：
 
-- victim 不是 LIFO；看 unique hot KV、会话风险、迁移成本。
-- drain 卡住不硬删。
-- 迁移失败按最新状态重算，不写 fallback 链。
+- 缩容节点不是按 LIFO 选；看唯一热 KV、会话风险、迁移成本。
+- 下线卡住不硬删。
+- 迁移失败按最新状态重算，不写预设降级链。
 
 ---
 
@@ -233,7 +233,7 @@ sequenceDiagram
     participant W as 实例 B
     participant K as kvcm
 
-    KVT-->>R: B 有前缀 P（Confirmed）
+    KVT-->>R: B 有前缀 P（已确认）
     R->>W: Dispatch(P)
     W-->>R: 本地 miss（副本不在了）
     R->>KVT: MISS_FEEDBACK(P, B)
@@ -269,7 +269,7 @@ sequenceDiagram
     end
     E--xR1: lease 过期
     R2->>E: 抢到 lease
-    R2->>R2: 从最新 KVT/价格继续
+    R2->>R2: 从最新 KVT/权重继续
     R1-->>K: 仍可发 KVIntent（幂等）
     R2-->>K: 仍可发 KVIntent（幂等）
 ```
@@ -294,7 +294,7 @@ sequenceDiagram
     K->>M: create_copy_task
     M-->>K: CopyEnd
     K-->>R: READY（B 的 DRAM）
-    R->>R: KVT：B.DRAM Confirmed
+    R->>R: KVT：B 的本机 DRAM 已确认
 
     A->>G: 请求（P + 新内容）
     G->>R: request
@@ -317,7 +317,7 @@ sequenceDiagram
 ## 11. 读图要点
 
 - **L0 不阻塞**：所有 KV intent 都是异步；请求走当前最优路径。
-- **READY 是 DRAM 回写事件**：KVT 的 `Confirmed(DRAM)` 以 kvcm READY/引擎事件为准；HBM 命中需要 HBM 证据。
-- **L2 只出决策**：provision 在外部编排；kvcm 只执行 KV 搬迁。
-- **失败不 fallback**：按最新 KVT/价格重算；读路径兜底不叫 fallback。
+- **READY 是 DRAM 回写事件**：KVT 的“本机 DRAM 已确认”以 kvcm READY/引擎事件为准；HBM 命中需要 HBM 证据。
+- **L2 只出决策**：扩容执行在外部编排；kvcm 只执行 KV 搬迁。
+- **失败不用预设降级链**：按最新 KVT/权重重算；读路径兜底不算“降级链”。
 - **多 SC 实例**：请求环可水平扩；L2 单 leader；intent 幂等。

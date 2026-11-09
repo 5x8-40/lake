@@ -54,7 +54,7 @@
 | **KV 对账** | Mooncake Conductor（`prefix_indexer.cpp::PrefixCacheTable::Query/Register`）建前缀索引；Dynamo standalone indexer（`listener.rs::handle_gap`）做事件/gap; Mooncake admin `GET /batch_query_keys` 给副本真相 | 索引、查询、gap replay、副本查询 | 抽样策略（热/老/可疑）、索引 vs master 的比对循环、`LOST/REMOVED` 失效事实回写、限速/HA |
 | **用量账本** | LMCache `lmcache/observability.py::LMCStatsMonitor`（本地/远端/存储字节、请求统计）；Prometheus/OTel 存指标；AIBrix 有 usage/TPM 类指标 | 字节/请求级指标、监控存储 | 把 intent、copy bytes、READY、命中、引擎 APC 命中串成一条链；算预热 ROI/归因；这不是监控系统自带的语义 |
 | **容量建议** | Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler；Mooncake 容量/水位指标 | 扩缩算法、指标源、目标副本数 | 池侧 KV footprint/tier mix/shard 建议；和 D8 的决策接口对齐（只给事实/区间） |
-| **下线搬迁** | Mooncake `CreateDrainJob`、`CancelDrainJob`；K8s drain | seg 级搬迁、job 级取消 | 与 D8 摘流/选 victim 联动；session-aware；搬完 verify 再停实例 |
+| **下线搬迁** | Mooncake `CreateDrainJob`、`CancelDrainJob`；K8s drain | seg 级搬迁、job 级取消 | 与 D8 摘流/选缩容节点联动；session-aware；搬完 verify 再停实例 |
 | **保留/删除规则** | Mooncake pin/lease/tenant quota；K8s ResourceQuota | 单 key/tenant 的容量与租约 | 跨模型的保留策略、pin 预算、删除审计、ROI 约束 |
 | **历史回放** | 没有 turnkey；可用 trace + 模拟器自建 | 事件/指标存储 | 决策日志 schema、反事实重放、策略版本对比 |
 
@@ -123,7 +123,7 @@ flowchart TB
 
 ### 3.1 KV 对账（反熵/核验）
 
-**问题**：引擎事件看不到池副本删除；KVT 只增不减；ghost 条目把请求导向无副本实例。0.3.13.post1 的 publisher 默认不开，删除面更依赖 KV 对账。
+**问题**：引擎事件看不到池副本删除；KVT 只增不减；ghost 条目把请求导向无副本实例。0.3.13.post1 的 publisher 当前默认不开；生产按开启规划，开启前删除面更依赖 KV 对账。
 
 **终局形态**：
 
@@ -232,15 +232,15 @@ sequenceDiagram
     participant M as Mooncake
     participant O as 编排
 
-    R->>R: 选 victim + 摘流
-    R->>K: DrainPlan(victim, targets, deadline)
+    R->>R: 选缩容节点 + 摘流
+    R->>K: DrainPlan(缩容节点, targets, deadline)
     K->>M: CreateDrainJob / move
     loop 进度
         K->>K: 查询/重试/verify
     end
     alt 成功
         K-->>R: DRAINED
-        R->>O: remove(victim)
+        R->>O: remove(缩容节点)
     else 卡住
         K-->>R: 部分失败
         R->>R: 保留 draining，下周期重试
@@ -280,7 +280,7 @@ sequenceDiagram
 
 - 记录 hook、事实、决策、intent、READY、命中、延迟；
 - 回放：同输入重跑策略；
-- 反事实：换权重/TTL/warm gate，看命中率/成本/尾部延迟。
+- 反事实：换权重/TTL/预热门控，看命中率/成本/尾部延迟。
 
 **收益**：
 
@@ -303,7 +303,7 @@ sequenceDiagram
 
 ## 4. 收益模型
 
-> 会话/预热的收益在 D8 §7 已经算过（命中/保留省秒级 prefill、本地放置省十毫秒级传输），本文不重复。这里只算控制面独立能力。
+> 会话/预热的收益在 D8 §7 已经算过（命中/保留省秒级 prefill、本地放置省跨机传输，按实测），本文不重复。这里只算控制面独立能力。
 
 ### 4.1 能力收益对照
 
@@ -380,7 +380,7 @@ D9 的能力都依赖具体机制。**事实写在各处，本文不重复**：
 1. **soft pin 有条件**（Case B）。治理规则不能假设"随时能 pin"；不满足就退 keepalive。
 2. **hard pin 不能事后加**。所以「保留等级」里 PIN 一档只能用 lease 延长模拟。
 3. **retain 未实现**。跨引擎存亡要靠 move 到活 seg 或自挂 SSD，Drain 和 HA 的能力上限受此约束。
-4. **删除面没有原生事件**（publisher 默认关、copy 路径零发布）。所以 KV 对账是 P0，不是可选项。
+4. **删除面没有原生事件**（publisher 当前默认关、copy 路径零发布）。所以开启前 KV 对账是过渡期 P0，不是可选项。
 
 ---
 

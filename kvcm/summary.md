@@ -227,24 +227,24 @@
 
 **D8. 管理面：统一调度中心（请求 × KV × 扩缩容）** — 🟡 设计草案
 
-- 定位：kvcm 分两个平面（像 K8s 的 controller-manager 与 scheduler）。**控制面**执行（D1/D2/D9），**管理面**决策（D8）。部署形态可选（独立进程/嵌入 Router/同进程），不影响归属。
+- 定位：kvcm 分两个平面（像 K8s 的 controller-manager 与 scheduler）。**控制面**执行（D1/D2/D9），**管理面**决策（D8）。管理面可独立进程或嵌入 Router，但**必须看得到在线请求**；离线形态只能做容量规划。
 - 目标形态：KVT（多源 KV 索引树）+ HookEnvelope + L0/L1/L2 三环，联合决策“请求去哪、KV 怎么动、集群扩不扩”。
 - 原则：hint ≠ command；KV 动作只走 intent；请求不等 READY；不设固定降级链；索引是派生视图；预算先行；决策与执行分离。
 - **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是跨机传输；HBM 命中只省毫秒级本地拷贝。
-  - **传输能否被计算掩盖，取决于残差**（D8a §1.1）：`residual_crit = T_transfer × v_prefill`，残差低于它时不能掩盖，`T_kv = T_compute + T_transfer`。
-  - **能否掩盖只看命中率，与上下文长度无关**（D8a §8.1）：掩盖条件可约化成 `(1 − hit) > v_prefill × bytes_per_token / BW`。GLM-5.2（93 KB/token）下，跨机要 hit < 97.9%，本机 DRAM 要 hit < 99.46%。
+  - **传输能否被计算掩盖，取决于残差**（D8a §1.1）：`可掩盖token数 = T_transfer × v_prefill`，残差低于它时不能掩盖，`T_kv = T_compute + T_transfer`。
+  - **能否掩盖只看命中率，与上下文长度无关**（D8a §8.1）：掩盖条件可约化成 `(1 − hit) > v_prefill × bytes_per_token / BW`。按 25GB/s 跨机示例：GLM-5.2（93 KB/token）下，跨机要 hit < 97.9%，本机 DRAM 要 hit < 99.46%；950 实测要替换示例。
   - **高命中率反而放大本地放置的价值**：命中 99% 时跨机传输是纯加项。512K 上下文跨机 `T_kv` 2.68 s vs 本机 0.87 s，差 1.82 s；1M 差 3.55 s。
   - **batch 效应**：forward 按层推进，某层没就绪整个 batch 等，损失按 `max over requests(T_kv)` 计。
   - 所以预取的价值不只是防驱逐，还包括把高命中率请求从跨机挪到本机。
-- **网卡是决策输入**（D8 §3.4）：区分 compute network（集合通信/实例间传，带宽大、间歇突发）与 storage network（存储访问，带宽小、易打满）。三处用到——L0 选路、L1 预取时机、L2 扩容判断（带宽满但池空时该加网络不是加节点）。`BW_eff` 必须实测，估高会误判「能掩盖」。参考 DualPath（arXiv:2602.21548v2）的双网络隔离。
-- **版本基线 v0.3.13.post1**：publisher 代码有但构建默认 OFF、运行默认 false、copy 路径零发布；soft pin 空写有条件可用（PR73），hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入已合入（#72）；E15 带宽限速未做。
+- **网络是决策输入**（D8 §3.4）：分三平面——H2D 专用 UB（950 800Gbps≈100GB/s，本机 DRAM→HBM）、存储面（池/跨机 KV）、计算面（集合通信）。KV 跨机尽量不走计算面；本机不只是带宽好，而是不跟算子抢、尾延迟确定。三处用到——L0 选路、L1 预取时机、L2 扩容判断（带宽满但池空时该加网络/改放置，不是加节点）。`BW_eff` 必须实测并含竞争惩罚。参考 DualPath 的 compute/storage 双网隔离，950 上再加 H2D 专用面。
+- **版本基线 v0.3.13.post1**：publisher 代码有但当前构建默认 OFF、运行默认 false，生产按开启规划；soft pin 空写设计、后续 PR，hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入已合入（#72）；E15 带宽限速未做。
 - 工作文档：[D8-joint-scheduling.md](design/D8-joint-scheduling.md)；算法：[D8a-scheduling-algorithms.md](design/D8a-scheduling-algorithms.md)；时序：[D8b-scheduling-sequences.md](design/D8b-scheduling-sequences.md)。
-- 待定：publisher 是否开启、hook 通道与信任、扩缩 actuator、多 SC 实例 leader、权重/阈值真机校准。
+- 待定：publisher 开启方式与成本、hook 通道与信任、扩缩 actuator、多 SC 实例 leader、权重/阈值真机校准。
 
 **D9. 控制面：执行与运营能力** — 🟡 设计草案
 
 - 定位：kvcm 控制面不做选路、不做扩缩决策、不持有前缀索引；在“执行 + 核验 + 记账 + 发布”边界内提供运营能力。**会话 KV、预热、选路、扩缩是 D8 管理面的动作，D9 不重复**；D9 只提供执行接口。
-- 控制面独立能力：KV 对账（反熵/核验）、用量账本（成本归因）、容量规划建议、下线搬迁（Drain）、保留/删除规则（治理）、历史回放/策略试算、会话分支/跨地域/模型灰度。
+- 控制面独立能力：KV 对账（核验）、用量账本（成本归因）、容量规划建议、下线搬迁（Drain）、保留/删除规则（治理）、历史回放/策略试算、会话分支/跨地域/模型灰度。
 - 优先级：P0 = KV 对账 + 用量账本；P1 = 容量规划建议 + 下线搬迁 + 保留/删除规则；P2 = 历史回放、会话分支/跨地域/模型灰度。
 - **收益**：KV 对账/用量账本让 D8 的命中/保留决策可信、可算 ROI；容量建议/下线搬迁是“保命中率”的防守型收益；保留规则/回放让策略可控、可回归。
 - 关键约束：soft pin 有条件可用、hard pin 拒绝；retain 未实现；KV 对账用 v0.3.13.post1 的零副作用 admin 查询；copy/move 无取消。

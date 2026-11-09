@@ -17,10 +17,10 @@ flowchart TB
     F["事实流<br/>引擎事件 / kvcm READY / 池事件 / miss"] --> KVT["1. KVT<br/>事件溯源 + 前缀匹配 + 合并"]
     KVT --> L0["2. 请求打分<br/>命中 / 传输 / 队列 / SLO"]
     KVT --> L1["3-4. 预取 + 保留<br/>EV / TTL / 预算"]
-    KVT --> L2["5. 扩缩<br/>排队 / 双环 / warm gate / victim"]
+    KVT --> L2["5. 扩缩<br/>排队 / 双环 / 预热门控 / 按 KV 价值选节点"]
     L0 -->|"命中/延迟反馈"| L2
     L1 -->|"KV 水位/READY"| L2
-    L2 -->|"价格/预算"| L0
+    L2 -->|"资源权重/预算"| L0
     L2 -->|"预算"| L1
     L0 -->|"决策日志"| LOG["6. 回放/归因"]
     L1 --> LOG
@@ -44,10 +44,11 @@ flowchart TB
 | `S_bytes` | 前缀字节数 = `P × bytes_per_token` |
 | `S_saved` | 预期节省的时间（命中/防 miss） |
 | `v_prefill` | **整实例**有效 prefill 吞吐（token/s），不是每 GPU；随上下文长度与命中率非线性下降 |
-| `BW` | 有效带宽 |
+| `BW` / `BW_eff` | 本次/到节点 n 的实际有效带宽；按平面取 `BW_h2d` / `BW_storage` / `BW_compute` |
+| `BW_h2d` / `BW_storage` / `BW_compute` | 三类网络的有效带宽：本机 H2D、存储面、计算面 |
 | `T_prefill` | 重算时间 = `P / v_prefill` |
-| `T_transfer` | 跨机传输 = `S_bytes / BW_wan` |
-| `T_local` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_local` |
+| `T_transfer` | 跨机传输 = `S_bytes / BW_storage` 或 `BW_compute`（按实际平面） |
+| `T_h2d` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_h2d`；950 H2D 800Gbps≈100GB/s |
 | `Q` | 队列等待 |
 | `D` | TTFT 目标 |
 | `L` | 模型层数（含 MTP 层） |
@@ -57,7 +58,7 @@ flowchart TB
 收益拆成四段：
 
 ```text
-T_total ≈ Q + T_kv + T_local
+T_total ≈ Q + T_kv + T_h2d
 ```
 
 其中 `T_kv` 是「拿到前缀 KV」的代价，**不能简单写成 `T_prefill + T_transfer`**：
@@ -91,8 +92,8 @@ vLLM 的 KV connector 是逐层的（`KVConnectorBase_V1::start_load_kv` 启动�
 临界点：
 
 ```text
-residual_crit = T_transfer × v_prefill
-若 residual < residual_crit：传输主导，且无法掩盖
+可掩盖token数 = T_transfer × v_prefill
+若 residual < 可掩盖token数：传输主导，且无法掩盖
 ```
 
 ### 逐层失败后的两种选择
@@ -104,7 +105,7 @@ residual_crit = T_transfer × v_prefill
 | **仍然逐层拉** | 更短（第一层到位即开始） | **差**：某层没跟上，整个 batch 这一步空转 | 单请求、batch 小、延迟优先 |
 | **先搬到本机 DRAM 再调度** | 更长（等搬完） | 好：搬运期间 GPU 去服务别的请求 | 高并发、吞吐优先 |
 
-第二条不需要搬到 HBM。DRAM→HBM 比跨机快约 4 倍，多数场景能重新藏进计算。
+第二条不需要搬到 HBM。本机 DRAM→HBM 走 950 专用 UB（800Gbps≈100GB/s），通常比跨机快；具体倍数按部署实测，不能固定写 4 倍。
 
 ### 胖 KV 的例外
 
@@ -133,7 +134,7 @@ T_batch_step = max over requests(自身 T_kv)
 
 - **miss（无命中）**：`T_kv = T_prefill`
 - **远端池命中**：残差很小，通常落在「不能掩盖」区间，`T_kv ≈ T_transfer`
-- **本机 DRAM 命中**：`T_kv = T_local`（仍有，但没有跨机那一段）
+- **本机 DRAM 命中**：`T_kv = T_h2d`（仍有，但没有跨机那一段）
 - **HBM 命中**：`T_kv ≈ 0`
 
 ---
@@ -185,7 +186,7 @@ flowchart LR
 
 ```text
 hit_tokens = contiguous_blocks × B
-local_hbm  = 连续 HBM confirmed 块数 × B
+local_hbm  = 连续 HBM 已确认块数 × B
 local_dram = 连续本机 DRAM 块数 × B
 pool_hit   = 连续池内块数 × B
 ```
@@ -214,7 +215,7 @@ KVCM_READY    = 3
 ENGINE_EVENT  = 2
 POOL_EVENT    = 2
 ROUTE_SPEC    = 1
-MISS_FEEDBACK = 4（负事实）
+未命中反馈 = 4（负事实）
 ```
 
 **收益**：池删除能覆盖引擎旧事件；延迟到达的 `Stored` 不会复活已删条目。
@@ -243,25 +244,35 @@ P_ghost ≈ 1 − exp(−λ_delete × age)
 
 ### 3.1 效用函数
 
+先定义符号，再写公式：
+
+| 符号 | 含义 |
+|---|---|
+| `H/P` | 连续 HBM / 池命中 token |
+| `B` | 要传的字节 |
+| `Q` | 队列等待 |
+| `F/R` | hook 未来价值 / 陈旧或 ghost 风险 |
+| `T_transfer` | 本次传输耗时 = `B / BW_eff` |
+| `w_hit/w_pool/w_transfer/w_q/w_slo/w_future/w_risk` | 各项权重，由 L2 的资源权重给出 |
+| `c_prefill/c_bw/c_queue/c_slo` | 单位成本（秒、字节、排队、SLO 违约） |
+| `κ_tier` | DRAM/NVMe/DFS 的折扣 |
+
 ```text
 U(r,n) =
-    w_hit   × H(r,n) × c_prefill
-  + w_pool  × P(r,n) × c_prefill × κ_tier
-  − w_bw    × (B(r,n) / BW_eff(n)) × c_bw
-  − w_q     × Q(n) × c_queue
-  − w_slo   × max(0, TTFT(r,n) − D) × c_slo
-  + w_future× F(r,n)
-  − w_risk  × R(r,n)
+    w_hit     × H(r,n) × c_prefill
+  + w_pool    × P(r,n) × c_prefill × κ_tier
+  − w_transfer× T_transfer(r,n) × c_bw
+  − w_q       × Q(n) × c_queue
+  − w_slo     × max(0, TTFT(r,n) − D) × c_slo
+  + w_future  × F(r,n)
+  − w_risk    × R(r,n)
 ```
 
-- `H`：连续 HBM 命中 token；`P`：连续池命中 token；
-- `B`：要传的字节；`Q`：队列等待；`F`：hook 未来价值；`R`：陈旧/ghost 风险；
-- `κ_tier`：DRAM/NVMe/DFS 的折扣；
-- `BW_eff(n)`：到节点 n 的**当前可用带宽**，不是理论带宽。两类网络要分开取：
-  - 从池读 KV 走 storage network（`BW_storage`）
-  - 实例间 KV 传走 compute network（`BW_compute`）
-  - 详见 D8 §3.4
-- `c_bw` 也应分开：storage 与 compute 的每 GB 成本不同（compute 更贵，因为它和集合通信共享）
+`BW_eff` 按三类网络分开取：
+
+- 本机 DRAM→HBM：`BW_h2d`（950 专用 UB，800Gbps≈100GB/s）；
+- 从池/远端读 KV：`BW_storage`；
+- 实例间 KV 传：`BW_compute`（和集合通信共享，要加竞争惩罚）。
 
 **不能用估算的带宽**：§1.1 的掩盖判据依赖 `T_transfer` 的准确性，估高了会把「不能掩盖」误判成「能掩盖」，选出一个实际更慢的节点。
 
@@ -310,13 +321,15 @@ flowchart TB
 
 ### 4.1 期望价值
 
+`EV` = 期望收益；`P_use` = 未来窗口内至少用一次的概率；`S_saved` = 用上时省下的时间。
+
 未来请求按 Poisson 到达，窗口 `T` 内至少一次：
 
 ```text
 Λ = ∫_0^T λ(s) ds
 P_use = 1 − exp(−Λ)
 S_saved = p_miss_avoided × T_prefill
-        + p_remote_to_local × (T_transfer − T_local)
+        + p_remote_to_local × (T_transfer − T_h2d)
 EV = P_use × S_saved − C_copy − C_occupancy
 C_copy = S_bytes / BW_copy × c_bw
 C_occupancy = S_bytes × T × c_mem
@@ -324,7 +337,7 @@ C_occupancy = S_bytes × T × c_mem
 
 一个重要的读数：
 
-- 如果预取只是把“远端命中”变“本机 DRAM”，收益是 `T_transfer − T_local`（十毫秒级）；
+- 如果预取只是把“远端命中”变“本机 DRAM”，收益是 `T_transfer − T_h2d`，按实测：8K 约 1.6ms、70K 约 14ms（H2D 800Gbps），跨机另算；
 - 如果它防止了一次驱逐/重算，收益是 `T_prefill`（秒级）。
 - **所以预取要和保留一起做**。
 
@@ -337,7 +350,7 @@ s.t. Σ x_i × bytes_i ≤ B_budget
      x_i ∈ {0,1}
 ```
 
-贪心排序：`EV_i / bytes_i` 从高到低；同价值按 deadline 早优先。
+贪心排序：`EV_i / bytes_i`（每字节期望收益）从高到低；同价值按 deadline 早优先。
 
 ### 4.3 EV 曲线
 
@@ -400,14 +413,14 @@ L = λ × W                （Little 定律）
 
 ```mermaid
 flowchart TB
-    O["OBSERVE<br/>队列/SLO/水位/hook"] --> P["PREDICT<br/>未来 5–15 分钟"]
+    O["观察<br/>队列/SLO/水位/hook"] --> P["预测<br/>未来 5–15 分钟"]
     P --> SL["慢环：容量下限"]
     O --> FL["快环：SLO ±1"]
-    SL --> R["RECONCILE<br/>预算/最小副本/冷却"]
+    SL --> R["校准/综合<br/>预算/最小副本/冷却"]
     FL --> R
-    R --> C["CONSTRAIN<br/>min/max/GPU/带宽"]
-    C --> E["EXECUTE<br/>provision / warm / drain"]
-    E --> F["FEEDBACK"]
+    R --> C["约束<br/>min/max/GPU/带宽"]
+    C --> E["执行<br/>扩容 / 预热 / 下线"]
+    E --> F["反馈"]
     F --> O
 ```
 
@@ -419,10 +432,12 @@ T_cool ≥ T_provision + T_warm + T_drain
 
 **收益**：慢环防预测错误，快环保突发；冷却防振荡。
 
-### 6.3 warm gate
+### 6.3 预热门控
+
+新实例先预热；**覆盖率** = 已确认 KV 的权重 / 目标前缀总权重；`w_b` 是块权重（按 token 数/层数/是否关键前缀），`W_min` 是接流门槛，`T_deadline` 是最晚接流时间，`route_weight` 是给新实例的接流权重。
 
 ```text
-coverage = Σ w_b × 1[b confirmed] / Σ w_b
+coverage = Σ w_b × 1[b 已确认] / Σ w_b
 ready if coverage ≥ W_min or t ≥ T_deadline
 route_weight = min(1, coverage / W_min)
 ```
@@ -447,7 +462,11 @@ sequenceDiagram
 
 **收益**：新节点不是“起来就接流量”，避免冷 miss 和 TTFT 抖动。
 
-### 6.4 victim 选择
+### 6.4 按 KV 价值选缩容节点
+
+`loss` = 缩掉它损失的 KV/SLO/迁移成本；`gain` = 释放出的容量价值；选 `gain − loss` 最大的节点。
+
+其中 `uniqueHotKV` = 只有该节点持有的热 KV；`refill` = 重建这些 KV 的代价；`sessionRisk` = 活跃/待恢复会话的风险；`migrationCost` = 搬走要花的字节/时间；`idleCapacity` = 可释放的空闲容量；`c_capacity` = 单位容量价值。
 
 ```text
 loss(v) = uniqueHotKV(v) × refill
@@ -459,11 +478,11 @@ choose max(gain − loss)
 
 ```mermaid
 flowchart LR
-    V["候选 victim"] --> S{"有活跃会话?"}
-    S -->|"是"| KEEP["保留/换 victim"]
+    V["候选缩容节点"] --> S{"有活跃会话?"}
+    S -->|"是"| KEEP["保留/换节点"]
     S -->|"否"| H{"有唯一热 KV?"}
     H -->|"是"| MOVE["move/retain 后缩"]
-    H -->|"否"| DRAIN["drain"]
+    H -->|"否"| DRAIN["下线"]
 ```
 
 **收益**：不用 LIFO，避免缩掉持有热前缀/活跃会话的节点。
@@ -542,20 +561,28 @@ Cost    = (|R_p| − 1) × S_bytes × c_mem × T
 
 **结论**：KV 命中是已有技术。我们的增量是把 KV 的放置变成负载均衡的执行器：知道热点在哪、该复制几份、放哪、什么时候撤，并和路由/扩缩/会话一起决策。
 
-### 6.6 影子价格
+### 6.6 资源权重
+
+有的材料把这种权重叫“影子价格”；这里就是**资源紧张程度映射成的权重**，不是钱。
 
 ```text
-λ_{t+1} = clip(λ_t + η × (u_t − u*), 0, λ_max)
+w = clamp(w0 × (util / util_target)^k, w_min, w_max)
 ```
 
-L2 出价格；L0/L1 读价格：
+- `util`：当前利用率/水位；`util_target`：目标水位；
+- `w0`：基准权重；`k`：敏感度；`w_min/w_max`：上下限；
+- `clamp(x, lo, hi)`：把 x 夹在 `[lo, hi]` 之间，防止权重无限大/无限小。
 
-- `λ_bw` 高 → 少传、多本地/重算；
-- `λ_hbm` 高 → 少保留、短 TTL；
-- `λ_prewarm` 高 → 只预取高 EV；
-- `λ_slo` 高 → 更激进扩容/预取。
+L2 更新权重；L0/L1 只读：
 
-**收益**：三条环不用做全局在线优化，也能朝同一方向走。
+| 权重 | 高时怎么变 |
+|---|---|
+| `w_hbm` | 少保留、短 TTL、优先 HBM 命中 |
+| `w_transfer` | 少跨机传输、多本地/重算 |
+| `w_prewarm` | 只预取高期望收益 |
+| `w_slo` | 更激进扩容/预取 |
+
+**收益**：三条环不用做全局在线优化，也能朝同一方向走；权重可解释、可回滚。
 
 ---
 
@@ -566,8 +593,8 @@ L2 出价格；L0/L1 读价格：
 | 多实例同时扩缩 | etcd lease 选 leader；只有 leader 出 ScaleDecision | 不打架 |
 | 重复 intent | 幂等键 `(prefix,target,op)`；kvcm 去重 | 不重复搬 |
 | 事件丢失 | 每源 seq + gap replay/snapshot | 索引可恢复 |
-| 决策不可复盘 | 决策日志记录输入/候选/价格/选择/版本 | 可回放/可 A/B |
-| leader 故障 | lease 过期重选；新 leader 从最新 KVT/价格继续 | 短暂停、不丢状态 |
+| 决策不可复盘 | 决策日志记录输入/候选/权重/选择/版本 | 可回放/可 A/B |
+| leader 故障 | lease 过期重选；新 leader 从最新 KVT/权重继续 | 短暂停、不丢状态 |
 
 ---
 
@@ -575,13 +602,15 @@ L2 出价格；L0/L1 读价格：
 
 ### 8.1 延迟量级
 
+> 下表是旧模型估算，跨机按 25GB/s 示例；950 上本机 H2D 按 800Gbps≈100GB/s。跨机/本机数值都要用真机替换，不能把示例当固定值。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)。
+
 ![KV 路径成本](figures/algo-latency-stack.svg)
 
-> 参数：GLM-5.2 口径 `bytes_per_token=93KB`、`L=79`（含 1 层 MTP）、`v_prefill=5900 token/s`（整实例）、`BW_wan=25GB/s`、`BW_local=100GB/s`。
+> 参数：GLM-5.2 口径 `bytes_per_token=93KB`、`L=79`（含 1 层 MTP）、`v_prefill=5900 token/s`（整实例）、跨机 `BW_storage=25GB/s`（示例，按部署实测）、本机 `BW_h2d=100GB/s`（950 H2D 800Gbps）。
 
 #### KV 大小与传输时间
 
-| context | `S_bytes` | 跨机 25GB/s | 本机 100GB/s | 每层跨机（79 层） |
+| context | `S_bytes` | 跨机 25GB/s（示例） | 本机 H2D 100GB/s | 每层跨机（79 层） |
 |---|---:|---:|---:|---:|
 | 32K | 2.8 GB | 114 ms | 28 ms | 1.4 ms |
 | 64K | 5.7 GB | 227 ms | 57 ms | 2.9 ms |
@@ -661,9 +690,9 @@ ROI = saved / cost
 | 预取 EV/背包 | 预取 ROI、浪费 | 只搬高价值；带宽不被打爆 |
 | 保留 TTL | resume 命中、内存占用 | 盈亏平衡，不无限 pin |
 | 排队/双环 | Ready 时延、振荡次数 | 慢环定下限、快环救突发 |
-| warm gate | 冷 miss、TTFT 抖动 | 新节点预热达标才接流 |
-| victim loss/gain | 缩容后命中率 | 不缩热节点/活跃会话 |
-| 影子价格 | 成本、全局协调 | 三环用同一价格信号 |
+| 预热门控 | 冷 miss、TTFT 抖动 | 新节点预热达标才接流 |
+| 缩容节点损失/收益 | 缩容后命中率 | 不缩热节点/活跃会话 |
+| 资源权重 | 成本、全局协调 | 三环用同一组权重信号 |
 | leader/幂等/日志 | 冲突、恢复时间、可复盘 | 不打架、可重试、可回放 |
 
 ### 8.4 收益的边界
@@ -673,7 +702,7 @@ ROI = saved / cost
 - 带宽满：预取与请求争带宽，必须限速；
 - HBM 压力：pin 太多会挤掉其他前缀，全局命中率可能下降；
 - hook 不准：预取到错前缀/错实例，ROI 为负；
-- 参数未校准：权重/阈值/价格只是起点，必须真机校准。
+- 参数未校准：权重/阈值只是起点，必须真机校准。
 
 ---
 
@@ -706,15 +735,15 @@ ROI = saved / cost
 | **gap 检测 + replay** | 事件丢失/乱序 | 跳号重放；不可用则 snapshot；再不行标 stale | 索引可恢复 | replay buffer 有界 |
 | **效用打分/成本模型** | 多目标（命中/传输/队列/SLO） | 分层权重 + TTFT 估算 + SLO 惩罚 | 选路可解释、可调 | 权重需真机校准 |
 | **传 vs 算阈值 `BW*`** | 远端命中是否值得传 | `BW* = B·c_bw/(residual·c_prefill)` | 避免“为了省重算反而更慢” | 带宽要有效测量 |
-| **预取 EV + 预算背包** | 预取可能白做 | Poisson 到达估 `P_use`；按 `EV/bytes` 贪心 | 预取 ROI 可控；带宽不被打爆 | ETA/复用率是估计 |
+| **预取期望收益 + 预算背包** | 预取可能白做 | Poisson 到达估 `P_use`；按每字节期望收益贪心 | 预取 ROI 可控；带宽不被打爆 | ETA/复用率是估计 |
 | **保留 TTL 盈亏平衡** | 保留太久浪费内存 | `p_resume(T)·S` vs 占用成本；指数衰减求 break-even | 会话保留可量化 | 恢复概率难估 |
 | **Little 定律 + 利用率目标** | 扩缩只看队列会滞后 | `L=λW`、`ρ=λ/(cμ)`、`c_min` | 容量有公式、可解释 | 突发/长尾需快环 |
 | **双环控制 + 滞回/冷却** | 扩缩振荡 | 慢环定下限、快环 ±1；cooldown > ready+warm+drain | 少抖动、少反复扩缩 | 参数需调 |
-| **warm gate coverage** | 新节点没 KV 就接流量 | 加权 confirmed 比例；未达标低权重 | 减少冷 miss | 会延迟新节点接流 |
-| **KV-aware victim** | LIFO 缩掉热节点 | `loss/gain` 比较 unique hot KV、会话风险、迁移成本 | 缩容不砸命中率 | 需要 KVT/会话视图 |
-| **影子价格/对偶分解** | 三环各自为政 | L2 出价格，L0/L1 局部最优 | 联合但不做全局在线优化 | 价格更新需稳定 |
+| **预热门控覆盖率** | 新节点没 KV 就接流量 | 加权“已确认”比例；未达标低权重 | 减少冷 miss | 会延迟新节点接流 |
+| **按 KV 价值选缩容节点** | LIFO 缩掉热节点 | `loss/gain` 比较唯一热 KV、会话风险、迁移成本 | 缩容不砸命中率 | 需要 KVT/会话视图 |
+| **资源权重/分解** | 三环各自为政 | L2 出权重，L0/L1 局部最优 | 联合但不做全局在线优化 | 权重更新需稳定 |
 | **leader lease + 幂等** | 多 SC 实例同时扩缩 | etcd lease 选主；intent 幂等键 | 不打架、可重试 | leader 故障有短暂停 |
-| **决策日志/回放** | 事故无法复盘、参数不敢调 | 记录输入/候选/价格/选择/版本 | 可解释、可 A/B、可回放 | 日志成本 |
+| **决策日志/回放** | 事故无法复盘、参数不敢调 | 记录输入/候选/权重/选择/版本 | 可解释、可 A/B、可回放 | 日志成本 |
 
 **技术栈（与算法分开看）**：
 
@@ -731,11 +760,11 @@ ROI = saved / cost
 
 | 指标 | 主要来源 | 预期方向 | 说明 |
 |---|---|---|---|
-| **TTFT** | 命中/保留、预取、HBM 命中 | 降 | 命中省秒级 prefill；本地放置省十毫秒级传输 |
-| **命中率** | KVT 选路、保留、预取、warm gate | 升 | 分层统计：HBM / 本机 DRAM / 远端池 |
+| **TTFT** | 命中/保留、预取、HBM 命中 | 降 | 命中省秒级 prefill；本地放置省跨机传输（按实测） |
+| **命中率** | KVT 选路、保留、预取、预热门控 | 升 | 分层统计：HBM / 本机 DRAM / 远端池 |
 | **吞吐/GPU 效率** | 少重算、扩缩、batch 填满 | 升 | 命中率 +10% 可能等价于多张卡的 prefill 产能 |
 | **成本** | 少 GPU 时间、带宽预算、pin 预算 | 降 | 用带宽/内存换 GPU 时间通常合算 |
-| **弹性** | 双环、warm gate、KV-aware victim | 快/稳 | 扩容 Ready 更快、缩容不丢热 KV |
+| **弹性** | 双环、预热门控、按 KV 价值选缩容节点 | 快/稳 | 扩容 Ready 更快、缩容不丢热 KV |
 | **风险** | KV 对账、leader、幂等、决策日志 | 降 | ghost 少、扩缩不打架、可复盘 |
 | **可运维性** | 账本、ROI、回放 | 升 | 从“拍脑袋”到“可测量/可调参” |
 
@@ -747,7 +776,7 @@ ROI = saved / cost
 
 | 参数 | 初值 | 校准方式 |
 |---|---|---|
-| `w_hit/w_bw/w_q/w_slo` | 量纲归一后 1.0 | 离线回放 + 真机 A/B |
+| `w_hit/w_transfer/w_q/w_slo` | 量纲归一后 1.0 | 离线回放 + 真机 A/B |
 | `BW*` | 由公式算 | 网卡/链路实测 |
 | `P_use` / `λ` | 历史 ETA/复用率 | trace 拟合 |
 | `TTL` | 由 `Net(T)` 算 | 会话恢复分布 |
@@ -796,15 +825,15 @@ break-even: μ×p0×exp(−μT)×T_prefill = c_h×bytes
 # 容量
 ρ = λ/(c×μ); c_min = ceil(λ/(μ×ρ_target)); L = λ×W
 
-# warm gate
-coverage = Σw_b×1[b confirmed]/Σw_b
+# 预热门控
+coverage = Σw_b×1[b 已确认]/Σw_b
 
-# victim
+# 按 KV 价值选缩容节点
 loss = uniqueHotRefill + sessionRisk + migrationCost
 gain = idleCapacity×c_capacity
 
-# 价格
-λ_{t+1} = clip(λ_t + η(u−u*), 0, λ_max)
+# 资源权重
+w = clamp(w0 × (util/util_target)^k, w_min, w_max)
 
 # 收益
 saved_gpu_s = QPS × Δhit × T_prefill
