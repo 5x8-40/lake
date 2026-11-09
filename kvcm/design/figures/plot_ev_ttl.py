@@ -20,7 +20,7 @@ import matplotlib.pyplot as plt  # noqa: E402
 
 KB = 1024
 MB = KB * 1024
-GB = MB * 1024
+GB = 1_000_000_000  # 十进制 GB（HIXL 带宽口径）
 
 BYTES_PER_TOKEN = 93 * KB
 BW_WAN = 23.8 * GB  # 950 ROCE 实测

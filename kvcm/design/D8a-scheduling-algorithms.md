@@ -48,7 +48,7 @@ flowchart TB
 | `BW_h2d` / `BW_storage` / `BW_compute` | 三类网络的有效带宽：本机 H2D、存储面、计算面 |
 | `T_prefill` | 重算时间 = `P / v_prefill` |
 | `T_transfer` | 跨机传输 = `S_bytes / BW_storage` 或 `BW_compute`；950 ROCE 实测约 23.8GB/s |
-| `T_h2d` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_h2d`；950 实测 H2D 约 46.9GB/s（UB_CTP Server）、93.4GB/s（POD），800Gbps 是链路口径 |
+| `T_h2d` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_h2d`；950 单机 UB_CTP≈46.9GB/s、POD≈93.4GB/s（两种场景）；800Gbps 是链路口径 |
 | `Q` | 队列等待 |
 | `D` | TTFT 目标 |
 | `L` | 模型层数（含 MTP 层） |
@@ -105,13 +105,13 @@ vLLM 的 KV connector 是逐层的（`KVConnectorBase_V1::start_load_kv` 启动�
 | **仍然逐层拉** | 更短（第一层到位即开始） | **差**：某层没跟上，整个 batch 这一步空转 | 单请求、batch 小、延迟优先 |
 | **先搬到本机 DRAM 再调度** | 更长（等搬完） | 好：搬运期间 GPU 去服务别的请求 | 高并发、吞吐优先 |
 
-第二条不需要搬到 HBM。本机 DRAM→HBM 走 950 专用 UB（800Gbps 是链路口径，实测约 47–93GB/s），通常比跨机 ROCE（≈23.8GB/s）快；具体倍数按部署实测，不能固定写 4 倍。
+第二条不需要搬到 HBM。本机 DRAM→HBM 走 950 专用 UB：单机 UB_CTP 实测≈47GB/s、POD≈93GB/s（两种场景）；通常比跨机 ROCE（≈23.8GB/s）快，具体倍数按部署实测。
 
 ### 胖 KV 的例外
 
 GLM-5.2（93 KB/token）这类模型的 KV 特别大，即使搬到本机 DRAM 也可能藏不住：
 
-- 1M 上下文 ≈ 88.7 GB（按表口径），本机 DRAM→HBM（47 GB/s）≈ 1.89 s（POD 93GB/s 约 0.95 s）
+- 1M 上下文 ≈ 95.2 GB，本机 DRAM→HBM（47 GB/s）≈ 2.03 s（POD 93GB/s 约 1.02 s）
 - 此时只有**HBM 驻留**（命中即零拷贝）才够
 
 这解释了为什么长上下文 + 胖 KV 场景下，HBM 命中率是硬指标。
@@ -222,7 +222,9 @@ ROUTE_SPEC    = 1
 
 ### 2.4 推测索引 + 置信度
 
-请求刚路由、引擎事件还没到 → 写短 TTL 推测条目：
+**Ghost（幽灵条目）** = 索引说“这块 KV 在”，池里其实已经被驱逐/删除；请求被送到空节点，只能远端读/重算。
+
+请求刚路由、引擎事件还没到 → 写短 TTL 的“预测”条目：
 
 ```text
 TTL_spec = E[event_delay] + 3σ[event_delay]    // 默认 2s，经验值
@@ -270,7 +272,7 @@ U(r,n) =
 
 `BW_eff` 按三类网络分开取：
 
-- 本机 DRAM→HBM：`BW_h2d`（950 专用 UB，实测约 47–93GB/s）；
+- 本机 DRAM→HBM：`BW_h2d`（950 单机 UB_CTP≈47GB/s；POD≈93GB/s，分开取值）；
 - 从池/远端读 KV：`BW_storage`；
 - 实例间 KV 传：`BW_compute`（和集合通信共享，要加竞争惩罚）。
 
@@ -304,9 +306,9 @@ flowchart TB
     S["请求 + Hook"] --> M["KVT.Match 逐候选"]
     M --> H{"连续 HBM 命中够?<br/>置信度够?"}
     H -->|"是"| HB["HBM 命中<br/>跳池加载 + 残差 prefill"]
-    H -->|"否"| P{"Pool 命中 + BW ≥ BW*?"}
-    P -->|"是"| PD["PD / 本地读"]
-    P -->|"否"| CO["COLOCATED"]
+    H -->|"否"| P{"PD 拓扑可用?"}
+    P -->|"是"| PD["PD 分离"]
+    P -->|"否"| CO["混部"]
     HB --> SEL["打分/约束"]
     PD --> SEL
     CO --> SEL
@@ -314,6 +316,8 @@ flowchart TB
 ```
 
 **收益**：把“命中、传输、队列、SLO、未来复用”放进同一个可解释分数；不追求全局最优，追求 5ms 内足够好。
+
+> PD 的默认选择：agent/长上下文优先 PD；`BW*` 只用于“传 vs 算/能否掩盖”，不是 PD 的开关。拓扑不可用才退回混部。
 
 ---
 
@@ -337,7 +341,7 @@ C_occupancy = S_bytes × T × c_mem
 
 一个重要的读数：
 
-- 如果预取只是把“远端命中”变“本机 DRAM”，收益是 `T_transfer − T_h2d`，按实测：8K 约 1.7–3.4ms、70K 约 15–30ms（H2D 47–93GB/s），跨机另算；
+- 如果预取只是把“远端命中”变“本机 DRAM”，收益是 `T_transfer − T_h2d`，按实测：8K 约 16ms（单机 47GB/s）/ 8ms（POD 93GB/s），70K 约 142ms / 72ms；跨机另算；
 - 如果它防止了一次驱逐/重算，收益是 `T_prefill`（秒级）。
 - **所以预取要和保留一起做**。
 
@@ -356,9 +360,9 @@ s.t. Σ x_i × bytes_i ≤ B_budget
 
 ![预取 EV 与保留时间](figures/algo-prefetch-ev.svg)
 
-> 参数：128K 上下文（GLM-5.2，`S_bytes=11.4GB`）、`S_saved≈2200ms`（命中率 +10% 省下的 prefill）、`λ=1/300`、`C_copy≈479ms`（ROCE 23.8GB/s 一次搬运）。曲线先升后降：太早预取白占内存，太晚赶不上请求。
+> 参数：128K 上下文（GLM-5.2，`S_bytes=12.2GB`）、`S_saved≈2200ms`（命中率 +10% 省下的 prefill）、`λ=1/300`、`C_copy≈512ms`（ROCE 23.8GB/s 一次搬运）。曲线先升后降：太早预取白占内存，太晚赶不上请求。
 
-**注意 `C_copy` 与 `S_saved` 的量级**：128K 时一次跨机搬运约 479 ms，而防住一次重算省 2200 ms——比值约 4.6:1。到 1M 时两者都放大，但比值不变（都随 `P` 线性）。
+**注意 `C_copy` 与 `S_saved` 的量级**：128K 时一次跨机搬运约 512 ms，而防住一次重算省 2200 ms——比值约 4.3:1。到 1M 时两者都放大，但比值不变（都随 `P` 线性）。
 
 **收益**：预取 ROI 可算；带宽按价值密度分配，不被低价值预热打爆。
 
@@ -380,7 +384,7 @@ break-even: μ × p0 × exp(−μT) × T_prefill = c_h × bytes
 
 ![保留 TTL 盈亏平衡](figures/algo-retention-ttl.svg)
 
-> 参数：128K 上下文、`S_saved≈2200ms`、`p0=1`、`μ=1/600`、占用成本按 11.4 GB × 0.5 ms/(GB·s) 计。曲线的零点就是最优 TTL 上界。
+> 参数：128K 上下文、`S_saved≈2200ms`、`p0=1`、`μ=1/600`、占用成本按 12.2 GB × 0.5 ms/(GB·s) 计。曲线的零点就是最优 TTL 上界。
 
 ### 5.2 等级选择
 
@@ -602,24 +606,24 @@ L2 更新权重；L0/L1 只读：
 
 ### 8.1 延迟量级
 
-> 下表按 950 实测口径：ROCE 跨机约 23.8GB/s；本机 H2D 约 47GB/s（UB_CTP Server）/ 93GB/s（POD）。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
+> 下表按 950 实测口径：ROCE 跨机约 23.8GB/s；本机 H2D 单机 UB_CTP 约 47GB/s、POD 约 93GB/s（两种场景，不并列成区间）。`93KiB/token` 来自 llm-d 架构文档的 GLM-5.2 估算；按模型配置的推导式是 `2 × 层数 × KV heads × head_dim × 精度字节`，本仓库没有逐项核对，换模型要重算。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
 
 ![KV 路径成本](figures/algo-latency-stack.svg)
 
-> 参数：GLM-5.2 口径 `bytes_per_token=93KB`、`L=79`（含 1 层 MTP）、`v_prefill=5900 token/s`（整实例）、跨机 `BW_storage=23.8GB/s`（950 ROCE 实测）、本机 `BW_h2d=47GB/s`（UB_CTP Server；POD 约 93GB/s）。
+> 参数：GLM-5.2 口径 `bytes_per_token=93KiB`、`L=79`（含 1 层 MTP）、`v_prefill=5900 token/s`（整实例，**输入假设，不是实测**）、跨机 `BW_storage=23.8GB/s`（950 ROCE 实测）、本机 `BW_h2d=47GB/s`（UB_CTP Server；POD 约 93GB/s）。
 
 #### KV 大小与传输时间
 
-`S_bytes` 按 GiB 口径（93KB/token × 1M ≈ 88.7GiB；不是 93GB）。
+`S_bytes` 按十进制 GB 计（93KiB/token × P / 1e9）；1M 约 95.2GB，不是 88.7GB。
 
 | context | `S_bytes` | 跨机 ROCE 23.8GB/s | 本机 H2D 47GB/s | 每层跨机（79 层） |
 |---|---:|---:|---:|---:|
-| 32K | 2.8 GB | 118 ms | 60 ms | 1.5 ms |
-| 64K | 5.7 GB | 239 ms | 121 ms | 3.0 ms |
-| 128K | 11.4 GB | 479 ms | 243 ms | 6.1 ms |
-| 256K | 22.7 GB | 954 ms | 483 ms | 12.1 ms |
-| 512K | 45.4 GB | 1908 ms | 966 ms | 24.2 ms |
-| 1M | 88.7 GB | 3727 ms | 1887 ms | 47.2 ms |
+| 32K | 3.05 GB | 128 ms | 65 ms | 1.6 ms |
+| 64K | 6.10 GB | 256 ms | 130 ms | 3.2 ms |
+| 128K | 12.19 GB | 512 ms | 259 ms | 6.5 ms |
+| 256K | 24.38 GB | 1024 ms | 519 ms | 13.0 ms |
+| 512K | 48.76 GB | 2049 ms | 1037 ms | 25.9 ms |
+| 1M | 95.23 GB | 4001 ms | 2026 ms | 50.6 ms |
 
 #### 能不能掩盖，只看命中率
 
@@ -647,14 +651,14 @@ L2 更新权重；L0/L1 只读：
 
 | context | residual | 跨机 `T_kv` | 本机 `T_kv` | 差值 |
 |---|---:|---:|---:|---:|
-| 32K | 320 | 172 ms | 114 ms | 118 ms |
-| 128K | 1,280 | 696 ms | 460 ms | 479 ms |
-| 512K | 5,120 | 2776 ms | 1834 ms | 1908 ms |
-| 1M | 10,000 | 5422 ms | 3582 ms | 3727 ms |
+| 32K | 320 | 182 ms | 119 ms | 63 ms |
+| 128K | 1,280 | 729 ms | 476 ms | 253 ms |
+| 512K | 5,120 | 2917 ms | 1905 ms | 1012 ms |
+| 1M | 10,000 | 5696 ms | 3721 ms | 1975 ms |
 
 差值就等于 `T_transfer`：**一旦不能掩盖，跨机那一段是纯加项。**
 
-再叠上 batch 效应（§1.1）：跨机的那 1.9 s（512K）不是只拖慢这一个请求，是拖慢整个 batch 这一步。
+再叠上 batch 效应（§1.1）：跨机的那 2.0 s（512K）不是只拖慢这一个请求，是拖慢整个 batch 这一步。
 
 #### 结论
 
@@ -781,6 +785,7 @@ ROI = saved / cost
 | `w_hit/w_transfer/w_q/w_slo` | 量纲归一后 1.0 | 离线回放 + 真机 A/B |
 | `BW*` | 由公式算 | 网卡/链路实测 |
 | `P_use` / `λ` | 历史 ETA/复用率 | trace 拟合 |
+| `v_prefill` | 5900 token/s（整实例，**输入假设**） | 真机 prefill 压测：`tokens / prefill_step_time`，按上下文长度分档 |
 | `TTL` | 由 `Net(T)` 算 | 会话恢复分布 |
 | `ρ_target` | 0.7–0.8 | 真机压测 |
 | `W_min` | 0.6–0.8 | 冷启动/命中权衡 |
@@ -792,7 +797,7 @@ ROI = saved / cost
 
 ### 9.1 950 实测带宽（先看这张表）
 
-来自 HIXL 性能表与 MindIE 拓扑诊断（同拓扑、同卡组；换机型/驱动要重测）：
+来自 HIXL 性能表与 MindIE 拓扑诊断；**只取 950PR/950DT（A5）数据，不取 A2 910B / A3 910C**。同拓扑、同卡组；换机型/驱动要重测：
 
 | 路径 | 实测有效带宽 | 用途 |
 |---|---:|---|

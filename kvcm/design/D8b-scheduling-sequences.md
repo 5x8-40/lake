@@ -52,9 +52,9 @@ flowchart TB
     S["请求"] --> H["KVT.Match"]
     H --> D{"连续 HBM 命中 ≥ 阈值<br/>且置信度 ≥ 0.9?"}
     D -->|"是"| DD["HBM 命中<br/>跳池加载 + 残差 prefill"]
-    D -->|"否"| P{"Pool 命中且 BW ≥ BW*?"}
-    P -->|"是"| PD["PD_DISAGG / 本地读<br/>P 产出 → 传输 → D"]
-    P -->|"否"| CO["COLOCATED<br/>同节点完成"]
+    D -->|"否"| P{"PD 拓扑可用?"}
+    P -->|"是"| PD["PD 分离<br/>P 产出 → 传输 → D"]
+    P -->|"否"| CO["混部<br/>同节点完成"]
     DD --> O["下发"]
     PD --> O
     CO --> O
@@ -63,6 +63,7 @@ flowchart TB
 注意：
 
 - “Pool 命中”包括本机 DRAM 与远端池；本机 DRAM 走本地读，省跨机传输。
+- **PD 不是由 BW* 开关的**：agent/长上下文默认 PD；`BW*` 只用于判断“传还是重算/能不能掩盖”，拓扑不可用才退回混部。
 - kvcm READY 只说明本机 DRAM 有副本；它不能直接让 L0 认定 HBM 命中。
 
 ---
@@ -245,7 +246,7 @@ sequenceDiagram
 
 要点：
 
-- ghost 只损性能。
+- **Ghost（幽灵条目）**：索引有、池里没了；请求被送到空节点。只损性能，不损正确性。
 - miss 反馈是最便宜的 KV 对账。
 - 不要把“查询失败”当成“副本丢失”。
 
