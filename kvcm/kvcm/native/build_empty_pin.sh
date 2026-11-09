@@ -18,11 +18,15 @@ print(found)')"
 "${PY}" -m pip install -q 'pybind11==2.13.6'
 PYBIND="$("${PY}" -m pybind11 --includes)"
 SUFFIX="$("${PY}" -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+MC_DIR="$(dirname "${STORE}")"
+LIBSTORE="${MC_DIR}/libmooncake_store.so"
+# UpsertStart/End/Revoke 在 libmooncake_store.so；store.so  alone 链不上这些符号。
 # shellcheck disable=SC2086
 c++ -std=c++20 -O2 -fPIC -shared ${PYBIND} \
   "${SRC}/empty_soft_pin.cpp" \
   "${STORE}" \
+  "${LIBSTORE}" \
   -Wl,--allow-shlib-undefined \
-  -Wl,-rpath,"$(dirname "${STORE}")" \
+  -Wl,-rpath,"${MC_DIR}" \
   -o "${SRC}/_empty_pin${SUFFIX}"
 echo "built ${SRC}/_empty_pin${SUFFIX}"

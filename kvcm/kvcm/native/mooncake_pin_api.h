@@ -5,8 +5,9 @@
 //
 // Replica::Descriptor 的字段名与上游不同（这里叫 body，上游叫
 // descriptor_variant），但类型/顺序按目标版本镜像；地址检查只读
-// MemDesc::buffer_descriptor。CallResult 是 tl::expected 的镜像；
-// 运行时 ABI 仍要靠真机验证，编译通过不等于布局一定对。
+// MemDesc::buffer_descriptor。CallResult / EndResult 是 tl::expected 的镜像：
+// EndResult 须按 expected<void, ErrorCode>（ok + union）；旧「ErrorCode 在前」
+// 会把成功读成失败。A14（0.3.13.post1）已校正。编译通过≠布局一定对。
 //
 // 地址检查只判断 UpsertStart 是否原地复用（Case B）；它不改变 lease
 // 语义：lease 挡驱逐 / 非 force Remove，挡不了 force Remove、lease 过期
@@ -97,8 +98,14 @@ struct CallResult {
     CallResult& operator=(const CallResult&) = delete;
 };
 
+// tl::expected<void, ErrorCode>（yalantinglibs）：union{unexpected|dummy} +
+// bool m_has_val。unexpected<ErrorCode> 对平凡 E 即 ErrorCode 本身。
+// 成功时字节常见为 00 00 00 00 01 ...；失败时 error 在前、ok=0。
 struct EndResult {
-    ErrorCode error{};
+    union {
+        ErrorCode error;
+        char dummy;
+    };
     bool ok{false};
     ~EndResult() {}
 };

@@ -55,9 +55,12 @@ mooncake::Client* client_of(py::handle cap_obj) {
 void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
                     const std::vector<size_t>& sizes,
                     const std::vector<uint64_t>& addresses, bool enable) {
-    // sizes/addresses 来自零副作用查询。这里只允许 Case B：UpsertStart
-    // 返回的 memory buffer 必须还是原来那一块；否则是 Case A/C（新
-    // buffer/新 key），直接 Revoke，绝不 UpsertEnd。
+    // 方案 1（当前收尾策略，见 D2 §2）：按「像不像原位」分流。
+    // - 地址/大小匹配 → 认定 Case B，只 UpsertEnd；End 失败也不 Revoke
+    //   （Case B 的唯一 PROCESSING 副本上 Revoke→Erase，会删掉好数据）。
+    // - 不匹配 → 认定 Case A/C，UpsertRevoke，绝不 End。
+    // 后续优化路径（文档登记，本 PR 不做）：留 PROCESSING / 池侧
+    // only_in_place / keepalive-only。
     //
     // lease 只能挡驱逐和非 force Remove，挡不了 force Remove，也挡不了
     // Case C（目标版本 UpsertStart 只看 size）。但 Case C 的旧 buffer 会
@@ -108,6 +111,8 @@ void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
             }
         }
         if (memory_count != 1 || !matched) {
+            // 方案 1：不匹配按 A/C Revoke。注意：若期望地址写错而 master
+            // 实际走了 Case B，Revoke 仍会 Erase 该 key（sole PROCESSING）。
             (void)client->master_client_.UpsertRevoke(
                 keys[i], mooncake::ReplicaType::ALL);
             fail("UpsertStart 不是原位复用（Case A/C），已 Revoke，没有钉上: " +
@@ -119,9 +124,12 @@ void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
             mooncake::ObjectMeta{keys[i], std::nullopt},
             mooncake::ReplicaType::ALL);
         if (!ended.ok) {
-            (void)client->master_client_.UpsertRevoke(
-                keys[i], mooncake::ReplicaType::ALL);
-            fail("UpsertEnd 失败，没有钉上: " + keys[i], succeeded);
+            // 方案 1：已确认 Case B，禁止 Revoke（会 Erase 好数据）。
+            // 副本留在 PROCESSING；崩溃恢复 / 补 End 是后续路径。
+            fail("UpsertEnd 失败（Case B，未 Revoke，副本可能仍 PROCESSING）"
+                 "，没有钉上: " +
+                     keys[i],
+                 succeeded);
         }
         succeeded.push_back(keys[i]);
     }

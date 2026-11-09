@@ -5,17 +5,18 @@
   - 本文定这些操作的语义、实现机制、失败处理
 - 状态：**设计完成**
   - §1 操作集框架：闭环——八项操作业界逐项对照、完备性审计、kvcm 能力边界（只能被动等池的真缺口 2 条，归池侧扩展 vs 无专用 RPC 但组合可达 7 条）
-  - §2 pin：`pin(HARD)` **拒绝**（hard pin 创建时固化，不能事后设置）；要 lease 保护用显式 `register_keepalive()`（续租由 `KeepaliveLoop` 调 `renew_once`）。候选 ② 读删写代价太大，不做。soft pin = **有条件可用空写**（目标版本无 lease gate；Case B 前置；main/0.3.14 有 gate 时不适用）；client_id 用方案一
+  - §2 pin：`pin(HARD)` **拒绝**（hard pin 创建时固化，不能事后设置）；要 lease 保护用显式 `register_keepalive()`（续租由 `KeepaliveLoop` 调 `renew_once`）。候选 ② 读删写代价太大，不做。soft pin = **有条件可用空写**（目标版本无 lease gate；Case B 前置；main/0.3.14 有 gate 时不适用）；**收尾 = 方案 1**（匹配只 End / End 失败不 Revoke·抛异常 / 不匹配 Revoke）；client_id 用方案一。真机 A14（0.3.13.post1）见 [pr73-soft-pin-tracker.md](pr73-soft-pin-tracker.md)（临时，合入前删）
   - **易混淆澄清**：[lease-pin-eviction.md](lease-pin-eviction.md)——lease / soft pin / hard pin / 驱逐分界（不替代本节 F1/F8/F9 与 §2）
   - §3 demote / promote：demote 先停保活，等满一个 lease TTL，再用 `GET /batch_query_keys` 确认盘副本。写回且池不满仍会失败
   - 协议：`SubmitIntent` 仍是前缀 × 目标；执行走 `PromoteFlow(target=)`。move / pin / demote / remove 无独立 intent，不扩协议
   - §4 retain / release：release 定型。retain 的留存机制靠「副本挂在谁身上」——搬到活 seg、或 kvcm 自己收进名下、或 DFS 副本。不存在保留身份注册；`#2991` 只是同一个 `client_id` 的重连窗口
-  - 未决问题（详见 summary）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）
+  - 未决问题（详见 summary）：copy 期间源前缀还在增长、新 block 谁补（P3）；copy 任务无法中途取消（P9）；soft pin 上层接流（prefetch READY 后是否/何时 `pin(SOFT)`）另议
 - **版本基线**：mooncake **v0.3.13.post1**（master / client 同版本）；main / v0.3.14 的 `has_read_lease` 门槛不在当前目标版本内，升级时再按那时设计。
 - 上游问题：summary D2（kvcm 对池内 KV 的操作面）
 - 版本锚点（mooncake 两个版本并存引用，文中标注 `@版本`）
-  - **0.3.11.post1**：测试床实际部署的 wheel
-  - **main @ 1fc27b62**：submodule 源码，代表升级后获得的能力
+  - **v0.3.13.post1**：目标基线；45 机 `vllm-ascend-lake-test` A14 真机冒烟版本
+  - **0.3.11.post1**：历史对照 / 旧测试床；`soft_pin_after` 通道 NO，当前扩展不兼容
+  - **main / v0.3.14-pre+**：`has_read_lease` gate；空写路径不可直接套用
 
 ## 参考实现
 
@@ -129,12 +130,13 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 推论：master 不核对调用方是谁。若请求里带的是原 client_id 的 UUID，行为 1 会把 client_id 写回原值，pin 照加。这是「借名」在 master 侧的基础。`MasterClient::UpsertStart` 没有「传入别人的 UUID」这个参数，发出去的是这个 client 自己的 UUID。当前空写因此做不到借名
   - 一个例外条件：upsert 开头 master 顺手做**单 key 惰性清理**（`CleanupStaleHandles`，`:2530`）——只遍历当前这把 key 自己的副本（O(副本数)），把挂在已死客户端 seg 上的副本清掉；若清完无有效副本，请求落入 Case A 新建。所以借名 upsert 要求原 client_id 当时在线（预热场景成立）
 - **F5 Revoke = 写中止**
-  - `UpsertEnd / UpsertRevoke` 直通 `PutEnd / PutRevoke`（`:1770` 附近 @0.3.11）
+  - `UpsertEnd / UpsertRevoke` 直通 `PutEnd / PutRevoke`（`:1770` 附近 @0.3.11；`PutRevoke` @0.3.13.post1 约 `master_service.cpp:4776-4885`）
   - 用途：PutStart/UpsertStart 分配了 buffer、副本标为写中之后，客户端写失败或放弃 → 调 Revoke 把写中的副本释放掉
   - 约束
     - 校验 client_id：与 key 的 client_id 不符调用 → `ILLEGAL_CLIENT`（只有发起写的人能中止）
     - 只撤写中副本；副本已就绪则拒绝 → `INVALID_WRITE`
-  - 与 kvcm 的关系：同一次空写里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时，副本留在 PROCESSING。扫任务记录再补 `End` 或 `Revoke` 的崩溃恢复当前不做
+  - **Case B 陷阱（真机确认）**：Case B 把唯一 COMPLETE 副本改成 PROCESSING；此时 `PutRevoke` → `EraseReplicas` → 无副本则 `Erase` **整 key**，不是「恢复 COMPLETE」。误判/错地址后 Revoke 会丢 KV。
+  - 与 kvcm 的关系（**方案 1，当前路径**）：地址匹配（Case B）只 `UpsertEnd`，**End 失败也不 Revoke**（防 Erase）；地址不匹配（按 A/C）才 `UpsertRevoke`。进程死在 Start 与 End 之间时，副本留在 PROCESSING。扫任务记录再补 `End` / `Revoke` 的崩溃恢复当前不做
 
 ### client_id 字段与级联清理
 
@@ -842,9 +844,10 @@ sequenceDiagram
 
 > **有条件可用（目标版本 = v0.3.13.post1，master/client 同版本）。**
 > 只走 Case B；`soft_pin_after.channel = YES`（v0311 仍 NO）。
-> `UpsertStart` 后做 buffer 地址/大小检查，不一致直接 `UpsertRevoke`，不 `UpsertEnd`；
-> 最坏 key missing → 重算，不会把空 buffer 标成完成。
-> `CallResult` / descriptor 的 ABI 仍需真机验证。
+> **收尾策略 = 方案 1**：`UpsertStart` 后地址/大小匹配 → 只 `UpsertEnd`（End 失败不 Revoke）；
+> 不匹配 → `UpsertRevoke`，不 End。A/C 最坏 key missing → 重算；Case B 误 Revoke 会 Erase（见 F5）。
+> `pin` 路径：`exists` + `renew_once` + 二次 `batch_query_keys` 收窄竞态。
+> 后续优化路径见下「空写失败收尾：方案 1 与后续」。ABI 已对 0.3.13.post1 真机校正。
 
 #### 限制、原因与 case
 
@@ -923,22 +926,24 @@ sequenceDiagram
    - 原因：目标版本 `GrantReadLease` 明确 “Soft-pin lifetime is intentionally independent from reads”；读 / `exists` 只续 lease。
    - case：只 register_keepalive + renew_once，不重新空写。
    - 后果：默认 30min 后 soft pin 失效；要继续 pin 必须周期性重新空写（`SoftPinAction::ENABLE`）。
-   - 补充：`pin(SOFT)` 本身只做一次 `exists`，不 `register_keepalive`；要 lease + soft pin 双保护，需额外调 `register_keepalive`。
+   - 补充：`pin(SOFT)` 做 `exists` + `renew_once` + 二次 query，不 `register_keepalive`；要 lease + soft pin 双保护，需额外调 `register_keepalive`。
 3. **空写窗口内 key 不可读**
    - 原因：`UpsertStart` 把 COMPLETE 副本标成 PROCESSING，`UpsertEnd` 才恢复；窗口内读者看不到 key（F3④）。
    - case：每次空写 / 续期。
    - 后果：毫秒级不可读；不丢数据，但读请求可能重试。
-4. **Start 与 End 之间崩溃**
-   - 原因：没有扫任务记录补 `End` / `Revoke` 的恢复机制。
-   - case：kvcm 进程在 `UpsertStart` 后、`UpsertEnd` 前死亡。
-   - 后果：副本留在 PROCESSING，key 不可读；需要后续恢复（本次不做，F5）。
-5. **`client_id` 被改写成 kvcm 的 UUID**
+4. **Start 与 End 之间崩溃 / End 失败（方案 1）**
+   - 原因：没有扫任务记录补 `End` / `Revoke` 的恢复机制；方案 1 在已确认 Case B 时 **禁止** 对 End 失败调 Revoke（防 Erase，F5）。
+   - case：kvcm 进程在 `UpsertStart` 后、`UpsertEnd` 前死亡；或 `UpsertEnd` RPC 失败。
+   - 后果：native / `pin` **抛异常**（本次操作失败，进程不因此退出）；副本留在 PROCESSING，key 不可读；需要后续恢复（本次不做；见后续路径 2）。
+5. **失败不是进程终止**
+   - `empty_soft_pin` 的 `fail()` 只 `throw std::runtime_error`（含「已钉上」部分成功列表）；上层 `try/except` 接住即可。
+6. **`client_id` 被改写成 kvcm 的 UUID**
    - 原因：upsert 无条件执行 `metadata.client_id = client_id`（F3①）；`MasterClient::UpsertStart` 只能发自己的 UUID，不能借名。
    - 后果：key 的写中止 / 副本清理权限归 kvcm；目前没感受到权限影响；kvcm 重启同 UUID 重注册未实现。
-6. **部分 key 失败不回滚**
+7. **部分 key 失败不回滚**
    - 原因：逐 key 循环；失败时前面的 key 已经钉上，没有跨 key 事务。
    - 后果：错误消息列出已成功的 key；调用方需要知道“部分成功”（R02）。
-7. **admin 查询失败**
+8. **admin 查询失败**
    - 短回或 `ok=false` 时，`pin`、`_verify_missing`、`demote` 都抛 `QueryError`（可重试），不会进入空写或误判缺副本。
    - 只有全部 key 都返回且 `ok=true` 后，才按副本内容判 READY / 缺盘 / 缺副本。
 
@@ -989,16 +994,36 @@ sequenceDiagram
 - 持续开销：每 key 每 TTL 一次空写续期
 - 副作用：两 RPC 之间 key 不可读（毫秒级，F3④）。0.3.11 布尔坑（忘带 true 的 upsert 顺手清 pin，F1）不在当前空写路径上：扩展只对着主线，0.3.11 的 soft_pin 通道是 NO
 
+#### 空写失败收尾：方案 1（当前）与后续优化路径
+
+| 分流 | 行为 | 调用方语义 |
+|---|---|---|
+| 地址/大小**匹配** | 只 `UpsertEnd` | 成功则 soft pin 生效 |
+| 匹配后 **End 失败** | **不** `UpsertRevoke`；native `throw runtime_error` → Python 异常 | **本次 pin 失败**（不是进程终止）；副本可能仍 PROCESSING |
+| 地址/大小**不匹配** | `UpsertRevoke`，不 End；同样抛异常 | pin 失败；按 A/C 最坏 key missing。若期望地址写错而 master 实为 Case B，Revoke 仍会 **Erase 整 key**（F5；方案 1 残余，A14 已确认） |
+
+**后续优化路径（登记备选；现状仍用方案 1）**：
+
+| # | 路径 | 做什么 | 解决什么 | 代价 / 依赖 | 状态 |
+|---|---|---|---|---|---|
+| **2** | 不匹配也不 Revoke，直接停 | 地址不匹配时只抛异常，不调 Revoke；与 End 失败/崩溃同形（留 PROCESSING） | 避免「误判 Case B 仍 Revoke→Erase」 | key 卡 PROCESSING 不可读；需超时回收或补 End/Revoke | 已讨论；**未采纳为现状** |
+| **3** | 池侧 `only_in_place` / pin-only RPC | 改 mooncake：非原位直接报错，或不改 replicas 只改 soft_pin 标记 | 从根上消灭 A/C 空写与 Revoke 删 key | 要改上游/fork；3rdparty 只读约定外需 fork | 未实现 |
+| **4** | keepalive-only（不空写） | 事后不加 soft pin，只 `register_keepalive` + 续租 | 无 PROCESSING 窗口、无 Revoke/Erase、无地址复用 | 不是 soft pin（只 lease 窗口）；`force Remove` 仍能删 | 机制已有；不作 soft pin 替代 |
+
+辅助收窄竞态（已随方案 1 落地）：`pin` 在空写前 `renew_once` + 二次 `batch_query_keys`；仍不 `register_keepalive`（soft pin ≠ lease 保活）。
+
+**真机**：A14（2026-11-09，45 机，0.3.13.post1）正向 Case B PASS；错地址 Revoke→Erase 符合方案 1 残余。细节与环境表见 [pr73-soft-pin-tracker.md](pr73-soft-pin-tracker.md)。
+
 #### soft pin 的其他方案
 
 | 方案 | 安全性 | 代价 | 状态 |
 |---|---|---|---|
-| 空写 upsert（当前路径） | 目标版本 Case B 安全；Case A/C 由 Post-`UpsertStart` 地址检查 + Revoke 兜底（最坏重算）。Case C 旧 buffer 延迟释放（默认 600s），检查时不会地址复用；地址复用残余主要来自 `exists` 后发生 force remove / stale 清理 / lease 过期驱逐，或 `UpsertStart` 惰性清理 / processing 抢占后无 COMPLETE 副本的 Case A | 无数据搬运；需要 native 扩展；ABI 已对 0.3.13.post1 核对 | 有条件可用（目标版本）；地址复用/ABI 是残余 |
+| 空写 upsert（当前路径，收尾=方案 1） | 目标版本 Case B 安全；Case A/C 由 Post-`UpsertStart` 地址检查 + Revoke 兜底（最坏重算）。Case C 旧 buffer 延迟释放（默认 600s），检查时不会地址复用；地址复用残余主要来自 `exists` 后发生 force remove / stale 清理 / lease 过期驱逐，或 `UpsertStart` 惰性清理 / processing 抢占后无 COMPLETE 副本的 Case A。Case B 上误 Revoke→Erase 已用「匹配才 End、End 失败不 Revoke」规避 | 无数据搬运；需要 native 扩展；ABI 已对 0.3.13.post1 核对 | 有条件可用（目标版本）；地址复用/不匹配 Revoke 删 key 是残余 |
 | 真实写入时带 pin（read-modify-write） | 安全：Case C 的新 buffer 会被数据填满 | 数据过 kvcm；需要读路径/buffer；`client_id` 改成 kvcm | 未实现 |
-| 池侧 pin-only RPC / `UpsertStart(only_in_place)` | 安全：不改 replicas，或会 Case C 直接报错 | 要改 mooncake（上游/fork） | 未实现 |
+| 池侧 pin-only RPC / `UpsertStart(only_in_place)` | 安全：不改 replicas，或会 Case C 直接报错 | 要改 mooncake（上游/fork） | 未实现（= 后续路径 3） |
 | 引擎写入时源头带 pin | 安全，但引擎不知道哪些 key 该 pin | 改引擎；pin 失去区分度 | 已否决，可随 E12 intent 重议 |
 | 读锁 / refcnt 挡驱逐 | 机制不存在：读只授 lease，不碰 refcnt | — | 已否决 |
-| keepalive 兜底 | lease 保护，不是 soft pin | 有界窗口；需要持续续租 | 已实现（另一机制） |
+| keepalive 兜底 | lease 保护，不是 soft pin | 有界窗口；需要持续续租 | 已实现（另一机制；= 后续路径 4 的底） |
 
 - 空写现在按“有条件可用”处理；对外可以说明“满足 Case B 前置条件时可用”，但不能承诺无条件 / 绝对保护。仍保留“动态库调未暴露 RPC”的参考价值。
 - 真实写入 / 池侧扩展是后续要补的安全路径；要消除 Case A 地址复用残余，只能走这三条中的一条。
@@ -1032,7 +1057,7 @@ sequenceDiagram
 - **当前决定**
   - 用方案一。空写从 kvcm 的 Python 进程发出，靠 `_empty_pin.so` 链 `store.so`。wheel 不带 C++ 头文件，扩展用本地 `mooncake_pin_api.h`，不改 mooncake（F12）。这次调用发出的是 kvcm 自己的 UUID，key 的 client_id 写成 kvcm 的。目前没感受到权限影响。**注意：这是有条件可用路径；代码里 `StoreClient.connect` 没有 UUID 参数，也没有把 UUID 持久化到 Ledger，“重启同 id 重注册”尚未实现。**
   - 借名（方案二）仍然做不到，不是当前路径。机制见上表
-  - 同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时副本留在 PROCESSING。扫任务记录再补 `End` 或 `Revoke` 的崩溃恢复当前不做（F5）
+  - 方案 1：地址匹配后 `UpsertEnd` 失败**不** `UpsertRevoke`（防 Case B Erase）。进程死在 Start 与 End 之间时副本留在 PROCESSING。扫任务记录再补 `End` 或 `Revoke` 的崩溃恢复当前不做（F5；后续路径 2）
 - **方案二仍缺的外部条件（不是当前路径）**
   1. mooncake 代码可改性——多人合作的开源项目，不是单方说了算
      - 上游提 PR（纯暴露只读接口，接受度预期高，节奏不可控）或 fork 维护本地 patch——是**独立成本**；升级拿 publisher 是官方功能零 patch，与此无关

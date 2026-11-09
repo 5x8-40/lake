@@ -76,12 +76,13 @@ def mooncake_main() -> BackendCapability:
             Support.YES,
             Support.YES,
             "有条件可用（目标版本）：SoftPinAction；无 has_read_lease 门槛；"
-            "同尺寸空写走 Case B；pin 前 exists 持 lease；需 put_step=1、无盘副本、"
-            "单内存副本。lease 挡驱逐/非 force Remove，不挡 force Remove、lease "
-            "过期后的驱逐或 Case C；pin(SOFT) 不 register_keepalive。Case C 旧 buffer "
-            "延迟释放（默认 600s），地址复用残余主要来自 Case A。"
-            "Start-End 崩溃 / 读者短暂不可读 / client_id 改写 / 不续期 / "
-            "并发重写 / ABI 仍是已知边界",
+            "同尺寸空写走 Case B；收尾方案 1（匹配只 End，不匹配 Revoke；"
+            "End 失败不 Revoke）。pin 前 exists+renew_once+二次 query；"
+            "需 put_step=1、无盘副本、单内存副本。lease 挡驱逐/非 force Remove，"
+            "不挡 force Remove、lease 过期后的驱逐或 Case C；pin(SOFT) 不 "
+            "register_keepalive。Case C 旧 buffer 延迟释放（默认 600s），"
+            "地址复用残余主要来自 Case A。Start-End 崩溃 / 读者短暂不可读 / "
+            "client_id 改写 / 不续期 / 并发重写 / ABI 仍是已知边界",
         ),
         hard_pin_after=Capability(
             Support.NO,
