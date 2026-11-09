@@ -295,7 +295,7 @@ flowchart LR
 口径：目标函数是 router 的内部问题，kvcm 侧无决策——§1-§3 闭环后 router 的输入已齐（引擎事件 + kvcm 补发 + medium 分层），怎么打分由 router 实现自定。候选方案记录在案：
 
 - **分级兜底（最简）**：全本地 > 池远端 > 重算，字典序定级，级内按负载选。
-- **打分制**：命中收益（连续本地满块数 × 分层成本；Dynamo 成本 device 1.0 / host 0.75 / disk 0.25 可借作初值）− 负载惩罚（队列长 / in-flight；在途负载无权威，router 本地记账，参考实现·Dynamo）。
+- **打分制**：命中收益（连续本地满块数 × 分层成本；Dynamo 成本 device 1.0 / host 0.75 / disk 0.25 可借作初值）− 负载惩罚（队列长 / 在途请求数；在途负载无权威，router 本地记账，参考实现·Dynamo）。
 - **传输成本两种算法**：显式比较（跨机字节 / 有效带宽 vs 重算成本，不划算换实例重算）或简化（远端副本固定扣分）。
 - **传输繁忙的测量（「有效带宽」怎么来）**：网卡/链路计数器采样——Linux RDMA 计数器（`/sys/class/infiniband/*/ports/*/counters`）或 ethtool 统计，按 Δbytes / (链路速率 × Δt) 估链路利用率；实例上报或控制面采集，router 打分把「目标实例传输忙」计入负载惩罚，kvcm 预热/搬迁据此避让与限速（E15）。参考实现：vLLM-Ascend AI-QoS（`tools/ai_qos/` + 官方介绍 `docs/source/user_guide/feature_guide/Ai_QoS_introduction_en.md`，vllm-project/vllm-ascend）——它证明 KVCache 传输与集合通信/算子下发在交换机上真实冲突（生产级问题）；它的解法是执行层流量分级（NPU channel 优先级映射 UB 交换机 Virtual Lane，严格优先级调度），与我们互补：它管「冲突时谁先走」（单机/交换机 QoS），本条管「什么时候搬、往哪台调度」（集群层避让）。
 
@@ -327,4 +327,4 @@ flowchart LR
 - **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../../docs/research/vllm-ascend/layerwise-taxonomy.md)）
 - **D7**：方案 A（壳请求进 HBM）去留与叠加顺序
 - **D8（管理面）**：统一调度中心（请求 × KV × 扩缩容；hook + KVT + L0/L1/L2 三环；目标形态 + 性能模型）——kvcm 的管理面（可独立组件/嵌入 Router）；把本文的选路面扩展成联合决策，[D8-joint-scheduling.md](D8-joint-scheduling.md)
-- **D9**：基于 kvcm 能力的服务地图（会话 KV / 预热 / 反熵 / 账本 / 容量 / 迁移；目标形态 + 收益）——把 D2 的操作集组合成服务，[D9-kv-services.md](D9-kv-services.md)
+- **D9**：基于 kvcm 能力的服务地图（会话 KV / 预热 / KV 对账 / 账本 / 容量 / 迁移；目标形态 + 收益）——把 D2 的操作集组合成服务，[D9-kv-services.md](D9-kv-services.md)

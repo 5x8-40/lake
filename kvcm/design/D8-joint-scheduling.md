@@ -2,7 +2,7 @@
 
 - 状态: **设计草案**（目标形态与收益模型；数值为模型估算，待真机校准）
 - 版本基线: **Mooncake v0.3.13.post1**（master / client 同版本）；vLLM-Ascend 0.26 系（kvcm D1 的事实基线）
-- 归属: **kvcm 的管理面（Management Plane）**——与**控制面**（KV 执行/核验/记账/发布）同属 kvcm 体系，职责不同。像 K8s 的 kube-controller-manager 与 kube-scheduler：两个进程，一套控制面体系。SC 是管理面的逻辑角色，**部署形态可选**（独立进程 / 嵌入 Router / 与控制面同进程），不影响归属
+- 归属: **kvcm 的管理面（Management Plane）**——与**控制面**（KV 执行/核验/记账/发布）同属 kvcm 体系，职责不同。像 K8s 的 kube-controller-manager 与 kube-scheduler：两个进程，一套控制面体系。SC 是管理面的逻辑角色，**调度形态可选**（独立进程 / 嵌入 Router），不影响归属；与控制面同进程只适合离线容量规划，不接在线请求
 - 控制面/管理面: [D1](D1-router-scheduling.md) / [D2](D2-kv-operations.md) / [D9](D9-kv-services.md) 是**控制面**（KV 操作与服务）；本文是**管理面**（请求 × KV × 扩缩的调度）
 - 时序: [D8b-scheduling-sequences.md](D8b-scheduling-sequences.md)（L0/L1/L2 的全部时序图与场景）
 - 算法: [D8a-scheduling-algorithms.md](D8a-scheduling-algorithms.md)（公式、图、收益模型）
@@ -254,7 +254,7 @@ KV 传输不能只看“还剩多少带宽”，要先看走哪张网。按 950 
 
 | 平面 | 典型链路 | 用途 | KV 传输 |
 |---|---|---|---|
-| **H2D** | 专用 UB，800Gbps 单向（≈100GB/s；另有 448Gbps 双链路口径，按部署确认） | 本机 DRAM ↔ HBM | **首选**，不碰算子网络 |
+| **H2D** | 专用 UB，800Gbps 单向（≈100GB/s）；112×4 Line=448Gbps 双链路、2×UB-C，按部署确认 | 本机 DRAM ↔ HBM | **首选**，不碰算子网络 |
 | **存储面** | RoCE / 独立 NIC | 池 DRAM/SSD 访问、跨机 KV | 次选，后台/限速 |
 | **计算面** | HCCS/UB | AllReduce/AllToAll/PD 集合通信 | **尽量不用于 KV 搬运** |
 
@@ -573,7 +573,7 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 | 参考 | 锚点 | 借了什么 | 关键差异 |
 |---|---|---|---|
 | **kvcm D1/D2** | `kvcm/design/D1-router-scheduling.md` §2/§4；`kvcm/design/D2-kv-operations.md` §1/§4 | intent ≠ command、READY、补发事件、单向边界、八操作/状态四类 | 本文补 hook/KVT/L2；不改变 kvcm actuator 定位 |
-| **Dynamo** | `lib/kv-router/src/protocols.rs::WorkerSelectionResult`；`components/src/dynamo/planner/core/load_scaling.py::LoadScalingMixin`；`lib/kv-router/src/services/indexer/listener.rs::handle_gap` | overlap 作为一等输入；慢/快双环；gap + replay | Dynamo 索引是事件派生副本；本文用多源 + 墓碑 + 置信度 |
+| **Dynamo** | `lib/kv-router/src/protocols.rs::WorkerSelectionResult`；`components/src/dynamo/planner/core/load_scaling.py::LoadScalingMixin`；`lib/kv-router/src/services/indexer/listener.rs::handle_gap` | overlap 作为一等输入；慢/快双环；gap + replay | Dynamo 索引是事件派生缓存；本文用多源 + 墓碑 + 置信度 |
 | **llm-d** | `pkg/kvcache/prefix_match.go::SpeculativeTier`；`.../preciseprefixcache/prerequest.go::defaultSpeculativeTTL`；`pkg/epp/scheduling/scheduler.go::Scheduler.Schedule` | 推测索引补窗口；scorer 插件化 | 推测只做亲和，不当作 HBM 命中；不依赖“逼近引擎真相” |
 | **AIBrix** | `pkg/kvevent/manager.go::Manager`；`pkg/controller/podautoscaler/context/context.go`（`gpu_cache_usage_perc`） | ZMQ 事件→前缀索引；KV 使用率/排队长度扩缩 | AIBrix 各副本各自收敛；本文 KVT 单实例内合并 + L2 leader |
 | **SGLang** | `sgl-model-gateway/src/policies/cache_aware.rs::CacheAwarePolicy`；`policies/tree.rs::Tree`；`srt/managers/kv_hints.py::KvHintsEnvelope`；`unified_cache/session_ref_tracker.py::UnifiedSessionRefTracker` | 近似树 + 最短队列；带版本 hint；session 软保护 | 目标部署用 vLLM-Ascend；session 保留落 kvcm，不落引擎 |

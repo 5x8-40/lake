@@ -21,7 +21,7 @@
 
 | 优先级 | 能力 | 做什么 | 关键技术/机制 | 主要收益 |
 |---|---|---|---|---|
-| **P0** | **KV 对账（反熵/核验）** | 索引说有的，池里真的还有 | 热/老条目抽样 + `batch_query_keys` 零副作用查询 | 降 ghost、保命中率、让 ROI 可信 |
+| **P0** | **KV 对账（核验）** | 索引说有的，池里真的还有 | 热/老条目抽样 + `batch_query_keys` 零副作用查询 | 降 ghost、保命中率、让 ROI 可信 |
 | **P0** | **用量账本（账本/归因）** | 谁花了多少、省了多少、值不值 | 任务/会话/字节/ROI 记录 + 命中归因 | 成本可见、预算可调、可计费 |
 | **P1** | **容量规划建议** | 池该多大、HBM/DRAM/SSD 怎么配 | working set + Little 定律 + admin 容量 | 少扩/少浪费、容量预测 |
 | **P1** | **下线搬迁（Drain/迁移）** | 缩容/维护不丢热 KV | `CreateDrainJob` / move / verify / 宽限期 | 缩容不砸命中率、不丢请求 |
@@ -35,7 +35,7 @@
 
 | 名词 | 人话 | 一个例子 | 不做会怎样 |
 |---|---|---|---|
-| **KV 对账（反熵）** | 定期抽查“索引说有的 KV，池里是不是真的还有” | Router 索引说 B 有前缀 P；B 的副本其实已被驱逐。对账发现后把 B 的条目标成失效 | 请求被发到空节点，跨机读/重算；命中率统计虚高 |
+| **KV 对账** | 定期抽查“索引说有的 KV，池里是不是真的还有” | Router 索引说 B 有前缀 P；B 的副本其实已被驱逐。对账发现后把 B 的条目标成失效 | 请求被发到空节点，跨机读/重算；命中率统计虚高 |
 | **用量账本（归因）** | 给每次预热/保留/迁移记账：花了多少、省了多少 | 预热 100 次，只有 20 次被用上；账本算出 ROI，决定下次只预取高价值前缀 | 不知道钱花在哪，预算拍脑袋，无法判断预热值不值 |
 | **容量规划建议** | 根据历史用量算“池子该多大、HBM/DRAM/SSD 各多少” | 热前缀 2TB、温 10TB、冷 50TB → 建议 HBM/DRAM/SSD 配比和节点数 | 扩容靠猜：不是不够就是过度采购 |
 | **下线搬迁（Drain）** | 节点要停之前，把上面的热 KV 搬到别的节点/落盘 | 缩容节点 C：先摘流，再把 C 的会话前缀 move 到 D，确认搬完再停 C | 直接停机会丢热 KV，缩完命中率掉、再扩回来 |
@@ -43,7 +43,7 @@
 | **历史回放/策略试算** | 用历史请求重跑新策略，先看效果再上线 | 把 TTL 从 10 分钟改 30 分钟，先回放一周流量，看命中率/成本变化 | 只能线上试错，出事难复盘 |
 | **会话分支 / 跨地域 / 模型灰度** | 会话分叉、异地副本、新模型小流量先上 | 分支共享前缀、各自增量；新 revision 先 5% 流量，旧 revision 逐步下线 | 分支/跨区/发布只能手工做，容易出错 |
 
-> “反熵”是分布式系统术语（熵=混乱，反熵=对抗系统越来越乱）。日常沟通建议直接叫 **“KV 对账”**，本文两种写法都保留。
+> 本文统一叫 **“KV 对账”**。
 
 ### 0.3 现成组件能做什么，我们补什么
 
@@ -53,7 +53,7 @@
 |---|---|---|---|
 | **KV 对账** | Mooncake Conductor（`prefix_indexer.cpp::PrefixCacheTable::Query/Register`）建前缀索引；Dynamo standalone indexer（`listener.rs::handle_gap`）做事件/gap; Mooncake admin `GET /batch_query_keys` 给副本真相 | 索引、查询、gap replay、副本查询 | 抽样策略（热/老/可疑）、索引 vs master 的比对循环、`LOST/REMOVED` 失效事实回写、限速/HA |
 | **用量账本** | LMCache `lmcache/observability.py::LMCStatsMonitor`（本地/远端/存储字节、请求统计）；Prometheus/OTel 存指标；AIBrix 有 usage/TPM 类指标 | 字节/请求级指标、监控存储 | 把 intent、copy bytes、READY、命中、引擎 APC 命中串成一条链；算预热 ROI/归因；这不是监控系统自带的语义 |
-| **容量建议** | Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler；Mooncake 容量/水位指标 | 扩缩算法、指标源、目标副本数 | 池侧 KV footprint/tier mix/shard 建议；和 D8 的决策接口对齐（只给事实/区间） |
+| **容量建议** | Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler；Mooncake 容量/水位指标 | 扩缩算法、指标源、目标副本数 | 池侧 KV footprint/tier mix/分片建议；和 D8 的决策接口对齐（只给事实/区间） |
 | **下线搬迁** | Mooncake `CreateDrainJob`、`CancelDrainJob`；K8s drain | seg 级搬迁、job 级取消 | 与 D8 摘流/选缩容节点联动；session-aware；搬完 verify 再停实例 |
 | **保留/删除规则** | Mooncake pin/lease/tenant quota；K8s ResourceQuota | 单 key/tenant 的容量与租约 | 跨模型的保留策略、pin 预算、删除审计、ROI 约束 |
 | **历史回放** | 没有 turnkey；可用 trace + 模拟器自建 | 事件/指标存储 | 决策日志 schema、反事实重放、策略版本对比 |
@@ -77,7 +77,7 @@ flowchart TB
 
     subgraph D9["D9 控制面（执行 + 运营）"]
         OPS["八项操作<br/>copy/move/keepalive/pin/demote/promote/retain/remove"]
-        VER["KV 对账<br/>（反熵/核验）"]
+        VER["KV 对账<br/>（核验）"]
         LED["用量账本<br/>（账本/归因）"]
         CAP["容量 / 放置顾问"]
         DRA["Drain / 迁移"]
@@ -121,7 +121,7 @@ flowchart TB
 
 ## 3. 控制面独立能力
 
-### 3.1 KV 对账（反熵/核验）
+### 3.1 KV 对账（核验）
 
 **问题**：引擎事件看不到池副本删除；KVT 只增不减；ghost 条目把请求导向无副本实例。0.3.13.post1 的 publisher 当前默认不开；生产按开启规划，开启前删除面更依赖 KV 对账。
 

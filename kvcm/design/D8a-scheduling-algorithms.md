@@ -48,7 +48,7 @@ flowchart TB
 | `BW_h2d` / `BW_storage` / `BW_compute` | 三类网络的有效带宽：本机 H2D、存储面、计算面 |
 | `T_prefill` | 重算时间 = `P / v_prefill` |
 | `T_transfer` | 跨机传输 = `S_bytes / BW_storage` 或 `BW_compute`（按实际平面） |
-| `T_h2d` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_h2d`；950 H2D 800Gbps≈100GB/s |
+| `T_h2d` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_h2d`；950 H2D 800Gbps≈100GB/s（另有 448Gbps 双链路口径，按部署确认） |
 | `Q` | 队列等待 |
 | `D` | TTFT 目标 |
 | `L` | 模型层数（含 MTP 层） |
@@ -602,7 +602,7 @@ L2 更新权重；L0/L1 只读：
 
 ### 8.1 延迟量级
 
-> 下表是旧模型估算，跨机按 25GB/s 示例；950 上本机 H2D 按 800Gbps≈100GB/s。跨机/本机数值都要用真机替换，不能把示例当固定值。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)。
+> 下表是旧模型估算，跨机按 25GB/s 示例；950 上本机 H2D 按 800Gbps≈100GB/s。跨机/本机数值都要用真机替换，不能把示例当固定值。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
 
 ![KV 路径成本](figures/algo-latency-stack.svg)
 
