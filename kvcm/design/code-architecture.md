@@ -277,7 +277,7 @@ stateDiagram-v2
 | 能力 | mooncake 0.3.11（历史部署） | mooncake 目标版本 v0.3.13.post1（当前基线；代码里沿用 main 名字） | 出处 |
 |------|------------------------------|----------------------------|------|
 | has_lease（读续租） | RPC ✓ 通道 ✓（`is_exist`） | RPC ✓ 通道 ✓ | D2 F9 |
-| soft pin 事后加（用 upsert 空写的方式） | RPC ✓ 通道 ✗（0.3.11/0.3.12 的 soft_pin 通道不适用） | RPC ✓ 通道 ✓（**有条件可用**：目标版本有 `SoftPinAction`、无 `has_read_lease` 门槛；要求 Case B——尺寸一致、单 slice、key 存在、无盘副本；pin 前 `exists` 持 lease；`UpsertStart` 后地址检查，不一致就 `UpsertRevoke`。lease 挡驱逐/非 force Remove，不挡 force Remove、lease 过期后的驱逐或 Case C；`pin(SOFT)` 不 `register_keepalive`。Case C 旧 buffer 延迟释放（默认 600s），地址复用残余主要来自 exists 后发生 force remove / stale 清理 / lease 过期驱逐，或 UpsertStart 惰性清理 / processing 抢占后无 COMPLETE 副本的 Case A。ABI 仍需真机验证；Start-End 崩溃 / 读者短暂不可读 / client_id 改写 / 不续期 / 并发重写是已知边界） | D2 F1/F12、D2 §2 |
+| soft pin 事后加（空写） | RPC ✓ 通道 ✗（0.3.11/0.3.12） | RPC ✓ 通道 ✓（有条件可用：Case B + 方案 1 收尾；`exists`+`renew_once`+二次 query；链 `libmooncake_store.so`；A14 已验。残余：不匹配 Revoke→Erase、A15 地址复用、End 失败留 PROCESSING。L2 未接） | D2 §2 / F12 |
 | hard pin 事后改标记 | ✗（创建时固化，`pin(HARD)` 拒绝；要 lease 保护用显式 `register_keepalive()` + `renew_once`。lease 是 master 的 `default_kv_lease_ttl`，kvcm 不改） | ✗ | D2 §2 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源，且 `source` 必填） | ✗ | D2 F7 |
 | has_offload / has_promotion（池通道降层/提回） | 降层通道 ✗（`/batch_query_keys` 无 disk 字段，主线 #2685 才加）。提回 ✓（`GetReplicaList`） | 降层 ✓：停保活 → 满 lease TTL → 确认 LOCAL_DISK。提回：L3 promote；PromoteFlow ±target；intent 经 TaskEngine，闸仅 copy | D2 §3 |
@@ -358,17 +358,12 @@ stateDiagram-v2
 
 **自封装 .so**（已落地的缺口只有空写 upsert。保留身份不在这份主线里，不用这个 .so 去补）：
 
-- 已落地的空写：**有条件可用（目标版本）**。单独的 `_empty_pin.so`，只链 wheel 里的 `store.so`。wheel 不带 C++ 头文件。扩展用本地 `kvcm/kvcm/native/mooncake_pin_api.h` 声明要用的类型，调用 `client->master_client_.UpsertStart` / `UpsertEnd`。成员地址由编译器算。产物放 kvcm 侧，不改 mooncake 源码。前置条件是 Case B（尺寸一致、单 slice、key 存在、无盘副本）；pin 前 `exists` 持 lease；`UpsertStart` 后地址检查，不一致就 `UpsertRevoke`。lease 挡驱逐/非 force Remove，不挡 force Remove、lease 过期后的驱逐或 Case C；`pin(SOFT)` 不 `register_keepalive`。Case C 旧 buffer 延迟释放（默认 600s），地址复用残余主要来自 exists 后发生 force remove / stale 清理 / lease 过期驱逐，或 UpsertStart 惰性清理 / processing 抢占后无 COMPLETE 副本的 Case A。Case C-by-size / Case A / ABI / Start-End 崩溃 / 读者短暂不可读 / client_id 改写 / 不续期 / 并发重写是已知边界
-- 单 client 保证（约束见上「三条接入通道」节：store_py 与自封装 .so 必须共用同一 client 实例/UUID）：
-  - 不能走的写法：自封装 .so 自己 `RealClient::create()` 再建一个 → 两个 UUID 两套心跳
-  - **当前空写**：把 `setup` 建好的那一个 client 传进扩展，调用它的 `UpsertStart`，不写数据，再 `UpsertEnd`。不 `RealClient::create()`。
-    - 类型只写到 `master_client_` 为止。与完整类定义对过：`PyClient::client_` 在 8 字节，`Client::master_client_` 在 48 字节，`ReplicateConfig` 208 字节，`ObjectMeta` 48 字节。
-    - 官方包用 `_get_pyclient_capsule` 把 `setup` 放进 `store_` 的那一个对象交出来。扩展按 `mooncake_pin_api.h` 里的成员调用 `UpsertStart` / `UpsertEnd`。
-    - **含 `pyclient.h` 的路径是退路，不是当前实现。** 若当前小头文件在真实调用上失败，再改回：pybind 参数为 `MooncakeStorePyWrapper&`，`get_real_client()` 拿出已建 client。拿到这个对象之后，`get_real_client()` 只是返回成员。不确定的是跨模块还原这个类：它没有单独头文件，pybind 版本还要和 wheel 一致（2.13.6）。代价是编译期要读 `pyclient.h` 带进来的那串头文件。使用时仍然只链 `store.so`。现在不走这条。
-    - **client_id**：当前路径是方案一。`MasterClient::UpsertStart` 发出去的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。机制说明留在 D2 §2。
-    - **写中窗口**：同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 和 End 之间时，副本停在 PROCESSING。扫任务记录再补 `End` 或 `Revoke` 当前不做。
-    - 保留身份先不动。1fc27b6 没有 `AddReplicaForRetainedClient`。`dummy_client.h` 的 `kRetained` 是外部 buffer 的引用计数。
-  - **另一条退路（未做）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）重新绑定一遍，Python 只 import 自封装 .so；天然单 client，代价是复制绑定面
+- 已落地的空写：有条件可用（v0.3.13.post1）。`_empty_pin.so` 链 `store.so` + `libmooncake_store.so`，本地 `mooncake_pin_api.h`，不改 mooncake。Case B 前置；收尾方案 1（匹配只 End；End 失败不 Revoke；不匹配 Revoke）。`pin`：`exists`+`renew_once`+二次 query。A14 已验；残余见 D2 §2。L2 未接。
+- 单 client：扩展必须用 `setup` 已建的那一个（`_get_pyclient_capsule`），禁止扩展内再 `RealClient::create()`。
+  - 类型只写到 `master_client_`；偏移已与完整类对过。含 `pyclient.h` / `get_real_client()` 是退路，当前不走。
+  - client_id：方案一（空写写成 kvcm UUID）。借名做不到。
+  - End 失败（已匹配）：不 Revoke，抛异常，可能留 PROCESSING。不匹配才 Revoke。崩溃恢复不做。
+  - 保留身份先不动。
 - 为什么空写不从 Python ctypes 直调：
   - ctypes 能调 C 函数，但造不了 C++ 对象
   - 方法参数和返回是 C++ 类型（`std::string` 的内存布局（短字符串内嵌）、`UUID` struct、`tl::expected` 返回值），在 Python 里按字节拼这些对象 = 手工复刻编译器的类型布局，且布局随 libstdc++ 版本变

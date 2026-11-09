@@ -259,21 +259,11 @@ class StoreClient:
         *,
         enable: bool = True,
     ) -> None:
-        """空写软钉。用官方包已经建好的 client，不第二次 create。
+        """空写软钉。复用 setup 已建 client（capsule），不二次 create。
 
-        ``sizes`` / ``addresses`` 由调用方从 ``GET /batch_query_keys``
-        的 ``size_`` / ``buffer_address_`` 传入。扩展在 ``UpsertStart``
-        后比较返回的 buffer 地址：只有原位复用（Case B）才 ``UpsertEnd``；
-        新 buffer（Case A/C）直接 ``UpsertRevoke``，不把空副本标成完成。
-        lease 挡驱逐 / 非 force ``Remove``，挡不了 ``Remove(force=True)``
-        或 Case C；Case C 旧 buffer 延迟释放（默认 600s），检查时不会
-        立即复用旧地址，地址复用残余主要来自 exists 后被 force remove /
-        stale 清理 / lease 过期驱逐，或 UpsertStart 惰性清理 / processing 抢占
-        后无 COMPLETE 副本的 Case A。
-
-        ``_get_pyclient_capsule`` 拿回 setup 时放进 ``store_`` 的 PyClient。
-        扩展在这个对象上调 ``MasterClient::UpsertStart`` / ``UpsertEnd``，
-        中间不 ``TransferWrite``。不用 ``upsert_tensor`` 重写数据。
+        ``sizes`` / ``addresses`` 来自 admin ``size_`` / ``buffer_address_``。
+        方案 1：``UpsertStart`` 后地址匹配 → 只 ``UpsertEnd``（End 失败不
+        Revoke，抛异常）；不匹配 → ``UpsertRevoke``。不写数据。
         """
         store = self._s()
         keys = list(keys)

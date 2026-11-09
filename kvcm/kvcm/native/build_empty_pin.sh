@@ -1,5 +1,6 @@
 #!/bin/bash
-# 软钉单独动态库。只链官方 store.so，不包含 Mooncake 头文件。
+# 软钉单独动态库。链官方 store.so + libmooncake_store.so（Upsert* 在后者）。
+# 不包含 Mooncake 头文件；类型见 mooncake_pin_api.h。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 SRC="$(cd "$(dirname "$0")" && pwd)"

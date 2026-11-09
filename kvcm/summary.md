@@ -79,21 +79,12 @@
 - remove：**全局删所有副本，不支持 target**。无论 force 都先注销保活。`force=False` 再等满一个 lease TTL，然后 `batch_remove(..., force=False)`。`force=True` 注销保活后立刻 `batch_remove(..., force=True)`，不等；但它只跳过 lease，未完成副本和在途 copy/move 仍会拒删。失败或取消不把登记加回去，注销过就留注销，调用方自己重试，租约可以过期。
 - 保活续租用 BatchExistKey（`renew_once` → `exists` → `batch_is_exist`），不用 ProbeKey。`register_keepalive` / `unregister_keepalive` 只登记或注销 Ledger 里的同一张表；续租由 `KeepaliveLoop` 调 `renew_once`。**lease 是 key 级，保这个 key 的所有副本；target 不是保活维度。**
 - 副本核验用主线 `GET /batch_query_keys`。提回：L3 `promote` 不带 target；`PromoteFlow` 无 target 等 memory，有 target 整包（可套 Prefetch）；TaskEngine intent 一律 `PromoteFlow(target=)`（`exists` 一次后 `run_after_exists`）；闸挡 copy 路径（目标已有副本时 copy 可为 no-op）；`check_promote` 的 `QueryError` 当未就绪。daemon `--admin` 必填；`--capability` 默认 `main`。
-- 软钉空写（**有条件可用，目标版本**）：`_get_pyclient_capsule` 把 `setup` 建好的那一个 client 传进单独的 `_empty_pin.so`，调用 `MasterClient::UpsertStart` / `UpsertEnd`，不写数据；要求 Case B（尺寸一致、单 slice、key 存在、无盘副本），pin 前 `exists` 持 lease，`UpsertStart` 后做 buffer 地址检查，不一致就 `UpsertRevoke`。lease 挡驱逐/非 force `Remove`，不挡 `Remove(force=true)` 或 Case C；Case C 旧 buffer 进 `discarded_replicas_` 延迟释放（默认 600s），检查时不会地址复用，地址复用残余主要来自 `exists` 后发生 force remove / stale 清理 / lease 过期驱逐，或 `UpsertStart` 惰性清理 / processing 抢占后无 COMPLETE 副本的 Case A。类型在 `mooncake_pin_api.h`，成员地址由编译器算，已与完整类定义对过。wheel 不带 C++ 头文件，扩展只链 `store.so`。`get_real_client()` 是退路：只有以后真实调用失败，才包含 `pyclient.h`，在对象还原成 `MooncakeStorePyWrapper` 之后取出已建 client。现在不走这条。client_id 用方案一：`UpsertStart` 发出的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 与 End 之间时副本留在 PROCESSING。扫任务记录再补 End/Revoke 的崩溃恢复当前不做（D2 F5）。保留身份先不动。
-- prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐——soft pin 空写；`pin(HARD)` 拒绝，hard 级 lease 保护用显式 `register_keepalive()`，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2
-  - soft pin 级（驱逐时排最后，极端情况仍可逐）——**有条件可用空写（目标版本）**：
-    - 好处：不动全局 lease；soft pin 标记断线窗口 30 分钟级（但 `exists` 的 lease 先过期，之后只在第二轮驱逐里排最后）
-    - 代价：官方绑定没有拆开的 upsert。空写走单独的 `_empty_pin.so`（只链 `store.so`，见上）。client_id 用方案一
-    - 限制：只有 Case B 安全；Case C-by-size / Case A / ABI / NoF-only 不支持（memory + NoF 可以）/ Start-End 崩溃 / 读者短暂不可读 / client_id 改写 / 不续期 / 并发重写是已知边界；地址检查挡住 A/C 的空 End，最坏重算。`pin(SOFT)` 只做一次 `exists`，不 `register_keepalive`；soft pin 只排第二轮驱逐，要 lease + soft pin 双保护需额外 `register_keepalive`。`soft_pin_after.channel = YES`（v0311 仍 NO）
-  - hard pin 级：`pin(HARD)` **拒绝**（hard pin 创建时固化，事后设置不了；`hard_pin_after = NO`）。要 lease 保护请显式 `register_keepalive()`：同一张 Ledger 表，不读数据、不 Remove、不重 put、不空写、不改 hard pin 位。lease 时长是 master 的 `default_kv_lease_ttl`，不是 kvcm 对单个 key 改标记；kvcm 不改这个配置。它只是 lease 窗口，不是 hard pin
-  - hard pin 候选 ② 读删写代价太大，不做
-  - 取消：hard 级 lease 保护（显式 `unregister_keepalive()`）停续租，等满一个 lease TTL。没有马上撤销 lease 的调用，也不查剩余租约。空写 soft pin 的取消是主线 `SoftPinAction::DISABLE`。扩展只对着主线，0.3.11 的 soft_pin 通道是 NO
-  - 完整限制、原因与 case（Case A/B/C、lease 边界、地址复用、ABI、版本）见 [D2-kv-operations.md](design/D2-kv-operations.md) §2「限制、原因与 case」
-  - 版本依赖：本 native 扩展只承诺 **v0.3.13.post1**。0.3.11 / 0.3.12 是 `with_soft_pin` bool + `UpsertEnd(string)`，不兼容；0.3.13-rc/0.3.13 机制相同但未单独验证；0.3.14-pre 起有 `has_read_lease` gate，有租约时同尺寸也会走 Case C，不能用。完整表见 D2 §2「4. 版本依赖」
-  - 读锁方案已否决：refcnt 是任务级保护，两个版本都没有读者引用 RPC
-  - client_id：方案一是当前路径（空写写成 kvcm 的 UUID，目前没感受到权限影响）。方案二借名仍做不到，不是当前路径；机制说明留在 D2 §2
-  - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）
+- 软钉空写（有条件可用，**v0.3.13.post1**；**L3 库能力，本 PR 不接 L2**）：`_empty_pin.so` 用已建 client 做 `UpsertStart`→地址检查→`UpsertEnd`/`UpsertRevoke`，不写数据。链 `store.so` + `libmooncake_store.so`。收尾方案 1：匹配只 End（End 失败不 Revoke，抛异常）；不匹配 Revoke。Case B 上 Revoke 会 Erase（F5）。`pin`：`exists`+`renew_once`+二次 query。细节与 A14 见 D2 §2 / [pr73-soft-pin-tracker.md](design/pr73-soft-pin-tracker.md)。
+- prefetch：已验证（`CreateCopyTask` → READY）。
+- pin：L3 `pin(SOFT)` 空写；`pin(HARD)` 拒绝，lease 用 `register_keepalive()`。结论见 [D2-kv-operations.md](design/D2-kv-operations.md) §2。
+  - soft pin：有条件可用；只承诺 0.3.13.post1；0.3.11/0.3.12 通道 NO；0.3.14-pre+ 有 lease gate 不可直接套。
+  - hard pin：创建时固化，事后拒绝；读删写不做。
+  - 取消：soft = `SoftPinAction::DISABLE`；hard 级 lease = `unregister_keepalive` 后等满 TTL。
 - retain：🟡 机制已定，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
   - 依据：清理只看副本挂在谁身上（内存副本跟段、盘副本跟登记它的 client），不看 key 的 client_id。要保留的是 KV 本身，不是那块内存
   - 四条可行路，顺序与 D2 时序图一致：
