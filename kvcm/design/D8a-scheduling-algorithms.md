@@ -224,6 +224,8 @@ ROUTE_SPEC    = 1
 
 **Ghost（幽灵条目）** = 索引说“这块 KV 在”，池里其实已经被驱逐/删除；请求被送到空节点，只能远端读/重算。
 
+> 预测条目的思路参考 llm-d EPP：`preciseprefixcache/prerequest.go::PreRequest` / `defaultSpeculativeTTL`（默认 2s）/ `prefix_match.go::SpeculativeTier`；它解决“路由已决策、引擎事件未到”的空窗，默认关闭。我们只借这个机制，TTL 按实际事件延迟校准。
+
 请求刚路由、引擎事件还没到 → 写短 TTL 的“预测”条目：
 
 ```text

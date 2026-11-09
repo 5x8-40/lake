@@ -222,7 +222,7 @@ stateDiagram-v2
     已过期 --> [*]
 ```
 
-- **预测**：请求刚路由、引擎事件还没到，先记一条“可能有”；只用于同批请求的亲和排序，避免一批请求被全部打散。
+- **预测**：请求刚路由、引擎事件还没到，先记一条“可能有”；只用于同批请求的亲和排序，避免一批请求被全部打散。 参考 llm-d EPP 的 speculative indexing（`PreRequest`/`defaultSpeculativeTTL`/`SpeculativeTier`）；默认 TTL 2s、默认关闭，我们按事件延迟校准。
 - **已确认**：引擎事件/READY/核验证明“真的有”；只有已确认条目才能算命中、才能支撑 HBM 判定。
 - 删除/失效带墓碑，防延迟到达的 `Stored` 复活；合并规则见 [D8a §2.3](D8a-scheduling-algorithms.md)。
 

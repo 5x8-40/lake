@@ -52,6 +52,8 @@ sequenceDiagram
 - **hook 不是请求**：它可以在请求前触发预取/保留；请求到达后也可以补发 KVIntent，但不是唯一来源。
 - **SC 的 decision 只记录，不传给引擎**：target/mode 在 Dispatch 时生效；prefix/session/deadline 留在 SC 的决策日志/指标里。
 - **预测条目**只用于同批请求的亲和，避免一批请求被全部打散；它不是 agent intent，也不参与 HBM 命中判定。
+
+> 参考：llm-d EPP 的 speculative indexing（`preciseprefixcache/prerequest.go::PreRequest`、`defaultSpeculativeTTL`、`prefix_match.go::SpeculativeTier`）：路由后先写短 TTL 预测条目，覆盖“已决策、引擎事件还没到”的空窗；默认 TTL 2s，`speculativeIndexing` 默认关。我们沿用这个思路，但 TTL 要按事件延迟校准，不照搬 2s。见 [llm-d 架构](../../docs/research/llm-d/architecture.md)。
 - KVT 查询是纯内存；miss 当作“无命中”处理，异步对账只修索引，不在 L0 热路径查 master。
 
 ---
