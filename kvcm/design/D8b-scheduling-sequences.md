@@ -1,15 +1,25 @@
 # D8b: 调度时序（L0 / L1 / L2）
 
-- 定位: [D8](D8-joint-scheduling.md) 的**时序图全集**——每张图对应一个决策环或联合场景。D8 正文只讲形态与边界，图都在这里；公式见 [D8a](D8a-scheduling-algorithms.md)
+- 定位: [D8](D8-joint-scheduling.md) 的**管理面时序**——只画 SC 与请求、kvcm、编排之间的交互；控制面内部（copy/verify/keepalive）见 [D9](D9-kv-services.md) / [D2](D2-kv-operations.md)。
 - 状态: 设计草案；版本基线 v0.3.13.post1
 - 归属: **kvcm 管理面（调度中心 SC）**；SC 可以是独立组件，也可以嵌入 Router。图中 `R` 表示 SC。
 - 读法: `->>` 调用/数据流；`-->>` 响应/异步回执；`--x` 失败/断线；`rect` 底色区分并列场景
 
-> **先记住一个区分**：kvcm 预取到目标 seg，得到的是**本机 DRAM**，不是 HBM。它让请求走本地读、省跨机 RDMA；第一次使用仍要把 KV 从 DRAM 拷进 HBM。**要认定 HBM 命中，需要 HBM 证据**（引擎 GPU 事件，或方案 A 壳请求）。
+## 0. 先定义几个词
+
+| 词 | 含义 |
+|---|---|
+| **HookEnvelope** | Agent/前端 → SC 的**独立消息**，不是请求；可在请求前、请求中、请求后到达 |
+| **KVIntent** | SC → kvcm 的**异步动作消息**（prefetch/retain/release 等），不是请求 |
+| **hint** | SC 给这次请求的**路由提示**（target/mode/prefix/session/affinity），来自 hook + KVT + 打分；不是 KVIntent |
+| **预测条目** | SC 在 Dispatch 后写入 KVT 的短 TTL 条目：“B 可能有 P”；只做同批亲和，不当作命中 |
+| **READY** | kvcm 的“本机 DRAM 副本就绪”，不是 HBM 命中 |
+
+> **D8b 不画首 token / 流式返回**。调度时序到 `Dispatch`/`accepted` 结束；请求完成/失败只作为异步统计回执。
 
 ---
 
-## 1. L0 请求环：一次选路
+## 1. L0 请求环：hook 与请求分开
 
 ```mermaid
 sequenceDiagram
@@ -17,85 +27,76 @@ sequenceDiagram
     participant G as Gateway
     participant R as SC
     participant KVT as KVT
-    participant Q as 队列
     participant W as vLLM-Ascend
     participant K as kvcm
 
-    C->>G: request + HookEnvelope
-    G->>R: 透传（鉴权/限流已做）
-    R->>R: 解析前缀 hash 链
-    R->>KVT: Match(ns, hashes, 候选节点)
-    KVT-->>R: 命中/tier/置信度/as-of
-    R->>R: 过滤约束（HBM 命中/PD/混部）
-    R->>R: 打分（命中/传输/队列/SLO/future/risk）
-    R->>Q: 入队（优先级）
-    R->>W: Dispatch(node, hint)
+    Note over C,R: 请求前：hook 是独立消息
+    C->>G: PRE_ANNOUNCE(session, prefix, eta, retention)
+    G->>R: hook
+    R->>K: KVIntent(PREFETCH/RETAIN)（异步）
+    K-->>R: ACCEPTED（不阻塞后续）
+
+    Note over C,W: 请求到达
+    C->>G: request + hint
+    G->>R: request
+    R->>KVT: Match(prefix, 候选节点)
+    KVT-->>R: 命中/介质/置信度
+    R->>R: mode = policy(请求类型, 模型部署)
+    R->>R: 打分（命中/传输/队列/SLO）
+    R->>W: Dispatch(target, mode, hint)
     R->>KVT: 写“预测”条目（短 TTL）
-    R-->>K: 异步 KVIntent（prefetch/retain）
-    W-->>R: 首 token/结果
-    R-->>G: 流式返回
-    G-->>C: 流式返回
 ```
 
 要点：
 
-- KVT 查询是纯内存，<5ms；miss 回退权威不在 L0 热路径（可选异步）。
-- 预取 intent 不阻塞本次请求；READY 回写由 L1/摄入层处理。
-- “预测”条目只用于同批请求的亲和，不参与 HBM 命中判定。
+- **hook 不是请求**：它可以在请求前触发预取/保留；请求到达后也可以补发 KVIntent，但不是唯一来源。
+- **hint 不是 KVIntent**：hint 是本次请求的路由提示；KVIntent 是给 kvcm 的异步动作。
+- **预测条目**只用于同批请求的亲和，避免一批请求被全部打散；它不是 agent intent，也不参与 HBM 命中判定。
+- KVT 查询是纯内存；miss 当作“无命中”处理，异步对账只修索引，不在 L0 热路径查 master。
 
 ---
 
-## 2. L0：HBM 命中 / PD / 混部分支
+## 2. L0：HBM 命中 / PD / 混部
 
 ```mermaid
 flowchart TB
     S["请求"] --> H["KVT.Match"]
-    H --> D{"连续 HBM 命中 ≥ 阈值<br/>且置信度 ≥ 0.9?"}
-    D -->|"是"| DD["HBM 命中<br/>跳池加载 + 残差 prefill"]
-    D -->|"否"| P{"PD 拓扑可用?"}
-    P -->|"是"| PD["PD 分离<br/>P 产出 → 传输 → D"]
-    P -->|"否"| CO["混部<br/>同节点完成"]
-    DD --> O["下发"]
+    H --> D{"连续 HBM 已确认命中 ≥ 阈值<br/>且置信度 ≥ 0.9?"}
+    D -->|"是"| HB["HBM 命中<br/>跳过池加载，只算剩余 token"]
+    D -->|"否"| M{"按请求类型/模型部署选 mode"}
+    M -->|"agent / 长上下文（PD 部署）"| PD["PD 分离"]
+    M -->|"模型只有混部"| CO["混部"]
+    HB --> O["下发"]
     PD --> O
     CO --> O
 ```
 
 注意：
 
-- “Pool 命中”包括本机 DRAM 与远端池；本机 DRAM 走本地读，省跨机传输。
-- **PD 不是由 BW* 开关的**：agent/长上下文默认 PD；`BW*` 只用于判断“传还是重算/能不能掩盖”，拓扑不可用才退回混部。
-- kvcm READY 只说明本机 DRAM 有副本；它不能直接让 L0 认定 HBM 命中。
+- PD 不是“拓扑可用”的运行时开关，而是 **`policy(请求类型, 模型部署)`**：agent/长上下文默认 PD；模型只有混部部署时才混部。
+- `BW*` 只用于“传 vs 算/能否掩盖”，不是 PD 开关。
+- kvcm READY 只说明本机 DRAM 有副本，不能直接让 L0 认定 HBM 命中。
 
 ---
 
-## 3. L1：预取 → READY（本机 DRAM）→ 回写
+## 3. L1：预取接口
 
 ```mermaid
 sequenceDiagram
     participant R as SC
     participant K as kvcm
-    participant M as Mooncake
-    participant W as 目标实例
-    participant KVT as KVT
 
-    R->>K: SubmitIntent(PREFETCH, P→B, deadline, budget)
-    K->>K: 幂等/前缀闸/预算检查
-    K->>M: create_copy_task(keys, B.seg)
-    M->>W: 派任务给源 seg client
-    W->>M: RDMA 复制
-    M-->>K: CopyEnd
-    K->>M: batch_query_keys / 核验副本（全 rank）
-    M-->>K: Ready
-    K-->>R: READY / 补发 BlockStored（medium=CPU）
-    R->>KVT: 写“已确认（本机 DRAM, B）”
-    Note over R,K: 超时：abandon + 按最新 KVT 重算
+    R->>K: SubmitIntent(PREFETCH, prefix, target, deadline, budget)
+    K-->>R: ACCEPTED / REJECTED
+    K-->>R: READY(DRAM) / FAILED（异步）
+    R->>R: KVT 写“已确认（本机 DRAM）”
 ```
 
 要点：
 
-- READY 写的是 **DRAM tier**，不是 HBM。
-- 第一次请求仍从 DRAM 读进 HBM；收益是省跨机传输。
-- 若要让 HBM 也有副本，走方案 A 壳请求（`max_tokens=1`）或引擎自己的加载/APC。
+- D8b 只画 SC↔kvcm 接口；`create_copy_task`、copy、verify 等控制面内部步骤见 D9/D2。
+- READY 是 **DRAM tier**，不是 HBM；第一次请求仍从 DRAM 读进 HBM。
+- 要 HBM 副本，走方案 A 壳请求或引擎自己的加载/APC。
 
 ---
 
@@ -106,21 +107,16 @@ sequenceDiagram
     participant A as Agent
     participant R as SC
     participant K as kvcm
-    participant M as Mooncake
+    participant W as 目标实例
 
     A->>R: POST(pause, session S, eta)
-    R->>R: 计算保留价值 Net(T)
+    R->>R: 计算保留价值
     R->>K: RETAIN(S, TTL, class)
-    K->>K: 注册 keepalive（有界）
-    loop TTL/3
-        K->>M: ExistKey/BatchExistKey（续租）
-    end
+    K-->>R: ACCEPTED
     A->>R: 恢复请求
-    R->>R: KVT.Match：S 的前缀仍在 B
-    R->>A: 路由到 B（本机 DRAM 读）
-    A->>R: Close
+    R->>W: Dispatch(会话亲和 / 本机 DRAM)
+    A->>R: POST(close, S)
     R->>K: RELEASE(S)
-    K->>K: 停 keepalive → lease 到期 → 池驱逐兜底
 ```
 
 要点：
@@ -138,18 +134,16 @@ sequenceDiagram
     participant L2 as SC L2
     participant O as 外部编排
     participant N as 新实例
-    participant K as kvcm
     participant R as SC L0
-    participant KVT as KVT
+    participant K as kvcm
 
     L2->>L2: 预测需求 / 选池 / 预算约束
     L2->>O: ScaleOut(pool, +1)
     O->>N: provision + load weights
     N->>R: register(warming)
     L2->>K: 预热 hot/hook 前缀到 N
-    K->>K: copy + verify
-    K-->>KVT: READY / BlockStored（DRAM）
-    KVT-->>L2: coverage
+    K-->>R: READY(DRAM)
+    R->>R: coverage
     alt coverage ≥ W_min 或 deadline
         L2->>R: ready，route_weight=1
     else 未达标
@@ -159,9 +153,9 @@ sequenceDiagram
 
 要点：
 
-- 预热门控的覆盖率默认按“本机 DRAM 已确认”算；HBM 覆盖是加分项，不是 Ready 的必要条件。
-- 新节点在 warming 期间不接/低权重接流量。
-- warm 可与权重加载重叠；`T_ready = provision + gate + warm` 要满足 <10s 目标。
+- 预热门控的覆盖率按“本机 DRAM 已确认”算；HBM 覆盖是加分项，不是 Ready 的必要条件。
+- 新节点 warming 期间不接/低权重接流量。
+- `T_ready` 的目标由 SLO/部署决定；本文不设固定秒数。
 
 ---
 
@@ -172,17 +166,12 @@ sequenceDiagram
     participant L2 as SC L2
     participant R as SC L0
     participant K as kvcm
-    participant M as Mooncake
     participant O as 外部编排
 
-    L2->>L2: 缩容节点 = argmax(gain − loss)
+    L2->>L2: 选“净收益最大”的缩容节点
     L2->>R: 标记“下线中”(缩容节点)
     R->>R: 停止新请求；在途继续
     L2->>K: DrainPlan(缩容节点, targets, deadline)
-    K->>M: CreateDrainJob / move / retain
-    loop 进度
-        K->>K: 查询/重试/verify
-    end
     alt 成功
         K-->>L2: 已下线
         L2->>O: remove(缩容节点)
@@ -194,9 +183,9 @@ sequenceDiagram
 
 要点：
 
-- 缩容节点不是按 LIFO 选；看唯一热 KV、会话风险、迁移成本。
-- 下线卡住不硬删。
-- 迁移失败按最新状态重算，不写预设降级链。
+- `gain(v)` 是释放出的容量价值；`loss(v)` 是唯一热 KV、会话风险、迁移成本；**选 `gain − loss` 最大的节点**。
+- 不是 LIFO；有活跃会话/唯一热 KV 的节点优先保留。
+- 下线卡住不硬删；迁移失败按最新状态重算。
 
 ---
 
@@ -204,20 +193,15 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant M as Mooncake
     participant K as kvcm
     participant L2 as SC L2
     participant R as SC L0
-    participant KVT as KVT
 
-    M-->>K: 水位/驱逐事件（或 admin 查询）
-    K-->>L2: PoolCapacity
+    K-->>L2: PoolCapacity（水位/驱逐/池压）
     L2->>L2: 判断：冷前缀多 / 容量真不够
     alt 冷前缀多
-        L2->>K: DEMOTE/停保活（软路径）
-        K->>K: 等驱逐/落盘
-        K-->>KVT: 更新 tier
-        R->>R: 不再本地读，改远端/重算
+        L2->>K: DEMOTE / 停保活（软路径）
+        K-->>R: tier 更新（异步）
     else 容量真不够
         L2->>L2: 扩 KV 池 / 加 DRAM 节点
     end
@@ -238,46 +222,19 @@ sequenceDiagram
     R->>W: Dispatch(P)
     W-->>R: 本地 miss（副本不在了）
     R->>KVT: MISS_FEEDBACK(P, B)
-    KVT->>KVT: B 的 loc → Stale/删除
-    R->>K: VERIFY(P, B)（抽样/热条目）
-    K-->>KVT: LOST / OK
-    R->>R: 本次走远端读/重算；下次换节点
+    R->>R: 本次按“无命中”重选
+    R->>K: 异步 KV 对账/修索引
 ```
 
 要点：
 
 - **Ghost（幽灵条目）**：索引有、池里没了；请求被送到空节点。只损性能，不损正确性。
-- miss 反馈是最便宜的 KV 对账。
-- 不要把“查询失败”当成“副本丢失”。
+- miss 不在 L0 热路径查 master；本次按无命中处理，异步对账只修索引。
+- 没有预设降级链；用最新状态重跑同一个决策函数。
 
 ---
 
-## 9. 多 SC 实例：L2 leader
-
-```mermaid
-sequenceDiagram
-    participant R1 as SC-1
-    participant R2 as SC-2
-    participant E as etcd
-    participant O as 外部编排
-    participant K as kvcm
-
-    R1->>E: 抢 lease /scheduling/leader
-    R2->>E: 抢 lease（失败，standby）
-    loop leader 任期
-        R1->>R1: L2 决策
-        R1->>O: ScaleDecision
-    end
-    E--xR1: lease 过期
-    R2->>E: 抢到 lease
-    R2->>R2: 从最新 KVT/权重继续
-    R1-->>K: 仍可发 KVIntent（幂等）
-    R2-->>K: 仍可发 KVIntent（幂等）
-```
-
----
-
-## 10. 联合场景：Agent 多轮全链路
+## 9. 联合场景：Agent 多轮
 
 ```mermaid
 sequenceDiagram
@@ -288,37 +245,35 @@ sequenceDiagram
     participant W as vLLM-Ascend
     participant M as Mooncake
 
-    A->>G: PRE_ANNOUNCE(S, P, B, eta 30s)
+    A->>G: PRE_ANNOUNCE(S, P, eta 30s)
     G->>R: hook
-    R->>R: KVT：P 在 A，B 无
     R->>K: PREFETCH(P→B) + RETAIN
-    K->>M: create_copy_task
-    M-->>K: CopyEnd
-    K-->>R: READY（B 的 DRAM）
-    R->>R: KVT：B 的本机 DRAM 已确认
+    K->>M: 预取（控制面内部，D9 展开）
+    K-->>R: READY（B 的本机 DRAM）
+    R->>R: KVT：B 的 DRAM 已确认
 
     A->>G: 请求（P + 新内容）
     G->>R: request
-    R->>R: Match：B 本机 DRAM 命中
-    R->>W: Generate(COLOCATED / 本地读, B)
-    W-->>R: 首 token；之后 B 的 APC 可能有 HBM 副本
+    R->>W: Dispatch(B, 混部/本地读)
+    R->>KVT: 写“预测”条目（短 TTL）
 
     A->>G: POST(pause)
     G->>R: hook
     R->>K: RETAIN(TTL)
-    Note over K: keepalive 续租
 
     A->>G: 恢复请求
     G->>R: request
-    R->>W: 路由到 B（若 HBM 命中则跳池加载）
+    R->>W: Dispatch(B；HBM 命中则跳过池加载，只算剩余 token)
 ```
 
 ---
 
-## 11. 读图要点
+## 10. 读图要点
 
-- **L0 不阻塞**：所有 KV intent 都是异步；请求走当前最优路径。
-- **READY 是 DRAM 回写事件**：KVT 的“本机 DRAM 已确认”以 kvcm READY/引擎事件为准；HBM 命中需要 HBM 证据。
-- **L2 只出决策**：扩容执行在外部编排；kvcm 只执行 KV 搬迁。
-- **失败不用预设降级链**：按最新 KVT/权重重算；读路径兜底不算“降级链”。
-- **多 SC 实例**：请求环可水平扩；L2 单 leader；intent 幂等。
+- **hook 是独立消息**，不是请求；它可以在请求前触发 KVIntent。
+- **hint 是路由提示**，不是 KVIntent；“预测条目”也不是 hook。
+- **调度时序不画首 token / 流式返回**；调度到 Dispatch 结束。
+- **READY 是 DRAM 回写事件**，不是 HBM 命中；HBM 命中需要 HBM 证据。
+- **PD 由请求类型/模型部署决定**，不是“拓扑可用”开关。
+- **miss 按无命中处理**，异步对账只修索引；没有固定降级链。
+- 多 SC 实例暂不考虑；单 SC 假设下 L2 不需要 leader 选举。
