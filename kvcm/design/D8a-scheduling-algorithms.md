@@ -360,9 +360,9 @@ s.t. Σ x_i × bytes_i ≤ B_budget
 
 ![预取 EV 与保留时间](figures/algo-prefetch-ev.svg)
 
-> 参数：128K 上下文（V3.2，`S_bytes≈11.0GB`）、`S_saved≈2200ms`（命中率 +10% 省下的 prefill）、`λ=1/300`、`C_copy≈462ms`（A3 ROCE 23.8GB/s 参考一次搬运）。曲线先升后降：太早预取白占内存，太晚赶不上请求。
+> 参数：128K 上下文（V3.2，`S_bytes≈11.0GB`）、`S_saved≈4.67s`（128K，90%→99% 的拟合 TTFT 差）、`λ=1/300`、`C_copy≈462ms`（A3 ROCE 23.8GB/s 参考一次搬运）。曲线先升后降：太早预取白占内存，太晚赶不上请求。
 
-**注意 `C_copy` 与 `S_saved` 的量级**：128K 时一次跨机搬运约 462 ms，而防住一次重算省 2200 ms——比值约 4.8:1。到 1M 时两者都放大，但比值不变（都随 `P` 线性）。
+**注意 `C_copy` 与 `S_saved` 的量级**：128K 时一次跨机搬运约 462 ms，而 90%→99% 的 TTFT 差约 4.67s——比值约 10:1。到 1M 时两者都放大，但比值不变（都随 `P` 线性）。
 
 **收益**：预取 ROI 可算；带宽按价值密度分配，不被低价值预热打爆。
 
@@ -384,7 +384,7 @@ break-even: μ × p0 × exp(−μT) × T_prefill = c_h × bytes
 
 ![保留 TTL 盈亏平衡](figures/algo-retention-ttl.svg)
 
-> 参数：128K 上下文、`S_saved≈2200ms`、`p0=1`、`μ=1/600`、占用成本按 11.0 GB × 0.5 ms/(GB·s) 计。曲线的零点就是最优 TTL 上界。
+> 参数：128K 上下文、`S_saved≈4.67s`、`p0=1`、`μ=1/600`、占用成本按 11.0 GB × 0.5 ms/(GB·s) 计。曲线的零点就是最优 TTL 上界。
 
 ### 5.2 等级选择
 
@@ -604,81 +604,58 @@ L2 更新权重；L0/L1 只读：
 
 ## 8. 整体收益：从算法到账
 
-### 8.1 延迟量级
+### 8.1 实测拟合：单实例 TTFT
 
-> 本机 H2D 按 950 实测：单机 UB_CTP 约 47GB/s、POD 约 93GB/s（两种场景，不并列成区间）。**950 跨机 H2D 没有实测数**；下表跨机列用 A3 910C 的 ROCE 23.8GB/s 作保守参考（A3 FabricMem 可到 78–107GB/s），不是 950 结论。V3.2 的布局是 `61 层 × 1408B = 85,888B/token = 83.9KiB`（BF16）；FP8 约减半。V4-Pro 是 `≈9.6KiB/token`，1M 约 9.85GB。换模型/精度要重算。800Gbps 是链路口径，不等于有效 H2D；换拓扑必须重测。950 H2D 口径见 [hixl performance](https://gitcode.com/cann/hixl/blob/master/benchmarks/performance.md)、[MindCluster 工具](https://www.hiascend.com/document/detail/zh/mindcluster/latest/toolbox/toolboxug/toolboxug_0015.html)、[Ascend 950DT 测量](https://gitcode.com/cann/cannbot-knowledge/blob/master/knowledge/common/platforms/concepts/ascend950dt_measured_observations.md)、[MindIE 拓扑带宽诊断](https://gitcode.com/Ascend/MindIE-SD/blob/5cda9fbf4aa60c5b893c4ce3b926f8344c1dc838/.agents/skills/parallelism-strategy/references/ascend-topology-bandwidth-diag.md)。
-
-![KV 路径成本](figures/algo-latency-stack.svg)
-
-> 参数：DeepSeek V3.2 口径 `bytes_per_token=83.9KiB`（85,888B）、`L=61`；`v_prefill=5900 token/s` 是示例输入，不是 V3.2 实测；跨机 `BW_storage=23.8GB/s`（A3 ROCE 参考）、本机 `BW_h2d=47GB/s`（UB_CTP Server；POD 约 93GB/s）。
-
-#### V3.2：KV 大小与传输时间
-
-`S_bytes` 按十进制 GB 计（85,888B/token × P / 1e9）。
-
-| context | `S_bytes` | 跨机 ROCE 23.8GB/s（A3 参考） | 本机 H2D 47GB/s | 每层跨机（61 层） |
-|---|---:|---:|---:|---:|
-| 32K | 2.75 GB | 115 ms | 58 ms | 1.5 ms |
-| 64K | 5.50 GB | 231 ms | 117 ms | 2.9 ms |
-| 128K | 10.99 GB | 462 ms | 234 ms | 5.9 ms |
-| 256K | 21.99 GB | 924 ms | 468 ms | 11.7 ms |
-| 512K | 43.98 GB | 1848 ms | 936 ms | 23.4 ms |
-| 1M | 85.89 GB | 3609 ms | 1827 ms | 45.7 ms |
-
-V3.2 的 1M KV 仍近 86GB；高命中率下传输是纯加项，能不能掩盖仍由命中率决定。
-
-#### V4-Pro 对照：KV 小 8.7 倍
-
-V4-Pro 的 1M KV 约 9.85GB（≈9.6KiB/token），同样带宽下：
-
-| context | `S_bytes` | 跨机 ROCE 23.8GB/s（A3 参考） | 本机 H2D 47GB/s |
-|---|---:|---:|---:|
-| 32K | 0.32 GB | 13 ms | 7 ms |
-| 128K | 1.26 GB | 53 ms | 27 ms |
-| 512K | 5.04 GB | 207 ms | 105 ms |
-| 1M | 9.85 GB | 414 ms | 210 ms |
-
-所以 V4-Pro 的传输瓶颈比 V3.2 小约 8.7 倍；它的主矛盾更可能在计算/队列，而不是 KV 搬运。
-
-#### 掩盖阈值
+设备 A（950）的实测数据是**单实例**，拟合公式：
 
 ```text
-T_compute = (1 − hit) × P / v_prefill
-T_transfer = P × bytes_per_token / BW
-能掩盖 ⇔ T_compute ≥ T_transfer
-        ⇔ (1 − hit) ≥ v_prefill × bytes_per_token / BW
+TTFT_fit = c + (1 − hit) × (a·N + b·N²)
 ```
 
-左边 `1−hit` 是未命中比例；右边是“每 token 传输时间 / 每 token 重算时间”。
-`hit < 阈值` 表示“未命中比例足够大，有足够多计算可掩盖传输”；`hit > 阈值` 表示“传输主导，掩盖不住”。
+`N` 为 K-token；每个模型独立拟合：
 
-按 A3 ROCE 23.8GB/s、H2D 47GB/s、H2D 93GB/s：
+| 模型 | c | a | b | R² | relative RMSE |
+|---|---:|---:|---:|---:|---:|
+| V3.2 | 0.0106 | 0.1929 | 0.0016629 | 0.99999 | 4.38% |
+| V4-Pro | 0.0259 | 0.1856 | 0.0003338 | 0.99997 | 7.05% |
 
-| 模型 | 跨机 ROCE | 本机 47GB/s | 本机 93GB/s |
-|---|---:|---:|---:|
-| V3.2（83.9KiB/token） | hit < 97.9% | hit < 98.9% | hit < 99.45% |
-| V4-Pro（≈9.6KiB/token） | hit < 99.76% | hit < 99.88% | hit < 99.94% |
+这个式子只描述**单实例、APC 命中**的 TTFT，不含跨机传输。4K/99% 时 V3.2 拟合值只有 18.6ms，小于 4K KV 的本机 H2D（约 58ms），说明它更接近 **HBM/APC 命中基线**，不能把 H2D 再算进去。
 
-`v_prefill=5900` 是示例输入；它一变，阈值跟着变，必须用 V3.2/V4-Pro 各自的 950 真机 prefill 数据校准。
+#### 拟合结果（秒）
 
-#### 高命中率下的实际代价（V3.2，99%）
+| 命中率 | V3.2 128K | V3.2 512K | V3.2 1M | V4-Pro 128K | V4-Pro 512K | V4-Pro 1M |
+|---|---:|---:|---:|---:|---:|---:|
+| 56% | 22.86 | 235.27 | 854.14 | 12.88 | 80.33 | 237.63 |
+| 90% | 5.20 | 53.48 | 194.13 | 2.95 | 18.28 | 54.03 |
+| 99% | 0.530 | 5.36 | 19.42 | 0.318 | 1.85 | 5.43 |
 
-| context | residual | 跨机 `T_kv`（A3 参考） | 本机 `T_kv` | 差值 |
+#### 跨机/本机怎么加
+
+拟合是 HBM 命中基线，所以：
+
+```text
+TTFT_local ≈ TTFT_fit + T_h2d
+TTFT_cross ≈ TTFT_fit + T_transfer
+跨机相对本机的额外代价 = T_transfer − T_h2d
+```
+
+99% 命中、A3 ROCE 23.8GB/s、H2D 47GB/s：
+
+| 模型/上下文 | 拟合 | 本机 +H2D | 跨机 +ROCE | 额外代价 |
 |---|---:|---:|---:|---:|
-| 32K | 320 | 169 ms | 113 ms | 57 ms |
-| 128K | 1,280 | 679 ms | 451 ms | 228 ms |
-| 512K | 5,120 | 2716 ms | 1804 ms | 912 ms |
-| 1M | 10,000 | 5304 ms | 3522 ms | 1782 ms |
-
-差值约等于 `T_transfer`：**一旦不能掩盖，跨机那一段是纯加项。**
-
-再叠上 batch 效应（§1.1）：跨机的那 1.85s（512K）不是只拖慢这一个请求，是拖慢整个 batch 这一步。
+| V3.2 128K | 0.530s | 0.764s | 0.992s | 0.228s |
+| V3.2 512K | 5.36s | 6.29s | 7.21s | 0.91s |
+| V3.2 1M | 19.42s | 21.25s | 23.03s | 1.78s |
+| V4-Pro 128K | 0.318s | 0.345s | 0.371s | 0.026s |
+| V4-Pro 512K | 1.85s | 1.96s | 2.06s | 0.10s |
+| V4-Pro 1M | 5.43s | 5.64s | 5.84s | 0.20s |
 
 #### 结论
 
-1. **V3.2 在 ≥99% 命中时是带宽压力案例**：1M KV 约 86GB，跨机 ROCE 参考约 3.6s；99% 命中时 residual 计算约 1.7s，传输 3.6s > 计算，掩盖不住。命中率更低时计算变多，传输可以被掩盖。
-2. **V4-Pro 是压缩对照，但“传输不是主矛盾”有条件**：1M KV 约 9.85GB，99% 命中时传输约 0.41s < residual 计算约 1.7s，可以掩盖；但命中率 >99.76% 后传输仍会主导。它是否成为主矛盾，取决于实际 `v_prefill` 和命中率。
-3. **掩盖阈值**：V3.2 跨机约 97.9%、本机 47GB/s 约 98.9%；V4-Pro 都在 99.7% 以上。不能把两套阈值混用。
+1. **V3.2 对跨机更敏感**：1M/99% 额外约 1.78s（约 8% 的跨机 TTFT），512K 约 0.91s（约 13%）。
+2. **V4-Pro 的额外代价小得多**：1M 约 0.20s（约 3.5%），512K 约 0.10s（约 5%）。
+3. **不能说“V3.2 就是带宽压力、V4 就不是”**：1M 高命中时计算仍占大头；短上下文时传输占比高，但绝对时间小。是否存在带宽压力，必须按上下文和命中率算。
+4. **不再用单阈值**：没有常数 `v_prefill` 就没有 97.9%/98.9% 这种单阈值；用上面的拟合 + 额外代价表。
 
 ### 8.2 吞吐/成本
 
@@ -691,8 +668,8 @@ ROI = saved / cost
 
 例子（命中率 +10%）：
 
-- 128K、2 QPS：每请求省 `0.1 × 128000 / 5900 ≈ 2.2 s`，合计 **4.3 GPU·s/s**；
-- 1M、0.5 QPS：每请求省 `0.1 × 1M / 5900 ≈ 16.9 s`，合计 **8.5 GPU·s/s**。
+- 128K、2 QPS：90%→99%，TTFT `5.20s → 0.530s`，省 `4.67 s/请求`，合计 **9.35 s/s**；
+- 1M、0.5 QPS：`194.13s → 19.42s`，省 `174.7 s/请求`，合计 **87.4 s/s**。
 
 长上下文的单请求收益大，但 QPS 天然低；短上下文 QPS 高但单请求收益小。两者相乘后的量级接近。
 
@@ -799,7 +776,7 @@ ROI = saved / cost
 | `w_hit/w_transfer/w_q/w_slo` | 量纲归一后 1.0 | 离线回放 + 真机 A/B |
 | `BW*` | 由公式算 | 网卡/链路实测 |
 | `P_use` / `λ` | 历史 ETA/复用率 | trace 拟合 |
-| `v_prefill` | 5900 token/s（整实例，**输入假设**） | 真机 prefill 压测：`tokens / prefill_step_time`；cmx-sim 设备 A（950）的 Qwen3-235B noCacheTPS 为 8741/5403 @4K/16K；V3.2/V4-Pro 需单独测，5900 是示例输入，不是 cmx-sim 直接值 |
+| `TTFT_fit` 的 c/a/b | 设备 A 拟合值 | 用 `tools/cmx-sim/measured.js` 的 `buildFit`；换模型/设备重拟 |
 | `TTL` | 由 `Net(T)` 算 | 会话恢复分布 |
 | `ρ_target` | 0.7–0.8 | 真机压测 |
 | `W_min` | 0.6–0.8 | 冷启动/命中权衡 |
