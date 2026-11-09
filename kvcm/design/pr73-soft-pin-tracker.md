@@ -2,15 +2,15 @@
 
 > **性质：临时文档。** 本文件只属于 `feat/kvcm-soft-pin` 这个 stacked PR；**合入前必须删除**，PR 描述注明“临时跟踪文档已删除”。
 >
-> 本 PR 基于已推送的 #81（`feat/kvcm-demote-promote`）；只列 soft pin 增量。
+> 本 PR 基于已合入的 #81（`main` @ `ddfc4c4`）；只列 soft pin 增量。
 
 ## Stack
 
 | PR | 分支 | base | 内容 |
 |---|---|---|---|
-| core | #80 已合入 main | — | move/remove/admin、prefetch/TaskEngine/daemon、keepalive |
-| demote/promote | #81 | `main`（含 #80） | demote / promote / PromoteFlow |
-| soft pin | `feat/kvcm-soft-pin` | #81 | native 空写、pin(SOFT)、NoF |
+| core | #80 已合入 | — | move/remove/admin、prefetch/TaskEngine/daemon、keepalive |
+| demote/promote | #81 已合入 | — | demote / promote / PromoteFlow |
+| soft pin | `feat/kvcm-soft-pin` | `main` | native 空写、pin(SOFT)、NoF |
 
 ## Scope
 
@@ -76,8 +76,9 @@
 
 ## 跨 PR
 
-- A06 / A16 / A17 继续 DEFER；见 core tracker。
-- R07/R10/R11/R12/A09–A13/R17 已在 core/demote 处理；R13（`pin(HARD)` 拒绝）在本 PR。
+- A16：OPEN、上线前必修、不挡合入（#81 已定口径；影响面含 `check_promote` / `promote`）。
+- A06 / A17 / 多 flow 分发：DEFER。
+- R13（`pin(HARD)` 拒绝）在本 PR。
 
 ## 合入前删除清单
 
@@ -89,4 +90,4 @@
 ## 维护日志
 
 - **2026-11-04**：从 core/demote tracker 拆出；补“`pin` 的 `exists` 自授 lease 在 gate 版本触发 Case C”的升级耦合，写入 D2 §2 和代码注释。
-- **2026-11-09**：rebase 到 #81 tip（PromoteFlow 整包 + CI 修复）；summary 冲突保留整包口径并把 soft pin 标为有条件可用；PrefetchFlow 超时在 3.9 接住 `asyncio.TimeoutError`。
+- **2026-11-09**：#81 合入后改 cherry-pick 到 `main`；summary 保留 #81 闸/`run_after_exists` 口径，soft pin 标为有条件可用；A16 与 #81 对齐为 OPEN。
