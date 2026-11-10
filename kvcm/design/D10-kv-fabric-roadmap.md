@@ -61,15 +61,6 @@ session close → 可以释放
 
 KV 是**会话级缓存**，不是 Agent 的状态本身。状态在应用/服务端；KV 只是加速。
 
-分支就是不同 messages：
-
-```text
-[history] + "方案 A"
-[history] + "方案 B"
-```
-
-引擎按 token hash 命中共享前缀。
-
 **namespace 必须带**：
 
 ```text
@@ -168,8 +159,22 @@ flowchart LR
 
 FinOps = 把 KV 的字节、带宽、保留时间做成**可见、可归因、可预算、可计价**的单位经济效益；不是账单系统。
 
+变量：
+
+| 变量 | 含义 | 单位 |
+|---|---|---|
+| `GB_tier` | 某层副本容量 | GB |
+| `H` | 保留时长 | 小时 |
+| `p_mem` | 内存单价 | 元 / GB·小时 |
+| `GB_xfer` | 传输量 | GB |
+| `p_bw` | 传输单价 | 元 / GB |
+| `GPU_s` | 预热 GPU 秒 | GPU·秒 |
+| `p_gpu` | GPU 单价 | 元 / GPU·秒 |
+
 ```text
-单会话成本 = Σ(bytes × T × c_mem) + Σ(transfer × c_bw) + prewarm 成本
+单会话成本 = GB_tier × H × p_mem
+           + GB_xfer × p_bw
+           + GPU_s × p_gpu
 毛利 = 收入 − 单会话成本
 ```
 
@@ -186,12 +191,17 @@ MTTR 降低 = 故障恢复时间（冷启动/重建） − 热备接管时间
 ### 5.3 负载整形 / 会话 resume 的一阶判断
 
 ```text
-负载整形值得 ⟺ P_reuse × T_prefill × c_gpu > transfer + 副本驻留成本
+复用收益 = P_use × T_prefill × p_gpu
+复用成本 = GB_tier × H × p_mem + GB_xfer × p_bw
 
-resume 值得 ⟺ P_resume × T_prefill × c_gpu > retain + transfer
+值得 ⟺ 复用收益 > 复用成本
 ```
 
-两个式子都只看“省下的重算”是否大于“复制/保留/传输成本”；具体数值用实测代，不要用拍脑袋常数。
+- `P_use`：未来真的复用的概率；
+- `T_prefill`：一次复用省下的重算时间（秒）；
+- `p_gpu`：GPU 单价（元 / GPU·秒）。
+
+负载整形和会话 resume 只是 `P_use` 和成本项不同，不需要两套公式。具体数值用实测代，不要用拍脑袋常数。
 
 ---
 

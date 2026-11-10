@@ -97,7 +97,7 @@ flowchart TB
 
 **怎么做**：
 
-- 按 `hotness × age × P_ghost` 抽样，不做全量 diff；
+- 按热度、年龄、ghost 风险抽样，不做全量 diff；
 - 用零副作用 admin 查询；查询失败与“副本丢失”分开；
 - 输出去重后的 `LOST/REMOVED/MOVED` 事实，供 D8 KVT 消费。
 
