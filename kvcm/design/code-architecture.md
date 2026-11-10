@@ -277,7 +277,7 @@ stateDiagram-v2
 | 能力 | mooncake 0.3.11（历史部署） | mooncake 目标版本 v0.3.13.post1（当前基线；代码里沿用 main 名字） | 出处 |
 |------|------------------------------|----------------------------|------|
 | has_lease（读续租） | RPC ✓ 通道 ✓（`is_exist`） | RPC ✓ 通道 ✓ | D2 F9 |
-| soft pin 事后加（空写） | RPC ✓ 通道 ✗（0.3.11/0.3.12） | RPC ✓ 通道 ✓（有条件可用：Case B + 方案 1 收尾；`exists`+`renew_once`+二次 query；链 `libmooncake_store.so`；A14 已验。残余：不匹配 Revoke→Erase、A15 地址复用、End 失败留 PROCESSING。L2 未接） | D2 §2 / F12 |
+| soft pin 事后加（空写） | RPC ✓ 通道 ✗（0.3.11/0.3.12） | RPC ✓ 通道 ✓（有条件可用：方案 1；A14 已验。**A15** 地址复用=精度风险，书面接受；不匹配 Revoke→Erase 可重算。L2 未接） | D2 §2 |
 | hard pin 事后改标记 | ✗（创建时固化，`pin(HARD)` 拒绝；要 lease 保护用显式 `register_keepalive()` + `renew_once`。lease 是 master 的 `default_kv_lease_ttl`，kvcm 不改） | ✗ | D2 §2 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源，且 `source` 必填） | ✗ | D2 F7 |
 | has_offload / has_promotion（池通道降层/提回） | 降层通道 ✗（`/batch_query_keys` 无 disk 字段，主线 #2685 才加）。提回 ✓（`GetReplicaList`） | 降层 ✓：停保活 → 满 lease TTL → 确认 LOCAL_DISK。提回：L3 promote；PromoteFlow ±target；intent 经 TaskEngine，闸仅 copy | D2 §3 |
@@ -358,7 +358,7 @@ stateDiagram-v2
 
 **自封装 .so**（已落地的缺口只有空写 upsert。保留身份不在这份主线里，不用这个 .so 去补）：
 
-- 已落地的空写：有条件可用（v0.3.13.post1）。`_empty_pin.so` 链 `store.so` + `libmooncake_store.so`，本地 `mooncake_pin_api.h`，不改 mooncake。Case B 前置；收尾方案 1（匹配只 End；End 失败不 Revoke；不匹配 Revoke）。`pin`：`exists`+`renew_once`+二次 query。A14 已验；残余见 D2 §2。L2 未接。
+- 已落地的空写：有条件可用（v0.3.13.post1）。方案 1；A14 见 D2 §2。**A15** 精度风险书面接受。L2 未接。
 - 单 client：扩展必须用 `setup` 已建的那一个（`_get_pyclient_capsule`），禁止扩展内再 `RealClient::create()`。
   - 类型只写到 `master_client_`；偏移已与完整类对过。含 `pyclient.h` / `get_real_client()` 是退路，当前不走。
   - client_id：方案一（空写写成 kvcm UUID）。借名做不到。
@@ -604,7 +604,7 @@ sequenceDiagram
 - **实现通道**：`KeepaliveLoop` 定期调 `renew_once` → `exists`（`batch_is_exist` / BatchExistKey，读即续租）。`MooncakeBackend.register_keepalive` / `unregister_keepalive` 只登记/注销同一张 Ledger 表，不改成 ProbeKey
 - **形态**：协程定时器（事件循环内 `asyncio.sleep` 周期触发），不是独立线程
 - **已知限制（量未测）**：默认约每 5s `sweep_once`，对表里每个前缀做一次全 key `batch_is_exist`。请求量与 sweep 延迟没有基线；保活前缀多或单前缀很长时，sweep 可能拖过周期。限流 / 分批 / 按前缀错峰要等真机量过再改，core 不先加策略
-- **A16（OPEN，上线前必修，不挡合入）**：demote 停保活后，同前缀 `exists` / 预热 / `check_promote` / `promote` 会授 lease，可打穿 TTL 等待。修法：前缀级串行（`summary.md` A16）。本 PR 不修。
+- **A16（OPEN，上线前必修，不挡合入）**：demote 停保活后，同前缀 `exists` / 预热 / `check_promote` / `promote` / **`pin(SOFT)` 的 `exists`+`renew_once`** 会授 lease，可打穿 TTL 等待。修法：前缀级串行（`summary.md` A16）。不在 soft pin PR 修。
 
 ### ReleaseLoop / RetainLoop
 
