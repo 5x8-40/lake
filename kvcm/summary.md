@@ -253,16 +253,16 @@
 - 待定：KV 对账采样成本、用量账本回传、容量建议边界、下线搬迁/retain、保留/删除默认策略。
 
 
-**D10. KV Fabric 路线图（规划草案）** — 🟡 规划中
+**D10. KV Fabric 产品愿景** — 🟡 规划中
 
 - 北极星：把 KV 从“缓存”变成一等云资源——可放置、可复制、可迁移、可计价、可治理。
 - 价值金字塔：L1 省算力（命中/保留/预取）→ L2 省传输/负载（热点多副本/迁移）→ L3 新体验（Agent 会话保留/恢复、共享前缀）→ L4 新商业（FinOps/QoS/计费）。
 - 值得做的方向：KV 负载整形、Agent 会话保留/恢复、KV FinOps/QoS、容量数字孪生、KV HA/DR、跨集群 KV Fabric、KV 存储效率。
 - 三阶段：H1 省（负载整形+会话保留+FinOps 最小集）；H2 稳/省（容量孪生+HA/DR+QoS）；H3 新（跨集群+存储效率）。
 - 建议下注：KV 负载整形、Agent 会话保留/恢复、KV FinOps/QoS。
-- **应用契约（D10 §0.3）**：应用发 text/messages + 可选 hook，后端 tokenize 后查 hash；分支就是 messages，不需要 KV branch handle。
-- **不做（D10 §0.4）**：应用级 branch handle / `kv://` / 订阅 / `Probe` / raw KV 市场；Probe/订阅只留内部诊断。
-- **不是组件也不是第三个平面**（D10 §0.2）：是管理面+控制面合起来的终局形态。判据三件（§0.5）：应用不指定实例、决策自动、执行完备。
+- **应用契约（D10 §0.3）**：应用发 text/messages + 可选 hook，后端 tokenize 后查 hash；分支就是 messages。
+- **不做（D10 §7）**：应用级 KV 句柄 / `kv://` / 订阅；应用只发请求/hook。
+- **不是组件也不是第三个平面**（D10 §0.2）：是管理面+控制面合起来的终局形态；应用不指定实例，KV 由系统放置。
 - **与 SOTA 的差异**（D10 §6）：链式 hash/逐块匹配/事件→索引/推测索引都是标准做法；差异在**放置主动权**（能改变放置 vs 只路由）和**索引权威**（派生缓存 + master 权威；L0 miss 不同步查 master，异步对账）。
 - 工作文档：[D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md)。
 
