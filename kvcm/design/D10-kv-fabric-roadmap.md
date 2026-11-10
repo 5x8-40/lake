@@ -3,7 +3,7 @@
 - 状态: 产品愿景，不承诺排期；用于讨论“KV 作为资源”能做到什么。
 - 版本基线: Mooncake v0.3.13.post1；vLLM-Ascend 0.26 系
 - 上游: [D8](D8-joint-scheduling.md)（管理面）、[D9](D9-kv-services.md)（控制面）
-- 一句话: 把 KV 变成**系统可放置、可复制、可迁移、可计价**的资源；应用仍然只发请求。
+- 一句话: 把 KV 变成**系统可放置、可复制、可迁移（KV 数据）、可计价**的资源；应用仍然只发请求。
 
 ---
 
@@ -216,7 +216,6 @@ llm-d 自己的 pain-point 说明：只靠事件索引会留幽灵条目、需�
 | 风险 | 说明 | 对策 |
 |---|---|---|
 | 复制成本反噬 | 多副本吃 HBM/带宽，可能降低全局命中 | 收益/预算约束；副本 TTL；全局水位 |
-| 单会话不可拆 | 复制前缀不能拆 decode | 明确边界；未来做请求迁移 |
 | 引擎/池绑定 | 不同引擎 key/事件不同 | 控制面适配层；KeyComputer 隔离 |
 | tokenizer/template 漂移 | 同样文字产生不同 token，前缀不命中 | namespace 带 model/revision/tokenizer/template；固定模板 |
 | 数据合规 | KV 含 prompt/PII | 保留策略/审计/加密/地域 |
@@ -227,7 +226,8 @@ llm-d 自己的 pain-point 说明：只靠事件索引会留幽灵条目、需�
 
 - 应用级 KV API：`kv://` / 订阅；
 - 应用管理 KV 生命周期；
-- 第三个平面；
+- decode 并行（TP/SP/EP、sequence parallel）、请求迁移、跨实例 decode 调度——归引擎/D8，不是 KV Fabric；
+- 第三个平面。
 
 ---
 
