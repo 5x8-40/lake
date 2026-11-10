@@ -183,24 +183,6 @@ void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
     }
 }
 
-namespace {
-
-// 与 A14 / empty_pin.EXPECTED_ABI_LAYOUT 对齐；改 mooncake_pin_api.h 时同步改 Python 常量。
-py::dict abi_layout() {
-    py::dict out;
-    out["ObjectMeta"] = static_cast<int>(sizeof(mooncake::ObjectMeta));
-    out["ReplicateConfig"] = static_cast<int>(sizeof(mooncake::ReplicateConfig));
-    out["EndResult"] = static_cast<int>(sizeof(mooncake::EndResult));
-    out["PyClient.client_"] =
-        static_cast<int>(offsetof(mooncake::PyClient, client_));
-    out["Client.master_client_"] =
-        static_cast<int>(offsetof(mooncake::Client, master_client_));
-    return out;
-}
-
-}  // namespace
-
 PYBIND11_MODULE(_empty_pin, m) {
     m.def("empty_soft_pin", &empty_soft_pin);
-    m.def("abi_layout", &abi_layout);
 }

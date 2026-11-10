@@ -1999,48 +1999,8 @@ def test_empty_pin_extension_rejects_non_capsule() -> None:
     ext = pytest.importorskip("kvcm.native._empty_pin")
 
     assert callable(ext.empty_soft_pin)
-    assert callable(ext.abi_layout)
     with pytest.raises(TypeError):
         ext.empty_soft_pin("not-a-capsule", ["k"], [8], [0x1000], True)
-
-
-def test_empty_pin_abi_rejects_wrong_mooncake_version(monkeypatch) -> None:
-    from kvcm.native import empty_pin
-
-    monkeypatch.setattr(empty_pin, "mooncake_installed_version", lambda: "0.3.14")
-    with pytest.raises(RuntimeError, match="≠ 空写承诺"):
-        empty_pin.ensure_empty_pin_abi(ext=object())
-
-
-def test_empty_pin_abi_rejects_layout_mismatch(monkeypatch) -> None:
-    from kvcm.native import empty_pin
-
-    class FakeExt:
-        @staticmethod
-        def abi_layout():
-            bad = dict(empty_pin.EXPECTED_ABI_LAYOUT)
-            bad["EndResult"] = 4
-            return bad
-
-    monkeypatch.setattr(
-        empty_pin, "mooncake_installed_version", lambda: empty_pin.EXPECTED_MOONCAKE_VERSION
-    )
-    with pytest.raises(RuntimeError, match="EndResult"):
-        empty_pin.ensure_empty_pin_abi(ext=FakeExt())
-
-
-def test_empty_pin_abi_accepts_matching_layout(monkeypatch) -> None:
-    from kvcm.native import empty_pin
-
-    class FakeExt:
-        @staticmethod
-        def abi_layout():
-            return dict(empty_pin.EXPECTED_ABI_LAYOUT)
-
-    monkeypatch.setattr(
-        empty_pin, "mooncake_installed_version", lambda: empty_pin.EXPECTED_MOONCAKE_VERSION
-    )
-    assert empty_pin.ensure_empty_pin_abi(ext=FakeExt()) is not None
 
 
 # ---------------------------------------------------------------------------

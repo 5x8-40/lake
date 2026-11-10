@@ -81,8 +81,7 @@ def mooncake_main() -> BackendCapability:
             "admin 查盘/size/address；native GetReplicaList 授 lease+取 id"
             "（不再单独 exists/renew_once）。需 put_step=1、无盘副本、单内存。"
             "Start 形状不明不 Revoke；地址仅 Start 前 sanity。"
-            "加载硬闸：wheel==0.3.13.post1 且 abi_layout 对齐 A14；"
-            "升 wheel 须重编 _empty_pin.so 并改 EXPECTED_*。"
+            "升 wheel 须重编 _empty_pin.so（无运行时 ABI 闸）。"
             "Start-End 崩溃 / PROCESSING / client_id 改写 / soft pin 不随 lease 续 "
             "仍是已知边界",
         ),

@@ -1,8 +1,7 @@
 // 只保留空写要用的类型。不包含 pyclient.h。
 // Client 只写到 master_client_ 为止，后面的成员不影响它的位置。
 // 与完整类定义对过（v0.3.13.post1 / 719735896c）：PyClient::client_ 在 8，
-// Client::master_client_ 在 48，ReplicateConfig 208 字节，ObjectMeta 48 字节，
-// EndResult 8。加载时由 empty_pin.ensure_empty_pin_abi 对版本号 + 这些尺寸做硬闸。
+// Client::master_client_ 在 48，ReplicateConfig 208 字节，ObjectMeta 48 字节。
 //
 // Replica::Descriptor 的字段名与上游不同（这里叫 body，上游叫
 // descriptor_variant），但类型/顺序按目标版本镜像。CallResult / EndResult
@@ -16,7 +15,6 @@
 
 #pragma once
 
-#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>

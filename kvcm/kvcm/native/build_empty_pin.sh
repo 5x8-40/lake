@@ -1,7 +1,7 @@
 #!/bin/bash
 # 软钉单独动态库。链官方 store.so + libmooncake_store.so（Upsert* 在后者）。
 # 不包含 Mooncake 头文件；类型见 mooncake_pin_api.h。
-# 升 Mooncake wheel 后必须重跑本脚本；加载时 empty_pin 还会核版本号 + abi_layout。
+# 升 Mooncake wheel 后必须重跑本脚本（手写头对齐的是编 so 时那套 wheel）。
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
 SRC="$(cd "$(dirname "$0")" && pwd)"

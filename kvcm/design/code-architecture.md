@@ -371,7 +371,7 @@ stateDiagram-v2
   - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）。当前空写不用它
 - 两个断点（E6）：
   1. 符号可见性：0.3.13.post1 `store.so` 导出 `MasterClient::UpsertStart` / `UpsertEnd` / `UpsertRevoke`。空写扩展链接这三个符号。`get_real_client` 是内联成员，不在动态符号表，当前空写也不调用它。
-  2. ABI 匹配：加载时 `empty_pin.ensure_empty_pin_abi` 硬闸（wheel 版本 = `EXPECTED_MOONCAKE_VERSION` + `abi_layout` sizeof 对齐 A14）；升 wheel 须重编 `_empty_pin.so` 并改常量。gcc/libstdc++ 与 wheel 构建环境一致性仍靠同机编。含 `pyclient.h` 的退路才要求 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a）；当前空写不转换 `MooncakeStorePyWrapper`。详见 D2 §2 R04。
+  2. ABI 匹配：手写头 + 本机编 so；升 wheel 须重编（无运行时 ABI 闸）。gcc/libstdc++ 与 wheel 构建环境一致性靠同机编。含 `pyclient.h` 的退路才要求 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a）；当前空写不转换 `MooncakeStorePyWrapper`。详见 D2 §2 R04。
 - E6 另核：`/query_key` 的续租副作用在核验场景能否接受。保留身份的符号不用再找：1fc27b6 没有 `AddReplicaForRetainedClient`，`kRetained` 是外部 buffer 引用计数。另：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），上游原生支持 NPU（v0.3.11 tag 已有 `ascend_transport` 目录）
 
 ### EngineAdapter（引擎适配）
