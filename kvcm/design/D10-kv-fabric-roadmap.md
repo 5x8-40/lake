@@ -3,19 +3,19 @@
 - 状态: 规划草案。不承诺排期，用于讨论方向取舍。
 - 版本基线: Mooncake v0.3.13.post1；vLLM-Ascend 0.26 系
 - 上游: [D8](D8-joint-scheduling.md)（管理面）、[D9](D9-kv-services.md)（控制面）
-- 一句话: 把 KV 从缓存变成一等云资源：可放置、可复制、可迁移、可计价、可治理。
+- 一句话: 把 KV 变成**系统可放置、可复制、可迁移、可计价**的资源；应用仍然只发请求。
 
 ---
 
-## 0. 北极星：什么是 KV Fabric
+## 0. 北极星：KV Fabric 是什么
 
-> **KV Fabric**：应用/Agent 不再关心“KV 在哪个实例”，只声明“我要这段记忆、这个延迟、这个预算”；KV Fabric 负责放置、复制、迁移、计价、治理。
+> **KV Fabric**：系统统一决定 KV 放在哪、复制几份、保留多久、什么时候迁移/降层；应用不指定实例，也不持有 KV 句柄。
 
 三个转变：
 
-1. **从 cache 到 state**：KV 不只是加速缓存，而是 Agent 的会话状态/工作记忆；
+1. **从 cache 到 state**：KV 不只是请求内缓存，而是 Agent 会话的长期状态；
 2. **从 routing 到 placement**：不只“谁有 KV 就发给谁”，而是“把 KV 放到该去的地方”；
-3. **从 cost 到 economics**：不只省 GPU，而是把 KV 的字节、带宽、时延、保留时间变成可计价、可预算的资源。
+3. **从 cost 到 economics**：不只省 GPU，而是把字节、带宽、保留时间变成可预算、可归因的资源。
 
 ### 0.1 什么是 Fabric
 
@@ -33,7 +33,7 @@ Fabric 不是某个协议或产品，而是一层把分散资源统一访问与�
 | **Memory Fabric** | 多机内存 | CXL 内存池、disaggregated memory |
 | **Service Fabric** | 微服务实例 | service mesh：流量、mTLS、重试、可观测 |
 | **GPU Fabric** | 多机 GPU/NPU | NVLink/NVSwitch、NCCL、跨节点集合通信 |
-| **KV Fabric** | 多实例/多介质/多集群的 KV | Agent 记忆、热点多副本、跨区复制、KV FinOps |
+| **KV Fabric** | 多实例/多介质/多集群的 KV | 会话记忆、热点多副本、跨区复制、KV FinOps |
 
 判断标准：
 
@@ -41,153 +41,89 @@ Fabric 不是某个协议或产品，而是一层把分散资源统一访问与�
 - 资源**分布、可池化、需要移动/复制/隔离/计价** → 才配叫 Fabric；
 - Fabric 的价值在“统一控制面 + 数据面 + 策略”，不是多画一层架构图。
 
-本文的 KV Fabric 指：**全局前缀命名 + 放置/副本控制 + 数据面 copy/move + 会话/保留/QoS + 账本/治理**。
+本文的 KV Fabric 指：**全局前缀视图 + 放置/副本控制 + 数据面 copy/move + 生命周期/配额/账本**。它是内部资源层，不是应用 API。
 
 ### 0.2 KV Fabric 不是什么
 
 **它既不是一个组件，也不是第三个平面。**
 
-它是「管理面 + 控制面」合起来的终局形态：管理面把声明式需求变成放置决策，控制面执行。它没有自己的代码，能力全在管理面（决策）和控制面（执行）里。
+它是「管理面 + 控制面」合起来的终局形态：管理面把请求/策略变成放置决策，控制面执行。它没有自己的代码，能力全在管理面（决策）和控制面（执行）里。
 
-### 0.3 一等资源需要什么
+它也不是：
 
-看三次同类抽象历史：
+- 应用级 KV 数据库；
+- 应用可寻址的 `kv://` 对象存储；
+- 应用订阅 KV 事件的系统；
+- 跨租户的 raw KV 市场。
 
-| 资源 | 抽象 | 声明层 → 底下的能力 |
-|---|---|---|
-| **计算** | Kubernetes | 声明 spec → 调度放置 → 生命周期 → 配额 → 运行时接口 |
-| **存储** | S3 / EBS | 桶与对象命名 → 分层放置 → 生命周期策略 → 版本与合规 → 数据面 |
-| **网络** | service mesh | 服务标识 → 流量路由 → 重试熔断 → 策略与 mTLS → 数据面 |
+### 0.3 应用契约：文字/消息进，系统内部 tokenize
 
-规律：**先有声明式接口，再在它下面展开放置、生命周期、治理、数据面。**
-
-KV 要做成一等资源，同样需要五层：
-
-```mermaid
-flowchart TB
-    L1["1 声明层<br/>KVRef：我要什么"] --> L2["2 放置层<br/>放哪、几份"]
-    L2 --> L3["3 生命周期层<br/>保多久、何时降、何时删"]
-    L3 --> L4["4 治理层<br/>谁能用多少、怎么算账"]
-    L4 --> L5["5 数据层<br/>怎么搬"]
-```
-
-| 层 | 内容 | 归属 | 现状 |
-|---|---|---|---|
-| **1 声明层** | 用户只说要什么，不说放哪 | kvcm 对外接口 | **几乎空白** |
-| **2 放置层** | 需求 → 具体放置方案（智力核心） | 管理面 D8 | 全是设计稿 |
-| **3 生命周期** | 保留等级、降层时机、回收规则 | 控制面 D2 + D9 | 只有 copy 通 |
-| **4 治理** | 配额、隔离、审计、计费 | 控制面 D9 | 全是设计稿 |
-| **5 数据层** | copy/move/retain/remove 原语 | kvcm + Mooncake | 唯一基本完整的一层 |
-
-越往上越空。数据层做完只是能搬 KV；声明层和放置层做完，用户才不用关心 KV 在哪。
-
-#### 声明层长什么样
-
-现在 kvcm 收的是命令：`{前缀, 目标实例}`。Fabric 的形态是声明：
+应用不需要 token，也不需要 KV 句柄：
 
 ```text
-KVRef {
-  namespace      // agent-123 / 模型版本 / 租户
-  prefix         // 内容
-  latency_target // 我要多快读到（不是“放到哪”）
-  retention      // 保多久 / 什么等级
-  budget         // 我愿意为此付多少
-  durability     // 丢了我能接受吗
-}
+应用：messages / text，可选 session_id，可选 hook
+后端：tokenizer + chat template → token IDs → block hash → APC/KVT
 ```
 
-**差别不在字段多少，在“谁决定”**：命令式里用户决定实例，声明式里系统决定，用户只声明约束。这里的“用户”指**应用/Agent/平台租户**，不是终端用户；hook 是 intent，不是声明式 `KVRef`。
-
-声明层的三个直接后果：
-
-1. **可组合**：多个 KVRef 可以合并、去重、统一放置；
-2. **可迁移**：声明不变，底下可以换实例、换介质、换集群；
-3. **可计价**：`budget` 是声明的一部分，账本才有对象可算。
-
-### 0.4 一等资源的能力：现状与缺口
-
-先纠正一个说法：不是说这些事“现在完全做不到”，而是**有一部分、缺的是产品化**。
-
-| 能力 | 现在有什么 | 缺什么 | 定位 |
-|---|---|---|---|
-| **分支** | APC/前缀缓存已能跨请求复用同一前缀；同实例多分支可以共享前缀块 | 分支句柄、pin、回滚、跨实例共享、块级 CoW | 可选，非核心 |
-| **checkpoint / 回滚** | APC 保留已算的块；重放前缀通常能命中 | pin、版本、显式句柄；sampling 状态只在精确复现时需要 | 可选 |
-| **可寻址** | content hash 是可寻址的；应用给 token 前缀即可 | 稳定名字 `kv://...`；应用仍要能重算 token 序列 | 可选 |
-| **查询/事件** | 系统内部已有 kv event（引擎→kvcm/索引），不是轮询 | 面向应用的 `Probe`；**不需要**应用级订阅 | 可选（Probe） |
-| **市场** | 内容寻址可去重，引用计费可做 | 跨租户共享、计费、治理 | 远期，非核心 |
-
-#### 分支：前缀共享已有，缺的是“分支句柄”
-
-Agent 同时探索三条路径，每条共享前 90% 前缀，只在分叉点后不同。
-
-- **同一实例、APC 开启**：三个分支共享的 90% 前缀只存一份，额外是 3 个 10% 的 delta，约 `90% + 3×10% = 120%`；**不是 3×90%**。
-- **跨实例**：前缀要在每个实例有副本，才可能接近 3 份；Mooncake 当前是整对象 copy，不做块级 CoW。
-- 所以分支的价值不是“省掉三份前缀”，而是：**分支身份、pin、回滚、跨实例共享、块级 CoW**。
-
-#### checkpoint / 回滚：一半免费，但不是“一定缺”
-
-| 情形 | KV 在不在 | 真正缺什么 |
-|---|---|---|
-| 请求中途失败 | 大概率还在。APC 的 `ref_cnt → 0` 不释放物理块，hash 表条目也可能保留 | token 前缀/位置；sampling 状态只在精确复现时需要 |
-| 隔很久再续 | 可能已被驱逐 | pin/lease、显式 checkpoint 句柄 |
-| 回滚到更早某一步 | **可能命中**：重放前缀能命中 APC 仍保留的块；但不保证 | pin、多版本共存；只有多版本/块级 CoW 才是真缺 |
-
-注意：**APC 不是“只保留最新”**。它是内容哈希表，之前的 prefix 块只要没被驱逐，仍可能命中；`ref_cnt → 0 ≠ 释放、≠ 摘 hash`（[vLLM block 生命周期](../../docs/research/vllm/block-lifecycle.md)）。
-
-所以 checkpoint 的“一半免费”成立：KV 常常还在；真正缺的是**pin/版本/句柄**。sampling 状态只有“精确复现同一输出”才需要，不是通用 resume 的必需项。
-
-#### 可寻址：已有内容寻址，缺名字引用
+正常路径：
 
 ```text
-现在：key = hash(链式 block hash)  → 内容寻址，能定位
-Fabric：kv://agent-123/session-45/step-7  → 名字寻址，应用不用重算 token
+Request(messages)
+→ 后端 tokenize
+→ 引擎算 hash
+→ 命中 APC/KVT
+→ 没有则重算/从池读
 ```
 
-- hash 已经是寻址，不是“没有寻址”；
-- 但 hash 要求应用能给出 token 前缀；应用若只有 session/step，就需要名字引用；
-- kvcm 的 namespace 隔离不等于名字解析；`kv://` 需要“名字 → 前缀/hash”的映射和鉴权。
-
-名字引用是**可选的会话句柄**，不是 KV 能用起来的前提。
-
-#### 查询/事件：内部事件已有，应用侧用 Probe，不用订阅
-
-现在系统内部已经有事件：
+Agent 的分支就是消息：
 
 ```text
-引擎 BlockStored/BlockRemoved
-→ kvcm/索引消费
-→ Router 查索引
+[history] + "方案 A"
+[history] + "方案 B"
+[history] + "方案 C"
 ```
 
-这不是轮询。但它是**系统内部事件**，不是面向应用的订阅契约。
+共享前缀由引擎按 hash 命中；分支身份在应用/会话层，不需要 KV branch handle。
 
-应用真正需要的是一个按需查询：
+**注意：同样的文字不一定产生同样的 token。** 下面任何一项变化都会导致前缀不同：
+
+- tokenizer 版本；
+- chat template；
+- system prompt 的顺序/格式；
+- tool schema 的序列化；
+- special tokens；
+- 模型 revision / LoRA / adapter；
+- 多模态输入的 hash；
+- cache salt / 租户隔离。
+
+所以 KV 的 namespace 至少要带：
 
 ```text
-Probe(KVRef) -> {
-  status: present | absent | unknown,
-  tiers: [HBM, DRAM, REMOTE],
-  best_location,
-  as_of,
-  confidence,
-  lease_until?
-}
+model_id + revision + tokenizer/template version
 ```
 
-- `present/absent/unknown` 三态，查询失败不能当删除；
-- 只有 retain/pin 才有确定 `lease_until`，普通 APC 只能给“可能被驱逐”；
-- 应用不需要订阅 `evicted/ready`；需要保证时用 `Ensure(KVRef, ttl)`，不是 push 订阅。
+应用不需要知道这些；后端必须确定、版本化。
 
-**应用级订阅不是 MVP，甚至可能不该做。** 内部事件保留给 SC/kvcm；应用侧只暴露可限流的 `Probe`/`Ensure`。
+### 0.4 做什么 / 不做什么
 
-#### 市场：远期，不是核心
+| 做 | 不做什么 |
+|---|---|
+| 放置：copy/move/多副本/迁移 | 应用级 KV branch handle |
+| 生命周期：lease/TTL/demote/promote/evict | 应用级 `kv://` 名字寻址 |
+| 配额/隔离/审计 | 应用级 KV 订阅 |
+| 账本/ROI/FinOps | 应用级 `Probe` 作为核心 API |
+| 容量规划/HA/跨集群（后续） | raw KV 市场 |
 
-把 system prompt、工具定义、RAG 文档的 KV 预置成公共资源：
+为什么不做这些：
 
-- 内容寻址天然去重：100 个租户用同一段 system prompt，池里只有一份；
-- 按引用计费：谁引用了、引用了多久、省了多少。
+- **分支**：真实表示就是 messages；应用发不同消息即可，不需要 KV 句柄；
+- **名字寻址**：应用发文字，后端 tokenize 后自然有 hash；`kv://` 只对“应用不想重发历史/共享 prompt”的产品有意义，不是 Fabric 核心；
+- **Probe**：`present` 到请求到达之间可能被驱逐，应用拿到也不能做确定性决策；只适合内部诊断；
+- **订阅**：系统内部已有 kv event，SC/索引消费即可；暴露给应用只会增加耦合；
+- **raw KV 市场**：KV 是模型相关、易失的，不适合作为跨租户商品；共享 prompt 是另一个产品层；
+- **Probe/订阅**：只保留内部诊断/SC 消费，不作为应用 API。
 
-这是 Fabric 的远期商业化能力，不是当前路线图的前置条件。
+如果未来做“服务端会话状态”产品，ID 是 **conversation/response ID**，映射到 messages/状态，不是 raw KV 句柄。
 
 ### 0.5 有没有做成：三件判据
 
@@ -195,22 +131,20 @@ Probe(KVRef) -> {
 
 | 判据 | 现在 |
 |---|---|
-| API 是声明式的：用户给 `{前缀, 延迟目标, 预算, 保留期}`，不指定实例 | 命令式：`{prefix, target}` |
-| 决策是自动的：放哪、几份、保多久、何时撤，由系统算 | 只有 D8 设计稿，无实现 |
+| 应用不指定实例：只发请求/约束，系统决定放哪 | 部分：SC 能选实例，但放置（copy/move/retain）大多还要人工/策略触发 |
+| 决策是自动的：放哪、几份、保多久、何时撤，由系统算 | 只有 D8 设计稿，无完整实现 |
 | 执行是完备的：八项操作都能通过 intent 触发 | 只有 copy 一条路走通 |
 
 三件都到位之前，说的都是“KV 缓存 + 一个聪明的控制面”，不是 Fabric。
-
-> 上面五件能力不是 Fabric 的门槛：核心仍是**放置、生命周期、计价/治理**；分支、名字引用、`Probe`、市场是可选项，按需求再做。
 
 ---
 
 ## 1. 为什么是现在
 
-- **Agent workload 把 KV 变成长期状态**：多轮复用高、工具调用停顿长；长上下文模型（256K–1M）下 resume 一次可能要重算数十万 token，DeepSeek V3.2 这类胖 KV 单请求就是几十 GB。KV 的生命周期从请求内变成会话级/天级。
+- **Agent workload 把 KV 变成长期状态**：多轮复用高、工具调用停顿长；长上下文模型（256K–1M）下 resume 一次可能要重算数十万 token，DeepSeek V3.2 这类胖 KV 单请求就是几十 GB。
 - **GPU 贵、带宽/内存相对便宜**：用 KV 放置换 GPU 时间，ROI 通常成立；但“无限复制/无限保留”会反噬，所以需要 economics。
 - **已有控制面**：kvcm 已能 copy/move/keepalive/pin/demote/promote/retain/remove；D8 已有管理面决策；缺的是**产品化/价值闭环**，不是再写一个 RPC。
-- **开源组件只覆盖零件**：Conductor/Dynamo indexer 做索引，Mooncake 做池/副本，LMCache/Prometheus 做指标；**跨层放置、会话记忆、计价治理**没有成品。
+- **开源组件只覆盖零件**：Conductor/Dynamo indexer 做索引，Mooncake 做池/副本，LMCache/Prometheus 做指标；**跨层放置、生命周期、计价治理**没有成品。
 
 ---
 
@@ -218,7 +152,7 @@ Probe(KVRef) -> {
 
 ```mermaid
 flowchart TB
-    L4["L4 新商业<br/>KV FinOps / QoS / 记忆服务"] --> L3["L3 新体验<br/>Agent Memory / 分支 / 共享"]
+    L4["L4 新商业<br/>KV FinOps / QoS"] --> L3["L3 新体验<br/>Agent 会话保留/恢复"]
     L3 --> L2["L2 省传输/负载<br/>热点多副本 / 迁移 / 负载整形"]
     L2 --> L1["L1 省算力<br/>命中 / 保留 / 预取"]
     L1 --> V["价值底座<br/>TTFT ↓ / GPU 利用率 ↑ / 成本 ↓"]
@@ -226,47 +160,31 @@ flowchart TB
 
 - **L1** 是“别重算”：命中/保留/预取；
 - **L2** 是“别挤在一个点”：热点前缀多副本、迁移、会话分散；
-- **L3** 是“以前做不到的体验”：会话分支、跨 Agent 共享记忆、低延迟 resume（目标，待实测）；
-- **L4** 是“能卖钱/能管钱”：KV FinOps、QoS 等级、按记忆计费。
+- **L3** 是“以前做不到的体验”：Agent 会话保留/恢复、跨 Agent 共享前缀（不是分支句柄）；
+- **L4** 是“能卖钱/能管钱”：KV FinOps、QoS 等级、按记忆/会话计费。
 
 ---
 
-## 3. 候选方向
+## 3. 能做的方向
 
 | 方向 | 做什么 | 谁买单 | 价值指标 | 难度 | 时机 |
 |---|---|---|---|---|---|
 | **A. KV 负载整形** | 热点前缀 copy 多副本；按负载/会话分流；副本数按收益定 | 平台/推理团队 | p99 TTFT、吞吐、扩容次数 | 中 | **现在** |
-| **B. Agent Memory OS** | 会话/分支/checkpoint/resume；跨 Agent 共享前缀；记忆 TTL/层级 | Agent 产品/平台 | resume 时延、任务成功率、单任务成本 | 中高 | **现在–1 年** |
-| **C. KV FinOps / QoS** | 按模型/租户/会话记账；预算/配额；QoS 等级；抢占式预取 | 云/平台/财务 | 成本可见性、预算达成、毛利 | 中 | **现在–1 年** |
+| **B. Agent 会话保留/恢复** | hook 提前预取/保留；恢复时本机读；不做 branch handle | Agent 产品/平台 | resume 时延、任务成功率、单任务成本 | 中 | **现在–1 年** |
+| **C. KV FinOps / QoS** | 按模型/租户/会话记账；预算/配额；QoS 等级 | 云/平台/财务 | 成本可见性、预算达成、毛利 | 中 | **现在–1 年** |
 | **D. 容量数字孪生** | 用历史 trace 模拟容量/配比/硬件；采购前 what-if | 基础设施/采购 | 少买/少闲置、容量预测误差 | 中 | 6–18 月 |
 | **E. KV HA / 热备 / DR** | 预复制热前缀到备用实例；故障快速接管；跨 AZ | SRE/平台 | MTTR、可用性、恢复命中率 | 中高 | 6–18 月 |
 | **F. 跨集群 KV Fabric** | 跨集群/地域复制热前缀；follow-the-sun；数据驻留 | 全球化平台 | 跨区 TTFT、合规、DR | 高 | 1–3 年 |
-| **G. KV 感知模型路由** | 同前缀在多个模型/版本间选：质量/成本/缓存命中 | 模型平台 | 单请求成本、质量、灰度效率 | 中高 | 1–2 年 |
-| **H. KV 存储效率** | 去重/压缩/量化/分层；共享 system prompt/tools | 平台/基础设施 | 每 GB 有效 KV、HBM 占用 | 高 | 1–3 年 |
-| **I. 生态 / SDK / 市场** | Agent 框架 SDK、KV Memory API、预置前缀市场 | 开发者/生态 | 接入数、调用量、留存 | 中 | 1–3 年 |
+| **G. KV 存储效率** | 去重/压缩/量化/分层；共享 system prompt/tools | 平台/基础设施 | 每 GB 有效 KV、HBM 占用 | 高 | 1–3 年 |
 
-### 3.1 四条扩展轴：什么会改变 kvcm 的身份
+明确不做：
 
-| 轴 | 扩展 | 代表 | 什么时候值得 |
-|---|---|---|---|
-| **同层：管更多状态** | 权重 / checkpoint / draft / 会话元数据 | TensorCast 的 artifact 抽象 | 放置策略能共用（冷热判据、迁移原语、记账维度相同） |
-| **垂直：沉到数据面** | kvcm 中转 / 自持冷数据 | KVCR 的进程内二级存储 | 源实例下线的概率高，且只短窗口持有 |
-| **横向：多池联邦** | Mooncake + MemCache + S3；多集群 | Mooncake DFS、LMCache controller | working set 超过单池容量，跨池传输 < 省下的重算 |
-| **时间：被动→主动** | 预测 / 动态保活 / 提前告知“赶不上” | SGLang session、vLLM Retention | 停顿分布异质，固定 TTL 在快/慢工具两边都亏 |
+- 不把 branch/checkpoint 做成 KV 句柄；分支用 messages，checkpoint 用消息历史 + APC；
+- 不做应用级 `kv://`；
+- 不做应用级订阅/Probe；
+- 不做 raw KV 市场。
 
-关键判断：
-
-- **轴一**：权重和 KV 的冷热判据不同（权重看模型请求，KV 看前缀复用），不能简单共用放置；checkpoint 和 KV 更像。
-- **轴二**：kvcm 从无状态控制面变成有状态数据节点，可用性成本陡增；只在中转窗口内短持有才划算。
-- **轴三**：working set 没超单池容量时，跨池纯亏；多池是容量门槛，不是“架构更先进”。
-- **轴四**：最便宜的是“提前告知赶不上”——hook 给到达时间、字节/带宽估预取耗时，只缺一个减法。
-
-**天花板**：KV Fabric 是“把 KV 当资源”这一层的终点。再往上管所有可放置、可复制的推理状态（KV + 权重 + checkpoint），跨池跨集群，能预测、能溯源、能计费，那时已经不叫 kvcm，需要重新命名。
-
-**不在四条轴上的两件事**：
-
-- **KV 事务**：复合操作原子性；等批量治理规则出现才需要。
-- **KV 内容一致性**：block hash 只对 token 序列做 hash，不含“这份 KV 是怎么算出来的”；属于计算层语义，不是 kvcm 的放置问题。
+如果未来做“共享 prompt registry”，名字是 prompt 版本，不是 raw KV；那是另一个产品层。
 
 ---
 
@@ -274,14 +192,14 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-    H1["H1（0–6 月）<br/>省：命中 + 负载整形 + 会话记忆 + FinOps 最小集"] --> H2["H2（6–18 月）<br/>稳/省：容量孪生 + HA/DR + QoS"]
-    H2 --> H3["H3（18 月+）<br/>新：跨集群 Fabric + 模型路由 + 生态"]
+    H1["H1（0–6 月）<br/>省：负载整形 + 会话保留 + FinOps 最小集"] --> H2["H2（6–18 月）<br/>稳/省：容量孪生 + HA/DR + QoS"]
+    H2 --> H3["H3（18 月+）<br/>新：跨集群 + 存储效率"]
 ```
 
 ### H1：把“省”做成可证明的 ROI
 
 - 热点前缀多副本 + 会话分散；
-- 会话保留/恢复（Agent Memory 最小集）；
+- Agent 会话保留/恢复（hook 预取 + retain）；
 - 账本/ROI：每会话、每前缀、每模型；
 - 目标：**TTFT p99 降、GPU 时间省、扩容次数降**，用 A/B 证明。
 
@@ -295,22 +213,16 @@ flowchart LR
 ### H3：把新体验做出来
 
 - 跨集群 KV Fabric：地域跟随、数据驻留、DR；
-- KV 感知模型路由：质量/成本/缓存联合；
-- 生态 SDK/市场：Agent 框架接入、共享前缀；
-- 目标：**新收入/新场景**，而不只是省成本。
+- KV 存储效率：去重/压缩/分层；
+- 目标：**跨区/大规模场景**，而不是再省一点本地成本。
 
 ### 如果只选三个
 
 1. **KV 负载整形**：直接打高负载 TTFT/吞吐，最容易证明 ROI；
-2. **Agent Memory OS**：新体验，拉开与 cache-aware router 的差距；
+2. **Agent 会话保留/恢复**：真实 Agent 需求，不需要发明 branch handle；
 3. **KV FinOps / QoS**：让平台能卖、能管、能扩。
 
-合起来就是：**“KV 既能省，又能卖，还能管。”**
-
-若还要再加，优先两条轴四能力：
-
-- **提前告知“赶不上”**：两个数已有来源，只缺一个减法，直接改善 gateway 决策；
-- **动态保活窗口**：Agent 停顿 3 秒到 3 分钟不等，固定 TTL 必然低效。
+合起来就是：**“KV 既能省，又能管，还能扩。”**
 
 ---
 
@@ -353,11 +265,11 @@ resume 值得 ⟺ P_resume × T_prefill × c_gpu > retain + transfer
 
 链式 block hash、逐块匹配、事件→索引、推测索引补空窗、介质分层打分，都是 SOTA 的标准做法（llm-d `pkg/kvcache/`、Dynamo `lib/kv-router/`、AIBrix `pkg/kvevent/`）。差异不在这些。
 
-| | SOTA（llm-d / Dynamo / AIBrix） | 我们 |
+| 维度 | SOTA（llm-d / Dynamo / AIBrix） | 我们 |
 |---|---|---|
 | **索引与权威** | 引擎事件的派生缓存：靠事件逼近真相，丢事件要 gap replay，过期要 TTL/推测补 | 同样是派生缓存，但以池 master 为权威；正常读缓存，miss 按无命中处理，异步对账修索引，不在 L0 热路径查 master |
 | **放置的主动权** | 只做路由：谁有 KV 就发给谁 | 控制面能改变放置：copy 多副本、move 迁移、retain |
-| **视图范围** | 只到“哪个 pod 有这个块 + 哪层介质” | 到实例 + 介质，另加生命周期/账本；不碰 seg/rank/字节，那些由控制面 `locate` 负责 |
+| **视图范围** | 只到“哪个 pod 有这个块 + 哪层介质” | 到实例 + 介质，另加生命周期/账本；不碰 seg/rank/字节 |
 
 真正的差异：**不是“缓存 vs 直连”，而是“只路由” vs “能改变放置”。**
 
@@ -366,25 +278,33 @@ resume 值得 ⟺ P_resume × T_prefill × c_gpu > retain + transfer
 | 前缀索引/路由 | ✅ | ✅ |
 | 池内 copy/move | 部分（P2P 补传） | ✅ |
 | 热点多副本（指定目标/副本数/预算） | 部分（master 选目标） | **指定目标/数量/预算** |
-| 会话记忆/分支 | ❌ | 目标 |
+| 会话保留/恢复 | 部分（引擎内） | ✅ 跨实例 |
 | FinOps/QoS | 部分指标 | 目标 |
 | 跨集群 | 部分（DFS/跨区） | 远期 |
 | 跨引擎 | 部分 | 控制面独立 |
 
-llm-d 自己的 pain-point 已经说明：只靠事件索引会留幽灵条目、需要推测索引补“决策→确认”空窗。我们要补的是**放置主动权 + 生命周期/账本**，不是在索引精度上再卷一层。
+llm-d 自己的 pain-point 说明：只靠事件索引会留幽灵条目、需要推测索引补“决策→确认”空窗。我们要补的是**放置主动权 + 生命周期/账本**，不是在索引精度上再卷一层。
 
 ---
 
-## 7. 风险与边界
+## 7. 风险与非目标
 
 | 风险 | 说明 | 对策 |
 |---|---|---|
 | 复制成本反噬 | 多副本吃 HBM/带宽，可能降低全局命中 | 收益/预算约束；副本 TTL；全局水位 |
 | 单会话不可拆 | 复制前缀不能拆 decode | 明确边界；未来做请求迁移 |
 | 引擎/池绑定 | 不同引擎 key/事件不同 | 控制面适配层；KeyComputer 隔离 |
+| tokenizer/template 漂移 | 同样文字产生不同 token，前缀不命中 | namespace 带 model/revision/tokenizer/template；固定模板 |
 | 数据合规 | KV 含 prompt/PII | 保留策略/审计/加密/地域 |
 | 开源组件成熟度 | publisher/retain 等能力版本不一 | 能力声明；降级方案 |
 | 组织边界 | 谁拥有 KV 预算/QoS | 平台/租户/FinOps 分工 |
+
+非目标：
+
+- 应用级 KV API（branch handle / `kv://` / 订阅 / Probe）；
+- raw KV 市场；
+- 第三个平面；
+- 让应用管理 KV 生命周期。
 
 ---
 
@@ -397,8 +317,6 @@ llm-d 自己的 pain-point 已经说明：只靠事件索引会留幽灵条目�
 | AIBrix | `pkg/kvevent/manager.go`；PodAutoscaler | 事件索引；KV 指标扩缩 | 我们跨层放置 |
 | Mooncake | `CreateCopyTask`/`CreateMoveTask`/`CreateDrainJob` | 池操作/副本/drain | 我们指定目标/数量/预算 |
 | LMCache | `observability.py::LMCStatsMonitor` | 字节/指标 | 我们做归因/FinOps |
-| TensorCast | `tensorcast/api/_config.py::StorePolicyProfile`；Global Store | 权重/KV/checkpoint 的 artifact 抽象 | 我们按需决策，且管推理拓扑 |
-| KVCR | `remote_fw_dram.py::fetch/query/_try_release_pin` | 传输窗口 pin、旁挂保活 | 我们独立进程，不持有 HBM |
-| Mooncake DFS | `master_service.cpp::CreateDrainJob` | 池内跨介质分层与 drain | 它是单池，我们要多池协调 |
+| vLLM APC | `block_pool.py::get_computed_blocks`；`hash_block_tokens` | 前缀 hash/命中 | 我们做跨实例放置，不重写引擎 |
 
-**关于“KV 内容一致性”**：vLLM 的 `extra_keys` 只把输入侧隔离标识折进 block hash，不校验“KV 是怎么算出来的”；据本仓检索，没有项目在 KV 上带产生方式元信息。这是真空白，但属于计算层语义，不是 kvcm 的放置问题。
+**本项无直接参考实现**：应用级 KV 订阅/`Probe`/`kv://` 句柄。我们判断这些不是 Fabric 核心，不做；如果未来做服务端会话状态产品，ID 是 conversation/response ID，不是 raw KV。
