@@ -10,30 +10,58 @@
 
 ---
 
-## 0. 算法地图
+## 0. 算法地图与复用边界
 
 ```mermaid
 flowchart TB
-    F["事实流<br/>引擎事件 / kvcm READY / 池事件 / miss"] --> KVT["1. KVT<br/>事件溯源 + 前缀匹配 + 合并"]
-    KVT --> L0["2. 请求打分<br/>命中 / 传输 / 队列 / SLO"]
-    KVT --> L1["3-4. 预取 + 保留<br/>EV / TTL / 预算"]
-    KVT --> L2["5. 扩缩<br/>排队 / 双环 / 预热门控 / 按 KV 价值选节点"]
-    L0 -->|"命中/延迟反馈"| L2
-    L1 -->|"KV 水位/READY"| L2
-    L2 -->|"资源权重/预算"| L0
-    L2 -->|"预算"| L1
-    L0 -->|"决策日志"| LOG["6. 回放/归因"]
-    L1 --> LOG
-    L2 --> LOG
+    KVT[("KVT<br/>共享命中视图")]
+
+    subgraph L0["L0 请求环"]
+        R1["KVT.Match"] --> R2["打分 / 约束"] --> R3["Dispatch"]
+    end
+
+    subgraph L1["L1 KV 动作环"]
+        A1["hook / ETA / READY"] --> A2["prefetch / retain / release"] --> A3["READY 回写"]
+    end
+
+    subgraph L2["L2 容量/放置环"]
+        S1["队列 / 水位 / 成本"] --> S2["扩缩 / 缩容 / 负载整形 / 权重"]
+    end
+
+    KVT --> R1
+    A3 --> KVT
+    R3 -->|"命中/延迟反馈"| S1
+    A3 -->|"水位/READY"| S1
+    S2 -->|"权重/预算"| R2
+    S2 -->|"预算"| A2
+    R3 --> LOG["决策日志 / 归因"]
+    A2 --> LOG
+    S2 --> LOG
 ```
 
-三类算法，分别回答：
+三个环不是三个串行阶段：
 
-1. **看什么**：KVT 怎么把多源事件变成可查询的命中视图；
-2. **怎么选**：请求、预取、保留、扩缩各自怎么算；
-3. **怎么证明赚**：每个决策对应哪个指标、多少量级。
+- **L0 请求环**：请求选哪个实例；
+- **L1 KV 动作环**：预取/保留/释放，也就是 SC 发给 kvcm 的 intent；
+- **L2 容量/放置环**：扩缩、缩容、热点多副本、资源权重。
 
----
+**KVT 不是第三个环**，它是三环共享的索引/视图；日志/归因是旁路，也不是环。
+
+### 0.1 哪些可以复用开源，哪些要自己写
+
+| 能力 | 现成实现 | 我们改什么 |
+|---|---|---|
+| 链式 block hash / 前缀匹配 | vLLM `hash_block_tokens`；SGLang/AIBrix/llm-d 都有 | 保持 hash/block size 口径；接池事件 |
+| 事件索引 / gap replay | llm-d EPP、Dynamo kv-router、AIBrix kvevent、Conductor | 加池 master/READY 事实 |
+| 推测索引 | llm-d `SpeculativeTier` / `PreRequest` | TTL 按实际事件延迟校准 |
+| 多源合并 / source rank / 墓碑 | 部分有 gap replay，没有 turnkey | 自己写胶水，不是发明新索引 |
+| 请求打分 | AIBrix 可组合 scorer；Dynamo cost 函数 | 加池侧放置/实例选择 |
+| 扩缩 | Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler | 池容量/副本事实 |
+| copy/move/retain | Mooncake 原语 | 放置决策自己写 |
+| 预取/保留收益 | 无 turnkey | 自己算 EV/TTL |
+| 幂等 / HA | 部分原语 | 自己补决策日志/恢复 |
+
+参考：[实例级路由调研](../../docs/research/model-routing/instance-level.md)、[模型级路由调研](../../docs/research/model-routing.md)。
 
 ## 1. 记号与收益定义
 
@@ -79,78 +107,54 @@ can_overlap 时：T_kv = max(T_compute(residual), T_transfer)
 不能掩盖时   ：T_kv = T_compute(residual) + T_transfer
 ```
 
-## 1.1 传输能否被计算掩盖
+## 1.1 两种 KV 加载方式：layerwise vs 批量加载
 
-vLLM 的 KV connector 是逐层的（`KVConnectorBase_V1::start_load_kv` 启动异步加载，`wait_for_layer_load` 在每层 attention 内阻塞等该层到位）。所以重叠的形态是「第 N 层算的时候，第 N+1 层在传」。
+先明确：**layerwise 不是唯一模式**。vLLM connector 提供逐层加载接口，但部署可以不逐层加载。
 
-**掩盖的前提是有计算可跑。** 逐层流水成立的条件是「每层传输时间 < 每层计算时间」：
+| 方式 | 行为 | 优点 | 代价 | 适用 |
+|---|---|---|---|---|
+| **layerwise 流式** | 第 N 层算，第 N+1 层传 | 单请求 TTFT 短，第一层到位就能开始 | batch 内长短 KV 互相阻塞；算力利用率低；对 P99 友好、对吞吐不友好 | 小 batch、延迟优先 |
+| **批量加载** | 先把 KV 搬到 DRAM/HBM，再调度 | 可以按 prefill 长度分组、组 batch；算力利用率高 | 单请求等待更长 | 高吞吐、按长度分 P 池 |
 
-```text
-每层传输 = S_bytes / L / BW
-每层计算 ≈ T_compute(residual) / L
-成立条件：S_bytes / BW < T_compute(residual)
-```
+layerwise 的本质是**牺牲算力利用率换更低的 TTFT/P99**：同一个 batch 里，长 KV 请求没到位，短 KV 请求也得等这一层，GPU 空转。
 
-这个条件在长上下文下会随命中率翻转：
+现代推理里“计算比传输快”不是固定结论：低命中/长 residual 时计算占大头，传输可以掩盖；高命中/短 residual 时计算被压掉，传输反而主导。是否掩盖必须按上下文、命中率、带宽算。
 
-| 场景 | residual | `T_compute` | 能否掩盖 |
-|---|---|---|---|
-| **1M 全 miss** | 1M | 分钟级（attention O(P²)） | 能，传输可忽略 |
-| **1M 命中 99.9%** | 1K | 几百 ms | **不能**，传输主导 |
-
-**关键：命中率高不等于快。** 它把计算压掉了，却把传输量留在满额。这是 DualPath（arXiv:2602.21548v2）的出发点：agentic 多轮命中率 ≥95%，瓶颈从计算转成 KV 加载 I/O。
-
-临界点：
+在 layerwise 模式下：
 
 ```text
-可掩盖token数 = T_transfer × v_prefill
-若 residual < 可掩盖token数：传输主导，且无法掩盖
+T_kv ≈ max(T_compute(residual), T_transfer)   # 有足够计算可掩盖
+T_kv ≈ T_compute(residual) + T_transfer       # 掩盖不了
 ```
 
-### 逐层失败后的两种选择
-
-逐层拉取在功能上永远可行，代价是 GPU 空转。发现掩不住时有两条路：
-
-| 选择 | TTFT | 吞吐 | 何时选 |
-|---|---|---|---|
-| **仍然逐层拉** | 更短（第一层到位即开始） | **差**：某层没跟上，整个 batch 这一步空转 | 单请求、batch 小、延迟优先 |
-| **先搬到本机 DRAM 再调度** | 更长（等搬完） | 好：搬运期间 GPU 去服务别的请求 | 高并发、吞吐优先 |
-
-第二条不需要搬到 HBM。本机 DRAM→HBM 走 950 专用 UB：单机 UB_CTP 实测≈47GB/s、POD≈93GB/s（两种场景）；通常比 A3 ROCE 23.8GB/s 参考快，但 950 跨机未测，不能直接算倍数。
-
-### 胖 KV 的例外
-
-DeepSeek V3.2（83.9 KiB/token）这类模型的 KV 仍然很大，即使搬到本机 DRAM 也可能藏不住：
-
-- 1M 上下文 ≈ 85.9 GB，本机 DRAM→HBM（47 GB/s）≈ 1.83 s（POD 93GB/s 约 0.92 s）
-- 此时只有**HBM 驻留**（命中即零拷贝）才够
-
-这解释了为什么长上下文 + 胖 KV 场景下，HBM 命中率是硬指标。
-
-### 对 batch 的影响
-
-跨机访问不只影响这一个请求。continuous batching 的 forward 按层推进，某层没就绪就整体等：
+在批量加载模式下：
 
 ```text
-T_batch_step = max over requests(自身 T_kv)
+T_kv ≈ T_transfer + queue
 ```
 
-最慢的那个决定整步。所以损失不是「省 X ms 传输」，而是「避免拖慢整个 batch 一步」，batch 越大、命中率越高，收益越大。
+批量加载不依赖“本请求的计算”去掩盖传输；它靠**其他请求**填 GPU，或按 prefill 长度分组减少长短阻塞。按长度分 P 池（你提到的 DeepInfer 一类做法）就是这条路，KV Fabric 只负责把 KV 放到目标、预热/保留，不决定引擎怎么分组。
 
----
+所以：
+
+- 不要默认所有场景都 layerwise；
+- 延迟优先可以 layerwise，吞吐优先先批量加载/分组；
+- 掩盖判据只在 layerwise 下有意义，不能拿它当通用结论。
 
 ## 1.2 命中层级的取项
 
 按命中层级选 `T_kv`：
 
 - **miss（无命中）**：`T_kv = T_prefill`
-- **远端池命中**：残差很小，通常落在「不能掩盖」区间，`T_kv ≈ T_transfer`
+- **远端池命中**：layerwise 下残差小，通常掩盖不了，`T_kv ≈ T_transfer`；批量加载则本来就等传输
 - **本机 DRAM 命中**：`T_kv = T_h2d`（仍有，但没有跨机那一段）
 - **HBM 命中**：`T_kv ≈ 0`
 
 ---
 
 ## 2. KVT：把事件变成命中视图
+
+KVT 不是从零写：事件索引、hash/前缀匹配先复用 llm-d/Dynamo/AIBrix/Conductor；下面只讲多源合并、池侧事实和推测索引的增量。
 
 ### 2.1 事件溯源 + 物化视图
 
@@ -165,7 +169,7 @@ flowchart LR
     K --> L["L0/L1/L2 查询"]
 ```
 
-**算法**：
+**算法**：事件索引/gap replay 可复用 llm-d/Dynamo/AIBrix/Conductor；我们补池事件、master 核验和 READY 事实。
 
 1. 每个源独立维护 `seq`；
 2. 事件到达按 `(source, seq)` 应用；跳号先 replay，再 snapshot，最后标 stale；
@@ -176,35 +180,22 @@ flowchart LR
 
 **收益**：选路零 RPC；命中长度精确；多源不打架。
 
-### 2.2 链式 block hash + 前缀匹配
+### 2.2 链式 block hash / 前缀匹配
 
-vLLM 的 key 是链式 hash：`h_i = H(h_{i-1}, tokens_i)`。请求自带一条 hash 链，KVT 逐块查：
+这是经典做法，不在本文重讲：vLLM 的 key 是 `h_i = H(h_{i-1}, tokens_i)`，KVT 从第一块开始做连续匹配；vLLM/SGLang/AIBrix/llm-d 都有现成实现。
 
-```text
-match(P) = 从第一块开始，连续命中同一实例的块数
-```
-
-```mermaid
-flowchart LR
-    H0["h0"] --> H1["h1"] --> H2["h2"] --> H3["h3"]
-    H1 --> A["实例 A: HBM"]
-    H2 --> A
-    H3 --> B["实例 B: DRAM"]
-    H3 --> C["远端池"]
-```
-
-命中定义：
+我们只保留两个约束：
 
 ```text
 hit_tokens = contiguous_blocks × B
-local_hbm  = 连续 HBM 已确认块数 × B
-local_dram = 连续本机 DRAM 块数 × B
-pool_hit   = 连续池内块数 × B
 ```
 
-**收益**：只把“连续命中”算作可复用前缀，避免中段空洞导致的错误 HBM 命中判断。
+- hash 口径、block size 必须和引擎一致；
+- 同一逻辑块的多 TP/DP rank 要按实例去重，不能把 rank 当独立实例。
 
 ### 2.3 多源合并：source rank + seq + 墓碑
+
+这部分**没有 turnkey**：gap replay 可以复用，`source rank + 墓碑 + 置信度` 是我们要写的胶水，不是发明新索引。
 
 ```mermaid
 flowchart TB
@@ -240,16 +231,14 @@ ROUTE_SPEC    = 1
 请求刚路由、引擎事件还没到 → 写短 TTL 的“预测”条目：
 
 ```text
-TTL_spec = E[event_delay] + 3σ[event_delay]    // 默认 2s，经验值
-conf(t) = conf0 × exp(−(t − t0)/τ)
-P_ghost ≈ 1 − exp(−λ_delete × age)
+TTL_spec = 事件延迟 + 余量     // 默认 2s，按实测校准
 ```
 
 用途：
 
 - 推测条目只用于**亲和排序**，不作为 HBM 命中证据；
-- `conf < 0.9` 不允许 HBM 命中判定；
-- `P_ghost × C_miss` 进入 L0 的 risk 项，优先对账热条目。
+- 置信度低于 0.9 不允许 HBM 命中判定；
+- 过期、删除事件、miss 反馈都会降置信度；热条目优先对账。
 
 **收益**：降低批内竞态导致的假 miss；ghost 只损性能，不损正确性。
 
@@ -257,9 +246,9 @@ P_ghost ≈ 1 − exp(−λ_delete × age)
 
 ## 3. 请求打分：选哪个实例
 
-### 3.1 效用函数
+### 3.1 打分：命中 / 传输 / 队列 / SLO
 
-先定义符号，再写公式：
+这是启发式加权，不是精确效用优化；权重由 L2 根据资源紧张程度调。先定义符号，再写分数：
 
 | 符号 | 含义 |
 |---|---|
@@ -283,15 +272,19 @@ U(r,n) =
   − w_risk    × R(r,n)
 ```
 
+这套打分不是新算法：AIBrix 的可组合 scorer、Dynamo 的 cost 函数都是同构做法；我们额外加的是池侧放置项和实例选择。
+
 `BW_eff` 按三类网络分开取：
 
 - 本机 DRAM→HBM：`BW_h2d`（950 单机 UB_CTP≈47GB/s；POD≈93GB/s，分开取值）；
 - 从池/远端读 KV：`BW_storage`；
 - 实例间 KV 传：`BW_compute`（和集合通信共享，要加竞争惩罚）。
 
-**不能用估算的带宽**：§1.1 的掩盖判据依赖 `T_transfer` 的准确性，估高了会把「不能掩盖」误判成「能掩盖」，选出一个实际更慢的节点。
+**不能用估算的带宽**：layerwise 的掩盖判据依赖 `T_transfer` 的准确性，估高了会把「不能掩盖」误判成「能掩盖」，选出一个实际更慢的节点。
 
 ### 3.2 TTFT 估算
+
+批量加载/串行：
 
 ```text
 TTFT(r,n) = Q(n)
@@ -300,17 +293,17 @@ TTFT(r,n) = Q(n)
           + T_handoff
 ```
 
-`residual = P − H`；HBM 命中时 `B≈0`，通常只剩末 token 残差。
-
-**这个式子假设传输能被计算掩盖**（两项相加，不是取 max）。按 §1.1，残差很小时不成立：
+layerwise：
 
 ```text
-可以掩盖：TTFT = Q + max(residual/v, X_bytes/BW_eff) + T_handoff
-不能掩盖：TTFT = Q + residual/v + X_bytes/BW_eff + T_handoff   ← 上式
+可掩盖：TTFT = Q + max(residual/v, X_bytes/BW_eff) + T_handoff
+掩不住：TTFT = Q + residual/v + X_bytes/BW_eff + T_handoff
 判据：residual < X_bytes/BW_eff × v_prefill
 ```
 
-选路时应按节点分别判断：同一个请求，走节点 A 可能能掩盖（A 带宽高），走节点 B 不能。
+`residual = P − H`；HBM 命中时 `X_bytes≈0`，通常只剩末 token 残差。
+
+选路时要先知道部署模式：批量加载按加法，layerwise 才判断能否取 max。同一个请求，走节点 A 可能能掩盖（A 带宽高），走节点 B 不能。
 
 ### 3.3 决策流程
 
@@ -425,6 +418,8 @@ L = λ × W                （Little 定律）
 > 参数：`λ=100 req/s`、`μ=30 req/s/副本`、目标 `ρ_target=0.8`。`c_min≈5`；低于 5 会进入不稳定区，延迟迅速上升。
 
 ### 6.2 双环控制
+
+扩缩控制可复用 Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler；我们补的是池容量/副本事实和 KV 价值项。
 
 ```mermaid
 flowchart TB
