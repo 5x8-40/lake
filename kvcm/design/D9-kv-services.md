@@ -13,7 +13,7 @@
 
 1. kvcm 的**控制面**做四件事：**执行、核验、记账、发布**；不做选路、不做扩缩、不持有前缀索引。
 2. **会话 KV、预热不是“调度之外的另一套系统”**：它们是 D8 管理面的 L1 动作，由 D8 决策、控制面执行。本文只保留“执行支撑”这一条边。
-3. 控制面的独立运营能力是：**KV 对账、用量账本、容量规划建议、下线搬迁、保留/删除规则、历史回放、会话分支/跨地域/模型灰度**。
+3. 控制面的独立运营能力是：**KV 对账、用量账本、容量规划建议、下线搬迁、KV 保留与删除治理、历史回放**。分支/跨地域/rollout 是 D8 决策，D9 只执行 copy/namespace/retain。
 4. D9 **不造新机制**：索引、查询、指标、池操作大多有现成组件；D9 补的是“抽样比对、intent→命中归因、容量/迁移/治理的联动”。
 5. 能力事实（RPC、前提、版本差异）在 [D2](D2-kv-operations.md) / [D1](D1-router-scheduling.md) / [summary.md](../summary.md)，本文不重复。
 
@@ -27,11 +27,10 @@
 | **用量账本** | 谁花了多少、省了多少、值不值 | 记录 intent/copy/READY/命中；按模型/会话/前缀归因；算 ROI | 成本可见、预算可调、可计费 |
 | **容量规划建议** | 池该多大、HBM/DRAM/SSD 怎么配 | working set + Little 定律 + admin 容量；what-if | 少扩/少浪费、容量可预测 |
 | **下线搬迁** | 节点停之前，把热 KV 搬到别处 | `CreateDrainJob` / move / verify / 宽限期 | 缩容不丢热 KV、不砸命中率 |
-| **保留/删除规则** | 谁能留多久、最多占多少、删前验什么 | retention class + TTL + pin 预算 + 命名空间 + 审计 | 防 pin 滥用、防误删、合规 |
+| **KV 保留与删除治理** | 谁能留多久、最多占多少、删前验什么 | retention class + TTL + pin 预算 + 命名空间 + 审计 | 防 pin 滥用、防误删、合规 |
 | **历史回放/策略试算** | 用历史请求重跑新策略，先看效果 | 决策日志 + 反事实重放 | 调参不拿生产试错、事故复盘 |
-| **分支/跨地域/模型灰度** | 会话分叉、异地副本、新模型小流量 | copy / DFS / 命名空间 / 保留 | 远期能力 |
 
-> **不在本表**：会话 KV、预热、选路、扩缩。它们是 D8 管理面的动作；控制面只为它们提供 copy/keepalive/pin/verify 等执行接口。
+> **不在本表**：会话 KV、预热、选路、扩缩、分支/跨区/rollout。它们是 D8 管理面的动作；控制面只为它们提供 copy/keepalive/pin/verify/namespace 等执行接口。
 
 优先级只在 §6 出现一次，避免和总表重复。
 
@@ -42,42 +41,39 @@
 ```mermaid
 flowchart TB
     subgraph D8["D8 管理面（决策）"]
-        DEC["会话 / 预热 / 选路 / 扩缩"]
+        D8DEC["会话语义 / 选择 / 扩缩 / 分支"]
     end
 
     subgraph D9["D9 控制面（执行 + 运营）"]
-        OPS["八项操作<br/>copy/move/keepalive/pin/demote/promote/retain/remove"]
+        D9OPS["八项操作<br/>copy/move/keepalive/pin/demote/promote/retain/remove"]
         VER["KV 对账"]
         LED["用量账本"]
         CAP["容量/放置顾问"]
         DRA["Drain/迁移"]
-        GOV["治理"]
+        GOV["KV 保留与删除治理"]
         SIM["回放/仿真"]
-        EXT["分支/跨区/rollout"]
         ADM["master admin"]
     end
 
-    DEC -->|"intent"| OPS
-    OPS --> LED
-    ADM --> LED
-    VER --> ADM
-    VER -->|"LOST/REMOVED"| DEC
+    D8DEC -->|"intent"| D9OPS
+    D9OPS --> LED
+    VER --> LED
     CAP --> LED
-    CAP --> ADM
-    CAP -->|"建议/区间"| DEC
-    DRA --> OPS
-    GOV --> OPS
+    ADM -->|"容量/副本事实"| VER
+    ADM -->|"容量事实"| CAP
+    VER -->|"LOST/REMOVED"| D8DEC
+    CAP -->|"建议/区间"| D8DEC
+    DRA --> D9OPS
+    GOV --> D9OPS
     SIM --> LED
-    EXT --> OPS
-    OPS --> M[("Mooncake Store")]
+    D9OPS --> M[("Mooncake Store")]
     ADM --> M
 ```
-
 读法：
 
 - **D8** 决定：会话保不保、预取到哪、请求去哪、扩不扩；
 - **D9** 执行这些决定（八项操作），并独立做对账、记账、容量建议、搬迁、治理、回放；
-- 会话/预热不画成 D9 的独立服务，只通过 `DEC → OPS` 这条执行边出现。
+- 会话/预热不画成 D9 的独立服务，只通过 `D8 决策 → D9 执行` 这条边出现。
 
 ---
 
@@ -97,7 +93,7 @@ flowchart TB
 
 ### 4.1 KV 对账
 
-**解决什么问题**：引擎事件看不到池副本删除；KVT 只增不减；ghost 条目把请求导向无副本实例。publisher 当前默认关；开启前删除面更依赖对账。
+**解决什么问题**：引擎事件看不到池副本删除；KVT 只增不减；ghost 条目把请求导向无副本实例。publisher 生产按开启规划；即使开启，事件也可能丢/乱序，copy/move 路径仍零发布，对账仍是兜底。
 
 **怎么做**：
 
@@ -144,6 +140,7 @@ flowchart TB
 
 - working set、hot/warm/cold、HBM/DRAM/SSD 配比；
 - 池节点数按 working set / 单节点可用容量估算；
+- Little 定律：在途请求 ≈ QPS × 延迟；用它把 QPS/延迟换成并发，再除以单节点可用并发；
 - 预热排期按 hook/热度/预算；
 - what-if：不同保留策略/配比下的命中率与成本。
 
@@ -155,11 +152,11 @@ flowchart TB
 
 ### 4.4 下线搬迁
 
-**解决什么问题**：缩容/维护/rollout 时，KV 要搬走或保留；搬不走的会被引擎下线带走。
+**解决什么问题**：缩容/维护/节点下线时，KV 要搬走或保留；搬不走的会被引擎下线带走。
 
 **怎么做**：
 
-- seg 级 `CreateDrainJob`（job 级可取消）或逐 key move/copy；
+- seg 级 `CreateDrainJob`（D2 F7 的批量 move 编排，不是单 key move）；源 seg 先 DRAINING，排空后 DRAINED；job 可 Cancel/Query；单 key 用 `CreateMoveTask`，无取消；
 - 宽限期卸载（`GracefulUnmountSegment`）作为迁移时间窗；
 - 失败保留 draining，不硬删；
 - 与 D8 摘流、编排停实例配合。
@@ -168,13 +165,13 @@ flowchart TB
 
 **边界/失败**：
 
-- 单任务无取消；源必须在线；
+- 单 key move/copy 无取消；DrainJob 有 job 级取消；源必须在线；
 - retain 未实现，跨引擎存亡只能靠 move 到活 seg / 自挂 SSD；
 - DFS 依赖部署。
 
 **验收**：缩容不丢热 KV、命中率不断崖；迁移完成率/耗时在预算内。
 
-### 4.5 保留/删除规则
+### 4.5 KV 保留与删除治理
 
 **解决什么问题**：pin/TTL/模型版本/删除没有统一规则，容易滥用、误删、没有审计。
 
@@ -189,7 +186,7 @@ flowchart TB
 
 - soft pin 有条件（Case B；设计、后续 PR）；
 - hard pin 不能事后加，PIN 一档只能用 lease 延长模拟；
-- 删除面没有原生事件时，靠 TTL/miss/对账兜底。
+- publisher 开时删除事件可用；但 copy/move 零发布、事件可能丢/乱序，仍要靠 TTL/miss/对账兜底。
 
 **验收**：pin 超限可发现、误删为 0、删除有审计；保留成本可控。
 
@@ -209,28 +206,20 @@ flowchart TB
 
 **验收**：回放结果与线上偏差可接受；策略版本可比较；事故可复盘。
 
-### 4.7 分支/跨地域/模型灰度
-
-- **分支**：共享前缀 + 独立 delta；分支关闭只释放独有块；Mooncake 整对象 copy，不做块级 CoW。
-- **跨集群**：DFS/对象存储副本（main 能力；0.3.13 需确认部署）；首版不做。
-- **模型 rollout**：新 revision 独立命名空间、预热、灰度、旧 revision 失效/GC；防旧 KV 误命中。
-- 优先级见 §6。
-
 ---
 
 ## 5. 收益与验收
 
 > 会话/预热的收益在 D8 §7 已算过（命中/保留省 prefill、本地放置省跨机传输）；本文只算控制面独立能力。
 
-| 能力 | 指标 | 公式/口径 | 验收 |
+| 能力 | 指标 | 口径（人话） | 验收 |
 |---|---|---|---|
-| KV 对账 | ghost 率、误判率、查询 QPS | `score = hotness×age×P_ghost`；`P_ghost ≈ 1−e^(−λ_delete×age)` | ghost 降、请求不被阻塞 |
-| 用量账本 | ROI、浪费、归因覆盖率 | `hit = engine_apc + local_pool + remote_pool + prewarm + retain`；`ROI = saved/cost` | 每会话/租户可算账 |
-| 容量建议 | 预测误差、利用率 | `N = ceil(working_set / usable_per_node)`；`c_min = ceil(λ/(μ×ρ_target))` | 少扩/少浪费 |
-| Drain | 迁移完成率、命中率下降 | `T_drain ≈ bytes/BW + tasks/concurrency + verify` | 缩容不丢热 KV |
+| KV 对账 | ghost 率、误判率、查询 QPS | 按热/老/可疑抽样；查询失败与“副本丢失”分开 | ghost 降、请求不被阻塞 |
+| 用量账本 | ROI、浪费、归因覆盖率 | 记录 intent/copy/READY/命中；按模型/会话/前缀归因 | 每会话/租户可算账 |
+| 容量建议 | 预测误差、利用率 | working set / 单节点可用容量；what-if | 少扩/少浪费 |
+| Drain | 迁移完成率、命中率下降 | 迁移字节/带宽 + 任务/并发 + 核验 | 缩容不丢热 KV |
 | 治理 | pin 超限、误删、审计覆盖 | 配额/TTL/命名空间/审计 | 滥用可发现、误删 0 |
 | 回放 | 回放偏差、策略对比 | 决策日志 + 反事实重放 | 调参可回归 |
-| 分支/跨区/灰度 | 远期，暂不量化 | copy / DFS / 命名空间 | 暂不作为 P0/P1 验收 |
 
 ---
 
@@ -239,7 +228,7 @@ flowchart TB
 ```mermaid
 flowchart LR
     P0["P0<br/>KV 对账 / 用量账本"] --> P1["P1<br/>容量建议 / 下线搬迁 / 规则"]
-    P1 --> P2["P2<br/>回放 / 分支 / 跨地域 / 灰度"]
+    P1 --> P2["P2<br/>历史回放"]
 ```
 
 | 优先级 | 能力 | 理由 |
@@ -248,11 +237,11 @@ flowchart LR
 | **P0** | 用量账本 | ROI/预算/归因 |
 | **P1** | 容量规划建议 | 扩缩需要池侧事实 |
 | **P1** | 下线搬迁 | 缩容/维护必须 |
-| **P1** | 保留/删除规则 | 防 pin 滥用/误删 |
+| **P1** | KV 保留与删除治理 | 防 pin 滥用/误删 |
 | **P2** | 历史回放/策略试算 | 调参需要 |
-| **P2** | 分支/跨地域/模型灰度 | 远期 |
 
 > 会话 KV、预热不在本表：它们归 D8 管理面（L1），控制面只提供执行接口。
+> 分支/跨地域/rollout 也不在本表：SC 决策，D9 只执行 copy/namespace/retain。
 
 ---
 
@@ -271,7 +260,7 @@ D9 的能力都依赖具体机制。**事实写在各处，本文不重复**：
 1. **soft pin 有条件**（Case B；设计、后续 PR）。治理规则不能假设“随时能 pin”；不满足就退 keepalive。
 2. **hard pin 不能事后加**。保留等级里的 PIN 一档只能用 lease 延长模拟。
 3. **retain 未实现**。跨引擎存亡要靠 move 到活 seg 或自挂 SSD，Drain 和 HA 的上限受此约束。
-4. **删除面没有原生事件**（publisher 当前默认关、copy 路径零发布）。所以开启前 KV 对账是过渡期必做，不是可选项。
+4. **publisher 开启后删除事件可用**；但 copy/move 路径零发布，事件也可能丢/乱序/延迟。所以 KV 对账仍是事件兜底、审计和 ROI 的必做项；publisher 关闭时才完全依赖 TTL/miss/对账。
 
 ---
 
@@ -312,7 +301,6 @@ D9 的能力都依赖具体机制。**事实写在各处，本文不重复**：
 1. **KV 对账成本**：admin 查询零副作用，但采样率/查询 QPS 预算怎么定？
 2. **用量账本**：请求命中结果从 D8/worker 回传的字段与延迟；多模型/租户怎么切？
 3. **容量顾问的边界**：建议与 D8 决策如何避免“两个大脑”？建议只出事实/区间。
-4. **Drain**：单任务无取消；retain 未实现时，跨引擎存亡只能靠 move 到活 seg / 自挂 SSD。
+4. **Drain**：单 key move/copy 无取消、DrainJob 可 job 级取消；retain 未实现时，跨引擎存亡只能靠 move 到活 seg / 自挂 SSD。
 5. **治理**：pin/TTL 预算、模型版本、删除审计的默认策略。
 6. **回放**：D8 决策日志的字段与采样率；仿真精度。
-7. **分支/跨区/rollout**：DFS 在 0.3.13 的部署确认；跨区事件/带宽。
