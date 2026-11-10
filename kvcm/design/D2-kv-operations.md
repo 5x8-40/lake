@@ -1025,6 +1025,7 @@ sequenceDiagram
 | NoF put（`nof_replica_num=1`） | SKIP：`INVALID_PARAMS`（本 master 未配通） |
 | 2026-11-10 tip 再验（client / backend.pin / 错地址） | PASS（同上容器） |
 | 2026-11-10 replica-id：正向 pin；错地址在 list sanity 拒绝且 **payload 保留** | PASS |
+| 2026-11-10 **删 key → id 必变**（不撞地址复用） | PASS：Case B `old_id==start_id`（例 19）；`force remove` 后 Case A `start_id` 新值（例 20）且 ≠ 旧 id，Revoke 不 End。容器临时 `probe_upsert_memory_ids`（未入仓） |
 
 **ABI 对照（2026-11-10）**
 
@@ -1036,7 +1037,7 @@ sequenceDiagram
 - 行为闭环（同日 tip）：正向 End 成功 + 错地址 Revoke——`EndResult` 若仍按旧布局会把成功误读成失败。
 - **R04 残余**：未对上游头做编译期 `static_assert`（wheel 无 `.h`；完整 include 依赖重）。版本号+源码头对照+行为验，不是 SHA 级 ABI 证明。
 
-未覆盖：并发、End 失败注入；**A15 已改为 replica id 校验**（待本改 tip 真机复验 id 稳定性）。  
+未覆盖：并发、End 失败注入、地址复用注入（不强制）。**A15**：replica id 校验 + 真机「删 key → id 必变」已验（上表）。  
 单测：`pytest -k pin_soft`；CI 不编 `_empty_pin.so`，无 so 时相关测 skip。
 
 编号线索：R02 部分失败不回滚；R03 `put_step=1`；R04 ABI；A04 NoF；A15 见上（id 关闭）；A16 见 summary（另开 PR，含 pin 的 GetReplicaList 续租）。
