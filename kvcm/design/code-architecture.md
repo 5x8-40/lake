@@ -277,7 +277,7 @@ stateDiagram-v2
 | 能力 | mooncake 0.3.11（历史部署） | mooncake 目标版本 v0.3.13.post1（当前基线；代码里沿用 main 名字） | 出处 |
 |------|------------------------------|----------------------------|------|
 | has_lease（读续租） | RPC ✓ 通道 ✓（`is_exist`） | RPC ✓ 通道 ✓ | D2 F9 |
-| soft pin 事后加（空写） | RPC ✓ 通道 ✗（0.3.11/0.3.12） | RPC ✓ 通道 ✓（有条件可用：方案 1；A14 已验。**A15** 地址复用=精度风险，书面接受；不匹配 Revoke→Erase 可重算。L2 未接） | D2 §2 |
+| soft pin 事后加（空写） | RPC ✓ 通道 ✗（0.3.11/0.3.12） | RPC ✓ 通道 ✓（方案 1 + replica id 关 A15；A14 行为见 D2。L2 未接） | D2 §2 |
 | hard pin 事后改标记 | ✗（创建时固化，`pin(HARD)` 拒绝；要 lease 保护用显式 `register_keepalive()` + `renew_once`。lease 是 master 的 `default_kv_lease_ttl`，kvcm 不改） | ✗ | D2 §2 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源，且 `source` 必填） | ✗ | D2 F7 |
 | has_offload / has_promotion（池通道降层/提回） | 降层通道 ✗（`/batch_query_keys` 无 disk 字段，主线 #2685 才加）。提回 ✓（`GetReplicaList`） | 降层 ✓：停保活 → 满 lease TTL → 确认 LOCAL_DISK。提回：L3 promote；PromoteFlow ±target；intent 经 TaskEngine，闸仅 copy | D2 §3 |
@@ -358,7 +358,7 @@ stateDiagram-v2
 
 **自封装 .so**（已落地的缺口只有空写 upsert。保留身份不在这份主线里，不用这个 .so 去补）：
 
-- 已落地的空写：有条件可用（v0.3.13.post1）。方案 1；A14 见 D2 §2。**A15** 精度风险书面接受。L2 未接。
+- 已落地的空写：有条件可用（v0.3.13.post1）。方案 1 + replica id（关 A15）；A14 见 D2 §2。L2 未接。
 - 单 client：扩展必须用 `setup` 已建的那一个（`_get_pyclient_capsule`），禁止扩展内再 `RealClient::create()`。
   - 类型只写到 `master_client_`；偏移已与完整类对过。含 `pyclient.h` / `get_real_client()` 是退路，当前不走。
   - client_id：方案一（空写写成 kvcm UUID）。借名做不到。

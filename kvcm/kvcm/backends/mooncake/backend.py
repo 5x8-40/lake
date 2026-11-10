@@ -1127,22 +1127,15 @@ class MooncakeBackend(KvOps):
             )
         # soft pin 空写是“有条件可用”：本 PR 目标版本没有 has_read_lease
         # 门槛，同尺寸会走 Case B；这里只保证 Case B 的前置条件。
-        # 方案 1（D2 §2）：UpsertStart 后地址匹配 → 只 End（End 失败不
-        # Revoke）；不匹配 → Revoke。本路径用 exists + 二次 query 前
-        # renew_once 收窄 exists→UpsertStart 竞态；不 register_keepalive。
-        # **未确认假设**：单 slice（put_step=1）、admin 的 size_/buffer_address_
-        # 与 metadata.size/旧 buffer 一致、key 不被并发重写。
-        # admin 的 memory 只含 DRAM values；NoF 单独存 nof，不再混入。
-        # memory+NoF 可以空写（UpsertEnd(ALL) 含 nof）；NoF-only 会在
-        # len(memory)!=1 处拒绝，因为 native 地址检查只认 MemDesc。
-        # lease 能挡驱逐和非 force Remove，挡不了 force Remove、lease 过期
-        # 后的驱逐或 Case C。
-        # Case C 的旧 buffer 进 discarded_replicas_ 延迟释放
-        # （put_start_release_timeout，默认 600s），所以检查时新 buffer
-        # 不会立即复用旧地址；地址复用残余主要来自 exists 后发生 force
-        # remove / stale 清理 / lease 过期驱逐，或 UpsertStart 惰性清理 /
-        # processing 抢占后无 COMPLETE 副本的 Case A，以及
-        # CallResult/descriptor 的 ABI 不确定性。
+        # 方案 1 + replica id（D2 §2）：native 先 GetReplicaList 取旧
+        # memory ReplicaID（授 lease），UpsertStart 后比 id——相同只 End
+        # （End 失败不 Revoke），不同 Revoke。地址/size 作 sanity。
+        # 本路径仍 exists + renew_once + admin 二次 query（盘副本守卫、
+        # 取 size/address）；与 native GetReplicaList 的 lease 有重叠，
+        # 可后续收拢。不 register_keepalive。
+        # **未确认假设**：单 slice（put_step=1）；admin 字段与池一致。
+        # admin 的 memory 只含 DRAM；NoF 单独存。memory+NoF 可空写；
+        # NoF-only 在 len(memory)!=1 拒绝。lease 挡驱逐/非 force Remove。
         if self._cap.soft_pin_after.channel is not Support.YES:
             raise UnsupportedCapabilityError(
                 "soft pin 事后加：这个能力集的通道不具备"

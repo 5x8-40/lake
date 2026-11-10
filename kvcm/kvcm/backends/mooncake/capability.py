@@ -76,12 +76,11 @@ def mooncake_main() -> BackendCapability:
             Support.YES,
             Support.YES,
             "有条件可用（目标版本）：SoftPinAction；无 has_read_lease 门槛；"
-            "同尺寸空写走 Case B；收尾方案 1（匹配只 End，不匹配 Revoke；"
-            "End 失败不 Revoke）。pin 前 exists+renew_once+二次 query；"
+            "同尺寸空写走 Case B；收尾方案 1 + replica id（GetReplicaList 旧 id "
+            "vs UpsertStart 返回 id；同→End，异→Revoke；关 A15）。"
+            "pin 前 exists+renew_once+二次 query；native 内再 GetReplicaList。"
             "需 put_step=1、无盘副本、单内存副本。"
-            "A15：Case A 地址复用可误判 B→空 End（精度风险，书面接受；"
-            "renew 只降概率）。lease 挡驱逐/非 force Remove，不挡 force Remove、"
-            "lease 过期驱逐或 Case C；不 register_keepalive。"
+            "lease 挡驱逐/非 force Remove；不 register_keepalive。"
             "Start-End 崩溃 / 短暂不可读 / client_id 改写 / soft pin 不随 lease 续 "
             "仍是已知边界",
         ),

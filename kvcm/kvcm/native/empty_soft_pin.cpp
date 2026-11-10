@@ -1,4 +1,4 @@
-// 把 setup 建好的 client 传进来，调用 UpsertStart / UpsertEnd。
+// 把 setup 建好的 client 传进来，调用 GetReplicaList / UpsertStart / UpsertEnd。
 // 类型在 mooncake_pin_api.h。不包含 pyclient.h，不手写偏移。
 
 #include "mooncake_pin_api.h"
@@ -50,27 +50,50 @@ mooncake::Client* client_of(py::handle cap_obj) {
     throw std::runtime_error(os.str());
 }
 
+// 从 descriptor 列表里取出唯一 memory 副本；允许多余 NoF。遇盘/DFS 拒绝。
+bool find_sole_memory(const std::vector<mooncake::Replica::Descriptor>& descs,
+                      uint64_t* id_out, uint64_t* addr_out, uint64_t* size_out,
+                      std::string* err) {
+    size_t memory_count = 0;
+    uint64_t id = 0;
+    uint64_t addr = 0;
+    uint64_t size = 0;
+    for (const auto& desc : descs) {
+        if (const auto* mem = std::get_if<mooncake::MemDesc>(&desc.body)) {
+            ++memory_count;
+            id = desc.id;
+            addr = static_cast<uint64_t>(mem->buffer_descriptor.buffer_address_);
+            size = static_cast<uint64_t>(mem->buffer_descriptor.size_);
+        } else if (std::get_if<mooncake::NofDesc>(&desc.body)) {
+            // memory+NoF 允许；UpsertEnd(ALL) 含 nof。
+            continue;
+        } else {
+            *err = "有盘/DFS 副本，空写收尾盖不住";
+            return false;
+        }
+    }
+    if (memory_count != 1) {
+        *err = "需要恰好一块 memory 副本，实际=" + std::to_string(memory_count);
+        return false;
+    }
+    *id_out = id;
+    *addr_out = addr;
+    *size_out = size;
+    return true;
+}
+
 }  // namespace
 
 void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
                     const std::vector<size_t>& sizes,
                     const std::vector<uint64_t>& addresses, bool enable) {
-    // 方案 1（当前收尾策略，见 D2 §2）：按「像不像原位」分流。
-    // - 地址/大小匹配 → 认定 Case B，只 UpsertEnd；End 失败也不 Revoke
-    //   （Case B 的唯一 PROCESSING 副本上 Revoke→Erase，会删掉好数据）。
-    // - 不匹配 → 认定 Case A/C，UpsertRevoke，绝不 End。
-    // 后续优化路径（文档登记，本 PR 不做）：留 PROCESSING / 池侧
-    // only_in_place / keepalive-only。
-    //
-    // lease 只能挡驱逐和非 force Remove，挡不了 force Remove，也挡不了
-    // Case C（目标版本 UpsertStart 只看 size）。但 Case C 的旧 buffer 会
-    // 进 discarded_replicas_ 延迟释放（put_start_release_timeout，默认
-    // 600s）；新 buffer 随后分配，旧 buffer 仍被持有，所以检查时不会
-    // 立即复用旧地址。
-    // 地址复用残余主要来自 Case A：调用方 exists 后 key 被 force remove /
-    // stale 清理 / lease 过期驱逐，或 UpsertStart 开头的惰性清理 / processing
-    // 抢占后没有 COMPLETE 副本；旧 buffer 真正释放后，新分配可能拿到同一
-    // 地址和 size，此时地址检查会误判成 B。ABI 读错 descriptor 也会破坏检查。
+    // 方案 1 + replica id（关 A15，见 D2 §2）：
+    // 1) GetReplicaList 取旧 memory ReplicaID（并授 lease）；
+    // 2) UpsertStart；
+    // 3) 返回的 memory id 与旧 id 相同 → Case B，只 End（End 失败不 Revoke）；
+    //    不同 → Case A/C，Revoke，绝不 End。
+    // 地址/size 作 sanity：与 GetReplicaList / 调用方不一致则拒绝。
+    // Case B 上误 Revoke 仍会 Erase（sole PROCESSING）——id 匹配后不 Revoke。
     if (keys.size() != sizes.size() || keys.size() != addresses.size() ||
         keys.empty()) {
         throw std::runtime_error("软钉的 key/size/address 不合法，没有钉上");
@@ -81,41 +104,69 @@ void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
     config.soft_pin_action = enable ? mooncake::SoftPinAction::ENABLE
                                     : mooncake::SoftPinAction::DISABLE;
     std::vector<std::string> succeeded;
-    // RPC 期间放开 GIL。这个作用域里只碰 C++ 字符串和 master client。
     py::gil_scoped_release release;
     for (size_t i = 0; i < keys.size(); ++i) {
         if (sizes[i] == 0 || addresses[i] == 0) {
             fail("软钉缺少原尺寸/地址，没有钉上: " + keys[i], succeeded);
         }
+
+        auto listed = client->master_client_.GetReplicaList(keys[i]);
+        if (!listed.ok) {
+            fail("GetReplicaList 失败，没有钉上: " + keys[i], succeeded);
+        }
+        uint64_t old_id = 0;
+        uint64_t listed_addr = 0;
+        uint64_t listed_size = 0;
+        std::string shape_err;
+        if (!find_sole_memory(listed.value.replicas, &old_id, &listed_addr,
+                              &listed_size, &shape_err)) {
+            fail("GetReplicaList " + shape_err + "，没有钉上: " + keys[i],
+                 succeeded);
+        }
+        if (listed_addr != addresses[i] || listed_size != sizes[i]) {
+            fail("GetReplicaList 地址/尺寸与调用方不一致，没有钉上: " + keys[i],
+                 succeeded);
+        }
+        if (old_id == 0) {
+            fail("GetReplicaList 未给出 replica id，没有钉上: " + keys[i],
+                 succeeded);
+        }
+
         auto started = client->master_client_.UpsertStart(
             keys[i], {sizes[i]}, config);
         if (!started.ok) {
             fail("UpsertStart 失败，没有钉上: " + keys[i], succeeded);
         }
 
-        // Case B 的返回 descriptor 复用旧 buffer；Case A/C 会返回新
-        // buffer。只对“唯一一个 memory descriptor 且地址/大小都等于旧值”
-        // 放行，其余一律 Revoke。
-        size_t memory_count = 0;
-        bool matched = false;
-        for (const auto& desc : started.value) {
-            if (const auto* mem =
-                    std::get_if<mooncake::MemDesc>(&desc.body)) {
-                ++memory_count;
-                if (static_cast<uint64_t>(
-                        mem->buffer_descriptor.buffer_address_) == addresses[i] &&
-                    static_cast<uint64_t>(mem->buffer_descriptor.size_) ==
-                        sizes[i]) {
-                    matched = true;
-                }
-            }
-        }
-        if (memory_count != 1 || !matched) {
-            // 方案 1：不匹配按 A/C Revoke。注意：若期望地址写错而 master
-            // 实际走了 Case B，Revoke 仍会 Erase 该 key（sole PROCESSING）。
+        uint64_t new_id = 0;
+        uint64_t new_addr = 0;
+        uint64_t new_size = 0;
+        if (!find_sole_memory(started.value, &new_id, &new_addr, &new_size,
+                              &shape_err)) {
             (void)client->master_client_.UpsertRevoke(
                 keys[i], mooncake::ReplicaType::ALL);
-            fail("UpsertStart 不是原位复用（Case A/C），已 Revoke，没有钉上: " +
+            fail("UpsertStart " + shape_err + "，已 Revoke，没有钉上: " +
+                     keys[i],
+                 succeeded);
+        }
+
+        // 主判据：replica id。地址复用时 id 仍会变（Case A 新分配）。
+        const bool id_matched = (new_id == old_id);
+        const bool addr_matched =
+            (new_addr == addresses[i] && new_size == sizes[i]);
+        if (!id_matched) {
+            (void)client->master_client_.UpsertRevoke(
+                keys[i], mooncake::ReplicaType::ALL);
+            fail("UpsertStart replica id 不匹配（Case A/C），已 Revoke，"
+                 "没有钉上: " +
+                     keys[i],
+                 succeeded);
+        }
+        if (!addr_matched) {
+            // id 同而地址不同不应出现在 Case B；当 ABI/竞态，宁 Revoke。
+            (void)client->master_client_.UpsertRevoke(
+                keys[i], mooncake::ReplicaType::ALL);
+            fail("UpsertStart id 匹配但地址/尺寸不一致，已 Revoke，没有钉上: " +
                      keys[i],
                  succeeded);
         }
@@ -124,8 +175,7 @@ void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
             mooncake::ObjectMeta{keys[i], std::nullopt},
             mooncake::ReplicaType::ALL);
         if (!ended.ok) {
-            // 方案 1：已确认 Case B，禁止 Revoke（会 Erase 好数据）。
-            // 副本留在 PROCESSING；崩溃恢复 / 补 End 是后续路径。
+            // 已确认 Case B（id 匹配），禁止 Revoke（会 Erase 好数据）。
             fail("UpsertEnd 失败（Case B，未 Revoke，副本可能仍 PROCESSING）"
                  "，没有钉上: " +
                      keys[i],

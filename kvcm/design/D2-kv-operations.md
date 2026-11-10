@@ -5,7 +5,7 @@
   - 本文定这些操作的语义、实现机制、失败处理
 - 状态：**设计完成**
   - §1 操作集框架：闭环——八项操作业界逐项对照、完备性审计、kvcm 能力边界（只能被动等池的真缺口 2 条，归池侧扩展 vs 无专用 RPC 但组合可达 7 条）
-  - §2 pin：`pin(HARD)` 拒绝；lease 保护用 `register_keepalive()`。soft pin = 有条件可用空写（目标版本无 lease gate，走 Case B；收尾方案 1；client_id 方案一）。A14 真机与 A15（精度残余）见本节「A14 真机记录」/「地址复用残余」。**L2 不接 soft pin**
+  - §2 pin：`pin(HARD)` 拒绝；lease 保护用 `register_keepalive()`。soft pin = 有条件可用空写（目标版本无 lease gate，走 Case B；方案 1 + **replica id** 关 A15；client_id 方案一）。A14 真机见本节。**L2 不接 soft pin**
   - 易混淆：[lease-pin-eviction.md](lease-pin-eviction.md)（lease / soft / hard / 驱逐）
   - §3 demote / promote：停保活 → 满 lease TTL → admin 确认盘副本
   - 协议：`SubmitIntent` 仍是前缀 × 目标；执行走 `PromoteFlow(target=)`。move / pin / demote / remove 无独立 intent
@@ -843,8 +843,8 @@ sequenceDiagram
 
 > 有条件可用（v0.3.13.post1）。只走 Case B；通道 YES（0.3.11/0.3.12 为 NO）。
 > 收尾方案 1：匹配 → 只 End（End 失败不 Revoke，抛异常）；不匹配 → Revoke。
-> Case B 上误 Revoke 会 Erase（F5，可重算）。**A15**（Case A 地址复用误判→空 End）是精度风险，书面接受。
-> `pin`：`exists` + `renew_once` + 二次 query。ABI / 真机见「A14 真机记录」。
+> Case B 上误 Revoke 会 Erase（F5，可重算）。**A15** 用 **replica id** 关闭：`GetReplicaList` 旧 id vs `UpsertStart` 返回 id；地址复用不再能骗过 End。
+> `pin`：`exists` + `renew_once` + 二次 query（admin）；native 内再 `GetReplicaList`（授 lease + 取 id）。ABI / 真机见「A14 真机记录」。
 
 #### 限制、原因与 case
 
@@ -854,7 +854,7 @@ sequenceDiagram
 |---|---|---|---|---|
 | **B** | key 存在，size 一致 | 复用旧 buffer，COMPLETE→PROCESSING | 地址 / 大小匹配 → `UpsertEnd`，pin 生效 | 无：旧数据留在原 buffer |
 | **C** | key 存在，size 不同 | 旧副本进 `discarded_replicas_` 延迟释放（默认 600s）；分配新 buffer | 地址不匹配 → `UpsertRevoke`，不 End | 不 End，不会把空 buffer 标完成；最坏 key missing → 重算 |
-| **A** | `UpsertStart` 判定时 key 不存在（`exists` 后被删 / 逐，惰性清理清空副本，或抢占 processing 后无 COMPLETE） | 分配新 buffer | 地址不匹配（通常）→ `UpsertRevoke` | 通常：key missing → 重算。**A15**：地址复用误判 B → 空 End → **精度风险** |
+| **A** | `UpsertStart` 判定时 key 不存在（`exists` 后被删 / 逐，惰性清理清空副本，或抢占 processing 后无 COMPLETE） | 分配新 buffer（**新 ReplicaID**） | **id 不匹配** → `UpsertRevoke`（地址仅 sanity） | key missing → 重算。地址复用也不再误 End（A15 关闭） |
 
 **1. 前置条件：不满足就不钉（或钉了也会被地址检查撤回）**
 
@@ -947,18 +947,14 @@ sequenceDiagram
 **4. 数据安全残余与工程边界**
 
 1. **空写本身不写数据**
-   - Case B：旧 buffer 原地复用，数据还在；`UpsertEnd` 只是把状态标回 COMPLETE，安全。
-   - Case A/C（地址检查生效、未误判）：新 buffer 没有数据；不 End，走 Revoke → 最坏 key missing → **可重算**（不是精度损失）。
-   - **不要**把上一句当成「空写绝无精度问题」——见下条 A15。
-2. **地址复用残余 A15（精度风险，只影响 Case A）**
-   - Case C：旧 buffer 在 `discarded_replicas_` 里延迟释放（默认 600s）；检查时旧地址仍被占 → **不会**因 C 误判。
-   - Case A：`exists` 之后、`UpsertStart` 之前 key 被 force remove / stale 清理 / lease 过期驱逐；或 Start 开头惰性清理 / processing 抢占后无 COMPLETE。旧 buffer 已释放，新分配若复用同一地址+size → 地址检查误判为 B → **空 buffer 被 End → 精度风险**（不是「key missing 再重算」）。
-   - 触发前提：先发生上述 Case A，且分配器恰好复用同地址。pin 开始时 key 已不在会在 `exists` 失败；静默续 lease、无 force remove/清理/驱逐时通常不发生。
-   - **短期处置（#82 书面接受）**：短时间不改 mooncake、不做 RMW。`soft_pin_after` 仍标 YES（有条件可用），但调用方须知：空写 soft pin **不能**在「exists→Start 窗口可能被强删/清理/驱逐」的场景当作精度无损；需要绝对保证时用 keepalive-only，或等 only_in_place / replica-id 校验 / RMW。`exists`+`renew_once`+二次 query 只降概率，不消 A15。
-   - 绝对保证：keepalive-only / 池侧 `only_in_place` / read-modify-write / 更强校验（如 replica id）——当前未做。
+   - Case B：旧 buffer 原地复用（**同 ReplicaID**），数据还在；`UpsertEnd` 标回 COMPLETE，安全。
+   - Case A/C：新 buffer / 新 id；id 不匹配 → 不 End，走 Revoke → 最坏 key missing → **可重算**。
+2. **A15（地址复用→误空 End）——已用 replica id 关闭**
+   - 旧路径只比地址+size：Case A 新 buffer 若复用同地址会误 End。
+   - **现路径**：`GetReplicaList` 旧 `Replica::Descriptor.id` → `UpsertStart` → 比返回 id。Case B 原地同 id（`master_service.cpp` 返回 `get_descriptor()`）；Case A 新 `next_id_`。id 不同 → Revoke。地址/size 仅 sanity；与 list/调用方不一致则**不进入** Start（错地址不再误 Erase 好 key）。
+   - 残余：查询/`id` ABI 读错；End 失败留 PROCESSING；Case B 误 Revoke 仍 Erase。only_in_place / RMW 未做。
 3. **ABI 残余**
-   - `mooncake_pin_api.h` 是手写镜像；`EndResult` 须按 `tl::expected<void, ErrorCode>`（A14 已校正）。
-   - 编译通过≠布局一定对；地址读错会破坏检查。A14 真机已验正向 Case B 可读旧地址。
+   - `mooncake_pin_api.h` 手写镜像；`EndResult` / `GetReplicaListResponse` 按 `tl::expected`。编译通过≠布局一定对。
 4. **版本依赖（空写扩展不是跨版本通用）**
 
 | 版本 | soft pin 配置 | `UpsertEnd` 签名 | `has_read_lease` gate | 本扩展可用性 |
@@ -1022,11 +1018,12 @@ sequenceDiagram
 |---|---|
 | put → soft_pin ENABLE；`master_soft_pin_key_count` 0→1；地址不变 | PASS |
 | DISABLE + get 比对 payload | PASS |
-| 错地址 → 异常 + Revoke→Erase（`got_len=0`） | PASS（方案 1 残余，可重算） |
+| 错地址 → 异常（现：与 GetReplicaList 不一致则**不** Start，key 保留） | PASS（行为相对旧 Revoke→Erase 更安全） |
 | tip 复验 + `backend.pin`（renew+二次 query） | PASS |
 | 225 put → 45 soft_pin（数据 ep 在 225） | PASS |
 | NoF put（`nof_replica_num=1`） | SKIP：`INVALID_PARAMS`（本 master 未配通） |
 | 2026-11-10 tip 再验（client / backend.pin / 错地址） | PASS（同上容器） |
+| 2026-11-10 replica-id：正向 pin；错地址在 list sanity 拒绝且 **payload 保留** | PASS |
 
 **ABI 对照（2026-11-10）**
 
@@ -1038,23 +1035,23 @@ sequenceDiagram
 - 行为闭环（同日 tip）：正向 End 成功 + 错地址 Revoke——`EndResult` 若仍按旧布局会把成功误读成失败。
 - **R04 残余**：未对上游头做编译期 `static_assert`（wheel 无 `.h`；完整 include 依赖重）。版本号+源码头对照+行为验，不是 SHA 级 ABI 证明。
 
-未覆盖：并发、End 失败注入、**A15 地址复用**（精度残余；书面接受，见上；reviewer 另提 replica-id 方案）。  
-单测：`pytest -k pin_soft` → 11 passed。CI 不编 `_empty_pin.so`，无 so 时相关测 skip。
+未覆盖：并发、End 失败注入；**A15 已改为 replica id 校验**（待本改 tip 真机复验 id 稳定性）。  
+单测：`pytest -k pin_soft`；CI 不编 `_empty_pin.so`，无 so 时相关测 skip。
 
-编号线索（合入后不再维护独立 tracker）：R02 部分失败不回滚；R03 `put_step=1` 真机布局；R04 ABI 见上对照（无 static_assert）；A04 NoF 收尾；A15 见上；A16 见 summary（含 soft pin 的 exists/renew 续 lease）。
+编号线索：R02 部分失败不回滚；R03 `put_step=1`；R04 ABI；A04 NoF；A15 见上（id 关闭）；A16 见 summary。
 
 #### soft pin 的其他方案
 
 | 方案 | 安全性 | 代价 | 状态 |
 |---|---|---|---|
-| 空写 upsert（方案 1） | Case B 安全；A/C 地址检查未误判时最坏重算；**A15 误判是精度风险**（书面接受） | native 扩展 | 有条件可用 |
+| 空写 upsert（方案 1 + replica id） | Case B：id 同→End；A/C：id 异→Revoke（可重算）；**A15 关闭** | native + `GetReplicaList` | 有条件可用 |
 | 真实写入带 pin | Case C 新 buffer 有数据 | 数据过 kvcm | 未实现 |
 | 池侧 only_in_place / pin-only | 非原位直接失败 | fork mooncake | 未实现（=备选 ③） |
 | 引擎源头带 pin | 安全但引擎不知何时 pin | 改引擎 | 否决 |
 | 读锁 / refcnt | 无读者引用 RPC | — | 否决 |
-| keepalive | 只护 lease | 持续续租 | 已有（≠ soft pin；消 A15 的绕开路径） |
+| keepalive | 只护 lease | 持续续租 | 已有（≠ soft pin） |
 
-- 满足 Case B 前置时可宣称有条件可用；**不承诺精度无损**（A15）。消 A15：RMW / only_in_place / replica-id / keepalive-only。
+- 满足 Case B 前置时可宣称有条件可用；A15 由 replica id 关闭（非 only_in_place）。
 
 ### hard pin 级（绝对不可驱逐）：不接受 `pin(HARD)`
 

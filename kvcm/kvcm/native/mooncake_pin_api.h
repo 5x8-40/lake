@@ -1,19 +1,17 @@
 // 只保留空写要用的类型。不包含 pyclient.h。
 // Client 只写到 master_client_ 为止，后面的成员不影响它的位置。
-// 与完整类定义对过（同一份源码树）：PyClient::client_ 在 8，
+// 与完整类定义对过（v0.3.13.post1 / 719735896c）：PyClient::client_ 在 8，
 // Client::master_client_ 在 48，ReplicateConfig 208 字节，ObjectMeta 48 字节。
 //
 // Replica::Descriptor 的字段名与上游不同（这里叫 body，上游叫
-// descriptor_variant），但类型/顺序按目标版本镜像；地址检查只读
-// MemDesc::buffer_descriptor。CallResult / EndResult 是 tl::expected 的镜像：
-// EndResult 须按 expected<void, ErrorCode>（ok + union）；旧「ErrorCode 在前」
-// 会把成功读成失败。A14（0.3.13.post1）已校正。编译通过≠布局一定对。
+// descriptor_variant），但类型/顺序按目标版本镜像。CallResult / EndResult
+// 是 tl::expected 的镜像：EndResult 须按 expected<void, ErrorCode>
+// （ok + union）；旧「ErrorCode 在前」会把成功读成失败。
 //
-// 地址检查只判断 UpsertStart 是否原地复用（Case B）；它不改变 lease
-// 语义：lease 挡驱逐 / 非 force Remove，挡不了 force Remove、lease 过期
-// 后的驱逐或 Case C。
-// Case C 的旧 buffer 延迟释放（默认 600s），所以检查时旧地址不会被
-// 新 buffer 立即复用；Case A 的地址复用是已知残余。
+// Case 判定（关 A15）：UpsertStart 前 GetReplicaList 取旧 memory
+// Replica::Descriptor.id；Start 后比 id。相同 → Case B 只 End；不同 →
+// Revoke。地址/size 只作额外 sanity。lease 挡驱逐 / 非 force Remove，
+// 挡不了 force Remove；Case C 旧 buffer 延迟释放（默认 600s）。
 
 #pragma once
 
@@ -29,7 +27,11 @@ namespace mooncake {
 
 enum class ErrorCode : int32_t {};
 enum class ReplicaType : int { ALL = 4 };
-enum class SoftPinAction : uint8_t { ENABLE = 1, DISABLE = 2 };
+enum class SoftPinAction : uint8_t {
+    PRESERVE = 0,
+    ENABLE = 1,
+    DISABLE = 2,
+};
 enum class ObjectDataType : uint8_t { UNKNOWN = 0 };
 enum class ReplicaStatus : int { UNDEFINED = 0 };
 using UUID = std::pair<uint64_t, uint64_t>;
@@ -84,6 +86,12 @@ struct ReplicateConfig {
     std::optional<std::vector<std::string>> group_ids{};
 };
 
+struct GetReplicaListResponse {
+    std::vector<Replica::Descriptor> replicas;
+    uint64_t lease_ttl_ms{};
+    std::optional<uint64_t> object_checksum;
+};
+
 template <class T>
 struct CallResult {
     union {
@@ -115,6 +123,9 @@ class TransferEngine;
 
 class MasterClient {
    public:
+    // 符号按名链接；声明顺序不要求与上游头一致。
+    CallResult<GetReplicaListResponse> GetReplicaList(
+        const std::string& object_key);
     CallResult<std::vector<Replica::Descriptor>> UpsertStart(
         const std::string& key, const std::vector<size_t>& slice_lengths,
         const ReplicateConfig& config);
