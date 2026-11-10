@@ -40,18 +40,29 @@ flowchart TB
 | 记号 | 含义 |
 |---|---|
 | `P` | prompt token 数 |
+| `H` | 连续 HBM 命中的 token 数 |
 | `B` | block token 数（128） |
 | `S_bytes` | 前缀字节数 = `P × bytes_per_token` |
+| `X_bytes` | 本次实际要传的 KV 字节数（可小于 `S_bytes`） |
 | `S_saved` | 预期节省的时间（命中/防 miss） |
 | `v_prefill` | **整实例**有效 prefill 吞吐（token/s），不是每 GPU；随上下文长度与命中率非线性下降 |
 | `BW` / `BW_eff` | 本次/到节点 n 的实际有效带宽；按平面取 `BW_h2d` / `BW_storage` / `BW_compute` |
 | `BW_h2d` / `BW_storage` / `BW_compute` | 三类网络的有效带宽：本机 H2D、存储面、计算面 |
 | `T_prefill` | 重算时间 = `P / v_prefill` |
+| `residual` | 未命中、需要重算的 token 数 = `P − H` |
+| `T_compute` | 重算时间 = `residual / v_prefill` |
+| `T_kv` | 拿到前缀 KV 的代价（可掩盖时取 max，不可掩盖时相加） |
+| `BW_copy` | copy/预取的有效带宽 |
 | `T_transfer` | 跨机传输 = `S_bytes / BW_storage` 或 `BW_compute`；950 跨机待测，A3 ROCE 参考约 23.8GB/s |
 | `T_h2d` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_h2d`；950 单机 UB_CTP≈46.9GB/s、POD≈93.4GB/s（两种场景）；800Gbps 是链路口径 |
+| `T_handoff` | PD/实例交接、首 token 固定开销（秒） |
 | `Q` | 队列等待 |
 | `D` | TTFT 目标 |
 | `L` | 模型层数（含 MTP 层） |
+| `c_gpu` | GPU 单位时间成本（元/GPU·s） |
+| `c_bw` | 传输单位时间成本（元/s） |
+| `c_mem` | 驻留单位字节时间成本（元/byte·s） |
+| `c_slo` | SLO 违约单位时间成本（元/s） |
 
 `v_prefill` 不能当常数：attention 是 O(P²)，长上下文下每 token 的 prefill 成本上升；命中率高时 residual 虽小，仍要 attend 全部缓存 KV，同样不是常数。校准必须按实际上下文长度分档。
 
@@ -253,12 +264,12 @@ P_ghost ≈ 1 − exp(−λ_delete × age)
 | 符号 | 含义 |
 |---|---|
 | `H/P` | 连续 HBM / 池命中 token |
-| `B` | 要传的字节 |
+| `X_bytes` | 本次实际要传的字节 |
 | `Q` | 队列等待 |
 | `F/R` | hook 未来价值 / 陈旧或 ghost 风险 |
-| `T_transfer` | 本次传输耗时 = `B / BW_eff` |
+| `T_transfer` | 本次传输耗时 = `X_bytes / BW_eff` |
 | `w_hit/w_pool/w_transfer/w_q/w_slo/w_future/w_risk` | 各项权重，由 L2 的资源权重给出 |
-| `c_prefill/c_bw/c_queue/c_slo` | 单位成本（秒、字节、排队、SLO 违约） |
+| `c_prefill` / `c_bw` / `c_queue` / `c_slo` | 单位成本：重算（元/token）、传输（元/s）、排队（元/s）、SLO 违约（元/s） |
 | `κ_tier` | DRAM/NVMe/DFS 的折扣 |
 
 ```text
@@ -285,7 +296,7 @@ U(r,n) =
 ```text
 TTFT(r,n) = Q(n)
           + residual(r,n) / v_prefill(n)
-          + B(r,n) / BW_eff(n)
+          + X_bytes(r,n) / BW_eff(n)
           + T_handoff
 ```
 
@@ -294,9 +305,9 @@ TTFT(r,n) = Q(n)
 **这个式子假设传输能被计算掩盖**（两项相加，不是取 max）。按 §1.1，残差很小时不成立：
 
 ```text
-可以掩盖：TTFT = Q + max(residual/v, B/BW_eff) + T_handoff
-不能掩盖：TTFT = Q + residual/v + B/BW_eff + T_handoff   ← 上式
-判据：residual < B/BW_eff × v_prefill
+可以掩盖：TTFT = Q + max(residual/v, X_bytes/BW_eff) + T_handoff
+不能掩盖：TTFT = Q + residual/v + X_bytes/BW_eff + T_handoff   ← 上式
+判据：residual < X_bytes/BW_eff × v_prefill
 ```
 
 选路时应按节点分别判断：同一个请求，走节点 A 可能能掩盖（A 带宽高），走节点 B 不能。
@@ -307,19 +318,19 @@ TTFT(r,n) = Q(n)
 flowchart TB
     S["请求 + Hook"] --> M["KVT.Match 逐候选"]
     M --> H{"连续 HBM 命中够?<br/>置信度够?"}
-    H -->|"是"| HB["HBM 命中<br/>跳池加载 + 残差 prefill"]
-    H -->|"否"| P{"PD 拓扑可用?"}
-    P -->|"是"| PD["PD 分离"]
-    P -->|"否"| CO["混部"]
+    H -->|"是"| HB["HBM 命中<br/>跳过池加载<br/>只算剩余 token"]
+    H -->|"否"| P{"mode = policy(请求类型, 模型部署)"}
+    P -->|"agent/长上下文"| PD["PD 分离"]
+    P -->|"模型仅混部"| CO["混部"]
     HB --> SEL["打分/约束"]
     PD --> SEL
     CO --> SEL
     SEL --> D["目标节点 + mode"]
 ```
 
-**收益**：把“命中、传输、队列、SLO、未来复用”放进同一个可解释分数；不追求全局最优，追求 5ms 内足够好。
+**收益**：把“命中、传输、队列、SLO、未来复用”放进同一个可解释分数；不追求全局最优，只要求在决策预算内足够好。
 
-> PD 的默认选择：agent/长上下文优先 PD；`BW*` 只用于“传 vs 算/能否掩盖”，不是 PD 的开关。拓扑不可用才退回混部。
+> PD 的默认选择：agent/长上下文优先 PD；模型只有混部部署时才混部。`BW*` 只用于“传 vs 算/能否掩盖”，不是 PD 的开关。
 
 ---
 
@@ -328,6 +339,7 @@ flowchart TB
 ### 4.1 期望价值
 
 `EV` = 期望收益；`P_use` = 未来窗口内至少用一次的概率；`S_saved` = 用上时省下的时间。
+`p_miss_avoided` = 预取避免一次驱逐/重算的概率；`p_remote_to_local` = 远端命中转本机命中的概率。
 
 未来请求按 Poisson 到达，窗口 `T` 内至少一次：
 
@@ -375,13 +387,14 @@ s.t. Σ x_i × bytes_i ≤ B_budget
 ### 5.1 Net(T) 与盈亏平衡
 
 ```text
-Net(T) = p_resume(T) × T_prefill − c_h × bytes × T − C_risk
+Net(T) = p_resume(T) × T_prefill − c_h × S_bytes × T − C_risk
 p_resume(T) = p0 × exp(−μT)
-break-even: μ × p0 × exp(−μT) × T_prefill = c_h × bytes
+break-even: μ × p0 × exp(−μT) × T_prefill = c_h × S_bytes
 ```
 
 - `p0`：会话恢复概率；`μ`：恢复概率衰减率；
 - `c_h`：每字节每秒的占用成本；
+- `C_risk`：迁移/违约/数据风险成本；
 - 解出的 `T*` 与 `T_max` 取小；解不出就退化为固定窗口。
 
 ![保留 TTL 盈亏平衡](figures/algo-retention-ttl.svg)
@@ -535,7 +548,7 @@ Cost    = (|R_p| − 1) × S_bytes × c_mem × T
         + copy_bytes / BW × c_bw
 ```
 
-`Benefit > Cost` 才复制；否则宁可排队/扩容，或路由到其他副本。
+其中 `W_single` / `W_multi` 是单副本 / 多副本下的排队+传输时延，`T` 是观察窗口。`Benefit > Cost` 才复制；否则宁可排队/扩容，或路由到其他副本。
 4. **选目标**：按 `headroom − queue − transfer_cost + topology_bonus` 选实例；避免同一故障域；目标 seg 容量不足不提交（PR72）。
 5. **减副本**：`|R_p| > r_target` 且没有会话引用/保留 TTL，释放多余副本；保留至少一份。
 6. **迁移**：节点 drain、故障、拓扑变化时用 `move`；负载分散优先用 `copy`（源保留，多副本分流）。
@@ -554,8 +567,8 @@ Cost    = (|R_p| − 1) × S_bytes × c_mem × T
 #### 会话的边界
 
 - **多个独立会话共享同一前缀**（system prompt、tools、RAG 文档）：副本集合可以真正分散请求。
-- **同一个会话的 decode**：一条序列只能在一个实例上跑；复制前缀不会把 decode 拆开。要分散单会话负载，需要请求迁移/会话迁移（未来特性），不是 KV 复制能解决的。
-- 所以“分散会话”要区分：**分散共享前缀的多个会话**（可以）vs **拆分单个会话的解码**（不行，至少现在不行）。
+- **同一个会话的 decode**：KV copy 不负责拆分或迁移；正常执行时一条序列在一个实例上跑，是否/如何并行（TP/SP/EP）以及请求迁移归引擎/D8。
+- 所以“分散会话”要区分：**分散共享前缀的多个会话**（KV 复制能做）vs **单条 decode 的执行并行/迁移**（归引擎，不是 KV 复制）。
 
 #### 与已有技术的关系
 
@@ -665,7 +678,7 @@ TTFT_cross ≈ TTFT_fit + T_transfer
 ```text
 节省的 GPU 时间/秒 = QPS × Δhit_rate × T_prefill
 等效 GPU 数 ≈ 节省的 GPU 时间/秒
-C_total = GPU 时间×c_gpu + 传输字节×c_bw + 驻留字节×T×c_mem + 浪费
+C_total = GPU 时间×c_gpu + (X_bytes/BW)×c_bw + 驻留字节×T×c_mem + 浪费
 ROI = saved / cost
 ```
 
@@ -734,7 +747,7 @@ ROI = saved / cost
 | **多源合并：source rank + seq + 墓碑** | 引擎/池/kvcm 事件互相覆盖 | 每源独立序号；负事实优先；墓碑防复活 | 多源不打架；删除可收敛 | 源 gap 时要 replay/snapshot |
 | **gap 检测 + replay** | 事件丢失/乱序 | 跳号重放；不可用则 snapshot；再不行标 stale | 索引可恢复 | replay buffer 有界 |
 | **效用打分/成本模型** | 多目标（命中/传输/队列/SLO） | 分层权重 + TTFT 估算 + SLO 惩罚 | 选路可解释、可调 | 权重需真机校准 |
-| **传 vs 算阈值 `BW*`** | 远端命中是否值得传 | `BW* = B·c_bw/(residual·c_prefill)` | 避免“为了省重算反而更慢” | 带宽要有效测量 |
+| **传 vs 算阈值 `BW*`** | 远端命中是否值得传 | `BW* = X_bytes·c_bw/(residual·c_prefill)` | 避免“为了省重算反而更慢” | 带宽要有效测量 |
 | **预取期望收益 + 预算背包** | 预取可能白做 | Poisson 到达估 `P_use`；按每字节期望收益贪心 | 预取 ROI 可控；带宽不被打爆 | ETA/复用率是估计 |
 | **保留 TTL 盈亏平衡** | 保留太久浪费内存 | `p_resume(T)·S` vs 占用成本；指数衰减求 break-even | 会话保留可量化 | 恢复概率难估 |
 | **Little 定律 + 利用率目标** | 扩缩只看队列会滞后 | `L=λW`、`ρ=λ/(cμ)`、`c_min` | 容量有公式、可解释 | 突发/长尾需快环 |
@@ -865,20 +878,20 @@ A3 的 Mooncake **推荐 FabricMem**（`ASCEND_ENABLE_USE_FABRIC_MEM=1`；CANN 9
 hit_tokens = contiguous_blocks × B
 
 # TTFT（区分能否掩盖）
-can_overlap: TTFT = Q + max(residual/v, B/BW) + T_handoff
-otherwise:   TTFT = Q + residual/v + B/BW + T_handoff
-判据: residual < B/BW × v_prefill
+can_overlap: TTFT = Q + max(residual/v, X_bytes/BW) + T_handoff
+otherwise:   TTFT = Q + residual/v + X_bytes/BW + T_handoff
+判据: residual < X_bytes/BW × v_prefill
 
 # 传 vs 算
-BW* = B×c_bw / (residual×c_prefill)
+BW* = X_bytes×c_bw / (residual×c_prefill)
 
 # 预取
 P_use = 1 − exp(−∫λ)
 EV = P_use×S_saved − C_copy − C_occupancy
 
 # 保留
-Net(T) = p0×exp(−μT)×T_prefill − c_h×bytes×T − C_risk
-break-even: μ×p0×exp(−μT)×T_prefill = c_h×bytes
+Net(T) = p0×exp(−μT)×T_prefill − c_h×S_bytes×T − C_risk
+break-even: μ×p0×exp(−μT)×T_prefill = c_h×S_bytes
 
 # 容量
 ρ = λ/(c×μ); c_min = ceil(λ/(μ×ρ_target)); L = λ×W
