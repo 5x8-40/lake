@@ -2,7 +2,7 @@
 
 来源：[issue #54](https://github.com/5x8-40/lake/issues/54)（KV-CM 遗留问题总清单）。本文是 kvcm 预复制生产化的总结文档：设计决策、潜在问题、工程项三类条目的总登记处——已闭环条目在原地标 ✅、结论指向正式文档，待定条目随讨论与实验更新。
 
-文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（copy 端到端）与独立实验（soft pin A14，见 [EXPERIMENTS.md](demo/EXPERIMENTS.md)）；本文 = 登记处。
+文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（copy 端到端）与独立实验（soft pin 真机，见 [EXPERIMENTS.md](demo/EXPERIMENTS.md)）；本文 = 登记处。
 
 编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环后在原位置标 ✅，结论落对应正式文档（`design/` 系设计文档 / `demo/` 系 demo 文档）。
 
@@ -71,15 +71,15 @@
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
 - 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。tasks 与 keepalive 有写入方。replicas 与 sessions 表在，还没有写入方。
-- 遗留（A06，归 E14）：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。promote 不发事件。
+- 遗留（归 E14）：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。promote 不发事件。
 - 协议：`SubmitIntent` 仍是前缀 × 目标实例；执行走 `PromoteFlow(target=)`（可提回 + copy）。move / pin / demote / remove 无独立 intent，不扩协议。
-- **A16（OPEN，上线前必修，不挡合入；另开 PR，不在 soft pin #82 修）**：同前缀未串行。demote 停保活后等 lease TTL 时，同前缀任何**会授 lease** 的操作都能打穿等待——包括 `exists` / 预热 / `check_promote` / `promote` / **`pin(SOFT)` 的 native `GetReplicaList`**（pin 的 lease 入口）。修法：前缀级互斥。横切 L2/L3，单独 PR。
-- **A17（DEFER）**：操作粒度未统一——copy 核验在 `query_task`；demote sleep+盘核验在 L3；promote 等待在 L2 `PromoteFlow`；move/remove 未拆 flow。与 A16 不同项。TaskEngine 多 flow 分发一并 DEFER（当前 intent 仅一种语义，固定 `PromoteFlow`）。
+- **同前缀串行化（未做；上线前必修）**：同前缀未串行。demote 停保活后等 lease TTL 时，同前缀任何**会授 lease** 的操作都能打穿等待——包括 `exists` / 预热 / `check_promote` / `promote` / **`pin(SOFT)` 的 native `GetReplicaList`**（pin 的 lease 入口）。修法：前缀级互斥。横切 L2/L3。
+- **操作粒度 / 多 flow 未统一（未做）**：copy 核验在 `query_task`；demote sleep+盘核验在 L3；promote 等待在 L2 `PromoteFlow`；move/remove 未拆 flow。TaskEngine 多 flow 分发一并未做（当前 intent 仅一种语义，固定 `PromoteFlow`）。
 - locate：进程内「实例 → rank 有序段名单」。intent 和操作入参没有 segment。没登记的实例报错。
 - remove：**全局删所有副本，不支持 target**。无论 force 都先注销保活。`force=False` 再等满一个 lease TTL，然后 `batch_remove(..., force=False)`。`force=True` 注销保活后立刻 `batch_remove(..., force=True)`，不等；但它只跳过 lease，未完成副本和在途 copy/move 仍会拒删。失败或取消不把登记加回去，注销过就留注销，调用方自己重试，租约可以过期。
 - 保活续租用 BatchExistKey（`renew_once` → `exists` → `batch_is_exist`），不用 ProbeKey。`register_keepalive` / `unregister_keepalive` 只登记或注销 Ledger 里的同一张表；续租由 `KeepaliveLoop` 调 `renew_once`。**lease 是 key 级，保这个 key 的所有副本；target 不是保活维度。**
 - 副本核验用主线 `GET /batch_query_keys`。提回：L3 `promote` 不带 target；`PromoteFlow` 无 target 等 memory，有 target 整包（可套 Prefetch）；TaskEngine intent 一律 `PromoteFlow(target=)`（`exists` 一次后 `run_after_exists`）；闸挡 copy 路径（目标已有副本时 copy 可为 no-op）；`check_promote` 的 `QueryError` 当未就绪。daemon `--admin` 必填；`--capability` 默认 `main`。
-- 软钉空写（有条件可用，**v0.3.13.post1**；L3，不接 L2）：`_empty_pin.so` 空写 Upsert；方案 1 + **replica id**（同 id→End，异 id 才 Revoke；关 A15）；链 `store.so`+`libmooncake_store.so`。`pin`：admin 查盘/尺寸 + native `GetReplicaList` 授 lease。升 wheel 须重编 so（无运行时 ABI 闸）。A14 见 [demo/EXPERIMENTS.md](demo/EXPERIMENTS.md)；R04 见 D2 §2。
+- 软钉空写（有条件可用，**v0.3.13.post1**；L3，不接 L2）：`_empty_pin.so` 空写 Upsert；方案 1 + **replica id**（同 id→End，异 id 才 Revoke；关闭地址复用误判）；链 `store.so`+`libmooncake_store.so`。`pin`：admin 查盘/尺寸 + native `GetReplicaList` 授 lease。升 wheel 须重编 so（无运行时 ABI 闸）。真机见 [demo/EXPERIMENTS.md](demo/EXPERIMENTS.md)；ABI 约束见 D2 §2。
 - prefetch：已验证（`CreateCopyTask` → READY）。
 - pin：L3 `pin(SOFT)` 空写；`pin(HARD)` 拒绝，lease 用 `register_keepalive()`。结论见 [D2-kv-operations.md](design/D2-kv-operations.md) §2。
   - soft pin：有条件可用；只承诺 0.3.13.post1；0.3.11/0.3.12 通道 NO；0.3.14-pre+ 有 lease gate 不可直接套。

@@ -1,8 +1,8 @@
 # va-precopy 实验总表与踩坑记录
 
-> **demo 记录**：precopy 预热验证（kvcm 八项操作中 **copy** 一项）的实验史；文末另附 soft pin A14 真机记录（独立实验）。生产化设计见 [../design/](../design/)；kvcm 全貌见 [../README.md](../README.md)。
+> **demo 记录**：precopy 预热验证（kvcm 八项操作中 **copy** 一项）的实验史；文末另附 soft pin 真机记录（独立实验）。生产化设计见 [../design/](../design/)；kvcm 全貌见 [../README.md](../README.md)。
 
-2026-10-08 ~ 11-02 copy 实验史（含已撤回证据；总表至 #24），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。文末 soft pin A14 是 2026-11-09/10 的独立记录。
+2026-10-08 ~ 11-02 copy 实验史（含已撤回证据；总表至 #24），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。文末 soft pin 真机是 2026-11-09/10 的独立记录。
 
 模型除注明外均为 `/data/models/Qwen3-VL-8B-w8a8c16`（GQA 8 KV head，block_size 128，`PYTHONHASHSEED=0`）；主机 245=7.242.105.245，217=7.242.105.217（**#17 起另用** 45=`7.242.104.45`，225=`7.242.110.225`）；容器镜像 `quay.io/ascend/vllm-ascend:v0.26.0rc1`；mooncake wheel `mooncake_transfer_engine_npu-0.3.11.post1`（除注明外）；master 在源机宿主机 `:50088`。
 
@@ -411,9 +411,9 @@ pid。途中根出 8 个坑，全部对代码验证：
 
 **段容量准入在真 Mooncake 路径上按设计拦住了必败拷贝**：真 `/query_segment` 剩余 + 真副本大小 → 闸外等待 → 超时停在提交前，零 `create_copy_task`。与 #18/#22「NAH 不等于字节见底」不矛盾——本特性只挡「客户端已能看见 need>remaining」的明显塞不下，挡不住分配洞/并发预留类 NAH。
 
-## soft pin A14 真机记录（Mooncake v0.3.13.post1，2026-11-09/10）
+## soft pin 真机记录（Mooncake v0.3.13.post1，2026-11-09/10）
 
-> 独立实验，不属于上面的 copy demo；soft pin 的设计、A15 关闭方式与 R04 残余见 [D2 §2](../design/D2-kv-operations.md)。本文只记录环境、ABI 问题、用例和未覆盖项。
+> 独立实验，不属于上面的 copy demo；soft pin 的设计、地址复用误判的关闭方式与手写 ABI 镜像约束见 [D2 §2](../design/D2-kv-operations.md)。本文只记录环境、ABI 问题、用例和未覆盖项。
 
 ### 环境
 
@@ -442,7 +442,7 @@ pid。途中根出 8 个坑，全部对代码验证：
 | 错地址 → 与 GetReplicaList 不一致则不 Start，key 保留 | PASS |
 | tip 复验 + `backend.pin`（admin + native list） | PASS |
 | 225 put → 45 soft_pin（数据 ep 在 225） | PASS |
-| NoF put（`nof_replica_num=1`） | N/A / SKIP：`INVALID_PARAMS`（本 master 未配通；不作为本 PR 验收） |
+| NoF put（`nof_replica_num=1`） | N/A / SKIP：`INVALID_PARAMS`（本 master 未配通；不作为验收项） |
 | 2026-11-10 tip 再验（client / backend.pin / 错地址） | PASS（同上容器） |
 | 2026-11-10 replica-id：正向 pin；错地址在 list sanity 拒绝且 payload 保留 | PASS |
 | 2026-11-10 删 key → id 必变（不撞地址复用） | PASS：Case B `old_id==start_id`（例 19）；`force remove` 后 Case A `start_id` 新值（例 20）且 ≠ 旧 id，Revoke 不 End。容器临时 `probe_upsert_memory_ids`（未入仓） |
@@ -462,5 +462,5 @@ pid。途中根出 8 个坑，全部对代码验证：
 
 ### 结论
 
-- A15 的 id 判据已在真机确认：Case B 同 id；删 key 后 Case A 新 id，Revoke 不 End。
-- A14 证明空写 soft pin 在目标 master 上可用；ABI/链接的残余风险见 D2 §2 R04。
+- 地址复用误判的 id 判据已在真机确认：Case B 同 id；删 key 后 Case A 新 id，Revoke 不 End。
+- 本次真机验证证明空写 soft pin 在目标 master 上可用；手写 ABI/链接的残余风险见 D2 §2。
