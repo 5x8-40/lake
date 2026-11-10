@@ -294,6 +294,9 @@ class StoreClient:
             raise StoreClientError(
                 "空写扩展还没加载，没有钉上"
             ) from e
+        except RuntimeError as e:
+            # native 抛 std::runtime_error；统一成 StoreClientError
+            raise StoreClientError(str(e)) from e
 
     def query_task(self, task_id: object) -> object:
         """查询任务状态（QueryTaskResponse）。"""

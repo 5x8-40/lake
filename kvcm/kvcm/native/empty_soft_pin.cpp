@@ -155,8 +155,14 @@ void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
         (void)new_addr;
         (void)new_size;
         if (new_id != old_id) {
-            (void)client->master_client_.UpsertRevoke(
+            auto revoked = client->master_client_.UpsertRevoke(
                 keys[i], mooncake::ReplicaType::ALL);
+            if (!revoked.ok) {
+                fail("UpsertStart replica id 不匹配（Case A/C），Revoke 也失败，"
+                     "副本可能仍 PROCESSING，没有钉上: " +
+                         keys[i],
+                     succeeded);
+            }
             fail("UpsertStart replica id 不匹配（Case A/C），已 Revoke，"
                  "没有钉上: " +
                      keys[i],
@@ -177,6 +183,24 @@ void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
     }
 }
 
+namespace {
+
+// 与 A14 / empty_pin.EXPECTED_ABI_LAYOUT 对齐；改 mooncake_pin_api.h 时同步改 Python 常量。
+py::dict abi_layout() {
+    py::dict out;
+    out["ObjectMeta"] = static_cast<int>(sizeof(mooncake::ObjectMeta));
+    out["ReplicateConfig"] = static_cast<int>(sizeof(mooncake::ReplicateConfig));
+    out["EndResult"] = static_cast<int>(sizeof(mooncake::EndResult));
+    out["PyClient.client_"] =
+        static_cast<int>(offsetof(mooncake::PyClient, client_));
+    out["Client.master_client_"] =
+        static_cast<int>(offsetof(mooncake::Client, master_client_));
+    return out;
+}
+
+}  // namespace
+
 PYBIND11_MODULE(_empty_pin, m) {
     m.def("empty_soft_pin", &empty_soft_pin);
+    m.def("abi_layout", &abi_layout);
 }

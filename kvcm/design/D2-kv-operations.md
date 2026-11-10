@@ -1036,12 +1036,17 @@ A14 / 删 key→id 变见下。
 - 与镜像头 `mooncake_pin_api.h` 字段对照（tag 源码）：`UpsertEnd/Revoke` = `tl::expected<void, ErrorCode>`；`ObjectMeta`；`Client` 成员序 `client_id_→metrics_→transfer_engine_→master_client_`；`ReplicateConfig` 字段序一致；`SoftPinAction` ENABLE=1/DISABLE=2。镜像省略 `PRESERVE=0`、默认 ENABLE（调用显式设）；`Descriptor` 字段名上游 `descriptor_variant`、镜像 `body`（variant 序仍镜像）。
 - 镜像 sizeof 探针（同机编译）：`ObjectMeta=48`、`ReplicateConfig=208`、`EndResult=8`（`ok@4`）、`PyClient::client_=8`、`Client::master_client_=48`，与头注释一致。
 - 行为闭环（同日 tip）：正向 End 成功；错地址在 list sanity 拒绝（不 Start）——`EndResult` 若仍按旧布局会把成功误读成失败。
-- **R04 残余**：未对上游头做编译期 `static_assert`（wheel 无 `.h`；完整 include 依赖重）。版本号+源码头对照+行为验，不是 SHA 级 ABI 证明。
+- **加载时硬闸（`empty_pin.ensure_empty_pin_abi`）**：
+  1. 已装发行版版本须 = `EXPECTED_MOONCAKE_VERSION`（`0.3.13.post1`；试 `mooncake-transfer-engine-npu` / `mooncake-transfer-engine`）；
+  2. `_empty_pin.abi_layout()` 的 sizeof/offsetof 须 = A14 表（`ObjectMeta=48` / `ReplicateConfig=208` / `EndResult=8` / `PyClient.client_=8` / `Client.master_client_=48`）。
+  不符 → 拒绝空写（变 `StoreClientError`），避免「升 wheel 仍用旧 so / 改坏头仍调 Upsert」静默错布局。
+  **升 wheel**：重编 `build_empty_pin.sh`，并同步改 `EXPECTED_MOONCAKE_VERSION` +（若布局变）`EXPECTED_ABI_LAYOUT` / 头注释。
+- **R04 残余**：未对上游头做编译期 `static_assert`（wheel 无 `.h`）。硬闸是版本号 + **我们镜像**的尺寸，不是 SHA 级「与 NPU wheel 字节布局」证明；同版本号不同构建仍可能漏网，靠重编 + 行为验。
 
 未覆盖：并发、End 失败注入、地址复用注入（不强制）、多 key 部分失败自动化、`BatchGetReplicaList`。**A15 已关闭**（id 校验 + 真机删 key→id 变）。  
-单测：`pytest -k pin_soft`；CI 不编 `_empty_pin.so`，无 so 时相关测 skip。
+单测：`pytest -k pin_soft` / `empty_pin_abi`；CI 不编 `_empty_pin.so`，无 so 时加载测 skip。
 
-编号线索：R02 部分失败不回滚；R03 `put_step=1`；R04 ABI；A04 NoF=N/A；A15 已关闭；A16 见 summary（另开 PR；pin 仅剩 GetReplicaList 续租）。
+编号线索：R02 部分失败不回滚；R03 `put_step=1`；R04 ABI（加载硬闸已上，SHA 级仍残余）；A04 NoF=N/A；A15 已关闭；A16 见 summary（另开 PR；pin 仅剩 GetReplicaList 续租）。
 
 #### soft pin 的其他方案
 
