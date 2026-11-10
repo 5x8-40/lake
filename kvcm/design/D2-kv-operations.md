@@ -134,8 +134,8 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - 约束
     - 校验 client_id：与 key 的 client_id 不符调用 → `ILLEGAL_CLIENT`（只有发起写的人能中止）
     - 只撤写中副本；副本已就绪则拒绝 → `INVALID_WRITE`
-  - **Case B 陷阱（真机确认）**：Case B 把唯一 COMPLETE 副本改成 PROCESSING；此时 `PutRevoke` → `EraseReplicas` → 无副本则 `Erase` **整 key**，不是「恢复 COMPLETE」。误判/错地址后 Revoke 会丢 KV。
-  - 与 kvcm 的关系（**方案 1，当前路径**）：地址匹配（Case B）只 `UpsertEnd`，**End 失败也不 Revoke**（防 Erase）；地址不匹配（按 A/C）才 `UpsertRevoke`。进程死在 Start 与 End 之间时，副本留在 PROCESSING。扫任务记录再补 `End` / `Revoke` 的崩溃恢复当前不做
+  - **Case B 陷阱（真机确认）**：Case B 把唯一 COMPLETE 副本改成 PROCESSING；此时 `PutRevoke` → `EraseReplicas` → 无副本则 `Erase` **整 key**，不是「恢复 COMPLETE」。因此 **id 相同（确认为 Case B）时禁止 Revoke**（含 End 失败）；错地址在 list sanity 就拒、不 Start、不 Revoke。
+  - 与 kvcm 的关系（**方案 1 + replica id，当前路径**）：`GetReplicaList` 旧 id 与 `UpsertStart` 返回 id **相同**（Case B）只 `UpsertEnd`，**End 失败也不 Revoke**（防 Erase）；**仅 id 不同**才 `UpsertRevoke`。Start 返回形状不明 → 失败且不 Revoke。进程死在 Start 与 End 之间时，副本留在 PROCESSING。崩溃恢复当前不做
 
 ### client_id 字段与级联清理
 
@@ -184,7 +184,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
     - hard pin → 永不候选
     - lease 未过期 → 跳过（lease 期内绝对安全）
     - 副本 refcnt>0（正被任务引用：copy/move/offload/promotion 在途；无读者引用机制，§2 读锁否决条）→ 该副本不可逐（per-副本字段 `get_refcnt()`）
-  - **lease 的保护边界**（目标版本）：lease 未过期只挡驱逐和非 force 的 `Remove`（`Remove` 里 `!force && !IsLeaseExpired()` → `OBJECT_HAS_LEASE`）。`Remove(force=true)` 明确绕过 lease；`UpsertStart` 的 Case C 只看 size、不看 lease。**但 Case C 不会立即释放旧 buffer**：旧副本进 `discarded_replicas_`，按 `put_start_release_timeout_sec_` 延迟释放（默认 600s，`types.h::DEFAULT_PUT_START_RELEASE_TIMEOUT`）；新 buffer 随后分配，旧 buffer 仍被 `discarded_replicas_` 持有，所以地址检查不会在 Case C 上误判。地址复用只发生在旧 buffer 真正释放之后，实际来源主要是 Case A（key 已被 force remove / stale 清理 / lease 过期驱逐，或 `UpsertStart` 开头的惰性清理 / processing 抢占后无 COMPLETE 副本）。详见 §2「限制、原因与 case」。
+  - **lease 的保护边界**（目标版本）：lease 未过期只挡驱逐和非 force 的 `Remove`（`Remove` 里 `!force && !IsLeaseExpired()` → `OBJECT_HAS_LEASE`）。`Remove(force=true)` 明确绕过 lease；`UpsertStart` 的 Case C 只看 size、不看 lease。**但 Case C 不会立即释放旧 buffer**：旧副本进 `discarded_replicas_`，按 `put_start_release_timeout_sec_` 延迟释放（默认 600s，`types.h::DEFAULT_PUT_START_RELEASE_TIMEOUT`）；新 buffer 随后分配，旧 buffer 仍被 `discarded_replicas_` 持有。**判据已是 replica id**（非地址）：Case C 新分配必新 id → 与 list 旧 id 不等 → Revoke。地址复用窗口主要仍是 Case A 类（force remove / stale / lease 过期驱逐后真正释放再分配）；id 递增后该窗口不再误 End。详见 §2「限制、原因与 case」。
   - 第一轮：无 soft pin 的候选；不够且 `allow_evict_soft_pinned_objects_` 时进第二轮：soft pin 候选
   - **两轮排序依据都是 `lease_timeout`（租约到期早晚 ≈ 最近被读时间）**，不是 LRU 计数、也不是 soft pin 剩余 TTL
     - soft pin TTL 的作用仅是「pin 还有效吗」——决定进哪一轮，不作排序依据
@@ -574,13 +574,15 @@ sequenceDiagram
     participant A as 引擎 A（副本所在）
 
     rect rgb(222, 235, 247)
-    Note over K,M: soft pin 级：空写 upsert（驱逐排最后）
-    K->>M: S1 GET /batch_query_keys（查原尺寸）
-    K->>M: S2 UpsertStart(key, 原尺寸, with_soft_pin)
+    Note over K,M: soft pin：空写 + replica id（驱逐排最后）
+    K->>M: S1 GET /batch_query_keys（盘守卫 + size/address）
+    K->>M: S2 GetReplicaList（旧 id + 授 lease）
+    K->>M: S3 UpsertStart(key, 原尺寸, SoftPinAction)
     Note over M: 副本标写中，key 不可读（毫秒级，F3④）
-    K->>M: S2 UpsertEnd（不写数据）
+    Note over K,M: id 同 → UpsertEnd；id 异 → UpsertRevoke；形状不明不 Revoke
+    K->>M: S4 UpsertEnd（不写数据；仅 id 相同时）
     Note over M: soft pin 置位 ✓
-    Note over K,M: 取消：空写扩展只对着主线 SoftPinAction::DISABLE<br/>0.3.11 的 soft_pin 通道是 NO（布尔坑不走这条空写）<br/>或停止续期等 TTL 到期
+    Note over K,M: 取消：SoftPinAction::DISABLE 或等 TTL<br/>0.3.11/0.3.12 通道 NO
     end
 
     rect rgb(223, 242, 223)
@@ -853,58 +855,57 @@ sequenceDiagram
 | Case | 触发 | `UpsertStart` 行为 | 空写处理 | 精度影响 |
 |---|---|---|---|---|
 | **B** | key 存在，size 一致 | 复用旧 buffer（**同 ReplicaID**），COMPLETE→PROCESSING | **id 相同** → `UpsertEnd`，pin 生效 | 无：旧数据留在原 buffer |
-| **C** | key 存在，size 不同 | 旧副本进 `discarded_replicas_` 延迟释放（默认 600s）；分配新 buffer | 地址不匹配 → `UpsertRevoke`，不 End | 不 End，不会把空 buffer 标完成；最坏 key missing → 重算 |
-| **A** | `UpsertStart` 判定时 key 不存在（`exists` 后被删 / 逐，惰性清理清空副本，或抢占 processing 后无 COMPLETE） | 分配新 buffer（**新 ReplicaID**） | **id 不匹配** → `UpsertRevoke`（地址仅 sanity） | key missing → 重算。地址复用也不再误 End（A15 关闭） |
+| **C** | key 存在，size 不同 | 旧副本进 `discarded_replicas_` 延迟释放（默认 600s）；分配新 buffer（**新 id**） | **id 不同** → `UpsertRevoke`，不 End | 不 End；最坏 key missing → 重算 |
+| **A** | `UpsertStart` 判定时 key 不存在（list 后被删 / 逐，惰性清理清空副本，或抢占 processing 后无 COMPLETE） | 分配新 buffer（**新 ReplicaID**） | **id 不同** → `UpsertRevoke` | key missing → 重算。地址复用也不再误 End（A15 关闭） |
 
-**1. 前置条件：不满足就不钉（或钉了也会被地址检查撤回）**
+**1. 前置条件：不满足就不钉（或 Start 后靠 replica id 撤回）**
 
 1. **key 存在，且仍是同尺寸（Case B）**
-   - 原因：`UpsertStart` 按「key 是否存在、size 是否一致」分 A/B/C；只有 Case B 复用旧 buffer，空写不填数据也不会改变已有 KV。
+   - 原因：`UpsertStart` 按「key 是否存在、size 是否一致」分 A/B/C；只有 Case B 复用旧 buffer（同 id），空写不填数据也不会改变已有 KV。
    - 不满足：
-     - key 不存在 → Case A：分配新 buffer；空写会把空 buffer 标成 COMPLETE，地址检查发现不匹配 → `UpsertRevoke`，key missing → 重算。
-       - 注意：`pin` 先 `exists`；如果 key 在 pin 开始时就不存在，`exists` 直接失败，不会进入 `UpsertStart`。Case A 发生在 `exists` 之后、`UpsertStart` 判定前 key 被删 / 逐的竞态，或 `UpsertStart` 开头的单 key 惰性清理把副本清空（F4），或抢占 processing 副本后没有 COMPLETE 副本。
-     - size 不一致 → Case C：旧副本移入 `discarded_replicas_`，分配新 buffer；地址检查不匹配 → `UpsertRevoke`，key missing → 重算。
-   - 覆盖范围：A/C 都能识别；**Case A 的地址复用残余**见下文「4.2 地址复用残余」。
+     - key 不存在 → Case A：分配新 buffer（新 id）；与 list 旧 id 比对失败 → `UpsertRevoke`，key missing → 重算。
+       - 注意：native 先 `GetReplicaList`；开始时就不存在则 list 失败，不进 `UpsertStart`。Case A 发生在 list 之后、`UpsertStart` 判定前 key 被删 / 逐，或 Start 开头惰性清理 / 抢占 processing 后无 COMPLETE。
+     - size 不一致 → Case C：新 buffer、新 id → id 不匹配 → `UpsertRevoke`。
+   - 覆盖范围：A/C 靠 **id** 识别；旧「只比地址」的 A15 已关闭（见下「4. 数据安全」）。
 2. **单 slice（`put_step=1`）**
    - 原因：native 空写一次只传一个 `size`，`UpsertStart(key, {size}, config)` 只表达一个 slice；多 slice 的 key 用单 slice 空写会尺寸错配或只覆盖部分 buffer。
    - 不满足：`pin` 直接抛 `UnsupportedCapabilityError`，不发 RPC。
 3. **无盘副本（`disk_replicas == 0` 且 `local_disk_endpoints` 为空）**
    - 原因：Case B 把所有 COMPLETE 副本（含 LOCAL_DISK / DISK）标成 PROCESSING；`UpsertEnd(ALL)` 的 `is_target_replica` 只恢复 memory / nof / dfs，不恢复 LOCAL_DISK / DISK。空写收尾盖不住盘副本，会把 key 留在不一致状态。
-   - 不满足：`pin` 在 `UpsertStart` 前拒绝，不发 RPC。
+   - 不满足：`pin` 在 admin 阶段拒绝，不发 Upsert。
 4. **单内存副本，且 admin 能读到 `size` / `buffer_address`**
-   - 原因：地址检查要逐 key 比较“唯一一个 memory descriptor 的地址 / 大小”；多个内存副本时无法用一个地址代表全部副本，检查会失真。
-   - 不满足：`pin` 抛 `StoreClientError` / `QueryError`，不发 RPC。
+   - 原因：Start 前用地址/size 与 `GetReplicaList` 结果做 sanity；主判据是 id。多内存副本无法用一个地址代表，且 id 比对也要求 sole memory。
+   - 不满足：`pin` 抛 `StoreClientError` / `QueryError`，不发 Upsert。
    - **NoF 处理**：admin 把 `values` 收进 `memory`，`nof_values` 单独收进 `nof`。`pin` 只要求 `memory` 单副本，因此：
      - memory + NoF：可以空写；`UpsertEnd(ALL)` 会一起收 NoF。
-     - NoF-only：`memory` 为空，`pin` 拒绝（native 地址检查只认 `MemDesc`）。
+     - NoF-only：`memory` 为空，`pin` 拒绝（native 只认 `MemDesc` 取 id）。
      - 核验 READY 也只认 `memory`，NoF 不再被当成 DRAM。
 5. **key 不被并发重写**
-   - 原因：admin 的 `GET /batch_query_keys` 与随后的 `UpsertStart` 不是同一个事务；另一个写者可以在两步之间改写 key。
-   - 额外 case：另一个写在途时，`UpsertStart` 会立即抢占 processing 副本；若抢占后没有 COMPLETE 副本，落 Case A（旧 processing 副本进 `discarded_replicas_` 延迟释放，检查时不会立即复用地址）。
-   - 地址检查能挡住 A/C，但**挡不住同尺寸并发重写**（对方也走 Case B 时，地址 / 大小仍然匹配）。
-   - 定位：未确认假设，不是当前代码能证明的。
+   - 原因：admin query、`GetReplicaList` 与 `UpsertStart` 不是同一事务；另一个写者可以在中间改写 key。
+   - 额外 case：另一个写在途时，`UpsertStart` 会立即抢占 processing；若抢占后无 COMPLETE，落 Case A（新 id → Revoke）。
+   - **id 比对**挡住 A/C（含地址复用）；**挡不住同尺寸并发重写**（对方也走 Case B 时 id 仍可能匹配——未确认假设）。
 
 **2. lease 能挡什么、挡不了什么**
 
 1. **能挡驱逐**
    - 原因：`BatchEvict` 的硬过滤是 `lease 未过期 → 跳过`（F8）。
-   - case：`pin` 前 `exists`，或持续 keepalive / 读，租约在 TTL 内。
+   - case：native `GetReplicaList` 授 lease，或持续 keepalive / 读，租约在 TTL 内。
 2. **能挡非 force 的 `Remove`**
    - 原因：`Remove` 里 `!force && !IsLeaseExpired()` → `OBJECT_HAS_LEASE`。
    - case：调用方 `remove(force=False)`，lease 未过期。
 3. **挡不了 `Remove(force=true)`**
    - 原因：force 明确跳过 lease 检查；这是 API 语义，不是 bug。
    - case：调用方强删 key。
-   - 后果：key 消失；下一次 pin 在 `exists` 就失败（不会空写）；只有强删恰好落在本次 `exists` 与 `UpsertStart` 之间才走 Case A，地址检查通常能发现，最坏因地址复用误判（见下文「4.2 地址复用残余」）。
+   - 后果：key 消失；下一次 pin 在 `GetReplicaList` 失败（不会空写）；强删落在 list 与 `UpsertStart` 之间 → Case A、新 id → Revoke（可重算）。
 4. **挡不了 client 死亡后的 stale 清理**
    - 原因：清理按副本所在 client / seg 维度走，不看 key 的 lease（F6b）；副本全在死 client 上时整 key 消失。
    - case：引擎进程死亡、client TTL 过期、stale handle 清理。
-   - 后果：清理落在本次 `exists` 之后、`UpsertStart` 判定前，或由 `UpsertStart` 开头的单 key 惰性清理触发，才走 Case A；pin 开始时已不存在则 `exists` 失败，不会空写。
+   - 后果：清理落在 list 之后、`UpsertStart` 判定前，或由 Start 开头惰性清理触发 → Case A；开始时已不存在则 list 失败。
 5. **挡不了 `UpsertStart` 的 Case C**
-   - 原因：目标版本 `UpsertStart` 只看 size，没有 `has_read_lease` 门槛；lease 不阻止 `UpsertStart` 丢旧副本、分新 buffer。
+   - 原因：目标版本 `UpsertStart` 只看 size，没有 `has_read_lease` 门槛；lease 不阻止丢旧副本、分新 buffer。
    - case：同一 key 被不同 size 的写 / 空写覆盖。
-   - 后果：旧副本进 `discarded_replicas_` 延迟释放（默认 600s，`types.h::DEFAULT_PUT_START_RELEASE_TIMEOUT`）；新 buffer 随后分配，旧 buffer 仍被持有；地址检查识别 C → `UpsertRevoke`；key missing → 重算。
-   - 版本差异：main / v0.3.14 才有 `has_read_lease` gate；目标版本没有，不能用 main 的行为套。
+   - 后果：新 buffer、新 id → id 不匹配 → `UpsertRevoke`；key missing → 重算。Case C 旧 buffer 延迟释放（默认 600s），与 id 判据无关。
+   - 版本差异：main / v0.3.14 才有 `has_read_lease` gate；目标版本没有。
 6. **挡不了 lease 过期后的驱逐**
    - 原因：lease 是限时保护；续租中断 / 超时后，`BatchEvict` 不再因 lease 跳过。
    - case：`pin(SOFT)` 只靠 native `GetReplicaList` 授 lease（不 `register_keepalive`）；或 list→Start 超过 lease TTL；或保活被注销。
@@ -970,10 +971,10 @@ sequenceDiagram
   - `UpsertStart` / `UpsertEnd` / `UpsertRevoke` 在 `libmooncake_store.so`（扩展须同时链它；A14 已验）。
   - `GET /batch_query_keys` 的 `values` 返回 `AllocatedBuffer::Descriptor`，含 `size_` / `buffer_address_`。
   - `ReplicateConfig` / `SoftPinAction` / `CallResult` / `Replica::Descriptor` 的布局；手写头文件只镜像目标版本。
-  - Case C 旧 buffer 延迟释放（`put_start_release_timeout`，默认 600s）；地址检查在 C 上不误判依赖这个行为。
+  - Case C 旧 buffer 延迟释放（`put_start_release_timeout`，默认 600s）；与 **id** 判据配合（新 id ≠ 旧 id）。
   - `GrantReadLease` 不续 soft pin（目标版本）；0.3.11 的 `GrantLease` 会同续 soft pin（F9），续期策略不同。
 - 注意：`SoftPinAction` 不是唯一门槛。0.3.11 / 0.3.12 即使只有 bool，`UpsertEnd` 也还是 `string` 签名；0.3.14-pre 起即使 API 名字相同，gate 也会让有租约的同尺寸空写走 Case C。
-- **升级注意（自己授的 lease）**：`pin` 在空写前先 `exists` 持租约防驱逐。目标 v0.3.13.post1 没有 `has_read_lease` gate，所以这个租约不会把同尺寸空写推成 Case C。换到 main / 0.3.14-pre+ 后，**这个自己授的 lease 就足以触发 Case C**，不是只防外部读者；升级前必须改 pin 路径或关闭空写。
+- **升级注意（自己授的 lease）**：当前 `pin` 靠 native `GetReplicaList` 授 lease（不再单独 `exists`）。目标 v0.3.13.post1 无 `has_read_lease` gate，该租约不会把同尺寸空写推成 Case C。换到 main / 0.3.14-pre+ 后，**list 自己授的 lease 就足以触发 Case C**；升级前必须改 pin 路径或关闭空写。
 
 5. **调用方**
    - 本 soft pin PR 只交 L3 `pin(SOFT)`；**不接 L2**（prefetch READY 后谁调 pin 另开 PR）。
@@ -981,22 +982,23 @@ sequenceDiagram
 
 #### 实现要点
 
-- 流程：admin 取 `size_`/`buffer_address_` → `UpsertStart`(同尺寸, SoftPinAction) → 地址检查 →（匹配）`UpsertEnd` /（不匹配）`UpsertRevoke`。有盘副本则拒绝（Case B 会把盘副本标 PROCESSING，`PutEnd(ALL)` 盖不回来）。A/C 靠地址检查；目标版本无 lease gate。
+- 流程：admin 取 `size_`/`buffer_address_`、拒盘副本 → native `GetReplicaList`（旧 id + 授 lease；地址/size sanity）→ `UpsertStart` → **比 id**：同 → `UpsertEnd`；异 → `UpsertRevoke`；Start 形状不明 → 失败不 Revoke。目标版本无 lease gate。
 - mooncake 不改。`_empty_pin.so` 链 `store.so` + `libmooncake_store.so`（F12）。
 - client_id：空写改成 kvcm UUID（方案一，F3①）。
 - soft pin TTL 默认 30min 自持；lease 先过期后只在第二轮驱逐里排后。续 soft pin 要再空写。
-- Start–End 窗口 key 不可读（毫秒级）。
+- Start–End 窗口 key 不可读（毫秒级）。每 key 一次 `GetReplicaList`（可升 `BatchGetReplicaList`，未做）。
 
-#### 空写失败收尾：方案 1（当前）与后续优化路径
+#### 空写失败收尾：方案 1 + replica id（当前）与后续优化路径
 
 | 分流 | 行为 | 调用方 |
 |---|---|---|
-| 匹配 | 只 `UpsertEnd` | 成功则钉上 |
-| 匹配后 End 失败 | 不 Revoke；抛异常 | 本次 pin 失败；可能留 PROCESSING |
-| 不匹配 | `UpsertRevoke`；抛异常 | 按 A/C；实为 Case B 时会 Erase（F5，接受） |
+| id 相同（Case B） | 只 `UpsertEnd` | 成功则钉上 |
+| id 相同后 End 失败 | 不 Revoke；抛异常 | 本次 pin 失败；可能留 PROCESSING |
+| id 不同（Case A/C） | `UpsertRevoke`；抛异常 | key missing → 可重算 |
+| Start 形状不明 | **不** Revoke；抛异常 | 可能留 PROCESSING；勿误 Erase |
 
-备选未做：② 不匹配也不 Revoke；③ 池侧 only_in_place；④ 只用 keepalive。  
-`pin` 已做 `renew_once` + 二次 query。A14 见下「A14 真机记录」。
+备选未做：② id 不同也不 Revoke；③ 池侧 only_in_place；④ 只用 keepalive；⑤ `BatchGetReplicaList`。  
+A14 / 删 key→id 变见下。
 
 #### A14 真机记录（v0.3.13.post1，永久）
 
@@ -1019,9 +1021,9 @@ sequenceDiagram
 | put → soft_pin ENABLE；`master_soft_pin_key_count` 0→1；地址不变 | PASS |
 | DISABLE + get 比对 payload | PASS |
 | 错地址 → 异常（现：与 GetReplicaList 不一致则**不** Start，key 保留） | PASS（行为相对旧 Revoke→Erase 更安全） |
-| tip 复验 + `backend.pin`（renew+二次 query） | PASS |
+| tip 复验 + `backend.pin`（admin + native list） | PASS |
 | 225 put → 45 soft_pin（数据 ep 在 225） | PASS |
-| NoF put（`nof_replica_num=1`） | SKIP：`INVALID_PARAMS`（本 master 未配通） |
+| NoF put（`nof_replica_num=1`） | N/A / SKIP：`INVALID_PARAMS`（本 master 未配通；不作为本 PR 验收） |
 | 2026-11-10 tip 再验（client / backend.pin / 错地址） | PASS（同上容器） |
 | 2026-11-10 replica-id：正向 pin；错地址在 list sanity 拒绝且 **payload 保留** | PASS |
 | 2026-11-10 **删 key → id 必变**（不撞地址复用） | PASS：Case B `old_id==start_id`（例 19）；`force remove` 后 Case A `start_id` 新值（例 20）且 ≠ 旧 id，Revoke 不 End。容器临时 `probe_upsert_memory_ids`（未入仓） |
@@ -1033,13 +1035,13 @@ sequenceDiagram
 - 浅拉上游：`kvcache-ai/Mooncake` tag `v0.3.13.post1` → commit `719735896c86b56fabec6cf3e825fb2ea640597a`。版本号可对齐；**无法**从 NPU wheel 核对同一 SHA。
 - 与镜像头 `mooncake_pin_api.h` 字段对照（tag 源码）：`UpsertEnd/Revoke` = `tl::expected<void, ErrorCode>`；`ObjectMeta`；`Client` 成员序 `client_id_→metrics_→transfer_engine_→master_client_`；`ReplicateConfig` 字段序一致；`SoftPinAction` ENABLE=1/DISABLE=2。镜像省略 `PRESERVE=0`、默认 ENABLE（调用显式设）；`Descriptor` 字段名上游 `descriptor_variant`、镜像 `body`（variant 序仍镜像）。
 - 镜像 sizeof 探针（同机编译）：`ObjectMeta=48`、`ReplicateConfig=208`、`EndResult=8`（`ok@4`）、`PyClient::client_=8`、`Client::master_client_=48`，与头注释一致。
-- 行为闭环（同日 tip）：正向 End 成功 + 错地址 Revoke——`EndResult` 若仍按旧布局会把成功误读成失败。
+- 行为闭环（同日 tip）：正向 End 成功；错地址在 list sanity 拒绝（不 Start）——`EndResult` 若仍按旧布局会把成功误读成失败。
 - **R04 残余**：未对上游头做编译期 `static_assert`（wheel 无 `.h`；完整 include 依赖重）。版本号+源码头对照+行为验，不是 SHA 级 ABI 证明。
 
-未覆盖：并发、End 失败注入、地址复用注入（不强制）。**A15**：replica id 校验 + 真机「删 key → id 必变」已验（上表）。  
+未覆盖：并发、End 失败注入、地址复用注入（不强制）、多 key 部分失败自动化、`BatchGetReplicaList`。**A15 已关闭**（id 校验 + 真机删 key→id 变）。  
 单测：`pytest -k pin_soft`；CI 不编 `_empty_pin.so`，无 so 时相关测 skip。
 
-编号线索：R02 部分失败不回滚；R03 `put_step=1`；R04 ABI；A04 NoF；A15 见上（id 关闭）；A16 见 summary（另开 PR，含 pin 的 GetReplicaList 续租）。
+编号线索：R02 部分失败不回滚；R03 `put_step=1`；R04 ABI；A04 NoF=N/A；A15 已关闭；A16 见 summary（另开 PR；pin 仅剩 GetReplicaList 续租）。
 
 #### soft pin 的其他方案
 
@@ -1083,7 +1085,7 @@ sequenceDiagram
 - **当前决定**
   - 方案一。`_empty_pin.so` + 本地头（F12）。UUID 持久化 / 重启同 id 重注册尚未做。
   - 借名做不到。
-  - 收尾方案 1：匹配后 End 失败不 Revoke；崩溃留 PROCESSING，无恢复（F5）。
+  - 收尾：id 同后 End 失败不 Revoke；id 不同才 Revoke；崩溃 / 形状不明留 PROCESSING，无恢复（F5）。
 - **方案二仍缺的外部条件（不是当前路径）**
   1. mooncake 代码可改性——多人合作的开源项目，不是单方说了算
      - 上游提 PR（纯暴露只读接口，接受度预期高，节奏不可控）或 fork 维护本地 patch——是**独立成本**；升级拿 publisher 是官方功能零 patch，与此无关

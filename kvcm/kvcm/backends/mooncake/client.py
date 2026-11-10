@@ -262,8 +262,10 @@ class StoreClient:
         """空写软钉。复用 setup 已建 client（capsule），不二次 create。
 
         ``sizes`` / ``addresses`` 来自 admin ``size_`` / ``buffer_address_``。
-        方案 1：``UpsertStart`` 后地址匹配 → 只 ``UpsertEnd``（End 失败不
-        Revoke，抛异常）；不匹配 → ``UpsertRevoke``。不写数据。
+        方案 1 + replica id：``GetReplicaList`` 旧 id 与 ``UpsertStart`` 返回
+        id 相同 → 只 ``UpsertEnd``（End 失败不 Revoke）；id 不同才
+        ``UpsertRevoke``；Start 形状不明不 Revoke。地址仅 Start 前 sanity。
+        不写数据。
         """
         store = self._s()
         keys = list(keys)
