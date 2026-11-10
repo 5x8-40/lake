@@ -7,6 +7,7 @@
 - 下游: 规划引用 [D10](D10-kv-fabric-roadmap.md)；运营侧对应 [D9](D9-kv-services.md)
 - 定位: D8 的**算法全集**——所有公式、推导、参数与收益账都在这里；D8 正文只保留定性结论
 - 非目标: 不写代码结构；不重复 D8 的架构/边界，只讲算法本身和收益怎么来
+- 核心差异: **hook 是输入，D8a 算的是拿到 hook/ETA/READY 后这个动作值不值得做**；hook 语义在 [D8 §4](D8-joint-scheduling.md)，本文不重复。
 
 ---
 
@@ -404,18 +405,15 @@ break-even: μ × p0 × exp(−μT) × T_prefill = c_h × S_bytes
 
 ## 6. 扩缩：加几个、缩哪个
 
-### 6.1 排队与容量
+### 6.1 容量下限
+
+排队论只用来定初值，不在本文推导：
 
 ```text
-ρ = λ / (c × μ)
-c_min = ceil(λ / (μ × ρ_target))
-L = λ × W                （Little 定律）
-# LLM 口径：W=TTLT（整系统）/ TTFT（首 token 段）/ TTLT−TTFT（decode 段）
+c_min ≈ ceil(λ / (μ × ρ_target))
 ```
 
-![副本数与延迟](figures/algo-scaling-queue.svg)
-
-> 参数：`λ=100 req/s`、`μ=30 req/s/副本`、目标 `ρ_target=0.8`。`c_min≈5`；低于 5 会进入不稳定区，延迟迅速上升。
+`λ` 是到达率，`μ` 是单副本服务能力，`ρ_target` 是目标利用率；算出来后用真机压测校准。Little 定律只用于在途数（整系统 `W=TTLT`，首 token 段 `W=TTFT`，decode 段 `W=TTLT−TTFT`），不是本文的重点。
 
 ### 6.2 双环控制
 
