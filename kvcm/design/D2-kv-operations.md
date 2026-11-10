@@ -1026,11 +1026,22 @@ sequenceDiagram
 | tip 复验 + `backend.pin`（renew+二次 query） | PASS |
 | 225 put → 45 soft_pin（数据 ep 在 225） | PASS |
 | NoF put（`nof_replica_num=1`） | SKIP：`INVALID_PARAMS`（本 master 未配通） |
+| 2026-11-10 tip 再验（client / backend.pin / 错地址） | PASS（同上容器） |
 
-未覆盖：并发、End 失败注入、**A15 地址复用**（精度残余，书面接受见上）。  
+**ABI 对照（2026-11-10）**
+
+- **ABI** = Application Binary Interface（布局/调用约定），≠ 版本号本身。
+- 真机包：`mooncake-transfer-engine-npu==0.3.13.post1`（dist-info 无 git commit；wheel `sha256=ba134f2c…`）。
+- 浅拉上游：`kvcache-ai/Mooncake` tag `v0.3.13.post1` → commit `719735896c86b56fabec6cf3e825fb2ea640597a`。版本号可对齐；**无法**从 NPU wheel 核对同一 SHA。
+- 与镜像头 `mooncake_pin_api.h` 字段对照（tag 源码）：`UpsertEnd/Revoke` = `tl::expected<void, ErrorCode>`；`ObjectMeta`；`Client` 成员序 `client_id_→metrics_→transfer_engine_→master_client_`；`ReplicateConfig` 字段序一致；`SoftPinAction` ENABLE=1/DISABLE=2。镜像省略 `PRESERVE=0`、默认 ENABLE（调用显式设）；`Descriptor` 字段名上游 `descriptor_variant`、镜像 `body`（variant 序仍镜像）。
+- 镜像 sizeof 探针（同机编译）：`ObjectMeta=48`、`ReplicateConfig=208`、`EndResult=8`（`ok@4`）、`PyClient::client_=8`、`Client::master_client_=48`，与头注释一致。
+- 行为闭环（同日 tip）：正向 End 成功 + 错地址 Revoke——`EndResult` 若仍按旧布局会把成功误读成失败。
+- **R04 残余**：未对上游头做编译期 `static_assert`（wheel 无 `.h`；完整 include 依赖重）。版本号+源码头对照+行为验，不是 SHA 级 ABI 证明。
+
+未覆盖：并发、End 失败注入、**A15 地址复用**（精度残余；书面接受，见上；reviewer 另提 replica-id 方案）。  
 单测：`pytest -k pin_soft` → 11 passed。CI 不编 `_empty_pin.so`，无 so 时相关测 skip。
 
-编号线索（合入后不再维护独立 tracker）：R02 部分失败不回滚；R03 `put_step=1` 真机布局；R04 ABI 无 static_assert；A04 NoF 收尾；A15 见上；A16 见 summary（含 soft pin 的 exists/renew 续 lease）。
+编号线索（合入后不再维护独立 tracker）：R02 部分失败不回滚；R03 `put_step=1` 真机布局；R04 ABI 见上对照（无 static_assert）；A04 NoF 收尾；A15 见上；A16 见 summary（含 soft pin 的 exists/renew 续 lease）。
 
 #### soft pin 的其他方案
 
