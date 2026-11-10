@@ -144,7 +144,7 @@ flowchart TB
   - 首 token 段并发 ≈ `req/s × TTFT`；
   - decode 段并发 ≈ `req/s × (TTLT − TTFT)`；
   - 整系统并发 ≈ `req/s × TTLT`。
-- 这三个数分别用于 P 池、D 池、整系统，不能混用；P 池更准确用“P 排队 + P prefill”。
+- 这三个数分别用于 P 段、D 段、整系统，不能混用。P 段用 **P 侧 TTFT**（P 排队 + P prefill 已经包含在 TTFT 里，不能再加一遍）。
 - 预热排期按 hook/热度/预算；
 - what-if：不同保留策略/配比下的命中率与成本。
 
