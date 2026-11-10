@@ -604,7 +604,7 @@ sequenceDiagram
 - **实现通道**：`KeepaliveLoop` 定期调 `renew_once` → `exists`（`batch_is_exist` / BatchExistKey，读即续租）。`MooncakeBackend.register_keepalive` / `unregister_keepalive` 只登记/注销同一张 Ledger 表，不改成 ProbeKey
 - **形态**：协程定时器（事件循环内 `asyncio.sleep` 周期触发），不是独立线程
 - **已知限制（量未测）**：默认约每 5s `sweep_once`，对表里每个前缀做一次全 key `batch_is_exist`。请求量与 sweep 延迟没有基线；保活前缀多或单前缀很长时，sweep 可能拖过周期。限流 / 分批 / 按前缀错峰要等真机量过再改，core 不先加策略
-- **A16（OPEN，上线前必修，不挡合入；另开 PR）**：demote 停保活后等 TTL 时，同前缀会授 lease 的调用可打穿等待：`exists` / 预热 / `check_promote` / `promote` / **`pin(SOFT)` 的 `exists`+`renew_once`+native `GetReplicaList`**。修法：前缀级互斥（见 `summary.md` A16）。**不在 soft pin #82 修。**
+- **A16（OPEN，上线前必修，不挡合入；另开 PR）**：demote 停保活后等 TTL 时，同前缀会授 lease 的调用可打穿等待：`exists` / 预热 / `check_promote` / `promote` / **`pin(SOFT)` 的 native `GetReplicaList`**（pin 已去掉重复 exists/renew）。修法：前缀级互斥（见 `summary.md` A16）。**不在 soft pin #82 修。**
 
 ### ReleaseLoop / RetainLoop
 

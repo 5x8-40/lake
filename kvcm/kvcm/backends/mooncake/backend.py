@@ -1127,15 +1127,13 @@ class MooncakeBackend(KvOps):
             )
         # soft pin 空写是“有条件可用”：本 PR 目标版本没有 has_read_lease
         # 门槛，同尺寸会走 Case B；这里只保证 Case B 的前置条件。
-        # 方案 1 + replica id（D2 §2）：native 先 GetReplicaList 取旧
-        # memory ReplicaID（授 lease），UpsertStart 后比 id——相同只 End
-        # （End 失败不 Revoke），不同 Revoke。地址/size 作 sanity。
-        # 本路径仍 exists + renew_once + admin 二次 query（盘副本守卫、
-        # 取 size/address）；与 native GetReplicaList 的 lease 有重叠，
-        # 可后续收拢。不 register_keepalive。
+        # 方案 1 + replica id（D2 §2）：admin 查盘/size/address（零副作用）；
+        # native GetReplicaList 取旧 id 并授 lease，UpsertStart 后比 id——
+        # 相同只 End，不同才 Revoke。不再单独 exists/renew_once（避免与
+        # GetReplicaList 重复授 lease）。不 register_keepalive。
         # **未确认假设**：单 slice（put_step=1）；admin 字段与池一致。
         # admin 的 memory 只含 DRAM；NoF 单独存。memory+NoF 可空写；
-        # NoF-only 在 len(memory)!=1 拒绝。lease 挡驱逐/非 force Remove。
+        # NoF-only 在 len(memory)!=1 拒绝。
         if self._cap.soft_pin_after.channel is not Support.YES:
             raise UnsupportedCapabilityError(
                 "soft pin 事后加：这个能力集的通道不具备"
@@ -1145,13 +1143,6 @@ class MooncakeBackend(KvOps):
                 "soft pin 空写只支持 put_step=1（单 slice）；当前 put_step="
                 f"{getattr(self._keys, 'put_step', '?')}"
             )
-        # 先拿一个读租约，防止查尺寸与 UpsertStart 之间 key 被驱逐。
-        # 注意：目标 v0.3.13.post1 没有 has_read_lease gate，所以这里仍是
-        # Case B。升级到 main/0.3.14-pre+ 后，这个 exists 自己授的 lease
-        # 就会让同尺寸空写走 Case C；不是只防外部读者。升级前必须改 pin
-        # 路径或关闭空写。
-        if not await self.exists(prefix):
-            raise VerifyError("soft pin: prefix not fully in pool")
         keys = await self._expand_keys(prefix.token_ids)
         if not keys:
             raise IntentInputError(
@@ -1159,9 +1150,6 @@ class MooncakeBackend(KvOps):
             )
         if self._admin is None:
             raise QueryError("软钉取尺寸需要主线 GET /batch_query_keys")
-        # 方案 1：空写前再 renew + 二次 query，收窄租约与地址窗口。
-        if not await self.renew_once(prefix):
-            raise VerifyError("soft pin: prefix disappeared before re-query")
         try:
             parsed = await self._rpc(self._admin.batch_query_keys, keys)
         except (AdminMainError, StoreClientError) as e:

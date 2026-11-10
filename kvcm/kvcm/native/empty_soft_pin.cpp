@@ -90,10 +90,10 @@ void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
     // 方案 1 + replica id（关 A15，见 D2 §2）：
     // 1) GetReplicaList 取旧 memory ReplicaID（并授 lease）；
     // 2) UpsertStart；
-    // 3) 返回的 memory id 与旧 id 相同 → Case B，只 End（End 失败不 Revoke）；
-    //    不同 → Case A/C，Revoke，绝不 End。
-    // 地址/size 作 sanity：与 GetReplicaList / 调用方不一致则拒绝。
-    // Case B 上误 Revoke 仍会 Erase（sole PROCESSING）——id 匹配后不 Revoke。
+    // 3) 返回 id 与旧 id 相同 → Case B，只 End（End 失败不 Revoke）；
+    //    id 不同 → Case A/C，Revoke，绝不 End。
+    // 地址/size：Start 前与 list/调用方比对；Start 后 id 已同时信任 End，
+    // 不作 Revoke 依据。Start 返回形状不明 → 失败且不 Revoke。
     if (keys.size() != sizes.size() || keys.size() != addresses.size() ||
         keys.empty()) {
         throw std::runtime_error("软钉的 key/size/address 不合法，没有钉上");
@@ -143,30 +143,22 @@ void empty_soft_pin(py::handle capsule, const std::vector<std::string>& keys,
         uint64_t new_size = 0;
         if (!find_sole_memory(started.value, &new_id, &new_addr, &new_size,
                               &shape_err)) {
-            (void)client->master_client_.UpsertRevoke(
-                keys[i], mooncake::ReplicaType::ALL);
-            fail("UpsertStart " + shape_err + "，已 Revoke，没有钉上: " +
+            // 形状不明时可能仍是 Case B；无条件 Revoke 会 Erase 好数据。
+            // 失败且不 Revoke（副本可能仍 PROCESSING）。
+            fail("UpsertStart " + shape_err + "，未 Revoke，没有钉上: " +
                      keys[i],
                  succeeded);
         }
 
-        // 主判据：replica id。地址复用时 id 仍会变（Case A 新分配）。
-        const bool id_matched = (new_id == old_id);
-        const bool addr_matched =
-            (new_addr == addresses[i] && new_size == sizes[i]);
-        if (!id_matched) {
+        // 主判据：replica id。只有 id 不匹配才 Revoke（Case A/C）。
+        // Start 后地址/size 不再作 Revoke 依据（id 同 → 信任 Case B 走 End）。
+        (void)new_addr;
+        (void)new_size;
+        if (new_id != old_id) {
             (void)client->master_client_.UpsertRevoke(
                 keys[i], mooncake::ReplicaType::ALL);
             fail("UpsertStart replica id 不匹配（Case A/C），已 Revoke，"
                  "没有钉上: " +
-                     keys[i],
-                 succeeded);
-        }
-        if (!addr_matched) {
-            // id 同而地址不同不应出现在 Case B；当 ABI/竞态，宁 Revoke。
-            (void)client->master_client_.UpsertRevoke(
-                keys[i], mooncake::ReplicaType::ALL);
-            fail("UpsertStart id 匹配但地址/尺寸不一致，已 Revoke，没有钉上: " +
                      keys[i],
                  succeeded);
         }

@@ -841,11 +841,10 @@ sequenceDiagram
 
 ### soft pin 级（驱逐排最后，极端情况可逐）：有条件可用的空写 upsert
 
-> 有条件可用（v0.3.13.post1）。只走 Case B；通道 YES（0.3.11/0.3.12 为 NO）。
-> 收尾方案 1：匹配 → 只 End（End 失败不 Revoke，抛异常）；不匹配 → Revoke。
-> Case B 上误 Revoke 会 Erase（F5，可重算）。**A15** 用 **replica id** 关闭：`GetReplicaList` 旧 id vs `UpsertStart` 返回 id；地址复用不再能骗过 End。
-> `pin`：`exists` + `renew_once` + 二次 query（admin）；native 内再 `GetReplicaList`（授 lease + 取 id）。  
-> **A16**：上述续租路径（含 `GetReplicaList`）可打穿 demote 的 TTL 等待——前缀互斥另开 PR，见 `summary.md` A16；**本 soft pin PR 不修**。ABI / 真机见「A14 真机记录」。
+> 有条件可用（v0.3.13.post1）。通道 YES（0.3.11/0.3.12 为 NO）。
+> **A15** 用 **replica id** 关闭：`GetReplicaList` 旧 id vs `UpsertStart` 返回 id；**仅 id 不同**才 Revoke；id 同只 End（End 失败不 Revoke）。地址不作 Start 后 Revoke 依据；Start 形状不明也不 Revoke。  
+> `pin`：admin 查盘/size/address；native `GetReplicaList`（授 lease + 取 id）——**不再**单独 `exists`/`renew_once`。  
+> **A16**：`GetReplicaList` 续租仍可打穿 demote TTL——前缀互斥另开 PR（`summary.md`）；**本 PR 不修**。ABI / 真机见「A14 真机记录」。
 
 #### 限制、原因与 case
 
@@ -853,7 +852,7 @@ sequenceDiagram
 
 | Case | 触发 | `UpsertStart` 行为 | 空写处理 | 精度影响 |
 |---|---|---|---|---|
-| **B** | key 存在，size 一致 | 复用旧 buffer，COMPLETE→PROCESSING | 地址 / 大小匹配 → `UpsertEnd`，pin 生效 | 无：旧数据留在原 buffer |
+| **B** | key 存在，size 一致 | 复用旧 buffer（**同 ReplicaID**），COMPLETE→PROCESSING | **id 相同** → `UpsertEnd`，pin 生效 | 无：旧数据留在原 buffer |
 | **C** | key 存在，size 不同 | 旧副本进 `discarded_replicas_` 延迟释放（默认 600s）；分配新 buffer | 地址不匹配 → `UpsertRevoke`，不 End | 不 End，不会把空 buffer 标完成；最坏 key missing → 重算 |
 | **A** | `UpsertStart` 判定时 key 不存在（`exists` 后被删 / 逐，惰性清理清空副本，或抢占 processing 后无 COMPLETE） | 分配新 buffer（**新 ReplicaID**） | **id 不匹配** → `UpsertRevoke`（地址仅 sanity） | key missing → 重算。地址复用也不再误 End（A15 关闭） |
 
@@ -908,8 +907,8 @@ sequenceDiagram
    - 版本差异：main / v0.3.14 才有 `has_read_lease` gate；目标版本没有，不能用 main 的行为套。
 6. **挡不了 lease 过期后的驱逐**
    - 原因：lease 是限时保护；续租中断 / 超时后，`BatchEvict` 不再因 lease 跳过。
-   - case：`pin(SOFT)` 只 `exists`+`renew_once`，不 `register_keepalive`；或查询到空写超过 lease TTL；或保活被注销。
-   - 后果：key 可能被逐；驱逐落在续租之后、`UpsertStart` 之前才走 Case A，否则 `exists`/`renew_once` 失败。
+   - case：`pin(SOFT)` 只靠 native `GetReplicaList` 授 lease（不 `register_keepalive`）；或 list→Start 超过 lease TTL；或保活被注销。
+   - 后果：key 可能被逐；驱逐落在 list 之后、`UpsertStart` 之前才走 Case A，否则 list 失败。
 7. **“加一个读”不是加引用**
    - 原因：读只授 lease，不碰 refcnt；mooncake 没有读者持引用的 RPC。refcnt 是 copy / move / offload / promotion 的任务级保护。
    - 结论：读与 keepalive 同性质，挡不了 force Remove / Case C。
@@ -924,7 +923,7 @@ sequenceDiagram
    - 原因：目标版本 `GrantReadLease` 明确 “Soft-pin lifetime is intentionally independent from reads”；读 / `exists` 只续 lease。
    - case：只 register_keepalive + renew_once，不重新空写。
    - 后果：默认 30min 后 soft pin 失效；要继续 pin 必须周期性重新空写（`SoftPinAction::ENABLE`）。
-   - 补充：`pin(SOFT)` 做 `exists` + `renew_once` + 二次 query，不 `register_keepalive`；要 lease + soft pin 双保护，需额外调 `register_keepalive`。
+   - 补充：`pin(SOFT)` 做 admin query + native `GetReplicaList`，不 `register_keepalive`；要 lease + soft pin 双保护，需额外调 `register_keepalive`。
 3. **空写窗口内 key 不可读**
    - 原因：`UpsertStart` 把 COMPLETE 副本标成 PROCESSING，`UpsertEnd` 才恢复；窗口内读者看不到 key（F3④）。
    - case：每次空写 / 续期。
@@ -952,8 +951,8 @@ sequenceDiagram
    - Case A/C：新 buffer / 新 id；id 不匹配 → 不 End，走 Revoke → 最坏 key missing → **可重算**。
 2. **A15（地址复用→误空 End）——已用 replica id 关闭**
    - 旧路径只比地址+size：Case A 新 buffer 若复用同地址会误 End。
-   - **现路径**：`GetReplicaList` 旧 `Replica::Descriptor.id` → `UpsertStart` → 比返回 id。Case B 原地同 id（`master_service.cpp` 返回 `get_descriptor()`）；Case A 新 `next_id_`。id 不同 → Revoke。地址/size 仅 sanity；与 list/调用方不一致则**不进入** Start（错地址不再误 Erase 好 key）。
-   - 残余：查询/`id` ABI 读错；End 失败留 PROCESSING；Case B 误 Revoke 仍 Erase。only_in_place / RMW 未做。
+   - **现路径**：`GetReplicaList` 旧 id → `UpsertStart` → 比返回 id。Case B 同 id → End；Case A 新 id → **仅此时** Revoke。Start 前地址与 list/调用方比对；Start 后地址不作 Revoke 依据。Start 返回形状不明 → 失败**不** Revoke。
+   - 真机：删 key → id 必变（A14 表）。残余：End 失败/形状不明留 PROCESSING；每 key 一次 GetReplicaList（可升 Batch）；only_in_place / RMW 未做。
 3. **ABI 残余**
    - `mooncake_pin_api.h` 手写镜像；`EndResult` / `GetReplicaListResponse` 按 `tl::expected`。编译通过≠布局一定对。
 4. **版本依赖（空写扩展不是跨版本通用）**
