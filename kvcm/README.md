@@ -11,7 +11,7 @@ KV 管理控制面：独立于推理引擎与 KV 池的第三进程，管 KV 全
 | | [design/code-architecture.md](design/code-architecture.md) | 服务化代码架构（五层；E10/E11/E15 设计依据） |
 | **专项设计** | [design/kv-prefetch.md](design/kv-prefetch.md) | copy/prefetch 详细方案（A 壳请求 / B 显式副本复制权衡与时序） |
 | **流程文档** | [design/flows/prefetch.md](design/flows/prefetch.md) | 预热流程步骤与数据流（每流程一篇，新增流程同目录另立） |
-| **demo 记录** | [demo/](demo/README.md) | precopy 预热验证：仅覆盖八项中 **copy** 一项的端到端链路（vllm-ascend + Mooncake 实测通过） |
+| **demo 记录** | [demo/](demo/README.md) | precopy 预热验证（**copy** 端到端，vllm-ascend + Mooncake 实测通过）；另有 soft pin 真机实验（[EXPERIMENTS.md](demo/EXPERIMENTS.md)） |
 | **登记处** | [summary.md](summary.md) | 设计决策 D / 潜在问题 P / 工程项 E 全状态总表 |
 
 ## 目录结构
@@ -20,7 +20,7 @@ KV 管理控制面：独立于推理引擎与 KV 池的第三进程，管 KV 全
 kvcm/
 ├── design/     # 生产化设计文档（八项操作全集）
 │   └── flows/  # 流程文档（每流程一篇）
-├── demo/       # precopy demo：只验证 copy 一项；文档+代码+测试床自包含
+├── demo/       # precopy demo（copy）+ soft pin 真机记录；文档+代码+测试床自包含
 ├── kvcm/       # 服务代码（daemon、后端、流程、Ledger）
 ├── tests/      # 服务代码的 pytest
 └── summary.md  # 登记处（D/P/E 编号总表）

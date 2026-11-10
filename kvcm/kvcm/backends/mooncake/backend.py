@@ -11,9 +11,8 @@
 
 已接线：copy / move / remove / exists / query_task /
 register_keepalive / unregister_keepalive / renew_once / demote /
-promote / check_promote / memory_instance。pin 仍走基类
-UnsupportedCapabilityError（soft pin 后续 PR）。retain 通道关闭，
-开头直接 NotImplementedError。
+promote / check_promote / memory_instance / pin(SOFT)。pin(HARD)
+拒绝。retain 通道关闭，开头直接 NotImplementedError。
 """
 
 from __future__ import annotations
@@ -47,7 +46,7 @@ from kvcm.ops.base import (
     VerifyError,
 )
 from kvcm.ops.capability import BackendCapability, Support
-from kvcm.ops.types import InstanceId, IntentInputError, Prefix
+from kvcm.ops.types import InstanceId, IntentInputError, PinKind, Prefix
 
 logger = logging.getLogger(__name__)
 
@@ -1116,6 +1115,76 @@ class MooncakeBackend(KvOps):
         返回是否全部 key 仍在池；RPC 失败按 exists 的约定抛 QueryError。
         """
         return await self.exists(prefix)
+
+    async def pin(
+        self, prefix: Prefix, kind: PinKind = PinKind.SOFT, *, enable: bool = True
+    ) -> None:
+        if kind is PinKind.HARD:
+            # hard pin 标记创建时固化，事后设置不了。登记保活不是 hard pin，
+            # 只是有窗口的 lease 保护；不要用 pin(HARD) 冒充它。
+            raise UnsupportedCapabilityError(
+                "hard pin 不能事后设置；要 lease 保护请显式调 register_keepalive()"
+            )
+        # soft pin 空写是“有条件可用”：本 PR 目标版本没有 has_read_lease
+        # 门槛，同尺寸会走 Case B；这里只保证 Case B 的前置条件。
+        # 方案 1 + replica id（D2 §2）：admin 查盘/size/address（零副作用）；
+        # native GetReplicaList 取旧 id 并授 lease，UpsertStart 后比 id——
+        # 相同只 End，不同才 Revoke。不再单独 exists/renew_once（避免与
+        # GetReplicaList 重复授 lease）。不 register_keepalive。
+        # **未确认假设**：单 slice（put_step=1）；admin 字段与池一致。
+        # admin 的 memory 只含 DRAM；NoF 单独存。memory+NoF 可空写；
+        # NoF-only 在 len(memory)!=1 拒绝。
+        if self._cap.soft_pin_after.channel is not Support.YES:
+            raise UnsupportedCapabilityError(
+                "soft pin 事后加：这个能力集的通道不具备"
+            )
+        if getattr(self._keys, "put_step", 1) != 1:
+            raise UnsupportedCapabilityError(
+                "soft pin 空写只支持 put_step=1（单 slice）；当前 put_step="
+                f"{getattr(self._keys, 'put_step', '?')}"
+            )
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        if self._admin is None:
+            raise QueryError("软钉取尺寸需要主线 GET /batch_query_keys")
+        try:
+            parsed = await self._rpc(self._admin.batch_query_keys, keys)
+        except (AdminMainError, StoreClientError) as e:
+            raise QueryError(str(e)) from e
+        self._require_admin_rows(keys, parsed)
+        blocked = [
+            key
+            for key in keys
+            if parsed[key].disk_replicas > 0
+            or bool(parsed[key].local_disk_endpoints)
+        ]
+        if blocked:
+            raise StoreClientError(
+                "有盘副本，空写收尾盖不住它们: " + ", ".join(blocked[:4])
+            )
+        sizes: list[int] = []
+        addresses: list[int] = []
+        for key in keys:
+            memory = list(parsed[key].memory)
+            if len(memory) != 1:
+                raise StoreClientError(
+                    f"soft pin 只支持单内存副本，没有钉上: {key} memory={len(memory)}"
+                )
+            view = memory[0]
+            if view.size is None or view.buffer_address is None:
+                raise QueryError(
+                    f"软钉读不到原尺寸/地址，没有钉上: {key}"
+                )
+            sizes.append(view.size)
+            addresses.append(view.buffer_address)
+        await self._rpc(
+            functools.partial(
+                self._client.soft_pin, keys, sizes, addresses, enable=enable
+            )
+        )
 
     async def demote(self, prefix: Prefix) -> None:
         """停保活 → 睡满 ``lease_ttl_s`` → 用 ``GET /batch_query_keys`` 确认 LOCAL_DISK。

@@ -277,7 +277,7 @@ stateDiagram-v2
 | 能力 | mooncake 0.3.11（历史部署） | mooncake 目标版本 v0.3.13.post1（当前基线；代码里沿用 main 名字） | 出处 |
 |------|------------------------------|----------------------------|------|
 | has_lease（读续租） | RPC ✓ 通道 ✓（`is_exist`） | RPC ✓ 通道 ✓ | D2 F9 |
-| soft pin 事后加（用 upsert 空写的方式） | RPC ✓ 通道 ✗（0.3.11/0.3.12 的 soft_pin 通道不适用） | **后续 stacked PR**：RPC ✓ 通道 ✓（**有条件可用**：目标版本有 `SoftPinAction`、无 `has_read_lease` 门槛；要求 Case B——尺寸一致、单 slice、key 存在、无盘副本；pin 前 `exists` 持 lease；`UpsertStart` 后地址检查，不一致就 `UpsertRevoke`。lease 挡驱逐/非 force Remove，不挡 force Remove、lease 过期后的驱逐或 Case C；`pin(SOFT)` 不 `register_keepalive`。Case C 旧 buffer 延迟释放（默认 600s），地址复用残余主要来自 exists 后发生 force remove / stale 清理 / lease 过期驱逐，或 UpsertStart 惰性清理 / processing 抢占后无 COMPLETE 副本的 Case A。ABI 仍需真机验证；Start-End 崩溃 / 读者短暂不可读 / client_id 改写 / 不续期 / 并发重写是已知边界） | D2 F1/F12、D2 §2 |
+| soft pin 事后加（空写） | RPC ✓ 通道 ✗（0.3.11/0.3.12） | RPC ✓ 通道 ✓（方案 1 + replica id 关闭地址复用误判；真机行为见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md)。L2 未接） | D2 §2 |
 | hard pin 事后改标记 | ✗（创建时固化，`pin(HARD)` 拒绝；要 lease 保护用显式 `register_keepalive()` + `renew_once`。lease 是 master 的 `default_kv_lease_ttl`，kvcm 不改） | ✗ | D2 §2 |
 | can_copy_with_source（指定源复制） | ✗（move 才能指定源，且 `source` 必填） | ✗ | D2 F7 |
 | has_offload / has_promotion（池通道降层/提回） | 降层通道 ✗（`/batch_query_keys` 无 disk 字段，主线 #2685 才加）。提回 ✓（`GetReplicaList`） | 降层 ✓：停保活 → 满 lease TTL → 确认 LOCAL_DISK。提回：L3 promote；PromoteFlow ±target；intent 经 TaskEngine，闸仅 copy | D2 §3 |
@@ -358,17 +358,12 @@ stateDiagram-v2
 
 **自封装 .so**（已落地的缺口只有空写 upsert。保留身份不在这份主线里，不用这个 .so 去补）：
 
-- 已落地的空写：**有条件可用（目标版本）**。单独的 `_empty_pin.so`，只链 wheel 里的 `store.so`。wheel 不带 C++ 头文件。扩展用本地 `kvcm/kvcm/native/mooncake_pin_api.h` 声明要用的类型，调用 `client->master_client_.UpsertStart` / `UpsertEnd`。成员地址由编译器算。产物放 kvcm 侧，不改 mooncake 源码。前置条件是 Case B（尺寸一致、单 slice、key 存在、无盘副本）；pin 前 `exists` 持 lease；`UpsertStart` 后地址检查，不一致就 `UpsertRevoke`。lease 挡驱逐/非 force Remove，不挡 force Remove、lease 过期后的驱逐或 Case C；`pin(SOFT)` 不 `register_keepalive`。Case C 旧 buffer 延迟释放（默认 600s），地址复用残余主要来自 exists 后发生 force remove / stale 清理 / lease 过期驱逐，或 UpsertStart 惰性清理 / processing 抢占后无 COMPLETE 副本的 Case A。Case C-by-size / Case A / ABI / Start-End 崩溃 / 读者短暂不可读 / client_id 改写 / 不续期 / 并发重写是已知边界
-- 单 client 保证（约束见上「三条接入通道」节：store_py 与自封装 .so 必须共用同一 client 实例/UUID）：
-  - 不能走的写法：自封装 .so 自己 `RealClient::create()` 再建一个 → 两个 UUID 两套心跳
-  - **当前空写**：把 `setup` 建好的那一个 client 传进扩展，调用它的 `UpsertStart`，不写数据，再 `UpsertEnd`。不 `RealClient::create()`。
-    - 类型只写到 `master_client_` 为止。与完整类定义对过：`PyClient::client_` 在 8 字节，`Client::master_client_` 在 48 字节，`ReplicateConfig` 208 字节，`ObjectMeta` 48 字节。
-    - 官方包用 `_get_pyclient_capsule` 把 `setup` 放进 `store_` 的那一个对象交出来。扩展按 `mooncake_pin_api.h` 里的成员调用 `UpsertStart` / `UpsertEnd`。
-    - **含 `pyclient.h` 的路径是退路，不是当前实现。** 若当前小头文件在真实调用上失败，再改回：pybind 参数为 `MooncakeStorePyWrapper&`，`get_real_client()` 拿出已建 client。拿到这个对象之后，`get_real_client()` 只是返回成员。不确定的是跨模块还原这个类：它没有单独头文件，pybind 版本还要和 wheel 一致（2.13.6）。代价是编译期要读 `pyclient.h` 带进来的那串头文件。使用时仍然只链 `store.so`。现在不走这条。
-    - **client_id**：当前路径是方案一。`MasterClient::UpsertStart` 发出去的是这个 client 自己的 UUID，空写会把 `client_id` 写成 kvcm 的。目前没感受到权限影响。借名（方案二）仍然做不到，不是当前路径。机制说明留在 D2 §2。
-    - **写中窗口**：同一次调用里 `UpsertEnd` 失败会 `UpsertRevoke`。进程死在 Start 和 End 之间时，副本停在 PROCESSING。扫任务记录再补 `End` 或 `Revoke` 当前不做。
-    - 保留身份先不动。1fc27b6 没有 `AddReplicaForRetainedClient`。`dummy_client.h` 的 `kRetained` 是外部 buffer 的引用计数。
-  - **另一条退路（未做）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）重新绑定一遍，Python 只 import 自封装 .so；天然单 client，代价是复制绑定面
+- 已落地的空写：有条件可用（v0.3.13.post1）。方案 1 + replica id（关闭地址复用误判）；真机见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md)。L2 未接。
+- 单 client：扩展必须用 `setup` 已建的那一个（`_get_pyclient_capsule`），禁止扩展内再 `RealClient::create()`。
+  - 类型只写到 `master_client_`；偏移已与完整类对过。含 `pyclient.h` / `get_real_client()` 是退路，当前不走。
+  - client_id：方案一（空写写成 kvcm UUID）。借名做不到。
+  - End 失败（已匹配）：不 Revoke，抛异常，可能留 PROCESSING。不匹配才 Revoke。崩溃恢复不做。
+  - 保留身份先不动。
 - 为什么空写不从 Python ctypes 直调：
   - ctypes 能调 C 函数，但造不了 C++ 对象
   - 方法参数和返回是 C++ 类型（`std::string` 的内存布局（短字符串内嵌）、`UUID` struct、`tl::expected` 返回值），在 Python 里按字节拼这些对象 = 手工复刻编译器的类型布局，且布局随 libstdc++ 版本变
@@ -376,7 +371,7 @@ stateDiagram-v2
   - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）。当前空写不用它
 - 两个断点（E6）：
   1. 符号可见性：0.3.13.post1 `store.so` 导出 `MasterClient::UpsertStart` / `UpsertEnd` / `UpsertRevoke`。空写扩展链接这三个符号。`get_real_client` 是内联成员，不在动态符号表，当前空写也不调用它。
-  2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机。含 `pyclient.h` 的退路才要求 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a）与跨模块还原对齐。当前空写不转换 `MooncakeStorePyWrapper`。
+  2. ABI 匹配：手写头 + 本机编 so；升 wheel 须重编（无运行时 ABI 闸）。gcc/libstdc++ 与 wheel 构建环境一致性靠同机编。含 `pyclient.h` 的退路才要求 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a）；当前空写不转换 `MooncakeStorePyWrapper`。详见 D2 §2 手写 ABI 镜像约束。
 - E6 另核：`/query_key` 的续租副作用在核验场景能否接受。保留身份的符号不用再找：1fc27b6 没有 `AddReplicaForRetainedClient`，`kRetained` 是外部 buffer 引用计数。另：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），上游原生支持 NPU（v0.3.11 tag 已有 `ascend_transport` 目录）
 
 ### EngineAdapter（引擎适配）
@@ -597,7 +592,7 @@ sequenceDiagram
 - **READY 补发（E14，闸外）**：正常路径在前缀闸释放之后、intent READY 之前，`_on_ready` 先等保活落账（`register_await`），再按目标实例补一条 `BlockStored`。写入失败 / 没有端点 / 发送抛错只记日志，预热仍成功。发布器按实例懒绑定，只在 `TaskEngine.shutdown`（进程退出）时关，不跟实例下线
 - **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
 - **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；`session_end` 类可延迟任务排队无妨
-- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。窗口上限来自两次分开的真机实验，不是一件事（[../demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md) #16、#17）。10 月 26 日单机（#16）：连不上是 `TRANSFER_FAIL`；窗口 4 节奏化 42/42 全成。10 月 29 日跨机（#17）：主错误是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），master 留内存失败；14 条全成，42 条大约一半失败。这次实验的错误是 master 留内存失败；段剩余预检对得上这个错误类型；它不代替 E15；实验当时也没跑这条预检。#16 的 `TRANSFER_FAIL` 与 #17 不是同一种失败。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过实测打爆的点。网卡利用率限速（网卡计数器采样）仍归 E15，仍不做，接在同一层信号量上
+- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把），提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍。窗口上限来自真机并发实验，见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md) #16/#17。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4。它只限建链 RPC 的在飞数，不替代前缀闸；网卡利用率限速归 E15。
 - **排队超时**：intent 在队列等待的语义（等多久算放弃）随 E12 intent 字段一起定；执行超时沿用 flow 现有 `timeout_s`
 - **失败态策略**（只留接口，随 E11 细化）：失败后的动作三种——① 重发；② 放弃这批任务，事后把留下的副本清掉（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 复制中途源实例下线时的处理（D5）。语义引 D2 §1 与 D5，不新造语义
 - **编程错误停收**：连续 3 次，或最后一条消费者退出时，`_accepting=False` 拒新 intent。已经入队、还没被取走的，按 shutdown 同款收成 FAILED（`cancelled (shutdown, never started)`）。编程错误本身仍然向上抛，不吞掉
@@ -609,7 +604,7 @@ sequenceDiagram
 - **实现通道**：`KeepaliveLoop` 定期调 `renew_once` → `exists`（`batch_is_exist` / BatchExistKey，读即续租）。`MooncakeBackend.register_keepalive` / `unregister_keepalive` 只登记/注销同一张 Ledger 表，不改成 ProbeKey
 - **形态**：协程定时器（事件循环内 `asyncio.sleep` 周期触发），不是独立线程
 - **已知限制（量未测）**：默认约每 5s `sweep_once`，对表里每个前缀做一次全 key `batch_is_exist`。请求量与 sweep 延迟没有基线；保活前缀多或单前缀很长时，sweep 可能拖过周期。限流 / 分批 / 按前缀错峰要等真机量过再改，core 不先加策略
-- **A16（OPEN，上线前必修，不挡合入）**：demote 停保活后，同前缀 `exists` / 预热 / `check_promote` / `promote` 会授 lease，可打穿 TTL 等待。修法：前缀级串行（`summary.md` A16）。本 PR 不修。
+- **同前缀串行化（未做）**：demote 停保活后等 TTL 时，同前缀会授 lease 的调用可打穿等待：`exists` / 预热 / `check_promote` / `promote` / **`pin(SOFT)` 的 native `GetReplicaList`**（pin 的 lease 入口）。修法：前缀级互斥。
 
 ### ReleaseLoop / RetainLoop
 

@@ -251,6 +251,53 @@ class StoreClient:
             )
         return raw
 
+    def soft_pin(
+        self,
+        keys: Sequence[str],
+        sizes: Sequence[int],
+        addresses: Sequence[int],
+        *,
+        enable: bool = True,
+    ) -> None:
+        """空写软钉。复用 setup 已建 client（capsule），不二次 create。
+
+        ``sizes`` / ``addresses`` 来自 admin ``size_`` / ``buffer_address_``。
+        方案 1 + replica id：``GetReplicaList`` 旧 id 与 ``UpsertStart`` 返回
+        id 相同 → 只 ``UpsertEnd``（End 失败不 Revoke）；id 不同才
+        ``UpsertRevoke``；Start 形状不明不 Revoke。地址仅 Start 前 sanity。
+        不写数据。
+        """
+        store = self._s()
+        keys = list(keys)
+        sizes = [int(s) for s in sizes]
+        addresses = [int(a) for a in addresses]
+        if (
+            len(keys) != len(sizes)
+            or len(keys) != len(addresses)
+            or not keys
+            or any(s <= 0 for s in sizes)
+        ):
+            raise StoreClientError("软钉读不到唯一的原尺寸/地址，没有钉上")
+        capsule_fn = getattr(store, "_get_pyclient_capsule", None)
+        if not callable(capsule_fn):
+            raise StoreClientError(
+                "官方包没有 _get_pyclient_capsule，拿不回已建 client，没有钉上"
+            )
+        capsule = capsule_fn()
+        if capsule is None:
+            raise StoreClientError("已建 client 的 capsule 是空的，没有钉上")
+        from kvcm.native.empty_pin import empty_soft_pin
+
+        try:
+            empty_soft_pin(capsule, keys, sizes, addresses, enable)
+        except ImportError as e:
+            raise StoreClientError(
+                "空写扩展还没加载，没有钉上"
+            ) from e
+        except RuntimeError as e:
+            # native 抛 std::runtime_error；统一成 StoreClientError
+            raise StoreClientError(str(e)) from e
+
     def query_task(self, task_id: object) -> object:
         """查询任务状态（QueryTaskResponse）。"""
         resp, err = self._s().query_task(task_id)

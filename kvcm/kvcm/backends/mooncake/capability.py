@@ -73,9 +73,17 @@ def mooncake_main() -> BackendCapability:
             "通道 = is_exist，读即续租（预热前置检查的 exists 调用同样续租——保活免费搭车）",
         ),
         soft_pin_after=Capability(
-            Support.NO,
-            Support.NO,
-            "soft pin 未接线；native 空写见后续 soft pin PR",
+            Support.YES,
+            Support.YES,
+            "有条件可用（目标版本）：SoftPinAction；无 has_read_lease 门槛；"
+            "同尺寸空写走 Case B；方案 1 + replica id（GetReplicaList 旧 id "
+            "vs UpsertStart 返回 id；同→End，异才 Revoke；关 A15）。"
+            "admin 查盘/size/address；native GetReplicaList 授 lease+取 id。"
+            "需 put_step=1、无盘副本、单内存。"
+            "Start 形状不明不 Revoke；地址仅 Start 前 sanity。"
+            "升 wheel 须重编 _empty_pin.so（无运行时 ABI 闸）。"
+            "Start-End 崩溃 / PROCESSING / client_id 改写 / soft pin 不随 lease 续 "
+            "仍是已知边界",
         ),
         hard_pin_after=Capability(
             Support.NO,
