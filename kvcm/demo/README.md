@@ -1,6 +1,6 @@
 # precopy demo：KV 预热复制端到端验证
 
-> 本文是 **demo 记录**：只验证 kvcm 八项操作中 **copy** 一项的端到端链路（vllm-ascend + Mooncake 测试床）。kvcm 项目全貌见 [../README.md](../README.md)；操作全集与生产化设计见 [../design/D2-kv-operations.md](../design/D2-kv-operations.md) / [../design/D1-router-scheduling.md](../design/D1-router-scheduling.md)。**本文命令的工作目录均为 `kvcm/demo/`**。
+> 本文是 **demo 记录**：只验证 kvcm 八项操作中 **copy** 一项的端到端链路（vllm-ascend + Mooncake 测试床）。soft pin A14 真机实验独立记录在 [EXPERIMENTS.md](EXPERIMENTS.md) 文末，不属于 copy demo。kvcm 项目全貌见 [../README.md](../README.md)；操作全集与生产化设计见 [../design/D2-kv-operations.md](../design/D2-kv-operations.md) / [../design/D1-router-scheduling.md](../design/D1-router-scheduling.md)。**本文命令的工作目录均为 `kvcm/demo/`**。
 
 在 **vllm-ascend** 上做 Mooncake KV **预复制（pre-copy）**：真实请求打到目标实例之前，用 Mooncake `create_copy_task` 把已有前缀 KV 复制到该实例的本机 DRAM segment，让读路径 local-first，避免跨机拉 KV。引擎不参与复制；不引入额外控制面框架。
 
@@ -29,7 +29,7 @@
 | NAH 根因对照（#18–#22，2026-10-30～11-02） | **驳回「字节见底」单因**（失败时仍有数百 MB free）；空闲 segment 上 window=4 不复现；半占用(~50%)+闸4×42 可稳复现；B seg **1GB→4GB 同风暴 NAH 消失**——见 [EXPERIMENTS.md](EXPERIMENTS.md) #18/#19/#22 |
 | PR72 段容量准入（#24，2026-11-02） | **通过**：假 admin `@pytest.mark.smoke`（CI 可跑）；真机 `@pytest.mark.npu`（`KVCM_NPU_SMOKE=1`，不进 Actions）— 见 [EXPERIMENTS.md](EXPERIMENTS.md) #24 |
 
-完整实验史（总表至 #24 + 异构实录 + 撤回记录；含 #17 跨机并发度、#18–#22 NAH 对照、#23 E14 补发、#24 段容量准入）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」；总结与待办见 [summary.md](../summary.md)。
+完整实验史（总表至 #24 + 异构实录 + 撤回记录；含 #17 跨机并发度、#18–#22 NAH 对照、#23 E14 补发、#24 段容量准入、soft pin A14）见 [EXPERIMENTS.md](EXPERIMENTS.md)；复现步骤与「读本机副本」判定方法见 [REPRODUCE.md](REPRODUCE.md)；未做项与边界见「边界与已知限制」；总结与待办见 [summary.md](../summary.md)。
 
 ## 快速开始
 

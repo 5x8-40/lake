@@ -5,7 +5,7 @@
   - 本文定这些操作的语义、实现机制、失败处理
 - 状态：**设计完成**
   - §1 操作集框架：闭环——八项操作业界逐项对照、完备性审计、kvcm 能力边界（只能被动等池的真缺口 2 条，归池侧扩展 vs 无专用 RPC 但组合可达 7 条）
-  - §2 pin：`pin(HARD)` 拒绝；lease 保护用 `register_keepalive()`。soft pin = 有条件可用空写（目标版本无 lease gate，走 Case B；方案 1 + **replica id** 关 A15；client_id 方案一）。A14 真机见本节。**L2 不接 soft pin**
+  - §2 pin：`pin(HARD)` 拒绝；lease 保护用 `register_keepalive()`。soft pin = 有条件可用空写（目标版本无 lease gate，走 Case B；方案 1 + **replica id** 关 A15；client_id 方案一）。A14 真机见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md)。**L2 不接 soft pin**
   - 易混淆：[lease-pin-eviction.md](lease-pin-eviction.md)（lease / soft / hard / 驱逐）
   - §3 demote / promote：停保活 → 满 lease TTL → admin 确认盘副本
   - 协议：`SubmitIntent` 仍是前缀 × 目标；执行走 `PromoteFlow(target=)`。move / pin / demote / remove 无独立 intent
@@ -846,7 +846,7 @@ sequenceDiagram
 > 有条件可用（v0.3.13.post1）。通道 YES（0.3.11/0.3.12 为 NO）。
 > **A15** 用 **replica id** 关闭：`GetReplicaList` 旧 id vs `UpsertStart` 返回 id；**仅 id 不同**才 Revoke；id 同只 End（End 失败不 Revoke）。地址不作 Start 后 Revoke 依据；Start 形状不明也不 Revoke。  
 > `pin`：admin 查盘/size/address；native `GetReplicaList` 授 lease + 取 id。
-> **A16**：`GetReplicaList` 续租仍可打穿 demote TTL——前缀互斥另开 PR（`summary.md`）；**本 PR 不修**。ABI / 真机见「A14 真机记录」。
+> **A16**：`GetReplicaList` 续租仍可打穿 demote TTL——前缀互斥另开 PR（`summary.md`）；**本 PR 不修**。ABI / 真机见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md)「soft pin A14 真机记录」。
 
 #### 限制、原因与 case
 
@@ -953,7 +953,7 @@ sequenceDiagram
 2. **A15（地址复用→误空 End）——已用 replica id 关闭**
    - 判据：`GetReplicaList` 旧 memory id vs `UpsertStart` 返回 id；同 id → Case B → End；异 id → Case A/C → Revoke，不 End。
    - 地址/size 只在 Start 前与 list/调用方比对；Start 后不作 Revoke 依据；形状不明 → 失败**不** Revoke。
-   - 真机：删 key → id 必变（A14 表）。残余：End 失败/形状不明留 PROCESSING；每 key 一次 GetReplicaList（可升 Batch）；only_in_place / RMW 未做。
+   - 真机：删 key → id 必变，见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md)「soft pin A14 真机记录」。残余：End 失败/形状不明留 PROCESSING；每 key 一次 GetReplicaList（可升 Batch）；only_in_place / RMW 未做。
 3. **ABI 残余**
    - `mooncake_pin_api.h` 手写镜像；`EndResult` / `GetReplicaListResponse` 按 `tl::expected`。编译通过≠布局一定对。
 4. **版本依赖（空写扩展不是跨版本通用）**
@@ -968,7 +968,7 @@ sequenceDiagram
 
 - 目标版本 = **v0.3.13.post1**（master / client 同版本）；当前 native 扩展只对这个版本承诺。
 - 其他版本相关依赖（都按目标版本核对）：
-  - `UpsertStart` / `UpsertEnd` / `UpsertRevoke` 在 `libmooncake_store.so`（扩展须同时链它；A14 已验）。
+  - `UpsertStart` / `UpsertEnd` / `UpsertRevoke` 在 `libmooncake_store.so`（扩展须同时链它；A14 已验，见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md)）。
   - `GET /batch_query_keys` 的 `values` 返回 `AllocatedBuffer::Descriptor`，含 `size_` / `buffer_address_`。
   - `ReplicateConfig` / `SoftPinAction` / `CallResult` / `Replica::Descriptor` 的布局；手写头文件只镜像目标版本。
   - Case C 旧 buffer 延迟释放（`put_start_release_timeout`，默认 600s）；与 **id** 判据配合（新 id ≠ 旧 id）。
@@ -978,7 +978,7 @@ sequenceDiagram
 
 5. **调用方**
    - 本 soft pin PR 只交 L3 `pin(SOFT)`；**不接 L2**（prefetch READY 后谁调 pin 另开 PR）。
-   - 真机靠单独冒烟（A14），不靠主流程流量。
+   - 真机靠单独冒烟（A14），见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md)；不靠主流程流量。
 
 #### 实现要点
 
@@ -997,49 +997,14 @@ sequenceDiagram
 | id 不同（Case A/C） | `UpsertRevoke`；抛异常 | key missing → 可重算 |
 | Start 形状不明 | **不** Revoke；抛异常 | 可能留 PROCESSING；勿误 Erase |
 
-备选未做：② id 不同也不 Revoke；③ 池侧 only_in_place；④ 只用 keepalive；⑤ `BatchGetReplicaList`。  
-A14 / 删 key→id 变见下。
+备选未做：② id 不同也不 Revoke；③ 池侧 only_in_place；④ 只用 keepalive；⑤ `BatchGetReplicaList`。
 
-#### A14 真机记录（v0.3.13.post1，永久）
+#### 真机验证（A14）
 
-| 项 | 值 |
-|---|---|
-| 日期 | 2026-11-09（含晚间补测） |
-| 机 | `7.242.104.45`；跨机 put 在 `7.242.110.225` |
-| 容器 | `vllm-ascend-lake-test`（两侧同版本） |
-| mooncake | **0.3.13.post1**（master+client） |
-| master | `:50088`；metrics `:9003`；`default_kv_lease_ttl=11000` |
-| 冒烟 | 容器内 `/tmp/lake-a14`（分支拷贝后本地编 `_empty_pin.so`）；脚本未入仓 |
+A14 的环境、ABI/链接问题、用例结果与未覆盖项见
+[demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md)「soft pin A14 真机记录」。
 
-| ABI 问题 | 修复 |
-|---|---|
-| 只链 `store.so` → `Upsert*` 未定义 | 同链 `libmooncake_store.so` |
-| `EndResult` 布局错 → 成功被误读成失败，End 不执行，副本可能留 PROCESSING | 按 `tl::expected<void, ErrorCode>`（ok+union） |
-
-| 用例 | 结果 |
-|---|---|
-| put → soft_pin ENABLE；`master_soft_pin_key_count` 0→1；地址不变 | PASS |
-| DISABLE + get 比对 payload | PASS |
-| 错地址 → 与 GetReplicaList 不一致则**不** Start，key 保留 | PASS |
-| tip 复验 + `backend.pin`（admin + native list） | PASS |
-| 225 put → 45 soft_pin（数据 ep 在 225） | PASS |
-| NoF put（`nof_replica_num=1`） | N/A / SKIP：`INVALID_PARAMS`（本 master 未配通；不作为本 PR 验收） |
-| 2026-11-10 tip 再验（client / backend.pin / 错地址） | PASS（同上容器） |
-| 2026-11-10 replica-id：正向 pin；错地址在 list sanity 拒绝且 **payload 保留** | PASS |
-| 2026-11-10 **删 key → id 必变**（不撞地址复用） | PASS：Case B `old_id==start_id`（例 19）；`force remove` 后 Case A `start_id` 新值（例 20）且 ≠ 旧 id，Revoke 不 End。容器临时 `probe_upsert_memory_ids`（未入仓） |
-
-**ABI 对照（2026-11-10）**
-
-- **ABI** = Application Binary Interface（布局/调用约定），≠ 版本号本身。
-- 真机包：`mooncake-transfer-engine-npu==0.3.13.post1`（dist-info 无 git commit；wheel `sha256=ba134f2c…`）。
-- 浅拉上游：`kvcache-ai/Mooncake` tag `v0.3.13.post1` → commit `719735896c86b56fabec6cf3e825fb2ea640597a`。版本号可对齐；**无法**从 NPU wheel 核对同一 SHA。
-- 与镜像头 `mooncake_pin_api.h` 字段对照（tag 源码）：`UpsertEnd/Revoke` = `tl::expected<void, ErrorCode>`；`ObjectMeta`；`Client` 成员序 `client_id_→metrics_→transfer_engine_→master_client_`；`ReplicateConfig` 字段序一致；`SoftPinAction` ENABLE=1/DISABLE=2。镜像省略 `PRESERVE=0`、默认 ENABLE（调用显式设）；`Descriptor` 字段名上游 `descriptor_variant`、镜像 `body`（variant 序仍镜像）。
-- 镜像 sizeof 探针（同机编译）：`ObjectMeta=48`、`ReplicateConfig=208`、`EndResult=8`（`ok@4`）、`PyClient::client_=8`、`Client::master_client_=48`，与头注释一致。
-- 行为闭环（同日 tip）：正向 End 成功；错地址在 list sanity 拒绝（不 Start）。
-- **R04 残余**：手写 `mooncake_pin_api.h` + 本机编 `_empty_pin.so`；wheel 无 `.h`，无运行时 ABI 证明。升 wheel **必须**重跑 `build_empty_pin.sh`（否则可能静默读错 `EndResult`）。版本号对不上不等于布局对；同版本号不同构建也挡不住——靠绑死 `0.3.13.post1` + 重编 + 行为验。
-
-未覆盖：并发、End 失败注入、地址复用注入（不强制）、多 key 部分失败自动化、`BatchGetReplicaList`。**A15 已关闭**（id 校验 + 真机删 key→id 变）。  
-单测：`pytest -k pin_soft`；CI 不编 `_empty_pin.so`，无 so 时相关测 skip。
+- **R04 残余**：手写 `mooncake_pin_api.h` + 本机编 `_empty_pin.so`；wheel 无 `.h`，无运行时 ABI 证明。升 wheel **必须**重跑 `build_empty_pin.sh` 并做行为验；版本号对不上不等于布局对，同版本号不同构建也挡不住。
 
 编号线索：R02 部分失败不回滚；R03 `put_step=1`；R04 ABI；A04 NoF=N/A；A15 已关闭；A16 见 summary（另开 PR；pin 仅剩 GetReplicaList 续租）。
 
