@@ -844,7 +844,8 @@ sequenceDiagram
 > 有条件可用（v0.3.13.post1）。只走 Case B；通道 YES（0.3.11/0.3.12 为 NO）。
 > 收尾方案 1：匹配 → 只 End（End 失败不 Revoke，抛异常）；不匹配 → Revoke。
 > Case B 上误 Revoke 会 Erase（F5，可重算）。**A15** 用 **replica id** 关闭：`GetReplicaList` 旧 id vs `UpsertStart` 返回 id；地址复用不再能骗过 End。
-> `pin`：`exists` + `renew_once` + 二次 query（admin）；native 内再 `GetReplicaList`（授 lease + 取 id）。ABI / 真机见「A14 真机记录」。
+> `pin`：`exists` + `renew_once` + 二次 query（admin）；native 内再 `GetReplicaList`（授 lease + 取 id）。  
+> **A16**：上述续租路径（含 `GetReplicaList`）可打穿 demote 的 TTL 等待——前缀互斥另开 PR，见 `summary.md` A16；**本 soft pin PR 不修**。ABI / 真机见「A14 真机记录」。
 
 #### 限制、原因与 case
 
@@ -1038,7 +1039,7 @@ sequenceDiagram
 未覆盖：并发、End 失败注入；**A15 已改为 replica id 校验**（待本改 tip 真机复验 id 稳定性）。  
 单测：`pytest -k pin_soft`；CI 不编 `_empty_pin.so`，无 so 时相关测 skip。
 
-编号线索：R02 部分失败不回滚；R03 `put_step=1`；R04 ABI；A04 NoF；A15 见上（id 关闭）；A16 见 summary。
+编号线索：R02 部分失败不回滚；R03 `put_step=1`；R04 ABI；A04 NoF；A15 见上（id 关闭）；A16 见 summary（另开 PR，含 pin 的 GetReplicaList 续租）。
 
 #### soft pin 的其他方案
 

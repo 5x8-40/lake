@@ -73,7 +73,7 @@
 - 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。tasks 与 keepalive 有写入方。replicas 与 sessions 表在，还没有写入方。
 - 遗留（A06，归 E14）：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。promote 不发事件。
 - 协议：`SubmitIntent` 仍是前缀 × 目标实例；执行走 `PromoteFlow(target=)`（可提回 + copy）。move / pin / demote / remove 无独立 intent，不扩协议。
-- **A16（OPEN，上线前必修，不挡合入）**：同前缀未串行。demote 停保活后等 lease TTL 时，同前缀 `exists` / 预热 / `check_promote` / `promote` / **`pin(SOFT)` 的 `exists`+`renew_once`** 会授 lease，可打穿等待。修法：前缀级互斥。
+- **A16（OPEN，上线前必修，不挡合入；另开 PR，不在 soft pin #82 修）**：同前缀未串行。demote 停保活后等 lease TTL 时，同前缀任何**会授 lease** 的操作都能打穿等待——包括 `exists` / 预热 / `check_promote` / `promote` / **`pin(SOFT)` 的 `exists`+`renew_once`+native `GetReplicaList`**（replica-id 路径为取旧 id 也会续租）。修法：前缀级互斥（demote 等待窗内禁止同前缀续租类调用）。横切 L2/L3，单独 PR。
 - **A17（DEFER）**：操作粒度未统一——copy 核验在 `query_task`；demote sleep+盘核验在 L3；promote 等待在 L2 `PromoteFlow`；move/remove 未拆 flow。与 A16 不同项。TaskEngine 多 flow 分发一并 DEFER（当前 intent 仅一种语义，固定 `PromoteFlow`）。
 - locate：进程内「实例 → rank 有序段名单」。intent 和操作入参没有 segment。没登记的实例报错。
 - remove：**全局删所有副本，不支持 target**。无论 force 都先注销保活。`force=False` 再等满一个 lease TTL，然后 `batch_remove(..., force=False)`。`force=True` 注销保活后立刻 `batch_remove(..., force=True)`，不等；但它只跳过 lease，未完成副本和在途 copy/move 仍会拒删。失败或取消不把登记加回去，注销过就留注销，调用方自己重试，租约可以过期。
