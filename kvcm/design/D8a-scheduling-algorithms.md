@@ -409,6 +409,7 @@ break-even: μ × p0 × exp(−μT) × T_prefill = c_h × bytes
 ρ = λ / (c × μ)
 c_min = ceil(λ / (μ × ρ_target))
 L = λ × W                （Little 定律）
+# LLM 口径：W=TTLT（整系统）/ TTFT（首 token 段）/ TTLT−TTFT（decode 段）
 ```
 
 ![副本数与延迟](figures/algo-scaling-queue.svg)

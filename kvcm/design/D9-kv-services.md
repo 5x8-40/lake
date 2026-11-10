@@ -140,7 +140,11 @@ flowchart TB
 
 - working set、hot/warm/cold、HBM/DRAM/SSD 配比；
 - 池节点数按 working set / 单节点可用容量估算；
-- Little 定律：在途请求 ≈ QPS × 延迟；用它把 QPS/延迟换成并发，再除以单节点可用并发；
+- Little 定律：`TTFT` = 到首 token，`TTLT` = 到最后一个 token。
+  - 首 token 段并发 ≈ `req/s × TTFT`；
+  - decode 段并发 ≈ `req/s × (TTLT − TTFT)`；
+  - 整系统并发 ≈ `req/s × TTLT`。
+- 这三个数分别用于 P 池、D 池、整系统，不能混用；P 池更准确用“P 排队 + P prefill”。
 - 预热排期按 hook/热度/预算；
 - what-if：不同保留策略/配比下的命中率与成本。
 
