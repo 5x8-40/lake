@@ -313,8 +313,8 @@ sequenceDiagram
     G->>R: request + hook
     R->>W: Dispatch(node, mode)
 
-    Note over A,R: POST（会话后）
-    A->>G: pause / resume / close / branch
+    Note over A,R: POST（工具返回/会话后）
+    A->>G: tool_call / tool_return / pause / close / branch
     G->>R: hook
     R->>K: RETAIN / DEMOTE / RELEASE
 ```
@@ -324,9 +324,11 @@ sequenceDiagram
 | 字段 | 作用 | 约束 |
 |---|---|---|
 | `version` / `hook_id` | 兼容/幂等 | 未知版本只观察、不生效 |
+| `event` | PRE_ANNOUNCE / ATTACHED / TOOL_CALL / TOOL_RETURN / PAUSE / CLOSE / BRANCH | 未知事件只 observe |
 | `session_id` / `workflow_id` / `step` / `branch` | 会话/分支定位 | 与路由键对齐 |
 | `prefix`（token_ids 或 hash 链） | 要预取/保留的前缀 | 优先 hash；必须与引擎口径一致 |
 | `timing` / `eta_ms` / `expected_turns` / `reuse_prob` | 请求前/中/后；预计到达 | ETA 决定提前量 |
+| `tool_class` / `tool_eta_ms` / `tool_elapsed_ms` | 工具类型/预计/已等 | 用于 `P_return(T)` 和 TTL |
 | `retention` / `ttl_ms` / `prefetch` | 保留等级与生命周期 | TTL/pin 上限可裁剪 |
 | `affinity`（node/zone/strict） | 会话亲和 | strict 也不能违反容量/SLO |
 | `deadline` / `priority` | SLO/优先级 | 优先级只影响排队，不做准入 |
@@ -340,6 +342,8 @@ sequenceDiagram
 - **预算与审计**：每 session/租户有 pin/预取/带宽上限；hook 可审计。
 - **key 口径**：vLLM-Ascend 是链式 block hash（`parent_hash`、block_size、模型类型、初始种子参与），TP 下同一逻辑块多把 key。SC 必须用与引擎逐字节一致的 hash 算法；hook 优先带 hash/token_ids，不要用估算 token 数。
 - **不等待**：pre_announce 只影响未来；attached 请求走当前最优路径，不等 READY。
+- **`PAUSE` ≠ `SUSPEND`**：PAUSE 只保留 KV；SUSPEND 是工具等待的请求级动作。当前引擎没有 suspend API，首版只做 retain/降优先级；引擎支持后才释放 GPU 槽位。
+- **TTL 用 `P_return(T | tool_class, elapsed)`**：有工具历史就用分布，没有再用固定衰减；超时/长期无响应直接释放。
 
 ---
 

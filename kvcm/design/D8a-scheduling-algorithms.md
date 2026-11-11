@@ -390,11 +390,12 @@ C_occupancy = S_bytes × T × c_mem
 
 ```text
 Net(T) = p_resume(T) × T_prefill − c_h × S_bytes × T − C_risk
-p_resume(T) = p0 × exp(−μT)
-break-even: μ × p0 × exp(−μT) × T_prefill = c_h × S_bytes
+p_resume(T) ≈ P_return(T | tool_class, elapsed)   // 有工具历史就用这个
+p_resume(T) = p0 × exp(−μT)                       // 无历史时的默认
 ```
 
-- `p0`：会话恢复概率；`μ`：恢复概率衰减率；
+- `P_return(...)`：工具在 T 内返回的概率，来自 hook 的 `tool_class/eta` + 历史分布；
+- `p0`：无工具历史时的基础恢复概率；`μ`：默认衰减率；
 - `c_h`：每字节每秒的占用成本；
 - `C_risk`：迁移/违约/数据风险成本；
 - 解出的 `T*` 与 `T_max` 取小；解不出就退化为固定窗口。
@@ -776,6 +777,8 @@ ROI = saved / cost
 | `prefetch_hit_rate` / `waste_bytes` | 预取是否值 | 升/降；预取 |
 | `retention_hit_rate` / `wasted_retention` | 保留是否值 | 升/降；保留 |
 | `TTFT_p99` / `ITL_p99` | 用户感知 | 降；整体 |
+| `session_e2e_p99` / `resume_ttft` | 会话级体验 | 降；hook/保留 |
+| `tool_wait_ratio` / `session_success` | 工具等待与任务结果 | 降/升；SUSPEND/调度 |
 | `gpu_seconds_saved` / `cost_per_1k_tokens` | 成本 | 降；账本 |
 | `scale_ready_latency` / `warm_coverage` | 弹性 | 快/升；L2 |
 | `ghost_ratio` / `verify_miss_rate` | 索引可信度 | 降；对账 |

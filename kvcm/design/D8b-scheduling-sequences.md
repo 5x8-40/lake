@@ -103,7 +103,7 @@ sequenceDiagram
 
 ---
 
-## 4. L1：会话停顿 → 保留 → 恢复
+## 4. L1：工具等待 → 保留 → 恢复
 
 ```mermaid
 sequenceDiagram
@@ -112,11 +112,13 @@ sequenceDiagram
     participant K as kvcm
     participant W as 目标实例
 
-    A->>R: POST(pause, session S, eta)
-    R->>R: 计算保留价值
+    A->>R: TOOL_CALL / SUSPEND(S, eta, tool_class)
+    R->>R: 算保留价值 + 标记 suspended
     R->>K: RETAIN(S, TTL, class)
     K-->>R: ACCEPTED
-    A->>R: 恢复请求
+    Note over R,W: 引擎无 suspend API 时：只 retain/降优先级，不释放槽位
+    A->>R: TOOL_RETURN / RESUME(S)
+    R->>R: 检查 KVT / READY
     R->>W: Dispatch(B, mode)
     A->>R: POST(close, S)
     R->>K: RELEASE(S)
@@ -124,11 +126,10 @@ sequenceDiagram
 
 要点：
 
-- 默认软释放（停 keepalive），不是立即 Remove。
-- soft pin 是“有条件可用”：Case B、单 slice、key 存在、无盘副本；hard pin 不事后设置。
-- 保留有 TTL/字节上限；到期未用要能回收。
-
----
+- **`PAUSE` ≠ `SUSPEND`**：PAUSE 是会话级 KV 保留；SUSPEND 是工具等待的请求级动作。
+- 当前 vLLM-Ascend 没有现成的 request suspend/resume API；首版只做 `RETAIN + 降优先级`。引擎支持后，SUSPEND 才能释放 GPU 槽位/并发。
+- 工具返回前 `RESUME`：先看 KVT/READY，再重新入队；KV 不在就按普通请求重算/加载。
+- 默认软释放（停 keepalive），不是立即 Remove；保留有 TTL/字节上限。
 
 ## 5. L2：扩容 + 预热门控
 
