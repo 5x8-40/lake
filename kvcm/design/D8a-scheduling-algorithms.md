@@ -119,11 +119,16 @@ can_overlap 时：T_kv = max(T_compute(residual), T_transfer)
 
 layerwise 的本质是**牺牲算力利用率换更低的 TTFT/P99**：同一个 batch 里，长 KV 请求没到位，短 KV 请求也得等这一层，GPU 空转。
 
+layerwise 改变的是“加载和计算怎么重叠”，**不改变 residual 的大小**；residual 由命中长度决定。
+
 现代推理里“计算比传输快”不是固定结论：低命中/长 residual 时计算占大头，传输可以掩盖；高命中/短 residual 时计算被压掉，传输反而主导。是否掩盖必须按上下文、命中率、带宽算。
 
-在 layerwise 模式下：
+在 layerwise 模式下，看的是每层：
 
 ```text
+每层传输 = X_bytes / (L × BW)
+每层计算 = T_compute(residual) / L
+
 T_kv ≈ max(T_compute(residual), T_transfer)   # 有足够计算可掩盖
 T_kv ≈ T_compute(residual) + T_transfer       # 掩盖不了
 ```
@@ -147,7 +152,7 @@ T_kv ≈ T_transfer + queue
 按命中层级选 `T_kv`：
 
 - **miss（无命中）**：`T_kv = T_prefill`
-- **远端池命中**：layerwise 下 residual 小，每层计算时间短，通常没有足够计算去盖住传输，`T_kv ≈ T_transfer`；批量加载则本来就等传输
+- **远端池命中**：residual 通常小；在 layerwise 下，每层计算时间短，但每层传输量不变，通常没有足够计算去盖住传输，`T_kv ≈ T_transfer`；批量加载则本来就等传输
 - **本机 DRAM 命中**：`T_kv = T_h2d`（仍有，但没有跨机那一段）
 - **HBM/APC 命中**：`T_kv ≈ 0`；引擎仍会走自己的 connector/APC 查询，只是外部 KV 加载量为 0，不是“跳过 connector”
 
