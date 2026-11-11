@@ -148,6 +148,8 @@ flowchart TB
   - decode 段并发 ≈ `req/s × (TTLT − TTFT)`；
   - 整系统并发 ≈ `req/s × TTLT`。
 - 这三个数分别用于 P 段、D 段、整系统，不能混用。P 段用 **P 侧 TTFT**（P 排队 + P prefill 已经包含在 TTFT 里，不能再加一遍）。
+- P/D 两池分开算容量，P:D 比例按负载调；
+- warm pool（已加载权重、未预热 KV）的空闲成本要单独算，和冷启动损失比较；
 - 预热排期按 hook/热度/预算；
 - what-if：不同保留策略/配比下的命中率与成本。
 

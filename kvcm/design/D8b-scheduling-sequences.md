@@ -158,6 +158,7 @@ sequenceDiagram
 要点：
 
 - 预热门控的覆盖率按“本机 DRAM 已确认”算；HBM 覆盖是加分项，不是 Ready 的必要条件。
+- 先看 warm pool（已加载权重、未预热 KV）；没有匹配模型再 provision。P/D 两池分开扩，比例按负载调。
 - 新节点 warming 期间不接/低权重接流量。
 - `T_ready` 的目标由 SLO/部署决定；本文不设固定秒数。
 
