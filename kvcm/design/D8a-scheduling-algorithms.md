@@ -319,6 +319,8 @@ layerwise：
 
 选路时要先知道部署模式：批量加载按加法，layerwise 才判断能否取 max。同一个请求，走节点 A 可能能掩盖（A 带宽高），走节点 B 不能。
 
+如果 KV 和集合通信共用一张网，还要加 `network_headroom`：余量低时，即使平均带宽够，也会让算子等。
+
 ### 3.3 决策流程
 
 ```mermaid
@@ -371,6 +373,8 @@ C_occupancy = S_bytes × T × c_mem
 不做背包/组合优化。按 `EV_i / bytes_i` 从高到低选，超过字节预算或带宽预算就停。
 
 理由很实际：预取的 `EV` 本身是估计，误差远大于“背包最优解”能带来的收益；在线系统要的是可解释、可增量更新，不是解一个整数规划。
+
+传输要分级：`demand load > prefetch > migration`。prefetch/migration 遇到集合通信高峰应让路或暂停，不能把算子网络打满。
 
 ### 4.3 EV 曲线
 
@@ -780,6 +784,9 @@ ROI = saved / cost
 | `retention_hit_rate` / `wasted_retention` | 保留是否值 | 升/降；保留 |
 | `TTFT_p99` / `ITL_p99` | 用户感知 | 降；整体 |
 | `session_e2e_p99` / `resume_ttft` | 会话级体验 | 降；hook/保留 |
+| `effective_hit_tokens` / `residual` | 命中是否真的省算 | 升/降；KVT/放置 |
+| `operator_bubble_ratio` / `kv_stall_ratio` | 算子空泡/等 KV | 降；预取/限速/错峰 |
+| `network_headroom`（H2D/存储/计算） | 是否和集合通信抢网 | 升；选点/限速 |
 | `tool_wait_ratio` / `session_success` | 工具等待与任务结果 | 降/升；SUSPEND/调度 |
 | `gpu_seconds_saved` / `cost_per_1k_tokens` | 成本 | 降；账本 |
 | `scale_ready_latency` / `warm_coverage` | 弹性 | 快/升；L2 |
