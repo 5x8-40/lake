@@ -641,10 +641,10 @@ L2 更新权重；L0/L1 只读：
 
 ### 6.7 SSD 层：promote 与直读怎么选
 
-先核实现状：Mooncake/vLLM 的本地盘读不是 SSD 直接进引擎 HBM。vLLM connector 有 `disk_offload_buffer_budget_bytes` / staging buffer，Mooncake `LOCAL_DISK` 走 offload RPC（`real_client.cpp` 注释也写明 LOCAL_DISK 必须走 offload RPC）。所以：
+先核实现状：Mooncake/vLLM 的 **LOCAL_DISK / 本地盘**读不是 SSD 直接进引擎 HBM。vLLM connector 有 `disk_offload_buffer_budget_bytes` / staging buffer，Mooncake `LOCAL_DISK` 走 offload RPC（`real_client.cpp` 注释也写明 LOCAL_DISK 必须走 offload RPC）。DISK/DFS 路径另算，不能套这段。所以：
 
 ```text
-SSD 读 ≈ 盘读 + host staging + 再进引擎
+LOCAL_DISK 读 ≈ 盘读 + host staging + 再进引擎
 ```
 
 这意味着 **promote（SSD→DRAM）很重要**，但它和“直接读”是两条不同路径：
@@ -776,6 +776,8 @@ ROI = saved / cost
 ---
 
 ### 8.4 观测指标
+
+> 以下是观测口径；除明确标“实测”的，数值/阈值待 A5 实测。
 
 | 指标 | 回答 | 方向/来源 |
 |---|---|---|

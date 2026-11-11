@@ -229,6 +229,7 @@ flowchart TB
 | Drain | 迁移完成率、命中率下降 | 迁移字节/带宽 + 任务/并发 + 核验 | 缩容不丢热 KV |
 | 治理 | pin 超限、误删、审计覆盖 | 配额/TTL/命名空间/审计 | 滥用可发现、误删 0 |
 | 回放 | 回放偏差、策略对比 | 决策日志 + 反事实重放 | 调参可回归 |
+| 网络/空泡 | `operator_bubble_ratio`、`kv_stall_ratio`、`network_headroom` | 按 step/layer 采样；区分 H2D/存储/计算面 | 确认“省了 KV 钱但算子变慢”没有发生 |
 
 ---
 
