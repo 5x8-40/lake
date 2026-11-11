@@ -281,7 +281,7 @@ D9 的能力都依赖具体机制。**事实写在各处，本文不重复**：
 | 容量建议 | Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler；Mooncake 容量/水位 | 扩缩算法、指标源、目标副本数 | 池侧 KV footprint/tier mix/容量建议；和 D8 决策接口对齐 |
 | 下线搬迁 | Mooncake `CreateDrainJob`、`CancelDrainJob`；K8s drain | seg 级搬迁、job 级取消 | 与 D8 摘流/选缩容节点联动；session-aware；搬完 verify |
 | 保留/删除规则 | Mooncake pin/lease/tenant quota；K8s ResourceQuota | 单 key/tenant 的容量与租约 | 跨模型保留策略、pin 预算、删除审计、ROI 约束 |
-| 历史回放 | 没有 turnkey；trace + 模拟器自建 | 事件/指标存储 | 决策日志 schema、反事实重放、策略版本对比 |
+| 历史回放 | 没有现成实现；trace + 模拟器自建 | 事件/指标存储 | 决策日志 schema、反事实重放、策略版本对比 |
 
 ### 8.2 关键代码锚点
 

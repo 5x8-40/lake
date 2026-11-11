@@ -55,11 +55,11 @@ flowchart TB
 | 链式 block hash / 前缀匹配 | vLLM `hash_block_tokens`；SGLang/AIBrix/llm-d 都有 | 保持 hash/block size 口径；接池事件 |
 | 事件索引 / gap replay | llm-d EPP、Dynamo kv-router、AIBrix kvevent、Conductor | 加池 master/READY 事实 |
 | 推测索引 | llm-d `SpeculativeTier` / `PreRequest` | TTL 按实际事件延迟校准 |
-| 多源合并 / source rank / 墓碑 | 部分有 gap replay，没有 turnkey | 自己写胶水，不是发明新索引 |
+| 多源合并 / source rank / 墓碑 | 部分有 gap replay，没有现成实现 | 自己写胶水，不是发明新索引 |
 | 请求打分 | AIBrix 可组合 scorer；Dynamo cost 函数 | 加池侧放置/实例选择 |
 | 扩缩 | Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler | 池容量/副本事实 |
 | copy/move/retain | Mooncake 原语 | 放置决策自己写 |
-| 预取/保留收益 | 无 turnkey | 自己算 EV/TTL |
+| 预取/保留收益 | 没有现成实现 | 自己算 EV/TTL |
 | 幂等 / HA | 部分原语 | 自己补决策日志/恢复 |
 
 参考：[实例级路由调研](../../docs/research/model-routing/instance-level.md)、[模型级路由调研](../../docs/research/model-routing.md)。
@@ -95,7 +95,7 @@ flowchart TB
 
 `v_prefill` 不能当常数：attention 是 O(P²)，长上下文下每 token 的 prefill 成本上升；命中率高时 residual 虽小，仍要 attend 全部缓存 KV，同样不是常数。校准必须按实际上下文长度分档。
 
-收益拆成四段：
+总代价拆成三段：
 
 ```text
 T_total ≈ Q + T_kv + T_h2d
@@ -147,9 +147,9 @@ T_kv ≈ T_transfer + queue
 按命中层级选 `T_kv`：
 
 - **miss（无命中）**：`T_kv = T_prefill`
-- **远端池命中**：layerwise 下残差小，通常掩盖不了，`T_kv ≈ T_transfer`；批量加载则本来就等传输
+- **远端池命中**：layerwise 下 residual 小，每层计算时间短，通常没有足够计算去盖住传输，`T_kv ≈ T_transfer`；批量加载则本来就等传输
 - **本机 DRAM 命中**：`T_kv = T_h2d`（仍有，但没有跨机那一段）
-- **HBM 命中**：`T_kv ≈ 0`
+- **HBM/APC 命中**：`T_kv ≈ 0`；引擎仍会走自己的 connector/APC 查询，只是外部 KV 加载量为 0，不是“跳过 connector”
 
 ---
 
@@ -196,7 +196,7 @@ hit_tokens = contiguous_blocks × B
 
 ### 2.3 多源合并：source rank + seq + 墓碑
 
-这部分**没有 turnkey**：gap replay 可以复用，`source rank + 墓碑 + 置信度` 是我们要写的胶水，不是发明新索引。
+这部分**没有现成实现**：gap replay 可以复用，`source rank + 墓碑 + 置信度` 是我们要写的胶水，不是发明新索引。
 
 ```mermaid
 flowchart TB
@@ -312,7 +312,7 @@ layerwise：
 flowchart TB
     S["请求 + Hook"] --> M["KVT.Match 逐候选"]
     M --> H{"连续 HBM 命中够?<br/>置信度够?"}
-    H -->|"是"| HB["HBM 命中<br/>跳过池加载<br/>只算剩余 token"]
+    H -->|"是"| HB["HBM/APC 命中<br/>KV 已在 HBM<br/>只算剩余 token"]
     H -->|"否"| P{"mode = policy(请求类型, 模型部署)"}
     P -->|"agent/长上下文"| PD["PD 分离"]
     P -->|"模型仅混部"| CO["混部"]

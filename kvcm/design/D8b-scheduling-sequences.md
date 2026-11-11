@@ -64,7 +64,7 @@ sequenceDiagram
 flowchart TB
     S["请求"] --> H["KVT.Match"]
     H --> D{"连续 HBM 已确认命中 ≥ 阈值<br/>且置信度 ≥ 0.9?"}
-    D -->|"是"| HB["HBM 命中<br/>跳过池加载<br/>只算剩余 token"]
+    D -->|"是"| HB["HBM/APC 命中<br/>KV 已在 HBM<br/>只算剩余 token"]
     D -->|"否"| M{"按请求类型/模型部署选 mode"}
     M -->|"agent / 长上下文（PD 部署）"| PD["PD 分离"]
     M -->|"模型只有混部"| CO["混部"]
@@ -75,7 +75,7 @@ flowchart TB
 
 注意：
 
-- **HBM 命中 = 前缀已在 HBM：跳过池加载，只计算剩余 token。**
+- **HBM/APC 命中 = 前缀已在 HBM：引擎仍走 connector/APC 查询，但外部 KV 加载量为 0，只计算剩余 token。**
 - PD 不是“拓扑可用”的运行时开关，而是 **`policy(请求类型, 模型部署)`**：agent/长上下文默认 PD；模型只有混部部署时才混部。
 - `BW*` 只用于“传 vs 算/能否掩盖”，不是 PD 开关。
 - kvcm READY 只说明本机 DRAM 有副本，不能直接让 L0 认定 HBM 命中。
@@ -265,7 +265,7 @@ sequenceDiagram
 
     A->>G: 恢复请求
     G->>R: request
-    R->>W: Dispatch(B, mode；HBM 命中则跳过池加载)
+    R->>W: Dispatch(B, mode；HBM 命中则外部加载≈0)
 ```
 
 ---
