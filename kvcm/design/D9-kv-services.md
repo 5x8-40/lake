@@ -139,6 +139,8 @@ flowchart TB
 **怎么做**：
 
 - working set、hot/warm/cold、HBM/DRAM/SSD 配比；
+- SSD 不是 HBM 直连：直读要 staging，大 KV 分批；热前缀 promote 到 DRAM，会占 DRAM 容量；
+- 容量建议要同时给 SSD 容量、staging buffer、DRAM promote cache、写预算/DWPD；
 - 池节点数按 working set / 单节点可用容量估算；
 - Little 定律：`TTFT` = 到首 token，`TTLT` = 到最后一个 token。
   - 首 token 段并发 ≈ `req/s × TTFT`；

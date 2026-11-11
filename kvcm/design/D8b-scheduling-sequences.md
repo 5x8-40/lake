@@ -210,6 +210,8 @@ sequenceDiagram
     end
 ```
 
+池压时先分冷热：冷前缀 `DEMOTE`；热前缀优先 `PROMOTE` 到 DRAM 或 `copy` 到低水位实例，不能一律降层。
+
 ---
 
 ## 8. 失败：ghost / miss 反馈

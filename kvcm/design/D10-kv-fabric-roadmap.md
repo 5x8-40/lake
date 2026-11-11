@@ -107,7 +107,9 @@ flowchart TB
 | **D. 容量数字孪生** | 用历史 trace 模拟容量/配比/硬件；采购前 what-if | 基础设施/采购 | 少买/少闲置、容量预测误差 | 6–18 月 |
 | **E. KV HA / 热备 / DR** | 预复制热前缀到备用实例；故障快速接管；跨 AZ | SRE/平台 | MTTR、可用性、恢复命中率 | 6–18 月 |
 | **F. 跨集群 KV Fabric** | 跨集群/地域复制热前缀；follow-the-sun；数据驻留 | 全球化平台 | 跨区 TTFT、合规、DR | 1–3 年 |
-| **G. KV 存储效率** | 去重/压缩/量化/分层；共享 system prompt/tools | 平台/基础设施 | 每 GB 有效 KV、HBM 占用 | 1–3 年 |
+| **G. KV 存储效率** | 去重/压缩/量化/分层；SSD 性能层 + promote；共享 system prompt/tools | 平台/基础设施 | 每 GB 有效 KV、HBM 占用 | 1–3 年 |
+
+SSD 不是冷备，是性能层：直读仍经 staging，热前缀 promote 到 DRAM，写寿命/DWPD 是约束。
 
 产品化不改变应用契约：应用仍然只发 text/messages；KV 句柄、`kv://`、应用订阅都不做。
 
