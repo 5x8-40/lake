@@ -422,7 +422,9 @@ c_min ≈ ceil(λ / (μ × ρ_target))
 
 ### 6.2 双环控制
 
-扩缩控制可复用 Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler；我们补的是池容量/副本事实和 KV 价值项。
+扩缩控制可复用 Dynamo Planner、llm-d WVA、AIBrix PodAutoscaler；我们补的是池容量/副本事实和 KV 价值。
+
+“KV 价值”不是新指标：一段 KV 未来被复用的概率 × 省下的重算/传输时间，减去保留/复制成本。它用于决定扩不扩、留几份、TTL 多长；具体计算见 §4/§5。
 
 ```mermaid
 flowchart TB
@@ -457,7 +459,7 @@ route_weight = min(1, coverage / W_min)
 
 ```mermaid
 sequenceDiagram
-    participant L2 as D8
+    participant L2 as SC L2
     participant O as 编排
     participant N as 新实例
     participant K as kvcm
@@ -475,30 +477,23 @@ sequenceDiagram
 
 **收益**：新节点不是“起来就接流量”，避免冷 miss 和 TTFT 抖动。
 
-### 6.4 按 KV 价值选缩容节点
+### 6.4 缩容选节点
 
-`loss` = 缩掉它损失的 KV/SLO/迁移成本；`gain` = 释放出的容量价值；选 `gain − loss` 最大的节点。
+目标：缩掉一个节点，但不要把它上面的热 KV 或活跃会话一起弄没。
 
-其中 `uniqueHotKV` = 只有该节点持有的热 KV；`refill` = 重建这些 KV 的代价；`sessionRisk` = 活跃/待恢复会话的风险；`migrationCost` = 搬走要花的字节/时间；`idleCapacity` = 可释放的空闲容量；`c_capacity` = 单位容量价值。
+对每个候选节点看两件事：
 
-```text
-loss(v) = uniqueHotKV(v) × refill
-        + sessionRisk(v)
-        + migrationCost(v)
-gain(v) = idleCapacity(v) × c_capacity
-choose max(gain − loss)
-```
+- **释放收益**：空出来的容量值多少；
+- **损失**：只有它有、别处没有的热 KV 要重建的代价；活跃/待恢复会话的风险；把 KV 搬走要花的传输时间。
 
-```mermaid
-flowchart LR
-    V["候选缩容节点"] --> S{"有活跃会话?"}
-    S -->|"是"| KEEP["保留/换节点"]
-    S -->|"否"| H{"有唯一热 KV?"}
-    H -->|"是"| MOVE["move/retain 后缩"]
-    H -->|"否"| DRAIN["下线"]
-```
+决策顺序：
 
-**收益**：不用 LIFO，避免缩掉持有热前缀/活跃会话的节点。
+1. 有活跃会话或唯一热 KV → 不直接关，先 `move`/`retain` 或换节点；
+2. 没有这两种风险 → 直接 `drain`；
+3. 有风险但搬走成本低于保留成本 → 先搬后缩；
+4. 搬走太贵或会伤 SLO → 保留，下个周期再看。
+
+不用 LIFO；核心是“先保命，再算账”。
 
 ### 6.5 热点前缀多副本与迁移（负载整形）
 
@@ -524,8 +519,10 @@ flowchart LR
 
 #### 算法
 
-1. **检测热点**：按前缀聚合 `λ_p`（EWMA 请求率）、队列、p99 TTFT、当前副本集合 `R_p`。
-2. **算目标副本数**：
+**第一步：检测热点，算目标副本数。**
+
+1. 按前缀聚合 `λ_p`（EWMA 请求率）、队列、p99 TTFT、当前副本集合 `R_p`，并看源实例水位。
+2. 目标副本数：
 
 ```text
 r_target = ceil(λ_p / (μ_p × ρ_target))
@@ -533,7 +530,17 @@ r_target = ceil(λ_p / (μ_p × ρ_target))
 
 `μ_p` 是该前缀在单实例上的服务能力（req/s），`ρ_target` 是目标利用率。`r_target` 只是下界，实际还要看容量、内存、网络。
 
-3. **加副本**：若 `|R_p| < r_target`，且
+**第二步：按情况选动作。** 这些动作不是固定顺序，按触发条件走：
+
+| 动作 | 触发 | 做法 |
+|---|---|---|
+| **加副本 / 选目标** | 副本数 < r_target，且收益 > 成本 | 选低水位、不同故障域、seg 容量够的实例；`copy` 到目标，路由分流 |
+| **防驱逐** | 源实例水位高，且这段前缀热 | 在源被 LRU 驱逐前，`copy` 到低水位实例；新请求路由到新副本。源仍可能驱逐，不承诺“永久保住” |
+| **减副本** | 副本数 > r_target，且没有会话引用/保留 TTL | 释放多余副本；至少留一份 |
+| **迁移** | 节点 drain、故障、拓扑变化 | 用 `move`；负载分散优先 `copy`，源保留 |
+| **回写** | copy/move READY | 更新 KVT；路由在副本集合内按“队列 + 传输 + 会话亲和”选点 |
+
+加副本/防驱逐的收益判断：
 
 ```text
 Benefit = λ_p × (W_single − W_multi) × c_slo
@@ -541,11 +548,7 @@ Cost    = (|R_p| − 1) × S_bytes × c_mem × T
         + copy_bytes / BW × c_bw
 ```
 
-其中 `W_single` / `W_multi` 是单副本 / 多副本下的排队+传输时延，`T` 是观察窗口。`Benefit > Cost` 才复制；否则宁可排队/扩容，或路由到其他副本。
-4. **选目标**：按 `headroom − queue − transfer_cost + topology_bonus` 选实例；避免同一故障域；目标 seg 容量不足不提交（PR72）。
-5. **减副本**：`|R_p| > r_target` 且没有会话引用/保留 TTL，释放多余副本；保留至少一份。
-6. **迁移**：节点 drain、故障、拓扑变化时用 `move`；负载分散优先用 `copy`（源保留，多副本分流）。
-7. **回写**：copy/move READY 后更新 KVT；路由在副本集合内按“队列 + 传输 + 会话亲和”选点。
+`W_single` / `W_multi` 是单副本 / 多副本下的排队+传输时延，`T` 是观察窗口。`Benefit > Cost` 才复制；否则排队、扩容，或路由到其他副本。
 
 #### copy / move / retain 的分工
 
@@ -725,7 +728,7 @@ ROI = saved / cost
 | **Little 定律 + 利用率目标** | 扩缩只看队列会滞后 | `L=λW`、`ρ=λ/(cμ)`、`c_min` | 容量有公式、可解释 | 突发/长尾需快环 |
 | **双环控制 + 滞回/冷却** | 扩缩振荡 | 慢环定下限、快环 ±1；cooldown > ready+warm+drain | 少抖动、少反复扩缩 | 参数需调 |
 | **预热门控覆盖率** | 新节点没 KV 就接流量 | 加权“已确认”比例；未达标低权重 | 减少冷 miss | 会延迟新节点接流 |
-| **按 KV 价值选缩容节点** | LIFO 缩掉热节点 | `loss/gain` 比较唯一热 KV、会话风险、迁移成本 | 缩容不砸命中率 | 需要 KVT/会话视图 |
+| **按 KV 价值选缩容节点** | LIFO 缩掉热节点 | 比较释放收益与唯一热 KV/会话/迁移损失 | 缩容不砸命中率 | 需要 KVT/会话视图 |
 | **资源权重/分解** | 三环各自为政 | L2 出权重，L0/L1 局部最优 | 联合但不做全局在线优化 | 权重更新需稳定 |
 | **幂等 + 决策日志/回放** | 重复 intent、事故难复盘、参数不敢调 | 幂等键；记录输入/候选/权重/选择/版本 | 不重复搬、可复盘、可 A/B | 需要 schema/日志成本 |
 
