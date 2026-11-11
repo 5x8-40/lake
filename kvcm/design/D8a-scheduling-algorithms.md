@@ -163,7 +163,7 @@ T_kv ≈ T_transfer + queue
 - **本机 DRAM 命中**：`T_kv = T_h2d`（仍有，但没有跨机那一段）
 - **SSD 直接读**：`T_kv ≈ T_ssd_direct`；不建 Mooncake DRAM 池副本，但仍有 host staging buffer
 - **SSD promote**：第一次 `T_kv ≈ T_ssd_promote + T_h2d`；之后走本机 DRAM `T_h2d`
-- **HBM 预取（预热动作）**：引擎 API/壳请求把 KV 预热到 HBM；预取成本 ≈ `T_h2d` + 引擎队列，控制面不能直接写 HBM；预取完成后请求命中 HBM，`T_kv ≈ 0`
+- **HBM 预取（预热动作）**：引擎 API/壳请求把 KV 预热到 HBM；预取成本 ≈ `T_h2d` + 引擎队列，控制面不能直接写 HBM；预取完成后且未被驱逐，请求命中 HBM，`T_kv ≈ 0`；被驱逐则按 miss/DRAM 路径走
 - **HBM/APC 命中**：`T_kv ≈ 0`；引擎仍会走自己的 connector/APC 查询，只是外部 KV 加载量为 0，不是“跳过 connector”
 
 ---
@@ -929,9 +929,15 @@ BW* = X_bytes×c_bw / (residual×c_prefill)
 P_use = 1 − exp(−∫λ)
 EV = P_use×S_saved − C_copy − C_occupancy
 
+# SSD
+T_ssd_direct = T_disk + T_stage + T_h2d
+T_ssd_promote = T_disk + T_stage + T_dram_write + verify
+首次请求 = T_ssd_promote + T_h2d
+
 # 保留
-Net(T) = p0×exp(−μT)×T_prefill − c_h×S_bytes×T − C_risk
-break-even: μ×p0×exp(−μT)×T_prefill = c_h×S_bytes
+p_resume(T) ≈ P_return(T | tool_class, elapsed)
+fallback: p0×exp(−μT)
+Net(T) = p_resume(T)×T_prefill − c_h×S_bytes×T − C_risk
 
 # 容量
 ρ = λ/(c×μ); c_min = ceil(λ/(μ×ρ_target)); L = λ×W

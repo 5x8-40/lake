@@ -119,7 +119,6 @@ flowchart TB
 
 - 记录 intent、copy/move、bytes、耗时、READY/FAILED、保留 TTL、命中结果；
 - 会话侧补 `session_e2e`、`resume_ttft`、`tool_wait`、`session_success`，用于判断“省了 KV 钱，但会话变慢/失败”的情况；
-- 网络/空泡补 `operator_bubble_ratio`、`kv_stall_ratio`、`network_headroom`，按 step/layer 采样并区分 H2D/存储/计算面；
 - 归因：`hit = engine_apc + local_pool + remote_pool + prewarm + retain`；
 - ROI：`saved / cost`；浪费：预取未用、保留未恢复、迁移失败；
 - 成本：GPU 时间、带宽、驻留字节。
@@ -133,6 +132,12 @@ flowchart TB
 - 账本是“事实 + 口径”，不是财务系统。
 
 **验收**：每个会话/租户/模型能算 ROI；预取/保留的浪费可定位；账本与 D8 决策可对上。
+
+**运行观测（不是账本字段）**：
+
+- `operator_bubble_ratio`：算子空泡；
+- `kv_stall_ratio`：等 KV；
+- `network_headroom`：H2D/存储/计算三平面的余量。
 
 ### 4.3 容量规划建议
 
