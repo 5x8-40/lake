@@ -84,7 +84,12 @@ flowchart TB
 | `BW_copy` | copy/预取的有效带宽 |
 | `T_transfer` | 跨机传输 = `S_bytes / BW_storage` 或 `BW_compute`；950 跨机待测，A3 ROCE 参考约 23.8GB/s |
 | `T_h2d` | 本机 DRAM→HBM 拷贝 = `S_bytes / BW_h2d`；950 单机 UB_CTP≈46.9GB/s、POD≈93.4GB/s（两种场景）；800Gbps 是链路口径 |
-| `T_ssd` | SSD/本地盘读，经 staging 到引擎；当前不是 SSD→HBM 直连，见 §6.7 |
+| `T_disk` | SSD 原始读时间 = `S_bytes / BW_ssd` |
+| `T_dram_write` | DRAM 写时间 = `S_bytes / BW_dram_write` |
+| `B_stage_usable` | staging buffer 可用字节（默认约 1.25GiB，按比例可用） |
+| `T_ssd_direct` | SSD 直接 offload 读：盘读 + staging + H2D，不建 DRAM 池副本 |
+| `T_ssd_promote` | promote 建立 DRAM 副本：盘读 + staging + DRAM 写 + verify；不含 H2D |
+| `T_stage` | host staging buffer 的搬运时间；默认 buffer ≈1.25GiB，大 KV 要分批 |
 | `T_handoff` | PD/实例交接、首 token 固定开销（秒） |
 | `Q` | 队列等待 |
 | `D` | TTFT 目标 |
@@ -155,7 +160,8 @@ T_kv ≈ T_transfer + queue
 - **miss（无命中）**：`T_kv = T_prefill`
 - **远端池命中**：residual 通常小；在 layerwise 下，每层计算时间短，但每层传输量不变，通常没有足够计算去盖住传输，`T_kv ≈ T_transfer`；批量加载则本来就等传输
 - **本机 DRAM 命中**：`T_kv = T_h2d`（仍有，但没有跨机那一段）
-- **SSD/本地盘命中**：`T_kv ≈ T_ssd + T_h2d`；当前路径要经 staging buffer，不能直接进 HBM
+- **SSD 直接读**：`T_kv ≈ T_ssd_direct`；不建 Mooncake DRAM 池副本，但仍有 host staging buffer
+- **SSD promote**：第一次 `T_kv ≈ T_ssd_promote + T_h2d`；之后走本机 DRAM `T_h2d`
 - **HBM/APC 命中**：`T_kv ≈ 0`；引擎仍会走自己的 connector/APC 查询，只是外部 KV 加载量为 0，不是“跳过 connector”
 
 ---
@@ -629,25 +635,35 @@ L2 更新权重；L0/L1 只读：
 先核实现状：Mooncake/vLLM 的本地盘读不是 SSD 直接进引擎 HBM。vLLM connector 有 `disk_offload_buffer_budget_bytes` / staging buffer，Mooncake `LOCAL_DISK` 走 offload RPC（`real_client.cpp` 注释也写明 LOCAL_DISK 必须走 offload RPC）。所以：
 
 ```text
-SSD 读 ≈ 盘读 + staging 到主机/DRAM + 再进引擎
+SSD 读 ≈ 盘读 + host staging + 再进引擎
 ```
 
-这意味着 **promote（SSD→DRAM）很重要**，但不是所有场景都值得 promote：
+这意味着 **promote（SSD→DRAM）很重要**，但它和“直接读”是两条不同路径：
+
+| | **直接 offload 读** | **promote 到 DRAM** |
+|---|---|---|
+| 是否建 Mooncake DRAM 池副本 | **不建** | **建** |
+| host staging | 每次都要 | 一次 |
+| 后续请求 | 再读 SSD + staging | 本机 DRAM，走 `T_h2d` |
+| 适合 | 一次性 / 冷 / 低复用 | 热前缀 / 高复用 |
+| 成本 | `T_ssd_direct = T_disk + T_stage + T_h2d` | `T_ssd_promote = T_disk + T_stage + T_dram_write + verify`；首次请求再加 `T_h2d` |
+
+所以：
+
+- **直接读**：不占 DRAM 池，但每次付 SSD + staging；
+- **promote**：占 DRAM 池，第一次付 SSD + staging + DRAM 写，之后省 SSD/staging；
+- 预期复用次数够多才 promote，否则直接读更便宜。
+
+场景表：
 
 | 场景 | 选择 | 原因 |
 |---|---|---|
-| 同一热前缀反复读 | `promote` 到 DRAM，路由本地 | 一次 promote，后续省 SSD 读 + staging + H2D |
-| 一次性/冷前缀 | 直接 SSD offload 读 | 不占 DRAM，不写盘 |
+| 同一热前缀反复读 | `promote` 到 DRAM | 一次搬运，后续省 SSD 读 + staging + H2D |
+| 一次性/冷前缀 | 直接 SSD offload 读 | 不占 DRAM 池，不写盘 |
 | 活跃写会话 | 留 DRAM | 避免反复 demote/promote，省 SSD 寿命 |
 | 源实例水位高 | `copy` 到低水位 DRAM，必要时 `demote` | 防驱逐；`copy/move` 不能直接把 SSD 当目标 |
 
-`promote` 的成本：
-
-```text
-T_promote ≈ S_bytes / BW_ssd + S_bytes / BW_dram_write + verify
-```
-
-只有预期复用次数足够多，promote 才划算；否则直读更便宜。
+staging 默认约 1.25GiB；`S_bytes` 超过它时按 `ceil(S_bytes / B_stage_usable)` 分批，不能假设一次搬完。当前路径没有 GPUDirect Storage，staging 是实打实的一跳。
 
 两个边界：
 
@@ -779,7 +795,7 @@ ROI = saved / cost
 | **传 vs 算阈值 `BW*`** | 远端命中是否值得传 | `BW* = X_bytes·c_bw/(residual·c_prefill)` | 避免“为了省重算反而更慢” | 带宽要有效测量 |
 | **预取收益 + 预算分配** | 预取可能白做 | 按 `P_use` 估收益；按每字节收益贪心，不超预算 | 预取 ROI 可控；带宽不被打爆 | ETA/复用率是估计 |
 | **保留 TTL 盈亏平衡** | 保留太久浪费内存 | `p_resume(T)·S` vs 占用成本；指数衰减求 break-even | 会话保留可量化 | 恢复概率难估 |
-| **SSD 分层 / promote** | SSD 不能直连 HBM | 热的 promote 到 DRAM，冷/一次性直读；算 write budget | 省 DRAM、稳 TTFT | SSD 延迟/寿命要实测 |
+| **SSD 直接读 vs promote** | SSD 不能直连 HBM | 冷的直接 offload 读；热的 promote 到 DRAM；算 staging/write budget | 省 DRAM、稳 TTFT | SSD 延迟/寿命要实测 |
 | **Little 定律 + 利用率目标** | 扩缩只看队列会滞后 | `L=λW`、`ρ=λ/(cμ)`、`c_min` | 容量有公式、可解释 | 突发/长尾需快环 |
 | **双环控制 + 滞回/冷却** | 扩缩振荡 | 慢环定下限、快环 ±1；cooldown > ready+warm+drain | 少抖动、少反复扩缩 | 参数需调 |
 | **预热门控覆盖率** | 新节点没 KV 就接流量 | 加权“已确认”比例；未达标低权重 | 减少冷 miss | 会延迟新节点接流 |
