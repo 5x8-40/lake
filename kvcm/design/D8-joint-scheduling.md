@@ -386,6 +386,7 @@ stateDiagram-v2
 |---|---|---|---|
 | keepalive | 会话活跃/保留 | 周期续租（有界） | lease TTL 的 1/3 左右 |
 | prefetch | hook/预测 | copy 到目标实例的本机 DRAM | 后台带宽 <10%；按每字节期望收益排序 |
+| hbm_prefetch | 请求即将到达，且 HBM 余量足 | 引擎 API / 壳请求把 KV 预热到 HBM | 需要引擎支持；控制面只发 intent，不能直接写 HBM |
 | retain | 停顿/长会话 | soft pin（设计；后续 PR）或 lease 延长 | TTL/字节上限 |
 | promote | 只剩盘副本且预期复用 | 池 promotion 或读删写 | 触发式，非确定 |
 | demote | 冷/水位高 | 停保活 + 等驱逐/落盘 | 写回模式时机不可控 |
@@ -393,6 +394,8 @@ stateDiagram-v2
 | move | 节点下线/迁移 | 指定源→目标 | 源在线；无取消 |
 
 预取的价值（`P_use`、`EV`）、保留的盈亏平衡（`Net(T)`）与预算约束，见 [D8a §4–§5](D8a-scheduling-algorithms.md)。
+
+HBM 预取不是 `copy`：它要引擎/connector 提供入口，或走壳请求；控制面只能发意图，不能写 HBM。预取前要看 HBM 余量和是否挤掉更热的 APC。
 
 ### 5.3 L2 容量环（5–60s）
 

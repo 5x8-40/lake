@@ -99,7 +99,7 @@ sequenceDiagram
 
 - D8b 只画 SC↔kvcm 接口；`create_copy_task`、copy、verify 等控制面内部步骤见 D9/D2。
 - READY 是 **DRAM tier**，不是 HBM；第一次请求仍从 DRAM 读进 HBM。
-- 要 HBM 副本，走方案 A 壳请求或引擎自己的加载/APC。
+- 要 HBM 副本，走方案 A 壳请求或引擎自己的加载/APC；HBM 预取不是 kvcm `copy`，控制面只发 intent。
 
 ---
 

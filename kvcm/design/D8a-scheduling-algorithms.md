@@ -162,6 +162,7 @@ T_kv ≈ T_transfer + queue
 - **本机 DRAM 命中**：`T_kv = T_h2d`（仍有，但没有跨机那一段）
 - **SSD 直接读**：`T_kv ≈ T_ssd_direct`；不建 Mooncake DRAM 池副本，但仍有 host staging buffer
 - **SSD promote**：第一次 `T_kv ≈ T_ssd_promote + T_h2d`；之后走本机 DRAM `T_h2d`
+- **HBM 预取**：引擎 API/壳请求把 KV 预热到 HBM；`T_kv ≈ T_h2d` + 引擎队列，控制面不能直接写 HBM
 - **HBM/APC 命中**：`T_kv ≈ 0`；引擎仍会走自己的 connector/APC 查询，只是外部 KV 加载量为 0，不是“跳过 connector”
 
 ---
