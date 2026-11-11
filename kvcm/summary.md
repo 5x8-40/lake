@@ -231,11 +231,12 @@
 - 目标形态：KVT（多源 KV 索引树）+ HookEnvelope + L0/L1/L2 三环，联合决策“请求去哪、KV 怎么动、集群扩不扩”。
 - 原则：hook ≠ command；KV 动作只走 intent；请求不等 READY；不设固定降级链；索引是派生视图；预算先行；决策与执行分离。
 - **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是跨机传输（950 跨机待测；A3 参考：FabricMem 78–107、ROCE 20–24GB/s）；HBM 命中只省本地 H2D 拷贝（950 单机 UB_CTP≈47GB/s、POD≈93GB/s，分开取值）。
-  - **传输能否被计算掩盖，取决于残差**（D8a §1.1）：`可掩盖token数 = T_transfer × v_prefill`，残差低于它时不能掩盖，`T_kv = T_compute + T_transfer`。
+  - **传输能否被计算掩盖，取决于残差**（D8a §1.1）：layerwise 下，`可掩盖token数 = T_transfer × v_prefill`，残差低于它时不能掩盖，`T_kv = T_compute + T_transfer`；批量加载不靠本请求计算掩盖，靠其他请求填 GPU 或按 prefill 长度分组。
   - **不再用单阈值**（D8a §8.1）：`v_prefill` 随上下文下降，改用设备 A 的拟合 `TTFT = c + (1−hit)(aN+bN²)`；99% 命中、1M 时 V3.2 跨机额外约 1.78s（约 8%），V4-Pro 约 0.20s（约 3.5%）。
   - **高命中率反而放大本地放置的价值**：命中 99% 时跨机传输是纯加项。512K 上下文跨机 `T_kv` 2.716 s vs 本机 1.804 s，差 0.912 s；1M 差 1.782 s。
   - **batch 效应**：forward 按层推进，某层没就绪整个 batch 等，损失按 `max over requests(T_kv)` 计。
   - 所以预取的价值不只是防驱逐，还包括把高命中率请求从跨机挪到本机。
+- **性能视角**（D8 §7.5）：需求/命中/执行/容量四层；看有效命中、residual、介质、`operator_bubble_ratio`、`network_headroom`，不只看 APC 命中率和平均带宽。
 - **网络是决策输入**（D8 §3.4）：分三平面——H2D 专用 UB（950 单机 UB_CTP≈47GB/s、POD≈93GB/s，分开取值；800Gbps 是链路口径）、存储面（池/跨机 KV）、计算面（集合通信）。KV 跨机尽量不走计算面；本机不只是带宽好，而是不跟算子抢、尾延迟确定。三处用到——L0 选路、L1 预取时机、L2 扩容判断（带宽满但池空时该加网络/改放置，不是加节点）。`BW_eff` 必须实测并含竞争惩罚。参考 DualPath 的 compute/storage 双网隔离，950 上再加 H2D 专用面。
 - **版本基线 v0.3.13.post1**：publisher 代码有但当前构建默认 OFF、运行默认 false，生产按开启规划；soft pin 空写设计、后续 PR，hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入已合入（#72）；E15 带宽限速未做。
 - 工作文档：[D8-joint-scheduling.md](design/D8-joint-scheduling.md)；算法：[D8a-scheduling-algorithms.md](design/D8a-scheduling-algorithms.md)；时序：[D8b-scheduling-sequences.md](design/D8b-scheduling-sequences.md)。
