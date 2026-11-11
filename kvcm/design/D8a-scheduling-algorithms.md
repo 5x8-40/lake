@@ -459,7 +459,7 @@ route_weight = min(1, coverage / W_min)
 
 ```mermaid
 sequenceDiagram
-    participant L2 as SC L2
+    participant L2 as 扩缩容环
     participant O as 编排
     participant N as 新实例
     participant K as kvcm

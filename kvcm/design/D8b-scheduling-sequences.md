@@ -134,7 +134,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant L2 as SC L2
+    participant L2 as 扩缩容环
     participant O as 外部编排
     participant N as 新实例
     participant R as SC L0
@@ -166,7 +166,7 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant L2 as SC L2
+    participant L2 as 扩缩容环
     participant R as SC L0
     participant K as kvcm
     participant O as 外部编排
@@ -197,7 +197,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant K as kvcm
-    participant L2 as SC L2
+    participant L2 as 扩缩容环
     participant R as SC L0
 
     K-->>L2: PoolCapacity（水位/驱逐/池压）
