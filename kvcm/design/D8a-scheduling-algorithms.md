@@ -8,6 +8,7 @@
 - 定位: D8 的**算法全集**——所有公式、推导、参数与收益账都在这里；D8 正文只保留定性结论
 - 非目标: 不写代码结构；不重复 D8 的架构/边界，只讲算法本身和收益怎么来
 - 核心差异: **hook 是输入，D8a 算的是拿到 hook/ETA/READY 后这个动作值不值得做**；hook 语义在 [D8 §4](D8-joint-scheduling.md)，本文不重复。
+- 阅读顺序: §0 地图/复用 → §1 记号/TTFT → §2 KVT → §3 打分 → §4 预取 → §5 保留 → §6 扩缩/SSD → §7 HA → §8 收益/指标 → §9 参数 → §10 参考。
 
 ---
 
@@ -638,7 +639,7 @@ L2 更新权重；L0/L1 只读：
 
 ---
 
-### 6.7 SSD 层：promote 比“直读”更常用
+### 6.7 SSD 层：promote 与直读怎么选
 
 先核实现状：Mooncake/vLLM 的本地盘读不是 SSD 直接进引擎 HBM。vLLM connector 有 `disk_offload_buffer_budget_bytes` / staging buffer，Mooncake `LOCAL_DISK` 走 offload RPC（`real_client.cpp` 注释也写明 LOCAL_DISK 必须走 offload RPC）。所以：
 
