@@ -163,7 +163,7 @@ T_kv ≈ T_transfer + queue
 - **本机 DRAM 命中**：`T_kv = T_h2d`（仍有，但没有跨机那一段）
 - **SSD 直接读**：`T_kv ≈ T_ssd_direct`；不建 Mooncake DRAM 池副本，但仍有 host staging buffer
 - **SSD promote**：第一次 `T_kv ≈ T_ssd_promote + T_h2d`；之后走本机 DRAM `T_h2d`
-- **HBM 预取**：引擎 API/壳请求把 KV 预热到 HBM；`T_kv ≈ T_h2d` + 引擎队列，控制面不能直接写 HBM
+- **HBM 预取（预热动作）**：引擎 API/壳请求把 KV 预热到 HBM；预取成本 ≈ `T_h2d` + 引擎队列，控制面不能直接写 HBM；预取完成后请求命中 HBM，`T_kv ≈ 0`
 - **HBM/APC 命中**：`T_kv ≈ 0`；引擎仍会走自己的 connector/APC 查询，只是外部 KV 加载量为 0，不是“跳过 connector”
 
 ---
@@ -321,7 +321,7 @@ layerwise：
 
 选路时要先知道部署模式：批量加载按加法，layerwise 才判断能否取 max。同一个请求，走节点 A 可能能掩盖（A 带宽高），走节点 B 不能。
 
-如果 KV 和集合通信共用一张网，还要加 `network_headroom`：余量低时，即使平均带宽够，也会让算子等。
+如果 KV 和集合通信共用一张网，还要加 `network_headroom`：目标平面的剩余可用带宽 + 排队余量，不是总带宽；余量低时，即使平均带宽够，也会让算子等。
 
 ### 3.3 决策流程
 
@@ -376,7 +376,13 @@ C_occupancy = S_bytes × T × c_mem
 
 理由很实际：预取的 `EV` 本身是估计，误差远大于“背包最优解”能带来的收益；在线系统要的是可解释、可增量更新，不是解一个整数规划。
 
-传输要分级：`demand load > prefetch > migration`。prefetch/migration 遇到集合通信高峰应让路或暂停，不能把算子网络打满。
+传输要分级：`demand load > prefetch > migration`。
+
+- `demand load`：请求已经在等 KV，最高优先；
+- `prefetch`：后台预取，可暂停；
+- `migration`：搬迁，最低优先，低峰执行。
+
+prefetch/migration 遇到集合通信高峰应让路或暂停，不能把算子网络打满。
 
 ### 4.3 EV 曲线
 
@@ -789,7 +795,7 @@ ROI = saved / cost
 | `TTFT_p99` / `ITL_p99` | 用户感知 | 降；整体 |
 | `session_e2e_p99` / `resume_ttft` | 会话级体验 | 降；hook/保留 |
 | `effective_hit_tokens` / `residual` | 命中是否真的省算 | 升/降；KVT/放置 |
-| `operator_bubble_ratio` / `kv_stall_ratio` | 算子空泡/等 KV | 降；预取/限速/错峰 |
+| `operator_bubble_ratio` / `kv_stall_ratio` | 算子空泡/等 KV（定义见 D8 §7.5） | 降；预取/限速/错峰 |
 | `network_headroom`（H2D/存储/计算） | 是否和集合通信抢网 | 升；选点/限速 |
 | `tool_wait_ratio` / `session_success` | 工具等待与任务结果 | 降/升；SUSPEND/调度 |
 | `gpu_seconds_saved` / `cost_per_1k_tokens` | 成本 | 降；账本 |

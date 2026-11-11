@@ -119,6 +119,7 @@ flowchart TB
 
 - 记录 intent、copy/move、bytes、耗时、READY/FAILED、保留 TTL、命中结果；
 - 会话侧补 `session_e2e`、`resume_ttft`、`tool_wait`、`session_success`，用于判断“省了 KV 钱，但会话变慢/失败”的情况；
+- 网络/空泡补 `operator_bubble_ratio`、`kv_stall_ratio`、`network_headroom`，按 step/layer 采样并区分 H2D/存储/计算面；
 - 归因：`hit = engine_apc + local_pool + remote_pool + prewarm + retain`；
 - ROI：`saved / cost`；浪费：预取未用、保留未恢复、迁移失败；
 - 成本：GPU 时间、带宽、驻留字节。
@@ -229,7 +230,6 @@ flowchart TB
 | Drain | 迁移完成率、命中率下降 | 迁移字节/带宽 + 任务/并发 + 核验 | 缩容不丢热 KV |
 | 治理 | pin 超限、误删、审计覆盖 | 配额/TTL/命名空间/审计 | 滥用可发现、误删 0 |
 | 回放 | 回放偏差、策略对比 | 决策日志 + 反事实重放 | 调参可回归 |
-| 网络/空泡 | `operator_bubble_ratio`、`kv_stall_ratio`、`network_headroom` | 按 step/layer 采样；区分 H2D/存储/计算面 | 确认“省了 KV 钱但算子变慢”没有发生 |
 
 ---
 
