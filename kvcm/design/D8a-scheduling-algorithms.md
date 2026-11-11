@@ -946,7 +946,9 @@ Net(T) = p_resume(T)×T_prefill − c_h×S_bytes×T − C_risk
 coverage = Σw_b×1[b 已确认]/Σw_b
 
 # 按 KV 价值选缩容节点
-loss = uniqueHotRefill + sessionRisk + migrationCost
+loss(v) = uniqueHotKV(v) × refill
+        + sessionRisk(v)
+        + migrationCost(v)
 gain = idleCapacity×c_capacity
 
 # 资源权重
