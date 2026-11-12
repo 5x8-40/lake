@@ -29,7 +29,7 @@ KV 管理控制面：独立于推理引擎与 KV 池的第三进程。使命两�
 | **专项设计** | [design/kv-prefetch.md](design/kv-prefetch.md) | copy/prefetch 详细方案（A 壳请求 / B 显式副本复制权衡与时序） |
 | | [design/D8b-scheduling-sequences.md](design/D8b-scheduling-sequences.md) | **管理面时序**：L0 选路 / L1 预取与保留 / L2 扩缩与下线的全部时序图 |
 | **流程文档** | [design/flows/prefetch.md](design/flows/prefetch.md) | 预热流程步骤与数据流（每流程一篇，新增流程同目录另立） |
-| **demo 记录** | [demo/](demo/README.md) | precopy 预热验证：仅覆盖八项中 **copy** 一项的端到端链路（vllm-ascend + Mooncake 实测通过） |
+| **demo 记录** | [demo/](demo/README.md) | precopy 预热验证（**copy** 端到端，vllm-ascend + Mooncake 实测通过）；另有 soft pin 真机实验（[EXPERIMENTS.md](demo/EXPERIMENTS.md)） |
 | **登记处** | [summary.md](summary.md) | 设计决策 D / 潜在问题 P / 工程项 E 全状态总表 |
 
 > **控制面 vs 管理面**：kvcm 当前只有**控制面**（D1/D2/D9：KV 执行、核验、记账、发布）；**管理面**是调度（D8），负责请求/KV/扩缩决策。管理面可以是独立组件，也可以嵌入 Router；控制面只执行 intent，不做选路、不做扩缩、不持有前缀索引。
@@ -40,8 +40,10 @@ KV 管理控制面：独立于推理引擎与 KV 池的第三进程。使命两�
 kvcm/
 ├── design/     # 生产化设计文档（控制面 D1/D2/D9 + 管理面 D8）
 │   └── flows/  # kvcm 自己的流程（目前只有 prefetch；调度时序在 design/D8b-scheduling-sequences.md）
-├── demo/       # precopy demo：只验证 copy 一项；文档+代码+测试床自包含
+├── demo/       # precopy demo（copy）+ soft pin 真机记录；文档+代码+测试床自包含
+├── kvcm/       # 服务代码（daemon、后端、流程、Ledger）
+├── tests/      # 服务代码的 pytest
 └── summary.md  # 登记处（D/P/E 编号总表）
 ```
 
-未来生产代码（E10 kvcm 服务）落地时新建顶层代码目录，与 `demo/` 平级；`demo/` 保持自包含、可独立交付。
+`demo/` 保持自包含、可独立交付。服务代码在 `kvcm/kvcm/`。

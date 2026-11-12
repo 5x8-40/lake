@@ -4,9 +4,14 @@
 
     intent 入队（asyncio.Queue）
         → 协程消费者出队
-        → 过传输闸（Semaphore，限同时没做完的预热前缀数）
-        → 执行 PrefetchFlow.run
-        → 终态记账 + READY 后注册保活并按实例补发 BlockStored
+        → PromoteFlow.run(prefix, target=…)
+            已在 target → 直接 ready（不过闸）
+            仅盘 → L3 promote 等到 memory（不过闸）
+            需搬到 target → 闸外等段空间，过前缀闸跑 PrefetchFlow
+        → PromoteResult.ready 后注册保活并按实例补发 BlockStored
+
+SubmitIntent 不扩协议。闸挡 copy 路径（目标已有副本时 copy 可为 no-op）。
+check_promote 的 QueryError 当未就绪。
 
 无优先级、不分轻重通道——轻任务本来就不经此队列（保活走
 KeepaliveLoop，查询由各自调用方直接 await）。
@@ -27,8 +32,9 @@ master（32K token、tp=2 时大约 512 个 key，4 个满额前缀大约 4×512
 `create_copy_task` 这一次 RPC，返回即还，任务已经被 master 接受——
 管的是建链速率（0.3.11 上 14 连发会 `ConnectToPeer FAILED`）。没有
 这把前缀闸的话，排队的前缀会以每次 4 个建链 RPC 的速度全部提交完：
-master 上叠着所有 plan，并且每个 handle 每轮 `query_task` 都要按 key
-顺序各查一次。前缀闸把「还没终态的预热前缀」卡在 `max_concurrent`。
+master 上叠着所有 plan，并且每个 handle 的 `query_task` 用 gather
+并发查，整个 backend 共用一把、不超过 4。前缀闸把「还没终态的预热前缀」
+卡在 `max_concurrent`。
 
 **线程边界**：`submit_intent` / `intent_status` 是**同步方法**，供 gRPC
 servicer（在其线程池线程里）调用——入队经 `call_soon_threadsafe` 投递
@@ -44,13 +50,15 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import sys
 import time
 from collections import OrderedDict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 
 from kvcm.api.events import EventPublisher
 from kvcm.flows.prefetch import PrefetchError, PrefetchFlow
+from kvcm.flows.promote import PromoteError, PromoteFlow
 from kvcm.ledger import prefix_key
 from kvcm.loops import KeepaliveLoop
 from kvcm.ops.base import (
@@ -62,7 +70,7 @@ from kvcm.ops.base import (
     TaskStatus,
     VerifyError,
 )
-from kvcm.ops.types import InstanceId, Prefix
+from kvcm.ops.types import InstanceId, IntentInputError, Prefix
 
 # 限速器钩子：() -> bool，False = 暂缓发起（E15 接入点，提交前询问）
 RateLimiter = Callable[[], bool]
@@ -155,11 +163,17 @@ class TaskEngine:
             raise ValueError("max_concurrent must be positive")
         self._ops = ops
         self._flow = PrefetchFlow(ops)
+        # 闸只包 copy：注入 _wait_then_run，已在 target / 只提回不走它
+        self._promote = PromoteFlow(ops, prefetch=self._gated_prefetch)
         self._keepalive = keepalive
         self._events = events
         self._limiter = limiter
-        self._queue: asyncio.Queue[_IntentRecord] = asyncio.Queue(maxsize=queue_size)
-        self._gate = asyncio.Semaphore(max_concurrent)
+        # Queue/Semaphore 延到首次使用再建（3.9 在 __init__ 会
+        # get_event_loop 绑死；跨 asyncio.run 还会「不同 loop」）。
+        self._queue_maxsize = queue_size
+        self._max_concurrent = max_concurrent
+        self._queue_obj: asyncio.Queue[_IntentRecord] | None = None
+        self._gate_obj: asyncio.Semaphore | None = None
         # 只存在途（PENDING）。这是去重表：同键有 PENDING 记录就返回既有
         # id 不重复执行——**淘汰 PENDING 会让同键执行两次**，所以这里
         # 永不淘汰，终态即移走。
@@ -169,6 +183,7 @@ class TaskEngine:
         self._finished: OrderedDict[str, _Finished] = OrderedDict()
         self._finished_max = max(1, finished_max)
         self._accepting = True
+        self._programming_errors = 0
         self._consumers: list[asyncio.Task] = []
         self._recover_tasks: list[asyncio.Task] = []
         # 下界，不是容量上限：出队后先做 exists（闸外），再在闸上挂起。
@@ -177,6 +192,18 @@ class TaskEngine:
         self._consumer_count = consumer_count or max(16, max_concurrent * 4)
         self._loop: asyncio.AbstractEventLoop | None = None
 
+    @property
+    def _queue(self) -> asyncio.Queue[_IntentRecord]:
+        if self._queue_obj is None:
+            self._queue_obj = asyncio.Queue(maxsize=self._queue_maxsize)
+        return self._queue_obj
+
+    @property
+    def _gate(self) -> asyncio.Semaphore:
+        if self._gate_obj is None:
+            self._gate_obj = asyncio.Semaphore(self._max_concurrent)
+        return self._gate_obj
+
     # ------------------------------------------------------------------
     # 生命周期（由 daemon 在事件循环内调用）
     # ------------------------------------------------------------------
@@ -184,6 +211,9 @@ class TaskEngine:
     def start(self) -> None:
         """启动协程消费者。必须在事件循环内调用（daemon 的 async main）。"""
         self._loop = asyncio.get_running_loop()
+        # 在本 loop 上预建，避免随后 put_nowait 绑到别的 loop
+        _ = self._queue
+        _ = self._gate
         for i in range(self._consumer_count):
             self._consumers.append(
                 asyncio.create_task(self._consume_loop(), name=f"kvcm-consumer-{i}")
@@ -217,20 +247,7 @@ class TaskEngine:
         #    只是不再等结果）。等线程的事归 daemon 的 `_wait_executor`——
         #    池由 daemon 创建并注入，`backend.close()` 对注入的池会直接
         #    return（`_owns_executor` 为假），等不到。这里不做。
-        # 队列里还没被取走的：标记失败，别让调用方永远等一个 PENDING。
-        # `get_nowait` 与 `task_done` 必须配对，否则 `_unfinished_tasks`
-        # 泄漏（将来有人 `await queue.join()` 会永久挂住）。
-        while True:
-            try:
-                rec = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-            try:
-                self._finish(
-                    rec, IntentStatus.FAILED, "cancelled (shutdown, never started)"
-                )
-            finally:
-                self._queue.task_done()
+        self._fail_never_started()
         # 已建占位但 _admit 还没跑到的（不在队列里）：同样标失败。
         # 必须先用 `list(...)` 快照——`_finish` 会从 `_records` 删条目，
         # 边迭代边删会抛 `RuntimeError: dictionary changed size`。
@@ -410,8 +427,8 @@ class TaskEngine:
         poll_s: float = 0.5,
         timeout_s: float = 120.0,
     ) -> None:
-        """直接执行一次预热（不排队、不记账；脚本与测试用）。"""
-        await self._run_prefetch(prefix, target, poll_s, timeout_s)
+        """直接执行一次 intent（不排队、不记账；脚本与测试用）。"""
+        await self._run_intent(prefix, target, poll_s, timeout_s)
 
     async def track(
         self,
@@ -439,59 +456,112 @@ class TaskEngine:
     # ------------------------------------------------------------------
 
     async def _consume_loop(self) -> None:
-        """消费者：出队 → 过闸 → 执行 → 记终态。"""
+        """消费者：出队 → PromoteFlow(target=) → 记终态。
+
+        闸只在 Promote 需要 copy 时经 ``_gated_prefetch`` 占用。
+        """
         while True:
             rec = await self._queue.get()
             try:
-                await self._run_prefetch(
+                await self._run_intent(
                     rec.prefix, rec.target, rec.poll_s, rec.timeout_s
                 )
                 self._finish(rec, IntentStatus.READY)
+                self._programming_errors = 0
             except asyncio.CancelledError:
                 self._finish(rec, IntentStatus.FAILED, "cancelled (shutdown)")
                 raise
-            except PrefetchError as e:
-                self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
-            except QueryError as e:
-                # exists 的查询失败（不包成 PrefetchError）只该判定这次
-                # intent 失败——**不能向上抛**，否则消费者协程退出，几次
-                # 抖动后全部消费者死光、新 intent 永远 PENDING
+            except (PromoteError, PrefetchError, QueryError, IntentInputError) as e:
+                # 这一次 intent 失败。不能向上抛，否则消费者退出，
+                # 几次之后新 intent 永远 PENDING。
+                # PromoteError：提回/搬到 target 业务失败。
+                # PrefetchError：闸内 copy 路径（经 Promote 包装前也可能冒出）。
+                # QueryError：exists 等查询失败。
+                # IntentInputError：未登记实例、前缀不足一块等。
+                self._programming_errors = 0
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
             except Exception as e:  # 编程错误也留原因，再往上抛（不吞）
                 self._finish(rec, IntentStatus.FAILED, f"{type(e).__name__}: {e}"[:500])
+                self._programming_errors += 1
+                current = asyncio.current_task()
+                others_done = all(
+                    t.done() for t in self._consumers if t is not current
+                )
+                # 3 次门槛，或这是最后一条活着的消费者。好坏交替会把计数清零，
+                # 但消费者仍会一条条死光，不在这里停收的话新 intent 永远 PENDING。
+                if self._programming_errors >= 3 or others_done:
+                    self._accepting = False
+                    print(
+                        "[kvcm] consumer exiting on programming error, "
+                        "no longer accepting intents: "
+                        f"{type(e).__name__}: {e}",
+                        file=sys.stderr,
+                    )
+                    sys.stderr.flush()
+                    self._fail_never_started()
                 raise
             finally:
                 self._queue.task_done()
 
-    async def _run_prefetch(
+    def _fail_never_started(self) -> None:
+        """队列里还没被取走的 intent 收成 FAILED。
+
+        和 shutdown 同一句原因。``get_nowait`` 与 ``task_done`` 必须配对，
+        否则 ``_unfinished_tasks`` 泄漏。
+        """
+        while True:
+            try:
+                rec = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                self._finish(
+                    rec, IntentStatus.FAILED, "cancelled (shutdown, never started)"
+                )
+            finally:
+                self._queue.task_done()
+
+    async def _gated_prefetch(
+        self,
+        prefix: Prefix,
+        target: InstanceId,
+        *,
+        poll_s: float,
+        timeout_s: float,
+    ) -> None:
+        """供 PromoteFlow 注入：闸外等段空间 → 过前缀闸 → PrefetchFlow。"""
+        await self._wait_then_run(prefix, target, poll_s, timeout_s)
+
+    async def _run_intent(
         self,
         prefix: Prefix,
         target: InstanceId,
         poll_s: float,
         timeout_s: float,
     ) -> None:
-        """跑一次预热。
+        """PromoteFlow(target=…)。闸在 copy 路径经注入 prefetch。
 
-        传输闸的范围：**exists 和等目标段空间在闸外**。名额在复查之前就
-        `acquire`；复查失败立刻 `release`，回到闸外再等。复查通过之后，
-        这个名额占到该前缀终态——这段时间 master 上有这个前缀的全部
-        key，轮询也占着名额。放不下就在闸外睡 0.5 秒再查，不占名额。
-        `submit_concurrency` 在建链 RPC 返回时就还，替不了这一段。
-
-        timeout_s 从这里开始，覆盖等空间、等前缀闸、提交和轮询。还没有
-        任务号就到点：这次预热停止，不记成复制失败。
+        timeout_s 覆盖提回、等段空间、过闸、copy、核验。已在 target 则
+        不过闸。``exists`` 只查一次，再走 ``run_after_exists``。
         """
         await self._throttle()
-        # 闸外：存在性检查（毫秒级 RPC，读即续租）
         if not await self._ops.exists(prefix):
             raise PrefetchError(
                 "prefix not fully in pool — warm 未覆盖该前缀、key 口径与引擎漂移，"
                 "或异构前提未满足（源引擎未开 tp_mismatch / PEER_TP_SIZE 两端错位，"
                 "则 effective 空间 key 全 miss）"
             )
-        await self._wait_then_run(prefix, target, poll_s, timeout_s)
-        # READY 接线：副本已核验到位 → 注册保活，并按目标实例补发
-        self._on_ready(prefix, target)
+        result = await self._promote.run_after_exists(
+            prefix,
+            target=target,
+            poll_s=poll_s,
+            timeout_s=timeout_s,
+        )
+        if not result.ready:
+            raise PromoteError(
+                f"promote finished but not schedulable on target={target}"
+            )
+        await self._on_ready(prefix, target)
 
     async def _wait_then_run(
         self,
@@ -547,7 +617,8 @@ class TaskEngine:
                 # Semaphore 自己把名额交回去，这里不再 release。
                 try:
                     await asyncio.wait_for(self._gate.acquire(), timeout=left)
-                except TimeoutError:
+                except asyncio.TimeoutError:
+                    # 3.9 里 asyncio.TimeoutError 尚非 builtin TimeoutError 别名
                     raise _stopped() from None
                 try:
                     left = deadline - time.monotonic()
@@ -613,21 +684,28 @@ class TaskEngine:
                 # READY 接线（恢复侧）：重启前没来得及注册的保活、没发出的
                 # BlockStored 在这里补上。target 必须在轮询前取好。
                 if status is TaskStatus.READY:
-                    self._on_ready(prefix, target)
+                    await self._on_ready(prefix, target)
                 return
             if loop.time() >= deadline:
                 await self._ops.abandon(handle)  # 超时收口（与流程同语义）
                 return
             await asyncio.sleep(poll_s)
 
-    def _on_ready(self, prefix: Prefix | None, target: InstanceId | None) -> None:
-        """第一次看到 READY：注册保活，并按目标实例补发一条 BlockStored。
+    async def _on_ready(
+        self, prefix: Prefix | None, target: InstanceId | None
+    ) -> None:
+        """第一次看到副本 READY：等保活落账，再补发一条 BlockStored。
 
-        正常路径与恢复路径共用这一跃迁。没有端点、或补发抛错，都不把
-        已经核验通过的预热打成失败——保活照常注册，异常只记日志。
+        正常路径与恢复路径共用。保活用 ``register_await``：写完（或
+        写失败已记账）之后才返回，这样 intent 的 READY 不会早于名单
+        落盘尝试。写入失败 / 补发失败都不把预热打成 FAILED。
         """
         if prefix is not None and self._keepalive is not None:
-            self._keepalive.register(prefix)
+            await_reg = getattr(self._keepalive, "register_await", None)
+            if await_reg is not None:
+                await await_reg(prefix)
+            else:
+                self._keepalive.register(prefix)
         if self._events is None or prefix is None or target is None:
             return
         try:

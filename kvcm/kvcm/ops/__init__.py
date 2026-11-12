@@ -11,9 +11,10 @@ from kvcm.ops.base import (
     VerifyError,
 )
 from kvcm.ops.capability import BackendCapability, Capability, Support
-from kvcm.ops.types import InstanceId, PinKind, Prefix
+from kvcm.ops.types import InstanceId, IntentInputError, PinKind, Prefix
 
 __all__ = [
+    "IntentInputError",
     "KvOps",
     "OpKind",
     "QueryError",

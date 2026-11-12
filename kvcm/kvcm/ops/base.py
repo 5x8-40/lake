@@ -5,11 +5,20 @@
 - 元数据标记：pin
 - 目的型：retain——由其他操作组合实现，对外仍呈现单步语义
 
-完成信号：copy / move / promote 有 READY（任务状态完成 + 目标侧副本
-核验通过）。retain 的 READY 跟着做法走：用 copy/move 搬某实例时按
-copy/move 的规则上报 READY；搬进 kvcm 自己的段盘、用旧 client_id 接管、DFS
-则不上报 READY。其余方法（keepalive / stop_keepalive / pin / demote /
-remove）无 READY。任务状态经 query_task 查询。
+keepalive 拆成三件事：`register_keepalive` / `unregister_keepalive`
+管理 Ledger 登记，`renew_once` 对前缀执行一次续租。周期续租由
+KeepaliveLoop 调 `renew_once`；登记由 TaskEngine 触发
+`KeepaliveLoop.register`（内部写 Ledger，也可直接调 L3 的
+`register_keepalive`）。不再提供一个既登记又续租的 `keepalive`。
+
+完成信号：copy / move 有 READY（任务完成 + 目标侧副本核验，经
+``TaskStatus.READY``）。promote 也有 READY（D2：某实例可调度），但 L3
+``promote`` 只触发、无 TaskHandle；READY 由 PromoteFlow 的
+``PromoteResult.ready`` 表达。是否已有 memory 由 ``check_promote``
+判定；不传 target 时落点反查 ``memory_instance``（对不上则
+ready=False）。传 target 则落在该实例后 ready=True（必要时经
+PrefetchFlow copy）。retain 的 READY 跟着做法走。其余方法无 READY。
+任务状态经 query_task 查询（仅任务类操作）。
 
 幂等：**本层不去重**——`copy` 每次调用都发起任务，同一前缀重复调用会产生
 重复传输。去重归编排层（TaskEngine 以 intent_id = 前缀 × 目标实例 为键：
@@ -28,13 +37,13 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
 from kvcm.ops.capability import BackendCapability
-from kvcm.ops.types import InstanceId, PinKind, Prefix
+from kvcm.ops.types import InstanceId, IntentInputError, PinKind, Prefix
 
 
 class TaskStatus(enum.Enum):
-    """任务状态机（任务类操作：copy / move / promote）。"""
+    """任务状态机（任务类操作：copy / move）。"""
 
-    PENDING = "pending"  # 排队
+    PENDING = "pending"  # 当前没有生产者
     RUNNING = "running"  # 进行
     READY = "ready"  # 任务完成且目标侧副本核验通过
     FAILED = "failed"  # 失败（处理策略归编排层：重发 / 弃置清副本 / 衔接）
@@ -45,7 +54,7 @@ class OpKind(enum.Enum):
 
     COPY = "copy"
     MOVE = "move"
-    PROMOTE = "promote"
+    RETAIN = "retain"
 
 
 @dataclass(frozen=True)
@@ -54,7 +63,7 @@ class TaskHandle:
 
     一次前缀操作展开为多个后端任务（每 key 一个），句柄承载全部标识。
     任务标识是**不透明对象**：本层不解释其类型（不同后端的任务号形态
-    不同，如整数对），只在 copy/move/promote 与 query_task 之间透传；
+    不同，如整数对），只在 copy/move 与 query_task 之间透传；
     需要持久化时由实现侧负责可逆编码。READY 核验所需的 key/目标映射
     由实现侧登记（任务状态机归状态层），不随句柄泄漏存储概念。
     """
@@ -84,7 +93,7 @@ class QueryError(RuntimeError):
 
 
 class SubmitError(RuntimeError):
-    """操作提交失败（copy/move/promote 的发起阶段）。
+    """操作提交失败（copy/move 的发起阶段）。
 
     已经落账的句柄放在 `handle` 上，交给流程 `abandon`（账本记
     abandoned）。池里的传输不取消。没有任务号时 `handle` 为 None。
@@ -95,7 +104,6 @@ class SubmitError(RuntimeError):
     def __init__(self, message: str = "", *args, handle: TaskHandle | None = None):
         super().__init__(message, *args)
         self.handle = handle
-
 
 class AdmissionWait(Exception):
     """这一轮目标段放不下，或管理端口暂时连不上。
@@ -111,6 +119,7 @@ class AdmissionStop(Exception):
     """
 
 
+
 class KvOps(ABC):
     """原子操作接口。实现由存储后端适配器提供（如 mooncake 后端）。
 
@@ -118,9 +127,8 @@ class KvOps(ABC):
     ——跑通 copy 流程的最小集。其余操作基类给默认实现（抛
     UnsupportedCapabilityError，消息注明适配器未接线）：编排层判断可
     用性应读 capability()，异常只是兜底；适配器落地某项时 override
-    并细化（通道具备但未接线抛 NotImplementedError，通道不具备抛
-    UnsupportedCapabilityError——mooncake 后端的 pin 即此形态）。第二
-    后端接入时不必先 stub 全部操作。
+    并细化。未接线抛 UnsupportedCapabilityError。第二后端接入时不必先
+    stub 全部操作。
     """
 
     def _unsupported(self, op: str) -> UnsupportedCapabilityError:
@@ -131,9 +139,9 @@ class KvOps(ABC):
     # ------------------------------------------------------------------
     # 同步 / 异步的分界：**会等待的方法一律 async**
     #
-    # async（会等待后端 / 网络 / 时间）：copy / move / keepalive /
-    # stop_keepalive / pin / demote / promote / retain / remove /
-    # query_task / abandon / exists
+    # async（会等待后端 / 网络 / 时间）：copy / move / register_keepalive /
+    # unregister_keepalive / renew_once / pin / demote / promote /
+    # check_promote / retain / remove / query_task / abandon / exists
     #   —— 实现内部把阻塞调用（同步 RPC、sqlite）交给 executor，等待期
     #      间协程挂起、不占线程（E11 执行模型）
     # 同步（纯内存查询，无等待）：capability / prefix_of
@@ -180,37 +188,71 @@ class KvOps(ABC):
         self,
         prefix: Prefix,
         target: InstanceId,
-        source: InstanceId | None = None,
+        source: InstanceId,
     ) -> TaskHandle:
-        """把前缀 KV 的副本归属转移到目标实例，源副本释放；可指定源实例
+        """把前缀 KV 的副本归属转移到目标实例，源副本释放；必须指定源实例
         （复制无此能力，移动才有）。READY 同 copy。"""
         raise self._unsupported("move")
 
-    async def keepalive(self, prefix: Prefix) -> None:
-        """注册保活：对前缀 KV 周期续租防驱逐。停止经 stop_keepalive。
-        无 READY。"""
-        raise self._unsupported("keepalive")
+    async def register_keepalive(self, prefix: Prefix) -> None:
+        """登记保活：把前缀写进 Ledger，周期续租由 KeepaliveLoop 负责。
+        不在这里发续租 RPC。无 READY。"""
+        raise self._unsupported("register_keepalive")
 
-    async def stop_keepalive(self, prefix: Prefix) -> None:
-        """注销保活。不是第九项操作——是 keepalive 注册的管理面。"""
-        raise self._unsupported("stop_keepalive")
+    async def unregister_keepalive(self, prefix: Prefix) -> None:
+        """注销保活登记。无 READY。"""
+        raise self._unsupported("unregister_keepalive")
 
-    async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
-        """元数据标记防驱逐：对已存在的 KV 生效，不写数据。
-        SOFT 可解；HARD 写入时固化、不可解，已存在的 KV 无法事后补标
-        （能力集 hard_pin_after）。无 READY。"""
+    async def renew_once(self, prefix: Prefix) -> bool:
+        """对前缀执行一次续租；返回是否全部 key 仍在池。
+
+        这是真正的 lease 续租动作，由 KeepaliveLoop 周期调用。
+        """
+        raise self._unsupported("renew_once")
+
+    async def pin(
+        self, prefix: Prefix, kind: PinKind = PinKind.SOFT, *, enable: bool = True
+    ) -> None:
+        """防驱逐。SOFT 是事后 soft pin，不写数据。``enable=False`` 走空写关闭。
+        HARD 标记创建时固化，事后设置不了；适配器拒绝 ``pin(HARD)``。
+        要 lease 保护请显式调 ``register_keepalive()``。无 READY。"""
         raise self._unsupported("pin")
 
     async def demote(self, prefix: Prefix) -> None:
-        """放弃前缀 KV 的热层位置。本接口不指定目标层——去向由池的冷热
-        策略决定；是否立即生效取决于后端能力（has_per_key_demote 全版本
-        均无，实际为停止保活后的自然降层）。无 READY。"""
+        """放弃前缀 KV 的热层位置。没有立刻搬到盘上的调用。
+        mooncake 上先注销保活，等满一个 lease TTL，再用
+        GET /batch_query_keys 确认盘副本。写回且池不满时失败。无 READY。"""
         raise self._unsupported("demote")
 
-    async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
-        """把前缀 KV 提回指定实例本机层级（调度意图，与 demote 的
-        「放弃位置」不对称是刻意的）。READY 同 copy。"""
+    async def promote(self, prefix: Prefix) -> None:
+        """触发池提回：只打 N 次访问，不验证、不等待、不带 target。
+
+        落点由池派给盘副本登记 client。是否已有 memory、落在哪台实例，
+        分别由 ``check_promote`` / ``memory_instance`` 查询。
+        """
         raise self._unsupported("promote")
+
+    async def check_promote(
+        self, prefix: Prefix, target: InstanceId | None = None
+    ) -> bool:
+        """前缀 memory 是否就绪。
+
+        - ``target is None``：每个 key 至少有一处 memory（不限实例）。
+        - ``target`` 给定：每个 key 按 ``build_plan`` 落在该实例对应 seg。
+
+        查询本身有副作用（mooncake：授 lease、累计命中、可能触发
+        promotion / dynamic replication）。失败抛 QueryError。供
+        PromoteFlow 轮询。
+        """
+        raise self._unsupported("check_promote")
+
+    async def memory_instance(self, prefix: Prefix) -> InstanceId | None:
+        """若每 key 已有 memory，返回任一可按 rank 映射服务全前缀的实例。
+
+        对不上目录 / 反查失败则 ``None``（提回仍算成功）。默认不实现则
+        返回 ``None``。
+        """
+        return None
 
     async def retain(self, prefix: Prefix, target: InstanceId | None = None) -> TaskHandle:
         """目的型：让前缀 KV 在源引擎下线后仍存活。
@@ -227,8 +269,14 @@ class KvOps(ABC):
         """
         raise self._unsupported("retain")
 
-    async def remove(self, prefix: Prefix) -> None:
-        """删除前缀 KV 的全部副本，全局生效。无 READY。"""
+    async def remove(self, prefix: Prefix, force: bool = False) -> None:
+        """删除前缀 KV 的全部副本，全局生效；不支持按 target 删除。无 READY。
+
+        无论 force 都先注销保活。force=False 再等一个 lease 后
+        ``batch_remove(force=False)``。force=True 立刻强删。
+        失败或取消不把登记加回去：注销过就留注销，调用方看到原因后自己重试，
+        租约可以过期。
+        """
         raise self._unsupported("remove")
 
     @abstractmethod

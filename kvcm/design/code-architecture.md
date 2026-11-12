@@ -1,6 +1,7 @@
 # kvcm 代码架构（五层）
 
 - 定位：kvcm 服务化（E10 重构 / E11 进程化 / E15 并行限速）的模块分层设计——E10 已完成（[PR #67](https://github.com/5x8-40/lake/pull/67)），本文是 E11 开工依据
+- **版本基线**：mooncake **v0.3.13.post1**（master / client 同版本）；代码里的 `main` 能力名只是能力集名字，不代表版本基线
 - 本文**不新增机制结论**——操作语义、完成信号、幂等性、能力事实全部引自 [D1-router-scheduling.md](D1-router-scheduling.md) / [D2-kv-operations.md](D2-kv-operations.md)；本文只把它们落成代码结构
 - 语言：Python（继承现有 `demo/precopy/` 1577 行与 mooncake store_py 绑定、keys.py 与引擎算法一致）
 
@@ -13,7 +14,7 @@ L1 接口层     IntentReceiver / EventPublisher / InstanceWatcher        kvcm/a
               进程对外通道；不含任何存储概念（IntentReceiver 已实现 gRPC。
               BlockStored 补发在 api/events.py 的 EventPublisher，由 daemon
               注入 TaskEngine。把地址交给索引与 InstanceWatcher 归 E13）
-L2 编排层     PrefetchFlow 已实现；SessionEnd/Drain/Retain 未实现    kvcm/flows/
+L2 编排层     TaskEngine → PromoteFlow（可套 PrefetchFlow）；SessionEnd/Drain/Retain 未实现    kvcm/flows/
               只调 L3 接口；代码里不出现 seg / lease / client_id / PoolKey / rank
 L3 原子操作层 KvOps：八操作 + query_task / exists / abandon          kvcm/ops/
               抽象接口（语义规格 = D2 §1）+ capability 声明结构
@@ -41,9 +42,9 @@ flowchart TB
     Recv["IntentReceiver<br/>接收"]
     Watch["InstanceWatcher<br/>接收"]
     Pub["EventPublisher<br/>发送"]
-    Eng["TaskEngine<br/>队列 + 前缀闸<br/>终态才还"]
+    Eng["TaskEngine<br/>队列 · Promote · 闸仅 copy"]
     Cons["消费者协程 ×N"]
-    Flow["PrefetchFlow"]
+    Flow["PromoteFlow<br/>+ PrefetchFlow"]
     Ops["KvOps"]
     MB["MooncakeBackend"]
     KC["KeyComputer"]
@@ -55,11 +56,11 @@ flowchart TB
 
   Router -->|"已接通 gRPC<br/>SubmitIntent / GetTask<br/>Prefix + target"| Recv
   Recv -->|"已接通<br/>submit_intent 入队即返"| Eng
-  Eng -->|"已接通<br/>出队后过前缀闸"| Cons
-  Cons -->|"已接通<br/>执行 run_after_exists"| Flow
+  Eng -->|"已接通<br/>出队"| Cons
+  Cons -->|"已接通<br/>PromoteFlow(target=)<br/>需 copy 才过闸"| Flow
   Ctrl -.->|"待接通<br/>实例上下线事件<br/>实例标识 + TP 配置 + rank 与 seg 对应表"| Watch
   Watch -.->|"待接通<br/>实例拓扑注册<br/>locate 在生产环境的数据来源"| MB
-  Flow -->|"已接通<br/>exists / copy / query_task / abandon<br/>Prefix+target / TaskHandle"| Ops
+  Flow -->|"已接通<br/>exists / promote / check_promote / copy…"| Ops
   Ops -->|"同一个对象<br/>调用进 MooncakeBackend"| MB
   MB -->|"已接通<br/>token_ids 算出 keys, 排出复制计划"| KC
   Vllm -->|"已接通 lazy import<br/>和引擎算得一致的 hash"| KC
@@ -68,7 +69,7 @@ flowchart TB
   Seg -->|"已接通 HTTP<br/>GET /get_all_segments"| Master
   MB -->|"已接通<br/>控制面调用"| SC
   SC -->|"已接通 RPC<br/>batch_is_exist<br/>create_copy_task<br/>query_task<br/>batch_get_replica_desc"| Master
-  MB -.->|"待接通 HTTP<br/>/batch_query_keys 零副作用核验"| Master
+  MB -->|"已接通 HTTP<br/>GET /batch_query_keys 副本核验"| Master
   MB -->|"已接通写<br/>running 到 ready / failed / abandoned"| Led
   Led -->|"已接通读<br/>rebuild 取 running 行"| MB
   Led -->|"落盘"| DB
@@ -77,11 +78,18 @@ flowchart TB
 ```
 
 - `IntentReceiver`、`InstanceWatcher` 只接收，箭头从进程外进来。`EventPublisher` 只发送，箭头从进程里出去。三者互不调用
-- **intent 的走法（E11 已实现）**：`IntentReceiver`（gRPC）收到 `SubmitIntent` 后不跑流程，只调 `TaskEngine.submit_intent` 投进 `asyncio.Queue` 并立即返回 `intent_id`；消费者协程出队后先做 `exists`，再在闸外等目标段放得下，放得下才占一个前缀闸名额跑 `PrefetchFlow.run_after_exists`，终态才还。`copy` 里每个 key 另过进程级提交信号量，`create_copy_task` 返回即还。回执由调用方 `GetTask` 主动查。READY 且前缀闸已还之后，`TaskEngine._on_ready` 注册保活并补发一条 `BlockStored`；没有端点或发送失败只记日志
-- 已接通的驱动是 `PrefetchFlow` 调 `KvOps`——运行时这个对象就是 `MooncakeBackend`，不是中间再转一跳。它写 `Ledger`，账本落在圈外的 sqlite 文件上；`rebuild` 再把 running 行读回来
+- **intent 的走法（E11）**：`SubmitIntent` 入队即返 `intent_id`。消费者 `exists` 后调用 `PromoteFlow.run(prefix, target=…)`：
+  - 已在 target → `ready`（不过闸）
+  - 仅盘 → L3 promote 等 memory（不过闸）
+  - 需搬到 target → 注入的闸路径：闸外等段空间 → 前缀闸 → PrefetchFlow
+  - copy 后 `check_promote(target)`；`QueryError` 当未就绪重试
+  - 闸路径内 `AdmissionWait` 继续等，不记 FAILED；`IntentInputError` 记 FAILED
+  - `ready` 后 `_on_ready`（保活 + `BlockStored`）
+  - 协议不改：仍是前缀 × 目标实例
+- Flow 调 `KvOps`（运行时即 `MooncakeBackend`）。Prefetch 写 `Ledger`；`rebuild` 捞 running 行
 - **实例拓扑的两条来路**：demo 环境没有注册通道，`RankTopology` 用探测法推断「哪个 rank 对应哪个 seg」（见 L4 节）；生产环境由实例启动时把自己的拓扑（TP 配置、rank 与 seg 对应表）经 `InstanceWatcher` 注册进来（D1 §3、E13）——两条来路汇成一个 `locate` 函数注入 backend
-- `StoreClient` 走 master 的 RPC `:50088`。`SegTopology` 自己会打 HTTP `:9003` 的 `/get_all_segments`（查存储池当前挂了哪些 seg）。demo 里把这份名单交给 `RankTopology` 做比对，进程里还没有这条装配
-- 虚线都是类已建、调用未接通：控制面到实例监听、把补发地址交给索引（发布本身已接通）、`/batch_query_keys` 核验
+- `StoreClient` 走 master 的 RPC `:50088`。`SegTopology` 自己会打 HTTP `:9003` 的 `/get_all_segments`（查存储池当前挂了哪些 seg）。`RankTopology` 用这份名单做 demo 探测，这条探测装配还没接进进程。现在的进程入口是 `InstanceDirectory`：daemon 用 `--instance-segs` 做初始登记，locate 只返回该实例的段
+- 虚线都是类已建、调用未接通：控制面到实例监听、`EventPublisher` 到索引。副本核验已经走 `GET /batch_query_keys`
 
 ### 模块依赖（参考）
 
@@ -91,7 +99,7 @@ flowchart TB
 
 ```mermaid
 flowchart LR
-  Api["api<br/>intents/watcher"] --> Types
+  Api["api<br/>grpc_server/events/watcher"] --> Types
   Flow["flows.prefetch"] --> Base["ops.base"]
   Flow --> Types["ops.types"]
   Base --> OCap["ops.capability"]
@@ -103,11 +111,12 @@ flowchart LR
   BE --> Led
   BE --> SC["client<br/>StoreClient"]
   BE --> KC["engines.vllm.keys<br/>KeyComputer"]
+  KC --> Types
   McCap["capability.py<br/>（mooncake 两版本能力表）"] --> OCap
   Seg["topology.py<br/>SegTopology"] --> Http["http_admin"]
 ```
 
-- `engines.vllm.keys`、`engines.vllm.topology`、`client`、`http_admin` 不 import 任何 kvcm 模块（图上没有它们的出边）
+- `engines.vllm.keys` 从 `kvcm.ops.types` 引 `IntentInputError`，不直接 import `ops.base`。`import kvcm.ops` 仍会经包的 `__init__` 加载 `ops.base`。`engines.vllm.topology`、`client`、`http_admin` 不 import 任何 kvcm 模块
 
 **谁调谁**（运行时方法调用）：
 
@@ -143,7 +152,7 @@ flowchart LR
 
 | 模块 | 职责 | 出处 |
 |------|------|------|
-| IntentReceiver | 收 Router 预热 intent（E12 已实现）。**协议**：gRPC `KvcmIntent.SubmitIntent { prefix{model_id, token_ids}, target }`，入队后立即返回 `intent_id`；执行状态由调用方 `GetTask(intent_id)` 查（PENDING / READY / FAILED / UNKNOWN）。intent ≠ command：kvcm 按池现状决定做不做、何时做，调用方不得假设执行时机。servicer 只调 `TaskEngine` 公开方法，不含存储概念 | D1 §4 职责边界、`proto/kvcm_intent.proto` |
+| IntentReceiver | 收 Router intent（E12）。协议：`SubmitIntent { prefix, target }`，入队即返；`GetTask` 查状态。intent ≠ command：TaskEngine → PromoteFlow 按池决定路径。不扩协议；move / pin / demote / remove 无 intent | D1 §4、`proto/kvcm_intent.proto` |
 | EventPublisher | READY 后按目标实例补发一条 `BlockStored`（`kvcm/api/events.py` 的 `EventPublisher`，daemon 注入 `TaskEngine`）。每个实例一个 `--kv-event-endpoint`，第一次补发才绑定，进程退出才关；不调用 `/register`，把地址交给索引归 E13 | D1 §2 方案 a、E14 |
 | InstanceWatcher | 实例上线/销毁接入 → 触发预热 / seg 副本处理；「端点→实例」「seg→实例」注册的权威来源（E13；先占位，事件源随 D4） | D1 §3、E13 |
 
@@ -155,8 +164,9 @@ flowchart LR
 
 | 流程 | 编排 | 状态 |
 |------|------|------|
-| PrefetchFlow | exists 前置检查 → copy → query_task 轮询到 READY。保活注册与 `BlockStored` 补发在流程返回后由 `TaskEngine._on_ready` 做（恢复路径用 `target_of`） | 已实现（`flows/prefetch.py`） |
-| SessionEndFlow | 停 keepalive + demote | 未实现（D1 §6） |
+| PrefetchFlow | exists → copy → query_task 到 READY。生产上由 PromoteFlow / TaskEngine 闸路径调用 | 已实现；intent 经 Promote 注入闸后调用 |
+| PromoteFlow | 不传 target：任意 memory + 反查持有方。传 target：已在 / promote / Prefetch copy，完成 = `check_promote(target)` → `ready`。可注入带闸 prefetch | 已接 TaskEngine（intent 入口）。demote 仍为 L3 库能力 |
+| SessionEndFlow | `unregister_keepalive` + demote | 未实现（D1 §6） |
 | DrainFlow | copy/move（或 seg 级批量 CreateDrainJob）+ 宽限期卸载 | 未实现（D2 §4 计划下线四步） |
 | RetainFlow | retain（死前 move/copy 到还活着的段；DFS 另编，不走这个返回值） | 未实现（D2 §4） |
 
@@ -171,7 +181,7 @@ flowchart LR
 | 任务全部完成、但副本核验缺（VerifyError） | 报错，带缺哪些副本的明细 |
 | 任务失败（FAILED） | 报错 |
 | 超过时限没完成 | 先放弃跟踪（abandon，见 L3 节），再报错 |
-| 目标段暂时放不下（AdmissionWait） | TaskEngine 在闸外再等，不记复制失败 |
+| 目标段暂时放不下（AdmissionWait） | 闸路径（`_wait_then_run`）内再等，不记 FAILED；库直调 Prefetch 则上抛 |
 | 段不存在（AdmissionStop） | TaskEngine 里包成 PrefetchError，这次预热停止 |
 
 流程的步骤、数据流与失败分支：**[flows/prefetch.md](flows/prefetch.md)**（每流程一篇，新增流程同目录另立）。
@@ -179,8 +189,8 @@ flowchart LR
 ## L3 原子操作层（核心抽象）
 
 - 接口规格直接抄 D2 §1：八项操作的语义、完成信号、READY 有无、幂等性都已定型——本层把它们落成 Python 抽象基类
-- 八项分三类（D2 §1）：**原子动作**（copy / move / keepalive / demote / promote / remove）、**元数据标记**（pin）、**目的型**（retain——死前把副本放到还活着的 client 上，或写成 DFS，调用方看起来仍像一步）
-- 完成信号：READY 的本义 =「可以把请求调度过来」（D2 §1）——copy / move / promote 有 READY（它们的完成都意味着「这个实例能接请求了」）；demote 降层后本就不能调度，没有 READY。retain 不产生「把请求调到源实例」的 READY。这个方法只表达 move/copy，返回任务号，再查副本确认已经在目标 client 上。空任务号不是完成信号，`query_task` 对它抛 `ValueError`。keepalive / stop_keepalive / pin / demote / remove 无 READY
+- 八项分三类（D2 §1）：**原子动作**（copy / move / keepalive / demote / promote / remove）、**元数据标记**（pin 的 soft；`pin(HARD)` 拒绝，hard 级 lease 保护走显式 `register_keepalive()` + `renew_once`，不改 hard pin 位）、**目的型**（retain——死前把副本放到还活着的 client 上，或写成 DFS，调用方看起来仍像一步）
+- 完成信号：READY 的本义 =「可以把请求调度过来」（D2 §1）——copy / move / promote 有 READY（它们的完成都意味着「这个实例能接请求了」）；demote 降层后本就不能调度，没有 READY。retain 不产生「把请求调到源实例」的 READY。这个方法只表达 move/copy，返回任务号，再查副本确认已经在目标 client 上。空任务号不是完成信号，`query_task` 对它抛 `ValueError`。register_keepalive / unregister_keepalive / renew_once / pin / demote / remove 无 READY
 - 幂等：同一个前缀对同一台实例，已经在复制就不重复发、已完成也不重复发（D1 §4）；后端侧重复调用也有幂等保护（D1 F11）
 
 **接口形态（`kvcm/ops/`）**
@@ -189,11 +199,11 @@ flowchart LR
 - **任务凭据（TaskHandle）**：一次 `copy(前缀)` 在 mooncake 上是逐条 key 各发一个复制任务——一个前缀通常对应多条 key（块数 × rank 数），所以一次操作会产生多个任务。凭据里的 `task_ids` 装着这次操作的全部任务号，查询时一起查。任务号的类型对 L3 不透明（`tuple[object, ...]`）：mooncake 的任务号是两个整数组成的整数对，L3 原样保存、原样回传，不做字符串化（`str()` 化后真实绑定的 `query_task` 会报 TypeError）；要写进 Ledger 时由实现侧编码成 `"整数:整数"` 的字符串（`encode_task_id`/`decode_task_id`，重启可还原）
 - **READY 规则**（本义 =「可以把请求调度过来」，D2 §1）：
   - copy / move：任务完成 + 目标侧副本核验通过（任务型，凭据里有任务号）
-  - promote：**核验式 READY**——触发式实现（反复 `GetReplicaList` 刷计数，master 按冷热策略**自主**搬运，kvcm 没有任务号）；READY = 轮询确认副本提回到位。凭据 = 触发记录。空任务号会让 `query_task` 抛 `ValueError`，不能拿来表示「还在等池自己搬」。其搬运是池自主行为，**不占传输闸**
+  - promote：L3 `promote(prefix)` 只打 N 次 `GetReplicaList`（默认 2）触发，不带 target、无 `TaskHandle`。READY = `PromoteResult.ready`。`check_promote(prefix, target=None)`：无 target 看任意 memory；有 target 看 `build_plan`；`QueryError` 当未就绪。`PromoteFlow` 传 target 时：已在 / 提回 / Prefetch copy，最后 `check_promote(target)`。TaskEngine：`exists` 一次后 `run_after_exists(target=)`；闸挡 copy 路径（目标已有副本时 copy 可为 no-op）。L3 提回不过闸。不做读删写。
   - **retain 返回 TaskHandle**——这个方法只表达 move/copy（D2 §4），返回这次搬运的任务号。DFS 不走这个返回值。空任务号抛 `ValueError`
-  - 其余方法（keepalive / stop_keepalive / pin / demote / remove）无 READY
-- **exists（查询，不是第九项管理操作）**：实现是 `batch_is_exist`，它有个副作用——被查到的 key 会被续租，所以预热前的存在性检查顺便就起了保活作用。两种结果必须分清：「不在池里」（key 确实没有 → 该预热）和「查询本身失败」（RPC 出错或单 key 返回 -1 → 转成 QueryError 等一会儿重查）——把查询失败当成「不在池里」会误判成需要重新计算
-- **abandon（放弃跟踪）**：kvcm 发起任务后要定期查它完成没有，这叫跟踪。abandon = 不再查了：删掉进程内的核验登记，Ledger 记为 abandoned，凭据从此失效（再查报 KeyError）。它**不是取消任务**——后端没有取消接口，传输可能照常完成。**abandon 之后不会自动删副本**：副本留在池里，按冷热策略自然降层、过期；要立刻删除得显式调 remove（未实现，归释放流程 ReleaseLoop，D1 §6）
+  - 其余方法（register_keepalive / unregister_keepalive / renew_once / pin / demote / remove）无 READY
+- **exists（查询，不是第九项管理操作）**：实现是 `batch_is_exist`，它有个副作用——被查到的 key 会被续租，所以预热前的存在性检查顺便就起了保活作用。两种结果必须分清：「不在池里」（key 确实没有 → 该预热）和「查询本身失败」（返回值不是 0/1/True/False，或列表长度和 key 数不一致 → 转成 QueryError 等一会儿重查）——把查询失败当成「不在池里」会误判成需要重新计算
+- **abandon（放弃跟踪）**：kvcm 发起任务后要定期查它完成没有，这叫跟踪。abandon = 不再查了：删掉进程内的核验登记，Ledger 记为 abandoned，凭据从此失效（再查报 KeyError）。它**不是取消任务**——后端没有取消接口，传输可能照常完成。**abandon 之后不会自动删副本**：副本留在池里，按冷热策略自然降层、过期；要立刻删除得显式调 remove（操作已落地；ReleaseLoop 骨架仍不调用它，D1 §6）
 
 
 ### 失败语义
@@ -203,9 +213,11 @@ flowchart LR
 | 异常 | 什么时候抛 | 调用方怎么办 |
 |------|-----------|-------------|
 | SubmitError | 提交任务的中途出错。已经落账的号由流程 `abandon`，账本是 abandoned；池里的传输不取消 | 视为失败；重试与否由编排层决定（重复提交有幂等保护，见下） |
-| QueryError | 查任务状态、查副本时 RPC 出错（网络抖动这类临时问题） | 轮询阶段：等一会儿重查，不算失败；exists 阶段：不包装，直接上抛给调用方 |
-| VerifyError | 任务全部显示完成、但副本核验缺副本。异常带明细 | 视为失败 |
+| QueryError | 查任务状态、查副本时得不到可用结果（RPC / 短回 / `ok=false` 等） | 轮询阶段：等一会儿重查，不算失败；exists 阶段：不包装，直接上抛给调用方 |
+| VerifyError | 已查清，成功条件不满足（终态，带明细）。copy/move：任务完成但目标缺内存副本；demote：每 key 的 `local_disk_replicas` 不够 | 视为失败 |
 | ValueError | 任务号是空的。空任务号不是完成信号 | 编程错误，直接传播，不包装 |
+
+**命名未决**：`VerifyError` 原偏 copy/move 核验；demote 无盘也用它。分类（`QueryError`=查不清 / `VerifyError`=查清不合格）保留；是否改名另定。
 
 **重复提交不视为失败（等副本状态，代码里叫 `_watch`）**
 
@@ -257,27 +269,31 @@ stateDiagram-v2
     - 绑定：`store_py.cpp` 的 pybind 绑定（v0.3.11 共 112 个 `.def` / @1fc27b6 共 120 个）；demo 部署的 `mooncake_transfer_engine_npu` wheel 是**官方 NPU 构建变体**（`scripts/build_wheel.sh` 改包名发布，同机制另有 `-efa` 变体），`create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），非 fork 私有
     - HTTP admin：两版本都有（端点见下「三条接入通道」节）
   - RPC ✓ 而通道 ✗ 时的处理顺序：
-    1. **自封装 .so**：照 `store_py.cpp` 的写法自写封装，link wheel 的 C++ 库，不改 mooncake 源码（两个断点待 E6 验证，见下）
+    1. **自封装 .so**：链 wheel 里的 `store.so`，不改 mooncake 源码。空写已经这样做：本地 `mooncake_pin_api.h` 声明类型，不读 wheel 里不存在的 C++ 头文件（见下）
     2. **替代实现**：原则 5
     3. **自研协议客户端**：最后手段
   - △ = 待 E6 核对
 
-| 能力 | mooncake 0.3.11（部署现状） | mooncake main（目标基线） | 出处 |
+| 能力 | mooncake 0.3.11（历史部署） | mooncake 目标版本 v0.3.13.post1（当前基线；代码里沿用 main 名字） | 出处 |
 |------|------------------------------|----------------------------|------|
 | has_lease（读续租） | RPC ✓ 通道 ✓（`is_exist`） | RPC ✓ 通道 ✓ | D2 F9 |
-| soft pin 事后加（用 upsert 空写的方式） | RPC ✓ 通道 ✗（绑定只有一步式 `upsert_tensor`；HTTP 无写类端点） | RPC ✓ 通道 ✗（同左；自封装 .so 候选） | D2 F1/F12 |
-| hard pin 事后加 | ✗（创建时固化、无 unpin） | ✗ | D2 F1 |
-| can_copy_with_source（指定源复制） | ✗（move 才能指定源） | ✗ | D2 F7 |
-| has_offload / has_promotion（池通道降层/提回） | RPC ✓ 通道 ✓（降层 = 停保活即可，无需调后端；提回 = HTTP `/query_key`） | RPC ✓ 通道 ✓（同左） | D2 §3 |
+| soft pin 事后加（空写） | RPC ✓ 通道 ✗（0.3.11/0.3.12） | RPC ✓ 通道 ✓（方案 1 + replica id 关闭地址复用误判；真机行为见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md)。L2 未接） | D2 §2 |
+| hard pin 事后改标记 | ✗（创建时固化，`pin(HARD)` 拒绝；要 lease 保护用显式 `register_keepalive()` + `renew_once`。lease 是 master 的 `default_kv_lease_ttl`，kvcm 不改） | ✗ | D2 §2 |
+| can_copy_with_source（指定源复制） | ✗（move 才能指定源，且 `source` 必填） | ✗ | D2 F7 |
+| has_offload / has_promotion（池通道降层/提回） | 降层通道 ✗（`/batch_query_keys` 无 disk 字段，主线 #2685 才加）。提回 ✓（`GetReplicaList`） | 降层 ✓：停保活 → 满 lease TTL → 确认 LOCAL_DISK。提回：L3 promote；PromoteFlow ±target；intent 经 TaskEngine，闸仅 copy | D2 §3 |
 | has_per_key_demote（确定性立即降层） | ✗ | ✗ | D2 §3 缺口 |
 | has_task_cancel（copy/move 任务取消） | ✗ | ✗ | D2 §1 审计 P9 |
 | has_local_segment（kvcm 自己挂 DRAM 段） | RPC ✓ 通道 ✓（`setup(global_segment_size)` 启动时挂） | 同左 | D2 §4 |
 | has_local_disk_mount（挂本机盘） | RPC ✓ 通道 ✓（`setup(enable_ssd_offload, ssd_offload_path)` 启动时挂，另有 `unmount_local_disk_segment`） | 同左 | D2 §4 |
 | has_dfs_replica（共享 3FS 副本） | ✗ | RPC ✓ 通道 △（写入路径待 E6 核对） | D2 F13② |
-| has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**（`/batch_query_keys` 零副作用） | D2 F11b |
+| has_admin_query（零副作用核验） | ✗（HTTP 版有副作用：续租 + 计命中） | **HTTP ✓**。副本核验走 `GET /batch_query_keys`，用传输端点比段还在不在。提回打 `GetReplicaList`，完成看每 key 是否已有 memory | D2 F11b |
+| has_tenant_quota（租户配额读） | ✗（channel NO；不是段剩余空间） | HTTP ✓（GET `/api/v1/tenant_quotas`）。租户配额记账，不能当段剩余空间用 | D2 F13 |
 
-- L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 的 DFS 是否可用，本质就是能力分支——本层把它落成显式声明
+空写扩展的版本依赖不止 `SoftPinAction`：`UpsertEnd` 从 0.3.13 起改成 `ObjectMeta`，0.3.14-pre 起有 `has_read_lease` gate；完整版本表见 D2 §2「4. 版本依赖」。
+
+- L2 按能力选路径（**看通道**）：D2 §3 的写穿/写回分支、§4 里仍登记的 DFS 前提，本质就是能力分支——本层把它落成显式声明。retained client 在这份主线上没有 RPC，通道关闭，L2 不选它
 - 同一后端不同版本能力不同（0.3.11 vs main 已在表里）——capability 在适配器初始化时按版本填充，不写死在类上
+- **声明，不探测**：`--capability` / 构造参数选哪张能力表，启动不探 master、不按版本号分叉。目标版本写在文档与部署约定里；flag 与真实 master 不一致时，运行到核验/操作才失败（daemon 对显式 `v0311` 会在进服务前拒启，因为那个 admin 查询有续租副作用）
 
 **接口演进：KeySet（已定方向，待实施）**
 
@@ -301,7 +317,7 @@ stateDiagram-v2
 
 先解释三个容易混淆的东西：
 
-- **locate**：一个函数，输入实例标识，输出「这个实例的每个 rank 对应哪个 seg」（rank 有序的 seg 列表）。复制前必须知道它——key 是按 rank 生成的，每条 key 要发到对应 rank 的 seg 上。它不是某个类，是构造 backend 时注入的参数；生产环境的数据来自实例注册（InstanceWatcher），demo 环境来自 RankTopology 探测
+- **locate**：进程内一份目录，实例 → rank 有序段名单（`InstanceDirectory`）。intent 和 copy / move / remove 的入参没有 segment，操作内部自己 locate。没登记的实例报错，不退回别人的段。`--instance-segs` 只在进程拉起时做初始登记；启动时打 `GET /get_segments_detail`，要求每个配置值满足 `segment_name == te_endpoint == 配置`（否则 copy 认段名、核验认端点会对不上）。生产环境的上下线仍归 InstanceWatcher（本次不做）
 - **SegTopology**：查 master 当前挂了哪些 seg（HTTP `/get_all_segments`）——存储池视角的 seg 全量名单。它不知道 seg 属于哪个实例、哪个 rank
 - **RankTopology**：demo 环境推断「rank ↔ seg」对应关系的探测机制。做法：从启动脚本写的 pidfile 找到 worker 进程树 → 读每个进程监听的 TCP 端口（`ss` 或 `/proc`，带超时）→ 拿端口与 SegTopology 给的 seg 名单比对（端口匹配上的 seg 就是这个进程的）→ 从进程名 `VLLM::Worker_TP<N>` 读出 rank 号 → 得到每个 rank 对应哪个 seg。任何一步对不上都直接报错（拿错对应关系 = 把 KV 复制到错误的机器内存）。生产环境不需要它——实例启动时自己把拓扑注册上来
 
@@ -311,15 +327,15 @@ stateDiagram-v2
 
 | 子件 | 职责 | 包路径 |
 |------|------|--------|
-| StoreClient | store 绑定生命周期（lazy import；connect/close，setup 失败先 close）+ **双通道**：控制类走绑定（create_copy_task / query_task / is_exist / remove…）；查询/观测走 HTTP admin。副本核验当前走绑定通道（有续租副作用）；main 的零副作用核验（`/batch_query_keys`）等升级到 mooncake 主线后接通（has_admin_query） | `client.py` + `http_admin.py` |
+| StoreClient | store 绑定生命周期（lazy import；connect/close，setup 失败先 close）+ **双通道**：控制类走绑定（create_copy_task / create_move_task / batch_remove / query_task / is_exist / batch_get_replica_desc）。副本核验走 `admin_main` 的 `GET /batch_query_keys`。提回仍用绑定的 GetReplicaList 累计命中。软钉空写走 `_get_pyclient_capsule` 拿回已建 client，扩展调 `MasterClient::UpsertStart` / `UpsertEnd`。保留登记的符号这个 wheel 没导出 | `client.py` + `http_admin.py` + `admin_main.py` + `native/` |
 | SegTopology | 查 master 的 seg 名单（见上）；seg、client_id、lease 语义归这里 | `topology.py` |
 | capability 填充 | 按连接上的版本填充（**构造必填**——不许默认冒充 main；目标基线 = **mooncake main**，0.3.11 仅为当前部署约束记录） | `capability.py` |
 
-- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger?)`——`locate`（实例 → rank 有序 seg 列表）以可调用注入：demo 环境 = RankTopology 探测，生产 = L1 InstanceWatcher 注册，backend 不关心来源。本类不 import `SegTopology` / `RankTopology` / `AdminClient`，这三件不是它的字段
+- **组装形态**：`MooncakeBackend(client, key_computer, locate, capability, ledger=None, submit_concurrency=4, executor=None, rpc_timeout_s=30, admin=None, promote_hits=2, lease_ttl_s=10, list_instances=None)`。`locate`（实例 → rank 有序 seg 列表）以可调用注入；`list_instances` 供 `memory_instance` 反查。`admin` 是主线 `GET /batch_query_keys` 客户端，副本核验、降层查盘、软钉取尺寸都用它。提回不拿 offload 端点对 seg 名，仍打 `GetReplicaList`。当前 daemon 用 `InstanceDirectory`（`--instance-segs`）。`RankTopology` 仍是 demo 探测，不是现在的进程入口。生产环境的上下线仍是 L1 InstanceWatcher。backend 不关心来源，本类不 import `SegTopology` / `RankTopology` / `AdminClient`，这三件不是它的字段
 - **copy 实现**（发起式）：前缀 → KeyComputer 算 key → locate 得 seg → `KeyComputer.build_plan` 做 rank 映射（异构 TP 反向展开）→ 逐 key 提交；`query_task` 聚合判定 READY。**rank 映射归引擎侧**——存储适配零 key 格式依赖（换引擎本类不动）
 - **exists 与 copy 目前各自独立算 key**：两个操作在接口上相互独立，同一前缀在一次预热里算两遍。短序列时成本可忽略，但长序列下不是——链式块 hash 逐块串行（token 数 ÷ block_size 次，不能并行），外加 块数 × rank 数 个 key 字符串。不设缓存（长驻进程的缓存增长管理问题更大）；正解见下「接口演进：KeySet」
 - **seg 概念与 lease/client_id 语义归本层**：全是 mooncake 特有——放通用层会把后端概念带进通用接口
-- **一个后端实例 = 一种 (源 TP, 目标 TP, put_step) 组合**：KeyComputer 的「key 按多少 rank 展开」规则在构造期定死（`kvcm/engines/vllm/keys.py::KeyComputer` docstring 记了完整前提链），换组合必须新建实例——编排层持多组合时按组合各建一个，不复用
+- **一个后端实例 = 一种 (源 TP, 目标 TP, put_step) 组合**：KeyComputer 的「key 按多少 rank 展开」规则在构造期定死（`kvcm/engines/vllm/keys.py::KeyComputer` docstring 记了完整前提链），换组合必须新建实例——编排层持多组合时按组合各建一个，不复用。**daemon 也是一种**：`--tp-size` / `--peer-tp-size` / `--put-step` 进程级，只建一个 KeyComputer；要服务多种组合就起多个进程，或编排层自持多 backend（本进程不做）
 - **第二后端候选已登记在案**：昇腾 MemCache（`3rdparty/memcache`；kv-prefetch.md 待定项「生产默认走 MemCache，还是留 Mooncake」）——L3 抽象现在建正是时候；但只建一层接口，第二后端真接入时再修接口，不为假想后端过度设计
 
 #### 三条接入通道（mooncake）
@@ -334,31 +350,29 @@ stateDiagram-v2
    - `ForAdmin` 系列（零副作用核验）只在这面：它们是 master 进程内方法，不注册到 client RPC 面——RPC 调不到，HTTP 是唯一通道
    - 查询类走这面的好处：不用注册 client，kvcm 进程死了也不在 master 留任何状态
    - 版本差异：0.3.11 的 `/batch_query_keys` 走普通 `BatchGetReplicaList`（有续租副作用）；main 走 `BatchGetReplicaListForAdmin`（零副作用）
+   - **客户端分批**：长前缀按请求行约 8KB 切 `GET`（只计 `GET {path} HTTP/1.1`，不含 header）。这是保守上限，**未与 master 真实限制校准**；单 key 编码后超限仍单独发出。超长 key / 极密前缀若踩到上游硬限，整批可能失败——要改就按目标版本实测或改 POST，不在 core 里猜
 3. **C 接口**（`mooncake-store/include/store_c.h`，ctypes 可直调）
    - 数据面操作：put / get / is_exist / remove / register_buffer
    - put 的 config 带完整 pin 支持（`with_hard_pin`、`soft_pin_action` ENABLE/DISABLE/PRESERVE、TTL）——但注释明确这只是发布时的行为，即「写新 key 时挂 pin」：写新 key 是引擎的活，kvcm 不写新 key；kvcm 要的 pin 全是**事后操作**（key 已在池里）
-   - 事后加/解 pin 的唯一通道 = upsert（D2 F3/F12），C 接口只有 put 没有 upsert；copy/move、admin 查询也都不在——缺的接口仍要自封装 .so 补。挂段挂盘不在此列：`setup()` 启动时就能带上，不需要运行时入口
+   - 事后加/解 pin 的通道 = 空写 upsert（D2 F3/F12）。C 接口只有 put，没有 upsert。copy/move 在官方绑定里，副本核验走 HTTP admin。空写用 kvcm 自己的 `_empty_pin.so`，不给 mooncake 打补丁
 
-**自封装 .so**（补空写 upsert：绑定、HTTP、C 接口都没有一步式空写，C++ 的 `UpsertStart` / `UpsertEnd` 有）：
+**自封装 .so**（已落地的缺口只有空写 upsert。保留身份不在这份主线里，不用这个 .so 去补）：
 
-- 写法：照 `store_py.cpp` 的写法——`#include` mooncake 头文件，调 C++ client 类方法，对外暴露 pybind 或 extern "C" 接口；产物放 kvcm 侧，不改 mooncake 源码
-- 单 client 保证（约束见上「三条接入通道」节：store_py 与自封装 .so 必须共用同一 client 实例/UUID）：
-  - 不能走的写法：自封装 .so 自己 `RealClient::create()` 再建一个 → 两个 UUID 两套心跳
-  - **路径 A（首选）：自封装 .so 复用 store_py 已建的 client**
-    - 依据：`MooncakeStorePyWrapper` 的成员 `store_` 是 public（`store_py.cpp:535` @1fc27b6，holder 为 `std::shared_ptr<PyClient>`），另有 public 访问器 `get_real_client()`（`:1647`）
-    - 做法：自封装 .so 用 pybind11 写，函数参数声明为 `MooncakeStorePyWrapper&`；Python 侧把 store_py 建好的 store 对象传进来，pybind11 跨模块按类型名在全局类型表里找到已注册的类型，还原出 C++ 对象 → 经 `store_` / `get_real_client()` 拿到同一个 `RealClient`，调缺口方法
-    - 效果：全进程一个 client 实例、一个 UUID、一套心跳；已有绑定与自封装 .so 缺口方法落在同一 client 上
-    - 前提：自封装 .so 编译用的 pybind11 与 wheel 内 store_py 的 internals 版本一致（不一致则跨模块 cast 查不到类型）；RTTI 开启（wheel 默认开）
-  - **路径 B（退路）：自封装 .so 取代 store_py**——自封装 .so 照 `store_py.cpp` 把用到的绑定面（demo 十来个方法）+ 缺口方法重新绑定一遍，Python 只 import 自封装 .so；天然单 client、不依赖跨模块 cast，代价是复制绑定面
-- 为什么不能 Python 直调（ctypes）：
+- 已落地的空写：有条件可用（v0.3.13.post1）。方案 1 + replica id（关闭地址复用误判）；真机见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md)。L2 未接。
+- 单 client：扩展必须用 `setup` 已建的那一个（`_get_pyclient_capsule`），禁止扩展内再 `RealClient::create()`。
+  - 类型只写到 `master_client_`；偏移已与完整类对过。含 `pyclient.h` / `get_real_client()` 是退路，当前不走。
+  - client_id：方案一（空写写成 kvcm UUID）。借名做不到。
+  - End 失败（已匹配）：不 Revoke，抛异常，可能留 PROCESSING。不匹配才 Revoke。崩溃恢复不做。
+  - 保留身份先不动。
+- 为什么空写不从 Python ctypes 直调：
   - ctypes 能调 C 函数，但造不了 C++ 对象
   - 方法参数和返回是 C++ 类型（`std::string` 的内存布局（短字符串内嵌）、`UUID` struct、`tl::expected` 返回值），在 Python 里按字节拼这些对象 = 手工复刻编译器的类型布局，且布局随 libstdc++ 版本变
-  - 所以中间必须有一层 C++：它用头文件调类方法（布局由编译器保证），对 Python 只暴露 C 类型
-  - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）
+  - 中间这一层 C++ 用本地 `mooncake_pin_api.h` 声明类型，链接 `store.so` 的导出符号。wheel 里没有 mooncake 头文件，链接不读那些头
+  - 备选：`cppyy`（JIT 解析 C++ 头文件直接调类，免手写封装；对 mooncake 头文件的兼容性待验证）。当前空写不用它
 - 两个断点（E6）：
-  1. 符号可见性：x86 0.3.13 wheel 实测 `Client` 类方法本体全部导出（`nm -D`：`BatchUpsert` / `CreateCopyTask` / `CreateMoveTask` 及 `RealClient::upsert_*_helper` 均在，连 `MooncakeStorePyWrapper` 自身符号也导出）；npu 0.3.11 wheel 待测试机复核（同一构建系统，预期一致；符号不导出则此路不通，退回替代实现）
-  2. ABI 匹配：gcc/libstdc++ 与 wheel 构建环境一致性待测试机；路径 A 的 pybind11 对齐：mooncake 锁定 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a），自封装 .so 编译用同版本即可对齐 internals
-- E6 另核：`/query_key` 的续租副作用在核验场景能否接受。另：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），上游原生支持 NPU（v0.3.11 tag 已有 `ascend_transport` 目录）
+  1. 符号可见性：0.3.13.post1 `store.so` 导出 `MasterClient::UpsertStart` / `UpsertEnd` / `UpsertRevoke`。空写扩展链接这三个符号。`get_real_client` 是内联成员，不在动态符号表，当前空写也不调用它。
+  2. ABI 匹配：手写头 + 本机编 so；升 wheel 须重编（无运行时 ABI 闸）。gcc/libstdc++ 与 wheel 构建环境一致性靠同机编。含 `pyclient.h` 的退路才要求 pybind11 **2.13.6**（@1fc27b6 `extern/pybind11` = 58c382a）；当前空写不转换 `MooncakeStorePyWrapper`。详见 D2 §2 手写 ABI 镜像约束。
+- E6 另核：`/query_key` 的续租副作用在核验场景能否接受。保留身份的符号不用再找：1fc27b6 没有 `AddReplicaForRetainedClient`，`kRetained` 是外部 buffer 引用计数。另：demo wheel 的 `create_copy_task` / `batch_get_replica_desc` 为 v0.3.11 原生绑定（`store_py.cpp:2682` / `:2660`），上游原生支持 NPU（v0.3.11 tag 已有 `ascend_transport` 目录）
 
 ### EngineAdapter（引擎适配）
 
@@ -389,8 +403,8 @@ stateDiagram-v2
 |----|--------|------|
 | tasks 任务状态机 | 可丢 | task_id / handle_id（同组任务分组键）/ op / prefix_key / target / status（running/ready/failed/abandoned，写入校验）/ model_id / token_ids / 时间戳；`gc_tasks` 清超龄终态 |
 | keepalive 保活注册表 | 不可丢 | prefix_key / model_id / token_ids（还原 Prefix 必需，重启后续上保活） |
-| replicas 副本台账 | 半可丢 | key / instance / verified_at（可从 master 副本查询重建） |
-| sessions 会话绑定 | 不可丢 | session_id / prefix_key / instance / model_id / token_ids |
+| replicas 副本台账 | 半可丢 | 表在，还没有写入方。key / instance / verified_at（可从 master 副本查询重建） |
+| sessions 会话绑定 | 不可丢 | 表在，还没有写入方。session_id / prefix_key / instance / model_id / token_ids |
 
 - **记账归实现侧（L4 持有，L2 不直接碰）**：copy / query_task / abandon 时由 MooncakeBackend 经 Ledger 迁移状态——记账需要任务号的持久化编码与状态迁移的时机，两样都只在实现侧手里；编排层记账两头都缺还会漏分支
 - **批量写入单事务**（多任务同迁移不出现半新半旧）；只管新建库（kvcm 未部署，不做老库迁移，旧结构文件删除重建）
@@ -404,13 +418,13 @@ key/seg 不落库。输入只有 `status='running'` 的行。输出是内存里�
 - `_plans`：每个任务凭据对应哪个前缀、哪台目标实例、复制计划（哪条 key 发到哪个 seg）——恢复后 `query_task` 靠它继续跟踪
 - `_watch`：哪些凭据处于「等副本」状态（同组里有撞车失败的任务）——恢复后这些凭据只查副本、不再查任务
 
-**恢复范围**：目前只恢复 copy（唯一已实现的操作）。move / promote 实现时要同步补各自的恢复路径——否则重启后这两类任务的跟踪会静默丢失。
+**恢复范围**：恢复 copy 与 move。promote 仍跳过。源段不落库，恢复只重算目标侧 plan。
 
 ```mermaid
 flowchart TD
     In["list_running_tasks<br/>列: task_id, handle_id, op<br/>model_id, token_ids, target"]
     Group["按 handle_id 分组<br/>用 rows 的第一行代表整组"]
-    Gate1{"handle_id 空<br/>或 op 不是 copy<br/>或 token_ids 空"}
+    Gate1{"handle_id 空<br/>或 op 不是 copy/move<br/>或 token_ids 空"}
     Skip1["跳过这组"]
     Calc["Prefix + locate + KeyComputer<br/>keys_for_tokens 然后 build_plan"]
     Gate2{"locate 抛错<br/>或 plan 为空"}
@@ -443,12 +457,12 @@ flowchart TD
 单事件循环 + 全部任务协程化 + `ThreadPoolExecutor` 只执行同步阻塞调用。
 
 - **KvOps 接口 async 化**：`async def exists / copy / query_task / abandon / ……`——等待的源头（轮询 `sleep`、RPC 阻塞）全在 ops 实现内部，只有这一层 async 才能让等待挂起；只在 flow 外层包 async，省不到这些等待
-- **阻塞调用走 executor**：mooncake 同步 RPC、sqlite 读写等，经 `asyncio.to_thread` 交给线程池执行。mooncake 绑定等 RPC 时释放 GIL，executor 内多个 RPC 能真并行
+- **阻塞调用走 executor**：mooncake 同步 RPC、sqlite 读写等，经 `loop.run_in_executor` 交到自建池。mooncake 绑定等 RPC 时释放 GIL，executor 内多个 RPC 能真并行
 - **线程池与任务数解耦**：executor 大小按 RPC 执行密度配（4~8），不随传输闸的名额数变。一个 copy 任务的生命周期以十秒计，其中 RPC 真正在执行的时间只占很小一部分，其余是 `await` 挂起——协程化后 100 个任务挂着也只占这几个线程
 - **backend 共享态（`_plans`/`_watch`）无锁**：事件循环单线程，协程只在 `await` 点切换——字典操作不跨 `await` 就天然原子（纪律写进注释：禁止在 `_plans`/`_watch` 读写之间 `await`）
-- **纪律（反例）**：协程里直接调同步阻塞函数 = 整个事件循环停摆（所有协程一起卡住）。所有阻塞调用必须 `to_thread`
+- **纪律（反例）**：协程里直接调同步阻塞函数 = 整个事件循环停摆（所有协程一起卡住）。阻塞调用用显式 `run_in_executor` 到自建池
 - **RPC 卡死防护**：同步 RPC 在对端无响应时可能永不返回，线程被永久占死。协程侧用 `asyncio.wait_for` 给调用加超时：超时只**放弃等待**并抛 `QueryError`，不中断线程（Python 无法中断 C++ 调用），也不 `abandon`——由上层决定：`query_task` 的 `QueryError` 在 `PrefetchFlow` 里继续轮询到流程超时，`exists` 的直接记为这次 intent 失败。卡死的线程泄漏一个、由泄漏监控暴露。根治靠 RPC 自带超时参数（0.3.11 无，main 有 `MC_RPC_TIMEOUT_MS`，列入 E6）
-- **async 化与 TaskEngine 同批做，不分两步**：签名 async + RPC 包 `to_thread` + `sleep` 换 `asyncio.sleep`、flow 轮询循环改 `await`——约一天工作量。不选「本期 flow 保持同步、并行提交留到以后」：并发提交（`asyncio.gather`）在同步代码里做不了，flow 到时**必须**改成异步——本期写的同步承接就是一份注定被拆掉重写的临时代码，flow 前后写两遍。既然改写躲不过，一次改完（并行提交已随本期落地，见「TaskEngine」节）
+- **async 化与 TaskEngine 同批做，不分两步**：签名 async + RPC 包 `run_in_executor` + `sleep` 换 `asyncio.sleep`、flow 轮询循环改 `await`——约一天工作量。不选「本期 flow 保持同步、并行提交留到以后」：并发提交（`asyncio.gather`）在同步代码里做不了，flow 到时**必须**改成异步——本期写的同步承接就是一份注定被拆掉重写的临时代码，flow 前后写两遍。既然改写躲不过，一次改完（并行提交已随本期落地，见「TaskEngine」节）
 
 **厨房比方**：线程池 = 厨师（就几个，真正下锅的活只有他们炒）；协程 = 点菜单（来一张挂一张，挂一千张也不占厨师）；事件循环 = 前台（收单、叫号，绝不能自己进厨房）。两把闸：前缀闸 = 同时几桌在做（从下单占到上菜）；提交信号量 = 同时几口在点火（点着就让出）。**厨师数决定干活速度，单子数决定能接多少活、等待多便宜**——协程化不是让这批活更快，是让等待与排队免费。
 
@@ -471,6 +485,7 @@ sequenceDiagram
     W->>Ex: exists（不过前缀闸）
     Ex->>M: batch_is_exist
     M-->>Ex: 在池
+    Note over W: PromoteFlow(target=)<br/>已在 target → 直接 ready，跳过下面闸与 copy<br/>仅盘 → promote 等 memory（不过闸）再视需要 copy<br/>下面 loop 仅「需要 copy」时进入
     loop 闸外，直到计划第一条的目标段放得下或超时
         Note over W: 大小用 batch_get_replica_desc，一轮只取一次
         W->>M: GET /query_segment（只查计划第一条的目标段）
@@ -503,20 +518,20 @@ sequenceDiagram
     W->>W: 写 Ledger 终态
     W->>Q: release 前缀闸
     end
-    W->>W: 闸外：注册保活，补发一条 BlockStored（失败只记日志）
+    W->>W: check_promote(target)；闸外注册保活，补发 BlockStored
 ```
 
 - 线程只在 `Ex`（线程池）这一列出现：每个 RPC 执行的几毫秒
-- 协程（W）全程只是一段代码状态，挂起时不占线程——排队 100 个这样的协程也免费
-- `loop 逐 key` 画的是提交信号量的拿还，不是「key 必须一个个串行」。同时在飞的 `create_copy_task` 不超过 4，多出来的 key 在 `S` 上等
-- 等段剩余在 acquire 之前。进闸后、`create_copy_task` 之前再查一次；不够就 release，回到闸外。等闸也吃从开始等待算起的预算：到点还没有任务号就停，不提交。`check_segment_room` 在 `KvOps` 上有默认实现（不占新段，直接通过）；占段的后端 override。编排层总是调用，不探测具体类有没有这个方法。
-- 图的提交和轮询画的是放得下之后的成功路径。失败 / 超时 / 取消同样在终态归还前缀闸。提交信号量在每次 `create_copy_task` 返回时已经还过，不跟前缀闸一起还
+- 协程（W）挂起时不占线程
+- `loop 逐 key` 是提交信号量的拿还，不是 key 必须串行；同时在飞 `create_copy_task` ≤ 4
+- 等段剩余与过闸只发生在需要 copy 时。`check_segment_room` 默认通过；占段后端 override
+- 图的提交/轮询是 copy 成功路径；失败/超时/取消同样归还前缀闸
 
 **线程池大小**：
 
-- **禁用 `to_thread` 默认池**（`min(32, cpu+4)`，大小不可控）——自建 executor 并显式配置
+- **不用 `asyncio.to_thread` 的默认池**（`min(32, cpu+4)`，大小不可控）。阻塞调用是显式 `run_in_executor` 到自建池
 - **RPC executor**：按 RPC 执行密度配（4~8），与传输闸的名额数**不绑定**——传输闸限「同时没做完的预热前缀数」（一个前缀的全部 key 都在 master 上，见下方 TaskEngine 节），线程只为 RPC 执行的那一瞬间服务
-- **Ledger 专用单线程 executor**（`max_workers=1`）：sqlite 调用全部 `to_thread` 到它——天然串行，不用加锁
+- **Ledger 专用单线程 executor**（`max_workers=1`）：sqlite 调用经 `run_in_executor` 到这个池——天然串行，不用加锁
 - **线程卡死监控（未实现，登记 E6）**：线程池的线程数固定，恶化的是「可用线程」——线程卡在无响应的 RPC 里出不来，池的实际并发逐次递减，卡满即服务假死。要监控的是「某次 RPC 调用已经跑了多久还没返回」，而不是线程总数——需要按每次调用记下开始时间（当前没有这份数据）。
   - 当前用 `_rpc` 的 30 秒 `wait_for` 限制等待时间：协程侧最多等 30 秒就报错，**服务不会假死**（任务失败，但池继续接活）；慢性的线程占用仍在
   - 根治靠 mooncake 自带 RPC 超时（0.3.11 无；main 有 `MC_RPC_TIMEOUT_MS` / `MC_RPC_CONNECT_TIMEOUT_MS`）——升级并配置后这个问题自然消失，届时不需额外监控代码
@@ -528,7 +543,7 @@ sequenceDiagram
   - 已经写进 `slots` 的照常落账（取消发生在它们之后）。另一种形状——某个 key 先失败、进到排空阶段再被取消——也照常落账：排空那步吞下取消、先记账再抛。
   - 「取消两次」（shield 记账期间又来一次取消）时记账会中断，那是极端场景，接受丢账——与上一条同源，都是「放弃等待不等于取消在跑的东西」。
   - 不修的理由：`_rpc` 是所有 RPC 的唯一入口，为一个调用点加回调或出参等于改整条通道。它与 `_rpc` 超时后线程继续跑是同一个形状——**放弃等待不等于取消线程**，Python 无法中断在跑的 C++ 调用。
-  - 真要根治，方向是让 `_rpc` 支持「调用结束后把结果交给一个不依赖取消的回调」，届时所有调用点一起受益；这属于通道改造，不在本 PR 范围。
+  - 真要根治，方向是让 `_rpc` 支持「调用结束后把结果交给一个不依赖取消的回调」，届时所有调用点一起受益；这属于通道改造，不在当前实现范围。
 - **同键双开靠 `setdefault` 装槽**：`submit_intent` 写入的唯一前置条件是槽为空——「先 `get` 再赋值」之间有空隙，两个 gRPC 线程同时提交同一键时，输家会覆盖赢家已入队的 PENDING，两个 `_admit` 各入队一次，同一前缀执行两遍。回归测试 `test_install_does_not_overwrite_queued_record` 把 `_records` 换成会停拍的字典来固定时序（`get` 在屏障放开后返回空槽；第二次 `__setitem__` 等 A 已 `queued` 再放行）；裸撞线程撞不出来，窗口只隔几条字节码
 - **启动期 connect 借默认池的例外已消除**：RPC 池在 `connect` 之前创建，`connect` 用同一个池（借一个线程、用完即还，启动期无其他任务争用）
 
@@ -546,7 +561,7 @@ sequenceDiagram
   - 和 `submit_concurrency` 不重复，两把闸管的是不同的东西：
     - 前缀闸卡「已经决定提交、还没到终态的预热前缀」数，即 `max_concurrent`。
     - `submit_concurrency` 只包住 `create_copy_task` 这一次 RPC，返回即还，管建链速率。
-    - 没有前缀闸时，排队前缀会以每次 4 个建链 RPC 的速度全部提交完：master 上叠着所有 plan，每个 handle 每轮 `query_task` 又都要按 key 查一遍（RPC 池只有 4~8 个线程）。
+    - 没有前缀闸时，排队前缀会以每次 4 个建链 RPC 的速度全部提交完：master 上叠着所有 plan，每个 handle 的 `query_task` 用 gather 并发查，整个 backend 共用一把、不超过 4（RPC 池只有 4~8 个线程）。
   - 不按 key 计，也不是带宽管控。带宽归 E15，网卡利用率限速仍不做。
 - **闸外做两件事**（都在 `TaskEngine._wait_then_run`，闸是显式 `acquire` / `release`，没有 `async with`）
   - `exists` 探测：预热的前置检查，毫秒级 RPC，读即续租。
@@ -571,30 +586,33 @@ sequenceDiagram
   - 另一条前缀如果已经提交、但 master 还没在目标段划出缓冲区，`/query_segment` 的已用还没加上，这条剩余看不见它，两条都可能放行。彻底避开要在 master 上预留，或把复制串成一条，代价高。这一点接受：不加锁、不预留，判断只能少失败。
 - **哪些操作不过闸**
   - 轮询占着名额，但不额外发建链。
-  - promote 的触发 RPC 是毫秒级，不过闸；但它的 READY 是核验式轮询，时长由池的提回进度决定，不是毫秒即返。
+  - L3 promote / 已在 target：不过闸。需 copy 时经 TaskEngine 注入路径过闸。
   - D2 §3 的另一条主动路径（读删写，数据经 kvcm）若启用，属 kvcm 发起的传输，要占闸。
 - **重启恢复不占闸（已知窗口）**：`TaskEngine._track` 只轮询 `rebuild` 捞回的 handle，不 acquire 传输闸。重启后旧前缀全部仍在 master 上搬，新预热仍可占满名额。接受这个叠加——让恢复任务去等闸，轮询会被串行化。轮询前用 `target_of` 取出目标实例，READY 后与正常路径一样补发
-- **READY 补发（E14，闸外）**：正常路径在前缀闸释放之后，`_on_ready` 注册保活并按目标实例补一条 `BlockStored`。没有端点或发送抛错只记日志，已经 READY 的预热仍成功，保活照常登记。发布器按实例懒绑定，只在 `TaskEngine.shutdown`（进程退出）时关，不跟实例下线
+- **READY 补发（E14，闸外）**：正常路径在前缀闸释放之后、intent READY 之前，`_on_ready` 先等保活落账（`register_await`），再按目标实例补一条 `BlockStored`。写入失败 / 没有端点 / 发送抛错只记日志，预热仍成功。发布器按实例懒绑定，只在 `TaskEngine.shutdown`（进程退出）时关，不跟实例下线
 - **任务状态机**：队列位置 + Ledger `running` 迁移的组合，不另建状态存储
 - **轻重任务统一协程**：保活、查询、promote 等轻任务也是协程，天然不占线程，且**不过传输闸**（见上）——不分优先级、不设单独通道；`session_end` 类可延迟任务排队无妨
-- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把）——提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍往返时间。窗口上限来自两次分开的真机实验，不是一件事（[../demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md) #16、#17）。10 月 26 日单机（#16）：连不上是 `TRANSFER_FAIL`；窗口 4 节奏化 42/42 全成。10 月 29 日跨机（#17）：主错误是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），master 留内存失败；14 条全成，42 条大约一半失败。这次实验的错误是 master 留内存失败；段剩余预检对得上这个错误类型；它不代替 E15；实验当时也没跑这条预检。#16 的 `TRANSFER_FAIL` 与 #17 不是同一种失败。这把限的是建链 RPC 的在飞数（返回即还），替不了上面的前缀闸。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4=16，正好踩过实测打爆的点。网卡利用率限速（网卡计数器采样）仍归 E15，仍不做，接在同一层信号量上
+- **并发提交（已落地）**：copy 的逐 key 提交用**进程级** `asyncio.Semaphore` 窗口（默认 4，`--copy-submit-concurrency`，所有 copy 共用一把），提交阶段从 N 倍往返时间缩到约（N ÷ 并发度）倍。窗口上限来自真机并发实验，见 [demo/EXPERIMENTS.md](../demo/EXPERIMENTS.md) #16/#17。**上限必须是进程级的**：传输闸允许 4 个前缀同时提交，若每个 copy 各持一把默认 4 的窗口，在飞建链就是 4×4。它只限建链 RPC 的在飞数，不替代前缀闸；网卡利用率限速归 E15。
 - **排队超时**：intent 在队列等待的语义（等多久算放弃）随 E12 intent 字段一起定；执行超时沿用 flow 现有 `timeout_s`
 - **失败态策略**（只留接口，随 E11 细化）：失败后的动作三种——① 重发；② 放弃这批任务，事后把留下的副本清掉（后端没有任务取消能力 P9——做不到中途取消，只能放弃跟踪、事后清副本）；③ 复制中途源实例下线时的处理（D5）。语义引 D2 §1 与 D5，不新造语义
+- **编程错误停收**：连续 3 次，或最后一条消费者退出时，`_accepting=False` 拒新 intent。已经入队、还没被取走的，按 shutdown 同款收成 FAILED（`cancelled (shutdown, never started)`）。编程错误本身仍然向上抛，不吞掉
 
 ### KeepaliveLoop
 
 - **为什么要保活**：mooncake 副本租约默认只有 5~10 秒（`types.h` `DEFAULT_DEFAULT_KV_LEASE_TTL`：0.3.11 = 5000ms，main = 10000ms）——预热完成后副本没人碰，5~10 秒内就可被驱逐；而真实流量晚于这个间隔到达是常态。保活 = 桥接「预热完成 → 首次流量」的空窗，**不是一直保**：窗口到即停租，之后副本冷热由池自己判断
 - **占位策略 = 固定窗口**（READY 后续租一个可配置窗口，窗口到即停租注销）：会话期（依赖 E12 会话信号）与首次命中后停（依赖 E13/E14 命中信号）现在都没有信号，做不了；固定窗口什么都不依赖，且有明确终点（不会把副本变相钉死在热层）。窗口时长参数化，默认 10 分钟只是起步值（真机观察「预热完成到首次流量」的典型间隔后再调）
-- **实现通道**：定期 `exists`（`batch_is_exist`，读即续租）——不依赖 L3 的 `keepalive()` 方法（NotImplementedError，留待将来语义更丰富的保活策略）
+- **实现通道**：`KeepaliveLoop` 定期调 `renew_once` → `exists`（`batch_is_exist` / BatchExistKey，读即续租）。`MooncakeBackend.register_keepalive` / `unregister_keepalive` 只登记/注销同一张 Ledger 表，不改成 ProbeKey
 - **形态**：协程定时器（事件循环内 `asyncio.sleep` 周期触发），不是独立线程
+- **已知限制（量未测）**：默认约每 5s `sweep_once`，对表里每个前缀做一次全 key `batch_is_exist`。请求量与 sweep 延迟没有基线；保活前缀多或单前缀很长时，sweep 可能拖过周期。限流 / 分批 / 按前缀错峰要等真机量过再改，core 不先加策略
+- **同前缀串行化（未做）**：demote 停保活后等 TTL 时，同前缀会授 lease 的调用可打穿等待：`exists` / 预热 / `check_promote` / `promote` / **`pin(SOFT)` 的 native `GetReplicaList`**（pin 的 lease 入口）。修法：前缀级互斥。
 
 ### ReleaseLoop / RetainLoop
 
-只留类骨架——依赖的 `demote` / `retain` / `remove` 在 L4 全是 NotImplementedError，能力接通（E10 后续）前无内容可跑。职责：ReleaseLoop = 软释放 / demote / 主动 Remove 三级（D1 §6）；RetainLoop = retain 与计划下线编排（D2 §4）。
+只留类骨架——不调用已落地的 move / remove / demote。retain 在适配器上通道关闭，直接失败，不登记。职责：ReleaseLoop = 软释放 / demote / 主动 Remove 三级（D1 §6）；RetainLoop = retain 与计划下线编排（D2 §4）。
 
 ### 进程生命周期
 
-- **启动**：`rebuild()` 接通——重启后恢复 running 任务的跟踪（见 L5 节）
+- **启动**：`--admin` 必填，空则在进服务循环前返回 1。`--capability` 默认 `main`（核验走主线零副作用 `GET /batch_query_keys`）；显式 `v0311` 同样在进服务循环前返回 1，那个端点有续租副作用，能力集对不上（能力表是声明，见上「capability 声明」）。`--instance-segs` 启动核对 `segment_name == te_endpoint`。然后 `rebuild()` 接通——重启后恢复 running 任务的跟踪（见 L5 节）
 - **优雅退出**（SIGTERM/SIGINT）五步：
   1. **停收 intent**——gRPC 入口关闭（`IntentGrpcServer.stop()`），`TaskEngine._accepting` 置假，`SubmitIntent` 返回 UNAVAILABLE
   2. **取消在途协程**（`task.cancel()`）——协程在 `await` 点收到 `CancelledError`；flow 捕获后做 abandon 处理（Ledger 记 abandoned；后端无任务取消能力 P9，传输不取消，副本清理归 remove）
@@ -624,11 +642,11 @@ sequenceDiagram
 
 ## 与 E10 / E11 / E15 的对位
 
-- **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest，73 passed + 1 skipped）；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
+- **E10（重构）✅ 已完成**（[PR #67](https://github.com/5x8-40/lake/pull/67)）：L3 抽象 + capability；demo 1577 行重组为 MooncakeBackend + 引擎侧子件 + Ledger；PrefetchFlow + L1 空骨架。测试 `kvcm/tests/`（pytest 全绿，1 例 skip（容器内上游漂移哨兵））；CI 路径隔离（`kvcm/kvcm/` 与 `kvcm/tests/` 改动跑 kvcm 单测，`kvcm/demo/` 改动跑 demo 冒烟，文档与 build.yml 自身不触发语言 job）
 - **E11（进程化）🔁 实施中**（[PR #70](https://github.com/5x8-40/lake/pull/70)）：设计 = 本文「运行时结构」节。**范围切分**：
   - 本期做：进程壳（启动/退出/rebuild 接通）+ TaskEngine + KeepaliveLoop（唯一常驻循环）+ IntentReceiver（gRPC，E12）+ **copy 并发提交**（信号量窗口，见 TaskEngine 节）
-  - 只留类骨架：ReleaseLoop、RetainLoop（依赖的操作全是 NotImplementedError，能力接通前无内容可跑）
-  - 不做：链路利用率限速器（E15 剩余部分）、重发策略、多模型归属判定（多模型接入前置，已登记）、E13。E14 的 BlockStored 补发不在 E11 本期，已在 `kvcm/api/events.py` 接通；移动和删除的事件仍未接
+  - 只留类骨架：ReleaseLoop、RetainLoop（不调用已落地的 move / remove / demote；retain 通道关闭，不登记）
+  - 不做：链路利用率限速器（E15 剩余部分）、重发策略、多模型归属判定（多模型接入前置，已登记）、E13/E14 协议
 - **E11 阶段计划**：
   1. 进程壳 + 状态恢复：Ledger 单线程 executor → 启动时 `rebuild()` 接通 → KeepaliveLoop（固定窗口，协程定时器）→ 优雅退出（协程取消 + abandon 处理）
   2. TaskEngine + flow/ops async 化：intent 占位入口 → `asyncio.Queue` + 前缀闸（默认 4，终态才还）→ 协程消费者直接调 async flow；copy 提交另过进程级提交信号量（返回即还）；KvOps 全方法 async 化 → 终态记账 → 超时处理（复用现有 abandon）

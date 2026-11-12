@@ -46,3 +46,4 @@ class BackendCapability:
     has_local_disk_mount: Capability  # kvcm 自己挂本机盘（setup 时挂）
     has_dfs_replica: Capability  # 共享文件系统副本
     has_admin_query: Capability  # 零副作用副本核验
+    has_tenant_quota: Capability  # 租户配额读接口（不是段剩余空间）

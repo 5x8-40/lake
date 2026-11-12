@@ -2,7 +2,7 @@
 
 来源：[issue #54](https://github.com/5x8-40/lake/issues/54)（KV-CM 遗留问题总清单）。本文是 kvcm 预复制生产化的总结文档：设计决策、潜在问题、工程项三类条目的总登记处——已闭环条目在原地标 ✅、结论指向正式文档，待定条目随讨论与实验更新。
 
-文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D8/D9/D10/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（仅验证 copy 一项的端到端链路）；本文 = 登记处。
+文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D8/D9/D10/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（copy 端到端）与独立实验（soft pin 真机，见 [EXPERIMENTS.md](demo/EXPERIMENTS.md)）；本文 = 登记处。
 
 编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环后在原位置标 ✅，结论落对应正式文档（`design/` 系设计文档 / `demo/` 系 demo 文档）。
 
@@ -68,28 +68,27 @@
 - 引擎事件通道上看不到池副本删除（F10）→ 索引里池副本条目只增不减，条目过时只损性能（F3）
 - GPU 侧有 Removed 事件（F8）
 - 池原生 publisher 有 removed 事件，但 0.3.11 不含、且载荷只说 key 怎么了、不说在哪台机器（F14，E8 已核）——升级后首选索引侧直接订阅解析（D1 §2 方案 b），kvcm 翻译重发为备选
-- 选路方进程形态与 D4 耦合；E11-E14 依赖设计定型，E10/E11 骨架可先行
+- 选路方进程形态与 D4 耦合；E13/E14 仍依赖设计定型。E10、E11（daemon / TaskEngine / KeepaliveLoop）、E12（SubmitIntent / GetTask）已落地
 
 **D2. KV 调度操作集（pin / demote / prefetch / retain / release）**
 
 独立控制面进程对 KV 的完整操作面，每项定语义、与池驱逐策略的优先级、失败处理：
 
-- 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。
-- prefetch：✅ 已验证（`CreateCopyTask` → READY）。
-- pin：READY 后防驱逐——🟡 候选已列出，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §2；lease / soft / hard / 驱逐易混淆点见 [lease-pin-eviction.md](design/lease-pin-eviction.md)
-  - soft pin 级（驱逐时排最后，极端情况仍可逐）——空写 upsert 一个方案：
-    - 好处：不动全局 lease、断线窗口 30 分钟级
-    - 代价：空写通道（Python 绑定没有分离接口）+ client_id 问题
-  - hard pin 级（绝对不可逐）——两个候选：
-    - ① lease 调大 + keepalive：零改动、零client_id 问题；代价 = 全局读租约变长 + kvcm 必须活着续租
-    - ② 读删写：kvcm 失联也安全；代价 = 数据要经过 kvcm 本地 + client_id 问题
-  - 取消方式：① 停续租等过期 / 空写传 false 或 `SoftPinAction::DISABLE` / hard pin 没有 unpin，只能再读删写一遍
-  - 读锁方案已否决：refcnt 是任务级保护，两个版本都没有读者引用 RPC
-  - client_id 问题两个方案并列（空写与读删写都要面对）：
-    - client_id 改归 kvcm：不改 mooncake；语义变（Revoke/`BatchReplicaClear` 权限归 kvcm，kvcm 死期间锁死；死透时逃生门 = 任一 client upsert 把 client_id 改写成自己、接管权限，upsert 不验身份）；与副本存亡无关——两方案下引擎下线行为一致（E5 已闭环）
-    - 借原 client_id UUID：语义不变；需 master 加「key → client_id」查询 RPC（内部数据现成）
-    - 决策条件：mooncake 能不能改（上游 PR / fork，独立成本）+ kvcm 实现语言（E10/E11）
-  - 机制事实：见 D2 文档 F1-F12（pin 形态、upsert 行为、client_id 管辖、lease 与驱逐、UUID 与空写通道）
+- 操作集框架：✅ 已闭环（结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §1）——八项操作 copy/move/keepalive/pin/demote/promote/retain/remove（原子动作 / 元数据标记 / 目的型三类），复合流程由原子操作组合（prefetch = copy+核验+保活注册；会话结束降层 = 停 keepalive+demote；下线迁移 = copy+remove 或 move 一步）；状态记录四类（任务状态机 / 保活注册表 / 副本台账 / 会话绑定）；kvcm 单实例跟随 master，状态存 sqlite。tasks 与 keepalive 有写入方。replicas 与 sessions 表在，还没有写入方。
+- 遗留（归 E14）：move 的源侧 BlockRemoved、目标侧 BlockStored，以及 remove 的 BlockRemoved，等与 E14 发布端合入后接。本次不发。promote 不发事件。
+- 协议：`SubmitIntent` 仍是前缀 × 目标实例；执行走 `PromoteFlow(target=)`（可提回 + copy）。move / pin / demote / remove 无独立 intent，不扩协议。
+- **同前缀串行化（未做；上线前必修）**：同前缀未串行。demote 停保活后等 lease TTL 时，同前缀任何**会授 lease** 的操作都能打穿等待——包括 `exists` / 预热 / `check_promote` / `promote` / **`pin(SOFT)` 的 native `GetReplicaList`**（pin 的 lease 入口）。修法：前缀级互斥。横切 L2/L3。
+- **操作粒度 / 多 flow 未统一（未做）**：copy 核验在 `query_task`；demote sleep+盘核验在 L3；promote 等待在 L2 `PromoteFlow`；move/remove 未拆 flow。TaskEngine 多 flow 分发一并未做（当前 intent 仅一种语义，固定 `PromoteFlow`）。
+- locate：进程内「实例 → rank 有序段名单」。intent 和操作入参没有 segment。没登记的实例报错。
+- remove：**全局删所有副本，不支持 target**。无论 force 都先注销保活。`force=False` 再等满一个 lease TTL，然后 `batch_remove(..., force=False)`。`force=True` 注销保活后立刻 `batch_remove(..., force=True)`，不等；但它只跳过 lease，未完成副本和在途 copy/move 仍会拒删。失败或取消不把登记加回去，注销过就留注销，调用方自己重试，租约可以过期。
+- 保活续租用 BatchExistKey（`renew_once` → `exists` → `batch_is_exist`），不用 ProbeKey。`register_keepalive` / `unregister_keepalive` 只登记或注销 Ledger 里的同一张表；续租由 `KeepaliveLoop` 调 `renew_once`。**lease 是 key 级，保这个 key 的所有副本；target 不是保活维度。**
+- 副本核验用主线 `GET /batch_query_keys`。提回：L3 `promote` 不带 target；`PromoteFlow` 无 target 等 memory，有 target 整包（可套 Prefetch）；TaskEngine intent 一律 `PromoteFlow(target=)`（`exists` 一次后 `run_after_exists`）；闸挡 copy 路径（目标已有副本时 copy 可为 no-op）；`check_promote` 的 `QueryError` 当未就绪。daemon `--admin` 必填；`--capability` 默认 `main`。
+- 软钉空写（有条件可用，**v0.3.13.post1**；L3，不接 L2）：`_empty_pin.so` 空写 Upsert；方案 1 + **replica id**（同 id→End，异 id 才 Revoke；关闭地址复用误判）；链 `store.so`+`libmooncake_store.so`。`pin`：admin 查盘/尺寸 + native `GetReplicaList` 授 lease。升 wheel 须重编 so（无运行时 ABI 闸）。真机见 [demo/EXPERIMENTS.md](demo/EXPERIMENTS.md)；ABI 约束见 D2 §2。
+- prefetch：已验证（`CreateCopyTask` → READY）。
+- pin：L3 `pin(SOFT)` 空写；`pin(HARD)` 拒绝，lease 用 `register_keepalive()`。结论见 [D2-kv-operations.md](design/D2-kv-operations.md) §2。
+  - soft pin：有条件可用；只承诺 0.3.13.post1；0.3.11/0.3.12 通道 NO；0.3.14-pre+ 有 lease gate 不可直接套。
+  - hard pin：创建时固化，事后拒绝；读删写不做。
+  - 取消：soft = `SoftPinAction::DISABLE`；hard 级 lease = `unregister_keepalive` 后等满 TTL。
 - retain：🟡 机制已定，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §4
   - 依据：清理只看副本挂在谁身上（内存副本跟段、盘副本跟登记它的 client），不看 key 的 client_id。要保留的是 KV 本身，不是那块内存
   - 四条可行路，顺序与 D2 时序图一致：
@@ -103,14 +102,14 @@
   - 改 key 的 `client_id` 留不住：改的是鉴权字段，副本还在原段上
   - `#2991` 只是同一个 client_id 的重连窗口。窗口内 Ping 保住的是登记，字节仍在死进程里
   - 长期未命中 → demote 到 SSD，由策略层定。这是防驱逐，不是换 client
-- demote / promote：🟡 设计完成，结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
-  - 框架：语义是原子的，实现是组合动作（池通道或 kvcm 读写组合 + 核验）；存储统一归 mooncake（引擎实例挂本机 SSD 做分层，kvcm 自己不持存储）
-  - demote = 池开 `enable_offload`：
+- demote / promote：结论写在 [D2-kv-operations.md](design/D2-kv-operations.md) §3
+  - 框架：demote 是组合动作；promote 的 L3 只触发；PromoteFlow 整包（有 target 可套 Prefetch）；intent 经 TaskEngine 走整包，闸仅 copy。存储统一归 mooncake
+  - demote：先确认前缀能展开成 key、并且 admin 已配置，再 `unregister_keepalive`。然后等满一个 lease TTL（`--lease-ttl-s`，默认 10，须与 master 的 `default_kv_lease_ttl` 一致；测试床实配过 11s；0.3.11 代码默认 5s，main 默认 10s）。kvcm 不改 master 的这个值。再用 `GET /batch_query_keys` 确认每个 key 的 `local_disk`；DFS（`disk_values`）不算成功，因为 promotion 只从 LOCAL_DISK 提回。不用 `GetReplicaList`（会续租）。没有立刻搬到盘上的 RPC。写回且池不满时仍失败。不读数据落盘，不调 `MountLocalDiskSegment`。失败或取消只恢复原本就有的保活行，且不重置窗口；原来没有保活行不会新建。成功不加回
+  - 池侧前提仍是 `enable_offload`：
     - 写穿 / 写回两模式（≈ HiCache write_through / write_back）
-    - 写回模式须先停保活、等 lease 过期——保活挡住驱逐，也就挡住落盘
   - promote 三条路：
     - `promotion_on_hit`：命中时池被动提回
-    - kvcm 主动①：反复调 `GetReplicaList` 看命中计数，过线就触发
+    - kvcm 主动①：L3 `promote(prefix)` 触发；`PromoteFlow` 无 target 等 memory，有 target 则可再 Prefetch；intent 经 TaskEngine 走带 target 整包
     - kvcm 主动②：读删写自己搬
     - promote 执行端 = 引擎来取（`PromotionObjectHeartbeat`，两版本都有，触发链不变）
   - copy/move 到不了 SSD（disk seg 没有 seg 名，两版本同）
@@ -157,7 +156,7 @@
   - 谁没有：keepalive / pin（不动数据）、retain（不把请求调回源实例；move/copy 那次搬运自己的完成信号另计）、demote（只记台账）、release（通知索引删除）
   - 「本机」= 本机 HBM + 本机池 seg 两层（D1 §3）
 - 保活：🟡 机制已定、策略未定（机制 D2 §1/F9，事实 D1 F15）
-  - 机制已定：keepalive 周期调 `ExistKey` 续租约（lease）——`batch_is_exist` 调用会顺带续租（`ProbeKey` 不续），TTL = master 配置（D2 F9），保护窗口 = 租约时长
+  - 机制已定：`register_keepalive` 登记，`KeepaliveLoop` 调 `renew_once` → `ExistKey` 周期续租约（lease）——`batch_is_exist` 调用会顺带续租（`ProbeKey` 不续），TTL = master 配置（D2 F9），保护窗口 = 租约时长
   - 预复制不续租的话，一个 TTL 窗口内没有读流量就可能被驱逐
   - 约束已定：保活循环必须有界——无限续租事实上等于 pin；kvcm 断线后租约到期自然失效，不残留
   - 策略未定：续多久、何时停——候选 = 会话期 / 固定窗口 / 首流量后停租，未选定
@@ -310,11 +309,11 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 ### B. 服务化重构（骨架可直接开工，接口依赖设计）
 
-- **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），按五层架构重组（L3 原子操作抽象屏蔽后端语义 + L4 mooncake 适配器 + L2 编排层只调 L3），明确状态归属与接口边界，为进程化打基础。🟡 **进行中**——三步（Ledger / L3+L4 / L2+API）已落地，PR 审核中。设计：[code-architecture.md](design/code-architecture.md)
+- **E10. 面向对象重构**——现 precopy 包是面向过程脚本（keys/resolve/common/precopy 四模块函数式），按五层架构重组（L3 原子操作抽象屏蔽后端语义 + L4 mooncake 适配器 + L2 编排层只调 L3），明确状态归属与接口边界，为进程化打基础。✅ **已落地**（Ledger / L3+L4 / L2+API）。设计：[code-architecture.md](design/code-architecture.md)
   - **已知边界（rebuild 任务归属）**：重启恢复（`MooncakeBackend.rebuild`）不区分任务归属——账本里全部 running 任务都按本实例的模型口径重算；多模型/多实例共用同一 Ledger 时会错算。当前单实例单模型无影响；**多模型前必须先加归属判定（model_id 不符则跳过）**。设计文档补全时写入
-  - **后续已定（接口 KeySet 化）**：L3 加 `keys_of(prefix) -> KeySet`（不透明类型），操作方法入参从 Prefix 改为 KeySet——长序列下消除「一次预热算两遍 key」。方案与分层论证见 [code-architecture.md](design/code-architecture.md)「接口演进：KeySet」；本 PR 不动代码，合入后实施
-- **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。骨架可直接开工；intent 接口先用占位，随 E12 定型。分层与模块划分：[code-architecture.md](design/code-architecture.md)
-- **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC 候选，与仓内跨语言 RPC 选型一致）。协议字段依赖 D4 定型；通道骨架可先行。
+  - **后续已定（接口 KeySet 化）**：L3 加 `keys_of(prefix) -> KeySet`（不透明类型），操作方法入参从 Prefix 改为 KeySet——长序列下消除「一次预热算两遍 key」。方案与分层论证见 [code-architecture.md](design/code-architecture.md)「接口演进：KeySet」；当前不动代码，后续实施
+- **E11. 进程化**——一次性脚本 → 常驻服务：接收预热 intent、并发处理多任务、任务状态机（排队/进行/READY/失败）、优雅退出（现 `store.close()` 只修了单次退出崩溃，进程化后生命周期要重构）。✅ **已落地**：daemon、TaskEngine、KeepaliveLoop 已在进程里跑。分层与模块划分：[code-architecture.md](design/code-architecture.md)
+- **E12. 与 router 通信**——intent（预热请求：前缀/目标实例）与 READY/失败回执的通道与协议（gRPC，与仓内跨语言 RPC 选型一致）。✅ **已落地**：`SubmitIntent` / `GetTask`。协议字段里仍依赖 D4 定型的部分没有扩。
 - **E13. 与服务控制面通信**——推理实例部署/销毁事件接入：新实例启动 → 触发热点前缀预热；实例销毁 → 其 seg 副本清理/归属处理（与 D3 耦合；D5 已闭环，见本文）。事件源选型（K8s watch / 部署系统通知）依赖 D4；接入骨架可先行。
   - **实例注册一次交全**（D1 §3b，已定，代码未接）：字段 = 实例 id、rank 有序段列表、补发端点、DP 编号、kind（可空）。管理面分配端点，kvcm 只校验不分配。
   - 与现有启动参数的关系：`--instance-segs` / `--kv-event-endpoint` 保留成 demo 兜底；同一实例不允许两处都登记，启动时报错。

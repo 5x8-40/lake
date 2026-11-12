@@ -1,16 +1,18 @@
 """MooncakeBackend：原子操作接口的 mooncake 实现。
 
 组装两个适配维度的子件：
-- 存储侧：StoreClient（绑定 + HTTP 双通道）、SegTopology、能力集（按版本）
+- 存储侧：StoreClient（绑定 + HTTP 双通道）、能力集（按版本）
 - 引擎侧：KeyComputer（前缀 → key 列表 → rank 映射计划）、实例 → seg
   列表（以 locate 可调用注入——demo 环境 = pidfile/proctitle 探测，生产
   = 实例注册）
 
-任务标识（mooncake 为整数对）在本实现内原样透传，不做字符串化；需要
-写入 Ledger 时由本实现做可逆编码（"hi:lo"）。
+本类不组装 SegTopology。任务标识（mooncake 为整数对）在本实现内原样
+透传，不做字符串化；需要写入 Ledger 时由本实现做可逆编码（"hi:lo"）。
 
-本步落地 copy / exists / query_task；其余操作随能力接线逐个落地，未落
-地的抛 NotImplementedError，通道不具备的抛 UnsupportedCapabilityError。
+已接线：copy / move / remove / exists / query_task /
+register_keepalive / unregister_keepalive / renew_once / demote /
+promote / check_promote / memory_instance / pin(SOFT)。pin(HARD)
+拒绝。retain 通道关闭，开头直接 NotImplementedError。
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Callable, Sequence
 
+from kvcm.backends.mooncake.admin_main import AdminMainError
 from kvcm.backends.mooncake.client import StoreClient, StoreClientError
 from kvcm.backends.mooncake.http_admin import AdminClient, AdminError, SegmentNotFound
 from kvcm.engines.vllm.keys import KeyComputer
@@ -43,7 +46,7 @@ from kvcm.ops.base import (
     VerifyError,
 )
 from kvcm.ops.capability import BackendCapability, Support
-from kvcm.ops.types import InstanceId, PinKind, Prefix
+from kvcm.ops.types import InstanceId, IntentInputError, PinKind, Prefix
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +127,9 @@ class MooncakeBackend(KvOps):
         executor: ThreadPoolExecutor | None = None,
         rpc_timeout_s: float = 30.0,
         admin: AdminClient | None = None,
+        promote_hits: int = 2,
+        lease_ttl_s: float = 10.0,
+        list_instances: Callable[[], Sequence[InstanceId]] | None = None,
     ) -> None:
         """
         client：已 connect 的 StoreClient（控制面身份，global_segment_size=0）。
@@ -131,6 +137,8 @@ class MooncakeBackend(KvOps):
             抛 QueryError，不盲提交。
         key_computer：引擎侧 key 计算器（持展开配置与 rank 映射知识）。
         locate：实例 → rank 有序 seg 列表（targets[i] = rank i 的本机 seg）。
+        list_instances：已登记实例列表，供 ``memory_instance`` 反查；不传则
+            反查恒为 None。
         capability：按连接上的后端版本填充的能力集（必填——能力宣告不
             允许默认冒充，填错版本 = 编排层选错路径）。
         ledger：任务状态记录（可选；不注入则任务状态只留进程内）。
@@ -147,20 +155,38 @@ class MooncakeBackend(KvOps):
             copy 的窗口」——传输闸允许 4 个前缀同时提交，若每个 copy 各持
             一把默认 4 的窗口，在飞建链就是 4×4=16，正好超过 #16 的打爆点
             （单机 14 连发是建链 TRANSFER_FAIL，不是 #17 的
-            NO_AVAILABLE_HANDLE；窗口 4 节奏化 42/42 全成）。所以上限必须
-            是**进程级**的。链路利用率限速器仍归 E15。
+            NO_AVAILABLE_HANDLE；窗口 4 节奏化 42/42 全成）。0.3.11 实测
+            ascend 上 14 连发约半数 TRANSFER_FAIL；#17 跨机同样窗口大约
+            一半失败，主导错误名是 NO_AVAILABLE_HANDLE（max retries reached:
+            10），所以它不是跨机的充分条件。上限必须是**进程级**的，
+            不代替 E15，也不做网卡限速。
         """
         if submit_concurrency <= 0:
             raise ValueError("submit_concurrency must be positive")
+        if promote_hits < 1:
+            raise ValueError("promote_hits must be positive")
+        if lease_ttl_s < 0:
+            raise ValueError("lease_ttl_s must be >= 0")
         self._client = client
+        # 副本核验走主线 GET /batch_query_keys。不设则核验失败，不退回
+        # batch_get_replica_desc。
+        self._admin = admin
+        self._promote_hits = promote_hits
+        # 与 master 的 default_kv_lease_ttl 对齐。main 默认 10s
+        # （DEFAULT_DEFAULT_KV_LEASE_TTL = 10000ms）。kvcm 不改 master 的这个值。
+        # demote 等满这一段：没有马上撤销 lease 的调用，也不查剩余租约。
+        self._lease_ttl_s = lease_ttl_s
         self._keys = key_computer
         self._locate = locate
+        self._list_instances = list_instances
         self._cap = capability
         self._ledger = ledger
         self._submit_concurrency = submit_concurrency
         # 进程级提交信号量：延迟创建（首次 copy 时建）。Semaphore() 构造
         # 不绑循环，首次排队等名额才绑；什么时候创建不是正确性的关键。
         self._submit_sem: asyncio.Semaphore | None = None
+        # 同一 handle 内并发查任务，不超过 4，不另建线程池。
+        self._query_sem: asyncio.Semaphore | None = None
         # 协程侧 RPC 超时（0.3.11 的绑定没有超时参数；main 有
         # MC_RPC_TIMEOUT_MS，届时可与此对齐）。<=0 表示不设超时。
         self._rpc_timeout_s = rpc_timeout_s
@@ -206,6 +232,13 @@ class MooncakeBackend(KvOps):
         """RPC executor（供其他组件复用，避免再建线程池——定稿只要两个
         池：RPC 池 + Ledger 单线程池）。"""
         return self._executor
+
+    async def _expand_keys(self, token_ids: tuple[int, ...]) -> list[str]:
+        """算 key 走已有 RPC 池，不占事件循环。不新建线程池。"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self._executor, self._keys.keys_for_tokens, token_ids
+        )
 
     # ------------------------------------------------------------------
     # 阻塞调用的协程包装
@@ -310,7 +343,9 @@ class MooncakeBackend(KvOps):
         `create_copy_task` 这一次 RPC，返回即还。前者挡住「还没传完就
         继续提交下一个前缀」，后者限建链速率。本信号量是**进程级**的，
         因为闸允许 4 个前缀同时提交，每 copy 各限 4 就会变成 16 个并发
-        建链（#16：14 连发 ConnectToPeer FAILED / TRANSFER_FAIL）。
+        建链（#16：14 连发 ConnectToPeer FAILED / TRANSFER_FAIL；0.3.11
+        实测 14 连发就打爆）。move 的 `create_move_task` 走同一把：两种
+        建链都计入进程级在飞数。
 
         延迟创建：`Semaphore()` 构造时不绑循环（`daemon.py:_serve` 里
         `build_backend` 执行时循环已经在跑，构造绑不绑都不影响），但
@@ -521,17 +556,28 @@ class MooncakeBackend(KvOps):
         if total <= 0:
             return None
         return (probe, total)
+    def _query_gate(self) -> asyncio.Semaphore:
+        """整个 backend 共用一把 query_task 信号量，并发不超过 4。
+
+        不是每个 handle 一把。跨循环复用会
+        ``RuntimeError: bound to a different event loop``，和
+        ``_submit_sem`` 一样。
+        """
+        if self._query_sem is None:
+            self._query_sem = asyncio.Semaphore(min(4, self._submit_concurrency))
+        return self._query_sem
 
     async def copy(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
         """在目标实例本机 seg 为前缀 KV 建副本（发起式；READY 经 query_task）。
 
-        内部展开：前缀 → key 列表（引擎侧）→ 目标实例 seg 列表（locate）
+        调用方只给实例，入参没有 segment。段从进程内目录 ``locate(target)``
+        读。内部展开：前缀 → key 列表（引擎侧）→ 目标实例 seg 列表
         → rank 映射计划（引擎侧）→ 逐 key 发起复制任务。「复制前确认
         warm 已覆盖前缀」的存在性检查归编排层，不在本操作内。
         """
-        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        keys = await self._expand_keys(prefix.token_ids)
         if not keys:
-            raise ValueError(
+            raise IntentInputError(
                 "prefix expands to no keys (shorter than one block?)"
             )
         targets = list(self._locate(target))
@@ -569,7 +615,8 @@ class MooncakeBackend(KvOps):
             # 排空若跑完，已经在 `_rpc` 里的会写槽；排空**自己**被取消时，
             # `gather` 会把没结束的子任务一起取消，它们的号（这一次还在
             # `await _rpc` 的那些）就此丢掉——只有已经写进 `slots` 的能落账
-            # （口径见 design/code-architecture.md「E11 已知遗留」）。
+            # （口径见 design/code-architecture.md 运行时结构
+            # 「取消落在并发提交上」）。
             # 这里不 shield 子任务：那会把最长 `rpc_timeout_s`（30 秒）的
             # 等待带进退出路径。
             #
@@ -597,7 +644,7 @@ class MooncakeBackend(KvOps):
                     # 记账必须完成：已发出的号不落账 = 重启后没人跟踪。
                     # 若这次 shield 也被取消（第二次取消），记账会中断——
                     # 那是「取消两次」的极端场景，接受丢账（登记在
-                    # code-architecture.md「E11 已知遗留」）。
+                    # code-architecture.md 运行时结构「取消落在并发提交上」）。
                     await asyncio.shield(self._record(partial, "running"))
                 except asyncio.CancelledError:
                     raise
@@ -617,7 +664,10 @@ class MooncakeBackend(KvOps):
         task_ids = [t for t in slots if t is not None]
         handle = TaskHandle(op=OpKind.COPY, task_ids=tuple(task_ids))
         self._plans[handle] = (prefix, target, plan, uuid.uuid4().hex)
-        await self._record(handle, "running")
+        try:
+            await asyncio.shield(self._record(handle, "running"))
+        except asyncio.CancelledError:
+            raise
         return handle
 
     async def query_task(self, handle: TaskHandle) -> TaskStatus:
@@ -644,11 +694,14 @@ class MooncakeBackend(KvOps):
         if handle in self._watch:
             # 在途冲突观测态：任务已死（冲突失败，账已记），只等副本到位
             return await self._verify_watch(handle, plan)
+        sem = self._query_gate()
+
+        async def _one(tid: object) -> object:
+            async with sem:
+                return await self._rpc(self._client.query_task, tid)
+
         try:
-            resps = [
-                await self._rpc(self._client.query_task, tid)
-                for tid in handle.task_ids
-            ]
+            resps = list(await asyncio.gather(*(_one(tid) for tid in handle.task_ids)))
         except StoreClientError as e:
             raise QueryError(str(e)) from e
         failed = [r for r in resps if r.status == StoreTaskStatus.FAILED]
@@ -688,23 +741,45 @@ class MooncakeBackend(KvOps):
         await self._finish(handle, "ready")
         return TaskStatus.READY
 
-    async def _verify_missing(self, plan: list[tuple[str, str]]) -> list[str]:
-        """副本核验：每个 key 在其映射目标 seg 上有内存副本；返回缺失明细
-        （空 = 通过）。核验 RPC 失败抛 QueryError（可重试）。
+    @staticmethod
+    def _require_admin_rows(keys: Sequence[str], parsed: dict[str, Any]) -> None:
+        """admin 请求的 key 必须全部返回且 ok；否则是可重试的 QueryError。"""
+        missing = [key for key in keys if key not in parsed]
+        if missing:
+            raise QueryError(
+                "batch_query_keys 短回，缺 key: " + ", ".join(missing[:4])
+            )
+        failed = [
+            (key, parsed[key].error) for key in keys if not parsed[key].ok
+        ]
+        if failed:
+            detail = ", ".join(
+                f"{key}({error or 'ok=false'})" for key, error in failed[:4]
+            )
+            raise QueryError("batch_query_keys 查询失败: " + detail)
 
-        TODO(版本接线)：capability has_admin_query = YES（main）时应切
-        HTTP /batch_query_keys 零副作用通道——当前写死绑定通道，每次
-        核验都给 key 续租（GetReplicaList 副作用），0.3.11 别无选择。
+    async def _verify_missing(self, plan: list[tuple[str, str]]) -> list[str]:
+        """副本核验：每个 key 在其映射目标上有 DRAM 内存副本；返回缺失明细
+        （空 = 通过）。
+
+        走主线 GET /batch_query_keys（零副作用）。段还在不在，用副本描述
+        里的传输端点去比。只用 ``memory``（``values``）；``nof`` 不是 DRAM，
+        不计 READY。不用 batch_get_replica_desc：那条会续租、计命中。
+        查询失败抛 QueryError（可重试）。
         """
+        if self._admin is None:
+            raise QueryError(
+                "副本核验需要主线 GET /batch_query_keys，未配置 admin"
+            )
+        keys = [key for key, _ in plan]
+        try:
+            parsed = await self._rpc(self._admin.batch_query_keys, keys)
+        except (AdminMainError, StoreClientError) as e:
+            raise QueryError(str(e)) from e
+        self._require_admin_rows(keys, parsed)
         missing: list[str] = []
         for key, seg in plan:
-            try:
-                descs = await self._rpc(
-                    self._client.batch_memory_replica_endpoints, [key]
-                )
-                endpoints = descs.get(key, [])
-            except StoreClientError as e:
-                raise QueryError(str(e)) from e
+            endpoints = [m.transport_endpoint for m in parsed[key].memory]
             if seg not in endpoints:
                 missing.append(f"{key} missing on {seg} (have={sorted(endpoints)})")
         return missing
@@ -761,18 +836,22 @@ class MooncakeBackend(KvOps):
     async def exists(self, prefix: Prefix) -> bool:
         """全部 key 在池才为真（batch_is_exist；读即续租）。
 
-        查询本身失败（RPC/单 key -1）抛 QueryError——「查不出来」与
-        「不存在」语义不同：前者调用方可重试，后者才触发重算/预热。
-        返回列表长度与 key 数不一致视为不存在（绑定异常时可能短回）。
+        查询本身失败（返回值不是 0/1/True/False，或列表长度和 key 数
+        不一致）抛 QueryError——「查不出来」与「不存在」语义不同：
+        前者调用方可重试，后者才触发重算/预热。短回不当成不在池。
         """
-        keys = self._keys.keys_for_tokens(prefix.token_ids)
+        keys = await self._expand_keys(prefix.token_ids)
         if not keys:
             return False
         try:
             result = await self._rpc(self._client.is_exist, keys)
         except StoreClientError as e:
             raise QueryError(str(e)) from e
-        return len(result) == len(keys) and all(result)
+        if len(result) != len(keys):
+            raise QueryError(
+                f"batch_is_exist size mismatch keys={len(keys)} results={len(result)}"
+            )
+        return all(result)
 
     def prefix_of(self, handle: TaskHandle) -> Prefix | None:
         """句柄登记的前缀（_plans 第一项）。终态删除登记后为 None——
@@ -823,7 +902,8 @@ class MooncakeBackend(KvOps):
         复轮询以返回值为输入；长度 = 恢复数）。
 
         规则：
-        - 仅恢复 copy（唯一已落地操作）
+        - 恢复 copy 与 move（已落地的任务型操作）；promote 仍跳过。
+          源段不落库，恢复只重算目标侧 plan，供 query_task 核验目标副本
         - 空 handle_id / 空 token_ids / 重算出空 plan：跳过（数据残缺行
           或口径漂移——登记空 plan 会在任务成功后假 READY）
         - 重算失败（实例已不在）：跳过，交由 gc_tasks / 下一次预热
@@ -855,7 +935,7 @@ class MooncakeBackend(KvOps):
             if not handle_id:
                 continue
             r0 = rows[0]
-            if r0.op != OpKind.COPY.value or not r0.token_ids:
+            if r0.op not in (OpKind.COPY.value, OpKind.MOVE.value) or not r0.token_ids:
                 continue
             prefix = Prefix(model_id=r0.model_id, token_ids=r0.token_ids)
             target = InstanceId(r0.target)
@@ -866,8 +946,21 @@ class MooncakeBackend(KvOps):
                 continue
             if not plan:
                 continue
+            # 部分提交的 handle 只落了已发出的任务号；rebuild 按 token_ids
+            # 重算的是全量 plan，若按全量核验会把从未提交的 key 当成缺副本。
+            # 这类 handle 不参与重建（在途任务重启后不再跟踪，下一次
+            # exists / 预热重新判断；见 A07）。
+            all_rows = self._ledger.list_tasks_by_handle(handle_id)
+            if len(all_rows) != len(plan):
+                logger.warning(
+                    "rebuild: skip partial handle %s (%d/%d tasks)",
+                    handle_id,
+                    len(all_rows),
+                    len(plan),
+                )
+                continue
             handle = TaskHandle(
-                op=OpKind.COPY,
+                op=OpKind(r0.op),
                 task_ids=tuple(decode_task_id(r.task_id) for r in rows),
             )
             self._plans[handle] = (prefix, target, plan, handle_id)
@@ -896,37 +989,358 @@ class MooncakeBackend(KvOps):
         self,
         prefix: Prefix,
         target: InstanceId,
-        source: InstanceId | None = None,
+        source: InstanceId,
     ) -> TaskHandle:
-        raise NotImplementedError("move：随保留/搬迁流程落地")
+        """把前缀 KV 从源实例挪到目标实例（一次一个 key）。
 
-    async def keepalive(self, prefix: Prefix) -> None:
-        raise NotImplementedError("keepalive：随保活注册表落地")
+        调用方只给实例，入参没有 segment。内部自己 ``locate(源)`` 和
+        ``locate(目标)``，两边可以是不同的段。与 copy 同形：前缀展开 →
+        rank 映射计划 → 进程级信号量逐 key 提交 → 句柄登记，READY 仍走
+        query_task 的目标侧副本核验。绑定 ``create_move_task(key, source,
+        target)`` 的 source 是段名且必填，所以源实例不能省——段从目录里
+        按 rank 映射出来，不是调用方传入的。
 
-    async def stop_keepalive(self, prefix: Prefix) -> None:
-        raise NotImplementedError("stop_keepalive：随保活注册表落地")
+        提交前要先做容量判断。plan 与 copy 同形，是 ``(key, 目标 seg)``
+        列表：目标段要新占一份。``_admit_new_bytes`` 在
+        ``feat/kvcm-segment-admission``（PR 72），本类不定义它。实例上
+        没有这份可调用对象时，``move`` 在任何 ``create_move_task`` 之前
+        抛出 ``RuntimeError``，错误信息点名 ``_admit_new_bytes``。测试可以
+        往实例上赋一个假实现来走提交路径。删除不占新内存，不走这里。
 
-    async def pin(self, prefix: Prefix, kind: PinKind = PinKind.SOFT) -> None:
-        if kind is PinKind.HARD:
-            if self._cap.hard_pin_after.channel is not Support.YES:
-                raise UnsupportedCapabilityError(
-                    "hard pin 写入时固化，已存在的 KV 无法事后补标（全版本无此能力）"
+        没有实例销毁事件，本方法不被 daemon / TaskEngine 调用。
+        移动成功后，源实例上这份 KV 没有了，要发 BlockRemoved；目标实例要发
+        BlockStored。发布端在 E14 分支。两分支合入后再接。本次 move 不发事件。
+        """
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        plan = self._keys.build_plan(keys, list(self._locate(target)))
+        source_plan = self._keys.build_plan(keys, list(self._locate(source)))
+        # 容量判断在任何 create_move_task 之前。拒绝则一个任务都不发。
+        # 方法本身不在本类：它在 feat/kvcm-segment-admission（PR 72）。
+        admit = getattr(self, "_admit_new_bytes", None)
+        if not callable(admit):
+            raise RuntimeError(
+                "move 在 create_move_task 之前需要 _admit_new_bytes；"
+                "该方法在 feat/kvcm-segment-admission（PR 72），"
+                "本分支没有这个方法"
+            )
+        await admit(plan)
+        moves = [
+            (key, src_seg, tgt_seg)
+            for (key, tgt_seg), (_, src_seg) in zip(plan, source_plan)
+        ]
+        slots: list[object | None] = [None] * len(moves)
+        sem = self._submit_gate()
+        stop = asyncio.Event()
+
+        async def _submit_one(i: int, key: str, src_seg: str, tgt_seg: str) -> None:
+            async with sem:
+                if stop.is_set():
+                    return
+                slots[i] = await self._rpc(
+                    self._client.create_move_task, key, src_seg, tgt_seg
                 )
-            raise NotImplementedError("hard pin：通道具备但尚未接线")
+
+        tasks = [
+            asyncio.create_task(_submit_one(i, key, src_seg, tgt_seg))
+            for i, (key, src_seg, tgt_seg) in enumerate(moves)
+        ]
+        try:
+            if tasks:
+                await asyncio.gather(*tasks)
+        except BaseException as e:
+            # 与 copy 相同：已发出的任务号必须落账，取消不能把它们丢掉。
+            stop.set()
+            try:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            except asyncio.CancelledError:
+                e = asyncio.CancelledError()
+            task_ids = [t for t in slots if t is not None]
+            partial_plan = [plan[i] for i, t in enumerate(slots) if t is not None]
+            handed: TaskHandle | None = None
+            if task_ids:
+                partial = TaskHandle(op=OpKind.MOVE, task_ids=tuple(task_ids))
+                handed = partial
+                self._plans[partial] = (
+                    prefix,
+                    target,
+                    partial_plan,
+                    uuid.uuid4().hex,
+                )
+                try:
+                    await asyncio.shield(self._record(partial, "running"))
+                except asyncio.CancelledError:
+                    raise
+                except BaseException:
+                    pass
+            if isinstance(e, asyncio.CancelledError):
+                raise e
+            raise SubmitError(
+                f"move submit failed after {len(task_ids)}/{len(plan)} tasks "
+                f"(submitted ids: {task_ids}): {e}",
+                handle=handed,
+            ) from e
+        task_ids = [t for t in slots if t is not None]
+        handle = TaskHandle(op=OpKind.MOVE, task_ids=tuple(task_ids))
+        self._plans[handle] = (prefix, target, plan, uuid.uuid4().hex)
+        try:
+            await asyncio.shield(self._record(handle, "running"))
+        except asyncio.CancelledError:
+            raise
+        return handle
+
+    async def _require_ledger(self):
+        if self._ledger is None:
+            raise RuntimeError("保活登记需要 Ledger")
+
+    async def register_keepalive(self, prefix: Prefix) -> None:
+        """登记保活。写入与 KeepaliveLoop.register 同一张 keepalive 表。
+
+        只写登记，不发续租 RPC；周期续租由 KeepaliveLoop 调 renew_once。
+        """
+        await self._require_ledger()
+        await self._in_ledger(self._ledger.register_keepalive, prefix)
+
+    async def unregister_keepalive(self, prefix: Prefix) -> None:
+        """注销保活。同一张表，DELETE 这一条前缀。"""
+        await self._require_ledger()
+        await self._in_ledger(self._ledger.unregister_keepalive, prefix)
+
+    async def renew_once(self, prefix: Prefix) -> bool:
+        """对前缀执行一次续租：exists → BatchExistKey（不改成 ProbeKey）。
+
+        返回是否全部 key 仍在池；RPC 失败按 exists 的约定抛 QueryError。
+        """
+        return await self.exists(prefix)
+
+    async def pin(
+        self, prefix: Prefix, kind: PinKind = PinKind.SOFT, *, enable: bool = True
+    ) -> None:
+        if kind is PinKind.HARD:
+            # hard pin 标记创建时固化，事后设置不了。登记保活不是 hard pin，
+            # 只是有窗口的 lease 保护；不要用 pin(HARD) 冒充它。
+            raise UnsupportedCapabilityError(
+                "hard pin 不能事后设置；要 lease 保护请显式调 register_keepalive()"
+            )
+        # soft pin 空写是“有条件可用”：本 PR 目标版本没有 has_read_lease
+        # 门槛，同尺寸会走 Case B；这里只保证 Case B 的前置条件。
+        # 方案 1 + replica id（D2 §2）：admin 查盘/size/address（零副作用）；
+        # native GetReplicaList 取旧 id 并授 lease，UpsertStart 后比 id——
+        # 相同只 End，不同才 Revoke。不再单独 exists/renew_once（避免与
+        # GetReplicaList 重复授 lease）。不 register_keepalive。
+        # **未确认假设**：单 slice（put_step=1）；admin 字段与池一致。
+        # admin 的 memory 只含 DRAM；NoF 单独存。memory+NoF 可空写；
+        # NoF-only 在 len(memory)!=1 拒绝。
         if self._cap.soft_pin_after.channel is not Support.YES:
             raise UnsupportedCapabilityError(
-                "soft pin 事后加：通道不具备（自封装 .so 接线前）"
+                "soft pin 事后加：这个能力集的通道不具备"
             )
-        raise NotImplementedError("soft pin：通道具备但尚未接线")
+        if getattr(self._keys, "put_step", 1) != 1:
+            raise UnsupportedCapabilityError(
+                "soft pin 空写只支持 put_step=1（单 slice）；当前 put_step="
+                f"{getattr(self._keys, 'put_step', '?')}"
+            )
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        if self._admin is None:
+            raise QueryError("软钉取尺寸需要主线 GET /batch_query_keys")
+        try:
+            parsed = await self._rpc(self._admin.batch_query_keys, keys)
+        except (AdminMainError, StoreClientError) as e:
+            raise QueryError(str(e)) from e
+        self._require_admin_rows(keys, parsed)
+        blocked = [
+            key
+            for key in keys
+            if parsed[key].disk_replicas > 0
+            or bool(parsed[key].local_disk_endpoints)
+        ]
+        if blocked:
+            raise StoreClientError(
+                "有盘副本，空写收尾盖不住它们: " + ", ".join(blocked[:4])
+            )
+        sizes: list[int] = []
+        addresses: list[int] = []
+        for key in keys:
+            memory = list(parsed[key].memory)
+            if len(memory) != 1:
+                raise StoreClientError(
+                    f"soft pin 只支持单内存副本，没有钉上: {key} memory={len(memory)}"
+                )
+            view = memory[0]
+            if view.size is None or view.buffer_address is None:
+                raise QueryError(
+                    f"软钉读不到原尺寸/地址，没有钉上: {key}"
+                )
+            sizes.append(view.size)
+            addresses.append(view.buffer_address)
+        await self._rpc(
+            functools.partial(
+                self._client.soft_pin, keys, sizes, addresses, enable=enable
+            )
+        )
 
     async def demote(self, prefix: Prefix) -> None:
-        raise NotImplementedError("demote：随释放流程落地")
+        """停保活 → 睡满 ``lease_ttl_s`` → 用 ``GET /batch_query_keys`` 确认 LOCAL_DISK。
 
-    async def promote(self, prefix: Prefix, target: InstanceId) -> TaskHandle:
-        raise NotImplementedError("promote：随提回流程落地")
+        ``lease_ttl_s`` 须与 master ``default_kv_lease_ttl`` 一致；无立即撤租、
+        不查剩余租约。不用 ``GetReplicaList`` / ``batch_get_replica_desc``（会续租）。
+        每 key 须有 LOCAL_DISK；DFS 不算。不读数据落盘、不挂盘。展开失败或无
+        admin 在 unregister 前就失败。失败/取消只恢复原先保活行与原
+        ``registered_at``；原先无行不新建；成功不加回。
+        """
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        if self._admin is None:
+            raise QueryError("降层查盘副本需要主线 GET /batch_query_keys")
+        if self._cap.has_offload.channel is not Support.YES:
+            raise UnsupportedCapabilityError(
+                "当前能力集没有盘副本字段，不能降层"
+            )
+        await self._require_ledger()
+        registered_at = await self._in_ledger(
+            self._ledger.keepalive_registered_at, prefix
+        )
+        await self.unregister_keepalive(prefix)
+        try:
+            await asyncio.sleep(self._lease_ttl_s)
+            try:
+                parsed = await self._rpc(self._admin.batch_query_keys, keys)
+            except (AdminMainError, StoreClientError) as e:
+                raise QueryError(str(e)) from e
+            self._require_admin_rows(keys, parsed)
+            missing = [key for key in keys if parsed[key].local_disk_replicas < 1]
+            if missing:
+                raise VerifyError(
+                    "demote: 还没有 LOCAL_DISK 副本，降层未完成: "
+                    + ", ".join(missing[:4])
+                )
+        except asyncio.CancelledError:
+            try:
+                await self._restore_demote_keepalive(prefix, registered_at)
+            except BaseException:
+                pass
+            raise
+        except (QueryError, VerifyError):
+            await self._restore_demote_keepalive(prefix, registered_at)
+            raise
+
+    async def _restore_demote_keepalive(
+        self, prefix: Prefix, registered_at: float | None
+    ) -> None:
+        """只把停之前就有的保活行按原 registered_at 插回去。"""
+        if registered_at is None:
+            return
+        await self._in_ledger(
+            self._ledger.restore_keepalive, prefix, registered_at
+        )
+
+    def _require_promotion(self) -> None:
+        if self._cap.has_promotion.channel is not Support.YES:
+            raise UnsupportedCapabilityError("提回通道不具备")
+
+    async def promote(self, prefix: Prefix) -> None:
+        """打 ``promote_hits`` 次 GetReplicaList 触发提回；不验证、不等待、不带 target。
+
+        落点由池派给盘副本登记 client。完成由 ``PromoteFlow`` 轮询
+        ``check_promote``（每 key 至少一处 memory）。
+        """
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        self._require_promotion()
+        for _ in range(self._promote_hits):
+            await self._rpc(self._client.batch_memory_replica_endpoints, keys)
+
+    async def check_promote(
+        self, prefix: Prefix, target: InstanceId | None = None
+    ) -> bool:
+        """前缀 memory 是否就绪（见 ``KvOps.check_promote``）。
+
+        查询本身会继续累计 promotion 命中，属于预期副作用。
+        ``target`` 给定且 locate/build_plan 失败时返回 False（不当作
+        任意 memory 命中）。
+        """
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        self._require_promotion()
+        last = await self._rpc(
+            self._client.batch_memory_replica_endpoints, keys
+        )
+        if target is None:
+            return all(bool(last.get(key)) for key in keys)
+        return self._memory_matches_instance(keys, last, target)
+
+    async def memory_instance(self, prefix: Prefix) -> InstanceId | None:
+        """返回任一已登记、且 ``build_plan`` 下每 key 落在对应 rank seg 的实例。
+
+        用 KeyComputer 做 key→rank→seg 映射，不只看「实例任意 seg 上有
+        memory」。未注入 ``list_instances``、locate 脏到 ``build_plan``
+        失败、或计划 seg 不在 memory 端点里，返回 None。
+        """
+        if self._list_instances is None:
+            return None
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        self._require_promotion()
+        last = await self._rpc(
+            self._client.batch_memory_replica_endpoints, keys
+        )
+        if not all(bool(last.get(key)) for key in keys):
+            return None
+        for inst in self._list_instances():
+            if self._memory_matches_instance(keys, last, inst):
+                return inst
+        return None
+
+    def _memory_matches_instance(
+        self,
+        keys: list[str],
+        last: dict[str, list[str]],
+        inst: InstanceId,
+    ) -> bool:
+        try:
+            plan = self._keys.build_plan(keys, list(self._locate(inst)))
+        except IntentInputError:
+            return False
+        return all(seg in last.get(key, []) for key, seg in plan)
 
     async def retain(self, prefix: Prefix, target: InstanceId | None = None) -> TaskHandle:
         raise NotImplementedError("retain：做法见 D2 §4，尚未接通")
 
-    async def remove(self, prefix: Prefix) -> None:
-        raise NotImplementedError("remove：随删除流程落地")
+    async def remove(self, prefix: Prefix, force: bool = False) -> None:
+        """删除该前缀展开出的全部 key，每个 key 的全部副本一起删；不支持 target。
+
+        无论 force，都先 ``unregister_keepalive``。``force=False`` 再等满一个
+        ``lease_ttl_s``，然后 ``batch_remove(..., force=False)``。
+        ``force=True`` 注销保活后立刻 ``batch_remove(..., force=True)``，不等。
+        失败或取消不把保活加回去：停过就留停。调用方看到原因后自己重试，
+        租约可以过期。成功路径也不加回。
+        不占新内存，不调用 ``_admit_new_bytes``。
+        """
+        keys = await self._expand_keys(prefix.token_ids)
+        if not keys:
+            raise IntentInputError(
+                "prefix expands to no keys (shorter than one block?)"
+            )
+        await self.unregister_keepalive(prefix)
+        if not force:
+            await asyncio.sleep(self._lease_ttl_s)
+        await self._rpc(self._client.batch_remove, keys, force)

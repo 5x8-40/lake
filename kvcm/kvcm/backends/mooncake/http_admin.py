@@ -9,7 +9,10 @@ from __future__ import annotations
 import re
 import urllib.error
 import urllib.request
+from typing import Callable
 from urllib.parse import quote
+
+from kvcm.backends.mooncake.admin_main import MainlineAdmin
 
 # Capacity 那一行冒号前有一个空格（0.3.11 rpc_service.cpp 与主线
 # master_admin_service.cpp::HandleQuerySegment 正文相同）。\s* 把
@@ -43,12 +46,17 @@ class SegmentNotFound(AdminError):
     """
 
 
-class AdminClient:
-    """master 管理端点客户端。"""
+class AdminClient(MainlineAdmin):
+    """master 管理端点客户端（段容量 + 主线只读查询）。"""
 
-    def __init__(self, base_url: str, *, timeout: float = 5.0) -> None:
-        self._base = base_url.rstrip("/")
-        self._timeout = timeout
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        timeout: float = 5.0,
+        fetcher: Callable[[str], str] | None = None,
+    ) -> None:
+        super().__init__(base_url, timeout=timeout, fetcher=fetcher)
 
     def get_text(self, path: str) -> str:
         """GET 端点返回文本（如 /get_all_segments 的行列表）。"""

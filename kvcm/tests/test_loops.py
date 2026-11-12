@@ -1,6 +1,6 @@
 """KeepaliveLoop 检查：固定窗口保活、到期注销、重启恢复、协程生命周期。
 
-fake KvOps（离线可跑）：脚本化 exists。
+fake KvOps（离线可跑）：脚本化 renew_once。
 """
 
 from __future__ import annotations
@@ -36,6 +36,9 @@ class FakeOps(KvOps):
             raise self._error
         return self._present
 
+    async def renew_once(self, prefix) -> bool:
+        return await self.exists(prefix)
+
     # KeepaliveLoop 不触及以下操作；抽象方法必须实现（abc 要求）
     async def copy(self, prefix, target):
         raise NotImplementedError
@@ -54,22 +57,48 @@ def _ledger():
     return Ledger(path), path
 
 
-def test_register_then_sweep_renews_via_exists() -> None:
+def test_register_then_sweep_renews_via_renew_once() -> None:
     led, path = _ledger()
     try:
         ops = FakeOps(present=True)
         loop = KeepaliveLoop(ops, led, interval_s=999, window_s=600)
         loop.register(_P)
         run(loop.sweep_once())
-        assert ops.calls == [_P]  # 一轮续租 = 一次 exists（读即续租）
+        assert ops.calls == [_P]  # 一轮续租 = 一次 renew_once（读即续租）
         assert led.list_keepalive() == [_P]  # 仍在保
         loop.close()
     finally:
         led.close()
 
 
+def test_sweep_skips_renew_if_unregistered_after_snapshot() -> None:
+    """快照之后行已删，不要再 renew_once 续租。"""
+    led, path = _ledger()
+    try:
+        ops = FakeOps(present=True)
+        loop = KeepaliveLoop(ops, led, interval_s=999, window_s=600)
+        loop.register(_P)
+        real = led.list_keepalive_records
+
+        def snapshot():
+            rows = real()
+            led._unregister_keepalive_sync(_P)
+            return rows
+
+        led.list_keepalive_records = snapshot  # type: ignore[method-assign]
+        run(loop.sweep_once())
+        assert ops.calls == []
+        loop.close()
+    finally:
+        led.close()
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
+
+
 def test_window_expiry_unregisters() -> None:
-    """窗口到：停租注销，不再调 exists（保活必须有界）。"""
+    """窗口到：停租注销，不再调 renew_once（保活必须有界）。"""
     led, path = _ledger()
     try:
         ops = FakeOps(present=True)
@@ -85,7 +114,7 @@ def test_window_expiry_unregisters() -> None:
 
 
 def test_present_false_unregisters() -> None:
-    """exists 返回 False（副本已不在池）：注销——续租没有对象。"""
+    """renew_once 返回 False（副本已不在池）：注销——续租没有对象。"""
     led, path = _ledger()
     try:
         loop = KeepaliveLoop(FakeOps(present=False), led, interval_s=999, window_s=600)
@@ -110,6 +139,46 @@ def test_query_error_skips_round_keeps_registration() -> None:
         loop.close()
     finally:
         led.close()
+
+
+def test_reregister_keeps_registered_at() -> None:
+    """再次登记不把窗口拨回现在。"""
+    led, path = _ledger()
+    try:
+        led.register_keepalive(_P)
+        first = led.list_keepalive_records()[0].registered_at
+        time.sleep(0.02)
+        led.register_keepalive(_P)
+        rows = led.list_keepalive_records()
+        assert len(rows) == 1
+        assert rows[0].registered_at == first
+    finally:
+        led.close()
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_restore_keepalive_leaves_newer_row_alone() -> None:
+    """行已经在时，恢复不把新窗口盖回旧时间。"""
+    led, path = _ledger()
+    try:
+        led.register_keepalive(_P)
+        led._backdate_keepalive(seconds=100)
+        old = led.list_keepalive_records()[0].registered_at
+        led.unregister_keepalive(_P)
+        led.register_keepalive(_P)
+        fresh = led.list_keepalive_records()[0].registered_at
+        assert fresh != old
+        led.restore_keepalive(_P, old)
+        assert led.list_keepalive_records()[0].registered_at == fresh
+    finally:
+        led.close()
+        import os
+
+        if os.path.exists(path):
+            os.unlink(path)
 
 
 def test_restart_recovery_needs_no_special_casing() -> None:
@@ -150,6 +219,30 @@ def test_start_stop_lifecycle() -> None:
             assert len(ops.calls) >= 1
             await loop.stop()
             assert led.list_keepalive() == [_P]  # 注册不撤销
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+
+
+def test_stop_during_idle_sleep_returns_quickly() -> None:
+    """空闲时 stop 取消 sleep，不必等完这一轮 interval。"""
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            loop = KeepaliveLoop(FakeOps(), led, interval_s=3.0, window_s=600)
+            loop.start()
+            await asyncio.sleep(0.05)
+            started = time.monotonic()
+            await loop.stop()
+            elapsed = time.monotonic() - started
+            assert elapsed < 0.5, f"stop 等了 {elapsed:.2f}s，接近 interval"
             loop.close()
         finally:
             led.close()
@@ -230,8 +323,8 @@ def test_sweep_failure_is_logged(capsys) -> None:
     assert "backend gone" in err, f"日志里没有根因: {err!r}"
 
 
-def test_exists_query_error_is_logged(capsys) -> None:
-    """`exists` 抛 QueryError（RPC 失败）同样要留痕，不能静默跳过。"""
+def test_renew_query_error_is_logged(capsys) -> None:
+    """`renew_once` 抛 QueryError（RPC 失败）同样要留痕，不能静默跳过。"""
 
     class QueryFailingOps(FakeOps):
         async def exists(self, prefix):
@@ -255,7 +348,7 @@ def test_exists_query_error_is_logged(capsys) -> None:
 
     run(scenario())
     err = capsys.readouterr().err
-    assert "keepalive exists failed" in err, f"QueryError 没打日志: {err!r}"
+    assert "keepalive renew failed" in err, f"QueryError 没打日志: {err!r}"
 
 
 def test_interval_and_window_must_be_positive() -> None:
@@ -299,6 +392,10 @@ def test_register_before_start_does_not_block_caller() -> None:
 
         def list_keepalive_records(self):
             return self._real.list_keepalive_records()
+
+        @property
+        def executor(self):
+            return self._real.executor
 
     led, path = _ledger()
     try:
@@ -405,3 +502,55 @@ def test_register_failure_is_counted_and_logged(capsys) -> None:
     err = capsys.readouterr().err
     assert "keepalive register failed" in err, f"没打日志: {err!r}"
     assert "db gone" in err, f"日志没根因: {err!r}"
+
+
+def test_register_await_row_present_when_returns() -> None:
+    """register_await 返回时 keepalive 行已在账本里（消掉路上空窗）。"""
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            loop = KeepaliveLoop(FakeOps(), led, interval_s=999, window_s=600)
+            loop.start()
+            await loop.register_await(_P)
+            assert led.list_keepalive() == [_P]
+            assert loop.register_failures == 0
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+
+
+def test_register_await_failure_counted_not_raised(capsys) -> None:
+    """register_await 写失败：不抛、计数、打日志（预热侧仍可 READY）。"""
+
+    async def scenario():
+        led, path = _ledger()
+        try:
+            class BrokenLedger(type(led)):
+                def register_keepalive(self, prefix):
+                    raise RuntimeError("db gone")
+
+            broken = BrokenLedger.__new__(BrokenLedger)
+            broken.__dict__.update(led.__dict__)
+            loop = KeepaliveLoop(FakeOps(), broken, interval_s=999, window_s=600)
+            loop.start()
+            await loop.register_await(_P)  # 不抛
+            assert loop.register_failures >= 1
+            loop.close()
+        finally:
+            led.close()
+            import os
+
+            if os.path.exists(path):
+                os.unlink(path)
+
+    run(scenario())
+    err = capsys.readouterr().err
+    assert "keepalive register failed" in err
+    assert "db gone" in err

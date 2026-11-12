@@ -1,8 +1,8 @@
 # va-precopy 实验总表与踩坑记录
 
-> **demo 记录**：precopy 预热验证（kvcm 八项操作中仅 **copy** 一项）的实验史。生产化设计见 [../design/](../design/)；kvcm 全貌见 [../README.md](../README.md)。
+> **demo 记录**：precopy 预热验证（kvcm 八项操作中 **copy** 一项）的实验史；文末另附 soft pin 真机记录（独立实验）。生产化设计见 [../design/](../design/)；kvcm 全貌见 [../README.md](../README.md)。
 
-2026-10-08 ~ 11-02 全量实验史（含已撤回证据；总表至 #24），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。
+2026-10-08 ~ 11-02 copy 实验史（含已撤回证据；总表至 #24），是 [README.md](README.md)「验证状态」的完整依据；复现操作见 [REPRODUCE.md](REPRODUCE.md)。文末 soft pin 真机是 2026-11-09/10 的独立记录。
 
 模型除注明外均为 `/data/models/Qwen3-VL-8B-w8a8c16`（GQA 8 KV head，block_size 128，`PYTHONHASHSEED=0`）；主机 245=7.242.105.245，217=7.242.105.217（**#17 起另用** 45=`7.242.104.45`，225=`7.242.110.225`）；容器镜像 `quay.io/ascend/vllm-ascend:v0.26.0rc1`；mooncake wheel `mooncake_transfer_engine_npu-0.3.11.post1`（除注明外）；master 在源机宿主机 `:50088`。
 
@@ -200,12 +200,12 @@ pid。途中根出 8 个坑，全部对代码验证：
 ### 工程含义（供 PR70 reviewer）
 
 1. **异步编排 ≠ 无限并发安全**。`asyncio` 只让调用方不堵；Mooncake/Ascend 路径在句柄耗尽时直接 `FAILED`，不会自动排队到成功。
-2. 本床 **14 任务全成、42 任务不可靠**。42 的主错误是 `NO_AVAILABLE_HANDLE`（master 留内存失败，最多重试 10 次），不是 #16 的建链 `TRANSFER_FAIL`。软闸默认 4 限的是在飞建链 RPC，不看段剩余。
-3. **生产风险**：一个稍长前缀在 TP≥2 时很容易展开到数十 key；若 Router 突发多个 prefetch intent，或单 intent 内一次铺开全部 key，会稳定踩到本崖。PR70 现状（`max_concurrent=4` + 进程级 `submit_concurrency`）是止血，**不是**可承诺的 SLO 级吞吐。
+2. **公开 wheel 未暴露「建链上限 = N」配置**；能确定的是：kvcm 软闸默认 **4**；底层对 `NO_AVAILABLE_HANDLE` **最多重试 10 次**；有效安全区靠实测——本拓扑 **14 任务全成、42 任务不可靠**。42 的主错误是 `NO_AVAILABLE_HANDLE`（master 留内存失败，最多重试 10 次），不是 #16 的建链 `TRANSFER_FAIL`。
+3. **生产风险**：一个稍长前缀在 TP≥2 时很容易展开到数十 key；若 Router 突发多个 prefetch intent，或单 intent 内一次铺开全部 key，会稳定踩到本崖。当时的 `submit_interval_s=0.2` 已删除，由进程级 `submit_concurrency`（默认 4）取代（`max_concurrent=4` + `submit_concurrency`）。这是止血，**不是**可承诺的 SLO 级吞吐。
 4. **E15 为阻塞项**：需要按窗口推进的限速器 + 明确背压/重试语义；仅靠协程多开会把传输子系统打进降级态（连带打伤引擎自身 put，见 #16 坑 8）。
 5. **异构 TP2↔TP4 本轮未测**：Qwen3.8-27B hybrid 被 gate；要复验异构需换非 hybrid 模型（或上游解除 gate）。
 
-代码锚点：`kvcm/backends/mooncake/backend.py`（`submit_concurrency`）、`kvcm/task_engine.py`（`max_concurrent` 传输闸）、Mooncake `client_service` 对 `NO_AVAILABLE_HANDLE` 有限重试（错误文案 `max retries reached: 10`）。
+代码锚点：`kvcm/backends/mooncake/backend.py`（`submit_interval_s` 已删除，连发由 `submit_concurrency` 窗口取代）、`kvcm/task_engine.py`（`max_concurrent` 传输闸）、Mooncake `client_service` 对 `NO_AVAILABLE_HANDLE` 有限重试（错误文案 `max retries reached: 10`）。
 
 ### #18–#22 续测后的结论与生产启示（2026-11-02）
 
@@ -321,6 +321,8 @@ pid。途中根出 8 个坑，全部对代码验证：
 - 更贴切：半占用的小 segment + 并发 `CopyStart→AllocateFrom` 时，**连续可分配洞 / 并发预留**扛不住；放大 cap 提高余量后压住。
 
 参考实现：Mooncake `MasterService::CopyStart` → `AllocateFrom` → `OffsetBufferAllocator::allocate` → `NO_AVAILABLE_HANDLE (-200)`。
+代码锚点：`kvcm/backends/mooncake/backend.py`（`submit_interval_s` 已删除，连发由 `submit_concurrency` 窗口取代）、`kvcm/task_engine.py`（`max_concurrent` 传输闸）、Mooncake `client_service` 对 `NO_AVAILABLE_HANDLE` 有限重试（错误文案 `max retries reached: 10`）。
+
 
 ## 实验实录 · 2026-11-02 · #23（PR71 E14：READY → BlockStored）
 
@@ -408,4 +410,57 @@ pid。途中根出 8 个坑，全部对代码验证：
 ### 结论
 
 **段容量准入在真 Mooncake 路径上按设计拦住了必败拷贝**：真 `/query_segment` 剩余 + 真副本大小 → 闸外等待 → 超时停在提交前，零 `create_copy_task`。与 #18/#22「NAH 不等于字节见底」不矛盾——本特性只挡「客户端已能看见 need>remaining」的明显塞不下，挡不住分配洞/并发预留类 NAH。
- (docs(kvcm): 登记 #24 段容量准入真测——need>remaining 不提交)
+
+## soft pin 真机记录（Mooncake v0.3.13.post1，2026-11-09/10）
+
+> 独立实验，不属于上面的 copy demo；soft pin 的设计、地址复用误判的关闭方式与手写 ABI 镜像约束见 [D2 §2](../design/D2-kv-operations.md)。本文只记录环境、ABI 问题、用例和未覆盖项。
+
+### 环境
+
+| 项 | 值 |
+|---|---|
+| 日期 | 2026-11-09（含晚间补测） |
+| 机 | `7.242.104.45`；跨机 put 在 `7.242.110.225` |
+| 容器 | `vllm-ascend-lake-test`（两侧同版本） |
+| mooncake | **0.3.13.post1**（master+client） |
+| master | `:50088`；metrics `:9003`；`default_kv_lease_ttl=11000` |
+| 冒烟 | 容器内 `/tmp/lake-a14`（分支拷贝后本地编 `_empty_pin.so`）；脚本未入仓 |
+
+### ABI / 链接问题
+
+| 问题 | 处理 |
+|---|---|
+| 只链 `store.so` → `Upsert*` 未定义 | 同链 `libmooncake_store.so` |
+| `EndResult` 布局错 → 成功被误读成失败，End 不执行，副本可能留 PROCESSING | 按 `tl::expected<void, ErrorCode>`（ok+union） |
+
+### 用例
+
+| 用例 | 结果 |
+|---|---|
+| put → soft_pin ENABLE；`master_soft_pin_key_count` 0→1；地址不变 | PASS |
+| DISABLE + get 比对 payload | PASS |
+| 错地址 → 与 GetReplicaList 不一致则不 Start，key 保留 | PASS |
+| tip 复验 + `backend.pin`（admin + native list） | PASS |
+| 225 put → 45 soft_pin（数据 ep 在 225） | PASS |
+| NoF put（`nof_replica_num=1`） | N/A / SKIP：`INVALID_PARAMS`（本 master 未配通；不作为验收项） |
+| 2026-11-10 tip 再验（client / backend.pin / 错地址） | PASS（同上容器） |
+| 2026-11-10 replica-id：正向 pin；错地址在 list sanity 拒绝且 payload 保留 | PASS |
+| 2026-11-10 删 key → id 必变（不撞地址复用） | PASS：Case B `old_id==start_id`（例 19）；`force remove` 后 Case A `start_id` 新值（例 20）且 ≠ 旧 id，Revoke 不 End。容器临时 `probe_upsert_memory_ids`（未入仓） |
+
+### ABI 对照
+
+- 真机包：`mooncake-transfer-engine-npu==0.3.13.post1`（dist-info 无 git commit；wheel `sha256=ba134f2c…`）。
+- 浅拉上游：`kvcache-ai/Mooncake` tag `v0.3.13.post1` → commit `719735896c86b56fabec6cf3e825fb2ea640597a`。版本号可对齐；**无法**从 NPU wheel 核对同一 SHA。
+- 与镜像头 `mooncake_pin_api.h` 字段对照（tag 源码）：`UpsertEnd/Revoke` = `tl::expected<void, ErrorCode>`；`ObjectMeta`；`Client` 成员序 `client_id_→metrics_→transfer_engine_→master_client_`；`ReplicateConfig` 字段序一致；`SoftPinAction` ENABLE=1/DISABLE=2。镜像省略 `PRESERVE=0`、默认 ENABLE（调用显式设）；`Descriptor` 字段名上游 `descriptor_variant`、镜像 `body`（variant 序仍镜像）。
+- 镜像 sizeof 探针（同机编译）：`ObjectMeta=48`、`ReplicateConfig=208`、`EndResult=8`（`ok@4`）、`PyClient::client_=8`、`Client::master_client_=48`，与头注释一致。
+- 行为闭环：正向 End 成功；错地址在 list sanity 拒绝（不 Start）。
+
+### 未覆盖与单测
+
+- 未覆盖：并发、End 失败注入、地址复用注入（不强制）、多 key 部分失败自动化、`BatchGetReplicaList`。
+- 单测：`pytest -k pin_soft`；CI 不编 `_empty_pin.so`，无 so 时相关测 skip。
+
+### 结论
+
+- 地址复用误判的 id 判据已在真机确认：Case B 同 id；删 key 后 Case A 新 id，Revoke 不 End。
+- 本次真机验证证明空写 soft pin 在目标 master 上可用；手写 ABI/链接的残余风险见 D2 §2。

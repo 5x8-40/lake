@@ -11,7 +11,7 @@
    计划第一条的目标段还放不放得下 → 放得下才逐 key 提交复制任务。等剩余
    的循环在 TaskEngine、前缀闸外面；进闸后再查一次，不够就回到闸外
 3. **query_task 轮询到 READY**：任务全部完成 + 副本核验通过
-4. **流程返回之后**（`TaskEngine._on_ready`，不在本流程里）：注册保活，并按目标实例补发一条 `BlockStored`。恢复跟踪在轮询前用 `target_of` 取目标，READY 后同样补发。没有端点或发送失败只记日志，预热仍成功
+4. **流程返回之后**（`TaskEngine._on_ready`，不在本流程里）：先 `await register_await` 等保活落账，再按目标实例补发一条 `BlockStored`；然后才把 intent 记成 READY。恢复跟踪在轮询前用 `target_of` 取目标，副本 READY 后同样等落账再补发。写入失败 / 没有端点 / 发送失败只记日志，预热仍成功
 
 ## 数据流
 
@@ -90,9 +90,8 @@ sequenceDiagram
                     Note over BE: 不再向 master 查任务
                 end
                 opt 要核验副本
-                    BE->>SC: batch_get_replica_desc
-                    SC->>M: RPC 绑定, 不是 HTTP
-                    M-->>BE: 每个 key 落在哪些 seg
+                    BE->>M: GET /batch_query_keys（admin，不是 batch_get_replica_desc）
+                    M-->>BE: 每个 key 的传输端点
                 end
                 alt 全部成功且副本齐
                     BE->>DB: status=ready
@@ -121,12 +120,12 @@ sequenceDiagram
   `keys` → 排出 `plan`（复制计划：每条 key 复制到哪个 seg）→ 每条
   key 提交后拿回一个任务号（两个整数组成的整数对）→ 写进 Ledger（任务
   号编码成 `"整数:整数"` 的字符串，连同 handle_id、token_ids）
-- 与 master 的交互里，复制和核验仍是绑定 RPC。提交前多一次管理端口
+- 与 master 的交互里，复制/任务查询仍走绑定 RPC；提交前多一次管理端口
   `GET /query_segment`（明文 Used / Capacity）。三个查询各答什么：
   - `/query_segment`：一条请求返回这一段自己的已用和容量，正是「这一段还放不放得下」要的两个数。
   - `/get_segments_detail`：返回全池所有段的明细。为了查一段要扫一遍所有段，代价随段数增长。
   - `/batch_query_keys`：按 key 查副本，回答「这些 key 在不在、在哪个端点」，不回答「这一段还剩多少字节」。段剩余和副本位置是两件事。
-- 副本核验现在走绑定通道（`batch_get_replica_desc`），有续租副作用。main 的零副作用核验（`/batch_query_keys`）等升级到 mooncake 主线后接通（`has_admin_query`）；代码里 `_verify_missing` 留着这个 TODO。所以上一条说「不用 `/batch_query_keys`」只针对段剩余，不针对核验。
+- 副本核验走 admin 的 `GET /batch_query_keys`，不用 `batch_get_replica_desc`；零副作用，不续租。
 - Ledger 在 copy 落账、到终态、进入等副本状态、abandon 时写。
   exists 失败，以及还没有任务号的提交失败，不写行。已经落账的号由
   `abandon` 记成 abandoned；池里的传输不取消
@@ -160,7 +159,7 @@ TaskEngine 的等待循环里出现。`PrefetchFlow.run` 没有等待循环，�
 
 - **KeyComputer**：前缀 → key 列表（引擎算法一致）；rank 映射计划
 - **locate**：目标实例 → rank 有序 seg 列表（demo 探测 / 生产实例注册）
-- **StoreClient**：绑定 RPC（exists / copy 提交 / query_task / 副本核验）
+- **StoreClient**：绑定 RPC（exists / copy 提交 / query_task）。副本核验走 admin 的 `GET /batch_query_keys`
 - **Ledger**：任务状态（running → ready/failed/abandoned）
 - **EventPublisher**：`TaskEngine` 在 READY 后按目标实例补发一条 `BlockStored`（`kvcm/api/events.py`）。不调用 `/register`。把地址交给索引归 E13
 - **keepalive**：`TaskEngine` 在 READY 后注册保活（见

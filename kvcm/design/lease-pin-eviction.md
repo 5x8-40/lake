@@ -34,12 +34,12 @@ hard pin？ / lease 未过期？ / 副本任务 refcnt>0？  → 跳过
 
 ### 续租为什么容易搅在一起
 
-一次 `GrantLease`（例如走 `ExistKey` / `BatchExistKey`）：
+一次 `GrantLease` / `GrantReadLease`（例如走 `ExistKey` / `BatchExistKey` / `GetReplicaList`）：
 
 - 总是续 lease；
-- 若 key **已经有 soft pin**，再顺带把 soft pin TTL 也推满（只延不缩）。
+- soft pin 是否顺带续：**版本差**——0.3.11 的 `GrantLease` 若已有 soft pin 会把 soft pin TTL 也推满（只延不缩）；目标 v0.3.13.post1 的 `GrantReadLease` **故意不续 soft pin**（要续 soft 只能再空写）。
 
-因此：**没有**「只续 soft、不续 lease」的独立 RPC；也**没有**「立刻撤销 lease」——只能停续、等过期。main 上的 `ProbeKey` 不续租，和会续租的存在查询不是一回事。
+因此：**没有**「只续 soft、不续 lease」的独立 RPC；也**没有**「立刻撤销 lease」——只能停续、等过期。main 上的 `ProbeKey` 不续租，和会续租的存在查询不是一回事。`pin(SOFT)` 用 native `GetReplicaList` 授 lease（见 D2 §2），不是单独 `exists`。
 
 ## kvcm 侧容易对错号的地方
 
@@ -47,7 +47,7 @@ hard pin？ / lease 未过期？ / 副本任务 refcnt>0？  → 跳过
 
 | 容易当成 | 实际 |
 |----------|------|
-| 保活 / 周期 `exists` = soft pin | **否**。那是在续 **lease**。 |
+| 保活 / 周期 `exists` / `GetReplicaList` = soft pin | **否**。那是在续 **lease**（目标版本也不续 soft）。 |
 | API 名叫 `pin(HARD)` = 设了 Mooncake hard pin 位 | **否**（若走的是登记保活这条路径）。hard pin 位创建固化、事后改不了；保活只给 lease 短窗。 |
 | soft pin = 绝对防驱逐 | **否**。第二轮仍可逐。 |
 | 停保活立刻就能删 / 降层 | **否**。lease 不会被立刻撤销，通常还要等满一个 lease TTL。 |
