@@ -321,7 +321,7 @@ layerwise：
 
 选路时要先知道部署模式：批量加载按加法，layerwise 才判断能否取 max。同一个请求，走节点 A 可能能掩盖（A 带宽高），走节点 B 不能。
 
-如果 KV 和集合通信共用一张网，还要加 `network_headroom`：目标平面的剩余可用带宽 + 排队余量，不是总带宽；余量低时，即使平均带宽够，也会让算子等。
+如果 KV 和集合通信共用一张网，还要加 `network_headroom`：目标平面的剩余可用带宽 + 排队余量，不是总带宽；余量低时，即使平均带宽够，通信算子也会变慢。
 
 ### 3.3 决策流程
 
@@ -402,12 +402,12 @@ prefetch/migration 遇到集合通信高峰应让路或暂停，不能把算子�
 
 ```text
 Net(T) = p_resume(T) × T_prefill − c_h × S_bytes × T − C_risk
-p_resume(T) ≈ P_return(T | tool_class, elapsed)   // 有工具历史就用这个
-p_resume(T) = p0 × exp(−μT)                       // 无历史时的默认
+p_resume(T) = p0 × exp(−μT)                       // v1 默认
+# P_return(T | tool_class, elapsed)：只有可靠历史/ETA 时才作为研究项，不进入 v1 控制
 ```
 
-- `P_return(...)`：工具在 T 内返回的概率，来自 hook 的 `tool_class/eta` + 历史分布；
-- `p0`：无工具历史时的基础恢复概率；`μ`：默认衰减率；
+- `P_return(...)`：工具在 T 内返回的概率；只有工具适配器有可靠历史/ETA 时才用，样本少或 ETA 不准时不用；
+- `p0`：无可靠工具历史时的基础恢复概率；`μ`：默认衰减率；
 - `c_h`：每字节每秒的占用成本；
 - `C_risk`：迁移/违约/数据风险成本；
 - 解出的 `T*` 与 `T_max` 取小；解不出就退化为固定窗口。
@@ -797,7 +797,7 @@ ROI = saved / cost
 | `effective_hit_tokens` / `residual` | 命中是否真的省算 | 升/降；KVT/放置 |
 | `operator_bubble_ratio` / `kv_stall_ratio` | 算子空泡/等 KV（定义见 D8 §7.5） | 降；预取/限速/错峰 |
 | `network_headroom`（H2D/存储/计算） | 是否和集合通信抢网 | 升；选点/限速 |
-| `tool_wait_ratio` / `session_success` | 工具等待与任务结果 | 降/升；SUSPEND/调度 |
+| `tool_wait_ratio` / `session_success` | 工具等待与任务结果 | 降/升；retain/offload/调度 |
 | `gpu_seconds_saved` / `cost_per_1k_tokens` | 成本 | 降；账本 |
 | `scale_ready_latency` / `warm_coverage` | 弹性 | 快/升；L2 |
 | `ghost_ratio` / `verify_miss_rate` | 索引可信度 | 降；对账 |
@@ -935,8 +935,8 @@ T_ssd_promote = T_disk + T_stage + T_dram_write + verify
 首次请求 = T_ssd_promote + T_h2d
 
 # 保留
-p_resume(T) ≈ P_return(T | tool_class, elapsed)
-fallback: p0×exp(−μT)
+p_resume(T) = p0×exp(−μT)        # v1 默认
+# P_return(T | tool_class, elapsed) 只在可靠历史/ETA 时作为研究项
 Net(T) = p_resume(T)×T_prefill − c_h×S_bytes×T − C_risk
 
 # 容量

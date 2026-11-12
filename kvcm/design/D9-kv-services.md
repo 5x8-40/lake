@@ -118,7 +118,7 @@ flowchart TB
 **怎么做**：
 
 - 记录 intent、copy/move、bytes、耗时、READY/FAILED、保留 TTL、命中结果；
-- 会话侧补 `session_e2e`、`resume_ttft`、`tool_wait`、`session_success`，用于判断“省了 KV 钱，但会话变慢/失败”的情况；
+- 会话侧补 `session_e2e`、`resume_ttft`、`tool_wait`、`session_success`；`resume_ttft` = 工具返回后新请求的 TTFT，不是引擎/请求 resume 的时间；
 - 归因：`hit = engine_apc + local_pool + remote_pool + prewarm + retain`；
 - ROI：`saved / cost`；浪费：预取未用、保留未恢复、迁移失败；
 - 成本：GPU 时间、带宽、驻留字节。

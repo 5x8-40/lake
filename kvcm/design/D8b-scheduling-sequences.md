@@ -103,7 +103,7 @@ sequenceDiagram
 
 ---
 
-## 4. L1：工具等待 → 保留 → 恢复
+## 4. L1：会话停顿 → 保留 → 恢复
 
 ```mermaid
 sequenceDiagram
@@ -112,23 +112,23 @@ sequenceDiagram
     participant K as kvcm
     participant W as 目标实例
 
-    A->>R: TOOL_CALL / SUSPEND(S, eta, tool_class)
-    R->>R: 算保留价值 + 标记 suspended
+    A->>R: PAUSE(S, eta)   # 会话退出/长时间不用，不是每次工具调用
+    R->>R: 计算保留价值
     R->>K: RETAIN(S, TTL, class)
     K-->>R: ACCEPTED
-    Note over R,W: 引擎无 suspend API 时：只 retain/降优先级，不释放槽位
-    A->>R: TOOL_RETURN / RESUME(S)
+    A->>R: 恢复请求
     R->>R: 检查 KVT / READY
     R->>W: Dispatch(B, mode)
-    A->>R: POST(close, S)
+    A->>R: CLOSE(S)
     R->>K: RELEASE(S)
 ```
 
 要点：
 
-- **`PAUSE` ≠ `SUSPEND`**：PAUSE 是会话级 KV 保留；SUSPEND 是工具等待的请求级动作。
-- 当前 vLLM-Ascend 没有现成的 request suspend/resume API；首版只做 `RETAIN + 降优先级`。引擎支持后，SUSPEND 才能释放 GPU 槽位/并发。
-- 工具返回前 `RESUME`：先看 KVT/READY，再重新入队；KV 不在就按普通请求重算/加载。
+- `PAUSE` 只用于会话退出/长时间不用；**不按每次工具调用 pause**。
+- 标准工具调用是“本轮生成结束或 abort，释放请求，KV retain”；工具返回后是**新请求**，不是 resume 原请求。
+- 不做 engine suspend，也不做 request suspend；当前 vLLM-Ascend 也没有 request suspend API。
+- 只有工具适配器明确给出可靠 ETA，才提前 `retain/offload`；不解析 `sleep` 之类命令文本。
 - 默认软释放（停 keepalive），不是立即 Remove；保留有 TTL/字节上限。
 
 ## 5. L2：扩容 + 预热门控
@@ -158,7 +158,7 @@ sequenceDiagram
 要点：
 
 - 预热门控的覆盖率按“本机 DRAM 已确认”算；HBM 覆盖是加分项，不是 Ready 的必要条件。
-- 先看 warm pool（已加载权重、未预热 KV）；没有匹配模型再 provision。P/D 两池分开扩，比例按负载调。
+- 先看 warm pool（已加载权重、未预热 KV）；没有匹配模型再 provision（外部编排创建实例 + 加载权重）。P/D 两池分开扩，比例按负载调。
 - 新节点 warming 期间不接/低权重接流量。
 - `T_ready` 的目标由 SLO/部署决定；本文不设固定秒数。
 

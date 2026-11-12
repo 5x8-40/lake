@@ -102,16 +102,16 @@ flowchart TB
 | 方向 | 做什么 | 谁买单 | 价值指标 | 时机 |
 |---|---|---|---|---|
 | **A. KV 负载整形** | 热点前缀 copy 多副本；按负载/会话分流；副本数按收益定 | 平台/推理团队 | p99 TTFT、吞吐、扩容次数 | **现在** |
-| **B. Agent 会话保留/恢复** | hook 提前预取/保留；工具等待期 suspend（引擎支持时）；应用仍管 messages | Agent 产品/平台 | resume 时延、会话 E2E、任务成功率 | **现在–1 年** |
+| **B. Agent 会话保留/恢复** | hook 提前预取/保留；工具调用结束/abort 后 KV retain/offload；工具返回按新请求恢复；应用仍管 messages | Agent 产品/平台 | resume TTFT、会话 E2E、任务成功率 | **现在–1 年** |
 | **C. KV FinOps / QoS** | 按模型/租户/会话记账；预算/配额；QoS 等级 | 云/平台/财务 | 成本可见性、预算达成、毛利 | **现在–1 年** |
 | **D. 容量数字孪生** | 用历史 trace 模拟容量/配比/硬件；采购前 what-if | 基础设施/采购 | 少买/少闲置、容量预测误差 | 6–18 月 |
 | **E. KV HA / 热备 / DR** | 预复制热前缀到备用实例；故障快速接管；跨 AZ | SRE/平台 | MTTR、可用性、恢复命中率 | 6–18 月 |
 | **F. 跨集群 KV Fabric** | 跨集群/地域复制热前缀；follow-the-sun；数据驻留 | 全球化平台 | 跨区 TTFT、合规、DR | 1–3 年 |
-| **G. KV 存储效率** | 去重/压缩/量化/分层；SSD 性能层 + promote；共享 system prompt/tools | 平台/基础设施 | 每 GB 有效 KV、HBM 占用 | 1–3 年 |
+| **G. KV 存储效率** | 去重/压缩/量化/分层；复用已有 SSD offload/promote；共享 system prompt/tools（内容寻址自然去重，新增治理/计费） | 平台/基础设施 | 每 GB 有效 KV、HBM 占用 | 1–3 年 |
 
-SSD 不是冷备，是性能层：直读仍经 staging，热前缀 promote 到 DRAM，写寿命/DWPD 是约束。
+SSD 不是冷备，是性能层：直读仍经 staging，热前缀 promote 到 DRAM，写寿命/DWPD 是约束；`promote` 是已有原语，D10 新增的是放置/预算策略。
 
-Agent 会话不只看 TTFT：工具等待期的 suspend/resume、会话级 E2E、resume TTFT 都算体验。
+Agent 会话不只看 TTFT：工具返回后新请求的 resume TTFT、会话级 E2E、工具等待占比都算体验；不做 engine/request suspend。
 
 产品化不改变应用契约：应用仍然只发 text/messages；KV 句柄、`kv://`、应用订阅都不做。
 

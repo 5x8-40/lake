@@ -313,8 +313,8 @@ sequenceDiagram
     G->>R: request + hook
     R->>W: Dispatch(node, mode)
 
-    Note over A,R: POST（工具返回/会话后）
-    A->>G: tool_call / tool_return / pause / close / branch
+    Note over A,R: POST（会话停顿/结束后）
+    A->>G: pause / close / branch
     G->>R: hook
     R->>K: RETAIN / DEMOTE / RELEASE
 ```
@@ -324,11 +324,11 @@ sequenceDiagram
 | 字段 | 作用 | 约束 |
 |---|---|---|
 | `version` / `hook_id` | 兼容/幂等 | 未知版本只观察、不生效 |
-| `event` | PRE_ANNOUNCE / ATTACHED / TOOL_CALL / TOOL_RETURN / PAUSE / CLOSE / BRANCH | 未知事件只 observe |
+| `event` | PRE_ANNOUNCE / ATTACHED / PAUSE / CLOSE / BRANCH / TOOL_HINT（可选） | 未知事件只 observe；TOOL_HINT 仅在工具适配器有可靠 ETA 时用 |
 | `session_id` / `workflow_id` / `step` / `branch` | 会话/分支定位 | 与路由键对齐 |
 | `prefix`（token_ids 或 hash 链） | 要预取/保留的前缀 | 优先 hash；必须与引擎口径一致 |
 | `timing` / `eta_ms` / `expected_turns` / `reuse_prob` | 请求前/中/后；预计到达 | ETA 决定提前量 |
-| `tool_class` / `tool_eta_ms` / `tool_elapsed_ms` | 工具类型/预计/已等 | 用于 `P_return(T)` 和 TTL |
+| `tool_class` / `tool_eta_ms` | 工具类型/预计时长（仅 TOOL_HINT） | 没有可靠 ETA 就不触发特殊动作 |
 | `retention` / `ttl_ms` / `prefetch` | 保留等级与生命周期 | TTL/pin 上限可裁剪 |
 | `affinity`（node/zone/strict） | 会话亲和 | strict 也不能违反容量/SLO |
 | `deadline` / `priority` | SLO/优先级 | 优先级只影响排队，不做准入 |
@@ -342,8 +342,10 @@ sequenceDiagram
 - **预算与审计**：每 session/租户有 pin/预取/带宽上限；hook 可审计。
 - **key 口径**：vLLM-Ascend 是链式 block hash（`parent_hash`、block_size、模型类型、初始种子参与），TP 下同一逻辑块多把 key。SC 必须用与引擎逐字节一致的 hash 算法；hook 优先带 hash/token_ids，不要用估算 token 数。
 - **不等待**：pre_announce 只影响未来；attached 请求走当前最优路径，不等 READY。
-- **`PAUSE` ≠ `SUSPEND`**：PAUSE 只保留 KV；SUSPEND 是工具等待的请求级动作。当前引擎没有 suspend API，首版只做 retain/降优先级；引擎支持后才释放 GPU 槽位。
-- **TTL 用 `P_return(T | tool_class, elapsed)`**：有工具历史就用分布，没有再用固定衰减；超时/长期无响应直接释放。
+- **不做 engine suspend，也不做 request suspend**：标准工具调用就是本轮生成结束或 abort，释放请求；KV 用 `retain/offload/demote/evict` 处理。工具返回后是新请求，不是 resume 原请求。
+- **PAUSE 只用于会话退出/长时间不用**，不按每次工具调用 pause。
+- **只有可靠 ETA 才算长工具**：工具适配器给 `TOOL_HINT` + `eta_ms` 才提前 retain/offload；不解析 `sleep` 等命令文本，没有 ETA 就按普通请求处理。
+- **v1 TTL 用固定衰减**：`p0×exp(−μT)`；`P_return` 只在有可靠历史/ETA 时做观测或后续研究，不作为默认控制。
 
 ---
 
@@ -437,7 +439,7 @@ flowchart TB
 - **冷却**：冷却时间 ≥ 扩容生效 + 预热 + 下线搬迁，防扩缩振荡（D8a §6.2 有公式）。
 - **滞回**：扩容阈值 > 缩容阈值；连续 N 周期才动作。
 - **优先级**：L0 永远不被 L1/L2 阻塞；L1 intent 异步；L2 只发目标容量。
-- **Warm Path 顺序**：路由正确 > 后台预取 > 低峰再平衡 > 在线迁移；在线迁移只在引擎支持时做，不能进 Hot Path。
+- **Warm Path 顺序**：路由正确 > 后台预取 > 低峰再平衡 > 请求迁移。请求迁移是引擎能力（搬正在跑的请求 + KV + 状态），不是 KV `copy`；KV 迁移走 `copy/move/offload/promote`，不能进 Hot Path。
 - **资源权重**：L2 单点更新；L0/L1 只读；当前按单 SC 假设，多 SC 后续再定。
 
 ---
@@ -553,7 +555,7 @@ Mooncake 有热度驱动的动态副本（按读命中/热度加副本）。它�
 
 1. **不要只看 APC 命中率**，看有效命中 token / residual / 介质；
 2. **冷热要分读写**：读热写冷放 SSD，读热写热留 DRAM；
-3. **网络均衡要看算子空泡**：KV 和集合通信同网时，传输会直接让算子等；
+3. **网络均衡要看算子空泡**：KV 传输和集合通信（尤其 MoE dispatch/combine）同网时，KV 抢带宽会让通信算子变慢，batch 等这一步；
 4. **预取分 HBM / DRAM / SSD 三层**，不是所有 KV 都值得搬；
 5. **pin 是容量换传输**：pin 多了会挤掉别的 KV，要看全局命中。
 
@@ -563,7 +565,7 @@ Mooncake 有热度驱动的动态副本（按读命中/热度加副本）。它�
 operator_bubble_ratio = Σ max(0, layer_ready_time − compute_ready_time) / step_time
 ```
 
-不是工具等待，也不是队列等待；是 KV/网络让算子没活干。
+不是工具等待，也不是队列等待；是 KV 传输拖慢通信算子，batch 等这一步。
 
 ---
 
