@@ -342,10 +342,10 @@ sequenceDiagram
 - **预算与审计**：每 session/租户有 pin/预取/带宽上限；hook 可审计。
 - **key 口径**：vLLM-Ascend 是链式 block hash（`parent_hash`、block_size、模型类型、初始种子参与），TP 下同一逻辑块多把 key。SC 必须用与引擎逐字节一致的 hash 算法；hook 优先带 hash/token_ids，不要用估算 token 数。
 - **不等待**：pre_announce 只影响未来；attached 请求走当前最优路径，不等 READY。
-- **不做 engine suspend，也不做 request suspend**：标准工具调用就是本轮生成结束或 abort，释放请求；KV 用 `retain/offload/demote/evict` 处理。工具返回后是新请求，不是 resume 原请求。
+- **不做 engine suspend，也不做 request suspend**：模型输出 tool_calls 后，本轮响应结束/abort，请求释放；工具运行期间没有 LLM 请求；工具运行结束后 Agent 发下一轮新请求。KV 用 `retain/offload/demote/evict` 处理。
 - **PAUSE 只用于会话退出/长时间不用**，不按每次工具调用 pause。
-- **只有可靠 ETA 才算长工具**：工具适配器给 `TOOL_HINT` + `eta_ms` 才提前 retain/offload；不解析 `sleep` 等命令文本，没有 ETA 就按普通请求处理。
-- **默认 TTL**：有 hook `eta_ms` 时用 `eta + slack`；没有就固定衰减 `p0×exp(−μT)`。`P_return` 只做研究/离线校准，不进在线控制。
+- **只有可靠 ETA 才算长工具**：hook 的生产方（agent/gateway）可以解析已知命令（如 `sleep N`）并填 `TOOL_HINT.eta_ms`；SC 只消费 ETA，不解析 shell。没有 ETA 就按普通请求处理。
+- **默认 TTL**：有 hook `eta_ms` 时用 `eta + slack`；没有就用固定 TTL。`Net(T)`/`P_return` 只做离线分析，不进在线控制。
 
 ---
 
@@ -668,7 +668,7 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 | 阶段 | 目标 | 验收 |
 |---|---|---|
 | **P0 观测与索引** | 引擎事件 + kvcm READY + miss 反馈接入 KVT；hook 只 observe；L0 用 KVT 选路；决策日志 | KVT 合并/墓碑/置信度；L0 <5ms；不改变现有行为 |
-| **P1 命中与保留** | 会话表；keepalive/soft pin（设计；后续 PR）；预取预算；KV 对账抽样；用量账本归因 | 命中率、resume TTFT、预取 ROI、ghost 率 |
+| **P1 命中与保留** | 会话表；keepalive/soft pin（设计；后续 PR）；预取预算；KV 对账抽样；用量账本归因 | 命中率、next_turn TTFT、预取 ROI、ghost 率 |
 | **P2 容量与弹性** | L2 双环；预热门控；按 KV 价值选缩容节点；池扩缩；资源权重 | 扩容 Ready 达到部署目标且预热达标；缩容零丢失；无振荡 |
 | **P3 服务化** | 会话 KV、预热服务、容量顾问、Drain、治理、回放 | 服务 SLA；ROI；容量预测误差；回放一致 |
 

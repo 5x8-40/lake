@@ -126,10 +126,12 @@ sequenceDiagram
 要点：
 
 - `PAUSE` 只用于会话退出/长时间不用；**不按每次工具调用 pause**。
-- 标准工具调用是“本轮生成结束或 abort，释放请求，KV retain”；工具返回后是**新请求**，不是 resume 原请求。
+- 模型输出 tool_calls 后，本轮响应结束/abort，请求释放；工具运行期间没有 LLM 请求；工具运行结束后 Agent 发**下一轮新请求**。
 - 不做 engine suspend，也不做 request suspend；当前 vLLM-Ascend 也没有 request suspend API。
-- 只有工具适配器明确给出可靠 ETA，才提前 `retain/offload`；不解析 `sleep` 之类命令文本。
-- 默认软释放（停 keepalive），不是立即 Remove；保留有 TTL/字节上限。
+- hook 的生产方（agent/gateway）可以解析已知命令（如 `sleep N`）并填 `eta_ms`；SC 只消费 ETA，不解析 shell。只有可靠 ETA 才提前 `retain/offload`。
+- 默认软释放（停 keepalive），不是立即 Remove。
+- soft pin 是“有条件可用”：Case B、单 slice、key 存在、无盘副本；hard pin 不事后设置。
+- 保留有 TTL/字节上限；到期未用要能回收。
 
 ## 5. L2：扩容 + 预热门控
 

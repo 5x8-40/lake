@@ -118,7 +118,7 @@ flowchart TB
 **怎么做**：
 
 - 记录 intent、copy/move、bytes、耗时、READY/FAILED、保留 TTL、命中结果；
-- 会话侧补 `session_e2e`、`resume_ttft`、`tool_wait`、`session_success`；`resume_ttft` = 工具返回后新请求的 TTFT，不是引擎/请求 resume 的时间；
+- 会话侧补 `session_e2e`、`next_turn_ttft`、`tool_wait`、`session_success`；`next_turn_ttft` = 工具运行结束后下一轮请求的 TTFT，不是引擎/请求 resume 的时间；
 - 归因：`hit = engine_apc + local_pool + remote_pool + prewarm + retain`；
 - ROI：`saved / cost`；浪费：预取未用、保留未恢复、迁移失败；
 - 成本：GPU 时间、带宽、驻留字节。
@@ -135,7 +135,7 @@ flowchart TB
 
 **运行观测（不是账本字段）**：
 
-- `operator_bubble_ratio`：算子空泡；
+- `operator_bubble_ratio`：通信算子空泡；KV 传输和 MoE dispatch/combine 抢超平面网络，导致通信算子变慢；
 - `kv_stall_ratio`：等 KV；
 - `network_headroom`：H2D/存储/计算三平面的余量。
 

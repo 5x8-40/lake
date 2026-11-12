@@ -398,16 +398,18 @@ prefetch/migration 遇到集合通信高峰应让路或暂停，不能把算子�
 
 ## 5. 保留：保多久
 
-### 5.1 Net(T) 与盈亏平衡
+### 5.1 Net(T) 与盈亏平衡（分析用）
 
 ```text
 Net(T) = p_resume(T) × T_prefill − c_h × S_bytes × T − C_risk
-p_resume(T) = p0 × exp(−μT)                       // 默认
+p_resume(T) = p0 × exp(−μT)                       // 分析假设
+# 在线 TTL 不使用 Net(T)：有 eta_ms 用 eta+slack，没有就固定 TTL
 # P_return(T | tool_class, elapsed)：仅研究/离线校准，不进入默认控制
 ```
 
+- `p_resume(T)=p0×exp(−μT)` 是**分析假设**，不是在线预测；用于容量/ROI 估算，不用于逐请求选 TTL。
 - `P_return(...)`：工具在 T 内返回的概率；**只做研究/离线校准**，不进默认在线控制；在线只用 hook 的 `eta_ms`，没有 ETA 就用固定 TTL；
-- `p0`：无可靠工具历史时的基础恢复概率；`μ`：默认衰减率；
+- `p0`：分析假设的基础恢复概率；`μ`：分析假设的衰减率；
 - `c_h`：每字节每秒的占用成本；
 - `C_risk`：迁移/违约/数据风险成本；
 - 解出的 `T*` 与 `T_max` 取小；解不出就退化为固定窗口。
@@ -416,7 +418,9 @@ p_resume(T) = p0 × exp(−μT)                       // 默认
 
 > 参数：128K 上下文、`S_saved≈4.67s`、`p0=1`、`μ=1/600`、占用成本按 11.0 GB × 0.5 ms/(GB·s) 计。曲线的零点就是最优 TTL 上界。
 
-### 5.2 等级选择
+### 5.2 等级选择（离线分层）
+
+> 下表用 Net(T) 做离线策略分层，不是逐请求在线计算；在线默认固定 TTL / ETA+slack。
 
 | 等级 | 判据 | 机制 |
 |---|---|---|
@@ -425,7 +429,7 @@ p_resume(T) = p0 × exp(−μT)                       // 默认
 | `PIN` | 高价值且 `T` 有上限 | hard pin 或 lease 延长 + 持续续租 |
 | `DURABLE` | 停顿长/节点将下线 | demote 到 SSD / DFS retain |
 
-**收益**：把“保留多久”从拍脑袋变成“占用成本 vs 重算成本”的盈亏平衡；避免无限 pin 把池子占满。默认用固定 TTL；有 hook ETA 时按 ETA + slack。
+**收益**：Net(T) 用于离线解释“占用成本 vs 重算成本”；在线不用它逐请求算 TTL——默认固定 TTL，有 hook ETA 时按 ETA + slack。
 
 ---
 
@@ -804,7 +808,7 @@ ROI = saved / cost
 | `prefetch_hit_rate` / `waste_bytes` | 预取是否值 | 升/降；预取 |
 | `retention_hit_rate` / `wasted_retention` | 保留是否值 | 升/降；保留 |
 | `TTFT_p99` / `ITL_p99` | 用户感知 | 降；整体 |
-| `session_e2e_p99` / `resume_ttft` | 会话级体验 | 降；hook/保留 |
+| `session_e2e_p99` / `next_turn_ttft` | 会话级体验 | 降；hook/保留 |
 | `effective_hit_tokens` / `residual` | 命中是否真的省算 | 升/降；KVT/放置 |
 | `operator_bubble_ratio` / `kv_stall_ratio` | 算子空泡/等 KV（定义见 D8 §7.5） | 降；预取/限速/错峰 |
 | `network_headroom`（H2D/存储/计算） | 是否和集合通信抢网 | 升；选点/限速 |

@@ -53,9 +53,9 @@ Fabric 不是某个协议，而是一层把分散资源统一访问与调度的�
 hook 不是 memory，也不是请求；它只告诉 SC“接下来可能发生什么”：
 
 ```text
-tool 快结束   → 下一轮请求可能复用前缀，提前预取
+tool 运行结束 → 下一轮请求可能复用前缀，提前预取
 pause 30s     → 可以 retain
-resume        → 恢复时优先本机读
+会话 resume   → 恢复时优先本机读
 session close → 可以释放
 ```
 
@@ -102,7 +102,7 @@ flowchart TB
 | 方向 | 做什么 | 谁买单 | 价值指标 | 时机 |
 |---|---|---|---|---|
 | **A. KV 负载整形** | 热点前缀 copy 多副本；按负载/会话分流；副本数按收益定 | 平台/推理团队 | p99 TTFT、吞吐、扩容次数 | **现在** |
-| **B. Agent 会话保留/恢复** | hook 提前预取/保留；工具调用结束/abort 后 KV retain/offload；工具返回按新请求恢复；应用仍管 messages | Agent 产品/平台 | resume TTFT、会话 E2E、任务成功率 | **现在–1 年** |
+| **B. Agent 会话保留/恢复** | hook 提前预取/保留；模型输出 tool_calls、本轮响应结束/abort 后 KV retain/offload；工具运行结束后下一轮请求；应用仍管 messages | Agent 产品/平台 | 下一轮 TTFT、会话 E2E、任务成功率 | **现在–1 年** |
 | **C. KV FinOps / QoS** | 按模型/租户/会话记账；预算/配额；QoS 等级 | 云/平台/财务 | 成本可见性、预算达成、毛利 | **现在–1 年** |
 | **D. 容量数字孪生** | 用历史 trace 模拟容量/配比/硬件；采购前 what-if | 基础设施/采购 | 少买/少闲置、容量预测误差 | 6–18 月 |
 | **E. KV HA / 热备 / DR** | 预复制热前缀到备用实例；故障快速接管；跨 AZ | SRE/平台 | MTTR、可用性、恢复命中率 | 6–18 月 |
@@ -111,7 +111,7 @@ flowchart TB
 
 SSD 不是冷备，是性能层：LOCAL_DISK 直读仍经 staging，热前缀 promote 到 DRAM，写寿命/DWPD 是约束；`promote` 是已有原语，D10 新增的是放置/预算策略。Mooncake TE 有 NVIDIA GDS，但 Store/vLLM connector 没接；A5 无 GDS。
 
-Agent 会话不只看 TTFT：工具返回后新请求的 resume TTFT、会话级 E2E、工具等待占比都算体验；不做 engine/request suspend。
+Agent 会话不只看 TTFT：工具运行结束后的下一轮请求 TTFT、会话级 E2E、工具运行等待占比都算体验；不做 engine/request suspend。
 
 产品化不改变应用契约：应用仍然只发 text/messages；KV 句柄、`kv://`、应用订阅都不做。
 
