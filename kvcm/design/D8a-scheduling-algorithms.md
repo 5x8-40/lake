@@ -403,10 +403,10 @@ prefetch/migration 遇到集合通信高峰应让路或暂停，不能把算子�
 ```text
 Net(T) = p_resume(T) × T_prefill − c_h × S_bytes × T − C_risk
 p_resume(T) = p0 × exp(−μT)                       // v1 默认
-# P_return(T | tool_class, elapsed)：只有可靠历史/ETA 时才作为研究项，不进入 v1 控制
+# P_return(T | tool_class, elapsed)：仅研究/离线校准，不进入 v1 控制
 ```
 
-- `P_return(...)`：工具在 T 内返回的概率；只有工具适配器有可靠历史/ETA 时才用，样本少或 ETA 不准时不用；
+- `P_return(...)`：工具在 T 内返回的概率；**只做研究/离线校准**，不进 v1 在线控制；在线只用 hook 的 `eta_ms`，没有 ETA 就用固定 TTL；
 - `p0`：无可靠工具历史时的基础恢复概率；`μ`：默认衰减率；
 - `c_h`：每字节每秒的占用成本；
 - `C_risk`：迁移/违约/数据风险成本；
@@ -425,7 +425,7 @@ p_resume(T) = p0 × exp(−μT)                       // v1 默认
 | `PIN` | 高价值且 `T` 有上限 | hard pin 或 lease 延长 + 持续续租 |
 | `DURABLE` | 停顿长/节点将下线 | demote 到 SSD / DFS retain |
 
-**收益**：把“保留多久”从拍脑袋变成“恢复概率 vs 占用成本”的盈亏平衡；避免无限 pin 把池子占满。
+**收益**：把“保留多久”从拍脑袋变成“占用成本 vs 重算成本”的盈亏平衡；避免无限 pin 把池子占满。v1 用固定 TTL；有 hook ETA 时按 ETA + slack。
 
 ---
 
@@ -936,7 +936,7 @@ T_ssd_promote = T_disk + T_stage + T_dram_write + verify
 
 # 保留
 p_resume(T) = p0×exp(−μT)        # v1 默认
-# P_return(T | tool_class, elapsed) 只在可靠历史/ETA 时作为研究项
+# P_return(T | tool_class, elapsed) 仅研究/离线校准
 Net(T) = p_resume(T)×T_prefill − c_h×S_bytes×T − C_risk
 
 # 容量
