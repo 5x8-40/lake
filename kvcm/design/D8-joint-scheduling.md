@@ -324,7 +324,7 @@ sequenceDiagram
 | 字段 | 作用 | 约束 |
 |---|---|---|
 | `version` / `hook_id` | 兼容/幂等 | 未知版本只观察、不生效 |
-| `event` | PRE_ANNOUNCE / ATTACHED / PAUSE / CLOSE / BRANCH / TOOL_HINT（可选） | 未知事件只 observe；TOOL_HINT 仅在工具适配器有可靠 ETA 时用 |
+| `event` | PRE_ANNOUNCE / ATTACHED / PAUSE / CLOSE / BRANCH / TOOL_HINT（可选） | 未知事件只 observe；TOOL_HINT 仅在 hook 生产方有可靠 ETA 时用 |
 | `session_id` / `workflow_id` / `step` / `branch` | 会话/分支定位 | 与路由键对齐 |
 | `prefix`（token_ids 或 hash 链） | 要预取/保留的前缀 | 优先 hash；必须与引擎口径一致 |
 | `timing` / `eta_ms` / `expected_turns` / `reuse_prob` | 请求前/中/后；预计到达 | ETA 决定提前量 |
