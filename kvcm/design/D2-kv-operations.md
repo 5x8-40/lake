@@ -215,10 +215,19 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
   - kvcm 客户端：`GET /batch_query_keys` 按请求行约 8KB 分批（不含 header），上限未与 master 校准；见 `admin_main.py` 与 [code-architecture.md](code-architecture.md)「三条接入通道」HTTP 节
 - **F12 空写的发送通道**
   - master 协议层：`UpsertStart` / `UpsertEnd` 是公开 RPC（`master_service.h:331/:338` @0.3.11）
-  - 官方 Python 绑定只有「带数据、一次完成」的 `upsert_tensor`，没有把 start/end 拆开的接口
-  - kvcm 的空写是单独的 `_empty_pin.so`。链 wheel 里的 `store.so` **和** `libmooncake_store.so`（`Upsert*` 符号在后者；`mooncake-transfer-engine==0.3.13.post1`）。wheel 不带 C++ 头；扩展用本地 `mooncake_pin_api.h`，经已建 `Client::master_client_` 调 `UpsertStart` / `UpsertEnd` / `UpsertRevoke`
-  - `get_real_client()` 是退路，不是当前实现。只有以后真实的 `UpsertStart` 调用失败，才改为包含 `pyclient.h`，在 Python 对象还原成 `MooncakeStorePyWrapper` 之后用 `get_real_client()` 取出已建 client。拿到对象之后，这个函数只是返回成员。现在不走这条，也不把 pybind 跨模块转换写进当前扩展
-  - `MasterClient::UpsertStart` 发出的是这个 client 自己的 UUID。当前路径是方案一：空写会把 key 的 client_id 写成 kvcm 的 UUID。借名（方案二）这条 API 做不到，不是当前路径（§2）
+  - 官方 Python 绑定只有“带数据、一次完成”的 `upsert_tensor`，没有把 `Start` / `End` 拆开的接口
+  - kvcm 的空写不是走 Python 绑定，而是单独的 `_empty_pin.so`：
+    - wheel 里有 `store.so` 和 `libmooncake_store.so`，`Upsert*` 符号在后者，所以两个都要链；
+    - wheel 不带 C++ 头，扩展用本地手写的 `mooncake_pin_api.h` 对齐 ABI；
+    - 扩展通过已建的 `Client::master_client_` 调 `UpsertStart` / `UpsertEnd` / `UpsertRevoke`。
+  - `get_real_client()` 只是备用方案，当前不用：
+    - Python 层拿到的是 `MooncakeStorePyWrapper` 外壳，真正的 C++ `Client` 藏在里面；
+    - `get_real_client()` 就是打开外壳取出 C++ client；
+    - 只有直接调 `UpsertStart` 失败时才考虑这条路；它要额外包含 `pyclient.h` 并做跨模块类型转换，容易和 Mooncake 版本绑死。
+  - `client_id` 归属要说清：
+    - Mooncake 会给每个 key 记一个 `client_id`，表示“谁写的/归属谁”；
+    - 空写扩展是独立 client，所以写完 key 的 `client_id` 是 **kvcm 的 UUID**，不是原引擎实例的 UUID；
+    - 想“借名”用原引擎的 `client_id` 写，当前 API 做不到；当前接受这个副作用（方案一），后续 lease/驱逐/审计要按 Mooncake 对该字段的语义确认。
 - **F12b 空写的前提与升级陷阱**（落地时必须对照）
   - **版本前提**：v0.3.13.post1 使用 `SoftPinAction` 三态，**没有** `has_read_lease` 门槛；Case B 只看尺寸
   - **安全前提**：Case B（同尺寸、单 slice、key 存在、无盘副本）；`put_step=1`；soft pin 前 `exists` 持 lease
