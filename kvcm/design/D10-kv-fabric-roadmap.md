@@ -109,7 +109,7 @@ flowchart TB
 | **F. 跨集群 KV Fabric** | 跨集群/地域复制热前缀；follow-the-sun；数据驻留 | 全球化平台 | 跨区 TTFT、合规、DR | 1–3 年 |
 | **G. KV 存储效率** | 去重/压缩/量化/分层；复用已有 SSD offload/promote；共享 system prompt/tools（内容寻址自然去重，新增治理/计费） | 平台/基础设施 | 每 GB 有效 KV、HBM 占用 | 1–3 年 |
 
-SSD 不是冷备，是性能层：直读仍经 staging，热前缀 promote 到 DRAM，写寿命/DWPD 是约束；`promote` 是已有原语，D10 新增的是放置/预算策略。
+SSD 不是冷备，是性能层：LOCAL_DISK 直读仍经 staging，热前缀 promote 到 DRAM，写寿命/DWPD 是约束；`promote` 是已有原语，D10 新增的是放置/预算策略。Mooncake TE 有 NVIDIA GDS，但 Store/vLLM connector 没接；A5 无 GDS。
 
 Agent 会话不只看 TTFT：工具返回后新请求的 resume TTFT、会话级 E2E、工具等待占比都算体验；不做 engine/request suspend。
 

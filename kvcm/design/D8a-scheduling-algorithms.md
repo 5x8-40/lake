@@ -647,11 +647,22 @@ L2 更新权重；L0/L1 只读：
 
 ### 6.7 SSD 层：promote 与直读怎么选
 
-先核实现状：Mooncake/vLLM 的 **LOCAL_DISK / 本地盘**读不是 SSD 直接进引擎 HBM。vLLM connector 有 `disk_offload_buffer_budget_bytes` / staging buffer，Mooncake `LOCAL_DISK` 走 offload RPC（`real_client.cpp` 注释也写明 LOCAL_DISK 必须走 offload RPC）。DISK/DFS 路径另算，不能套这段。所以：
+先核实现状：Mooncake/vLLM 的 **LOCAL_DISK / 本地盘**读不是 SSD 直接进引擎 HBM。vLLM connector 有 `disk_offload_buffer_budget_bytes` / staging buffer，Mooncake `LOCAL_DISK` 走 offload RPC（`real_client.cpp` 注释也写明 LOCAL_DISK 必须走 offload RPC）。DISK/DFS 路径实现不同，但同样不是 GDS 直灌 HBM；不能把 LOCAL_DISK 的 staging 细节套到所有路径，结论仍是不到 HBM。所以：
 
 ```text
 LOCAL_DISK 读 ≈ 盘读 + host staging + 再进引擎
 ```
+
+核实补充：
+
+| 层 | 能否 NVMe-oF/GDS → HBM |
+|---|---|
+| Mooncake TE `NVMeoFTransport` | **可以**（NVIDIA cuFile/GDS，注册 HBM buffer） |
+| Mooncake Store `LOCAL_DISK` | 当前**不走** GDS，走 offload/staging |
+| vLLM connector | **没有** GDS 入口 |
+| A5/昇腾 | 不是 GDS 体系；`ascend_transport` 无 GDS |
+
+`storage_backend.h` 里的 4K 对齐/记录布局是“future DMA/GDS”的预留，不是已实现的读路径。NVMe-oF 协议本身不是 GPU 专属；不兼容的是 GDS/cuFile 这段。远程 SSD 也一样：可以存，但读进引擎当前仍要经读节点的 staging/transfer，不是 Store 直灌 HBM。
 
 这意味着 **promote（SSD→DRAM）很重要**，但它和“直接读”是两条不同路径：
 

@@ -213,11 +213,11 @@ SOTA 的索引（llm-d `pkg/kvcache`、Dynamo `lib/kv-router`、AIBrix `pkg/kvev
 | **HBM** | 实例 APC/显存里的块 | 引擎 `BlockStored(medium=GPU)` | 真本地命中；HBM 命中的依据 |
 | **本机 DRAM** | 本机池 DRAM 副本 | 引擎 `BlockStored(medium=CPU)` / kvcm READY | 本地读，省跨机传输；仍要拷进 HBM |
 | **远端 DRAM/DFS** | 池内其他节点/介质 | 池事件、kvcm 核验 | Pool 命中，省重算但要传输 |
-| **SSD/LOCAL_DISK** | 池内盘副本 | 池事件、kvcm 核验 | 直读经 host staging，不建 DRAM 副本；热前缀 promote 到本机 DRAM；DISK/DFS 另算 |
+| **SSD/盘副本** | 池内本地/远程盘副本 | 池事件、kvcm 核验 | LOCAL_DISK 直读经 host staging；DISK/DFS 走各自 offload/transfer，不等于 GDS 直连；热前缀 promote 到本机 DRAM |
 
 **关键区分**：kvcm 预取到目标实例，得到的是「本机 DRAM」，不是 HBM。第一次使用仍要把 KV 从 DRAM 拷进 HBM。**要认定 HBM 命中，需要 HBM 证据**（引擎 GPU 事件，或方案 A 壳请求把 KV 带进 HBM）。
 
-SSD 不是 HBM 直连：直接读要经 host staging，且不建 Mooncake DRAM 池副本；反复读的热前缀应 promote 到本机 DRAM。`copy/move` 只接 DRAM seg，SSD 走 `offload`/`demote`/`promote`；细节见 [D8a §6.7](D8a-scheduling-algorithms.md)。
+SSD 不是 HBM 直连：LOCAL_DISK 直接读要经 host staging，且不建 Mooncake DRAM 池副本；反复读的热前缀应 promote 到本机 DRAM。`copy/move` 只接 DRAM seg，SSD 走 `offload`/`demote`/`promote`。Mooncake TE 的 `NVMeoFTransport` 有 NVIDIA cuFile/GDS，但不在 Store LOCAL_DISK/vLLM connector 路径；A5 无 GDS。细节见 [D8a §6.7](D8a-scheduling-algorithms.md)。
 
 #### 状态与置信度
 
