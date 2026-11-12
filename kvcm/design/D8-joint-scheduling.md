@@ -345,7 +345,7 @@ sequenceDiagram
 - **不做 engine suspend，也不做 request suspend**：标准工具调用就是本轮生成结束或 abort，释放请求；KV 用 `retain/offload/demote/evict` 处理。工具返回后是新请求，不是 resume 原请求。
 - **PAUSE 只用于会话退出/长时间不用**，不按每次工具调用 pause。
 - **只有可靠 ETA 才算长工具**：工具适配器给 `TOOL_HINT` + `eta_ms` 才提前 retain/offload；不解析 `sleep` 等命令文本，没有 ETA 就按普通请求处理。
-- **v1 TTL**：有 hook `eta_ms` 时用 `eta + slack`；没有就固定衰减 `p0×exp(−μT)`。`P_return` 只做研究/离线校准，不进在线控制。
+- **默认 TTL**：有 hook `eta_ms` 时用 `eta + slack`；没有就固定衰减 `p0×exp(−μT)`。`P_return` 只做研究/离线校准，不进在线控制。
 
 ---
 
