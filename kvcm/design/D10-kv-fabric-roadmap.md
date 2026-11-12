@@ -241,7 +241,7 @@ llm-d 自己的 pain-point 说明：只靠事件索引会留幽灵条目、需�
 
 - 应用级 KV API：`kv://` / 订阅；
 - 应用管理 KV 生命周期；
-- decode 并行（TP/SP/EP、sequence parallel）、请求迁移、跨实例 decode 调度——归引擎/D8，不是 KV Fabric；
+- decode 并行（TP/SP/EP、sequence parallel）、请求迁移、跨实例 decode 调度——D8 只做决策，gateway/engine 执行；不是 KV Fabric；
 - 第三个平面。
 
 ---

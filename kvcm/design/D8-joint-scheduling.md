@@ -439,8 +439,31 @@ flowchart TB
 - **冷却**：冷却时间 ≥ 扩容生效 + 预热 + 下线搬迁，防扩缩振荡（D8a §6.2 有公式）。
 - **滞回**：扩容阈值 > 缩容阈值；连续 N 周期才动作。
 - **优先级**：L0 永远不被 L1/L2 阻塞；L1 intent 异步；L2 只发目标容量。
-- **Warm Path 顺序**：路由正确 > 后台预取 > 低峰再平衡 > 请求迁移。请求迁移是引擎能力（搬正在跑的请求 + KV + 状态），不是 KV `copy`；KV 迁移走 `copy/move/offload/promote`，不能进 Hot Path。
+- **Warm Path 顺序**：路由正确 > 后台预取 > 低峰再平衡 > 请求迁移。请求迁移由 D8 决策，gateway 执行 abort/token 接续，engine 执行新请求；D8 不直接 abort、不搬 token 流、不改引擎/Mooncake 源码。KV 迁移走 `copy/move/offload/promote`。
 - **资源权重**：L2 单点更新；L0/L1 只读；当前按单 SC 假设，多 SC 后续再定。
+
+### 5.5 请求迁移（可选）
+
+前提：`save_decode_cache` 全局开，decode KV 持续进池；这是多轮命中基线，不是迁移专用开关。
+
+流程：
+
+```text
+D8 选目标/决定迁移
+→ gateway abort 源请求，累积已生成 tokens
+→ gateway 把 prompt + generated_tokens 发目标
+→ 目标 engine 按 KVT 查池
+→ 命中就少算，不命中就重算
+```
+
+边界：
+
+- **D8 只做决策**：选点、判收益、发 migration intent；不直接 abort、不接 token 流、不改引擎/Mooncake 源码。
+- **gateway 执行**：abort、token 接续、客户端不重复/不丢。
+- **engine 执行**：新请求正常调度；KV 从池加载。
+- 最后 partial block 可能没保存，允许**尾巴重算**；不追求零开销。
+- 采样状态（RNG/stop/penalty）由 gateway/engine 负责，不能只靠 tokens。
+- 不进 Hot Path；只在低峰/过载纠偏时用。
 
 ---
 
