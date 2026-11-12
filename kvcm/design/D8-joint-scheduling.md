@@ -465,6 +465,45 @@ D8 选目标/决定迁移
 - 采样状态（RNG/stop/penalty）由 gateway/engine 负责，不能只靠 tokens。
 - 不进 Hot Path；只在低峰/过载纠偏时用。
 
+#### 参考实现（不要混）
+
+| 参考 | 做什么 | 对我们 |
+|---|---|---|
+| **Llumnix**（OSDI'24） | 请求连 KV 一起在实例间热迁移，运行时纠偏 | 最接近“请求迁移”；调研里尾延迟可改善一个数量级 |
+| **TensorCast** | 请求级 KV 迁移/hydrate，把 KV 挪到请求侧 | 高负载下收益大，但动作在引擎/运行时 |
+| **Dynamo Migrator** | 故障时把 prompt + 已生成 token 重发到健康 worker | 这是 **replay/恢复**，不是稳态热迁移 |
+
+参考位置：[model-routing/instance-level.md](../../docs/research/model-routing/instance-level.md)、[tensorcast/overview.md](../../docs/research/tensorcast/overview.md)、[dynamo/overview.md](../../docs/research/dynamo/overview.md)。
+
+#### 收益与不赚
+
+收益**不是 TTFT**：请求已经在 decode，首 token 已过去。收益主要是：
+
+- 尾延迟 / ITL；
+- 负载纠偏，避免长 decode 占着热点实例；
+- drain/故障前预迁移；
+- 长 decode 的会话 E2E/TTLT。
+
+净收益：
+
+```text
+净收益 ≈ 剩余 decode 时间减少
+        + 尾延迟/SLO 改善
+        − KV 搬运/暂停/重算成本
+        − 失败/重复 token 风险
+```
+
+只有同时满足才迁：
+
+```text
+源实例过载 或 目标明显更空闲
+且 剩余 decode 还很长
+且 KV 已在池里/可命中
+且 净收益 > 0
+```
+
+不赚：负载本来就均衡、decode 很短、KV 不命中、客户端不能无缝切换。默认不做，不能当 Hot Path 优化。
+
 ---
 
 ## 6. 联合闭环场景
