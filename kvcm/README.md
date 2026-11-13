@@ -25,6 +25,7 @@ KV 管理控制面：独立于推理引擎与 KV 池的第三进程。使命两�
 | | [design/D8a-scheduling-algorithms.md](design/D8a-scheduling-algorithms.md) | **管理面：调度算法**：全部公式、推导、参数与收益模型（D8 的公式都在这） |
 | | [design/D9-kv-services.md](design/D9-kv-services.md) | **控制面：执行与运营能力**：KV 对账 / 用量账本 / 容量建议 / 下线搬迁 / KV 保留与删除治理 / 回放（分支/跨区/rollout 归 D8，不重复） |
 | | [design/D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md) | **愿景：KV Fabric 产品愿景**：价值金字塔、方向组合、三阶段、竞争定位与非目标 |
+| | [design/D11-kvcm-vs-oss.md](design/D11-kvcm-vs-oss.md) | **对比：kvcm 与开源方案**：控制流分歧（hint 推 vs 中心命令）、能力矩阵、逐家事实与出处、真实优势与短板 |
 | | [design/code-architecture.md](design/code-architecture.md) | 服务化代码架构（五层；E10/E11/E15 设计依据） |
 | **专项设计** | [design/kv-prefetch.md](design/kv-prefetch.md) | copy/prefetch 详细方案（A 壳请求 / B 显式副本复制权衡与时序） |
 | | [design/D8b-scheduling-sequences.md](design/D8b-scheduling-sequences.md) | **管理面时序**：L0 选路 / L1 预取与保留 / L2 扩缩与下线的全部时序图 |
@@ -38,7 +39,7 @@ KV 管理控制面：独立于推理引擎与 KV 池的第三进程。使命两�
 
 ```text
 kvcm/
-├── design/     # 生产化设计文档（控制面 D1/D2/D9 + 管理面 D8）
+├── design/     # 生产化设计文档（控制面 D1/D2/D9 + 管理面 D8 + 对比 D11）
 │   └── flows/  # kvcm 自己的流程（目前只有 prefetch；调度时序在 design/D8b-scheduling-sequences.md）
 ├── demo/       # precopy demo（copy）+ soft pin 真机记录；文档+代码+测试床自包含
 ├── kvcm/       # 服务代码（daemon、后端、流程、Ledger）

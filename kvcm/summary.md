@@ -2,7 +2,7 @@
 
 来源：[issue #54](https://github.com/5x8-40/lake/issues/54)（KV-CM 遗留问题总清单）。本文是 kvcm 预复制生产化的总结文档：设计决策、潜在问题、工程项三类条目的总登记处——已闭环条目在原地标 ✅、结论指向正式文档，待定条目随讨论与实验更新。
 
-文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D8/D9/D10/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（copy 端到端）与独立实验（soft pin 真机，见 [EXPERIMENTS.md](demo/EXPERIMENTS.md)）；本文 = 登记处。
+文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D8/D9/D10/D11/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（copy 端到端）与独立实验（soft pin 真机，见 [EXPERIMENTS.md](demo/EXPERIMENTS.md)）；本文 = 登记处。
 
 编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环后在原位置标 ✅，结论落对应正式文档（`design/` 系设计文档 / `demo/` 系 demo 文档）。
 
@@ -266,6 +266,15 @@
 - **不是组件也不是第三个平面**（D10 §0.2）：是管理面+控制面合起来的终局形态；应用不指定实例，KV 由系统放置。
 - **与 SOTA 的差异**（D10 §6）：链式 hash/逐块匹配/事件→索引/推测索引都是标准做法；差异在**放置主动权**（能改变放置 vs 只路由）和**索引权威**（派生缓存 + master 权威；L0 miss 不同步查 master，异步对账）。
 - 工作文档：[D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md)。
+
+**D11. 与开源方案对比** — 🟡 设计对照
+
+- 定位：回答「开源是不是都是 connector + 引擎自己决策」，并给出 kvcm 差异的准确边界。不是竞争叙事，是决策权归属的对照。
+- **控制流两类**（D11 §2）：开源主流是 **hint 推**——中心下发 `kv.fetch`/`kv.prefetch`/`kv.move`，引擎内策略复核后自己决定拉不拉（KVCR 最完整实现）；kvcm 是 **中心命令**——直接对池下 `CreateCopyTask`/`MoveStart+MoveEnd`/空写 pin，引擎不必参与。第三类是 llm-d/Dynamo/AIBrix 的「只决定请求去哪」。
+- **上游关键事实**（D11 §4）：vLLM `vllm/v1/kv_hints/protocol.py` 与 SGLang `managers/kv_hints.py` **只有信封、无 action handler**；vLLM 唯一消费者是 KVCR 二级层（`kv_offload/tiering/kvcr/manager.py::on_new_request`）。KVCR 的主动放置仍是 TODO（`runtime/policy_runtime.py`）。
+- **真实优势**（D11 §5.1）：不改引擎（官方 connector 即可）、能指定目标段、副本权威来自池 master 而非事件推断、八项操作齐全。
+- **真实短板**（D11 §5.2）：看不见引擎 HBM/APC（HBM 命中判定必须靠引擎事件）；数据面依赖源 seg client 在线；`retain` 仍是 `NotImplementedError`（`backends/mooncake/backend.py:1325`）；soft pin 只承诺 0.3.13.post1 且无 ABI 闸；key 必须自己与引擎逐字节对齐；异构 TP 仍需 #15835 backport。
+- 工作文档：[D11-kvcm-vs-oss.md](design/D11-kvcm-vs-oss.md)；图见同目录 `figures/fig-vs-oss-{positioning,matrix,flow}.svg`。
 
 ## 二、潜在问题
 
