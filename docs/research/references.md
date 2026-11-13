@@ -35,6 +35,8 @@
   - K8s Gateway API Inference Extension 的 EPP 参考实现:逐块 KV 索引 + 推测索引(TTL 2s)+ 插件化 scorer + PD sidecar/coordinator 编排。
 - **四栈对比** → [`serving-stack-comparison.md`](serving-stack-comparison.md)
   - Dynamo / FlexKV / llm-d / AIBrix:覆盖层、KV 状态归属、定位象限、路由/PD/扩缩/卸载逐维度对比。
+- **kvcm vs 开源** → [`../../kvcm/design/D11-kvcm-vs-oss.md`](../../kvcm/design/D11-kvcm-vs-oss.md)
+  - 决策权归属对照:hint 推(KVCR/vLLM/SGLang 信封)vs 中心命令(kvcm 对池下发);能力矩阵、逐家符号级出处、我方真实短板(看不见引擎 HBM/APC、retain 未接)。
 - **Guided / structured decoding** → [`guided-decoding.md`](vllm_vs_sglang/guided-decoding.md)
   - SGLang × vLLM:xgrammar/llguidance 仅 GPU apply、FSM 仍在 CPU;overlap/async 近零 vs spec+grammar / pending token 的同步气泡;与 lake 重叠契约及抢占时 FSM 游标交接。
 - **Sampling 参数** → [`sampling-params.md`](vllm_vs_sglang/sampling-params.md)
@@ -58,6 +60,7 @@
 - **llm-d Router** (Red Hat/Google/IBM 等): K8s 原生分布式推理栈的路由仓——EPP(Envoy ext-proc)精确缓存感知选路 + pd-sidecar/coordinator 的 PD(/EPD)编排;扩缩在独立仓 WVA(KV 利用率/队列深度驱动,指标交 HPA/KEDA 执行)。**源码已引入** `3rdparty/llm-d-router`,见 [`llm-d/`](llm-d/)。
 - **AIBrix** (字节跳动 → vllm-project): K8s 推理平台积木——网关路由策略集、KV 事件同步、KV 感知扩缩、StormService 角色编排(PD 为静态拓扑)、aibrix_kvcache 卸载框架。**源码已引入** `3rdparty/aibrix`,见 [`aibrix/`](aibrix/)。
 - **Dynamo / FlexKV / llm-d / AIBrix 四栈对比**: 四者词汇表相似(KV 复用/路由/PD),区别在覆盖层与 KV 状态归属。见 [`serving-stack-comparison.md`](serving-stack-comparison.md);路由维度细评见 [`model-routing/instance-level.md`](model-routing/instance-level.md)。
+- **kvcm / KV Fabric 与开源方案对比**: 开源侧以 hint 推(路由建议、引擎复核)为主,少数为引擎内插件或对象池;kvcm 以中心命令直接对池下发。能力矩阵与逐家符号级出处见 [`../../kvcm/design/D11-kvcm-vs-oss.md`](../../kvcm/design/D11-kvcm-vs-oss.md)。
 
 ## KV Cache 复用与传输
 
