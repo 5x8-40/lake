@@ -3,6 +3,7 @@
 - 状态: **已闭环**——事实基线（F1-F15）已核实；六个设计问题全部闭环
 - 上游问题: [summary.md](../summary.md) D1——Router 如何感知预复制副本并据此选实例；「谁预取、何时放行」的进程形态归 D4
 - 角色约定: kvcm 目前没有 router 组件。本文选路面逻辑上分两层（§1）：**索引**（订阅事件流建索引）与 **Router**（查索引、决定请求发往哪个实例；gateway 侧扩展 / 独立 router 进程 / 编排内置均有可能）。索引进程形态（内置 Router / 独立组件）归 D4
+- 平面归属: 本文是**两个平面之间的契约**——控制面侧定义「kvcm 补发什么事件、什么格式、身份怎么算」（§2 方案 a）；管理面侧定义「Router/索引怎么用这些事件选路」（F1–F15 的池层事实与 §5 分层成本）。所以它既不是纯控制面文档，也不是纯管理面文档
 
 ## 参考实现
 
@@ -294,7 +295,7 @@ flowchart LR
 口径：目标函数是 router 的内部问题，kvcm 侧无决策——§1-§3 闭环后 router 的输入已齐（引擎事件 + kvcm 补发 + medium 分层），怎么打分由 router 实现自定。候选方案记录在案：
 
 - **分级兜底（最简）**：全本地 > 池远端 > 重算，字典序定级，级内按负载选。
-- **打分制**：命中收益（连续本地满块数 × 分层成本；Dynamo 成本 device 1.0 / host 0.75 / disk 0.25 可借作初值）− 负载惩罚（队列长 / in-flight；在途负载无权威，router 本地记账，参考实现·Dynamo）。
+- **打分制**：命中收益（连续本地满块数 × 分层成本；Dynamo 成本 device 1.0 / host 0.75 / disk 0.25 可借作初值）− 负载惩罚（队列长 / 在途请求数；在途负载无权威，router 本地记账，参考实现·Dynamo）。
 - **传输成本两种算法**：显式比较（跨机字节 / 有效带宽 vs 重算成本，不划算换实例重算）或简化（远端副本固定扣分）。
 - **传输繁忙的测量（「有效带宽」怎么来）**：网卡/链路计数器采样——Linux RDMA 计数器（`/sys/class/infiniband/*/ports/*/counters`）或 ethtool 统计，按 Δbytes / (链路速率 × Δt) 估链路利用率；实例上报或控制面采集，router 打分把「目标实例传输忙」计入负载惩罚，kvcm 预热/搬迁据此避让与限速（E15）。参考实现：vLLM-Ascend AI-QoS（`tools/ai_qos/` + 官方介绍 `docs/source/user_guide/feature_guide/Ai_QoS_introduction_en.md`，vllm-project/vllm-ascend）——它证明 KVCache 传输与集合通信/算子下发在交换机上真实冲突（生产级问题）；它的解法是执行层流量分级（NPU channel 优先级映射 UB 交换机 Virtual Lane，严格优先级调度），与我们互补：它管「冲突时谁先走」（单机/交换机 QoS），本条管「什么时候搬、往哪台调度」（集群层避让）。
 
@@ -325,3 +326,5 @@ flowchart LR
 - **D5**：故障衔接（源 seg 所在 client 掉线 copy 失败（F4）、与重路由的先后）
 - **D6**：layerwise 选型（[../docs/research/vllm-ascend/layerwise-taxonomy.md](../../docs/research/vllm-ascend/layerwise-taxonomy.md)）
 - **D7**：方案 A（壳请求进 HBM）去留与叠加顺序
+- **D8（管理面）**：统一调度中心（请求 × KV × 扩缩容；hook + KVT + L0/L1/L2 三环；目标形态 + 性能模型）——kvcm 的管理面（可独立组件/嵌入 Router）；把本文的选路面扩展成联合决策，[D8-joint-scheduling.md](D8-joint-scheduling.md)
+- **D9**：基于 kvcm 能力的服务地图（会话 KV / 预热 / KV 对账 / 账本 / 容量 / 迁移；目标形态 + 收益）——把 D2 的操作集组合成服务，[D9-kv-services.md](D9-kv-services.md)

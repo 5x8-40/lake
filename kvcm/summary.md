@@ -2,13 +2,17 @@
 
 来源：[issue #54](https://github.com/5x8-40/lake/issues/54)（KV-CM 遗留问题总清单）。本文是 kvcm 预复制生产化的总结文档：设计决策、潜在问题、工程项三类条目的总登记处——已闭环条目在原地标 ✅、结论指向正式文档，待定条目随讨论与实验更新。
 
-文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（copy 端到端）与独立实验（soft pin 真机，见 [EXPERIMENTS.md](demo/EXPERIMENTS.md)）；本文 = 登记处。
+文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D8/D9/D10/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（copy 端到端）与独立实验（soft pin 真机，见 [EXPERIMENTS.md](demo/EXPERIMENTS.md)）；本文 = 登记处。
 
 编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环后在原位置标 ✅，结论落对应正式文档（`design/` 系设计文档 / `demo/` 系 demo 文档）。
 
-依赖主线：D1（已闭环）/ D2 是设计主线（E5 已闭环，结论见本文 E 节）；E10→E11→E12/E13/E14 是服务化主线（重构先行、协议随后）；P1-P8 大多随 D1/D2 定型一并回答。
+依赖主线：D1（已闭环）/ D2 是控制面操作主线，D8 是管理面（调度），D9 是控制面服务扩展（E5 已闭环，结论见本文 E 节）；E10→E11→E12/E13/E14 是服务化主线（重构先行、协议随后）；P1-P9 大多随 D1/D2/D8/D9 定型一并回答。
+
+> **kvcm 分两个平面**（像 K8s 的 controller-manager 与 scheduler：两个进程，一套控制面体系）：**控制面**执行（D1/D2/D9，八项操作/核验/记账/发布），**管理面**决策（D8 系列，选路/会话/放置/扩缩）。管理面可独立进程或嵌入 Router，但必须看得到在线请求；离线形态只能做容量规划。**KV Fabric**（D10）是两者合起来的终局形态，不是第三个平面。
 
 状态标记：✅ 已闭环（附结论写在哪个文档）｜🟡 部分闭环｜无标记 = 待定。
+
+**当前目标版本：Mooncake v0.3.13.post1（master / client 同版本）。** 文中出现的 0.3.11 / main 对照是版本差异记录，不代表当前部署基线；D8/D9 与新增设计按 v0.3.13.post1 写。
 
 ## 一、设计决策
 
@@ -220,6 +224,49 @@
 
 - 待定：壳请求（方案 A 的预取请求：`max_tokens=1`、不真正生成、只为把 KV 带进 HBM，定义见 [kv-prefetch.md](design/kv-prefetch.md)）这条路是否保留、与 B2 的叠加顺序。
 
+**D8. 管理面：统一调度中心（请求 × KV × 扩缩容）** — 🟡 设计草案
+
+- 定位：kvcm 分两个平面（像 K8s 的 controller-manager 与 scheduler）。**控制面**执行（D1/D2/D9），**管理面**决策（D8）。管理面可独立进程或嵌入 Router，但**必须看得到在线请求**；离线形态只能做容量规划。
+- 目标形态：KVT（多源 KV 索引树）+ HookEnvelope + L0/L1/L2 三环，联合决策“请求去哪、KV 怎么动、集群扩不扩”。
+- 原则：hook ≠ command；KV 动作只走 intent；请求不等 READY；不设固定降级链；索引是派生视图；预算先行；决策与执行分离。
+- **收益结论**：命中/保留省的是秒级 prefill（最大杠杆）；本地放置省的是跨机传输（950 跨机待测；A3 参考：FabricMem 78–107、ROCE 20–24GB/s）；HBM 命中只省本地 H2D 拷贝（950 单机 UB_CTP≈47GB/s、POD≈93GB/s，分开取值）。
+  - **传输能否被计算掩盖，取决于残差**（D8a §1.1）：layerwise 下，`可掩盖token数 = T_transfer × v_prefill`，残差低于它时不能掩盖，`T_kv = T_compute + T_transfer`；批量加载不靠本请求计算掩盖，靠其他请求填 GPU 或按 prefill 长度分组。
+  - **不再用单阈值**（D8a §8.1）：`v_prefill` 随上下文下降，改用设备 A 的拟合 `TTFT = c + (1−hit)(aN+bN²)`；99% 命中、1M 时 V3.2 跨机额外约 1.78s（约 8%），V4-Pro 约 0.20s（约 3.5%）。
+  - **高命中率反而放大本地放置的价值**：命中 99% 时跨机传输是纯加项。512K 上下文跨机 `T_kv` 2.716 s vs 本机 1.804 s，差 0.912 s；1M 差 1.782 s。
+  - **batch 效应**：forward 按层推进，某层没就绪整个 batch 等，损失按 `max over requests(T_kv)` 计。
+  - 所以预取的价值不只是防驱逐，还包括把高命中率请求从跨机挪到本机。
+- **性能视角**（D8 §7.5）：需求/命中/执行/容量四层；看有效命中、residual、介质、`operator_bubble_ratio`、`network_headroom`，不只看 APC 命中率和平均带宽。
+- **请求迁移**（D8 §5.5）：D8 只做决策；gateway abort/token 接续，engine 执行新请求；`save_decode_cache` 全局开，partial tail 允许重算；不是 KV Fabric。
+- **网络是决策输入**（D8 §3.4）：分三平面——H2D 专用 UB（950 单机 UB_CTP≈47GB/s、POD≈93GB/s，分开取值；800Gbps 是链路口径）、存储面（池/跨机 KV）、计算面（集合通信）。KV 跨机尽量不走计算面；本机不只是带宽好，而是不跟算子抢、尾延迟确定。三处用到——L0 选路、L1 预取时机、L2 扩容判断（带宽满但池空时该加网络/改放置，不是加节点）。`BW_eff` 必须实测并含竞争惩罚。参考 DualPath 的 compute/storage 双网隔离，950 上再加 H2D 专用面。
+- **版本基线 v0.3.13.post1**：publisher 代码有但当前构建默认 OFF、运行默认 false，生产按开启规划；soft pin 空写设计、后续 PR，hard pin 事后设置拒绝；copy/move 无取消；retain 未实现；admin `batch_query_keys` 零副作用可用；实例注册归 E13；段容量准入已合入（#72）；E15 带宽限速未做。
+- 工作文档：[D8-joint-scheduling.md](design/D8-joint-scheduling.md)；算法：[D8a-scheduling-algorithms.md](design/D8a-scheduling-algorithms.md)；时序：[D8b-scheduling-sequences.md](design/D8b-scheduling-sequences.md)。
+- 待定：publisher 开启方式与成本、hook 通道与信任、扩缩 actuator、权重/阈值真机校准；多 SC 后续再定。
+
+**D9. 控制面：执行与运营能力** — 🟡 设计草案
+
+- 定位：kvcm 控制面不做选路、不做扩缩决策、不持有前缀索引；在“执行 + 核验 + 记账 + 发布”边界内提供运营能力。**会话 KV、预热、选路、扩缩是 D8 管理面的动作，D9 不重复**；D9 只提供执行接口。
+- 控制面独立能力：KV 对账（核验）、用量账本（成本归因）、容量规划建议、下线搬迁（Drain）、KV 保留与删除治理、历史回放/策略试算；分支/跨地域/rollout 归 D8，D9 只执行。
+- 优先级：P0 = KV 对账 + 用量账本；P1 = 容量规划建议 + 下线搬迁 + KV 保留与删除治理；P2 = 历史回放。
+- **收益**：KV 对账/用量账本让 D8 的命中/保留决策可信、可算 ROI；容量建议/下线搬迁是“保命中率”的防守型收益；保留规则/回放让策略可控、可回归。
+- 关键约束：soft pin 设计、后续 PR；hard pin 拒绝；retain 未实现；KV 对账用 v0.3.13.post1 的零副作用 admin 查询；copy/move 无取消。
+- **不重写轮子**：索引/查询复用 Conductor/Dynamo indexer/Mooncake admin；字节/指标复用 LMCache observability/Prometheus；D9 补的是抽样比对、intent→命中的归因、与 D8 的联动。
+- 工作文档：[D9-kv-services.md](design/D9-kv-services.md)。
+- 待定：KV 对账采样成本、用量账本回传、容量建议边界、下线搬迁/retain、保留/删除默认策略。
+
+
+**D10. KV Fabric 产品愿景** — 🟡 规划中
+
+- 北极星：把 KV 从“缓存”变成一等云资源——可放置、可复制、可迁移、可计价、可治理。
+- 价值金字塔：L1 省算力（命中/保留/预取）→ L2 省传输/负载（热点多副本/迁移）→ L3 新体验（Agent 会话保留/恢复、共享前缀）→ L4 新商业（FinOps/QoS/计费）。
+- 值得做的方向：KV 负载整形、Agent 会话保留/恢复、KV FinOps/QoS、容量数字孪生、KV HA/DR、跨集群 KV Fabric、KV 存储效率。
+- 三阶段：H1 省（负载整形+会话保留+FinOps 最小集）；H2 稳/省（容量孪生+HA/DR+QoS）；H3 新（跨集群+存储效率）。
+- 建议下注：KV 负载整形、Agent 会话保留/恢复、KV FinOps/QoS。
+- **应用契约（D10 §0.3）**：应用发 text/messages + 可选 hook，后端 tokenize 后查 hash；分支就是 messages。
+- **不做（D10 §7）**：应用级 KV 句柄 / `kv://` / 订阅；应用只发请求/hook。
+- **不是组件也不是第三个平面**（D10 §0.2）：是管理面+控制面合起来的终局形态；应用不指定实例，KV 由系统放置。
+- **与 SOTA 的差异**（D10 §6）：链式 hash/逐块匹配/事件→索引/推测索引都是标准做法；差异在**放置主动权**（能改变放置 vs 只路由）和**索引权威**（派生缓存 + master 权威；L0 miss 不同步查 master，异步对账）。
+- 工作文档：[D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md)。
+
 ## 二、潜在问题
 
 - **P1. KV 与模型版本绑定**——vLLM block hash 不含权重 revision，权重更新后旧 KV 会被误命中、输出错了也不报错。key 命名空间必须含 model_id/revision（要求已写入 D2 §4 release；落地随 kvcm 实现，E11/E12）。
@@ -246,13 +293,14 @@
 - **E6. 0.3.11 API 子集核对**——✅ 已闭环（结论写在 D2 F13）
   - 做法：三个版本的 RPC 注册表 diff（v0.3.11 与 v0.3.11.post1 完全相同）
   - 0.3.11 已有：lease / offload / promotion 心跳取任务、Admin 查询三件套、`EvictDiskReplica`、`BatchExistKey` 续租（D1 F15）、soft pin（D2 F9）
-  - main 才有：`ProbeKey`/`BatchProbeKey`、零副作用 Admin 查询（`GetReplicaListForAdmin`）、租户配额五件套、KV 事件、容量快照、`UnmountLocalDiskSegment`
+  - main 才有：`ProbeKey`/`BatchProbeKey`、租户配额五件套、容量快照、`UnmountLocalDiskSegment`；`has_read_lease` 门槛在 0.3.14-pre/main
+  - **0.3.13.post1 补充**：零副作用 Admin 查询（`GetReplicaListForAdmin`/`GET /batch_query_keys`）、KV 事件 publisher 代码、`SoftPinAction` 三态已具备；publisher 默认构建 OFF/运行 false
   - `default_kv_lease_ttl` 测试床配置 11s（D2 F9）
   - 缺口清单 = D2 F13⑥（per-key 降层 RPC、copy/move 取消、key→client_id 查询）——kvcm 侧组合达不到完整语义，要补得动 mooncake 池侧（copy 取消有 kvcm 弱版「弃置 + 事后清副本」，P9）；改不改、何时补未议
 - **E7. MLA 实测**——`put_step>1` 时传输计划全部分配到 `targets[0]`、其余 rank 读远端：功能上推断正确但还没实测；hybrid/sparse 被上游的开关检查排除（异构不支持，同构可用）。
 - **E8. mooncake kv_event schema 核对**——✅ 已闭环（结论写在 D1 F14）
 
-publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medium+tenant+group，**无 seg/机器位置**；ZMQ 传输；CMake 默认 OFF、官方 wheel 构建 ON。**0.3.11.post1 不含此机制**（publisher 代码在 v0.3.11 之后进仓，tag 上无 `kv_event/` 目录、无构建开关）——D1 路径 b 要用须升级 mooncake 版本。
+publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medium+tenant+group，**无 seg/机器位置**；ZMQ 传输；CMake `ENABLE_KV_EVENTS` 默认 OFF，运行 `--enable_kv_events` 默认 false；copy 路径零发布。**0.3.11.post1 不含此机制**（publisher 代码在 v0.3.11 之后进仓）；**0.3.13.post1 含代码**，但是否编译进 wheel、是否运行开启要按部署确认——未显式开启时删除面仍不可见。
 
 - **E9. vLLM 事件载荷核对**——✅ 已闭环（结论写在 D1 事实基线 F7-F10）
   - `BlockStored` 含 `medium` 字段
@@ -293,6 +341,13 @@ publisher 含 stored/removed/cleared，**驱逐发 removed**；载荷 = key+medi
 
 - **E15. copy 并行与限速**——🟡 **网卡利用率限速仍然不做**。并行窗口已落地（E11：`asyncio.Semaphore`，默认 4，`--copy-submit-concurrency`）。10 月 29 日跨机（[demo/EXPERIMENTS.md](demo/EXPERIMENTS.md) #17，与 #16 单机 `TRANSFER_FAIL` 不是同一次实验）：42 条 `create_copy_task` 在窗口 4 下约一半失败，主错误是 `NO_AVAILABLE_HANDLE`（`max retries reached: 10`），master 留内存失败；14 条全成。提交前只查计划第一条的目标段，只加落在这一段上的新字节；其它段的剩余和字节都不参与，这一段不够就一个 key 都不发。没查的段仍可能在 `CopyStart` 时 `NO_AVAILABLE_HANDLE`。这已经在本分支落地；它不代替 E15，也不做网卡采样。实验当时也没跑这条预检。另一条前缀已经提交、但还没在目标段划出缓冲区时，剩余里看不见，两条都可能放行。彻底避开代价高，接受这个窗口。Router 侧用网卡信号打分归 D1 §5。
 - **E16. 生产化缺口**——EP 拓扑实测、master HA、监控指标（READY 延迟、copy 失败率、external hit；命中率归因口径与 P8 耦合）。
+
+### D. 管理面与服务化（D8/D9）
+
+- **E17. 管理面调度中心 MVP**——按 [D8](design/D8-joint-scheduling.md)：hook 信封 / KV 事实 / KV intent / 决策日志 契约；KVT（先接引擎事件 + kvcm READY + speculative + miss 反馈）；L0 选路接入；L1 预取/保留最小集；时序见 [D8b-scheduling-sequences.md](design/D8b-scheduling-sequences.md)。
+  - 验收：KVT 合并/墓碑/置信度单测；L0 决策延迟 p99 <5ms；hook observe 模式不改变现有行为；READY/miss 回写闭环。
+- **E18. KV 对账 + 用量账本最小集**——按 [D9](design/D9-kv-services.md)：热条目抽样核验（v0.3.13.post1 用 `GET /batch_query_keys` / `GetReplicaListForAdmin`，零副作用）；`LOST/REMOVED` 事实回写；ledger 增加 bytes/ROI/归因字段。
+  - 验收：ghost 检出率、误判率、查询 QPS 预算；预取/保留 ROI 可算；不因核验阻塞请求。
 
 ## 参考锚点
 
