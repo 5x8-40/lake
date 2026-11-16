@@ -6,13 +6,12 @@
 运行：
     python3 docs/research/kvcm-vs-oss/figures/plot_kvcm_vs_oss.py
 
-输出（全部为本目录下的**自绘图**，非上游原图）：
-    fig-layer-map.svg       分层归属（谁在哪层，kvcm 站哪）
-    fig-control-modes.svg   三种分发/控制形态
-    fig-authority-matrix.svg 决策权 / 执行权 / 权威记录三分
-    fig-hint-timeline.svg   信封先落地、执行缺位
+输出（本目录下的**自绘图**，非上游原图）：
+    fig-overview.svg        分层归属 + 三种分发/控制形态（左：谁在哪层；右：谁说了算）
+    fig-evidence.svg        按控制权的矩阵 + hint 落地时间线（左：权威；右：落地状态）
     fig-ucm-schematic.svg   UCM 分层示意（redrawn from 上游 architecture.svg）
 
+图数刻意压到三张：两张对照工件各承载一组问题，一张是上游架构的重绘。
 图内文字用英文：仓库无 CJK 字体，中文会渲染成方块。
 """
 
@@ -42,20 +41,12 @@ def _box(ax, x, y, w, h, text, fc=GREY, fs=8.0, weight="normal"):
     ax.add_patch(
         FancyBboxPatch(
             (x, y), w, h,
-            boxstyle="round,pad=0.006,rounding_size=0.012",
+            boxstyle="round,pad=0.004,rounding_size=0.010",
             fc=fc, ec=EDGE, linewidth=0.9,
         )
     )
     ax.text(x + w / 2, y + h / 2, text, ha="center", va="center",
             fontsize=fs, color=INK, fontweight=weight, linespacing=1.35)
-
-
-def _bracket(ax, x, y0, y1, label, side="left"):
-    tx = x - 0.012 if side == "left" else x + 0.012
-    ha = "right" if side == "left" else "left"
-    ax.plot([x, x], [y0, y1], color="#999999", linewidth=1.0)
-    ax.text(tx, (y0 + y1) / 2, label, ha=ha, va="center", fontsize=7.5,
-            color="#5a5a5a", linespacing=1.3)
 
 
 def _arrow(ax, xy1, xy2, style="->", ls="-", color="#333333"):
@@ -92,105 +83,103 @@ LAYERS = [
 ]
 
 
-def layer_map() -> None:
-    fig, ax = _canvas(9.0, 5.6)
-    ax.set_title("Where each project sits (layer first, then capability)",
-                 fontsize=10.5, pad=10)
+def _draw_layers(ax) -> None:
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+    ax.set_title("(a) which layer each project sits in", fontsize=9.4, pad=8)
 
-    top, step = 0.90, 0.163
+    # 图层留在左侧 0.02–0.70，右侧 0.72–1.0 留给 kvcm 标注，避免压住层内文字
+    top, step = 0.93, 0.168
     for i, (name, who, fc, gloss) in enumerate(LAYERS):
         y = top - i * step
-        _box(ax, 0.03, y - 0.128, 0.94, 0.128, "", fc=fc)
-        ax.text(0.055, y - 0.030, name, fontsize=8.6, fontweight="bold", color=INK)
-        ax.text(0.055, y - 0.072, who, fontsize=7.8, color=INK)
-        ax.text(0.055, y - 0.105, gloss, fontsize=6.8, color="#4a4a4a", style="italic")
+        _box(ax, 0.02, y - 0.132, 0.68, 0.132, "", fc=fc)
+        ax.text(0.038, y - 0.028, name, fontsize=8.0, fontweight="bold", color=INK)
+        ax.text(0.038, y - 0.070, who, fontsize=6.9, color=INK)
+        ax.text(0.038, y - 0.104, gloss, fontsize=6.0, color="#4a4a4a", style="italic")
 
-    # kvcm 是 L2 的 client：从 L2 带右侧引出
+    # kvcm 是 L2 的 client：从 L2 带右缘引出，落在右侧独立栏位
     y_l2 = top - 3 * step
-    _arrow(ax, (0.80, y_l2 - 0.064), (0.905, y_l2 - 0.064), style="->", color="#b03a2e")
-    _box(ax, 0.62, y_l2 - 0.128, 0.30, 0.058,
-         "kvcm / KV Fabric (this project)", fc=RED, fs=7.6, weight="bold")
-    ax.text(0.62, y_l2 - 0.145,
-            "client of the pool: issues copy/move/pin, reads master records",
-            fontsize=6.4, color="#5a5a5a", style="italic")
+    _arrow(ax, (0.705, y_l2 - 0.066), (0.745, y_l2 - 0.066), style="->", color="#b03a2e")
+    _box(ax, 0.755, y_l2 - 0.104, 0.235, 0.078, "", fc=RED)
+    ax.text(0.872, y_l2 - 0.052, "kvcm /\nKV Fabric", ha="center", va="center",
+            fontsize=7.4, fontweight="bold", color=INK, linespacing=1.3)
+    ax.text(0.872, y_l2 - 0.075, "(this project)", ha="center", va="center",
+            fontsize=6.2, color="#5a5a5a")
 
-    ax.text(0.03, 0.035,
-            "Placement is evidence-backed (file:symbol) for every project; see the tables in the text.\n"
-            "A project can appear twice when it ships both an envelope and a router (Dynamo).",
-            fontsize=6.8, color="#5a5a5a", linespacing=1.5)
-    fig.tight_layout()
-    fig.savefig(HERE / "fig-layer-map.svg", format="svg")
-    plt.close(fig)
+    ax.text(0.02, 0.015,
+            "A project can appear twice when it ships both an envelope and a router (Dynamo).\n"
+            "Placement is evidence-backed (file:symbol) for every project; see the tables in §3.",
+            fontsize=6.2, color="#5a5a5a", linespacing=1.5)
 
 
 # ---------------------------------------------------------------------------
 # 2. 三种分发/控制形态
 # ---------------------------------------------------------------------------
 
+# (标题, 左框, 中框, 右框, 箭头标签, 结论)
+MODES = [
+    (
+        "A. envelope hint — vLLM / SGLang / KVCR",
+        ("router / EPP\n(global index)", GREY),
+        ("engine + hint consumer", AMBER),
+        ("policy accepts, clips\nor drops; then pulls", AMBER),
+        "request + kv_hints",
+        "decision and cost judgement stay inside the engine: the centre can advise, cannot enforce.\n"
+        "On main the envelope is merged, the action handler is not.",
+    ),
+    (
+        "B. centre decides, node executes — object pool",
+        ("MetaService / master\n(placement + replicas)", GREEN),
+        ("client lib in engine", GREY),
+        ("LocalService: I/O only", GREEN),
+        "alloc / query -> addr",
+        "the centre owns where bytes live and who may read; the node performs I/O.\n"
+        "MemCache MetaService/LocalService; Mooncake master/segment.",
+    ),
+    (
+        "C. central command on the pool — kvcm",
+        ("kvcm\n(pool client, own UUID)", RED),
+        ("master\n(replica authority)", GREY),
+        ("seg A source · seg B target\n· kvcm seg", GREY),
+        "CreateCopyTask /\ncreate_move_task",
+        "names the target segment and can move bytes; the engine does not decide, but the source seg\n"
+        "client must be online. Verification: query_task + GetReplicaList -> READY.",
+    ),
+]
 
-def control_modes() -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(11.6, 4.2))
-    for ax in axes:
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-        ax.axis("off")
 
-    # (a) 信封 hint
-    a = axes[0]
-    a.set_title("A. envelope hint (vLLM / SGLang / KVCR)", fontsize=8.8)
-    _box(a, 0.04, 0.76, 0.40, 0.14, "router / EPP\n(global index)")
-    _box(a, 0.56, 0.76, 0.40, 0.16, "engine\n+ hint consumer lib", fc=AMBER)
-    _box(a, 0.56, 0.46, 0.40, 0.16, "policy decides\naccept / clip / drop", fc=AMBER)
-    _box(a, 0.56, 0.14, 0.40, 0.16, "local DRAM / peer\n(NIXL, destination pulls)")
-    _arrow(a, (0.44, 0.83), (0.56, 0.83))
-    a.text(0.50, 0.90, "request\n+ kv_hints", fontsize=6.4, ha="center")
-    _arrow(a, (0.76, 0.76), (0.76, 0.62))
-    _arrow(a, (0.76, 0.46), (0.76, 0.30))
-    a.text(0.04, 0.56,
-           "decision + cost judgement\nstay inside the engine;\n"
-           "the centre can advise,\ncannot enforce",
-           fontsize=7.0, va="top", color=INK, linespacing=1.45)
-    a.text(0.56, 0.055, "vLLM / SGLang main: envelope merged, no action handler",
-           fontsize=6.2, style="italic", color="#5a5a5a")
+def _draw_modes(ax) -> None:
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+    ax.set_title("(b) how control is distributed", fontsize=9.4, pad=8)
 
-    # (b) 中心分发、节点执行
-    b = axes[1]
-    b.set_title("B. centre decides, node executes (object pool)", fontsize=8.8)
-    _box(b, 0.04, 0.78, 0.42, 0.14, "MetaService / master\n(placement + replicas)", fc=GREEN)
-    _box(b, 0.56, 0.78, 0.40, 0.12, "client lib (in engine)")
-    _box(b, 0.56, 0.46, 0.40, 0.18, "LocalService\nIO / MF proxy", fc=GREEN)
-    _box(b, 0.56, 0.14, 0.40, 0.16, "GVA memory pool\n/ SSD pool")
-    _arrow(b, (0.46, 0.85), (0.56, 0.85))
-    b.text(0.51, 0.91, "alloc / query\n→ addr", fontsize=6.3, ha="center")
-    _arrow(b, (0.76, 0.78), (0.76, 0.64))
-    _arrow(b, (0.76, 0.46), (0.76, 0.30))
-    b.text(0.04, 0.60,
-           "the centre owns where bytes\nlive and who may read;\n"
-           "the node only performs I/O",
-           fontsize=7.0, va="top", color=INK, linespacing=1.45)
-    b.text(0.56, 0.055, "MemCache MetaService/LocalService; Mooncake master/segment",
-           fontsize=6.2, style="italic", color="#5a5a5a")
+    band_h = 1.0 / len(MODES)
+    for i, (title, left, mid, right, arrow_label, conclusion) in enumerate(MODES):
+        top = 1.0 - i * band_h
+        y_row = top - 0.20
+        ax.text(0.005, top - 0.030, title, fontsize=8.2, fontweight="bold", color=INK)
 
-    # (c) 中心命令（kvcm）
-    c = axes[2]
-    c.set_title("C. central command on the pool (kvcm)", fontsize=8.8)
-    _box(c, 0.02, 0.72, 0.40, 0.16, "kvcm\n(pool client, own UUID)", fc=RED)
-    _box(c, 0.54, 0.80, 0.42, 0.12, "master\n(replica authority)")
-    _box(c, 0.54, 0.48, 0.42, 0.22, "seg A (source engine)\nseg B (target engine)\nkvcm seg")
-    _box(c, 0.20, 0.12, 0.44, 0.16, "ledger: keepalive / tasks")
-    _arrow(c, (0.42, 0.80), (0.54, 0.86))
-    c.text(0.48, 0.92, "CreateCopyTask /\ncreate_move_task", fontsize=6.2, ha="center")
-    _arrow(c, (0.54, 0.74), (0.42, 0.79))
-    c.text(0.48, 0.66, "GetReplicaList → READY", fontsize=6.2, ha="center")
-    _arrow(c, (0.75, 0.80), (0.75, 0.70))
-    _arrow(c, (0.30, 0.72), (0.40, 0.28))
-    c.text(0.02, 0.52,
-           "names the target segment\nand can move bytes;\n"
-           "engine does not decide —\nbut the source seg client\nmust be online",
-           fontsize=7.0, va="top", color=INK, linespacing=1.45)
+        _box(ax, 0.005, y_row, 0.30, 0.105, left[0], fc=left[1], fs=7.0)
+        _box(ax, 0.375, y_row, 0.26, 0.105, mid[0], fc=mid[1], fs=7.0)
+        _box(ax, 0.705, y_row, 0.29, 0.105, right[0], fc=right[1], fs=7.0)
 
-    fig.tight_layout()
-    fig.savefig(HERE / "fig-control-modes.svg", format="svg")
+        _arrow(ax, (0.305, y_row + 0.052), (0.373, y_row + 0.052))
+        _arrow(ax, (0.637, y_row + 0.052), (0.703, y_row + 0.052))
+        ax.text(0.339, y_row + 0.082, arrow_label, fontsize=5.9, ha="center",
+                va="bottom", color="#4a4a4a", linespacing=1.2)
+
+        ax.text(0.005, y_row - 0.012, conclusion, fontsize=6.2, va="top",
+                color="#5a5a5a", linespacing=1.45)
+
+
+def overview() -> None:
+    fig = plt.figure(figsize=(13.4, 6.2))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.42], wspace=0.05)
+    _draw_layers(fig.add_subplot(gs[0, 0]))
+    _draw_modes(fig.add_subplot(gs[0, 1]))
+    fig.savefig(HERE / "fig-overview.svg", format="svg")
     plt.close(fig)
 
 
@@ -227,30 +216,27 @@ AUTH_TXT = {
 }
 
 
-def authority_matrix() -> None:
+def _draw_matrix(ax) -> None:
     grid = np.array([[r[1], r[2], r[3]] for r in AUTH_ROWS])
-    fig, ax = plt.subplots(figsize=(7.4, 5.4))
     cmap = matplotlib.colors.ListedColormap([GREY, AMBER, GREEN])
     ax.imshow(grid, cmap=cmap, vmin=0, vmax=2, aspect="auto")
     ax.set_xticks(range(len(AUTH_COLS)))
-    ax.set_xticklabels(AUTH_COLS, fontsize=8)
+    ax.set_xticklabels(AUTH_COLS, fontsize=7.4)
     ax.set_yticks(range(len(AUTH_ROWS)))
-    ax.set_yticklabels([r[0] for r in AUTH_ROWS], fontsize=8)
+    ax.set_yticklabels([r[0] for r in AUTH_ROWS], fontsize=7.4)
     for i in range(grid.shape[0]):
         for j in range(grid.shape[1]):
             ax.text(j, i, AUTH_TXT.get((i, j), ""), ha="center", va="center",
-                    fontsize=7, color=INK)
+                    fontsize=6.6, color=INK)
     ax.set_xticks(np.arange(-0.5, 3, 1), minor=True)
     ax.set_yticks(np.arange(-0.5, len(AUTH_ROWS), 1), minor=True)
     ax.grid(which="minor", color="white", linewidth=2)
     ax.tick_params(which="minor", length=0)
     ax.set_title(
-        "green = holds it / owns it, orange = participates but does not own, grey = absent",
-        fontsize=8.4,
+        "(a) who decides / who acts on bytes / who records authority\n"
+        "green = owns it, orange = participates but does not own, grey = absent",
+        fontsize=8.2, pad=8,
     )
-    fig.tight_layout()
-    fig.savefig(HERE / "fig-authority-matrix.svg", format="svg")
-    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -289,13 +275,12 @@ TIMELINE = {
 TIMELINE_XMIN, TIMELINE_XMAX = 2026.40, 2026.98
 
 
-def hint_timeline() -> None:
-    fig, ax = plt.subplots(figsize=(10.6, 5.4))
+def _draw_timeline(ax) -> None:
     rows = list(TIMELINE)
     for i, name in enumerate(rows):
         y = len(rows) - 1 - i
         ax.axhline(y, color="#dddddd", linewidth=0.8, zorder=0)
-        ax.text(TIMELINE_XMIN - 0.012, y, name, ha="right", va="center", fontsize=9,
+        ax.text(TIMELINE_XMIN - 0.012, y, name, ha="right", va="center", fontsize=8.4,
                 fontweight="bold", color=INK)
         pts = sorted(TIMELINE[name], key=lambda t: t[0])
         # 距离过近的点归成一组，组内标签按堆叠高度错开，避免互相压字
@@ -312,28 +297,34 @@ def hint_timeline() -> None:
         for group in groups:
             for k, (x, label, marker) in enumerate(group):
                 color = {"o": "#c0392b", "s": "#2e6da4", "X": "#b9770e"}[marker]
-                ax.scatter([x], [y], marker="o" if marker != "X" else "X", s=54,
+                ax.scatter([x], [y], marker="o" if marker != "X" else "X", s=48,
                            color=color, zorder=3,
                            linewidths=1.5 if marker == "X" else 0)
-                dy = 0.20 + 0.26 * k
+                dy = 0.18 + 0.24 * k
                 ax.plot([x, x], [y + 0.05, y + dy - 0.02], color="#cccccc",
                         linewidth=0.7, zorder=1)
-                ax.text(x, y + dy, label, fontsize=6.2, ha="center", va="bottom",
+                ax.text(x, y + dy, label, fontsize=5.9, ha="center", va="bottom",
                         color="#333333", linespacing=1.3)
 
     ax.set_xlim(TIMELINE_XMIN, TIMELINE_XMAX)
     ax.set_ylim(-0.30, len(rows) - 0.05)
     ax.set_yticks([])
     ax.set_xticks([2026.42, 2026.50, 2026.58, 2026.67, 2026.75, 2026.83, 2026.92])
-    ax.set_xticklabels(["Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], fontsize=8)
+    ax.set_xticklabels(["Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"], fontsize=7.4)
     ax.set_xlabel("2026: RFC opened (red) / merged or landed (blue) / still missing (orange X)",
-                  fontsize=7.6)
-    ax.set_title("Envelope first, execution missing: hint landing status at 2026-11-13",
-                 fontsize=10)
+                  fontsize=7.2)
+    ax.set_title("(b) envelope first, execution missing (status at 2026-11-13)",
+                 fontsize=8.6, pad=8)
     ax.spines[["top", "right", "left"]].set_visible(False)
     ax.tick_params(axis="y", length=0)
-    fig.tight_layout()
-    fig.savefig(HERE / "fig-hint-timeline.svg", format="svg")
+
+
+def evidence() -> None:
+    fig = plt.figure(figsize=(14.2, 5.8))
+    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.18], wspace=0.22)
+    _draw_matrix(fig.add_subplot(gs[0, 0]))
+    _draw_timeline(fig.add_subplot(gs[0, 1]))
+    fig.savefig(HERE / "fig-evidence.svg", format="svg")
     plt.close(fig)
 
 
@@ -368,16 +359,12 @@ def ucm_schematic() -> None:
 
 
 def main() -> None:
-    layer_map()
-    control_modes()
-    authority_matrix()
-    hint_timeline()
+    overview()
+    evidence()
     ucm_schematic()
     for name in (
-        "fig-layer-map.svg",
-        "fig-control-modes.svg",
-        "fig-authority-matrix.svg",
-        "fig-hint-timeline.svg",
+        "fig-overview.svg",
+        "fig-evidence.svg",
         "fig-ucm-schematic.svg",
     ):
         print(f"wrote {HERE / name}")

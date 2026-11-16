@@ -8,9 +8,9 @@
 
 ## 1. 分层：先问「在哪一层」，再问「谁说了算」
 
-![分层归属](kvcm-vs-oss/figures/fig-layer-map.svg)
+![分层归属与控制形态](kvcm-vs-oss/figures/fig-overview.svg)
 
-（自绘图，由 [`kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`](kvcm-vs-oss/figures/plot_kvcm_vs_oss.py) 生成。分层的判据是「这段代码跑在谁的进程里、持有什么状态」，逐条依据在 §3。全部图源与许可见 [`kvcm-vs-oss/figures/README.md`](kvcm-vs-oss/figures/README.md)。）
+（自绘图，由 [`kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`](kvcm-vs-oss/figures/plot_kvcm_vs_oss.py) 生成。左栏是本节的层归属，右栏是 §2 的三种控制形态。分层的判据是「这段代码跑在谁的进程里、持有什么状态」，逐条依据在 §3。全部图源与许可见 [`kvcm-vs-oss/figures/README.md`](kvcm-vs-oss/figures/README.md)。）
 
 | 层 | 项目 | 这一层在做什么 | 与 kvcm 的关系 |
 |---|---|---|---|
@@ -28,11 +28,7 @@
 
 ## 2. 三种分发/控制形态
 
-「hint 推 vs 中心命令」只是本节的 A 与 C 两种；B 是一大类被漏掉的中形态。
-
-![三种控制形态](kvcm-vs-oss/figures/fig-control-modes.svg)
-
-（自绘图，同上脚本。）
+「hint 推 vs 中心命令」只是本节的 A 与 C 两种；B 是一大类被漏掉的中形态。三种形态与 §1 的分层同见 [`fig-overview.svg`](kvcm-vs-oss/figures/fig-overview.svg) 右栏。
 
 ### 2.1 A：请求信封 hint —— 中心建议，引擎决定
 
@@ -147,9 +143,9 @@ kvcm（Mooncake client，自己的 UUID）
 
 ### 3.4 L4 请求信封：vLLM / SGLang / KVCR
 
-![hint 落地状态](kvcm-vs-oss/figures/fig-hint-timeline.svg)
+![hint 落地状态](kvcm-vs-oss/figures/fig-evidence.svg)
 
-（自绘时间线；日期取自各 RFC/PR 的 `created_at` / `closed_at`，2026-11-13 核对。合并状态见下表。）
+（自绘图，同 §1 脚本；左栏是 §5.2 的控制权矩阵，右栏是这里的 hint 落地时间线。日期取自各 RFC/PR 的 `created_at` / `closed_at`，2026-11-13 核对。合并状态见下表。）
 
 | 事实 | 出处 |
 |---|---|
@@ -265,9 +261,7 @@ kvcm（Mooncake client，自己的 UUID）
 
 ### 5.2 按控制权：谁决定、谁执行、谁持权威记录
 
-![控制权矩阵](kvcm-vs-oss/figures/fig-authority-matrix.svg)
-
-（自绘图，同上脚本。绿 = 持有，橙 = 参与但不拥有，灰 = 无。）
+矩阵与 §3.4 的 hint 落地时间线同见 [`fig-evidence.svg`](kvcm-vs-oss/figures/fig-evidence.svg)（左栏矩阵，右栏时间线；绿 = 持有，橙 = 参与但不拥有，灰 = 无）。
 
 | 项目（层） | 决定「KV 去哪」 | 执行「动字节」 | 权威记录 |
 |---|---|---|---|
