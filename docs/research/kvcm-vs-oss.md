@@ -65,10 +65,12 @@ KVCR 和 kvcm 在这里走到一起了：两家都意识到「KV 必须脱离引
 
 | 方案 | 升级时要做什么 | 代价 |
 |---|---|---|
-| UCM | 维护 **16 个版本补丁目录**（`0.9.2`、`0.11.0`、`v0110`…`v0300`、`common`） | 每跟一个引擎版本，补丁要重打、重测 |
-| FlexKV | **5 份 vLLM 补丁，377–528 行，最多触及 13 个 vLLM 文件**（含 `v1/core/sched/scheduler.py`） | 同上，且直接改调度器 |
+| UCM | 维护 **16 个版本补丁目录**（`0.9.2`、`0.11.0`、`v0110`…`v0300`、`common`）。点开看：[`ucm/integration/vllm/patch/`](https://github.com/ModelEngine-Group/unified-cache-management/tree/develop/ucm/integration/vllm/patch) | 每跟一个引擎版本，补丁要重打、重测 |
+| FlexKV | **5 份 vLLM 补丁，377–528 行，最多触及 13 个 vLLM 文件**（含 `v1/core/sched/scheduler.py`）。点开看：[`examples/vllm_adaption/`](https://github.com/taco-project/FlexKV/tree/main/examples/vllm_adaption) | 同上，且直接改调度器 |
 | LMCache | 跟随 LMCache 自己的 connector 与 MP server 版本 | 引擎与协调器要一起升级 |
 | **kvcm** | **不需要出补丁** | — |
+
+两个目录一眼能看出来。UCM 那个目录名就是引擎版本号，`0.9.2` 到 `v0300` 排成一列，跟一个版本就多一个目录；FlexKV 那边是文件名带版本，`vllm_0_10_1_1`、`vllm_0_16_0`、`vllm_up_0_14_1`、`vllm_main`，一份补丁对一个版本。
 
 UCM 的 `patch/v0300/mamba_layer_hooks_patch.py` 值得单独看一眼：它不是在装钩子，而是在判断某一类层（线性注意力 / GDN / KDA）在 `VLLM_COMPILE` 模式下钩子会不会被 Dynamo 追踪剪掉，剪掉了就退化成 `--enforce-eager`。也就是说，补丁要跟的不只是版本号，还有引擎编译器的行为。
 
@@ -146,7 +148,7 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 | 事实 | 出处 |
 |---|---|
 | 走 `KVConnectorBase_V1` 接入；多套 connector 分型（direct / layerwise / PD / lite / mock），另有稀疏框架 | `ucm/integration/vllm/ucm_connector.py`：`UCMDirectConnector`、`UCMLayerWiseConnector`、`UCMCPConnector`、`UCMPDConnector`、`UCMLiteConnector`、`UCMConnector` |
-| 版本补丁树：按引擎版本分目录，另有 common 与根级补丁脚本 | `ucm/integration/vllm/patch/`：`0.9.2`、`0.11.0`、`v0110`…`v0300`、`common` 共 16 个目录 + `apply_patch.py` / `boot_patch.py` 等根级模块 |
+| 版本补丁树：按引擎版本分目录，另有 common 与根级补丁脚本 | [`ucm/integration/vllm/patch/`](https://github.com/ModelEngine-Group/unified-cache-management/tree/develop/ucm/integration/vllm/patch)：`0.9.2`、`0.11.0`、`v0110`…`v0300`、`common` 共 16 个目录 + `apply_patch.py` / `boot_patch.py` 等根级模块 |
 | store 抽象只有 lookup / prefetch / load / dump / wait 一族 | `ucm/store/ucmstore_v1.py::UcmKVStoreBaseV1`；`ucm/store/ucmstore_v1.h::StoreV1` |
 | v1 store 无 move / retain；prefetch 只作 GC 热度提示 | `grep -rn "def move\|def retain" ucm/` 无命中；`ucm_connector.py` 注释 "Prefetch is only a GC hotness hint" |
 | v2 store 有 request 作用域的 `Pin`/`Unpin`（传输期防驱逐窗口） | `ucm/v2/store/store.h::Pin` / `Unpin`；`ucm/v2/proxy/store_scheduler.h::StoreScheduler`、`store_worker.h::StoreWorker`、`store_peer.h::StorePeer` |
@@ -163,6 +165,7 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 | 远端 radix 共享：Redis 元数据通道 + 分布式 radix，带 `lease_renew_ms` | `flexkv/cache/radix_remote.py::DistributedRadixTree`、`flexkv/cache/redis_meta.py::RedisMetaChannel` |
 | 有预取协调器（session 级预取计划与配额） | `flexkv/prefetch/coordinator.py`（"Single-owner session scheduler. The backend owns cache plans, not policy."）、`prefetch/policy.py` |
 | 无请求路由、无扩缩 | `grep -rn "router\|controller" --include=*.py flexkv/` 无命中 |
+| vLLM 补丁（5 份，按引擎版本分） | [`examples/vllm_adaption/`](https://github.com/taco-project/FlexKV/tree/main/examples/vllm_adaption)；`vllm_0_10_1_1` / `vllm_0_16_0` / `vllm_up_0_14_1` / `vllm_main-flexkv-layerwise-wrapper`；`vllm_0_10_1_1-flexkv-connector-namespace.patch` 触及 13 个 vLLM 文件（含 `v1/core/sched/scheduler.py`） |
 
 ### A.2 对象池：MemCache / Mooncake
 
@@ -288,7 +291,7 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 | UCM v2 窗口 / pin | `ucm/v2/proxy/store_scheduler.h::StoreScheduler`；`ucm/v2/store/store.h::Pin` / `Unpin` |
 | UCM DRAM store 角色与派发 | `ucm/store/dram/cc/config.h::Role`；`ucm/store/dram/cc/task_manager.cc::TaskManager::BuildRequests` |
 | UCM 一致性哈希 | `ucm/shared/router/router.h::Router::RouteKeys` |
-| UCM 补丁树 | `ucm/integration/vllm/patch/` |
+| UCM 补丁树 | [`ucm/integration/vllm/patch/`](https://github.com/ModelEngine-Group/unified-cache-management/tree/develop/ucm/integration/vllm/patch) |
 | MemCache 对象 API | `src/memcache/include/mmc_client.h`；`mmc_def.h::mmc_put_options` |
 | MemCache 中心实现 | `src/memcache/csrc/meta_service/mmc_meta_manager.cpp::MmcMetaManager` |
 | MemCache 租约 | `entities/mmc_blob_state.cpp::BlobStateMachine::GetGlobalTransTable`；`entities/mmc_meta_lease_manager.h::MmcMetaLeaseManager` |
