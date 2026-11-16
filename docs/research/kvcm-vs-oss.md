@@ -2,7 +2,33 @@
 
 > 调研快照：2026-11-13。上游源码快照：vLLM `93eeae69`、SGLang `5792cf6e`、UCM `57ddbb26`、KVCR `b7aa81d0`、LMCache `58c11e38`、MemCache `14b4e35e`、FlexKV `55ad438e`、llm-d-router `647ca7ca`、Dynamo `b20fe6fe`、AIBrix `17652f54`；kvcm 基线 `4d9dd33`（D8/D9/D10 已入 main）。
 > 性质：开源方案对照研究，不是设计决策文档。kvcm 自身的设计在 [`kvcm/design/`](../../kvcm/design/D10-kv-fabric-roadmap.md)，本文只做外部调研与边界核对。
-> 读法：§1 分层 → §2 三种分发形态 → §3 逐层符号级事实 → §4 上游架构图与许可 → §5 能力矩阵 → §6 我方短板 → §7 未复核条目。
+> 读法：§0 一句话对比（先看这张表）→ §1 分层 → §2 三种分发形态 → §3 逐层符号级事实 → §4 上游架构图与许可 → §5 能力矩阵 → §6 我方短板 → §7 未复核条目。
+
+---
+
+## 0. 一句话对比：先看这张表
+
+十个项目各是什么、能对 KV 做什么、做不到什么、与 kvcm 什么关系。细节与符号级出处见后文各节。
+
+| 项目 | 形态 | 能对 KV 做什么 | 做不到 / 不负责什么 | 与 kvcm 的关系 |
+|---|---|---|---|---|
+| **kvcm** | 池的 client（独立进程） | 点名复制/移动副本、pin、保活、核验、记账 | 不产生 KV、不看引擎 HBM、retain 未接 | — |
+| UCM | 引擎内插件 | 前缀命中查询、按层 load/dump、PD 三拓扑 | 跨实例放置、跨引擎保留 | 同一件事的两个位置：它在引擎里，我们在池上 |
+| FlexKV | 引擎内插件 | 本机 CPU/SSD/远端分层、radix 匹配、session 预取 | 请求路由、集群扩缩 | 同上；它的远端层要靠自己维护 radix |
+| MemCache | 对象池 | put/get/exist/remove、副本数、租约、内部多级搬迁 | 前缀语义、hint 通道、跨引擎保留 | 它是我们可站的池之一（我们目前接 Mooncake） |
+| Mooncake master | 对象池 | 副本权威、点名 copy/move 任务、租约、动态副本 | 前缀索引、请求路由 | **kvcm 当前依附的池**，我们是它的 client |
+| LMCache | 独立协调器 | fleet key 目录、指定实例预取、自身 L2 的 pin、配额驱逐 | 不搬字节、无 move 路由、跨引擎保留 | 形态最接近，权威性与覆盖面不同 |
+| vLLM / SGLang | 请求信封 | 版本化信封的传输与形状校验 | action 执行（main 上未接） | 我们的「管理面决定」可以经它们落地，但目前不依赖 |
+| KVCR | 请求信封 + 引擎内二级存储 | 三种 hint 解析、目的地发起 P2P、policy 可插拔 | 入池放置仍是 TODO | 与我们在「谁来搬」上分岔：它目的地发起，我们点名 |
+| llm-d EPP | 路由层 | 逐块索引、推测条目、插件化打分 | 不碰 KV 字节 | 我们缺的那一层（D8 的 SC），可并存 |
+| Dynamo | 路由层 + hint 生产 | 类型化 hint（强制/偏好两级）、传输候选解析 | 引擎内执行（vLLM sidecar 仍发 `None`） | 整栈最像我们，但是三个东西拼起来 |
+| AIBrix | 路由层 + 引擎旁卸载 | 前缀哈希索引、PodAutoscaler、自身 L1/L2 卸载框架 | 不碰池的命令面 | 平台积木，与我们不冲突 |
+
+三条最容易被误读的差异，先讲清：
+
+1. **「能对 KV 做什么」不等于「能做多少操作」。** UCM 不能 move，不是因为它弱，是因为 move 不属于引擎内插件该干的事。它的职责是「引擎这次要用 KV，我从下层给你取」。跨实例把副本挪走，本来就超出它的范围。
+2. **我们和 UCM/FlexKV 不是替代关系。** 它们在引擎里管「这次请求怎么取 KV」，我们在池上管「这块 KV 该放在哪」。引擎用 UCM 把 KV 写进 Mooncake，kvcm 照样能对同一批 key 下 copy/move。
+3. **我们和 LMCache 只像一半。** 都是独立进程 + fleet 视图 + 命令面。但它的目录是事件派生的最终一致视图，我们读 master 的副本记录；它管自己进程内的 L1/L2 缓存，我们管整个池。
 
 ---
 
@@ -14,15 +40,15 @@
 
 | 层 | 项目 | 这一层在做什么 | 与 kvcm 的关系 |
 |---|---|---|---|
-| L5 路由层 | llm-d EPP、Dynamo router、AIBrix gateway | 决定请求落到哪个实例；KV 随请求流动 | kvcm 的上游：它们决定「去哪」，kvcm 决定「KV 放哪」 |
-| L4 请求信封 hint | vLLM、SGLang、KVCR（+ Dynamo 的 hint 生产侧） | 中心在请求里捎一段结构化意图，引擎解析后自行取舍 | 与我们正交；它们的 action 面尚未执行 |
-| L3 独立协调器 | LMCache `mp_coordinator` | 带独立进程、fleet 视图与命令面，事件派生 | 形态最接近的一家，权威性不同 |
-| L2 对象池元数据 | MemCache `MetaService`、Mooncake master | 拥有字节：放置、副本、租约、驱逐 | **kvcm 就站在这一层之上**，是池的 client |
-| L1 引擎插件 | UCM、FlexKV（AIBrix `aibrix_kvcache` 同级） | 活在引擎进程里，store 接口是库调用 | kvcm 复用的接入样板 |
+| 路由层 | llm-d EPP、Dynamo router、AIBrix gateway | 决定请求落到哪个实例；KV 随请求流动 | kvcm 的上游：它们决定「去哪」，kvcm 决定「KV 放哪」 |
+| 请求信封 | vLLM、SGLang、KVCR（+ Dynamo 的 hint 生产侧） | 中心在请求里捎一段结构化意图，引擎解析后自行取舍 | 与我们正交；它们的 action 面尚未执行 |
+| 独立协调器 | LMCache `mp_coordinator` | 带独立进程、fleet 视图与命令面，事件派生 | 形态最接近的一家，权威性不同 |
+| 对象池 | MemCache `MetaService`、Mooncake master | 拥有字节：放置、副本、租约、驱逐 | **kvcm 就站在这一层之上**，是池的 client |
+| 引擎内插件 | UCM、FlexKV（AIBrix `aibrix_kvcache` 同级） | 活在引擎进程里，store 接口是库调用 | kvcm 复用的接入样板 |
 
-两个项目会同时出现在两层：Dynamo 既是 L5 的路由器、也是 L4 的 hint 生产者；AIBrix 既有网关侧索引（L5）也有引擎旁卸载框架（L1）。
+两个项目会同时出现在两层：Dynamo 既是路由器、也是 hint 生产者；AIBrix 既有网关侧索引（路由层）也有引擎旁卸载框架（引擎内插件）。
 
-**kvcm 的位置**：L2 的 client，不是新的池。它持有自己的 UUID 连到池的 master，读副本权威记录（`GetReplicaList` / `batch_query_keys`），并直接对池下发 copy / move / pin 等动作。这条「在 L2 之上加一层执行面」的做法，与 L1 插件（改引擎）、L3 协调器（自建 fleet 视图）、L5 路由（只改请求落点）都不同层。
+**kvcm 的位置**：对象池的 client，不是新的池。它持有自己的 UUID 连到池的 master，读副本权威记录（`GetReplicaList` / `batch_query_keys`），并直接对池下发 copy / move / pin 等动作。这条「在对象池之上加一层执行面」的做法，与引擎内插件（改引擎）、独立协调器（自建 fleet 视图）、路由层（只改请求落点）都不同层。
 
 ---
 
@@ -60,13 +86,13 @@ kvcm（Mooncake client，自己的 UUID）
 
 ### 2.4 三种形态并不互斥
 
-同一套系统可以同时具备多种：Mooncake 既有「按热度自动加副本」（B）也可被 client 点名 copy（C）；Dynamo 既路由（L5）也生产 hint（L4）；UCM 既是插件（L1）也有 DRAM store 的调度/执行分离（B）。讨论「谁说了算」时必须先说清是哪一层、哪种形态，否则容易把不同层的东西当同一层比。
+同一套系统可以同时具备多种：Mooncake 既有「按热度自动加副本」（B）也可被 client 点名 copy（C）；Dynamo 既路由也生产 hint；UCM 既是引擎内插件也有 DRAM store 的调度/执行分离（B）。讨论「谁说了算」时必须先说清是哪一层、哪种形态，否则容易把不同层的东西当同一层比。
 
 ---
 
 ## 3. 逐层事实（符号级出处）
 
-### 3.1 L1 引擎插件：UCM / FlexKV
+### 3.1 引擎内插件：UCM / FlexKV
 
 **UCM**（ModelEngine，MIT 附加条件）
 
@@ -93,9 +119,9 @@ kvcm（Mooncake client，自己的 UUID）
 | 有预取协调器（session 级预取计划与配额） | `flexkv/prefetch/coordinator.py`（"Single-owner session scheduler. The backend owns cache plans, not policy."）、`prefetch/policy.py`、`prefetch/runtime.py` |
 | 无请求路由、无扩缩 | `grep -rn "router\|controller" --include=*.py flexkv/` 无命中 |
 
-判读：FlexKV 管「这台机的 KV 放哪层」，附带一套远端 radix 的租约式元数据；它不管「放到哪台机」。它比「纯本机卸载库」复杂，但仍在 L1。
+判读：FlexKV 管「这台机的 KV 放哪层」，附带一套远端 radix 的租约式元数据；它不管「放到哪台机」。它比「纯本机卸载库」复杂，但仍在引擎内插件这一层。
 
-### 3.2 L2 对象池：MemCache / Mooncake
+### 3.2 对象池：MemCache / Mooncake
 
 **MemCache**（Ascend，MulanPSL2）
 
@@ -123,7 +149,7 @@ kvcm（Mooncake client，自己的 UUID）
 
 判读：旧对照表里「动态副本做不到指定实例」不准确——它有 `preferred_target_segment`，但受热度与冷却窗约束，属「池按自身策略放置」；kvcm 需要的是「调用方点名 + 有完成信号」，只有任务通道满足。
 
-### 3.3 L3 独立协调器：LMCache
+### 3.3 独立协调器：LMCache
 
 `mp_coordinator` 自 2026-06-03（#3488 "add mp coordinator backbone"）起替代旧的进程内 `cache_controller`。旧的 `lmcache/v1/cache_controller/` 于 2026-10-22 被移到 `lmcache/v1/inprocess/v1/cache_controller/`（#5970），又于 2026-11-06 整体移出主仓（#6254 "Remove in-tree InProcess implementation"，代码迁到独立仓 `LMCache_inprocess`）。**main 上不存在 `cache_controller/` 目录，也不存在 `RegistryTree` / `KVController` / `LMCacheControllerManager` / `LMCacheWorker` 这些符号。**
 
@@ -139,9 +165,9 @@ kvcm（Mooncake client，自己的 UUID）
 | 无 move 路由 | 全部路由：`/cache/prefetches`、`/cache/pins`、`/cache/delete`、`/quota*`、`/directory/*`、`/instances*`、`/events`、`/config/chunk-size`、`/status`、`/metrics`、`/healthz` |
 | 目录查询可按 key 或 token 序列 | `http_apis/directory_api.py::lookup_placements`（`POST /directory/lookup`）、`blend_lookup` |
 
-判读：形态上与 kvcm 最接近（独立进程、fleet 视图、可指定实例的预取），差别在两点：它的位置知识是事件派生的最终一致视图（kvcm 直接读池 master 的副本记录），且它管的是自己的 L2 层，不碰「引擎 HBM + 池」这整套。
+判读：形态上与 kvcm 最接近（独立进程、fleet 视图、可指定实例的预取），差别在两点：它的位置知识是事件派生的最终一致视图（kvcm 直接读池 master 的副本记录），且它管的是自己那一层（LMCache 的 L1/L2 缓存），不碰「引擎 HBM + 池」这整套。
 
-### 3.4 L4 请求信封：vLLM / SGLang / KVCR
+### 3.4 请求信封：vLLM / SGLang / KVCR
 
 ![hint 落地状态](kvcm-vs-oss/figures/fig-evidence.svg)
 
@@ -165,7 +191,7 @@ kvcm（Mooncake client，自己的 UUID）
 
 判读：两家引擎把「接口形状」标准化了，把「谁执行、怎么执行」留给编排层。对 kvcm 的含义是：不必等上游合 action handler，也不必改引擎；同时也不能指望「下发 hint 就会动」——今天没有任何一家引擎会因为一个信封而主动搬字节。
 
-### 3.5 L5 路由层：llm-d / Dynamo / AIBrix
+### 3.5 路由层：llm-d / Dynamo / AIBrix
 
 | 事实 | 出处 |
 |---|---|
@@ -181,7 +207,7 @@ kvcm（Mooncake client，自己的 UUID）
 
 判读：这三家决定「请求去哪」。它们与 kvcm 互补：kvcm 缺这一层（D8 的 SC 尚未落地），它们缺「能对池下命令、能保活、能搬」这层。
 
-### 3.6 kvcm 站在 L2 之上
+### 3.6 kvcm 站在对象池之上
 
 | 事实 | 出处 |
 |---|---|
@@ -247,17 +273,17 @@ kvcm（Mooncake client，自己的 UUID）
 
 | 层 | 项目 | 该层的核心能力 | 该层**不承担**的能力 |
 |---|---|---|---|
-| L1 引擎插件 | UCM | 前缀命中查询（`lookup_on_prefix`）、load/dump、layer-wise 传输、PD 三拓扑、按引擎版本维护补丁树 | 跨实例放置、生命周期保活、跨引擎保留 |
-| L1 引擎插件 | FlexKV | 本机 CPU/SSD/远端分层、radix 匹配、session 预取协调、远端 radix 租约 | 请求路由、集群扩缩 |
-| L2 对象池 | MemCache | 对象 put/get/query、副本数 + 偏好节点、租约、内部多级搬迁、MetaService HA | KV 语义（前缀）、hint 通道、跨引擎保留语义 |
-| L2 对象池 | Mooncake master | 副本权威记录、点名 copy/move 任务、动态副本（热度准入）、租约 | 前缀索引、请求路由 |
-| L3 协调器 | LMCache `mp_coordinator` | fleet key 目录（最终一致）、实例注册/心跳、指定实例预取、L2 pin 计数、配额驱逐、checkpoint | 数据面搬运、跨引擎字节保留、move |
-| L4 信封 | vLLM / SGLang | 版本化信封的传输与形状校验、请求链携带 | action 执行（未接）、成本判断（在引擎内） |
-| L4 信封 | KVCR | 三种 hint 解析与拒绝语义、目的地发起 P2P、policy 可插拔、库存上报 | 入池放置（TODO）、跨请求保留 |
-| L5 路由 | llm-d EPP | 逐块索引、推测条目、插件化打分、P2P 来源交接 | 对池下命令、保活 |
-| L5 路由 | Dynamo router | 类型化 hint（强制/偏好两级）、传输候选解析、可插拔 hint policy | 引擎内执行（SGLang sidecar 已接，vLLM sidecar 未接） |
-| L5 路由 | AIBrix gateway | 前缀哈希索引（本地 / 事件同步）、PodAutoscaler、L1/L2 卸载框架 | 对池下命令、租约保活 |
-| L2 之上 | kvcm | 池 client 身份、点名 copy/move、8 个操作的接口面、READY 核验、keepalive 循环 | 前缀索引与选路（D8 管理面）、HBM/APC 可见性 |
+| 引擎内插件 | UCM | 前缀命中查询（`lookup_on_prefix`）、load/dump、layer-wise 传输、PD 三拓扑、按引擎版本维护补丁树 | 跨实例放置、生命周期保活、跨引擎保留 |
+| 引擎内插件 | FlexKV | 本机 CPU/SSD/远端分层、radix 匹配、session 预取协调、远端 radix 租约 | 请求路由、集群扩缩 |
+| 对象池 | MemCache | 对象 put/get/query、副本数 + 偏好节点、租约、内部多级搬迁、MetaService HA | KV 语义（前缀）、hint 通道、跨引擎保留语义 |
+| 对象池 | Mooncake master | 副本权威记录、点名 copy/move 任务、动态副本（热度准入）、租约 | 前缀索引、请求路由 |
+| 独立协调器 | LMCache `mp_coordinator` | fleet key 目录（最终一致）、实例注册/心跳、指定实例预取、自身 L2 的 pin 计数、配额驱逐、checkpoint | 数据面搬运、跨引擎字节保留、move |
+| 请求信封 | vLLM / SGLang | 版本化信封的传输与形状校验、请求链携带 | action 执行（未接）、成本判断（在引擎内） |
+| 请求信封 | KVCR | 三种 hint 解析与拒绝语义、目的地发起 P2P、policy 可插拔、库存上报 | 入池放置（TODO）、跨请求保留 |
+| 路由层 | llm-d EPP | 逐块索引、推测条目、插件化打分、P2P 来源交接 | 对池下命令、保活 |
+| 路由层 | Dynamo router | 类型化 hint（强制/偏好两级）、传输候选解析、可插拔 hint policy | 引擎内执行（SGLang sidecar 已接，vLLM sidecar 未接） |
+| 路由层 | AIBrix gateway | 前缀哈希索引（本地 / 事件同步）、PodAutoscaler、自身 L1/L2 卸载框架 | 对池下命令、租约保活 |
+| 对象池之上 | kvcm | 池 client 身份、点名 copy/move、8 个操作的接口面、READY 核验、keepalive 循环 | 前缀索引与选路（D8 管理面）、HBM/APC 可见性 |
 
 ### 5.2 按控制权：谁决定、谁执行、谁持权威记录
 
@@ -265,16 +291,16 @@ kvcm（Mooncake client，自己的 UUID）
 
 | 项目（层） | 决定「KV 去哪」 | 执行「动字节」 | 权威记录 |
 |---|---|---|---|
-| UCM（L1） | 引擎：命中就 load，不命中重算 | 自己的 store 层 | 无（每实例各记各的） |
-| FlexKV（L1） | 本机 radix + session 预取计划 | 本机各层 + 远端 radix | 无（Redis 侧只是块元数据通道） |
-| MemCache（L2） | put 时由调用方给副本数/偏好节点，中心分配 | LocalService | MetaService |
-| Mooncake（L2） | 任务通道由调用方点名；动态副本由池按热度 | segment 所在 client | master |
-| vLLM / SGLang（L4） | 引擎（信封未被消费） | 无 | 无 |
-| KVCR（L4） | 引擎内 policy（`decide_ingest` / `decide_eviction`） | 目的地 `fetch`，NIXL 点对点 | 只记本节点 |
-| LMCache（L3） | 协调器（预取/pin/配额） | MP server | 事件派生目录（最终一致） |
-| llm-d EPP（L5） | 只选请求落点 | 无（目标引擎自己去取） | 索引派生 |
-| Dynamo router（L5） | 选落点 + 出 hint（可 Required） | 引擎执行 | 索引派生 |
-| AIBrix gateway（L5） | 只选请求落点 | 无 | 网关索引派生 |
+| UCM（引擎内插件） | 引擎：命中就 load，不命中重算 | 自己的 store 层 | 无（每实例各记各的） |
+| FlexKV（引擎内插件） | 本机 radix + session 预取计划 | 本机各层 + 远端 radix | 无（Redis 侧只是块元数据通道） |
+| MemCache（对象池） | put 时由调用方给副本数/偏好节点，中心分配 | LocalService | MetaService |
+| Mooncake（对象池） | 任务通道由调用方点名；动态副本由池按热度 | segment 所在 client | master |
+| vLLM / SGLang（请求信封） | 引擎（信封未被消费） | 无 | 无 |
+| KVCR（请求信封） | 引擎内 policy（`decide_ingest` / `decide_eviction`） | 目的地 `fetch`，NIXL 点对点 | 只记本节点 |
+| LMCache（独立协调器） | 协调器（预取/pin/配额） | MP server | 事件派生目录（最终一致） |
+| llm-d EPP（路由层） | 只选请求落点 | 无（目标引擎自己去取） | 索引派生 |
+| Dynamo router（路由层） | 选落点 + 出 hint（可 Required） | 引擎执行 | 索引派生 |
+| AIBrix gateway（路由层） | 只选请求落点 | 无 | 网关索引派生 |
 | **kvcm** | D8 管理面决定（当前未落地，控制面只执行 intent） | kvcm 控制面发起，master 协调、segment 执行 | 读 master 的副本记录 |
 
 一行读法：**权威记录只在两个对象池（MetaService / master）手里；kvcm 不复制这份记录，直接读它。** 其余各家的位置知识都是事件派生的视图。决定与执行的拆分，则只有 kvcm 明确成两个平面（D8 管理面决定、控制面执行）。
@@ -287,8 +313,8 @@ kvcm 的各子系统分别对应不同的上游，整体对照会失真。逐块
 |---|---|---|
 | D9 控制面执行 | LMCache coordinator 的 prefetch / pin / delete API | 对面是「按实例下发、带完成查询」的命令面：`mp_coordinator/http_apis/cache_api.py::request_prefetch`（提交 + `GET /cache/prefetches/{instance_id}/{request_id}` 轮询）、`controllers/eviction_http_api.py::request_pin` / `request_delete`。kvcm 侧对应 `ops/base.py::KvOps` 的 copy / move / pin / remove + `query_task` |
 | D8 L0 请求路由 | llm-d EPP、Dynamo KV Smart Router | EPP：`pkg/kvcache/indexer.go::Indexer` + `pkg/epp/scheduling/weighted_scorer.go` 的插件化打分；Dynamo：`lib/router/kv-indexer/src/kv_hints.rs::KvTransferCandidates` + `lib/router/scheduler/src/kv_hints.rs::resolve_transfer_sources`。kvcm 这一环尚未实现（D8 的 SC） |
-| D8 L1 KV 生命周期 | LMCache coordinator、KVCR | LMCache：预取 / pin / 配额驱逐三个控制器（`controllers/{prefetch_manager,eviction_controller}.py`）；KVCR：`policy.py::KVCachePolicy` 的 `decide_ingest` / `decide_eviction` 钩子 + 入池放置 TODO |
-| D8 L2 容量扩缩 | Dynamo Planner、AIBrix PodAutoscaler | `components/src/dynamo/planner/core/{load_scaling,throughput_scaling}.py` 的 `LoadScalingMixin` / `ThroughputScalingMixin`（慢快双环）；`pkg/controller/podautoscaler/autoscaler.go::DefaultAutoScaler`（KPA 指标驱动，`AutoScaler` 接口在 42 行）。kvcm 一侧只出容量事实与建议，执行归外部编排 |
+| D8 的 L1（KV 生命周期环） | LMCache coordinator、KVCR | LMCache：预取 / pin / 配额驱逐三个控制器（`controllers/{prefetch_manager,eviction_controller}.py`）；KVCR：`policy.py::KVCachePolicy` 的 `decide_ingest` / `decide_eviction` 钩子 + 入池放置 TODO |
+| D8 的 L2（容量环） | Dynamo Planner、AIBrix PodAutoscaler | `components/src/dynamo/planner/core/{load_scaling,throughput_scaling}.py` 的 `LoadScalingMixin` / `ThroughputScalingMixin`（慢快双环）；`pkg/controller/podautoscaler/autoscaler.go::DefaultAutoScaler`（KPA 指标驱动，`AutoScaler` 接口在 42 行）。kvcm 一侧只出容量事实与建议，执行归外部编排 |
 | 池元数据权威 | Mooncake master | `mooncake-store/include/master_client.h::GetReplicaList` / `BatchGetReplicaList` / `CreateCopyTask` / `CreateMoveTask`。kvcm 是它的 client（`backends/mooncake/client.py::StoreClient`，`global_segment_size=0` 的纯控制身份），不是它本身 |
 | 引擎接入池 | UCM / FlexKV / LMCache 的 connector | UCM：`ucm/integration/vllm/ucm_connector.py` 下的 `UCMConnector` / `UCMDirectConnector` / `UCMPDConnector` 一族；FlexKV：`examples/vllm_adaption/*-flexkv-connector.patch` 打出的 `FlexKVConnectorV1(KVConnectorBase_V1)`；LMCache：`integration/vllm/lmcache_mp_connector.py::LMCacheMPConnector`。kvcm 不依赖其中任何一个（轴五） |
 
@@ -314,7 +340,7 @@ kvcm 的各子系统分别对应不同的上游，整体对照会失真。逐块
 
 3. **「不要求引擎改造」→「KV 动作不需要改引擎，但接入仍有已知补丁」**
    - 旧：「不要求引擎改代码 / 不要求引擎改造。引擎跑官方 connector，KV 进池即可」。
-   - 新：「KV 动作不需要改引擎——引擎跑官方 connector 把 KV 写进池即可，之后的 copy/move/pin 都在池上做。机制上是**耦合点不同**：kvcm 接的是池的 backend，不是引擎的 connector，所以换引擎不换 backend（§6.3 轴五）。接入仍有已知兼容补丁：异构 TP 场景 vllm-ascend v0.26.0rc1 需要 #15835 backport（`kvcm/demo/README.md`）；key 计算必须与引擎逐字节一致（`kvcm/kvcm/engines/vllm/keys.py`），`PYTHONHASHSEED` 未设会静默漂移。」
+   - 新：「KV 动作不需要改引擎——引擎跑官方 connector 把 KV 写进池即可，之后的 copy/move/pin 都在池上做。机制上是**耦合点不同**：kvcm 接的是池的 backend，不是引擎的 connector，所以换引擎不换 backend（§6.4 轴五）。接入仍有已知兼容补丁：异构 TP 场景 vllm-ascend v0.26.0rc1 需要 #15835 backport（`kvcm/demo/README.md`）；key 计算必须与引擎逐字节一致（`kvcm/kvcm/engines/vllm/keys.py`），`PYTHONHASHSEED` 未设会静默漂移。」
 
 4. **「引擎不必参与」→「不需要引擎参与决策，但源 client 必须在线」**
    - 旧：「引擎不必参与」「只要源 seg 的 client 在线」两句被当作互不相干的两件事写在不同处。
@@ -328,9 +354,38 @@ kvcm 的各子系统分别对应不同的上游，整体对照会失真。逐块
 4. **pin 有前置条件**：soft pin 依赖手写 `_empty_pin.so`，只对 Mooncake v0.3.13.post1 成立，升 wheel 要重编，且无运行时 ABI 闸（`kvcm/summary.md`）。
 5. **要自己对齐 key**：前缀 → 池 key 的算法必须与引擎逐字节一致（`engines/vllm/keys.py`）。
 6. **copy / move 无取消**：两版本都无取消 RPC（D2 事实基线「copy / move 机制」、`summary.md` P9），请求改道时只能弃置 + 事后清副本。
-7. **缺 L5**：D8 的 SC 尚未实现，选路仍要外部 router。
+7. **缺路由层**：D8 的 SC 尚未实现，选路仍要外部 router。
 
-### 6.3 收敛后的差异表述
+### 6.3 不需要跟着引擎打补丁，省的是什么
+
+这是本篇里最实在的一条优势，但它容易被说过头，先把边界划清楚。
+
+**事实：靠 connector 接入的方案，代价是跟着引擎版本维护补丁树。**
+
+| 项目 | 补丁规模 | 补哪里 | 出处 |
+|---|---|---|---|
+| UCM | **16 个版本目录**（`0.9.2`、`0.11.0`、`v0110`…`v0300`、`common`） | 打 `vLLM` 的层钩子、`vllm_ascend` 的 GDN/线性注意力路径 | `ucm/integration/vllm/patch/`；`patch/v0300/mamba_layer_hooks_patch.py` 开头即说明 `@maybe_transfer_kv_layer` 只覆盖全注意力层，线性注意力层拿不到逐层钩子，只能自己装两层钩子，且第二层在 `VLLM_COMPILE` 下会静默失效、必须 `--enforce-eager` |
+| FlexKV | **5 份 vLLM 补丁，377–528 行，最多 13 个文件** | 直接改 `vllm/v1/core/sched/scheduler.py`、`kv_cache_utils.py`、`entrypoints/openai/protocol.py` 等 | `examples/vllm_adaption/*.patch`；`vllm_0_10_1_1-flexkv-connector-namespace.patch` 触及 13 个 vLLM 文件 |
+
+UCM 那个 `mamba_layer_hooks_patch.py` 值得单独看：它不是「装个钩子」，而是要判断某一类层在编译模式下钩子会不会被 Dynamo 追踪剪掉，剪掉了就退化成 eager 执行。也就是说，补丁不只是跟进版本号，还要跟进引擎编译器的行为。这是随引擎演化持续付的成本。
+
+**我们的位置：不碰引擎，只碰池。**
+
+`grep -rni "connector" kvcm/kvcm/` 零命中（§6.4 轴五已核）。kvcm 的全部动作是对 Mooncake master 的 RPC，参数是 key 和段（§3.6）。所以：
+
+- 引擎从 vLLM 0.26 升到 0.27，kvcm 不需要出补丁；
+- 换一个引擎（vLLM → vLLM-Ascend → SGLang），只要它们写进同一个池、key 算法对得上，kvcm 的操作面不变；
+- 池从 Mooncake 换成别的实现，动的只是 `backends/` 下一个 adapter（`ops/base.py::KvOps` 是抽象基类，目前只有 `mooncake` 一个实现）。
+
+**但这条优势有边界，不能写成「零成本」：**
+
+1. **接入仍有补丁。** 异构 TP 场景要 vllm-ascend v0.26.0rc1 的 #15835 backport（§6.1 第 3 条）。这部分成本没有消失，只是从 kvcm 转移到了「引擎接入池」这一步——而这一步本来就要做，不管有没有 kvcm。
+2. **key 必须逐字节对齐。** 补丁可以不管，key 算法必须跟（`engines/vllm/keys.py`）。这是另一种耦合，只是它耦合在**内容**上而不是**代码**上。`PYTHONHASHSEED` 没设就会静默漂移。
+3. **能做的事受池的 API 限制。** 我们不能像 UCM 那样在引擎里插钩子，所以拿不到 HBM 内部的视图（§6.2 第 1 条）；也不能在引擎 forward 的中间插入动作。补丁自由的代价是可见性。
+
+一句话：**我们省的是「跟着引擎版本改引擎源码」这件事，换掉的代价是「看不见引擎内部状态」。** 这两条是同一枚硬币的两面，写清楚比只讲省下来的那面更有说服力。
+
+### 6.4 收敛后的差异表述
 
 旧的「中心命令 vs hint 推」二分作为**一条轴**仍成立：在「谁能对 KV 字节强制动手」这条轴上，kvcm 与对象池的调用方（不是池自己）站在「能点名、能拿完成信号」的一端，信封路线站在「只能建议」的一端。但它不是唯一的轴：
 

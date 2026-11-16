@@ -69,16 +69,16 @@ def _canvas(w=8.4, h=6.0):
 # ---------------------------------------------------------------------------
 
 LAYERS = [
-    # (层名, 项目, 底色, 关键词)
-    ("L5  routing layer", "llm-d EPP · Dynamo router · AIBrix gateway", BLUE,
+    # (层名, 项目, 底色, 关键词)；层名不用 L 编号：D8 已有 L0/L1/L2 三环，会撞
+    ("routing", "llm-d EPP · Dynamo router · AIBrix gateway", BLUE,
      "decides where the request goes; KV follows the request"),
-    ("L4  request-envelope hint", "vLLM · SGLang · KVCR (+ Dynamo hint producer)", AMBER,
+    ("request envelope", "vLLM · SGLang · KVCR (+ Dynamo hint producer)", AMBER,
      "router advises in-band; engine resolves, may drop"),
-    ("L3  standalone coordinator", "LMCache mp_coordinator", GREEN,
+    ("standalone coordinator", "LMCache mp_coordinator", GREEN,
      "fleet views + commands, event-derived, eventually consistent"),
-    ("L2  object-pool metadata", "MemCache MetaService · Mooncake master", GREEN,
+    ("object pool", "MemCache MetaService · Mooncake master", GREEN,
      "owns bytes: placement, replicas, lease, eviction"),
-    ("L1  engine plugin", "UCM · FlexKV (+ AIBrix kvcache, kvcr lib)", BLUE,
+    ("engine plugin", "UCM · FlexKV (+ AIBrix kvcache, kvcr lib)", BLUE,
      "lives in the engine process; store interface is a library call"),
 ]
 
