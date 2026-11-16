@@ -379,108 +379,144 @@ def _thin(ax, xy1, xy2, color="#4e8a4a", ls="-"):
 
 
 def _panel(ax, title, subtitle, strategy_side):
-    """画一侧。两侧的四个堆叠层完全相同，只有「策略块在哪」不同。"""
+    """画一侧。两侧都画两个引擎共享同一个池，只让「策略块在哪」不同。"""
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
     ax.set_title(title, fontsize=9.8, pad=14, fontweight="bold")
-    ax.text(0.5, 0.958, subtitle, ha="center", va="top", fontsize=7.2,
+    ax.text(0.5, 0.965, subtitle, ha="center", va="top", fontsize=7.2,
             color="#4a4a4a", style="italic")
 
-    # 系统边界
     ax.add_patch(FancyBboxPatch(
-        (0.012, 0.055), 0.976, 0.875, boxstyle="round,pad=0.004,rounding_size=0.010",
+        (0.012, 0.030), 0.976, 0.880, boxstyle="round,pad=0.004,rounding_size=0.010",
         fc="none", ec="#7a7a7a", linewidth=1.0, linestyle=(0, (6, 4))))
 
-    # ---- 四层（两侧完全相同）----
-    _gbox(ax, 0.035, 0.715, 0.56, 0.165,
-          "Engine (vLLM / SGLang / MindIE)",
-          "connector:  KVConnectorBase_V1\n"
-          "compute:    attention / prefill / decode\n"
-          "local KV:   HBM APC",
-          fs=7.4, body_fs=6.4)
+    # ---- 两个引擎（并排，主栈只占左侧 0.035–0.775，右侧留给 kvcm）----
+    e_w, e_h, e_y = 0.355, 0.225, 0.700
+    e1_x, e2_x = 0.035, 0.400
 
-    _gbox(ax, 0.035, 0.505, 0.56, 0.145,
-          "Client Library   (python / C++ API)",
-          "IO Proxy  ·  MF Proxy  ·  RPC Client",
-          fs=7.2, body_fs=6.4)
+    ENGINES = [
+        (e1_x, "Engine A   vLLM-Ascend", "AscendStoreConnector"),
+        (e2_x, "Engine B   SGLang", "HiCache / FlexKV"),
+    ]
 
-    _gbox(ax, 0.035, 0.295, 0.56, 0.155,
-          "Meta Service / master",
-          "RPC Server · Meta Manager\n"
-          "Space Allocator · Locality · Eviction\n"
-          "metrics · HA",
-          fs=7.2, body_fs=6.4)
-
-    _gbox(ax, 0.035, 0.105, 0.265, 0.105, "GVA memory pool",
-          "pooled DRAM", fs=6.8, body_fs=6.2)
-    _gbox(ax, 0.330, 0.105, 0.265, 0.105, "SSD pool",
-          "local NVMe", fs=6.8, body_fs=6.2)
-
-    # ---- 数据面 / 控制面 ----
-    _thick(ax, (0.20, 0.715), (0.20, 0.652))     # engine → client lib
-    _thick(ax, (0.13, 0.505), (0.13, 0.212))     # client lib → DRAM pool
-    _thick(ax, (0.42, 0.505), (0.42, 0.212))     # client lib → SSD pool
-    _thin(ax, (0.50, 0.505), (0.50, 0.452))      # client lib → master (RPC)
+    for ex, name, strat in ENGINES:
+        _gbox(ax, ex, e_y, e_w, e_h, name,
+              "connector:  KVConnectorBase_V1\n"
+              "compute:    attention / prefill / decode\n"
+              "local KV:   HBM APC",
+              fs=7.0, body_fs=6.0)
+        # (a) 策略在引擎进程内：每个引擎里各一份，写出具体开源方案名
+        if strategy_side == "engine":
+            _gbox(ax, ex + 0.007, e_y + 0.007, e_w - 0.014, 0.104,
+                  "KV strategy  (in THIS process)",
+                  f"{strat}\n"
+                  "radix · eviction · prefetch\n"
+                  "retention",
+                  fc="#fdf3e0", ec="#b58a3a", fs=6.3, body_fs=5.6)
 
     if strategy_side == "engine":
-        # (a) 策略是引擎进程内的一块，用另一套配色压在引擎层里
-        _gbox(ax, 0.315, 0.735, 0.265, 0.128,
-              "KV strategy",
-              "prefix radix match\n"
-              "eviction order\n"
-              "prefetch on hit\n"
-              "session retention",
-              fc="#fdf3e0", ec="#b58a3a", fs=7.0, body_fs=6.0)
-        ax.text(0.4475, 0.715, "inside the engine process", ha="center", va="top",
-                fontsize=6.4, color="#8a6520", style="italic")
-    else:
-        # (b) 策略是池的 client，与引擎平级，通过 master 的 RPC 动手
-        _gbox(ax, 0.635, 0.715, 0.335, 0.165,
-              "kvcm   (pool client)",
-              "placement · retention · TTL\n"
-              "prefetch target · cross-engine\n"
-              "survival · byte accounting",
-              fc="#e8eef9", ec="#4a6fa5", fs=7.2, body_fs=6.2)
-        ax.text(0.8025, 0.700, "decides; does not run engines", ha="center",
-                va="top", fontsize=6.4, color="#35507a", style="italic")
-        # 控制：kvcm → master（点名任务 / 读副本权威）
-        _thin(ax, (0.80, 0.715), (0.52, 0.452), color="#4a6fa5", ls=(0, (4, 2)))
-        ax.text(0.66, 0.575,
-                "CreateCopyTask /\ncreate_move_task /\npin / GetReplicaList",
-                fontsize=6.0, color="#35507a", ha="center", va="center",
-                linespacing=1.4)
+        ax.text(0.405, e_y - 0.010,
+                "two copies of the strategy, one per engine:\n"
+                "patch vLLM-Ascend, patch SGLang — one patch tree per engine version",
+                ha="center", va="top", fontsize=6.2, color="#8a6520",
+                style="italic", linespacing=1.5)
 
-    ax.text(0.022, 0.020,
+    # ---- Client Library：每个引擎一个（数据面直连池）----
+    cl_y, cl_h = 0.435, 0.095
+    for ex in (e1_x, e2_x):
+        _gbox(ax, ex, cl_y, e_w, cl_h,
+              "Client Library  (python / C++ API)",
+              "IO Proxy · MF Proxy · RPC Client",
+              fs=6.6, body_fs=5.8)
+
+    # ---- 共享池：一个整体区域，两个引擎都连进来 ----
+    pool_x, pool_y, pool_w, pool_h = 0.035, 0.052, 0.740, 0.335
+    ax.add_patch(FancyBboxPatch(
+        (pool_x, pool_y), pool_w, pool_h,
+        boxstyle="round,pad=0.004,rounding_size=0.010",
+        fc="#f4faf3", ec="#3f7a3a", linewidth=1.2))
+    ax.text(pool_x + 0.010, pool_y + pool_h - 0.014,
+            "THE POOL — shared by both engines   (Mooncake / MemCache)",
+            fontsize=7.2, fontweight="bold", color="#1f4d1c", va="top")
+
+    _gbox(ax, pool_x + 0.012, 0.245, pool_w - 0.024, 0.082,
+          "Meta Service / master",
+          "RPC Server · Meta Manager · Space Allocator · Locality · Eviction · HA",
+          fs=6.6, body_fs=5.7)
+    _gbox(ax, pool_x + 0.012, 0.062, 0.345, 0.070, "GVA memory pool",
+          "pooled DRAM", fs=6.2, body_fs=5.6)
+    _gbox(ax, pool_x + 0.380, 0.062, 0.345, 0.070, "SSD pool",
+          "local NVMe", fs=6.2, body_fs=5.6)
+    _thin(ax, (pool_x + 0.185, 0.245), (pool_x + 0.185, 0.133))
+    _thin(ax, (pool_x + 0.552, 0.245), (pool_x + 0.552, 0.133))
+
+    # ---- 数据面：每个引擎各有一条粗箭头进池 ----
+    for cx in (e1_x + e_w / 2, e2_x + e_w / 2):
+        _thick(ax, (cx, e_y), (cx, cl_y + cl_h))
+        _thick(ax, (cx, cl_y), (cx, pool_y + pool_h))
+
+    # (b) 策略是池的一个 client：一份，在池外右侧，只经 master 动手
+    if strategy_side == "kvcm":
+        kx, kw, ky, kh = 0.793, 0.190, 0.150, 0.360
+        ax.add_patch(FancyBboxPatch(
+            (kx, ky), kw, kh, boxstyle="round,pad=0.003,rounding_size=0.008",
+            fc="#e8eef9", ec="#4a6fa5", linewidth=1.1))
+        ax.text(kx + kw / 2, ky + kh - 0.014, "kvcm", ha="center", va="top",
+                fontsize=8.0, fontweight="bold", color="#26405f")
+        ax.text(kx + kw / 2, ky + kh - 0.040, "one pool client\ncovers BOTH engines",
+                ha="center", va="top", fontsize=5.8, color="#26405f",
+                linespacing=1.4)
+        ax.text(kx + 0.008, ky + 0.212,
+                "placement\n"
+                "retention · TTL\n"
+                "prefetch target\n"
+                "cross-engine survival\n"
+                "byte accounting",
+                ha="left", va="top", fontsize=5.6, color="#333333",
+                linespacing=1.5)
+        # 只一条短控制线：kvcm → master，穿过池边界
+        _thin(ax, (kx, 0.288), (pool_x + pool_w, 0.288),
+              color="#4a6fa5", ls=(0, (4, 2)))
+        ax.text(kx + kw / 2, ky + 0.008,
+                "CreateCopyTask\ncreate_move_task\npin / GetReplicaList",
+                ha="center", va="bottom", fontsize=5.2, color="#35507a",
+                linespacing=1.5)
+        ax.text(0.405, e_y - 0.010,
+                "engines carry no placement strategy; swapping an engine\n"
+                "changes nothing in kvcm — it talks to the pool, not the engine",
+                ha="center", va="top", fontsize=6.2, color="#35507a",
+                style="italic", linespacing=1.5)
+
+    ax.text(0.022, 0.014,
             "thick = data path     thin = RPC / control path",
-            fontsize=6.2, color="#5a5a5a")
+            fontsize=6.0, color="#5a5a5a")
 
 
 def control_placement() -> None:
-    """同一组部件，两种控制位置：策略在引擎内 vs 在池的 client 上。"""
-    fig, axes = plt.subplots(1, 2, figsize=(14.6, 7.4))
+    """两个引擎共享一个池；策略在引擎内（各一份）vs 在池的 client 上（一份）。"""
+    fig, axes = plt.subplots(1, 2, figsize=(14.8, 7.6))
     _panel(
         axes[0],
-        "(a) open source: the strategy lives in the engine",
+        "(a) open source: one strategy copy per engine",
         "connector + per-engine patches; each engine decides for itself",
         "engine",
     )
     _panel(
         axes[1],
-        "(b) kvcm: the strategy lives beside the pool",
-        "backend-coupled: any engine writing into the same pool is covered",
+        "(b) kvcm: one strategy for the shared pool",
+        "backend-coupled: any engine writing into the pool is covered",
         "kvcm",
     )
 
-    # 两 panel 之间加一条对比注释
-    fig.text(0.5, 0.028,
-             "Same boxes on both sides. What moves is the strategy block: "
-             "left, it sits inside the engine process and needs engine patches; "
-             "right, it is a pool client and reaches the pool through master RPCs "
-             "(CreateCopyTask / MoveStart+MoveEnd / pin / GetReplicaList).",
-             ha="center", va="bottom", fontsize=7.0, color="#4a4a4a", wrap=True)
+    fig.text(0.5, 0.026,
+             "Same boxes on both sides: two engines, one shared pool. "
+             "What changes is where the strategy block lives — "
+             "left, inside each engine process (needs engine patches); "
+             "right, one pool client reaching the pool through master RPCs.",
+             ha="center", va="bottom", fontsize=7.0, color="#4a4a4a")
 
-    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    fig.tight_layout(rect=(0, 0.048, 1, 1))
     fig.savefig(HERE / "fig-control-placement.svg", format="svg")
     plt.close(fig)
 
