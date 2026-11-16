@@ -285,6 +285,23 @@ kvcm（Mooncake client，自己的 UUID）
 
 一行读法：**权威记录只在两个对象池（MetaService / master）手里；kvcm 不复制这份记录，直接读它。** 其余各家的位置知识都是事件派生的视图。决定与执行的拆分，则只有 kvcm 明确成两个平面（D8 管理面决定、控制面执行）。
 
+### 5.3 按子系统：kvcm 的每一块分别像谁
+
+kvcm 的各子系统分别对应不同的上游，整体对照会失真。逐块看：
+
+| kvcm 部分 | 最像的开源组件 | 依据 |
+|---|---|---|
+| D9 控制面执行 | LMCache coordinator 的 prefetch / pin / delete API | 对面是「按实例下发、带完成查询」的命令面：`mp_coordinator/http_apis/cache_api.py::request_prefetch`（提交 + `GET /cache/prefetches/{instance_id}/{request_id}` 轮询）、`controllers/eviction_http_api.py::request_pin` / `request_delete`。kvcm 侧对应 `ops/base.py::KvOps` 的 copy / move / pin / remove + `query_task` |
+| D8 L0 请求路由 | llm-d EPP、Dynamo KV Smart Router | EPP：`pkg/kvcache/indexer.go::Indexer` + `pkg/epp/scheduling/weighted_scorer.go` 的插件化打分；Dynamo：`lib/router/kv-indexer/src/kv_hints.rs::KvTransferCandidates` + `lib/router/scheduler/src/kv_hints.rs::resolve_transfer_sources`。kvcm 这一环尚未实现（D8 的 SC） |
+| D8 L1 KV 生命周期 | LMCache coordinator、KVCR | LMCache：预取 / pin / 配额驱逐三个控制器（`controllers/{prefetch_manager,eviction_controller}.py`）；KVCR：`policy.py::KVCachePolicy` 的 `decide_ingest` / `decide_eviction` 钩子 + 入池放置 TODO |
+| D8 L2 容量扩缩 | Dynamo Planner、AIBrix PodAutoscaler | `components/src/dynamo/planner/core/{load_scaling,throughput_scaling}.py` 的 `LoadScalingMixin` / `ThroughputScalingMixin`（慢快双环）；`pkg/controller/podautoscaler/autoscaler.go::DefaultAutoScaler`（KPA 指标驱动，`AutoScaler` 接口在 42 行）。kvcm 一侧只出容量事实与建议，执行归外部编排 |
+| 池元数据权威 | Mooncake master | `mooncake-store/include/master_client.h::GetReplicaList` / `BatchGetReplicaList` / `CreateCopyTask` / `CreateMoveTask`。kvcm 是它的 client（`backends/mooncake/client.py::StoreClient`，`global_segment_size=0` 的纯控制身份），不是它本身 |
+| 引擎接入池 | UCM / FlexKV / LMCache 的 connector | UCM：`ucm/integration/vllm/ucm_connector.py` 下的 `UCMConnector` / `UCMDirectConnector` / `UCMPDConnector` 一族；FlexKV：`examples/vllm_adaption/*-flexkv-connector.patch` 打出的 `FlexKVConnectorV1(KVConnectorBase_V1)`；LMCache：`integration/vllm/lmcache_mp_connector.py::LMCacheMPConnector`。kvcm 不依赖其中任何一个（轴五） |
+
+汇成一句判断：**单看组件，kvcm 最像 LMCache `mp_coordinator`；看整栈，最像 Dynamo（KV Smart Router + KVBM/KVCR + Planner），但那是三个东西，且其中 KVBM 已 sunset（见 [dynamo/overview.md](dynamo/overview.md)「KVBM 变局」），KVCR 是它的继任者；池权威这一块依附 Mooncake master；耦合方式与上述任一都不同。**
+
+这条「最像 LMCache coordinator」有边界，写清楚免得读成对等：LMCache coordinator 只像 kvcm 的**控制面外形**（独立进程、按实例下命令、带完成查询），不是完整管理面——它不做请求路由、不做扩缩，目录是事件派生的最终一致视图，而 kvcm 读的是 master 的副本记录（§3.3、§5.2）。
+
 ---
 
 ## 6. 我方边界与短板
@@ -303,7 +320,7 @@ kvcm（Mooncake client，自己的 UUID）
 
 3. **「不要求引擎改造」→「KV 动作不需要改引擎，但接入仍有已知补丁」**
    - 旧：「不要求引擎改代码 / 不要求引擎改造。引擎跑官方 connector，KV 进池即可」。
-   - 新：「KV 动作不需要改引擎——引擎跑官方 connector 把 KV 写进池即可，之后的 copy/move/pin 都在池上做。接入仍有已知兼容补丁：异构 TP 场景 vllm-ascend v0.26.0rc1 需要 #15835 backport（`kvcm/demo/README.md`）；key 计算必须与引擎逐字节一致（`kvcm/kvcm/engines/vllm/keys.py`），`PYTHONHASHSEED` 未设会静默漂移。」
+   - 新：「KV 动作不需要改引擎——引擎跑官方 connector 把 KV 写进池即可，之后的 copy/move/pin 都在池上做。机制上是**耦合点不同**：kvcm 接的是池的 backend，不是引擎的 connector，所以换引擎不换 backend（§6.3 轴五）。接入仍有已知兼容补丁：异构 TP 场景 vllm-ascend v0.26.0rc1 需要 #15835 backport（`kvcm/demo/README.md`）；key 计算必须与引擎逐字节一致（`kvcm/kvcm/engines/vllm/keys.py`），`PYTHONHASHSEED` 未设会静默漂移。」
 
 4. **「引擎不必参与」→「不需要引擎参与决策，但源 client 必须在线」**
    - 旧：「引擎不必参与」「只要源 seg 的 client 在线」两句被当作互不相干的两件事写在不同处。
@@ -327,8 +344,30 @@ kvcm（Mooncake client，自己的 UUID）
 - 轴二（分发形态）：引擎自决 / 中心分发节点执行 / 调用方点名（§2）。
 - 轴三（权威）：事件派生视图 / 池 master 权威（§5.2）。
 - 轴四（决定权归属）：管理面决定 / 引擎内 policy 决定 / router 决定（§6.1 第 1 条）。
+- 轴五（耦合点）：接引擎 connector / 接池 backend（本节末）。
 
-kvcm 的差异落在轴三与轴四：权威记录在池 master 且直接读，决定权在独立的管理面。这两条是可核对的，不依赖「中心命令」这个说法。
+**轴五：connector-coupled 与 backend-coupled。** 这一条决定「换引擎要不要重做」，LMCache 与 kvcm 在这一点上形状不同。
+
+kvcm 的耦合点在池：`backend.py::copy` 只拿 key 列表与目标 segment，调 `self._client.create_copy_task(key, [seg])`；`move` 调 `self._client.create_move_task(key, src_seg, tgt_seg)`；`remove` 调 `self._client.batch_remove(keys, force)`。三个方法的入参里没有引擎侧句柄、回调或事件接口。全包 `grep -rni "connector" kvcm/kvcm/` 零命中。引擎相关的代码只有 `kvcm/kvcm/engines/vllm/keys.py::KeyComputer`（token 序列 → 池 key）与 `topology.py::RankTopology`（rank ↔ seg 对号），产出都是池认得的东西。
+
+```text
+kvcm
+  → backend adapter / StoreClient
+  → Mooncake master（副本权威）
+  → 池里的 KV
+
+vLLM / vLLM-Ascend / SGLang
+  → 各自的 connector（AscendStoreConnector 等）
+  → 同一个 Mooncake 池
+```
+
+两侧在池上相遇。只要引擎们用的是同一个池、且 key / block hash 对齐，kvcm 的 KV 操作层对它们一视同仁，不需要为某个引擎写 connector——connector 是引擎接入池的方式，不是 kvcm 的前置条件。
+
+LMCache 在另一头：它驱动的是装在引擎里的进程内服务。`mp_coordinator/http_apis/cache_api.py::request_prefetch` 先在 `InstanceRegistry` 里解析 `instance_id`（`MPInstance{ip, http_port}`），再把 `POST /cache/prefetches` 代理到那台 server（`PrefetchManager.submit_prefetch`）；驱逐同样按实例投递 `DELETE /cache/objects`（`controllers/eviction_controller.py::execute_evictions`）。这些 server 是 `MPCacheServer`（`v1/multiprocess/server.py`），由 LMCache 自己的 connector 拉起或等待（`integration/vllm/vllm_multi_process_adapter.py` 调 `maybe_start_mp_server_from_url` / `wait_for_mp_server_from_url`，实现在 `integration/vllm/mp_server_launcher.py`）。没有那个 connector，注册表里就没有实例，协调器无从下发。
+
+结果是：kvcm 换引擎不动 backend，换后端不动引擎侧（`ops/base.py::KvOps` 是抽象基类，`backends/` 下目前只有 `mooncake`）；LMCache 的协调器离开自家 connector 就失去作用对象。这是「与引擎的接缝放在哪一层」的取舍——LMCache 放 connector，kvcm 放 backend。
+
+回到差异本身：kvcm 落在轴三、轴四与轴五——权威记录在池 master 且直接读，决定权在独立的管理面，接缝在池的 backend。这三条都可核对，不依赖「中心命令」这个说法。
 
 ---
 
@@ -402,3 +441,9 @@ kvcm 的差异落在轴三与轴四：权威记录在池 master 且直接读，�
 | FlexKV 请求面 | `flexkv/server/request.py`；`flexkv/server/server.py::KVServer` |
 | FlexKV 远端 radix | `flexkv/cache/radix_remote.py::DistributedRadixTree`；`flexkv/cache/redis_meta.py::RedisMetaChannel` |
 | FlexKV 预取协调 | `flexkv/prefetch/coordinator.py` |
+| kvcm 耦合点在池（copy/move/remove 的入参只有 key + seg） | `kvcm/kvcm/backends/mooncake/backend.py::copy` / `move` / `remove`（`create_copy_task` / `create_move_task` / `batch_remove`） |
+| kvcm 引擎侧只做 key 与 rank 对号 | `kvcm/kvcm/engines/vllm/keys.py::KeyComputer`；`kvcm/kvcm/engines/vllm/topology.py::RankTopology` |
+| LMCache 耦合点在 connector（协调器按实例投递） | `mp_coordinator/http_apis/cache_api.py::request_prefetch`（`InstanceRegistry` 解析 → 代理 `POST /cache/prefetches`）；`controllers/eviction_controller.py::execute_evictions`（`DELETE /cache/objects`） |
+| LMCache 进程内 server 由自家 connector 拉起 | `integration/vllm/vllm_multi_process_adapter.py`（`maybe_start_mp_server_from_url` / `wait_for_mp_server_from_url`）；`integration/vllm/mp_server_launcher.py`；`v1/multiprocess/server.py::MPCacheServer` |
+| Dynamo 扩缩（慢快双环） | `components/src/dynamo/planner/core/load_scaling.py::LoadScalingMixin`；`throughput_scaling.py::ThroughputScalingMixin` |
+| AIBrix 扩缩（KPA 指标） | `pkg/controller/podautoscaler/autoscaler.go::AutoScaler` / `DefaultAutoScaler` |
