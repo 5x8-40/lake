@@ -78,10 +78,12 @@ KVCR 和 kvcm 在这里走到一起了：两家都意识到「KV 必须脱离引
 |---|---|---|
 | UCM | 维护 **16 个版本补丁目录**（`0.9.2`、`0.11.0`、`v0110`…`v0300`、`common`）。点开看：[`ucm/integration/vllm/patch/`](https://github.com/ModelEngine-Group/unified-cache-management/tree/develop/ucm/integration/vllm/patch) | 每跟一个引擎版本，补丁要重打、重测 |
 | FlexKV | **5 份 vLLM 补丁，377–528 行，最多触及 13 个 vLLM 文件**（含 `v1/core/sched/scheduler.py`）。点开看：[`examples/vllm_adaption/`](https://github.com/taco-project/FlexKV/tree/main/examples/vllm_adaption) | 同上，且直接改调度器 |
-| LMCache | 跟随 LMCache 自己的 connector 与 MP server 版本 | 引擎与协调器要一起升级 |
+| LMCache | 跟随 LMCache 自己的 connector 与 MP server 版本。官方维护一份 [vLLM × LMCache 兼容矩阵](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/Installation_compatibility_matrix.csv)（[说明页](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/compatibility.rst)） | 引擎与协调器要一起升级 |
 | **kvcm** | **不需要出补丁** | — |
 
-两个目录一眼能看出来。UCM 那个目录名就是引擎版本号，`0.9.2` 到 `v0300` 排成一列，跟一个版本就多一个目录；FlexKV 那边是文件名带版本，`vllm_0_10_1_1`、`vllm_0_16_0`、`vllm_up_0_14_1`、`vllm_main`，一份补丁对一个版本。
+LMCache 那张矩阵能直接看出负担：横轴是 8 个 LMCache 版本（0.3.10 → 0.4.2），纵轴是 vLLM 的每个次版本（0.11.2 → 0.18.0），逐格标是否验证过。文档开头自己写着「vLLM 和 LMCache 独立发版，新的 LMCache 发布不意味着旧版 vLLM 能加载每一个 connector，新的 vLLM 发布也可能改掉集成所依赖的 KV-cache API」。所以它跟 UCM/FlexKV 是两种形态的同一件事：它们打补丁，LMCache 维护兼容矩阵——都要跟着引擎版本走，只是记录方式不同。
+
+两个目录一眼能看出来。UCM 那个目录名就是引擎版本号，`0.9.2` 到 `v0300` 排成一列，跟一个版本就多一个目录；FlexKV 那边是文件名带版本，`vllm_0_10_1_1`、`vllm_0_16_0`、`vllm_up_0_14_1`、`vllm_main`，一份补丁对一个版本。LMCache 没有补丁目录，负担变成了维护那张矩阵的每一行每一格。
 
 UCM 的 `patch/v0300/mamba_layer_hooks_patch.py` 值得单独看一眼：它不是在装钩子，而是在判断某一类层（线性注意力 / GDN / KDA）在 `VLLM_COMPILE` 模式下钩子会不会被 Dynamo 追踪剪掉，剪掉了就退化成 `--enforce-eager`。也就是说，补丁要跟的不只是版本号，还有引擎编译器的行为。
 
@@ -210,6 +212,7 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 
 | 事实 | 出处 |
 |---|---|
+| 与 vLLM 的兼容性靠官方矩阵维护，不靠补丁目录 | [`docs/source/getting_started/Installation_compatibility_matrix.csv`](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/Installation_compatibility_matrix.csv)；[`compatibility.rst`](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/compatibility.rst) 开头即写明「vLLM 与 LMCache 独立发版，新版 LMCache 不保证旧版 vLLM 能加载每个 connector」 |
 | 独立进程、FastAPI 服务，默认只监听回环 | `lmcache/v1/mp_coordinator/app.py::create_app`；`docs/source/mp/coordinator.rst`（默认 `127.0.0.1:9300`） |
 | fleet 级 key 目录，事件派生、最终一致，**答案只是 hint，必须在 owner 处验证** | `views/key_directory.py::KeyDirectory`（docstring: "Eventually consistent: lookups are hints to be validated at the owner"）、`lookup` |
 | 目录只由 CacheEvent 批次构建，可 checkpoint / 回放 | `ingest/event_gate.py::EventGate`、`cache_events.py::CacheEventSink`、`events_replay.py::replay`、`persistence/checkpoint.py` |
