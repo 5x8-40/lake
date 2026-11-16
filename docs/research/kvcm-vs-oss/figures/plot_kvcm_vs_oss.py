@@ -350,12 +350,149 @@ def ucm_schematic() -> None:
     plt.close(fig)
 
 
+def _gbox(ax, x, y, w, h, title, body="", fc="#eef7ec", ec="#4e8a4a",
+          fs=7.6, body_fs=6.6):
+    """上游 MemCache 图同款：深色标题条 + 浅绿内容区的圆角块。"""
+    ax.add_patch(FancyBboxPatch(
+        (x, y), w, h, boxstyle="round,pad=0.003,rounding_size=0.008",
+        fc=fc, ec=ec, linewidth=0.9))
+    if title:
+        ax.text(x + 0.008, y + h - 0.016, title, ha="left", va="top",
+                fontsize=fs, color="#1f4d1c", fontweight="bold")
+    if body:
+        ax.text(x + 0.008, y + h - 0.040, body, ha="left", va="top",
+                fontsize=body_fs, color="#333333", linespacing=1.45)
+
+
+def _thick(ax, xy1, xy2, color="#3f7a3a"):
+    """数据面：上游图里的粗块状箭头。"""
+    ax.add_patch(FancyArrowPatch(
+        xy1, xy2, arrowstyle="-|>", mutation_scale=13, linewidth=3.0,
+        color=color, shrinkA=1, shrinkB=1))
+
+
+def _thin(ax, xy1, xy2, color="#4e8a4a", ls="-"):
+    """控制面：上游图里的细箭头。"""
+    ax.add_patch(FancyArrowPatch(
+        xy1, xy2, arrowstyle="-|>", mutation_scale=8, linewidth=1.1,
+        color=color, linestyle=ls, shrinkA=1, shrinkB=1))
+
+
+def _panel(ax, title, subtitle, strategy_side):
+    """画一侧。两侧的四个堆叠层完全相同，只有「策略块在哪」不同。"""
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
+    ax.set_title(title, fontsize=9.8, pad=14, fontweight="bold")
+    ax.text(0.5, 0.958, subtitle, ha="center", va="top", fontsize=7.2,
+            color="#4a4a4a", style="italic")
+
+    # 系统边界
+    ax.add_patch(FancyBboxPatch(
+        (0.012, 0.055), 0.976, 0.875, boxstyle="round,pad=0.004,rounding_size=0.010",
+        fc="none", ec="#7a7a7a", linewidth=1.0, linestyle=(0, (6, 4))))
+
+    # ---- 四层（两侧完全相同）----
+    _gbox(ax, 0.035, 0.715, 0.56, 0.165,
+          "Engine (vLLM / SGLang / MindIE)",
+          "connector:  KVConnectorBase_V1\n"
+          "compute:    attention / prefill / decode\n"
+          "local KV:   HBM APC",
+          fs=7.4, body_fs=6.4)
+
+    _gbox(ax, 0.035, 0.505, 0.56, 0.145,
+          "Client Library   (python / C++ API)",
+          "IO Proxy  ·  MF Proxy  ·  RPC Client",
+          fs=7.2, body_fs=6.4)
+
+    _gbox(ax, 0.035, 0.295, 0.56, 0.155,
+          "Meta Service / master",
+          "RPC Server · Meta Manager\n"
+          "Space Allocator · Locality · Eviction\n"
+          "metrics · HA",
+          fs=7.2, body_fs=6.4)
+
+    _gbox(ax, 0.035, 0.105, 0.265, 0.105, "GVA memory pool",
+          "pooled DRAM", fs=6.8, body_fs=6.2)
+    _gbox(ax, 0.330, 0.105, 0.265, 0.105, "SSD pool",
+          "local NVMe", fs=6.8, body_fs=6.2)
+
+    # ---- 数据面 / 控制面 ----
+    _thick(ax, (0.20, 0.715), (0.20, 0.652))     # engine → client lib
+    _thick(ax, (0.13, 0.505), (0.13, 0.212))     # client lib → DRAM pool
+    _thick(ax, (0.42, 0.505), (0.42, 0.212))     # client lib → SSD pool
+    _thin(ax, (0.50, 0.505), (0.50, 0.452))      # client lib → master (RPC)
+
+    if strategy_side == "engine":
+        # (a) 策略是引擎进程内的一块，用另一套配色压在引擎层里
+        _gbox(ax, 0.315, 0.735, 0.265, 0.128,
+              "KV strategy",
+              "prefix radix match\n"
+              "eviction order\n"
+              "prefetch on hit\n"
+              "session retention",
+              fc="#fdf3e0", ec="#b58a3a", fs=7.0, body_fs=6.0)
+        ax.text(0.4475, 0.715, "inside the engine process", ha="center", va="top",
+                fontsize=6.4, color="#8a6520", style="italic")
+    else:
+        # (b) 策略是池的 client，与引擎平级，通过 master 的 RPC 动手
+        _gbox(ax, 0.635, 0.715, 0.335, 0.165,
+              "kvcm   (pool client)",
+              "placement · retention · TTL\n"
+              "prefetch target · cross-engine\n"
+              "survival · byte accounting",
+              fc="#e8eef9", ec="#4a6fa5", fs=7.2, body_fs=6.2)
+        ax.text(0.8025, 0.700, "decides; does not run engines", ha="center",
+                va="top", fontsize=6.4, color="#35507a", style="italic")
+        # 控制：kvcm → master（点名任务 / 读副本权威）
+        _thin(ax, (0.80, 0.715), (0.52, 0.452), color="#4a6fa5", ls=(0, (4, 2)))
+        ax.text(0.66, 0.575,
+                "CreateCopyTask /\ncreate_move_task /\npin / GetReplicaList",
+                fontsize=6.0, color="#35507a", ha="center", va="center",
+                linespacing=1.4)
+
+    ax.text(0.022, 0.020,
+            "thick = data path     thin = RPC / control path",
+            fontsize=6.2, color="#5a5a5a")
+
+
+def control_placement() -> None:
+    """同一组部件，两种控制位置：策略在引擎内 vs 在池的 client 上。"""
+    fig, axes = plt.subplots(1, 2, figsize=(14.6, 7.4))
+    _panel(
+        axes[0],
+        "(a) open source: the strategy lives in the engine",
+        "connector + per-engine patches; each engine decides for itself",
+        "engine",
+    )
+    _panel(
+        axes[1],
+        "(b) kvcm: the strategy lives beside the pool",
+        "backend-coupled: any engine writing into the same pool is covered",
+        "kvcm",
+    )
+
+    # 两 panel 之间加一条对比注释
+    fig.text(0.5, 0.028,
+             "Same boxes on both sides. What moves is the strategy block: "
+             "left, it sits inside the engine process and needs engine patches; "
+             "right, it is a pool client and reaches the pool through master RPCs "
+             "(CreateCopyTask / MoveStart+MoveEnd / pin / GetReplicaList).",
+             ha="center", va="bottom", fontsize=7.0, color="#4a4a4a", wrap=True)
+
+    fig.tight_layout(rect=(0, 0.05, 1, 1))
+    fig.savefig(HERE / "fig-control-placement.svg", format="svg")
+    plt.close(fig)
+
+
 def main() -> None:
     ownership()
+    control_placement()
     evidence()
     ucm_schematic()
     for name in (
         "fig-ownership.svg",
+        "fig-control-placement.svg",
         "fig-evidence.svg",
         "fig-ucm-schematic.svg",
     ):

@@ -22,6 +22,17 @@ kvcm 把 KV 从引擎手里拿了出来。key 是池里的对象，副本有主�
 
 （自绘图，由 [`kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`](kvcm-vs-oss/figures/plot_kvcm_vs_oss.py) 生成。红线上方是「KV 必须有引擎或请求才能存在」，下方是「池比引擎活得久」。kvcm 站在池这一行的右侧：它不是池，是池的调用方。全部图源与许可见 [`kvcm-vs-oss/figures/README.md`](kvcm-vs-oss/figures/README.md)。）
 
+换到具体部件上看，两边的差别只有一个格子：**KV 控制策略画在哪个进程里**。图 (a)(b) 的引擎、Client Library、Meta Service / master、GVA 内存池、SSD 池完全一样，只有策略块换了位置。
+
+![控制策略在哪](kvcm-vs-oss/figures/fig-control-placement.svg)
+
+（自绘图，同上脚本。粗箭头是数据面，细箭头是 RPC / 控制面。部件命名沿用 MemCache 上游架构图，便于和 §A.2 那张原图对照。）
+
+- **(a) 开源侧**：策略是引擎进程内的一块，和 connector 一起编译进去。它决定这次请求取多少 KV、驱逐谁、要不要预取，然后由引擎自己动手。这就是为什么要跟着引擎版本打补丁——策略和引擎代码在同一进程里，接口一变就得跟着改。
+- **(b) kvcm**：引擎只做自己的事（算 attention、命中了就读本机 APC）。策略块挪到池的 client 上，通过 `CreateCopyTask` / `create_move_task` / `pin` / `GetReplicaList` 这些 master RPC 对池动手。**引擎换成哪一个都不影响这块策略**——它认的是池，不是引擎。
+
+同一张图也能看出 (b) 的代价：kvcm 没有引擎内那条细箭头，所以它拿不到 HBM/APC 里的信息（§4）。
+
 ## 2. 这条差别决定什么
 
 下面五条不是五个并列的功能，是同一件事的五个面：

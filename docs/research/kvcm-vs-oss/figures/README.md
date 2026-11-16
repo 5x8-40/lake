@@ -5,6 +5,7 @@
 | 文件 | 类型 | 来源 | 许可 | 快照 / 版本 |
 |---|---|---|---|---|
 | `fig-ownership.svg` | 自绘 | `plot_kvcm_vs_oss.py`（本仓）。主线图：KV 依附于谁，各家落在哪一段 | 本仓 MIT | kvcm `4d9dd33`，上游 2026-11-13 |
+| `fig-control-placement.svg` | 自绘 | 同上。同一组部件两种控制位置：策略在引擎进程内 vs 在池的 client 上。部件命名沿用 MemCache 上游架构图 | 本仓 MIT | 同上 |
 | `fig-evidence.svg` | 自绘 | 同上。左栏控制权矩阵（谁决定 / 谁动字节 / 谁的记录权威），右栏 hint 落地时间线 | 本仓 MIT | 同上 |
 | `fig-ucm-schematic.svg` | 自绘（redrawn） | redrawn from unified-cache-management `docs/source/_static/architecture.svg` | MIT with additional conditions | UCM `57ddbb26`（2026-11-13） |
 | `memcache-architecture.png` | 上游原图 | Ascend MemCache `doc/source/memcache_architecture.png`（[gitcode.com/Ascend/memcache](https://gitcode.com/Ascend/memcache)） | MulanPSL2 | MemCache `14b4e35e`（2026-06-02） |
