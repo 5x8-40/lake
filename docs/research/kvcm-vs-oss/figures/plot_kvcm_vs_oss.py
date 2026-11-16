@@ -1,17 +1,20 @@
 """生成 kvcm / KV Fabric 与开源方案对比的自绘图（对照工件）。
 
 口径：kvcm @ `4d9dd33`（2026-11-13）；上游快照 2026-11-13（逐家 commit 见正文头部）。
-坐标与打分为**判断**，依据逐条写进正文 §1–§3 的符号级事实表。
+
+正文主线是「KV 依附于谁」，所以第一张图直接画这条：
+KV 的持有者从「某个请求」到「池」，各家排在同一条轴上。
+持有者是引擎进程或请求，动作就只能从请求开始、到请求结束；
+持有者是池，KV 才能跨请求、跨引擎存在。
 
 运行：
     python3 docs/research/kvcm-vs-oss/figures/plot_kvcm_vs_oss.py
 
 输出（本目录下的**自绘图**，非上游原图）：
-    fig-overview.svg        分层归属 + 三种分发/控制形态（左：谁在哪层；右：谁说了算）
-    fig-evidence.svg        按控制权的矩阵 + hint 落地时间线（左：权威；右：落地状态）
-    fig-ucm-schematic.svg   UCM 分层示意（redrawn from 上游 architecture.svg）
+    fig-ownership.svg      主线图：KV 依附于谁，各家落在哪一段
+    fig-evidence.svg       证据图：控制权矩阵 + hint 落地时间线
+    fig-ucm-schematic.svg  UCM 分层示意（redrawn from 上游 architecture.svg）
 
-图数刻意压到三张：两张对照工件各承载一组问题，一张是上游架构的重绘。
 图内文字用英文：仓库无 CJK 字体，中文会渲染成方块。
 """
 
@@ -56,142 +59,132 @@ def _arrow(ax, xy1, xy2, style="->", ls="-", color="#333333"):
     )
 
 
-def _canvas(w=8.4, h=6.0):
-    fig, ax = plt.subplots(figsize=(w, h))
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
-    return fig, ax
-
-
 # ---------------------------------------------------------------------------
-# 1. 分层归属
+# 1. 主线：KV 依附于谁
 # ---------------------------------------------------------------------------
 
-LAYERS = [
-    # (层名, 项目, 底色, 关键词)；层名不用 L 编号：D8 已有 L0/L1/L2 三环，会撞
-    ("routing", "llm-d EPP · Dynamo router · AIBrix gateway", BLUE,
-     "decides where the request goes; KV follows the request"),
-    ("request envelope", "vLLM · SGLang · KVCR (+ Dynamo hint producer)", AMBER,
-     "router advises in-band; engine resolves, may drop"),
-    ("standalone coordinator", "LMCache mp_coordinator", GREEN,
-     "fleet views + commands, event-derived, eventually consistent"),
-    ("object pool", "MemCache MetaService · Mooncake master", GREEN,
-     "owns bytes: placement, replicas, lease, eviction"),
-    ("engine plugin", "UCM · FlexKV (+ AIBrix kvcache, kvcr lib)", BLUE,
-     "lives in the engine process; store interface is a library call"),
-]
-
-
-def _draw_layers(ax) -> None:
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
-    ax.set_title("(a) which layer each project sits in", fontsize=9.4, pad=8)
-
-    # 图层留在左侧 0.02–0.70，右侧 0.72–1.0 留给 kvcm 标注，避免压住层内文字
-    top, step = 0.93, 0.168
-    for i, (name, who, fc, gloss) in enumerate(LAYERS):
-        y = top - i * step
-        _box(ax, 0.02, y - 0.132, 0.68, 0.132, "", fc=fc)
-        ax.text(0.038, y - 0.028, name, fontsize=8.0, fontweight="bold", color=INK)
-        ax.text(0.038, y - 0.070, who, fontsize=6.9, color=INK)
-        ax.text(0.038, y - 0.104, gloss, fontsize=6.0, color="#4a4a4a", style="italic")
-
-    # kvcm 是 L2 的 client：从 L2 带右缘引出，落在右侧独立栏位
-    y_l2 = top - 3 * step
-    _arrow(ax, (0.705, y_l2 - 0.066), (0.745, y_l2 - 0.066), style="->", color="#b03a2e")
-    _box(ax, 0.755, y_l2 - 0.104, 0.235, 0.078, "", fc=RED)
-    ax.text(0.872, y_l2 - 0.052, "kvcm /\nKV Fabric", ha="center", va="center",
-            fontsize=7.4, fontweight="bold", color=INK, linespacing=1.3)
-    ax.text(0.872, y_l2 - 0.075, "(this project)", ha="center", va="center",
-            fontsize=6.2, color="#5a5a5a")
-
-    ax.text(0.02, 0.015,
-            "A project can appear twice when it ships both an envelope and a router (Dynamo).\n"
-            "Placement is evidence-backed (file:symbol) for every project; see the tables in §3.",
-            fontsize=6.2, color="#5a5a5a", linespacing=1.5)
-
-
-# ---------------------------------------------------------------------------
-# 2. 三种分发/控制形态
-# ---------------------------------------------------------------------------
-
-# (标题, 左框, 中框, 右框, 箭头标签, 结论)
-MODES = [
+# (持有者, 这一段的含义, 该段的项目, 底色, 能做到什么)
+OWNERS = [
     (
-        "A. envelope hint — vLLM / SGLang / KVCR",
-        ("router / EPP\n(global index)", GREY),
-        ("engine + hint consumer", AMBER),
-        ("policy accepts, clips\nor drops; then pulls", AMBER),
-        "request + kv_hints",
-        "decision and cost judgement stay inside the engine: the centre can advise, cannot enforce.\n"
-        "On main the envelope is merged, the action handler is not.",
+        "request",
+        "lives and dies with one request",
+        ["vLLM / SGLang envelopes"],
+        AMBER,
+        "action window = this request only\n(handlers not wired on main)",
     ),
     (
-        "B. centre decides, node executes — object pool",
-        ("MetaService / master\n(placement + replicas)", GREEN),
-        ("client lib in engine", GREY),
-        ("LocalService: I/O only", GREEN),
-        "alloc / query -> addr",
-        "the centre owns where bytes live and who may read; the node performs I/O.\n"
-        "MemCache MetaService/LocalService; Mooncake master/segment.",
+        "engine process",
+        "lives in the engine's private memory",
+        ["UCM", "FlexKV", "AIBrix kvcache", "KVCR (pre-fix)"],
+        BLUE,
+        "can touch HBM/APC directly;\nneeds engine patches per version",
     ),
     (
-        "C. central command on the pool — kvcm",
-        ("kvcm\n(pool client, own UUID)", RED),
-        ("master\n(replica authority)", GREY),
-        ("seg A source · seg B target\n· kvcm seg", GREY),
-        "CreateCopyTask /\ncreate_move_task",
-        "names the target segment and can move bytes; the engine does not decide, but the source seg\n"
-        "client must be online. Verification: query_task + GetReplicaList -> READY.",
+        "sidecar / guard",
+        "lives beside the engine, survives it",
+        ["KVCR + Guard"],
+        GREEN,
+        "survives engine death;\nbut only for one engine's cache",
+    ),
+    (
+        "coordinator (event view)",
+        "coordinates instances, does not own bytes",
+        ["LMCache mp_coordinator"],
+        GREEN,
+        "fleet view + per-instance commands;\nview is eventually consistent",
+    ),
+    (
+        "pool",
+        "lives in the pool; the engine is only a client",
+        ["MemCache", "Mooncake master"],
+        GREEN,
+        "survives engine death;\nauthoritative replica record",
     ),
 ]
 
+KVCM_NOTE = (
+    "kvcm / KV Fabric\n"
+    "a client of the pool:\n"
+    "decides where KV should be,\n"
+    "not where it happens to be"
+)
 
-def _draw_modes(ax) -> None:
+
+def ownership() -> None:
+    fig, ax = plt.subplots(figsize=(13.0, 6.8))
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.axis("off")
-    ax.set_title("(b) how control is distributed", fontsize=9.4, pad=8)
+    ax.set_title(
+        "Who holds the KV?  Everything else follows from this column",
+        fontsize=11.5, pad=12,
+    )
 
-    band_h = 1.0 / len(MODES)
-    for i, (title, left, mid, right, arrow_label, conclusion) in enumerate(MODES):
-        top = 1.0 - i * band_h
-        y_row = top - 0.20
-        ax.text(0.005, top - 0.030, title, fontsize=8.2, fontweight="bold", color=INK)
+    n = len(OWNERS)
+    top, step = 0.90, 0.145
+    # 最后一行（pool）额外下移，让出空隙放分界线与说明文字，避免压住文字
+    gap_shift = 0.075
+    col_x, col_w = 0.03, 0.42
+    act_x = 0.47
 
-        _box(ax, 0.005, y_row, 0.30, 0.105, left[0], fc=left[1], fs=7.0)
-        _box(ax, 0.375, y_row, 0.26, 0.105, mid[0], fc=mid[1], fs=7.0)
-        _box(ax, 0.705, y_row, 0.29, 0.105, right[0], fc=right[1], fs=7.0)
+    ax.text(col_x + 0.005, top + 0.058, "holder", fontsize=8.2,
+            fontweight="bold", color="#5a5a5a")
+    ax.text(act_x + 0.005, top + 0.058, "what that buys / costs", fontsize=8.2,
+            fontweight="bold", color="#5a5a5a")
 
-        _arrow(ax, (0.305, y_row + 0.052), (0.373, y_row + 0.052))
-        _arrow(ax, (0.637, y_row + 0.052), (0.703, y_row + 0.052))
-        ax.text(0.339, y_row + 0.082, arrow_label, fontsize=5.9, ha="center",
-                va="bottom", color="#4a4a4a", linespacing=1.2)
+    ys = []
+    for i, (holder, gloss, projects, fc, note) in enumerate(OWNERS):
+        y = top - i * step - (gap_shift if i >= 4 else 0.0)
+        ys.append(y)
+        _box(ax, col_x, y - 0.125, col_w, 0.125, "", fc=fc)
+        ax.text(col_x + 0.015, y - 0.026, holder, fontsize=8.0,
+                fontweight="bold", color=INK)
+        ax.text(col_x + 0.015, y - 0.052, gloss, fontsize=6.4,
+                color="#4a4a4a", style="italic")
+        ax.text(col_x + 0.015, y - 0.084, " · ".join(projects), fontsize=7.2, color=INK)
 
-        ax.text(0.005, y_row - 0.012, conclusion, fontsize=6.2, va="top",
-                color="#5a5a5a", linespacing=1.45)
+        ax.text(act_x + 0.005, y - 0.048, note, fontsize=6.8, color=INK, linespacing=1.5)
 
+    # 分界线画在 coordinator 与 pool 之间的空隙里，说明文字也放这段空隙
+    y_split = (ys[3] - 0.125 + ys[4]) / 2
+    ax.plot([0.012, 0.745], [y_split, y_split], color="#b03a2e",
+            linewidth=1.3, linestyle=(0, (5, 3)))
+    ax.text(0.015, y_split + 0.010,
+            "above: the KV needs the engine (or a request) to exist",
+            fontsize=6.8, color="#b03a2e")
+    ax.text(0.015, y_split - 0.022,
+            "below: the pool outlives the engine — this is where kvcm works",
+            fontsize=6.8, color="#b03a2e")
 
-def overview() -> None:
-    fig = plt.figure(figsize=(13.4, 6.2))
-    gs = fig.add_gridspec(1, 2, width_ratios=[1.0, 1.42], wspace=0.05)
-    _draw_layers(fig.add_subplot(gs[0, 0]))
-    _draw_modes(fig.add_subplot(gs[0, 1]))
-    fig.savefig(HERE / "fig-overview.svg", format="svg")
+    # kvcm 落在 pool 这一行的右侧，明确它不是池本身
+    y_pool = ys[4]
+    _arrow(ax, (col_x + col_w + 0.005, y_pool - 0.0625),
+           (0.795, y_pool - 0.0625), style="->", color="#b03a2e")
+    _box(ax, 0.80, y_pool - 0.125, 0.185, 0.125, "", fc=RED)
+    ax.text(0.8925, y_pool - 0.0625, KVCM_NOTE, ha="center", va="center",
+            fontsize=6.6, fontweight="bold", color=INK, linespacing=1.45)
+
+    ax.text(0.03, 0.018,
+            "Reading: a holder that is an engine process or a request can only act between "
+            "\"request arrives\" and \"request ends\".\n"
+            "A pool can hold KV with no request at all — that is what makes prefetch, keepalive, "
+            "cross-engine survival and byte accounting possible.",
+            fontsize=6.8, color="#5a5a5a", linespacing=1.6)
+
+    fig.tight_layout()
+    fig.savefig(HERE / "fig-ownership.svg", format="svg")
     plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
-# 3. 决策权 / 执行权 / 权威记录
+# 2. 决策权 / 执行权 / 权威记录 + hint 落地时间线
 # ---------------------------------------------------------------------------
 
 AUTH_ROWS = [
     ("UCM (engine plugin)", 2, 1, 0),
     ("FlexKV (engine plugin)", 2, 1, 0),
-    ("MemCache (object pool)", 1, 1, 2),
-    ("Mooncake (object pool)", 1, 1, 2),
+    ("MemCache (pool)", 1, 1, 2),
+    ("Mooncake (pool)", 1, 1, 2),
     ("vLLM / SGLang (envelope)", 1, 0, 0),
     ("KVCR (envelope consumer)", 2, 2, 1),
     ("LMCache coordinator", 2, 2, 1),
@@ -238,10 +231,6 @@ def _draw_matrix(ax) -> None:
         fontsize=8.2, pad=8,
     )
 
-
-# ---------------------------------------------------------------------------
-# 4. hint 演进时间线：信封先落地，执行缺位
-# ---------------------------------------------------------------------------
 
 # (x 月位, 标签, 标记)  标记: o = RFC / 公开, s = 已合入, X = 缺位
 # 日期均取自 GitHub issue/PR 的 created_at / closed_at（2026-11-13 核对）。
@@ -329,7 +318,10 @@ def evidence() -> None:
 
 
 def ucm_schematic() -> None:
-    fig, ax = _canvas(8.0, 4.4)
+    fig, ax = plt.subplots(figsize=(8.0, 4.4))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.axis("off")
     ax.set_title("UCM: engine plugin over a pluggable store (redrawn)", fontsize=10)
 
     _box(ax, 0.05, 0.76, 0.90, 0.13,
@@ -359,11 +351,11 @@ def ucm_schematic() -> None:
 
 
 def main() -> None:
-    overview()
+    ownership()
     evidence()
     ucm_schematic()
     for name in (
-        "fig-overview.svg",
+        "fig-ownership.svg",
         "fig-evidence.svg",
         "fig-ucm-schematic.svg",
     ):
