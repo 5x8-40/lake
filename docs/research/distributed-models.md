@@ -35,7 +35,7 @@
 | Dynamo | 编排星型 + 事件流 | 无全局位置权威；discovery 走 etcd | NATS 事件流（best-effort，可丢） | 最终一致（事件副本） | 引擎各自负责 | canary + 在途迁移；etcd lease 收敛 | 索引最终一致，误判以重算兜底 |
 | SGLang | 实例自治 + 共享 L3 + 旁路索引 | 无（每实例树 + L3 实时查后端） | kv_events（zmq）+ gateway 近似树 | 无全局；L3 最终一致 | 后端决定 | 无（崩溃由 L3 回填） | 跨实例命中依赖近似树或实时查询 |
 | vLLM | 单实例引擎 + 事件外发 | 引擎内强一致；集群级无 | KV Events（zmq 单向） | 集群级最终一致（外部索引） | 引擎内保证 | worker 有状态，崩溃丢 KV | 集群语义外挂；#48501 向控制面演进 |
-| LMCache | 共享存储 / 中心 controller 两式 | controller RegistryTree（best-effort） | 心跳 + 序列号 + full sync（0.8 阈值） | 弱（允许错误，周期收敛） | 内容寻址去重；无锁并发写 | controller 无 HA；daemon 无 fate-sharing | O(n²) lookup；全内存 RegistryTree |
+| LMCache | 共享存储 / MP coordinator 两式 | coordinator `KeyDirectory`（事件派生，best-effort） | 实例注册+心跳；cache event 经 gate 去重/排序/fencing；可 checkpoint 与回放 | 弱（hint，需 owner 侧验证） | 内容寻址去重；无锁并发写 | coordinator 可 checkpoint 恢复；daemon 无 fate-sharing | 单进程全内存目录；事件总线扇出 |
 | FlexKV | 本机自治 + Redis 快照 | 本机 radix；Redis GMS 快照非权威 | 周期 upload/rebuild + lease | 最终一致（快照可陈旧） | 后端决定 | 无；worker 退出索引失效 | 快照时效；无回查权威 |
 | UCM | 无自有（继承 store 后端） | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 |
 | TileRT | 点对点（单槽 PD） | 无（进程内忙闲表） | 一次性握手 | 不适用 | 不适用 | 无（429） | 不适用（专用 bs=1） |

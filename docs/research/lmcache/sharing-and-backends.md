@@ -1,6 +1,6 @@
 # LMCache — 跨实例复用与存储后端
 
-> 源码:`lmcache/v1/`、`csrc/storage_backends/`、`rust/`、`lmcache/v1/cache_controller/`。
+> 源码:`lmcache/v1/`、`csrc/storage_backends/`、`rust/`、`lmcache/v1/mp_coordinator/`(2026-11-13 快照 `58c11e38`;协调器目录原为 `lmcache/v1/cache_controller/`,2026-10-22 移入 `inprocess/`、2026-11-06 移出主仓,见下文「MP coordinator」节)。
 
 ## 缓存键与匹配
 
@@ -15,7 +15,7 @@
 2. **P2P 直传(CPU 内存共享)**:`P2PBackend` 经 `CreateTransferChannel`:
    - `NixlChannel`:底层 NIXL(RDMA/NVLink/TCP)。
    - `PySocketChannel`:ZMQ 控制面 + 原生 socket 数据面。
-   - 需 `cache_controller` 维护"谁有哪些 chunk"元数据。
+   - "谁有哪些 chunk"由 MP coordinator 的 `KeyDirectory` 提供(事件派生、最终一致)。
    - PD disagg 走 `NixlStorageBackend`/`pd_backend(_async)`。
 
 ## 存储后端
@@ -56,15 +56,16 @@
 - Non-MP:`StorageManager` 串联 LocalCPU(L1)→ LocalDisk/Remote(L2)。
 - MP:`distributed/storage_manager.py::StorageManager` + `L1Manager` + 多 `L2Adapter` + `StoreController`/`PrefetchController`/`L1EvictionController`/`L2EvictionController`。tier 词汇 `distributed/tiers.py::Tier{L1,L2,ALL}`。`QuotaManager` 管配额,`store_policy` 决定写哪些 adapter。
 
-## cache_controller(中央协调器)
+## MP coordinator(中央协调器)
 
-`lmcache/v1/cache_controller/` + `examples/cache_controller/`:
+`lmcache/v1/mp_coordinator/`(独立 FastAPI 进程,`lmcache coordinator` 启动,默认 `127.0.0.1:9300`,见 `docs/source/mp/coordinator.rst`):
 
 - **职责**:**元数据协调,不是数据路径**。数据仍在 P2P 或共享存储上流动。
-- **元数据**:`RegistryTree`(`utils.py`) — `(instance_id, worker_id) → location → set[chunk_hash]`。
-- **命令**:lookup/pin/move/clear/compress/health/full_sync。
-- **组件**:`KVController`(`controllers/kv_controller.py`)处理 lookup;`RegistrationController` 管实例注册+心跳;`LMCacheWorker`(`worker.py`)是实例侧代理;`LMCacheControllerManager` 是服务端。带 WebUI。
-- **通信**:ZMQ。
+- **fleet 视图**:`views/key_directory.py::KeyDirectory` — `ObjectKey → placements(instance_id, tier, backend, size)`,由 cache event 构建,**最终一致,答案只是 hint,必须在 owner 侧验证**。
+- **命令面**(HTTP):`POST /cache/prefetches`(指定 `instance_id` 预热)、`POST|GET|DELETE /cache/pins`(排除在该协调器自己的 L2 驱逐计划外)、`POST /cache/delete`、`/quota*`、`/directory/{lookup,blend-lookup,keys,stats}`、`/instances*`、`/events`、`/config/chunk-size`。**无 move 路由。**
+- **组件**:`controllers/base.py::Controller`(控制器基类)、`controllers/prefetch_manager.py::PrefetchManager`(预取派发)、`controllers/eviction_controller.py::FleetEvictionController`(配额 / 驱逐 / pin 计数)、`views/instance_registry.py::InstanceRegistry`(注册与心跳)、`ingest/event_gate.py::EventGate`(事件准入、去重、fencing)、`discovery.py::Registry`(controller / view 发现)、`persistence/checkpoint.py`(目录与配额的 checkpoint)。
+- **通信**:HTTP(FastAPI);事件可经 HTTP 或 Kafka 源进入(`ingest/{http,kafka}_event_source.py`)。
+- **命名变更**:本文件旧版把这一层写成 `lmcache/v1/cache_controller/` 下的 `LMCacheControllerManager` / `LMCacheWorker` / `KVController` / `RegistryTree`(ZMQ 通信)。这些符号与目录在快照 `58c11e38`(2026-11-13)上均不存在:`cache_controller` 于 2026-10-22 移入 `lmcache/v1/inprocess/v1/`(#5970),再于 2026-11-06 整体移出主仓到独立仓 `LMCache_inprocess`(#6254)。
 
 ## 压缩/serde
 
@@ -74,7 +75,7 @@
 
 ## 一致性
 
-**无全局强一致**。元数据靠 controller 的 ZMQ 消息 + 心跳 + 序列号追踪(`WorkerNode.seq_tracker`)+ `RWLockWithTimeout`/`FastLockWithTimeout`。Full sync 是 best-effort(完成阈值默认 0.8,超时 300s)。数据层靠内容寻址天然去重;失效靠 TTL + 显式 clear/evict。
+**无全局强一致**。fleet 视图靠 cache event 批次 + 实例心跳构建:事件经 `EventGate` 按 per-emitter 光标排序、去重、fencing 后才进各 view;目录可 checkpoint 并从事件流重放(`events_replay.py`)。答案只是 hint,字节可用性在 owner MP server 侧验证。数据层靠内容寻址天然去重;失效靠 L1 上报者 incarnation 与 L2 显式删除。
 
 ## Rust 组件
 
@@ -116,10 +117,13 @@
 | serde 包装(adapter 之上) | `lmcache/v1/distributed/`(SerdeL2AdapterWrapper) |
 | Non-MP serde | `lmcache/v1/storage_backend/naive_serde/`::`NaiveSerializer` / `CacheGenSerializer` / `KIVISerializer` |
 | MP serde | `lmcache/v1/distributed/serde/`::`fp8` / `asym_k16_v8` / `turboquant` / `multi` |
-| controller 元数据树 | `lmcache/v1/cache_controller/utils.py`::`RegistryTree`((instance,worker)→location→set[chunk_hash]) |
-| controller lookup | `lmcache/v1/cache_controller/controllers/kv_controller.py`::`KVController` |
-| 实例注册/心跳 | `lmcache/v1/cache_controller/`(RegistrationController) |
-| 实例侧代理 | `lmcache/v1/cache_controller/worker.py`::`LMCacheWorker` |
-| 服务端 | `lmcache/v1/cache_controller/controller_manager.py`::`LMCacheControllerManager` |
+| coordinator fleet 目录 | `lmcache/v1/mp_coordinator/views/key_directory.py`::`KeyDirectory.lookup` |
+| coordinator 控制器基类 | `lmcache/v1/mp_coordinator/controllers/base.py`::`Controller` |
+| 预取派发 | `lmcache/v1/mp_coordinator/controllers/prefetch_manager.py`::`PrefetchManager.submit_prefetch` |
+| 配额 / 驱逐 / pin | `lmcache/v1/mp_coordinator/controllers/eviction_controller.py`::`FleetEvictionController.pin` / `unpin` |
+| 实例注册/心跳 | `lmcache/v1/mp_coordinator/views/instance_registry.py`::`InstanceRegistry` + `registrar.py`::`keep_registered` |
+| 事件管线 | `lmcache/v1/mp_coordinator/cache_events.py`::`CacheEventSink`;`ingest/event_gate.py`::`EventGate` |
+| HTTP 面 | `lmcache/v1/mp_coordinator/http_apis/{cache_api,directory_api,instances_api}.py`;`controllers/eviction_http_api.py` |
+| 服务端入口 | `lmcache/v1/mp_coordinator/app.py`::`create_app` |
 | Rust 裸设备 I/O | `rust/raw_block/src/lib.rs`::`RawBlockDevice`(`pwrite_from_buffer`/`pread_into`;posix/io_uring/io_uring_cmd) |
 | Rust I/O 后端(non-MP/MP 共用) | `RustRawBlockBackend`(non-MP) + `RawBlockL2Adapter`→`RawBlockCore`(MP) |

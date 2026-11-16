@@ -104,7 +104,7 @@ FlexKV 文档：Dynamo KV events 与 namespace isolation、与 distributed reuse
 | 自管层 | CPU/SSD/REMOTE | G2/G3（G4 对象） | CPU/disk/远程 backend | 实例 L1/L2 |
 | 何时离 GPU | 结束后 delay-free | 结束后 delay-free | 前向 `save_kv_layer` | `write_backup` 等 |
 | GPU 在卸载栈中 | 注册端点，非一层 | G1 句柄 | 拷贝基址 | 树节点可记 GPU 槽 |
-| 集群 | Redis 快照或 Dynamo events | NATS KV events | RegistryTree / 共享 L2 | L3 `batch_exists` |
+| 集群 | Redis 快照或 Dynamo events | NATS KV events | MP coordinator `KeyDirectory` / 共享 L2 | L3 `batch_exists` |
 
 ## 代码索引
 

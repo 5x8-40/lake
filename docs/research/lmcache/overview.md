@@ -40,7 +40,7 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 ### 跨实例共享(两条路径)
 
 1. **共享远程存储(L2 adapter)**:多实例共用 Redis/Mooncake/S3/Aerospike/NIXL-store,通过 `chunk_hash` 内容寻址天然去重共享。
-2. **P2P 直传(CPU 内存共享)**:`P2PBackend` 经 `NixlChannel`(NIXL/RDMA/TCP)或 `PySocketChannel`(ZMQ 控制面 + 原生 socket 数据面)在实例间直传 KV bytes。需 `cache_controller` 维护"谁有哪些 chunk"元数据。
+2. **P2P 直传(CPU 内存共享)**:`p2p_l2_adapter` 经 NIXL 在实例间直传 KV bytes(`lmcache/v1/transport/`、`lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`)。"谁有哪些 chunk"由 MP coordinator 的 `KeyDirectory` 提供(事件派生、最终一致)。
 
 详见 [sharing-and-backends.md](sharing-and-backends.md)。
 
@@ -48,13 +48,14 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 
 > 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md);细节见 [sharing-and-backends.md](sharing-and-backends.md)。
 
-- **拓扑**:两种并存。(a)共享存储为中心:多实例共用 Redis/Mooncake/S3 等 L2 adapter,`chunk_hash` 内容寻址天然去重,实例间无协调;(b)controller 星型:`LMCacheControllerManager`(中心)+ 每实例 `LMCacheWorker`(代理),ZMQ 通信,维护"谁有哪些 chunk"的元数据(`RegistryTree`:(instance,worker)→location→set[chunk_hash]),仅协调元数据,不在数据路径上。
-- **元数据权威**:中心 controller 全内存 `RegistryTree`,定位为 best-effort 协调器而非权威:心跳 + 序列号追踪(`WorkerNode.seq_tracker`),full sync 完成阈值 0.8、超时 300s。
-- **同步机制**:worker 心跳上报 + 命令通道(lookup/pin/move/clear/compress/health/full_sync);P2P 直传路径(`P2PBackend` 经 NIXL/socket)需 controller 元数据定位对等端。
-- **一致性**:无全局强一致。多实例并发写同 key 无锁/事务;数据层靠内容寻址去重;失效靠 TTL + 显式 clear/evict。`KVController` lookup 在实例增多时退化 O(n²)(源码注释自承认)。
-- **HA 与故障**:MP daemon 模式下引擎崩溃 KV 不丢(无 fate-sharing);controller 本身无 HA,元数据丢失后靠 full sync 重建。
-- **扩展性**:共享存储路径随后端扩展;controller 路径受全内存 `RegistryTree` 与 O(n²) lookup 限制。
-- **与 lake 对照**:LMCache 的 controller+worker 形态最接近 lake 的 CP+agent,但一致性立场不同——LMCache 为 best-effort(允许错误,周期 full sync 收敛),lake CP 为单写者权威(线性一致查询 + 镜像推送 + miss 回查)。此外 LMCache 的 KV 按 rank 入 key(部分实例私有),lake KV 不绑定 rank。
+- **拓扑**:两种并存。(a)共享存储为中心:多实例共用 Redis/Mooncake/S3 等 L2 adapter,`chunk_hash` 内容寻址天然去重,实例间无协调;(b)MP coordinator 星型:独立进程(`lmcache/v1/mp_coordinator/`)注册各 MP server、消费其 cache event、维护 fleet 级 `ObjectKey → placements` 目录,并暴露命令面(预取 / pin / 删除 / 配额)。它只在元数据面,不在数据路径上。
+- **元数据权威**:`KeyDirectory`(`views/key_directory.py`)是**事件派生的最终一致视图**,模块 docstring 明确"lookups are hints to be validated at the owner"。不是权威记录——字节是否可用必须在 owner MP server 侧验证。
+- **同步机制**:MP server 注册 + 心跳(`http_apis/instances_api.py`、`registrar.py::keep_registered`);cache event 批经 ingest gate 去重、排序、fencing 后喂给各 view(`ingest/event_gate.py::EventGate`);目录与配额可 checkpoint(`persistence/checkpoint.py`)并可回放(`events_replay.py::replay`)。
+- **一致性**:无全局强一致。事件流可丢可乱,目录靠 gate 与 fencing 收敛;失效靠 L1 上报者 incarnation 与 L2 显式删除。
+- **HA 与故障**:MP daemon 模式下引擎崩溃 KV 不丢(无 fate-sharing);coordinator 可 checkpoint 恢复,未落盘的增量靠重放事件流补齐;coordinator 默认只监听回环,跨机部署需显式绑定并配 API key。
+- **扩展性**:共享存储路径随后端扩展;coordinator 路径受单进程 `KeyDirectory`(全内存 dict + 反向索引)与事件总线扇出限制。
+- **命名变更(2026-10 / 11)**:旧的进程内 `lmcache/v1/cache_controller/`(`LMCacheControllerManager` / `LMCacheWorker` / `KVController` / `RegistryTree`,ZMQ 通信)在 2026-10-22 移到 `lmcache/v1/inprocess/v1/cache_controller/`(#5970),又在 2026-11-06 整体移出主仓到独立仓 `LMCache_inprocess`(#6254)。主仓现在只有 `mp_coordinator`,上述符号已不存在。
+- **与 lake 对照**:LMCache 的 coordinator + MP server 形态最接近 lake 的 CP+agent,但一致性立场不同——LMCache 的目录是事件派生的 hint(允许错误,收敛即可),lake CP 为单写者权威(线性一致查询 + 镜像推送 + miss 回查)。此外 LMCache 的 KV 按 rank 入 key(部分实例私有),lake KV 不绑定 rank。
 
 ## 技术栈
 
@@ -80,8 +81,10 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 | L2 adapter 抽象 | `lmcache/v1/distributed/l2_adapters/base.py`::`L2AdapterInterface` |
 | P2P 跨实例 | `lmcache/v1/storage_backend/p2p_backend.py`::`P2PBackend` (L160) |
 | 传输通道(NIXL/socket) | `lmcache/v1/transfer_channel/`(`nixl_channel.py`、`py_socket_channel.py`) |
-| 控制器(元数据协调,非数据路径) | `lmcache/v1/cache_controller/worker.py`::`LMCacheWorker` + `controller_manager.py`::`LMCacheControllerManager` + `controllers/kv_controller.py` |
-| 元数据树 | `lmcache/v1/cache_controller/utils.py`::`RegistryTree` |
+| 协调器入口(元数据协调,非数据路径) | `lmcache/v1/mp_coordinator/app.py`::`create_app`;控制器基类 `mp_coordinator/controllers/base.py`::`Controller` |
+| fleet key 目录 | `lmcache/v1/mp_coordinator/views/key_directory.py`::`KeyDirectory.lookup` |
+| 实例注册 / 心跳 | `lmcache/v1/mp_coordinator/views/instance_registry.py`::`InstanceRegistry`;`mp_coordinator/registrar.py`::`keep_registered` |
+| 预取 / pin 命令面 | `mp_coordinator/http_apis/cache_api.py`::`request_prefetch`;`mp_coordinator/controllers/eviction_controller.py`::`FleetEvictionController` |
 | vLLM 集成(拦截 KV) | `lmcache/integration/vllm/lmcache_connector_v1.py`::`LMCacheConnectorV1Dynamic` (L30) |
 | C++ 后端抽象 | `csrc/storage_backends/connector_interface.h`::`IStorageConnector` |
 | C++ 后端基类(SQ/CQ+tiling) | `csrc/storage_backends/connector_base.h`::`ConnectorBase<T>` |
@@ -103,12 +106,12 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 ## 劣势
 
 1. **强依赖 vLLM 的 hash/connector 抽象** — `token_database.py` 大量 vLLM 版本兼容代码,hash 取自 vLLM;深度耦合 vLLM 演进。
-2. **无全局强一致元数据** — controller 是 best-effort(心跳超时 + 0.8 阈值 full sync);`KVController` lookup 在实例多时退化到 O(n²)(源码注释自承认)。多实例并发写同 key 无锁/事务。
+2. **无全局强一致元数据** — coordinator 的 `KeyDirectory` 是事件派生的最终一致视图,答案只是 hint,必须在 owner 侧验证;事件丢失或乱序靠 gate 的重放与 fencing 兜底,不做全局事务。多实例并发写同 key 无锁/事务。
 3. **共享靠存储或 P2P,非内存池** — 跨实例共享要么走共享远程存储(网络/序列化开销),要么 P2P 直传(需预分配 NIXL buffer + 控制器元数据),**非真正的全局共享内存池**。
 4. **匹配粒度受限** — 链式 prefix hash + 顺序 contains,断链即停;非 prefix 部分需 CacheBlend 重算(有质量损失);无真正的 radix tree 灵活匹配(radix 在 vLLM 侧)。
 5. **架构双轨复杂** — non-MP(逐步 deprecated)与 MP 两套代码路径并存,认知与维护成本高。
 6. **C++ 后端构建门槛** — Redis/Mooncake 原生后端 + CacheGen kernel 需 CUDA/C++ 工具链,`NO_NATIVE_EXT` 退化为纯 Python 性能损失大。
-7. **元数据规模隐患** — `RegistryTree` 用 `dict[str, set[int]]` 全内存维护 chunk→location,集群级 chunk 数量大时元数据内存与 lookup 延迟是瓶颈。
+7. **元数据规模隐患** — `KeyDirectory` 用单进程全内存 dict(`ObjectKey → _KeyRecord.placements`)+ 按 instance 的反向索引维护 fleet 视图,集群级 chunk 数量大时内存与事件扇出是瓶颈。
 
 ## 与本系统的关键对比
 
@@ -116,7 +119,7 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 |------|---------|--------|
 | 跨实例复用 | 是,但经(a)共享远程存储 或 (b)P2P 直传 + 中心元数据;非统一内存池 | 全局统一 KV 池 |
 | 内容寻址 | 仅 L2/MP 的 `ObjectKey.chunk_hash`;non-MP 的 `CacheEngineKey` 含 `world_size/worker_id` → **KV 部分实例私有(按 rank 切分)** | 纯内容寻址,同内容同 key |
-| 全局元数据 | 弱:controller `RegistryTree`(best-effort,无强一致/事务) | radix + 位置视图由控制面强一致维护 |
+| 全局元数据 | 弱:`KeyDirectory`(事件派生、最终一致,无强一致/事务) | radix + 位置视图由控制面强一致维护 |
 | KV 归属 | 实例(rank)私有 + 可共享:`kv_rank` 入 key,同 chunk 不同 rank 是不同对象 | KV 不绑定 rank |
 | 存算分离程度 | 部分:MP 模式 cache daemon 与引擎分离,但 KV 仍按引擎的 rank/格式组织 | 格式无关的 KV 抽象 |
 
