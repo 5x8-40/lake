@@ -203,12 +203,14 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 | 事实 | 出处 |
 |---|---|
 | 副本权威记录可查 | `mooncake-store/include/master_client.h::GetReplicaList` / `BatchGetReplicaList` |
-| 点名目标的 copy / move | `master_client.h::CreateCopyTask` / `CreateMoveTask` |
+| 点名目标的 copy / move（**Mooncake master 的 API**，不是 kvcm 的） | `master_client.h::CreateCopyTask(key, targets)` 只给 key 与目标 segment 列表，源由 master 从现有副本里挑；`CreateMoveTask(key, source, target)` 唯一能指定源，完成后删源 |
 | 动态副本可「偏好」目标段，但受热度准入闸约束 | `include/rpc_types.h::ReplicaActionProposal{preferred_target_segment}`；`src/master_service.cpp`：入口先过 `DynamicReplicationHeatAdmitted`，`preferred_target_segment` 只在 `is_valid_target` 成立时被采纳 |
 
 ### A.3 独立协调器：LMCache
 
 协调器是独立进程（`lmcache/v1/mp_coordinator/`），与引擎进程分开部署，只持元数据与命令面。
+
+和 Mooncake master 的差别在一个维度：master 对外提供 `CreateCopyTask` / `CreateMoveTask`，知道副本挂在哪个 segment，能按段指派搬迁；协调器没有对等的搬迁能力，它只知道「这个实例有这个 tier 的这个 backend 上有一份」，粒度为实例而非段，命令面只有预取 / pin / 删除 / 配额。
 
 | 事实 | 出处 |
 |---|---|
