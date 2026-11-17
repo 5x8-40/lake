@@ -36,7 +36,7 @@
 - **四栈对比** → [`serving-stack-comparison.md`](serving-stack-comparison.md)
   - Dynamo / FlexKV / llm-d / AIBrix:覆盖层、KV 状态归属、定位象限、路由/PD/扩缩/卸载逐维度对比。
 - **kvcm vs 开源** → [`kvcm-vs-oss.md`](kvcm-vs-oss.md)
-  - 分层（引擎插件 / 对象池 / 协调器 / 信封 hint / 路由）+ 三种分发形态 + 按控制权的能力矩阵；逐家符号级出处、上游图与许可、我方真实短板（看不见引擎 HBM/APC、retain 未接）。
+  - 一篇立场文：开源方案里 KV 是引擎进程的状态，kvcm 里 KV 是池里的一等对象。按「不依附请求 / 活过请求 / 活过引擎 / 可换主人 / 可被度量」五面展开，三个场景（引擎下线 / 升级版本 / 下一轮提前量）看差异；逐家符号级出处、我方真实短板（看不见引擎 HBM/APC、retain 未接）。
 - **Guided / structured decoding** → [`guided-decoding.md`](vllm_vs_sglang/guided-decoding.md)
   - SGLang × vLLM:xgrammar/llguidance 仅 GPU apply、FSM 仍在 CPU;overlap/async 近零 vs spec+grammar / pending token 的同步气泡;与 lake 重叠契约及抢占时 FSM 游标交接。
 - **Sampling 参数** → [`sampling-params.md`](vllm_vs_sglang/sampling-params.md)
@@ -60,7 +60,7 @@
 - **llm-d Router** (Red Hat/Google/IBM 等): K8s 原生分布式推理栈的路由仓——EPP(Envoy ext-proc)精确缓存感知选路 + pd-sidecar/coordinator 的 PD(/EPD)编排;扩缩在独立仓 WVA(KV 利用率/队列深度驱动,指标交 HPA/KEDA 执行)。**源码已引入** `3rdparty/llm-d-router`,见 [`llm-d/`](llm-d/)。
 - **AIBrix** (字节跳动 → vllm-project): K8s 推理平台积木——网关路由策略集、KV 事件同步、KV 感知扩缩、StormService 角色编排(PD 为静态拓扑)、aibrix_kvcache 卸载框架。**源码已引入** `3rdparty/aibrix`,见 [`aibrix/`](aibrix/)。
 - **Dynamo / FlexKV / llm-d / AIBrix 四栈对比**: 四者词汇表相似(KV 复用/路由/PD),区别在覆盖层与 KV 状态归属。见 [`serving-stack-comparison.md`](serving-stack-comparison.md);路由维度细评见 [`model-routing/instance-level.md`](model-routing/instance-level.md)。
-- **kvcm / KV Fabric 与开源方案对比**: 开源侧分五层(引擎插件 / 对象池元数据 / 独立协调器 / 请求信封 hint / 路由层),分发形态三种(引擎自决 / 中心分发节点执行 / 调用方点名);kvcm 站在对象池之上,是池的 client 而非新池。能力矩阵按「按层」与「按控制权」两张给,逐家符号级出处见 [`kvcm-vs-oss.md`](kvcm-vs-oss.md)。
+- **kvcm / KV Fabric 与开源方案对比**: 论点是「开源方案里 KV 是引擎进程的状态,kvcm 里 KV 是池里的一等对象」;§5 给出每家 KV 依附于谁(UCM / FlexKV 依附引擎进程,vLLM / SGLang 依附请求,MemCache / Mooncake 本身是池,KVCR 依附 Guard,kvcm 依附池),附录 A 逐家符号级出处,附录 B 列我方短板与待确认项。见 [`kvcm-vs-oss.md`](kvcm-vs-oss.md)。
 
 ## KV Cache 复用与传输
 

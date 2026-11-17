@@ -177,4 +177,4 @@
 
 各项目与 lake 的逐条对照,见各自的 pain-points 文档:[dynamo](dynamo/overview.md) · [flexkv](flexkv/pain-points.md) · [llm-d](llm-d/pain-points.md) · [aibrix](aibrix/pain-points.md)。
 
-> 本文只覆盖这四栈。把范围扩到引擎插件(UCM / FlexKV)、对象池(MemCache / Mooncake)、协调器(LMCache)、信封(vLLM / SGLang / KVCR)与 kvcm 的分层对照,见 [`kvcm-vs-oss.md`](kvcm-vs-oss.md)——那里先分层再比能力,避免不同层当同层比。
+> 本文只覆盖这四栈。把范围扩到引擎插件(UCM / FlexKV)、对象池(MemCache / Mooncake)、协调器(LMCache)、信封(vLLM / SGLang / KVCR)与 kvcm,见 [`kvcm-vs-oss.md`](kvcm-vs-oss.md)——那里按「KV 依附于谁」一条轴比较,不按功能清单。

@@ -2,7 +2,7 @@
 
 来源：[issue #54](https://github.com/5x8-40/lake/issues/54)（KV-CM 遗留问题总清单）。本文是 kvcm 预复制生产化的总结文档：设计决策、潜在问题、工程项三类条目的总登记处——已闭环条目在原地标 ✅、结论指向正式文档，待定条目随讨论与实验更新。
 
-文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D8/D9/D10/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（copy 端到端）与独立实验（soft pin 真机，见 [EXPERIMENTS.md](demo/EXPERIMENTS.md)）；本文 = 登记处。外部调研不占 D 编号，放在主仓 `docs/research/`（kvcm 相关：`kvcm-vs-oss.md`）。
+文档分层（详见 [README.md](README.md) 导航）：`design/` = 全局设计（D1/D2/D8/D9/D10/code-architecture）与专项设计（kv-prefetch，仅 copy）；`demo/` = precopy demo 记录（copy 端到端）与独立实验（soft pin 真机，见 [EXPERIMENTS.md](demo/EXPERIMENTS.md)）；本文 = 登记处。
 
 编号：**D** = 设计决策（语义/选型未定，先决策）；**P** = 潜在问题（待评估）；**E** = 工程项。编号创建后不复用；条目闭环后在原位置标 ✅，结论落对应正式文档（`design/` 系设计文档 / `demo/` 系 demo 文档）。
 
@@ -267,15 +267,13 @@
 - **与 SOTA 的差异**（D10 §6）：链式 hash/逐块匹配/事件→索引/推测索引都是标准做法；差异在**放置主动权**（能改变放置 vs 只路由）和**索引权威**（派生缓存 + master 权威；L0 miss 不同步查 master，异步对账）。
 - 工作文档：[D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md)。
 
-**开源方案对比（调研，非设计决策）** — 见 [../docs/research/kvcm-vs-oss.md](../docs/research/kvcm-vs-oss.md)
+**开源方案对比（调研）** — 见 [../docs/research/kvcm-vs-oss.md](../docs/research/kvcm-vs-oss.md)
 
-- 定位：回答「开源方案各自在哪一层、谁对 KV 字节说了算」，并给出 kvcm 差异的准确边界。不是竞争叙事，是分层与决策权归属的对照。
-- **分层**（§1）：L1 引擎插件（UCM / FlexKV）、L2 对象池元数据（MemCache / Mooncake）、L3 独立协调器（LMCache `mp_coordinator`）、L4 请求信封 hint（vLLM / SGLang / KVCR）、L5 路由层（llm-d / Dynamo / AIBrix）。kvcm 是 L2 的 client，不是新池。
-- **分发形态三种**（§2）：引擎自决（信封）／中心分发节点执行（对象池）／调用方点名（kvcm）。旧文把「hint 推 vs 中心命令」当唯一分界，漏掉了第二类。
-- **上游关键事实**（§3）：vLLM `vllm/v1/kv_hints/protocol.py` 与 SGLang `managers/kv_hints.py` **只有信封、无 action handler**；vLLM 唯一消费者是 KVCR 二级层（`kv_offload/tiering/kvcr/manager.py::on_new_request`）。KVCR 的入池放置仍是 `TODO(kvcr-g3)`（`runtime/policy_runtime.py:67`）。
-- **我方口径**（§6.1）：D8 管理面决定、kvcm 控制面执行；接口面覆盖八项但 `retain` 未接；KV 动作不需要改引擎、接入仍带已知补丁；不需要引擎参与决策、但源 seg client 必须在线。
-- **真实短板**（§6.2）：看不见引擎 HBM/APC；数据面依赖源 seg client 在线；`retain` 仍是 `NotImplementedError`（`backends/mooncake/backend.py:1326`）；soft pin 只承诺 0.3.13.post1 且无 ABI 闸；key 必须自己与引擎逐字节对齐；copy/move 无取消；异构 TP 仍需 #15835 backport；缺 L5 选路。
-- 图：正文 §1/§2/§3.4/§5.2 各一张自绘图（脚本 `docs/research/kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`），MemCache 架构用上游原图。
+- 定位：开源方案里 KV 是引擎进程的状态，kvcm 里 KV 是池里的一等对象。全篇按「KV 依附于谁」组织，逐家给到符号级出处。
+- **持有者轴**（§2）：不依附请求 / 活过请求 / 活过引擎 / 可换主人 / 可被度量，是同一件事的五个面。引擎侧做不到是立场必然，不是能力不足。
+- **三个场景**（§3）：引擎下线、引擎升级版本、下一轮请求的提前量。下线场景最能区分——KVCR 用 Guard 旁挂进程接管，kvcm 把 KV 交给池。
+- **代价与短板**（§4 / 附录 B）：有且只有一个必然代价，看不见引擎 HBM/APC，其余短板都是它的派生；另有 `retain` 未接、copy/move 无取消、soft pin 无 ABI 闸、key 要自己与引擎逐字节对齐、缺路由层。
+- 附件：§1 两张图（KV 依附于谁、控制策略在引擎内还是在池的 client 上），§5 一张（控制权与落地状态），附录 A 两张（UCM 分层重绘、MemCache 上游原图）。脚本 `docs/research/kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`。
 
 ## 二、潜在问题
 

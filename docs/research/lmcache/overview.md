@@ -54,7 +54,6 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 - **一致性**:无全局强一致。事件流可丢可乱,目录靠 gate 与 fencing 收敛;失效靠 L1 上报者 incarnation 与 L2 显式删除。
 - **HA 与故障**:MP daemon 模式下引擎崩溃 KV 不丢(无 fate-sharing);coordinator 可 checkpoint 恢复,未落盘的增量靠重放事件流补齐;coordinator 默认只监听回环,跨机部署需显式绑定并配 API key。
 - **扩展性**:共享存储路径随后端扩展;coordinator 路径受单进程 `KeyDirectory`(全内存 dict + 反向索引)与事件总线扇出限制。
-- **命名变更(2026-10 / 11)**:旧的进程内 `lmcache/v1/cache_controller/`(`LMCacheControllerManager` / `LMCacheWorker` / `KVController` / `RegistryTree`,ZMQ 通信)在 2026-10-22 移到 `lmcache/v1/inprocess/v1/cache_controller/`(#5970),又在 2026-11-06 整体移出主仓到独立仓 `LMCache_inprocess`(#6254)。主仓现在只有 `mp_coordinator`,上述符号已不存在。
 - **与 lake 对照**:LMCache 的 coordinator + MP server 形态最接近 lake 的 CP+agent,但一致性立场不同——LMCache 的目录是事件派生的 hint(允许错误,收敛即可),lake CP 为单写者权威(线性一致查询 + 镜像推送 + miss 回查)。此外 LMCache 的 KV 按 rank 入 key(部分实例私有),lake KV 不绑定 rank。
 
 ## 技术栈

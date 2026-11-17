@@ -12,7 +12,7 @@
 
 约定：
 
-- 图数刻意压到四张。`fig-ownership` 就是正文主线（KV 依附于谁）的那张图，不另设一张「分层图」——分层是属性，归属才是差异。
+- 自绘图四张，各管一件事：`fig-ownership` 是正文主线（KV 依附于谁），`fig-control-placement` 是部件级对照，`fig-evidence` 是控制权与落地状态，`fig-ucm-schematic` 是 UCM 接线的重绘。第五张 `memcache-architecture.png` 是上游原图。
 - 上游原图保留原文件，不做裁剪或重绘；出处与许可写在正文图注里，本文档同步登记。
 - 自绘图只用于对照工件。`fig-ucm-schematic.svg` 是重绘，图注与脚注都写明「redrawn from」，不声称是上游原图。
 - UCM 的 `architecture.svg` 与 `pd_disaggregation.jpg` 仓内只放链接，不复制：`LICENSE` 文件是标准 MIT，但 README 声明「MIT license with additional conditions」且未写明附加条款，边界不清，按保守处理。

@@ -1,6 +1,6 @@
 # LMCache — 跨实例复用与存储后端
 
-> 源码:`lmcache/v1/`、`csrc/storage_backends/`、`rust/`、`lmcache/v1/mp_coordinator/`(2026-11-13 快照 `58c11e38`;协调器目录原为 `lmcache/v1/cache_controller/`,2026-10-22 移入 `inprocess/`、2026-11-06 移出主仓,见下文「MP coordinator」节)。
+> 源码:`lmcache/v1/`、`csrc/storage_backends/`、`rust/`、`lmcache/v1/mp_coordinator/`(2026-11-13 快照 `58c11e38`)。
 
 ## 缓存键与匹配
 
@@ -65,7 +65,6 @@
 - **命令面**(HTTP):`POST /cache/prefetches`(指定 `instance_id` 预热)、`POST|GET|DELETE /cache/pins`(排除在该协调器自己的 L2 驱逐计划外)、`POST /cache/delete`、`/quota*`、`/directory/{lookup,blend-lookup,keys,stats}`、`/instances*`、`/events`、`/config/chunk-size`。**无 move 路由。**
 - **组件**:`controllers/base.py::Controller`(控制器基类)、`controllers/prefetch_manager.py::PrefetchManager`(预取派发)、`controllers/eviction_controller.py::FleetEvictionController`(配额 / 驱逐 / pin 计数)、`views/instance_registry.py::InstanceRegistry`(注册与心跳)、`ingest/event_gate.py::EventGate`(事件准入、去重、fencing)、`discovery.py::Registry`(controller / view 发现)、`persistence/checkpoint.py`(目录与配额的 checkpoint)。
 - **通信**:HTTP(FastAPI);事件可经 HTTP 或 Kafka 源进入(`ingest/{http,kafka}_event_source.py`)。
-- **命名变更**:本文件旧版把这一层写成 `lmcache/v1/cache_controller/` 下的 `LMCacheControllerManager` / `LMCacheWorker` / `KVController` / `RegistryTree`(ZMQ 通信)。这些符号与目录在快照 `58c11e38`(2026-11-13)上均不存在:`cache_controller` 于 2026-10-22 移入 `lmcache/v1/inprocess/v1/`(#5970),再于 2026-11-06 整体移出主仓到独立仓 `LMCache_inprocess`(#6254)。
 
 ## 压缩/serde
 

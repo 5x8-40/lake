@@ -136,7 +136,7 @@ lake/
 │       ├── hbm-tier-and-offload.md  #   HBM 归属与 KV 卸载路径对照
 │       ├── distributed-models.md    #   各项目分布式模型对比
 │       ├── serving-stack-comparison.md # Dynamo/FlexKV/llm-d/AIBrix 四栈对比
-│       ├── kvcm-vs-oss.md           #   kvcm / KV Fabric 与开源方案对比（分层 / 分发形态 / 控制权矩阵）
+│       ├── kvcm-vs-oss.md           #   kvcm / KV Fabric 与开源方案对比（KV 依附于谁）
 │       ├── kvcm-vs-oss/figures/     #   上文的图（自绘 + 上游原图，图源与许可见同目录 README）
 │       ├── dualpath.md              #   DualPath 双路径 KV 加载分析
 │       ├── nvidia-cmx.md            #   NVIDIA CMX 目标栈与边界

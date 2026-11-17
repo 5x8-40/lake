@@ -1,8 +1,8 @@
 # kvcm / KV Fabric 与开源方案对比（调研）
 
 > 调研快照：2026-11-13。上游源码快照：vLLM `93eeae69`、SGLang `5792cf6e`、UCM `57ddbb26`、KVCR `b7aa81d0`、LMCache `58c11e38`、MemCache `14b4e35e`、FlexKV `55ad438e`、llm-d-router `647ca7ca`、Dynamo `b20fe6fe`、AIBrix `17652f54`；kvcm 基线 `4d9dd33`。
-> 性质：开源方案对照研究，不是设计决策文档。kvcm 自身的设计在 [`kvcm/design/`](../../kvcm/design/D10-kv-fabric-roadmap.md)。
-> 读法：§1 立场 → §2 这条差别决定什么 → §3 三个场景看差异 → §4 代价 → §5 各家归类 → 附录 A 符号级事实 / B 未复核 / C 代码索引。
+> 范围：开源方案对照研究。kvcm 自身的设计在 [`kvcm/design/`](../../kvcm/design/D10-kv-fabric-roadmap.md)。
+> 读法：§1 立场 → §2 这条差别决定什么 → §3 三个场景看差异 → §4 代价 → §5 各家归类 → 附录 A 符号级事实 / B 短板与待确认 / C 代码索引。
 
 ---
 
@@ -49,7 +49,7 @@ kvcm 把 KV 从引擎手里拿了出来。key 是池里的对象，副本有主�
 
 同样，我们和 UCM/FlexKV 不是替代关系。引擎用 UCM 把 KV 写进 Mooncake，kvcm 照样能对同一批 key 下 copy/move。前者管「这次请求怎么取」，后者管「这块 KV 该在哪」。
 
-**retain 未接，是接线没做完，不是架构上做不到。** 判断这条差异时不该看当前实现状态，而该看：一旦接上，它属于谁的职责范围。retain 只有在「KV 是池的对象」这个前提下才成立——所以它是我们的题目，不是 UCM 的题目。
+**retain 未接，是接线没做完。** retain 只有在「KV 是池的对象」这个前提下才成立，所以它是我们的题目，不是 UCM 的题目；判断这条差异看职责范围，不看当前实现状态。
 
 ## 3. 三个场景看差异
 
@@ -81,7 +81,7 @@ KVCR 和 kvcm 在这里走到一起了：两家都意识到「KV 必须脱离引
 | LMCache | 跟随 LMCache 自己的 connector 与 MP server 版本。官方维护一份 [vLLM × LMCache 兼容矩阵](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/Installation_compatibility_matrix.csv)（[说明页](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/compatibility.rst)） | 引擎与协调器要一起升级 |
 | **kvcm** | **不需要出补丁** | — |
 
-LMCache 那张矩阵能直接看出负担：横轴是 8 个 LMCache 版本（0.3.10 → 0.4.2），纵轴是 vLLM 的每个次版本（0.11.2 → 0.18.0），逐格标是否验证过。文档开头自己写着「vLLM 和 LMCache 独立发版，新的 LMCache 发布不意味着旧版 vLLM 能加载每一个 connector，新的 vLLM 发布也可能改掉集成所依赖的 KV-cache API」。所以它跟 UCM/FlexKV 是两种形态的同一件事：它们打补丁，LMCache 维护兼容矩阵——都要跟着引擎版本走，只是记录方式不同。
+LMCache 那张矩阵能直接看出负担：横轴是 8 个 LMCache 版本（0.3.10 → 0.4.2），纵轴是 vLLM 的每个次版本（0.11.2 → 0.18.0），逐格标是否验证过。说明页开头就写明 vLLM 与 LMCache 独立发版，新版 LMCache 不保证能加载到每个较早的 vLLM 版本上，新版 vLLM 也可能改掉集成所依赖的 KV-cache API。所以它跟 UCM/FlexKV 是两种形态的同一件事：它们打补丁，LMCache 维护兼容矩阵——都要跟着引擎版本走，只是记录方式不同。
 
 两个目录一眼能看出来。UCM 那个目录名就是引擎版本号，`0.9.2` 到 `v0300` 排成一列，跟一个版本就多一个目录；FlexKV 那边是文件名带版本，`vllm_0_10_1_1`、`vllm_0_16_0`、`vllm_up_0_14_1`、`vllm_main`，一份补丁对一个版本。LMCache 没有补丁目录，负担变成了维护那张矩阵的每一行每一格。
 
@@ -208,11 +208,11 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 
 ### A.3 独立协调器：LMCache
 
-`mp_coordinator` 自 2026-06-03（#3488）替代旧的进程内 `cache_controller`。旧目录于 2026-10-22 移入 `lmcache/v1/inprocess/v1/cache_controller/`（#5970），2026-11-06 整体移出主仓（#6254）。**main 上不存在 `cache_controller/`，也不存在 `RegistryTree` / `KVController` / `LMCacheControllerManager`。**
+协调器是独立进程（`lmcache/v1/mp_coordinator/`），与引擎进程分开部署，只持元数据与命令面。
 
 | 事实 | 出处 |
 |---|---|
-| 与 vLLM 的兼容性靠官方矩阵维护，不靠补丁目录 | [`docs/source/getting_started/Installation_compatibility_matrix.csv`](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/Installation_compatibility_matrix.csv)；[`compatibility.rst`](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/compatibility.rst) 开头即写明「vLLM 与 LMCache 独立发版，新版 LMCache 不保证旧版 vLLM 能加载每个 connector」 |
+| 与 vLLM 的兼容性靠官方矩阵维护，不靠补丁目录 | [`docs/source/getting_started/Installation_compatibility_matrix.csv`](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/Installation_compatibility_matrix.csv)；[`compatibility.rst`](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/compatibility.rst) 开头即说明 vLLM 与 LMCache 独立发版，新版 LMCache 不保证能加载到每个较早的 vLLM 版本上 |
 | 独立进程、FastAPI 服务，默认只监听回环 | `lmcache/v1/mp_coordinator/app.py::create_app`；`docs/source/mp/coordinator.rst`（默认 `127.0.0.1:9300`） |
 | fleet 级 key 目录，事件派生、最终一致，**答案只是 hint，必须在 owner 处验证** | `views/key_directory.py::KeyDirectory`（docstring: "Eventually consistent: lookups are hints to be validated at the owner"）、`lookup` |
 | 目录只由 CacheEvent 批次构建，可 checkpoint / 回放 | `ingest/event_gate.py::EventGate`、`cache_events.py::CacheEventSink`、`events_replay.py::replay`、`persistence/checkpoint.py` |
@@ -263,7 +263,7 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 
 ---
 
-## 附录 B：可核对的短板与未复核条目
+## 附录 B：短板与待确认
 
 ### B.1 短板
 
@@ -273,17 +273,17 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 4. **copy / move 无取消**：两版本都无取消 RPC，请求改道时只能弃置 + 事后清副本。
 5. **pin 有前置条件**：soft pin 依赖手写 `_empty_pin.so`，只对 Mooncake v0.3.13.post1 成立，升 wheel 要重编，且无运行时 ABI 闸。
 6. **要自己对齐 key**：前缀 → 池 key 的算法必须与引擎逐字节一致；`PYTHONHASHSEED` 未设会静默漂移。这是内容上的耦合，不是代码上的。
-7. **接入仍有已知补丁**：异构 TP 场景 vllm-ascend v0.26.0rc1 需要 #15835 backport。这部分成本没有消失，只是从 kvcm 转移到了「引擎接入池」这一步——而这一步本来就要做，不管有没有 kvcm。
+7. **接入仍有已知补丁**：异构 TP 场景 vllm-ascend v0.26.0rc1 需要 #15835 backport。这部分成本落在「引擎接入池」这一步，不管有没有 kvcm 都要做。
 8. **缺路由层**：D8 的 SC 尚未实现，选路仍要外部 router。
 
-### B.2 未复核
+### B.2 待确认
 
-1. **SGLang `kv.deref` / `kv.demote` / `kv.prefetch` 的 action handler 是否已在非 main 分支实现。** 只核了 main。按 main 记「无」。
-2. **KVCR 入池放置的完成时间**。`TODO(kvcr-g3)` 仍在，上游无 issue 可锚定时间表。
-3. **Mooncake `CreateCopyTask` / `CreateMoveTask` 的完成信号语义**（READY 判定、失败重试）依赖 kvcm D2 的实测结论，本文只核到 API 存在与声明。
-4. **MemCache `MoveBlob` / `ReplicateBlob` 是否有计划对外暴露。** 本快照内无对外 RPC。
-5. **AIBrix 网关路由的决策路径细节。** 只核到索引数据结构与卸载框架，未逐条走 gateway plugin 的打分链路。
-6. **llm-d P2P 的逐条拓扑覆盖**（哪些 connector 组合支持 pull）未做全矩阵核对。
+1. **SGLang `kv.deref` / `kv.demote` / `kv.prefetch` 的 action handler 是否已在非 main 分支实现？** 本文只核 main，按 main 记「无」。
+2. **KVCR 入池放置何时完成？** `TODO(kvcr-g3)` 仍在，上游无 issue 可锚定时间表。
+3. **Mooncake `CreateCopyTask` / `CreateMoveTask` 的完成信号语义**（READY 判定、失败重试）——依赖 kvcm D2 的实测结论，本文只核到 API 存在与声明。
+4. **MemCache `MoveBlob` / `ReplicateBlob` 是否有计划对外暴露？** 本快照内无对外 RPC。
+5. **AIBrix 网关路由的决策路径细节**——本文只核到索引数据结构与卸载框架，未逐条走 gateway plugin 的打分链路。
+6. **llm-d P2P 的逐条拓扑覆盖**（哪些 connector 组合支持 pull）——未做全矩阵核对。
 
 ---
 
