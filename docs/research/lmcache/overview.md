@@ -7,6 +7,18 @@
 
 LMCache 是一个 **vendor-neutral 的 LLM KV cache 管理层**,把 GPU 上一次性的 KV cache 变成可跨请求、跨实例、跨引擎持久存储/复用/观测/变换的"AI-native knowledge",目标是降 TTFT、提吞吐(尤其长上下文/agent/RAG 场景)。
 
+## 时间线
+
+| 日期 | commit | 事件 |
+|---|---|---|
+| 2025-11-17 | `7aad1f8e` (#1907) | 第一个独立 cache server:`Example LMCache independent cache server for multi-process mode`,MP 线起点 |
+| 2026-05-13 | `b16de35f` (#3235) | `lmcache_mp_connector.py` 落地,引擎可连独立 server |
+| 2026-06-03 | `84df850c` (#3488) | MP coordinator 骨架 |
+| 2026-10-21 | `032e23da` (#5831) | vLLM in-process 集成隔离,挪进 `lmcache/inprocess/` |
+| 2026-10-22 | `2d4f4bdf` (#5970) | `cache_controller/` → `inprocess/v1/` |
+| 2026-11-06 | `5b9db86f` (#6254) | 树内 InProcess 实现移除,迁到独立仓 [`LMCache_inprocess`](https://github.com/LMCache/LMCache_inprocess) |
+| 2026-11-12 | tag `v0.5.8rc1` | 撰写时最新发布 |
+
 ## 设计哲学
 
 - **问题**:推理引擎(vLLM/SGLang)的 KV cache 是进程内临时状态,prefill 是 TTFT 瓶颈;引擎崩溃即丢失。
@@ -22,6 +34,52 @@ LMCache 是一个 **vendor-neutral 的 LLM KV cache 管理层**,把 GPU 上一�
 |------|------|------|
 | **MP**(多进程) | 独立服务 `MPCacheServer`,引擎经 ZMQ 或 gRPC 请求面访问;`StorageManager` 管 L1 与多个 L2 adapter | 树内唯一路径 |
 | **InProcess**(单进程) | `LMCacheEngine` 跑在推理进程内,`CacheEngine → StorageManager → LocalCPUBackend + RemoteBackend` | 已移出主仓,见 [`LMCache_inprocess`](https://github.com/LMCache/LMCache_inprocess) |
+
+### 新版结构
+
+三个进程角色,上游各有专页:
+
+| 角色 | 位置 | 职责 | 上游文档 |
+|------|------|------|---------|
+| 引擎侧 connector | 引擎进程内 | 实现引擎自己的 KV connector 接口,把 KV 存取翻译成对 server 的 RPC | [mp/index.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/index.rst) |
+| MP server | 每节点一个独立进程 | L1/L2 存储与读写、chunk 哈希、prefetch 调度 | 同上 |
+| MP coordinator | 独立进程,**可选** | fleet 级实例注册 + 事件派生的 key 目录 + 命令面 | [mp/coordinator.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/coordinator.rst) |
+
+上游对 MP 的一句定义:**"LMCache multiprocess (MP) mode runs LMCache as a standalone service that vLLM instances reach through a configurable ZMQ or gRPC request transport. One LMCache server per node can serve multiple vLLM pods."** 上游列的收益是进程隔离、推理路径上没有 GIL 争用、同节点多 pod 共享一份 L1、CPU 内存可独立于显存扩缩。架构图见 [mp/architecture.png](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/architecture.png)。
+
+引擎侧 connector 三家:
+
+| 引擎 | 文件:符号 |
+|------|-----------|
+| vLLM | `lmcache/integration/vllm/lmcache_mp_connector.py`::`LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA)` |
+| SGLang | `lmcache/integration/sglang/unified_lmcache_mp_connector.py`::`UnifiedLMCacheMPConnector` |
+| TensorRT-LLM | `lmcache/integration/tensorrt_llm/tensorrt_mp_adapter.py`::`LMCacheMPKvConnectorScheduler` / `LMCacheMPKvConnectorWorker` |
+
+vLLM 侧另有 scheduler 适配层 `lmcache/integration/vllm/vllm_multi_process_adapter.py`::`LMCacheMPSchedulerAdapter`(持有 `server_urls`、`zmq.Context`)。
+
+MP server 内部:`MPCacheServer` 只是 compositor(`_build_modules()` 按 `--engine-type` 与 `--supported-transfer-mode` 装配 `DiscoverableModule`),模块在 `lmcache/v1/multiprocess/modules/`:`blend`、`engine_driven_transfer`、`kv_events`、`lmcache_driven_transfer`、`lookup`、`management`、`p2p_controller`、`server_transfer`。HTTP 面在 `http_apis/`:`/cache/objects`(GET/DELETE)、`/cache/prefetches`、`/cache/clear`、`/cache/checksums`、`/quota/{cache_salt}`、`/status`、`/healthcheck`、`/config`、`/lmc_version`。**MP server 上没有 `/cache/pins`。**
+
+Coordinator 的三条边界:
+
+- **可选**。`lmcache/v1/multiprocess/config.py`::`CoordinatorConfig` 默认 `url = ""`,docstring 写明:"When :attr:`url` is empty, the server registers with no coordinator and runs exactly as before." 事件上报默认也关(`event_reporting = False`)。
+- **pin 只在 coordinator 上。** 不接 coordinator 就只有 prefetch / delete / quota / clear,没有 pin(`/cache/pins` 由 `mp_coordinator/controllers/eviction_http_api.py`::`request_pin` 提供)。pin 的语义是"排除在该 coordinator 自己的 L2 驱逐计划外"的计数,见 `controllers/eviction_controller.py`::`FleetEvictionController._pin_counts`。
+- **P2P 依赖 coordinator,且与 GDS/Device-DAX L1 互斥。** 上游写明 "A server started with `--p2p-advertise-url` but no `--coordinator-url` refuses to start";传输通道要注册一整段连续 L1,所以 `--gds-l1-path` 与 `--l1-devdax-path` 下拒绝启动。三条组件(Coordinator 只管成员、server 里的 P2P controller、RDMA transfer channel)见 [mp/p2p.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/p2p.rst)。
+
+### 两种 connector(别混)
+
+"connector" 在这套代码里指两个完全不同的东西:
+
+| | 引擎侧 KV connector | 存储侧 native connector |
+|---|---|---|
+| 位置 | 引擎进程内 | C++ 库,pybind 暴露;MP 模式下由 server 进程加载 |
+| 接口 | 引擎的 KV connector 接口(vLLM `KVConnectorBase_V1`、SGLang、TensorRT-LLM 各自一套) | `csrc/storage_backends/connector_base.h`::`ConnectorBase<T>` |
+| 必须实现 | `get_num_new_matched_tokens` / `start_load_kv` / `wait_for_layer_load` / `save_kv_layer` / `request_finished` | `create_connection` / `do_single_get` / `do_single_set` / `do_single_exists`(可选 `do_single_delete`) |
+| 版本耦合 | 有,跟引擎的 KV-cache API 走 | 无,只认 key 与字节 |
+| 份数 | 每引擎一份 | 六份:`aerospike` `fs` `hf3fs` `mooncake` `nixl` `redis` |
+
+native connector 的契约只有上面四个方法,`csrc/storage_backends/README.md` 的一句话是:"Write the connector once, get both modes for free"——同一份 C++ 实现经 `NativeConnectorL2Adapter` 服务 MP,另一条入口是 `ConnectorClientBase`(asyncio),随 InProcess 移出主仓。设计要点是四件事:GIL 在 pybind 层释放、批量请求按 tiling 分给线程、eventfd 唤醒而非轮询、提交非阻塞。详见 [native_connectors.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/developer_guide/extending_lmcache/native_connectors.rst)。
+
+`lmcache/v1/gpu_connector/` 是第三个无关的东西:GPU KV 布局与 GDS backend 选择(`gds_backends/`、`gds_context.py`、`gpu_ops.py`),不属于上面任一类。
 
 ### 核心数据流
 

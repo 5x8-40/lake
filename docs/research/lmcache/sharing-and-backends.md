@@ -41,6 +41,22 @@
 
 serde 由 `l2_adapters/serde_wrapper.py`::`SerdeL2AdapterWrapper` 透明包裹,per-adapter opt-in。
 
+### 存储侧 native connector(`csrc/storage_backends/`)
+
+C++ 写一次,MP 与 InProcess 两种模式复用——这是与"引擎侧 KV connector"完全不同的东西(两者区分见 [overview.md](overview.md#两种-connector别混))。
+
+| 契约 | 符号 |
+|------|------|
+| 顶层抽象 | `connector_interface.h`::`IStorageConnector` — `submit_batch_get` / `submit_batch_set` / `submit_batch_exists` / `submit_batch_delete` + `drain_completions` + `event_fd` + `close` |
+| 实现基类 | `connector_base.h`::`ConnectorBase<ConnectionType>` — 覆盖 4 个必需方法 `create_connection` / `do_single_get` / `do_single_set` / `do_single_exists`,可选 `do_single_delete` |
+| 工作池 | `connector_base.h`::`WorkerPoolConfig{per_op_workers}` — lane key(`lookup`/`retrieve`/`store`)→ 线程数,未列出的走共享池 |
+| Python 桥(MP) | `lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py`::`NativeConnectorL2Adapter` — 3 个 eventfd + demux 线程 + `ObjectKey` 序列化 + 客户端侧锁跟踪 |
+| Python 桥(InProcess) | `ConnectorClientBase`(asyncio),随 InProcess 移出主仓 |
+
+六份实现:`aerospike/`、`fs/`、`hf3fs/`、`mooncake/`、`nixl/`、`redis/`(`redis/` 是 RESP2 over TCP 的参考实现,`aerospike/` 需 `BUILD_AEROSPIKE=1`)。上游 README 的一句话:["Build high-performance storage connectors in C++/Rust that work in both LMCache modes… Write the connector once, get both modes for free."](https://github.com/LMCache/LMCache/blob/dev/csrc/storage_backends/README.md)
+
+**C++ 原因**:GIL 在 pybind 层释放、批量请求按 tiling 均分给线程、eventfd 唤醒而非轮询、SQ/CQ 非阻塞提交。
+
 ## 分层与配额
 
 - `distributed/storage_manager.py`::`StorageManager` + 多 `L1Manager` + 多 `L2Adapter` + `storage_controllers/` 下的 `StoreController` / `PrefetchController` / `EvictionController`。tier 词汇 `distributed/api.py`::`Tier{L1,L2,ALL}`。
