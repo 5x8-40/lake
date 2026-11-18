@@ -2,166 +2,218 @@
 
 > 调研快照：2026-11-13。上游源码快照：vLLM `93eeae69`、SGLang `5792cf6e`、UCM `57ddbb26`、KVCR `b7aa81d0`、LMCache `58c11e38`、MemCache `14b4e35e`、FlexKV `55ad438e`、llm-d-router `647ca7ca`、Dynamo `b20fe6fe`、AIBrix `17652f54`；kvcm 基线 `4d9dd33`。
 > 范围：开源方案对照研究。kvcm 自身的设计在 [`kvcm/design/`](../../kvcm/design/D10-kv-fabric-roadmap.md)。
-> 读法：§1 立场 → §2 这条差别决定什么 → §3 三个场景看差异 → §4 代价 → §5 各家归类 → 附录 A 符号级事实 / B 短板与待确认 / C 代码索引。
+> 读法：§1 为什么这是架构差异 → §2 kvcm 的身份 → §3 四个问题 → §4 耦合与补丁 → §5 三个场景 → §6 各家归类 → §7 今天与目标 → 附录 A 符号级事实 / B 短板与待确认 / C 代码索引。
 
 ---
 
-## 1. 一句话立场
+## 1. 为什么这是架构差异，不是一个 PR 能补的功能
 
-**开源方案里，KV 是引擎进程的状态；kvcm 里，KV 是池里的一等对象。**
+先说清这一点，否则后面每一条能力都像是在说「上游少做了某件事，我们补上」。
 
-这句话看起来抽象，但它决定了后面所有事。展开说：
+**决定 KV 放在哪，需要三类信息同时在场。它们在开源栈里分属三个系统，没有任何一个组件同时握有两者以上。**
 
-开源方案的共同前提是「KV 依附于某个持有它的实体」——引擎进程、某个请求、或某个 connector 自己维护的目录。所以它们的思路都是同一个方向：引擎要用 KV，怎么让它用得更好。加钩子（UCM/FlexKV）、加信封（vLLM/SGLang）、加目录（LMCache/KVCR）、加路由（llm-d/Dynamo/AIBrix），都是这个方向下的不同做法。
-
-这些做法的生命周期也是被引擎定的：动作从「引擎要这个 KV」开始，到「这个请求结束」为止。KV 什么时候消失，由引擎决定。
-
-kvcm 把 KV 从引擎手里拿了出来。key 是池里的对象，副本有主、有位置，池自己记权威记录。于是「这块 KV 在哪、还活着吗、该不该搬」变成了一个**和任何引擎进程无关的问题**。
-
-![KV 依附于谁](kvcm-vs-oss/figures/fig-ownership.svg)
-
-（自绘图，由 [`kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`](kvcm-vs-oss/figures/plot_kvcm_vs_oss.py) 生成。红线上方是「KV 必须有引擎或请求才能存在」，下方是「池比引擎活得久」。kvcm 站在池这一行的右侧：它不是池，是池的调用方。全部图源与许可见 [`kvcm-vs-oss/figures/README.md`](kvcm-vs-oss/figures/README.md)。）
-
-换到具体部件上看，两边的差别只有一个格子：**KV 控制策略画在哪个进程里**。图 (a)(b) 的引擎、Client Library、Meta Service / master、GVA 内存池、SSD 池完全一样，只有策略块换了位置。
-
-![控制策略在哪](kvcm-vs-oss/figures/fig-control-placement.svg)
-
-（自绘图，同上脚本。粗箭头是数据面，细箭头是 RPC / 控制面。部件命名沿用 MemCache 上游架构图，便于和 §A.2 那张原图对照。）
-
-- **(a) 开源侧**：策略是引擎进程内的一块，和 connector 一起编译进去。它决定这次请求取多少 KV、驱逐谁、要不要预取，然后由引擎自己动手。这就是为什么要跟着引擎版本打补丁——策略和引擎代码在同一进程里，接口一变就得跟着改。
-- **(b) kvcm**：引擎只做自己的事（算 attention、命中了就读本机 APC）。策略块挪到池的 client 上，通过 `CreateCopyTask` / `create_move_task` / `pin` / `GetReplicaList` 这些 master RPC 对池动手。**引擎换成哪一个都不影响这块策略**——它认的是池，不是引擎。
-
-同一张图也能看出 (b) 的代价：kvcm 没有引擎内那条细箭头，所以它拿不到 HBM/APC 里的信息（§4）。
-
-## 2. 这条差别决定什么
-
-下面五条不是五个并列的功能，是同一件事的五个面：
-
-| 因为 KV 是池的对象 | 所以 | 引擎内插件 | 引擎外服务 |
+| 信息 | 归属 | 谁拿得到 | 谁拿不到 |
 |---|---|---|---|
-| 不依附于请求 | 没有请求也能存在：策略预取、空闲时预热 | 预取由请求钩子触发：无请求就取不到前缀和 ETA | 有独立的预取入口，参数是模型 + token 序列 |
-| 不依附于请求的生命周期 | 活过请求：保活、降层、按 TTL 留 | 只能随请求结束顺带做 | 按 TTL / lease 保留，与请求无关 |
-| 不依附于产生它的引擎 | 活过引擎：retain 的设计目标 | 字节在引擎私有内存里 | 字节在池的段上 |
-| 有主人，可以换主人 | 引擎之间转移副本（move） | 改引擎状态才能换主人 | 对池点名搬，引擎不参与 |
-| 可被度量、归属、设预算 | 按前缀/租户记字节与带宽 | 各实例各记各的 | 池统一记账 |
+| 请求侧需求：下一轮何时来、去哪台、什么前缀、预算多少 | 网关 / agent | 入口组件（llm-d EPP、Dynamo router） | 引擎、池 |
+| 池侧库存：哪个 segment 有哪个 key 的副本、lease 多久、容量余量 | 池 master | 池的 client | 引擎、路由层 |
+| 执行能力：指名搬副本、保活、核验到位 | 池 API | 池的 client | 引擎侧插件 |
 
-表格里「引擎内插件」指 UCM、FlexKV 这类跑在引擎进程里的实现，「引擎外服务」指独立进程（LMCache MP server、kvcm）。第三、四、五行的区别与第二行同源：字节在谁手里、账记在哪里。
+vLLM 可以加一种 hint 类型，但它看不到集群里 KV 的分布；Mooncake 可以加一个 API，但它看不到请求流。**要凑齐这三样，得同时改三个项目并维护它们之间的胶水**——而胶水本身要跟着三个项目各自的接口演进而改。这就是打补丁负担的来源，也是它不能靠单点 PR 收口的原因。
 
-「引擎内插件」那一列不是能力不足，是**立场不同导致的必然**。举例：UCM 没有 move，不是它做得差，是「把副本从 A 机挪到 B 机」根本不发生在引擎内插件的职责里——插件只知道「这次请求要用的 KV 在哪」，不知道「集群里还有哪些副本、该不该合并」。
+第二层差别在**中心基于什么做决定**。Mooncake 其实已经是中心化放置：
 
-预取这一行值得单独说明，因为三家的形态并不相同：
-
-| 方案 | 预取入口 | 能否脱离请求 |
+| | 依据 | 时机 |
 |---|---|---|
-| UCM | `get_num_new_matched_tokens(request, num_computed_tokens)`，内部 `_prefetch_store` 只在这条调用链上 | 不能，取不到 `request.request_id` 就算不出 block id |
-| FlexKV | SGLang 钩子 `prefetch_from_storage(rid, last_host_node, token_ids)` | 主路径不能。另有一个 `prefetch_control(action, **payload)` 的独立 IPC 通道，但没有 ETA 与保留语义，不用于下一轮预热 |
-| KVCR | `submit_hint(hints, request_id=None)` | API 上 `request_id` 可省，但 `discard_hint(request_id)` 必填，远端来源按 request 存，作用域仍绑请求 |
-| LMCache MP server | `POST /cache/prefetches`，参数是 `model_name` / `world_size` / `token_ids` | 能，不需要任何请求 |
+| Mooncake 动态副本 | 过去的热度（`DynamicReplicationHeatAdmitted` 要求窗口内命中数达标） | 已经热了之后 |
+| kvcm 的目标 | 未来的需求（hook 给出的 ETA、会话、前缀） | 请求到达之前 |
 
-所以「引擎侧方案」这个笼统说法要拆开：引擎内的插件确实被请求驱动，引擎外的独立服务则不受此限。这两类在对比里不能并成一组。
+两者都是「中心说了算」，区别是中心的输入不同。前者只能反应，后者可以前置。而「看见未来的需求」这件事，池做不到——它不在请求路径上。
 
-同样，我们和 UCM/FlexKV 不是替代关系。引擎用 UCM 把 KV 写进 Mooncake，kvcm 照样能对同一批 key 下 copy/move。前者管「这次请求怎么取」，后者管「这块 KV 该在哪」。
+### 由此得到的一句话立场
 
-**retain 未接，是接线没做完。** retain 只有在「KV 是池的对象」这个前提下才成立，所以它是我们的题目，不是 UCM 的题目；判断这条差异看职责范围，不看当前实现状态。
+**开源侧不是没有池，也不是没有中心。它们缺的是「同时看得见请求、又拿得到池权威」的那个位置。**
 
-## 3. 三个场景看差异
+kvcm 占的就是这个位置：它是池的 client（拿得到权威与执行能力），同时接收 hook（看得见请求侧需求）。
 
-抽象说完了，看三个具体场景，各家的处理有什么不同。
+## 2. kvcm 的身份：三层，不是「池的 client + 八项操作」
 
-### 3.1 引擎要下线（滚动升级、缩容、故障）
+写成「池的 client」会让读者以为 kvcm 拥有权威。实际分工是：
 
-这是最能区分立场的一个场景。**KV 能不能活下来，取决于它依附于谁。**
+| 层 | 是什么 | 现状 |
+|---|---|---|
+| **接入身份** | 池的一个 client：自己的 UUID、心跳、`global_segment_size=0`（不持有存储） | 已实现 |
+| **逻辑角色** | master 的 facade：封装 RPC，加上生命周期、核验、记账 | 已实现 |
+| **控制面** | D9 执行（copy/move/pin/keepalive/demote/promote/remove + 核验 + 台账） | 已实现（retain 除外） |
+| | D8 决策（选路、保留、放置、扩缩） | **未实现** |
+| **终局** | KV Fabric：master 权威 + D9 控制面 + D8 联合调度 + 多引擎/多后端/多集群 + 租户/QoS/账本 | 目标 |
+
+关键的一句：**权威始终在 master，不在 kvcm。** kvcm 是 master 的 client 侧控制面封装——它读权威、按权威下指令，但它不是权威本身。它的价值在于「在权威之上加了一层决策与核验」，不在于持有记录。
+
+## 3. 四个问题
+
+按「数据归属」讲不清楚差异，按这四个问题可以。
+
+### 3.1 元数据有没有权威中心
+
+| 方案 | 权威记录 | 性质 |
+|---|---|---|
+| Mooncake master | 有 | 单写者、段级、lease/驱逐都在它手里 |
+| MemCache MetaService | 有 | 同上 |
+| LMCache `KeyDirectory` | 无 | 事件派生、最终一致；docstring 写明「lookups are hints to be validated at the owner」 |
+| llm-d / Dynamo / AIBrix | 无 | 派生索引，只服务于选路 |
+| **kvcm** | **借用 master 的** | 自己不持记录，读 master、按 master 下指令 |
+
+kvcm 这一格容易读错，所以单独说：它读 `GetReplicaList` / `BatchGetReplicaList` 拿副本位置，用 `query_task` 核验任务，用账本记录自己发起的操作。**这三样都不是「权威」，是权威的使用者与观察者。**
+
+### 3.2 全局视野覆盖到哪
+
+「全局」必须限定到具体范围，否则是空话。
+
+| 范围 | kvcm | 说明 |
+|---|---|---|
+| 池内（哪些段有副本、容量、lease） | 有 | 读 master，段级精度 |
+| 引擎 HBM / APC | **没有** | 在引擎进程内，池外不可见；判定 HBM 命中只能靠引擎事件或壳请求 |
+| 跨引擎的前缀视图 | 有（目标） | D8 的 KVT 是 master 的派生视图 |
+| 多集群 | 目标，非现状 | 单集群设计 |
+
+第二行是最重要的限制。kvcm 选择待在池外，换来「不跟引擎版本绑死」，代价就是看不见引擎内部（§4）。
+
+### 3.3 是否做全局管理
+
+不是「能不能 copy」，而是管不管放置、生命周期、预算、租户、QoS、账本。
+
+| 方案 | 管什么 |
+|---|---|
+| UCM / FlexKV | 这次请求怎么取 KV；范围在本机、本请求 |
+| MemCache / Mooncake | 池内放置与容量；按自身热度策略，不感知请求与预算 |
+| LMCache 协调器 | 自己的 L1/L2：fleet 目录、按实例预取、L2 配额与驱逐 |
+| llm-d / Dynamo / AIBrix | 请求去哪；不碰 KV 字节 |
+| **kvcm** | 目标：KV 该在哪、活多久、给谁用。现状：按指令执行 + 保活 + 记账；放置决策仍靠人工或简单策略 |
+
+### 3.4 是否做请求 + KV + 扩缩联合调度
+
+这一条是开源侧普遍没有的，但也是我们尚未实现的。
+
+```text
+L0 请求路由      —— 决定去哪    （D8，未实现；现在靠外部 router）
+L1 KV 生命周期   —— 决定留多久  （D8 部分；D9 执行已有）
+L2 容量扩缩      —— 决定扩不扩  （D8，未实现；外部 HPA/KEDA）
+共享 KVT / 预算 / 账本           （KVT 未实现；账本在 D9）
+```
+
+Dynamo 是唯一在形态上做齐三层的（Smart Router + KVBM/KVCR + Planner），但它是三个组件拼装，且 KVBM 已 sunset、KVCR 接棒，三者之间靠 hint 与事件松耦合，不共享同一份预算与账本。
+
+## 4. 耦合与补丁
+
+### 4.1 耦合点
+
+这是 kvcm 和 LMCache 最关键的结构差别。
+
+| | LMCache | UCM / FlexKV | kvcm |
+|---|---|---|---|
+| 耦合点 | connector-coupled | engine plugin / patch | **backend-coupled** |
+| 换引擎 | 要接 LMCache connector | 要改引擎或打 patch | 只要同一个 backend + key 对齐 |
+| 换 backend | 不适用 | 不适用 | 换 backend adapter |
+
+```text
+kvcm
+  → backend adapter
+  → Mooncake store / master
+
+vLLM / vLLM-Ascend / SGLang
+  → 各自的 connector / store
+  → 同一个 Mooncake 池
+```
+
+所以：**kvcm 不依赖 connector；connector 是引擎接入池的方式。** 一个引擎用 UCM 还是 SGLang 原生 connector 把 KV 写进池，与 kvcm 无关——它们只要写进同一个池、key 算法一致即可。
+
+### 4.2 补丁是兼容性代价，不是主维度
+
+放在「接入负担」看就好，不要当架构轴。
+
+| 方案 | 负担形态 |
+|---|---|
+| UCM | 16 个版本补丁目录（[`patch/`](https://github.com/ModelEngine-Group/unified-cache-management/tree/develop/ucm/integration/vllm/patch)） |
+| FlexKV | 5 份 vLLM 补丁，377–528 行，最多触及 13 个 vLLM 文件（[`vllm_adaption/`](https://github.com/taco-project/FlexKV/tree/main/examples/vllm_adaption)） |
+| LMCache | 维护 [vLLM × LMCache 兼容矩阵](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/Installation_compatibility_matrix.csv) |
+| kvcm | 不打补丁 |
+
+一句话：**要碰 HBM，打 patch 或提 PR 无法避免；kvcm 暂时不做这个选择。** 代价是看不见 HBM/APC，收益是不跟引擎版本绑死。这两条是同一枚硬币的两面。
+
+## 5. 三个场景
+
+抽象说完，看三个具体场景。
+
+![分层归属与控制形态](kvcm-vs-oss/figures/fig-ownership.svg)
+
+（自绘图，由 [`kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`](kvcm-vs-oss/figures/plot_kvcm_vs_oss.py) 生成。红线上方是「KV 必须有引擎或请求才能存在」，下方是「池比引擎活得久」。kvcm 站在池这一行：它是池的调用方，不是池本身。全部图源与许可见 [`kvcm-vs-oss/figures/README.md`](kvcm-vs-oss/figures/README.md)。）
+
+### 5.1 引擎要下线（滚动升级、缩容、故障）
 
 | 方案 | 引擎下线时 KV 会怎样 | 为什么 |
 |---|---|---|
-| UCM / FlexKV | 该引擎进程内的一切随之消失 | KV 的持有者就是那个进程。插件没有「让别的进程接管」这个概念 |
-| vLLM / SGLang | 一样。信封是请求元数据，随请求结束而结束 | 没有「请求之外的 KV」这个概念 |
-| LMCache | L2 层的字节还在（在共享存储上），但目录里的条目要等事件或超时才对上 | 目录是事件派生的，实例消失后要靠心跳超时剔除 |
-| KVCR | Guard 旁挂进程能接管，这是它专门解决的问题 | 它把「KV 的归属」从引擎进程挪到了 Guard |
-| Mooncake / MemCache | **池里的副本不受影响**，只有挂在死掉那台引擎 segment 上的副本会清 | 池是独立进程，引擎只是它的一个 client |
-| **kvcm** | 同上——而且可以**在引擎死前**主动把副本搬到活着的 segment，或挪进自己的段 | 因为它能对池点名搬 |
+| UCM / FlexKV | 该引擎进程内的一切消失 | KV 的持有者是那个进程 |
+| vLLM / SGLang | 一样，信封随请求结束 | 没有「请求之外的 KV」 |
+| LMCache | L2 字节还在，目录要等心跳超时才对上 | 目录事件派生 |
+| KVCR | Guard 旁挂进程接管 | 它把归属从引擎挪到了 Guard |
+| Mooncake / MemCache | 池里的副本不受影响，只清挂在死引擎 segment 上的 | 池是独立进程 |
+| **kvcm** | 同上，且能在引擎死前把副本搬到活段 | 能对池点名搬 |
 
-KVCR 和 kvcm 在这里走到一起了：两家都意识到「KV 必须脱离引擎进程才能活过引擎」。区别在做法——KVCR 在引擎旁挂一个进程，kvcm 直接把 KV 交给池。
+KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进程，一家把 KV 交给池。
 
-这条也正是 D2 §4 定的四条 retain 路径的来源（见 [`kvcm/design/D2-kv-operations.md`](../../kvcm/design/D2-kv-operations.md) §4）。retain 未接不等于这条路走不通：今天就能用 move 把副本搬到活段。
+### 5.2 引擎升级版本
 
-### 3.2 引擎升级版本
+见 §4.2 的补丁与矩阵表。核心差异不是「谁打的补丁少」，而是**接缝放在哪**：放引擎里就要跟版本，放池上就只跟 key 算法。
 
-| 方案 | 升级时要做什么 | 代价 |
+### 5.3 下一轮请求提前量
+
+| 方案 | 预取入口 | 能否脱离请求 |
 |---|---|---|
-| UCM | 维护 **16 个版本补丁目录**（`0.9.2`、`0.11.0`、`v0110`…`v0300`、`common`）。点开看：[`ucm/integration/vllm/patch/`](https://github.com/ModelEngine-Group/unified-cache-management/tree/develop/ucm/integration/vllm/patch) | 每跟一个引擎版本，补丁要重打、重测 |
-| FlexKV | **5 份 vLLM 补丁，377–528 行，最多触及 13 个 vLLM 文件**（含 `v1/core/sched/scheduler.py`）。点开看：[`examples/vllm_adaption/`](https://github.com/taco-project/FlexKV/tree/main/examples/vllm_adaption) | 同上，且直接改调度器 |
-| LMCache | 跟随 LMCache 自己的 connector 与 MP server 版本。官方维护一份 [vLLM × LMCache 兼容矩阵](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/Installation_compatibility_matrix.csv)（[说明页](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/compatibility.rst)） | 引擎与协调器要一起升级 |
-| **kvcm** | **不需要出补丁** | — |
+| UCM | `get_num_new_matched_tokens(request, num_computed_tokens)`；`_prefetch_store` 只在这条链上 | 不能，取不到 `request.request_id` 就算不出 block id |
+| FlexKV | SGLang 钩子 `prefetch_from_storage(rid, ...)`；另有 `prefetch_control(action, **payload)` 独立 IPC 通道，但无 ETA 与保留语义 | 主路径不能 |
+| KVCR | `submit_hint(hints, request_id=None)` | `request_id` 可省，但 `discard_hint` 必填、远端来源按 request 存，作用域仍绑请求 |
+| LMCache MP server | `POST /cache/prefetches`（模型 + token 序列） | 能 |
+| **kvcm** | D8 决策 + D9 执行（`copy` / `register_keepalive`） | 能，但 D8 未实现 |
 
-LMCache 那张矩阵能直接看出负担：横轴是 8 个 LMCache 版本（0.3.10 → 0.4.2），纵轴是 vLLM 的每个次版本（0.11.2 → 0.18.0），逐格标是否验证过。说明页开头就写明 vLLM 与 LMCache 独立发版，新版 LMCache 不保证能加载到每个较早的 vLLM 版本上，新版 vLLM 也可能改掉集成所依赖的 KV-cache API。所以它跟 UCM/FlexKV 是两种形态的同一件事：它们打补丁，LMCache 维护兼容矩阵——都要跟着引擎版本走，只是记录方式不同。
+保留用什么机制也不同：LMCache 用驱逐计划里的计数（`_pin_counts`，进程内存，重启即失），我们用池的 lease（master 计时，续租一停就过期，与 kvcm 进程无关）。
 
-两个目录一眼能看出来。UCM 那个目录名就是引擎版本号，`0.9.2` 到 `v0300` 排成一列，跟一个版本就多一个目录；FlexKV 那边是文件名带版本，`vllm_0_10_1_1`、`vllm_0_16_0`、`vllm_up_0_14_1`、`vllm_main`，一份补丁对一个版本。LMCache 没有补丁目录，负担变成了维护那张矩阵的每一行每一格。
+## 6. 各家归类
 
-UCM 的 `patch/v0300/mamba_layer_hooks_patch.py` 值得单独看一眼：它不是在装钩子，而是在判断某一类层（线性注意力 / GDN / KDA）在 `VLLM_COMPILE` 模式下钩子会不会被 Dynamo 追踪剪掉，剪掉了就退化成 `--enforce-eager`。也就是说，补丁要跟的不只是版本号，还有引擎编译器的行为。
-
-这不是说别家做得笨。**它们必须待在引擎里，因为它们的答案要影响引擎的行为**：什么时候取 KV、取多少、在哪一层插进去。要影响引擎，就得改引擎。
-
-kvcm 的答案不影响引擎行为，只影响「KV 在哪」，所以它可以待在引擎外。`grep -rni "connector" kvcm/kvcm/` 全包零命中——这不是巧合，是定位的直接后果。
-
-### 3.3 下一轮请求提前量
-
-Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分钟。这段时间里，KV 应该被保留、预热、还是释放。
-
-| 方案 | 能做到什么 | 边界 |
+| 项目 | 一句话 | 关键位置 |
 |---|---|---|
-| UCM | 本次请求内按层预取 | 请求边界之外没有动作 |
-| LMCache | 能按实例预取（`POST /cache/prefetches`），也能 pin | 只管自己的 L1/L2，pin 是「排除在自己驱逐计划外」的计数，没有 TTL/续租概念 |
-| KVCR | 能按 hint 从远端拉 | 入池放置仍是 `TODO(kvcr-g3)`；`no_retain` 明确拒绝 |
-| **kvcm** | 保活（lease 续租）、降层、搬到指定段、按 TTL 留 | retain 未接；copy/move 无取消 |
-
-这一场各家都能做一部分，差异没有前两个场景那么大。真正的差别在**保留用什么机制**：LMCache 用驱逐计划里的计数，我们用池的 lease。lease 是池的语义，引擎不参与；计数是协调器自己记的，它挂了就没了。
-
-## 4. 代价：引擎内部你看不见
-
-这条立场有且只有一个必然代价，其他「不如别家」的地方都是它的派生。
-
-**HBM / APC 在引擎进程里，你在池外就摸不到。** 池只知道「DRAM 副本 READY」，不知道那块 KV 有没有被引擎读进显存、现在还在不在。要判定 HBM 命中，只能靠引擎事件或壳请求推断（D8 §3.1）。别家住在引擎里，这项天然有。
-
-派生的代价还有几条：
-
-- **不能插在引擎 forward 中间**。UCM 可以在第 N 层算完就把 KV 传走，我们只能整块搬。
-- **能做的事受池 API 限制**。池没有的能力我们也没有。比如池没有「按 key 查询 client_id」的 RPC，pin 就只能靠空写（`_empty_pin.so`）。
-- **数据面依赖源 seg client 在线**。源引擎进程死了，内存里那份就搬不出来——这条不是我们独有，KVCR 的主动搬运同样要求源节点在场。
-
-这几条都写在附录 B 的短板清单里，不藏。
-
----
-
-## 5. 各家归类
-
-一句话一个，看清各自站在这个立场的哪一侧。
-
-| 项目 | 一句话 | KV 依附于谁 |
-|---|---|---|
-| UCM | 引擎内插件 + 可插拔 store，管「这次请求怎么取 KV」 | 引擎进程 |
-| FlexKV | 引擎旁卸载库，管「这台机的 KV 放哪层」 | 引擎进程 |
-| MemCache | 昇腾对象池，MetaService 管分配与副本 | 池（本身就是池） |
-| Mooncake | 对象池 + 传输引擎；master 持副本权威 | 池（本身就是池） |
-| LMCache | 独立协调器 + 进程内 MP server，管自己的 L1/L2 | 引擎侧 MP server 进程 |
-| vLLM / SGLang | 请求信封的传输层，执行尚未接 | 请求 |
-| KVCR | 引擎内二级存储 + hint 驱动 P2P + Guard 容错 | Guard 进程（刻意的例外） |
+| UCM | 引擎内插件 + 可插拔 store，管「这次请求怎么取 KV」 | 引擎进程内 |
+| FlexKV | 引擎旁卸载库，管「这台机的 KV 放哪层」 | 引擎进程内 |
+| MemCache | 昇腾对象池，MetaService 管分配与副本 | 池（本身是池） |
+| Mooncake | 对象池 + 传输引擎；master 持副本权威，动态副本按热度 | 池（本身是池） |
+| LMCache | 独立协调器 + 进程内 MP server，管自己的 L1/L2 | 引擎侧 server 进程 + 协调器 |
+| vLLM / SGLang | 请求信封的传输层，action 执行未接 | 请求 |
+| KVCR | 引擎内二级存储 + hint 驱动 P2P + Guard 容错 | Guard 进程 |
 | llm-d EPP | 路由层，逐块索引 + 插件化打分 | 不持有 KV |
-| Dynamo | 路由层 + 类型化 hint + Planner，整栈最全 | 引擎 + 派生索引 |
+| Dynamo | 路由 + 类型化 hint + Planner，形态最全但不共享预算 | 引擎 + 派生索引 |
 | AIBrix | K8s 平台积木，网关索引 + 引擎旁卸载 | 引擎 + 网关索引 |
-| **kvcm** | **池的 client：对池点名搬、保活、核验、记账** | **池** |
+| **kvcm** | master 的 client 侧控制面：读权威、下指令、核验、记账 | 池外 |
 
-从这一列能看出：**只有 MemCache / Mooncake / kvcm 三者的 KV 完全脱离引擎进程。** 前两个本身就是池，kvcm 是池的调用方——池负责「KV 在哪」，kvcm 负责「KV 该在哪」。
+## 7. 今天与目标
 
-![控制权与落地状态](kvcm-vs-oss/figures/fig-evidence.svg)
+写清差距，避免把目标当成已有能力。
 
-（自绘图，同上脚本。左栏把「谁决定、谁动字节、谁的记录算权威」拆开填格：绿 = 持有，橙 = 参与但不拥有，灰 = 无。可以看到权威记录只落在两个对象池手里，其余各家的位置知识都是派生视图。右栏是请求信封的落地时间线：两家引擎都把信封形状定下来了，但 action 执行都还没接。日期取自各 RFC/PR 的 `created_at` / `closed_at`，2026-11-13 核对。）
+| | 今天 | 目标 | 差距 |
+|---|---|---|---|
+| 接入 | 池 client（UUID、心跳、不持存储） | 多后端 adapter | 只有 `mooncake` 一个实现 |
+| 权威使用 | 读 master 副本记录 | 同上 | 无 |
+| 执行 | copy / move / pin / keepalive / demote / promote / remove + 核验 | 同 + retain | `retain` 未接 |
+| 决策 | 按指令执行；无自动放置策略 | D8：请求 + KV + 扩缩联合 | D8 的 SC 未实现 |
+| 视野 | 池内段级 | + 前缀视图（KVT） | KVT 未实现 |
+| 账本 | 操作台账（sqlite） | + 字节/带宽归因与预算 | 未实现 |
+| HBM | 不可见 | 不做（架构选择） | — |
+
+一句话：**今天是一个「按指令执行 + 核验 + 记账」的控制面；目标才是 Fabric。** 中间的差距几乎全在 D8。
 
 ---
 
 ## 附录 A：逐家符号级事实
 
-前面说的是立场，这里给证据。每条都能在源码里对上。
+前面是判断，这里是证据。每条都能在源码里对上。
 
 ### A.1 引擎内插件：UCM / FlexKV
 
@@ -179,7 +231,7 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 | v1 store 无 move / retain；prefetch 只作 GC 热度提示 | `grep -rn "def move\|def retain" ucm/` 无命中；`ucm_connector.py` 注释 "Prefetch is only a GC hotness hint" |
 | v2 store 有 request 作用域的 `Pin`/`Unpin`（传输期防驱逐窗口） | `ucm/v2/store/store.h::Pin` / `Unpin`；`ucm/v2/proxy/store_scheduler.h::StoreScheduler`、`store_worker.h::StoreWorker`、`store_peer.h::StorePeer` |
 | DRAM store 有 scheduler / worker 角色分离 + 一致性哈希派发 | `ucm/store/dram/cc/config.h::Role{SCHEDULER,WORKER}`；`task_manager.cc::TaskManager::BuildRequests` → `router->RouteKeys` |
-| 全仓无 kv_hints / 无 hint 平面 | `grep -rn "kv_hints\|KvHint" ucm/` 为空 |
+| 全仓无 kv_hints / 无 action hint 平面 | `grep -rn "kv_hints\|KvHint" ucm/` 为空 |
 | PD 三种传输拓扑（HBM 直传 / DRAM 中介 / 统一池），主推经池 | `docs/source/user-guide/pd-disaggregation/index.md` |
 
 **FlexKV**（腾讯云 TACO）
@@ -209,7 +261,7 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 | 内部有 move / replicate，但只被驱逐回调使用，无对外 RPC | `MmcMetaManager::MoveBlob` / `ReplicateBlob`；唯一调用点 `EvictCallBackFunction` |
 | lease：读/写状态机上加租约，删除时等租约清零 | `entities/mmc_blob_state.cpp::BlobStateMachine::GetGlobalTransTable`（`LeaseAdd` / `LeaseWait`）、`entities/mmc_meta_lease_manager.h::MmcMetaLeaseManager` |
 | MetaService 支持 HA（K8s Lease 选主） | `python/memcache_hybrid/meta_service_leader_election.py::MetaServiceLeaderElection` |
-| 不认前缀语义、无 hint | `grep -rni "router\|hint" src/memcache/` 无命中 |
+| 不认前缀语义、无 action hint | `grep -rni "router\|hint" src/memcache/` 无命中 |
 
 **Mooncake**（kvcache-ai，v0.3.13.post1）
 
@@ -233,7 +285,8 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 | 目录只由 CacheEvent 批次构建，可 checkpoint / 回放 | `ingest/event_gate.py::EventGate`、`cache_events.py::CacheEventSink`、`events_replay.py::replay`、`persistence/checkpoint.py` |
 | 实例注册与心跳、超时剔除 | `http_apis/instances_api.py`、`views/instance_registry.py::InstanceRegistry`、`registrar.py::keep_registered` |
 | 预取能指定实例 | `http_apis/cache_api.py::request_prefetch`（body 带 `instance_id`；未知实例 404）、`controllers/prefetch_manager.py::PrefetchManager.submit_prefetch` |
-| pin 是「排除在自己 L2 驱逐计划外」的计数，不是按时间续租 | `controllers/eviction_controller.py::FleetEvictionController.pin`（`_pin_counts`）、`controllers/eviction_http_api.py::request_pin` |
+| L1 驱逐在每个 MP server 本地，coordinator 只做 L2 | `distributed/storage_manager.py` 建 `L1EvictionController`（`eviction_policy/` 可选 `arc` / `lru` / `isolated_lru` / `noop`）；coordinator 侧 `controllers/eviction_controller.py::FleetEvictionController` 的 docstring 写 "Per-cache_salt L2 eviction controller for the fleet" |
+| pin 是「排除在自己 L2 驱逐计划外」的计数，不是按时间续租 | `FleetEvictionController.pin`（`_pin_counts`）、`controllers/eviction_http_api.py::request_pin` |
 | 无 lease / keepalive 语义 | `grep -rni "lease\|keepalive" lmcache/v1/mp_coordinator/` 仅命中无关的 `_release_locked` |
 | 无 move 路由 | 全部路由：`/cache/prefetches`、`/cache/pins`、`/cache/delete`、`/quota*`、`/directory/*`、`/instances*`、`/events`、`/config/chunk-size`、`/status`、`/metrics`、`/healthz` |
 
@@ -265,6 +318,10 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 
 ### A.6 kvcm 站在池之上
 
+![控制策略在哪](kvcm-vs-oss/figures/fig-control-placement.svg)
+
+（自绘图，同上脚本。同一组部件，两种控制位置：左侧策略在引擎进程内，右侧在池的 client 上。粗箭头是数据面，细箭头是 RPC / 控制面。部件命名沿用 MemCache 上游架构图。）
+
 | 事实 | 出处 |
 |---|---|
 | 八项操作的接口面 | `kvcm/kvcm/ops/base.py::KvOps` |
@@ -276,20 +333,35 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 | 能力按后端版本显式声明 | `ops/capability.py::BackendCapability` |
 | 保活循环 | `loops.py::KeepaliveLoop` |
 
+### A.7 操作矩阵（证据，非主结构）
+
+接口面覆盖 copy / move / keepalive / pin / demote / promote / retain / remove 八项；当前可用七项，`retain` 仍在接线。逐项能力与限制：
+
+| 操作 | 状态 | 限制 |
+|---|---|---|
+| copy | 可用 | 无取消 RPC |
+| move | 可用 | 无取消 RPC；源 seg client 必须在线 |
+| keepalive | 可用 | lease 窗口 = master 的 `default_kv_lease_ttl` |
+| pin | 有条件 | soft 依赖手写 `_empty_pin.so`，只对 Mooncake v0.3.13.post1；hard 不能事后设置 |
+| demote | 可用 | 写回模式下时机不可控 |
+| promote | 可用 | 触发式，非确定 |
+| retain | **未接** | `backend.py::retain` 抛 `NotImplementedError` |
+| remove | 可用 | 按 key 全副本删除 |
+
 ---
 
 ## 附录 B：短板与待确认
 
 ### B.1 短板
 
-1. **看不见引擎 HBM / APC**（§4）。HBM 命中判定必须靠引擎事件或壳请求。
+1. **看不见引擎 HBM / APC**（§3.2）。HBM 命中判定必须靠引擎事件或壳请求。
 2. **retain 未接**：`backend.py::retain` 抛 `NotImplementedError`。跨引擎存活目前只能靠 move 到活段，或 kvcm 自挂盘（D2 §4）。
 3. **数据面依赖源 seg client 在线**。不是我们独有：KVCR 的主动搬运同样要求源节点在场。
-4. **copy / move 无取消**：两版本都无取消 RPC，请求改道时只能弃置 + 事后清副本。
-5. **pin 有前置条件**：soft pin 依赖手写 `_empty_pin.so`，只对 Mooncake v0.3.13.post1 成立，升 wheel 要重编，且无运行时 ABI 闸。
+4. **copy / move 无取消**：两个版本都无取消 RPC，请求改道时只能弃置 + 事后清副本。
+5. **pin 有前置条件**：soft pin 依赖手写 `_empty_pin.so`，升 wheel 要重编，且无运行时 ABI 闸。
 6. **要自己对齐 key**：前缀 → 池 key 的算法必须与引擎逐字节一致；`PYTHONHASHSEED` 未设会静默漂移。这是内容上的耦合，不是代码上的。
 7. **接入仍有已知补丁**：异构 TP 场景 vllm-ascend v0.26.0rc1 需要 #15835 backport。这部分成本落在「引擎接入池」这一步，不管有没有 kvcm 都要做。
-8. **缺路由层**：D8 的 SC 尚未实现，选路仍要外部 router。
+8. **缺 D8**：选路、放置决策、扩缩都尚未实现，现在只做执行。
 
 ### B.2 待确认
 
@@ -333,7 +405,8 @@ Agent 场景里，一轮结束到下一轮开始之间可能有几秒到几分�
 | LMCache fleet 目录 | `mp_coordinator/views/key_directory.py::KeyDirectory` |
 | LMCache 实例注册 | `mp_coordinator/views/instance_registry.py::InstanceRegistry` |
 | LMCache 预取 | `mp_coordinator/http_apis/cache_api.py::request_prefetch` |
-| LMCache pin / 驱逐 | `mp_coordinator/controllers/eviction_controller.py::FleetEvictionController` |
+| LMCache L1 驱逐 | `distributed/storage_manager.py`（`L1EvictionController`）；`distributed/eviction_policy/` |
+| LMCache L2 驱逐 / pin | `mp_coordinator/controllers/eviction_controller.py::FleetEvictionController` |
 | LMCache 事件管线 | `mp_coordinator/cache_events.py::CacheEventSink`；`ingest/event_gate.py::EventGate` |
 | LMCache 进程内 server 由自家 connector 拉起 | `integration/vllm/vllm_multi_process_adapter.py`；`v1/multiprocess/server.py::MPCacheServer` |
 | vLLM hint 信封 | `vllm/v1/kv_hints/protocol.py::KvHintsEnvelope` |
