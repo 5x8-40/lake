@@ -2,15 +2,15 @@
 
 > 调研快照：2026-11-13。上游源码快照：vLLM `93eeae69`、SGLang `5792cf6e`、UCM `57ddbb26`、KVCR `b7aa81d0`、LMCache `58c11e38`、MemCache `14b4e35e`、FlexKV `55ad438e`、llm-d-router `647ca7ca`、Dynamo `b20fe6fe`、AIBrix `17652f54`；kvcm 基线 `4d9dd33`。
 > 范围：开源方案对照研究。kvcm 自身的设计在 [`kvcm/design/`](../../kvcm/design/D10-kv-fabric-roadmap.md)。
-> 读法：§1 为什么这是架构差异 → §2 kvcm 的身份 → §3 四个问题 → §4 耦合与补丁 → §5 三个场景 → §6 各家归类 → §7 今天与目标 → 附录 A 符号级事实 / B 短板与待确认 / C 代码索引。
+> 读法：§1 必要性 → §2 角色与耦合 → §3 四个问题 → §4 三个场景 → §5 各家归类 → §6 今天与目标 → 附录 A 符号级事实 / B 短板与待确认 / C 代码索引。
 
 ---
 
-## 1. 为什么这是架构差异，不是一个 PR 能补的功能
+## 1. kvcm 架构的必要性
 
-先说清这一点，否则后面每一条能力都像是在说「上游少做了某件事，我们补上」。
+### 1.1 三类信息分属三个系统
 
-**决定 KV 放在哪，需要三类信息同时在场。它们在开源栈里分属三个系统，没有任何一个组件同时握有两者以上。**
+决定 KV 放在哪，需要三类信息同时在场。
 
 | 信息 | 归属 | 谁拿得到 | 谁拿不到 |
 |---|---|---|---|
@@ -18,26 +18,26 @@
 | 池侧库存：哪个 segment 有哪个 key 的副本、lease 多久、容量余量 | 池 master | 池的 client | 引擎、路由层 |
 | 执行能力：指名搬副本、保活、核验到位 | 池 API | 池的 client | 引擎侧插件 |
 
-vLLM 可以加一种 hint 类型，但它看不到集群里 KV 的分布；Mooncake 可以加一个 API，但它看不到请求流。**要凑齐这三样，得同时改三个项目并维护它们之间的胶水**——而胶水本身要跟着三个项目各自的接口演进而改。这就是打补丁负担的来源，也是它不能靠单点 PR 收口的原因。
+开源栈里没有任何组件同时握有两者以上。vLLM 可以加一种 hint 类型，但它看不到集群里 KV 的分布；Mooncake 可以加一个 API，但它看不到请求流。要凑齐这三样，得同时改三个项目并维护它们之间的胶水，而胶水本身要跟着三个项目各自的接口演进。
 
-第二层差别在**中心基于什么做决定**。Mooncake 其实已经是中心化放置：
+补丁负担由此而来：**缺的不是某个功能，是那个同时满足「能看见请求」与「能拿到池权威」的位置。**
+
+### 1.2 中心基于什么做决定
+
+Mooncake 已经是中心化放置，但依据和时机与我们不同。
 
 | | 依据 | 时机 |
 |---|---|---|
 | Mooncake 动态副本 | 过去的热度（`DynamicReplicationHeatAdmitted` 要求窗口内命中数达标） | 已经热了之后 |
-| kvcm 的目标 | 未来的需求（hook 给出的 ETA、会话、前缀） | 请求到达之前 |
+| kvcm | 未来的需求（hook 给出的 ETA、会话、前缀） | 请求到达之前 |
 
-两者都是「中心说了算」，区别是中心的输入不同。前者只能反应，后者可以前置。而「看见未来的需求」这件事，池做不到——它不在请求路径上。
+两者都是中心说了算，区别在中心的输入。前者只能反应，后者可以前置。而看见未来的需求这件事，池做不到——它不在请求路径上。
 
-### 由此得到的一句话立场
+**kvcm 占的位置**：池的 client（拿得到权威与执行能力），同时接收 hook（看得见请求侧需求）。
 
-**开源侧不是没有池，也不是没有中心。它们缺的是「同时看得见请求、又拿得到池权威」的那个位置。**
+## 2. kvcm 的角色
 
-kvcm 占的就是这个位置：它是池的 client（拿得到权威与执行能力），同时接收 hook（看得见请求侧需求）。
-
-## 2. kvcm 的身份：三层，不是「池的 client + 八项操作」
-
-写成「池的 client」会让读者以为 kvcm 拥有权威。实际分工是：
+### 2.1 三层身份
 
 | 层 | 是什么 | 现状 |
 |---|---|---|
@@ -47,7 +47,38 @@ kvcm 占的就是这个位置：它是池的 client（拿得到权威与执行�
 | | D8 决策（选路、保留、放置、扩缩） | **未实现** |
 | **终局** | KV Fabric：master 权威 + D9 控制面 + D8 联合调度 + 多引擎/多后端/多集群 + 租户/QoS/账本 | 目标 |
 
-关键的一句：**权威始终在 master，不在 kvcm。** kvcm 是 master 的 client 侧控制面封装——它读权威、按权威下指令，但它不是权威本身。它的价值在于「在权威之上加了一层决策与核验」，不在于持有记录。
+**权威始终在 master，不在 kvcm。** kvcm 是 master 的 client 侧控制面封装——读权威、按权威下指令，但它不是权威本身。它的价值在于「在权威之上加了一层决策与核验」，不在于持有记录。
+
+### 2.2 耦合点
+
+| | LMCache | UCM / FlexKV | kvcm |
+|---|---|---|---|
+| 耦合点 | connector-coupled | engine plugin / patch | **backend-coupled** |
+| 换引擎 | 要接 LMCache connector | 要改引擎或打 patch | 只要同一个 backend + key 对齐 |
+| 换 backend | 不适用 | 不适用 | 换 backend adapter |
+
+```text
+kvcm
+  → backend adapter
+  → Mooncake store / master
+
+vLLM / vLLM-Ascend / SGLang
+  → 各自的 connector / store
+  → 同一个 Mooncake 池
+```
+
+**kvcm 不依赖 connector；connector 是引擎接入池的方式。** 引擎用 UCM 还是 SGLang 原生 connector 把 KV 写进池，与 kvcm 无关——只要写进同一个池、key 算法一致。
+
+### 2.3 补丁是兼容性代价
+
+| 方案 | 负担形态 |
+|---|---|
+| UCM | 16 个版本补丁目录（[`patch/`](https://github.com/ModelEngine-Group/unified-cache-management/tree/develop/ucm/integration/vllm/patch)） |
+| FlexKV | 5 份 vLLM 补丁，377–528 行，最多触及 13 个 vLLM 文件（[`vllm_adaption/`](https://github.com/taco-project/FlexKV/tree/main/examples/vllm_adaption)） |
+| LMCache | 维护 [vLLM × LMCache 兼容矩阵](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/Installation_compatibility_matrix.csv) |
+| kvcm | 不打补丁 |
+
+**要碰 HBM，打 patch 或提 PR 无法避免；kvcm 暂时不做这个选择。** 代价是看不见 HBM/APC，收益是不跟引擎版本绑死。这两条是同一枚硬币的两面。
 
 ## 3. 四个问题
 
@@ -63,7 +94,7 @@ kvcm 占的就是这个位置：它是池的 client（拿得到权威与执行�
 | llm-d / Dynamo / AIBrix | 无 | 派生索引，只服务于选路 |
 | **kvcm** | **借用 master 的** | 自己不持记录，读 master、按 master 下指令 |
 
-kvcm 这一格容易读错，所以单独说：它读 `GetReplicaList` / `BatchGetReplicaList` 拿副本位置，用 `query_task` 核验任务，用账本记录自己发起的操作。**这三样都不是「权威」，是权威的使用者与观察者。**
+kvcm 读 `GetReplicaList` / `BatchGetReplicaList` 拿副本位置，用 `query_task` 核验任务，用账本记录自己发起的操作。这三样是权威的使用与观察，不是权威本身。
 
 ### 3.2 全局视野覆盖到哪
 
@@ -76,11 +107,11 @@ kvcm 这一格容易读错，所以单独说：它读 `GetReplicaList` / `BatchG
 | 跨引擎的前缀视图 | 有（目标） | D8 的 KVT 是 master 的派生视图 |
 | 多集群 | 目标，非现状 | 单集群设计 |
 
-第二行是最重要的限制。kvcm 选择待在池外，换来「不跟引擎版本绑死」，代价就是看不见引擎内部（§4）。
+第二行是最重要的限制。kvcm 选择待在池外，换来「不跟引擎版本绑死」，代价就是看不见引擎内部（§2.3）。
 
 ### 3.3 是否做全局管理
 
-不是「能不能 copy」，而是管不管放置、生命周期、预算、租户、QoS、账本。
+这一问看的不是能否 copy，而是管不管放置、生命周期、预算、租户、QoS、账本。
 
 | 方案 | 管什么 |
 |---|---|
@@ -103,52 +134,13 @@ L2 容量扩缩      —— 决定扩不扩  （D8，未实现；外部 HPA/KEDA
 
 Dynamo 是唯一在形态上做齐三层的（Smart Router + KVBM/KVCR + Planner），但它是三个组件拼装，且 KVBM 已 sunset、KVCR 接棒，三者之间靠 hint 与事件松耦合，不共享同一份预算与账本。
 
-## 4. 耦合与补丁
-
-### 4.1 耦合点
-
-这是 kvcm 和 LMCache 最关键的结构差别。
-
-| | LMCache | UCM / FlexKV | kvcm |
-|---|---|---|---|
-| 耦合点 | connector-coupled | engine plugin / patch | **backend-coupled** |
-| 换引擎 | 要接 LMCache connector | 要改引擎或打 patch | 只要同一个 backend + key 对齐 |
-| 换 backend | 不适用 | 不适用 | 换 backend adapter |
-
-```text
-kvcm
-  → backend adapter
-  → Mooncake store / master
-
-vLLM / vLLM-Ascend / SGLang
-  → 各自的 connector / store
-  → 同一个 Mooncake 池
-```
-
-所以：**kvcm 不依赖 connector；connector 是引擎接入池的方式。** 一个引擎用 UCM 还是 SGLang 原生 connector 把 KV 写进池，与 kvcm 无关——它们只要写进同一个池、key 算法一致即可。
-
-### 4.2 补丁是兼容性代价，不是主维度
-
-放在「接入负担」看就好，不要当架构轴。
-
-| 方案 | 负担形态 |
-|---|---|
-| UCM | 16 个版本补丁目录（[`patch/`](https://github.com/ModelEngine-Group/unified-cache-management/tree/develop/ucm/integration/vllm/patch)） |
-| FlexKV | 5 份 vLLM 补丁，377–528 行，最多触及 13 个 vLLM 文件（[`vllm_adaption/`](https://github.com/taco-project/FlexKV/tree/main/examples/vllm_adaption)） |
-| LMCache | 维护 [vLLM × LMCache 兼容矩阵](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/Installation_compatibility_matrix.csv) |
-| kvcm | 不打补丁 |
-
-一句话：**要碰 HBM，打 patch 或提 PR 无法避免；kvcm 暂时不做这个选择。** 代价是看不见 HBM/APC，收益是不跟引擎版本绑死。这两条是同一枚硬币的两面。
-
-## 5. 三个场景
-
-抽象说完，看三个具体场景。
+## 4. 三个场景
 
 ![分层归属与控制形态](kvcm-vs-oss/figures/fig-ownership.svg)
 
 （自绘图，由 [`kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`](kvcm-vs-oss/figures/plot_kvcm_vs_oss.py) 生成。红线上方是「KV 必须有引擎或请求才能存在」，下方是「池比引擎活得久」。kvcm 站在池这一行：它是池的调用方，不是池本身。全部图源与许可见 [`kvcm-vs-oss/figures/README.md`](kvcm-vs-oss/figures/README.md)。）
 
-### 5.1 引擎要下线（滚动升级、缩容、故障）
+### 4.1 引擎要下线（滚动升级、缩容、故障）
 
 | 方案 | 引擎下线时 KV 会怎样 | 为什么 |
 |---|---|---|
@@ -161,11 +153,11 @@ vLLM / vLLM-Ascend / SGLang
 
 KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进程，一家把 KV 交给池。
 
-### 5.2 引擎升级版本
+### 4.2 引擎升级版本
 
-见 §4.2 的补丁与矩阵表。核心差异不是「谁打的补丁少」，而是**接缝放在哪**：放引擎里就要跟版本，放池上就只跟 key 算法。
+见 §2.3 的补丁与矩阵表。核心差异在**接缝放在哪**：放引擎里就要跟版本，放池上就只跟 key 算法。
 
-### 5.3 下一轮请求提前量
+### 4.3 下一轮请求提前量
 
 | 方案 | 预取入口 | 能否脱离请求 |
 |---|---|---|
@@ -177,7 +169,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 
 保留用什么机制也不同：LMCache 用驱逐计划里的计数（`_pin_counts`，进程内存，重启即失），我们用池的 lease（master 计时，续租一停就过期，与 kvcm 进程无关）。
 
-## 6. 各家归类
+## 5. 各家归类
 
 | 项目 | 一句话 | 关键位置 |
 |---|---|---|
@@ -193,7 +185,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | AIBrix | K8s 平台积木，网关索引 + 引擎旁卸载 | 引擎 + 网关索引 |
 | **kvcm** | master 的 client 侧控制面：读权威、下指令、核验、记账 | 池外 |
 
-## 7. 今天与目标
+## 6. 今天与目标
 
 写清差距，避免把目标当成已有能力。
 
