@@ -37,7 +37,9 @@ Mooncake 已经是中心化放置，但依据和时机与我们不同。
 
 ## 2. kvcm 的角色
 
-### 2.1 三层身份
+### 2.1 四层身份
+
+同一件东西从「接入」看到「终局」是四个层次，层层加码，各自成立：
 
 | 层 | 是什么 | 现状 |
 |---|---|---|
@@ -76,9 +78,11 @@ vLLM / vLLM-Ascend / SGLang
 | UCM | 16 个版本补丁目录（[`patch/`](https://github.com/ModelEngine-Group/unified-cache-management/tree/develop/ucm/integration/vllm/patch)） |
 | FlexKV | 5 份 vLLM 补丁，377–528 行，最多触及 13 个 vLLM 文件（[`vllm_adaption/`](https://github.com/taco-project/FlexKV/tree/main/examples/vllm_adaption)） |
 | LMCache | 维护 [vLLM × LMCache 兼容矩阵](https://github.com/LMCache/LMCache/blob/main/docs/source/getting_started/Installation_compatibility_matrix.csv) |
-| kvcm | 不打补丁 |
+| kvcm | 自身不打引擎补丁；引擎接入池的已知 backport 仍要打（见 B.1.7） |
 
-**要碰 HBM，打 patch 或提 PR 无法避免；kvcm 暂时不做这个选择。** 代价是看不见 HBM/APC，收益是不跟引擎版本绑死。这两条是同一枚硬币的两面。
+**kvcm 自身不要求给引擎打补丁；引擎接入池仍可能有已知 backport，成本落在「引擎接入」这一步。** 差别在补丁作用的对象：UCM / FlexKV 的补丁改的是引擎内部（调度、显存管理），要跟着引擎版本走；kvcm 不动引擎，剩下的补丁属于「引擎怎么把 KV 写进池」，换不换 kvcm 都要做。
+
+要碰 HBM，打 patch 或提 PR 无法避免；kvcm 暂时不做这个选择。代价是看不见 HBM/APC，收益是不跟引擎版本绑死。这两条是同一枚硬币的两面。
 
 ## 3. 四个问题
 
@@ -117,7 +121,7 @@ kvcm 读 `GetReplicaList` / `BatchGetReplicaList` 拿副本位置，用 `query_t
 |---|---|
 | UCM / FlexKV | 这次请求怎么取 KV；范围在本机、本请求 |
 | MemCache / Mooncake | 池内放置与容量；按自身热度策略，不感知请求与预算 |
-| LMCache 协调器 | 自己的 L1/L2：fleet 目录、按实例预取、L2 配额与驱逐 |
+| LMCache 协调器 | L1 在 MP server 本地（逐实例驱逐）；协调器只管 L2 的配额、驱逐、预取、pin |
 | llm-d / Dynamo / AIBrix | 请求去哪；不碰 KV 字节 |
 | **kvcm** | 目标：KV 该在哪、活多久、给谁用。现状：按指令执行 + 保活 + 记账；放置决策仍靠人工或简单策略 |
 
@@ -132,7 +136,7 @@ LMCache 的 `mp_coordinator` 是这一维度上与我们最接近的实现：独
         → HTTP 动作下发到 MP server
 ```
 
-上游说明：[The LMCache Coordinator](https://tensormesh.ai/blog/lmcache-coordinator/)（2026-11-12）、[Multi-Server Coordination](https://docs.lmcache.ai/mp/coordinator.html)、[RFC #4226](https://github.com/LMCache/LMCache/issues/4226)。
+上游说明：[The LMCache Coordinator](https://blog.lmcache.ai/en/2026/11/11/the-lmcache-coordinator-a-control-plane-for-fleet-wide-kv-cache/)（2026-11-11）、[Multi-Server Coordination](https://docs.lmcache.ai/mp/coordinator.html)、[RFC #4226](https://github.com/LMCache/LMCache/issues/4226)。
 
 | 维度 | LMCache 做法 | 可借鉴 | 不能照搬 |
 |---|---|---|---|
@@ -149,6 +153,8 @@ LMCache 的 `mp_coordinator` 是这一维度上与我们最接近的实现：独
 
 两条对我们最直接的影响：事件管线缺 incarnation 维度（引擎重启后旧进程的迟到事件会把死位置写回视图）；`views` 与 `controllers` 的职责划分可以避免一个类包办决策与状态。
 
+**LMCache coordinator 是 kvcm 控制面最接近的同类；但它是 connector-coupled、事件目录、只覆盖自己的 L1/L2；kvcm 是 backend-coupled、master 权威、目标覆盖池 + 请求 + 容量。**
+
 ### 3.4 是否做请求 + KV + 扩缩联合调度
 
 这一条是开源侧普遍没有的，但也是我们尚未实现的。
@@ -164,9 +170,9 @@ Dynamo 是唯一在形态上做齐三层的（Smart Router + KVBM/KVCR + Planner
 
 ## 4. 三个场景
 
-![分层归属与控制形态](kvcm-vs-oss/figures/fig-ownership.svg)
+![数据依附于谁 × 策略在哪](kvcm-vs-oss/figures/fig-ownership.svg)
 
-（自绘图，由 [`kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`](kvcm-vs-oss/figures/plot_kvcm_vs_oss.py) 生成。红线上方是「KV 必须有引擎或请求才能存在」，下方是「池比引擎活得久」。kvcm 站在池这一行：它是池的调用方，不是池本身。全部图源与许可见 [`kvcm-vs-oss/figures/README.md`](kvcm-vs-oss/figures/README.md)。）
+（自绘图，由 [`kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`](kvcm-vs-oss/figures/plot_kvcm_vs_oss.py) 生成。纵轴是数据依附于谁、横轴是策略在哪：红线右边才拿得到池的权威，红线下面才不需要请求就能动 KV。kvcm 落在最下面一行 × 最右一列的交点上，但它是池的 client，不是池本身。全部图源与许可见 [`kvcm-vs-oss/figures/README.md`](kvcm-vs-oss/figures/README.md)。）
 
 ### 4.1 引擎要下线（滚动升级、缩容、故障）
 
@@ -183,7 +189,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 
 ### 4.2 引擎升级版本
 
-见 §2.3 的补丁与矩阵表。核心差异在**接缝放在哪**：放引擎里就要跟版本，放池上就只跟 key 算法。
+见 §2.3 的补丁与矩阵表。核心差异在**接缝放在哪**：放引擎里就要跟版本，放池上只需要对齐 key 算法——不过「引擎接入池」这一步仍可能有已知 backport（§2.3）。
 
 ### 4.3 下一轮请求提前量
 
@@ -205,7 +211,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | FlexKV | 引擎旁卸载库，管「这台机的 KV 放哪层」 | 引擎进程内 |
 | MemCache | 昇腾对象池，MetaService 管分配与副本 | 池（本身是池） |
 | Mooncake | 对象池 + 传输引擎；master 持副本权威，动态副本按热度 | 池（本身是池） |
-| LMCache | 独立协调器 + 进程内 MP server，管自己的 L1/L2 | 引擎侧 server 进程 + 协调器 |
+| LMCache | 独立协调器 + 进程内 MP server；L1 在 server 本地，协调器管 L2 的配额 / 驱逐 / 预取 / pin | 引擎侧 server 进程 + 协调器 |
 | vLLM / SGLang | 请求信封的传输层，action 执行未接 | 请求 |
 | KVCR | 引擎内二级存储 + hint 驱动 P2P + Guard 容错 | Guard 进程 |
 | llm-d EPP | 路由层，逐块索引 + 插件化打分 | 不持有 KV |
@@ -295,6 +301,16 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 
 协调器是独立进程（`lmcache/v1/mp_coordinator/`），与引擎进程分开部署，只持元数据与命令面。
 
+![LMCache coordinator 数据流](kvcm-vs-oss/figures/fig-lmcache-coordinator.svg)
+
+（**本仓自绘**，按图意重绘，未复制原图：事实以事件流入、决策以 HTTP 流出——event gate → broadcaster → views / controllers → 动作回到 MP server。重绘自 [The LMCache Coordinator](https://blog.lmcache.ai/en/2026/11/11/the-lmcache-coordinator-a-control-plane-for-fleet-wide-kv-cache/)（2026-11-11）与 [Multi-Server Coordination](https://docs.lmcache.ai/mp/coordinator.html)。这两处的配图是博文插图，页面未声明可复用许可，因此不复制原图，只按图意重绘。）
+
+![LMCache MP 模式与 Mooncake L2 adapter](kvcm-vs-oss/figures/fig-lmcache-mp-l2.svg)
+
+（**本仓自绘**，按图意重绘：vLLM worker → MP server（ZMQ RPC / L1 Manager / StoreController / PrefetchController）→ L2 adapter 层 → Mooncake store 等后端。重绘自 [当开源遇见开源：LMCache 与 Mooncake 的一次双向奔赴](https://blog.lmcache.ai/zh/2026/05/26/%E5%BD%93%E5%BC%80%E6%BA%90%E9%81%87%E8%A7%81%E5%BC%80%E6%BA%90%EF%BC%9Almcache-%E4%B8%8E-mooncake-%E7%9A%84%E4%B8%80%E6%AC%A1%E5%8F%8C%E5%90%91%E5%A5%94%E8%B5%B4/)（2026-05-26）与 [Mooncake | LMCache](https://docs.lmcache.ai/kv_cache/mooncake.html)；许可判断同上。）
+
+这张图定下了 L1 / L2 的归属：**L1 的驱逐在 MP server 本地，L2 的配额、驱逐、预取、pin 才归 coordinator。**
+
 和 Mooncake master 的差别在一个维度：master 对外提供 `CreateCopyTask` / `CreateMoveTask`，知道副本挂在哪个 segment，能按段指派搬迁；协调器没有对等的搬迁能力，它只知道「这个实例有这个 tier 的这个 backend 上有一份」，粒度为实例而非段，命令面只有预取 / pin / 删除 / 配额。
 
 | 事实 | 出处 |
@@ -303,14 +319,14 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | 独立进程、FastAPI 服务，默认只监听回环 | `lmcache/v1/mp_coordinator/app.py::create_app`；`docs/source/mp/coordinator.rst`（默认 `127.0.0.1:9300`） |
 | fleet 级 key 目录，事件派生、最终一致，**答案只是 hint，必须在 owner 处验证** | `views/key_directory.py::KeyDirectory`（docstring: "Eventually consistent: lookups are hints to be validated at the owner"）、`lookup` |
 | 目录只由 CacheEvent 批次构建，可 checkpoint / 回放 | `ingest/event_gate.py::EventGate`、`cache_events.py::CacheEventSink`、`events_replay.py::replay`、`persistence/checkpoint.py` |
-| 实例注册与心跳、超时剔除 | `http_apis/instances_api.py`、`views/instance_registry.py::InstanceRegistry`、`registrar.py::keep_registered`；30s 无心跳（每 10s 检查一次）即剔除并 fence 其 L1 条目（[blog](https://tensormesh.ai/blog/lmcache-coordinator/)） |
+| 实例注册与心跳、超时剔除 | `http_apis/instances_api.py`、`views/instance_registry.py::InstanceRegistry`、`registrar.py::keep_registered`；30s 无心跳（每 10s 检查一次）即剔除并 fence 其 L1 条目（[blog](https://blog.lmcache.ai/en/2026/11/11/the-lmcache-coordinator-a-control-plane-for-fleet-wide-kv-cache/)） |
 | 预取能指定实例 | `http_apis/cache_api.py::request_prefetch`（body 带 `instance_id`；未知实例 404）、`controllers/prefetch_manager.py::PrefetchManager.submit_prefetch` |
 | L1 驱逐在每个 MP server 本地，coordinator 只做 L2 | `distributed/storage_manager.py` 建 `L1EvictionController`（`eviction_policy/` 可选 `arc` / `lru` / `isolated_lru` / `noop`）；coordinator 侧 `controllers/eviction_controller.py::FleetEvictionController` 的 docstring 写 "Per-cache_salt L2 eviction controller for the fleet" |
 | pin 是「排除在自己 L2 驱逐计划外」的计数，不是按时间续租 | `FleetEvictionController.pin`（`_pin_counts`）、`controllers/eviction_http_api.py::request_pin` |
 | 无 lease / keepalive 语义 | `grep -rni "lease\|keepalive" lmcache/v1/mp_coordinator/` 仅命中无关的 `_release_locked` |
 | checkpoint 默认 60s；quota / pin 立即落 metadata | `mp_coordinator/config.py::CoordinatorConfig.checkpoint_interval` 默认 `60.0`；`0` 表示关闭 |
 | `/healthz` 恒返回 healthy，不做降级判断 | `http_apis/health_api.py::healthz` 直接 `return {"status": "healthy"}` |
-| 今天无 move；roadmap 要加 promote / demote / move / duplicate | 当前路由：`/cache/prefetches`、`/cache/pins`、`/cache/delete`、`/quota*`、`/directory/*`、`/instances*`、`/events`、`/config/chunk-size`、`/status`、`/metrics`、`/healthz`；动作面 roadmap 见 [blog](https://tensormesh.ai/blog/lmcache-coordinator/) 的 future directions 表（"Action: Delete, pin and warm prefetch → Promote, demote, move, duplicate KV across nodes"） |
+| 今天无 move；roadmap 要加 promote / demote / move / duplicate | 当前路由：`/cache/prefetches`、`/cache/pins`、`/cache/delete`、`/quota*`、`/directory/*`、`/instances*`、`/events`、`/config/chunk-size`、`/status`、`/metrics`、`/healthz`；动作面 roadmap 见 [blog](https://blog.lmcache.ai/en/2026/11/11/the-lmcache-coordinator-a-control-plane-for-fleet-wide-kv-cache/) 的 future directions 表（"Action: Delete, pin and warm prefetch → Promote, demote, move, duplicate KV across nodes"） |
 
 ### A.4 请求信封：vLLM / SGLang / KVCR
 
