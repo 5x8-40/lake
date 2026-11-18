@@ -301,15 +301,37 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 
 协调器是独立进程（`lmcache/v1/mp_coordinator/`），与引擎进程分开部署，只持元数据与命令面。
 
-![LMCache coordinator 数据流](kvcm-vs-oss/figures/fig-lmcache-coordinator.svg)
+**coordinator 的内部数据流**（上游原图，[The LMCache Coordinator](https://blog.lmcache.ai/en/2026/11/11/the-lmcache-coordinator-a-control-plane-for-fleet-wide-kv-cache/)，© LMCache authors）：
 
-（**本仓自绘**，按图意重绘，未复制原图：事实以事件流入、决策以 HTTP 流出——event gate → broadcaster → views / controllers → 动作回到 MP server。重绘自 [The LMCache Coordinator](https://blog.lmcache.ai/en/2026/11/11/the-lmcache-coordinator-a-control-plane-for-fleet-wide-kv-cache/)（2026-11-11）与 [Multi-Server Coordination](https://docs.lmcache.ai/mp/coordinator.html)。这两处的配图是博文插图，页面未声明可复用许可，因此不复制原图，只按图意重绘。）
+![LMCache coordinator 数据流](kvcm-vs-oss/figures/upstream-lmcache-coordinator.png)
 
-![LMCache MP 模式与 Mooncake L2 adapter](kvcm-vs-oss/figures/fig-lmcache-mp-l2.svg)
+这张图自上而下四段，值得逐个对着看：
 
-（**本仓自绘**，按图意重绘：vLLM worker → MP server（ZMQ RPC / L1 Manager / StoreController / PrefetchController）→ L2 adapter 层 → Mooncake store 等后端。重绘自 [当开源遇见开源：LMCache 与 Mooncake 的一次双向奔赴](https://blog.lmcache.ai/zh/2026/05/26/%E5%BD%93%E5%BC%80%E6%BA%90%E9%81%87%E8%A7%81%E5%BC%80%E6%BA%90%EF%BC%9Almcache-%E4%B8%8E-mooncake-%E7%9A%84%E4%B8%80%E6%AC%A1%E5%8F%8C%E5%90%91%E5%A5%94%E8%B5%B4/)（2026-05-26）与 [Mooncake | LMCache](https://docs.lmcache.ai/kv_cache/mooncake.html)；许可判断同上。）
+| 图中的位置 | 内容 | 对 kvcm 的意义 |
+|---|---|---|
+| 顶部 MP servers | 每节点一个，L1 DRAM + L2 盘或 S3 | 字节在这里；coordinator 不碰字节 |
+| 中间两条输入 | 左：`POST /events` 或 Kafka（按 instance_id 分区）；右：运维调 REST API | 两个输入源：机器事实与人的意图 |
+| coordinator 内：event gate → broadcaster | 按 seq 去重、识别 incarnation（重启）、标记缺口；然后按序分发 | 这是我们要借鉴的事件管线，尤其 incarnation 那一维 |
+| 分叉成 views / controllers | views 记「什么是真的」（registry / key directory / usage），controllers 记「该做什么」（驱逐 / 预取 / 可插拔），中间一个 `read` 箭头 | 视图与决策分离，控制器读视图但不合并成一个类 |
+| 底部两个文件 | checkpoint（views / LRU / 游标，每 60s）挂在 views 下；metadata（配额与 pin 这类意图，改动即落）挂在 controllers 下 | 派生状态与 operator intent 分开持久化 |
+| 右侧回流绿箭头 | `decisions go back as plain HTTP calls` | 决策以普通 HTTP 回到 server，不经过请求路径 |
 
-这张图定下了 L1 / L2 的归属：**L1 的驱逐在 MP server 本地，L2 的配额、驱逐、预取、pin 才归 coordinator。**
+一句话读法：**事实从左边进来，决定从右边出去，中间没有任何一格在推理请求的路径上。**
+
+**MP 模式的整体结构**（上游原图，[当开源遇见开源：LMCache 与 Mooncake 的一次双向奔赴](https://blog.lmcache.ai/zh/2026/05/26/%E5%BD%93%E5%BC%80%E6%BA%90%E9%81%87%E8%A7%81%E5%BC%80%E6%BA%90%EF%BC%9Almcache-%E4%B8%8E-mooncake-%E7%9A%84%E4%B8%80%E6%AC%A1%E5%8F%8C%E5%90%91%E5%A5%94%E8%B5%B4/)，© LMCache authors）：
+
+![LMCache MP 模式与 Mooncake L2 adapter](kvcm-vs-oss/figures/upstream-lmcache-mp-l2.png)
+
+四层，说明的是「谁管什么」：
+
+| 层 | 有什么 | 归属 |
+|---|---|---|
+| vLLM worker | worker 0 / 1 / N | 引擎侧；同节点多个 worker 共用一个 server |
+| LMCache MP server | ZMQ RPC 层（`STORE` / `LOOKUP` / `RETRIEVE`）、L1 Manager（CPU 共享内存池）、StoreController（L1 → L2 异步推）、PrefetchController（L2 → L1 异步拉） | L1 与它的驱逐就在这里 |
+| L2 Adapter 层 | `fs` / `nixl_store` / `mooncake_store` / `s3` … 统一接口、可插拔 | 适配层，不含策略 |
+| 外部存储 | 本地 FS/NVMe、NIXL、Mooncake store（RDMA/TCP）、S3/MinIO | 字节的落点与副本 |
+
+**L1 的驱逐在 MP server 本地，L2 的配额、驱逐、预取、pin 才归 coordinator。** 这个分工是 coordinator 那张图之外最容易搞混的一点：coordinator 管的是 fleet 级的 L2 策略，不是每台机器 L1 里逐出哪一块。
 
 和 Mooncake master 的差别在一个维度：master 对外提供 `CreateCopyTask` / `CreateMoveTask`，知道副本挂在哪个 segment，能按段指派搬迁；协调器没有对等的搬迁能力，它只知道「这个实例有这个 tier 的这个 backend 上有一份」，粒度为实例而非段，命令面只有预取 / pin / 删除 / 配额。
 

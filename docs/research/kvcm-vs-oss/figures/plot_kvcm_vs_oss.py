@@ -24,10 +24,9 @@ Noto Sans CJK 即可，例如：
     fig-control-placement.svg    部件图：策略在引擎内 vs 在池的 client 上
     fig-evidence.svg             证据图：控制权矩阵 + hint 落地时间线
     fig-ucm-schematic.svg        UCM 分层示意（重绘自上游 architecture.svg）
-    fig-lmcache-coordinator.svg  LMCache coordinator 数据流（重绘自上游博文）
-    fig-lmcache-mp-l2.svg        LMCache MP 模式 + Mooncake L2 adapter（重绘自上游博文）
 
 图内文字用中文；项目名、API 名、字段名保留英文原样。
+本目录另有两张 LMCache 的上游原图（upstream-lmcache-*.png），不由本脚本生成。
 """
 
 from __future__ import annotations
@@ -526,231 +525,7 @@ def _thin(ax, xy1, xy2, color="#4e8a4a", ls="-", scale=8):
         color=color, linestyle=ls, shrinkA=1, shrinkB=1))
 
 
-def lmcache_coordinator() -> None:
-    """事件流入、HTTP 动作流出：event gate → broadcaster → views / controllers。"""
-    fig, ax = plt.subplots(figsize=(10.6, 8.6))
-    ax.set_xlim(0, 1.13)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
-    ax.set_title(t("LMCache coordinator：事实以事件流入，决策以 HTTP 调用流出（重绘）",
-                   "LMCache coordinator: facts in as events, decisions out as HTTP"),
-                 fontsize=10.6, pad=12)
 
-    # MP servers（数据面）
-    ax.add_patch(FancyBboxPatch((0.03, 0.815), 0.69, 0.135,
-                                boxstyle="round,pad=0.004,rounding_size=0.010",
-                                fc="#f4faf3", ec="#3f7a3a", linewidth=1.1))
-    ax.text(0.042, 0.937, t("MP server，每节点一个（数据面）",
-                            "MP servers, one per node (data plane)"),
-            fontsize=7.4, fontweight="bold", color="#1f4d1c", va="top")
-    for i, nm in enumerate(["1", "2", "N"]):
-        x = 0.045 + i * 0.228
-        _gbox(ax, x, 0.826, 0.205, 0.083, f"MP server {nm}",
-              t("KV 缓存：L1 DRAM，L2 磁盘或 S3",
-                "KV cache: L1 DRAM, L2 disk or S3"), fs=6.6, body_fs=5.7)
-    ax.text(0.695 + 0.012, 0.865, "…", fontsize=9, color="#1f4d1c", va="center")
-
-    # 事件传输 / 运维入口
-    _gbox(ax, 0.03, 0.680, 0.335, 0.100,
-          t("事件传输", "Event transport"),
-          t("cache event：POST /events\n或 Kafka（按 instance_id 分区）",
-            "cache events: POST /events\nor Kafka keyed by instance_id"),
-          fc="#eef2f9", ec="#4a6fa5", fs=6.8, body_fs=5.8, tc="#26405f")
-    _gbox(ax, 0.395, 0.680, 0.325, 0.100,
-          t("运维 / 调度器", "Operators, schedulers"),
-          t("调 REST API 下指令", "issue commands over the REST API"),
-          fc="#fdf3e0", ec="#b58a3a", fs=6.8, body_fs=5.8, tc="#7a5a1c")
-
-    # coordinator 主框
-    ax.add_patch(FancyBboxPatch((0.03, 0.100), 0.93, 0.545,
-                                boxstyle="round,pad=0.004,rounding_size=0.010",
-                                fc="#fbfbfd", ec="#4a4a4a", linewidth=1.2,
-                                linestyle=(0, (7, 4))))
-    ax.text(0.952, 0.634, t("coordinator（独立 FastAPI 进程，默认 127.0.0.1:9300）",
-                            "coordinator (standalone FastAPI, 127.0.0.1:9300)"),
-            ha="right", fontsize=6.9, fontweight="bold", color="#333333", va="top")
-
-    _gbox(ax, 0.055, 0.545, 0.885, 0.058,
-          t("Event gate：按 per-server seq 去重、识别 incarnation（重启）、标记缺口",
-            "Event gate: dedup by seq, fence restarts, flag gaps"),
-          fs=6.7, fc="#fdf3e0", ec="#b58a3a", tc="#7a5a1c")
-    _gbox(ax, 0.055, 0.468, 0.885, 0.058,
-          t("Broadcaster：把准入的批次按序分发给订阅者",
-            "Broadcaster: hands admitted batches to consumers, in order"),
-          fs=6.7, fc="#eef7ec", ec="#4e8a4a")
-
-    _gbox(ax, 0.055, 0.245, 0.420, 0.200,
-          t("views：什么是真的", "Views: what is true"),
-          t("registry：谁活着、在哪\nkey directory：每个 key 在哪\n"
-            "usage：按租户 / 按实例的字节与命中",
-            "registry: who is alive, where\nkey directory: where each key lives\n"
-            "usage: bytes and hits per tenant / server"),
-          fs=7.0, body_fs=5.9)
-    _gbox(ax, 0.520, 0.245, 0.420, 0.200,
-          t("controllers：该做什么（可插拔）", "Controllers: what to do (pluggable)"),
-          t("驱逐：配额、LRU 序、pin\n预取：把 L1 预热到指名实例\n"
-            "自己的：从任意包加载",
-            "eviction: quotas, LRU order, pins\nprefetch: warm L1 on a named instance\n"
-            "your own: loaded from any package"),
-          fs=7.0, body_fs=5.9, fc="#e8f4e5", ec="#2f6b2a")
-
-    _gbox(ax, 0.055, 0.110, 0.420, 0.120,
-          t("checkpoint 文件", "Checkpoint file"),
-          t("views、LRU 序、Kafka offset；\n每 60s 落一次",
-            "views, LRU order, Kafka offset;\nevery 60 s"),
-          fs=6.7, body_fs=5.8, fc="#f2f2f2", ec="#777777", tc="#3a3a3a")
-    _gbox(ax, 0.520, 0.110, 0.420, 0.120,
-          t("metadata 文件", "Metadata file"),
-          t("配额与 pin 这类 intent；\n每次改动即落",
-            "quotas and pins; saved on every change"),
-          fs=6.7, body_fs=5.8, fc="#f2f2f2", ec="#777777", tc="#3a3a3a")
-
-    # 连线
-    _thin(ax, (0.197, 0.815), (0.197, 0.782))            # servers -> transport
-    _thin(ax, (0.197, 0.680), (0.197, 0.603))            # transport -> gate
-    _thin(ax, (0.557, 0.680), (0.557, 0.603), color="#b58a3a")
-    _thin(ax, (0.497, 0.545), (0.497, 0.526))            # gate -> broadcaster
-    _thin(ax, (0.497, 0.468), (0.265, 0.445))            # broadcaster -> views
-    _thin(ax, (0.497, 0.468), (0.730, 0.445))            # broadcaster -> controllers
-    _thin(ax, (0.475, 0.345), (0.520, 0.345), color="#2f6b2a", ls=(0, (3, 2)))
-    ax.text(0.4975, 0.355, t("读", "reads"), ha="center", va="bottom",
-            fontsize=5.6, color="#2f6b2a")
-
-    # 决策回流：沿右侧独立通道回到 MP server
-    _thick(ax, (0.940, 0.345), (1.055, 0.345), color="#2f6b2a")
-    _thick(ax, (1.055, 0.345), (1.055, 0.878), color="#2f6b2a")
-    _thick(ax, (1.055, 0.878), (0.725, 0.878), color="#2f6b2a")
-    ax.text(1.072, 0.600, t("决策以普通 HTTP 调用下发到 MP server",
-                            "decisions go back as plain HTTP calls"),
-            rotation=90, ha="center", va="center", fontsize=6.6, color="#2f6b2a")
-
-    ax.text(0.03, 0.030,
-            t("重绘自 The LMCache Coordinator（blog.lmcache.ai，2026-11-11）与 "
-              "docs.lmcache.ai/mp/coordinator.html；\n"
-              "本图按图意重绘为中文示意，未复制原图，原图版权归 LMCache 作者。\n"
-              "coordinator 不在请求路径上：它挂了，推理照常运行，只有 fleet 级功能等它回来。",
-              "Redrawn from The LMCache Coordinator (blog.lmcache.ai, 2026-11-11) and "
-              "docs.lmcache.ai/mp/coordinator.html."),
-            fontsize=6.0, color="#5a5a5a", va="bottom", linespacing=1.65)
-    fig.savefig(HERE / "fig-lmcache-coordinator.svg", format="svg")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# 5. LMCache MP 模式 + Mooncake L2 adapter（重绘）
-# ---------------------------------------------------------------------------
-
-def lmcache_mp_l2() -> None:
-    """引擎 → MP server（L1 Manager / Store / Prefetch）→ L2 adapter → 后端。"""
-    fig, ax = plt.subplots(figsize=(10.6, 8.2))
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
-    ax.set_title(t("LMCache MP 模式：L1 在 server 本地，L2 经 adapter 落 Mooncake store（重绘）",
-                   "LMCache MP mode with a Mooncake L2 adapter (redrawn)"),
-                 fontsize=10.2, pad=12)
-
-    # vLLM workers
-    ax.add_patch(FancyBboxPatch((0.04, 0.865), 0.92, 0.105,
-                                boxstyle="round,pad=0.004,rounding_size=0.010",
-                                fc="#eef7ec", ec="#4e8a4a", linewidth=1.0))
-    ax.text(0.052, 0.960, t("vLLM worker 进程", "vLLM worker processes"),
-            fontsize=7.0, fontweight="bold", color="#1f4d1c", va="top")
-    for i, nm in enumerate(["0", "1", "N"]):
-        _box(ax, 0.070 + i * 0.300, 0.872, 0.240, 0.052,
-             f"vLLM worker {nm}", fc="#ffffff", fs=6.8, ec="#4e8a4a")
-    ax.text(0.905, 0.898, "…", fontsize=9, color="#1f4d1c", va="center", ha="center")
-
-    # MP server
-    ax.add_patch(FancyBboxPatch((0.04, 0.430), 0.92, 0.400,
-                                boxstyle="round,pad=0.004,rounding_size=0.010",
-                                fc="#fdfaf2", ec="#b58a3a", linewidth=1.2))
-    ax.text(0.052, 0.818, t("LMCache MP server（独立进程）",
-                            "LMCache MP server (separate process)"),
-            fontsize=7.0, fontweight="bold", color="#7a5a1c", va="top")
-
-    _box(ax, 0.065, 0.745, 0.870, 0.052,
-         t("ZMQ RPC 层（vLLM worker 与本进程之间）：STORE / LOOKUP / RETRIEVE",
-           "ZMQ RPC layer: STORE / LOOKUP / RETRIEVE"),
-         fc="#ffffff", fs=6.6, ec="#b58a3a")
-
-    _gbox(ax, 0.065, 0.590, 0.250, 0.130,
-          "StoreController", t("L1 → L2\n异步推送", "L1 → L2 async push"),
-          fs=6.6, body_fs=6.0)
-    _gbox(ax, 0.345, 0.575, 0.310, 0.160,
-          t("L1 Manager", "L1 Manager"),
-          t("CPU 共享内存池，\n本节点所有 worker 共用",
-            "CPU shared memory pool,\nshared by every worker on the node"),
-          fs=7.0, body_fs=6.0, fc="#e8f4e5", ec="#2f6b2a")
-    _gbox(ax, 0.685, 0.590, 0.250, 0.130,
-          "PrefetchController", t("L2 → L1\n异步拉回", "L2 → L1 async load"),
-          fs=6.6, body_fs=6.0)
-
-    ax.add_patch(FancyBboxPatch((0.065, 0.445), 0.870, 0.125,
-                                boxstyle="round,pad=0.004,rounding_size=0.008",
-                                fc="#f7f7fb", ec="#4a6fa5", linewidth=1.0,
-                                linestyle=(0, (5, 3))))
-    ax.text(0.075, 0.560, t("L2 Adapter 层（可插拔，统一接口 L2AdapterInterface）",
-                            "L2 adapter layer (pluggable, L2AdapterInterface)"),
-            fontsize=6.4, fontweight="bold", color="#26405f", va="top")
-    for i, nm in enumerate(["fs adapter", "nixl_store adapter",
-                            "mooncake_store adapter", "s3 · mock …"]):
-        hot = nm == "mooncake_store adapter"
-        _box(ax, 0.078 + i * 0.213, 0.455, 0.196, 0.052, nm,
-             fc="#fdeacd" if hot else "#ffffff", fs=5.9,
-             ec="#c47a1a" if hot else "#4a6fa5",
-             weight="bold" if hot else "normal")
-
-    # 外部存储
-    ax.text(0.045, 0.400, t("外部存储（L2）", "External storage (L2)"),
-            fontsize=7.0, fontweight="bold", color="#26405f", va="top")
-    backends = [
-        (t("本地 FS / NVMe", "Local FS / NVMe"), "#ffffff", "#4a6fa5", False),
-        (t("NIXL（GDS / HF3FS / 对象）", "NIXL (GDS / HF3FS / OBJ)"), "#ffffff", "#4a6fa5", False),
-        (t("Mooncake store\nRDMA 分布式 KV", "Mooncake store\nRDMA distributed KV"),
-         "#fdeacd", "#c47a1a", True),
-        (t("S3 / MinIO", "S3 / MinIO"), "#ffffff", "#4a6fa5", False),
-    ]
-    for i, (nm, fc, ec, hot) in enumerate(backends):
-        _box(ax, 0.078 + i * 0.213, 0.255, 0.196, 0.110, nm, fc=fc, fs=6.0, ec=ec,
-             weight="bold" if hot else "normal")
-
-    # 数据路径
-    for i in range(3):
-        _thin(ax, (0.190 + i * 0.300, 0.865), (0.190 + i * 0.300, 0.836))
-    _thin(ax, (0.190, 0.745), (0.190, 0.722))
-    _thin(ax, (0.500, 0.745), (0.500, 0.737))
-    _thin(ax, (0.810, 0.745), (0.810, 0.722))
-    _thin(ax, (0.190, 0.590), (0.190, 0.572))
-    _thin(ax, (0.810, 0.590), (0.810, 0.572))
-    _thick(ax, (0.315, 0.655), (0.345, 0.655))
-    _thick(ax, (0.655, 0.655), (0.685, 0.655))
-    for i in (0, 1, 2, 3):
-        cx = 0.176 + i * 0.213
-        _thick(ax, (cx, 0.445), (cx, 0.368),
-               color="#c47a1a" if i == 2 else "#4a6fa5")
-        ax.text(cx + 0.006, 0.406, "RDMA / TCP" if i == 2 else "",
-                fontsize=5.2, color="#a8641a", va="center")
-
-    ax.text(0.045, 0.165,
-            t("粗线 = 数据路径　　细线 = 异步控制。一次 store 常涉及成百上千个 chunk，"
-              "所以 adapter 侧做批量下发，并按操作类型分 worker 池。\n"
-              "重绘自《当开源遇见开源：LMCache 与 Mooncake 的一次双向奔赴》"
-              "（blog.lmcache.ai，2026-05-26）与 docs.lmcache.ai/kv_cache/mooncake.html；\n"
-              "本图按图意重绘为中文示意，未复制原图，原图版权归 LMCache 作者。"
-              "与 coordinator 的分工：L1 驱逐 / LRU 在 MP server 本地，"
-              "L2 的配额 / 驱逐 / 预取 / pin 才归 coordinator。",
-              "thick = data path    thin = async control. "
-              "Redrawn from the LMCache x Mooncake MP-mode post (blog.lmcache.ai, 2026-05-26) "
-              "and docs.lmcache.ai/kv_cache/mooncake.html."),
-            fontsize=6.0, color="#4a4a4a", va="top", linespacing=1.65)
-    fig.savefig(HERE / "fig-lmcache-mp-l2.svg", format="svg")
-    plt.close(fig)
-
-
-# ---------------------------------------------------------------------------
-# 6. 部件级对照：策略在引擎内 vs 在池的 client 上
-# ---------------------------------------------------------------------------
 
 def _panel(ax, title, subtitle, strategy_side):
     """画一侧。两侧都画两个引擎共享同一个池，只让「策略块在哪」不同。"""
@@ -913,15 +688,11 @@ def main() -> None:
     control_placement()
     evidence()
     ucm_schematic()
-    lmcache_coordinator()
-    lmcache_mp_l2()
     for name in (
         "fig-ownership.svg",
         "fig-control-placement.svg",
         "fig-evidence.svg",
         "fig-ucm-schematic.svg",
-        "fig-lmcache-coordinator.svg",
-        "fig-lmcache-mp-l2.svg",
     ):
         print(f"wrote {HERE / name}")
 
