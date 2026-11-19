@@ -1,6 +1,6 @@
 # LMCache — 跨实例复用与存储后端
 
-> 源码:`lmcache/v1/`、`csrc/storage_backends/`、`rust/`、`lmcache/v1/mp_coordinator/`(2026-11-13 快照 `58c11e38`;submodule gitlink 仍固定 `9229067c`)。
+> 源码:`lmcache/v1/`、`csrc/storage_backends/`、`rust/`、`lmcache/v1/mp_coordinator/`(2026-11-13 快照 `58c11e38`)。submodule gitlink 仍固定 `9229067c`(2026-07-13,InProcess 时代布局),与本文引用的 `dev` 分支不是同一棵树;本文以 `dev` 为准。
 
 ## 缓存键与匹配
 
@@ -18,6 +18,7 @@
    - `impl/mooncake_te_impl.py`::`MooncakeTeTransferChannelClient` — Mooncake transfer engine。
    - "谁有哪些 chunk"由 MP coordinator 的 `KeyDirectory` 提供(事件派生、最终一致)。
    - 前提:必须有 coordinator,且 L1 须为一整段连续区域 → 与 GDS L1、Device-DAX L1 互斥,见 [mp/p2p.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/p2p.rst)。
+   - **落点是本节点 L1(CPU pinned DRAM),不是显存。** `p2p.rst`: "The transfer is a one-sided RDMA read from the requesting node into its own L1"。之后再由 H2D 进 HBM,所以跨节点读是两跳。L1 的定义见 [`l1_manager/dram.py`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/l1_manager/dram.py)::`DramL1Manager`("Pinned-DRAM L1 manager")。RDMA 直写显存需要 GPUDirect RDMA,当前没有:`api.py` 的 `MemoryResidency.VRAM` 注释写 "Reserved for GDS/GDR L2 adapters; nothing reports it yet"。
 3. **PD disagg**:由引擎侧 `MultiConnector` 并列 `NixlConnector` 与 `LMCacheMPConnector` 组合,不是 LMCache 自己的后端,见 [mp/disaggregated_prefill.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/disaggregated_prefill.rst)。
 
 ## 存储后端
@@ -59,6 +60,7 @@ C++ 写一次,MP 与 InProcess 两种模式复用——这是与"引擎侧 KV co
 
 ## 分层与配额
 
+- **介质**:L1 默认是 **CPU pinned DRAM**(`l1_manager/dram.py`::`DramL1Manager`,docstring "Pinned-DRAM L1 manager"),另有 `GdsL1Manager`(NVMe slab,走 GPUDirect **Storage**)与 `DevDaxL1Manager`(Device-DAX slab)。**L1 不在 GPU 显存里**,引擎 HBM 只是 KV 的来源与去向(`gpu_connector/` 负责 H2D/D2H)。
 - `distributed/storage_manager.py`::`StorageManager` + 多 `L1Manager` + 多 `L2Adapter` + `storage_controllers/` 下的 `StoreController` / `PrefetchController` / `EvictionController`。tier 词汇 `distributed/api.py`::`Tier{L1,L2,ALL}`。
 - `QuotaManager`(`distributed/quota_manager.py`)按 `cache_salt` 记配额,HTTP 面在 MP server 的 `/quota/{cache_salt}`。
 - `storage_controllers/store_policy.py`::`StorePolicy` 决定写哪些 adapter。
