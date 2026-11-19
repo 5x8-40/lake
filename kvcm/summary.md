@@ -270,12 +270,12 @@
 **开源方案对比（调研）** — 见 [../docs/research/kvcm-vs-oss.md](../docs/research/kvcm-vs-oss.md)
 
 - 定位：不是「补哪个功能」的问题，而是缺一个同时「看得见请求」与「拿得到池权威」的位置。全篇按这个位置展开，逐家给到符号级出处。
-- **必要性**（§1）：请求侧需求、池侧库存、执行能力三类信息分属三个系统，开源栈里没有任何组件同时握有两者以上；补丁负担由此而来。中心化不等于会决策——Mooncake 的动态副本依据「过去的热度」，kvcm 要依据「未来的需求」，差别在中心的输入。
+- **必要性**（§1）：请求侧需求、池侧库存、执行能力三类信息分属三个系统，主流开源栈里没有单一组件同时握有三类信息；补丁负担由此而来。中心化不等于会决策——Mooncake 的动态副本依据「过去的热度」，kvcm 要依据「未来的需求」，差别在中心的输入。
 - **角色与耦合**（§2）：四层身份（接入身份 / 逻辑角色 / 控制面 / 终局），权威始终在 master；耦合点是 backend 而非 connector；UCM / FlexKV 的补丁改引擎内部、要跟版本走，kvcm 不动引擎，引擎接入池的已知 backport 仍要打。
-- **四个问题**（§3）：元数据有没有权威中心、全局视野覆盖到哪、是否做全局管理、是否做请求 + KV + 扩缩联合调度。按「数据归属」讲不清差异，按这四问可以。LMCache coordinator 是最接近的同类，但 connector-coupled、事件目录、只覆盖自己的 L1/L2。
+- **四个问题**（§3）：元数据有没有权威中心、全局视野覆盖到哪、是否做全局管理、是否做请求 + KV + 扩缩联合调度。按「数据归属」讲不清差异，按这四问可以。LMCache coordinator 是最接近的同类，但 connector-coupled、事件目录、L1 本地 + L2 fleet；不能照搬它的权威与耦合点。
 - **三个场景**（§4）：引擎下线、引擎升级版本、下一轮请求的提前量。下线场景最能区分——KVCR 用 Guard 旁挂进程接管，kvcm 把 KV 交给池。
 - **今天与目标**（§6）：今天只是「按指令执行 + 核验 + 记账」的控制面，目标才是 Fabric；差距几乎全在 D8。短板见 §3.2 与附录 B（看不见引擎 HBM/APC、`retain` 未接、copy/move 无取消、soft pin 无 ABI 闸、key 要自己与引擎逐字节对齐）。
-- 附件：§4 一张主线图（数据依附于谁 × 策略在哪，自绘）；附录 A 四张上游原图（UCM 逻辑架构、MemCache 架构、LMCache coordinator 数据流、LMCache MP 模式与 Mooncake L2 adapter），各配逐段中文说明。脚本 `docs/research/kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`。
+- 附件：§4 一张自绘主线图（数据依附于谁 × 策略在哪）、A.6 一张自绘部件图（策略在引擎内 vs 在池的 client 上）、§5 一张自绘证据图（控制权与落地状态）；附录 A 四张上游原图（UCM 逻辑架构、MemCache 架构、LMCache coordinator 数据流、LMCache MP 模式与 Mooncake L2 adapter），各配逐段中文说明。脚本 `docs/research/kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`。
 
 ## 二、潜在问题
 

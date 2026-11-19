@@ -18,7 +18,7 @@
 | 池侧库存：哪个 segment 有哪个 key 的副本、lease 多久、容量余量 | 池 master | 池的 client | 引擎、路由层 |
 | 执行能力：指名搬副本、保活、核验到位 | 池 API | 池的 client | 引擎侧插件 |
 
-开源栈里没有任何组件同时握有两者以上。vLLM 可以加一种 hint 类型，但它看不到集群里 KV 的分布；Mooncake 可以加一个 API，但它看不到请求流。要凑齐这三样，得同时改三个项目并维护它们之间的胶水，而胶水本身要跟着三个项目各自的接口演进。
+主流开源栈里没有单一组件同时握有这三类信息。vLLM 可以加一种 hint 类型，但它看不到集群里 KV 的分布；Mooncake 可以加一个 API，但它看不到请求流。要凑齐这三样，得同时改三个项目并维护它们之间的胶水，而胶水本身要跟着三个项目各自的接口演进。
 
 补丁负担由此而来：**缺的不是某个功能，是那个同时满足「能看见请求」与「能拿到池权威」的位置。**
 
@@ -125,6 +125,8 @@ kvcm 读 `GetReplicaList` / `BatchGetReplicaList` 拿副本位置，用 `query_t
 | llm-d / Dynamo / AIBrix | 请求去哪；不碰 KV 字节 |
 | **kvcm** | 目标：KV 该在哪、活多久、给谁用。现状：按指令执行 + 保活 + 记账；放置决策仍靠人工或简单策略 |
 
+L1 的容量与淘汰由 MP server 本地负责，coordinator 不选 L1 victim；但 P2P 场景下 coordinator 负责 peer membership。跨节点“共享 L1”不是共享地址空间：本节点 miss 后向 peer 查询，拿到远端地址后用 RDMA 把 KV 读进本地 L1。P2P controller 按心跳间隔向 coordinator 问 live peers；prefix 查询在 peer 间完成，coordinator 不参与每次 lookup，也不看 KV 数据。
+
 ### 3.3.1 与 LMCache coordinator 的对照
 
 LMCache 的 `mp_coordinator` 是这一维度上与我们最接近的实现：独立进程、off request path、只持视图与命令面，数据面仍在 MP server。它的结构值得直接借用，权威与范围不能照搬。
@@ -149,11 +151,11 @@ LMCache 的 `mp_coordinator` 是这一维度上与我们最接近的实现：独
 | 权威 | 事件派生、最终一致、owner 侧验证 | 参考其 owner 验证 | kvcm 用 master 权威 |
 | 动作 | 今天 delete / pin / prefetch；roadmap 加 promote / demote / move / duplicate | — | 动作面要按我们自己的池能力定 |
 | 耦合 | connector-coupled | — | kvcm 保持 backend-coupled |
-| 范围 | 自己的 L1 / L2 | — | kvcm 覆盖池 + 请求 + 容量 |
+| 范围 | L1 在 server 本地；L2 策略在 coordinator | — | kvcm 覆盖池 + 请求 + 容量 |
 
 两条对我们最直接的影响：事件管线缺 incarnation 维度（引擎重启后旧进程的迟到事件会把死位置写回视图）；`views` 与 `controllers` 的职责划分可以避免一个类包办决策与状态。
 
-**LMCache coordinator 是 kvcm 控制面最接近的同类；但它是 connector-coupled、事件目录、只覆盖自己的 L1/L2；kvcm 是 backend-coupled、master 权威、目标覆盖池 + 请求 + 容量。**
+**LMCache coordinator 是 kvcm 控制面最接近的同类；但它是 connector-coupled、事件目录、L1 本地 + L2 fleet；kvcm 是 backend-coupled、master 权威、目标覆盖池 + 请求 + 容量。**
 
 ### 3.4 是否做请求 + KV + 扩缩联合调度
 
@@ -218,6 +220,10 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | Dynamo | 路由 + 类型化 hint + Planner，形态最全但不共享预算 | 引擎 + 派生索引 |
 | AIBrix | K8s 平台积木，网关索引 + 引擎旁卸载 | 引擎 + 网关索引 |
 | **kvcm** | master 的 client 侧控制面：读权威、下指令、核验、记账 | 池外 |
+
+![控制权与落地状态](kvcm-vs-oss/figures/fig-evidence.svg)
+
+（自绘图，同上脚本。左栏是控制权矩阵：谁决定、谁动字节、谁的记录算数；右栏是请求信封的落地时间线。图内文字为中文，项目名/API 名保留英文。）
 
 ## 6. 今天与目标
 

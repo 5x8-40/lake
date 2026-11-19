@@ -60,7 +60,7 @@
 - **llm-d Router** (Red Hat/Google/IBM 等): K8s 原生分布式推理栈的路由仓——EPP(Envoy ext-proc)精确缓存感知选路 + pd-sidecar/coordinator 的 PD(/EPD)编排;扩缩在独立仓 WVA(KV 利用率/队列深度驱动,指标交 HPA/KEDA 执行)。**源码已引入** `3rdparty/llm-d-router`,见 [`llm-d/`](llm-d/)。
 - **AIBrix** (字节跳动 → vllm-project): K8s 推理平台积木——网关路由策略集、KV 事件同步、KV 感知扩缩、StormService 角色编排(PD 为静态拓扑)、aibrix_kvcache 卸载框架。**源码已引入** `3rdparty/aibrix`,见 [`aibrix/`](aibrix/)。
 - **Dynamo / FlexKV / llm-d / AIBrix 四栈对比**: 四者词汇表相似(KV 复用/路由/PD),区别在覆盖层与 KV 状态归属。见 [`serving-stack-comparison.md`](serving-stack-comparison.md);路由维度细评见 [`model-routing/instance-level.md`](model-routing/instance-level.md)。
-- **kvcm / KV Fabric 与开源方案对比**: 论点是「开源方案里 KV 是引擎进程的状态,kvcm 里 KV 是池里的一等对象」;§5 给出每家 KV 依附于谁(UCM / FlexKV 依附引擎进程,vLLM / SGLang 依附请求,MemCache / Mooncake 本身是池,KVCR 依附 Guard,kvcm 依附池),附录 A 逐家符号级出处,附录 B 列我方短板与待确认项。见 [`kvcm-vs-oss.md`](kvcm-vs-oss.md)。
+- **kvcm / KV Fabric 与开源方案对比**: 论点是缺一个同时「看得见请求」和「拿得到池权威」的位置;按请求侧需求/池侧库存/执行能力三类信息、权威/视野/全局管理/联合调度四个问题展开;kvcm 是池 client 上的 master facade,backend-coupled,不依赖 connector;最后给出今天 vs KV Fabric。附录 A 逐家符号级出处,附录 B 列我方短板与待确认项。见 [`kvcm-vs-oss.md`](kvcm-vs-oss.md)。
 
 ## KV Cache 复用与传输
 
