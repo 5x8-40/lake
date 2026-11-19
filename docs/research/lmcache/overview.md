@@ -45,7 +45,7 @@ LMCache 是一个 **vendor-neutral 的 LLM KV cache 管理层**,把 GPU 上一�
 | 多机组一个服务 | **每个节点各起一个 MP server**;引擎只连本节点的 server,跨节点靠 L2 或 P2P | `p2p.rst`:"In a multi-node deployment, every node runs its own LMCache server process" |
 | PD 分离 | P、D 每个 vLLM 实例各一个 MP server,不能共用;多机 P/D 仍按节点铺开 | `disaggregated_prefill.rst`:"Two LMCache servers — one `lmcache server` per vLLM instance (they must not share one)" |
 
-connector 侧 `server_urls` 是列表,一个 worker 可指向多个 server([`vllm_multi_process_adapter.py`](https://github.com/LMCache/LMCache/blob/dev/lmcache/integration/vllm/vllm_multi_process_adapter.py)::`LMCacheMPSchedulerAdapter` 持有 `server_urls`)。
+connector 侧 `server_urls` 是列表,一个 engine 可指向多个 MP server([`vllm_multi_process_adapter.py`](https://github.com/LMCache/LMCache/blob/dev/lmcache/integration/vllm/vllm_multi_process_adapter.py)::`LMCacheMPSchedulerAdapter` 持有 `server_urls`)。
 
 引擎侧 connector 三家:
 
@@ -92,18 +92,18 @@ native connector 的契约只有上面四个方法,`csrc/storage_backends/README
 
 ### 两种传输模式:谁发起、走什么链路
 
-由 `--supported-transfer-mode` 选,决定 **KV 字节怎么在 worker 与 server 之间移动**;这跟请求面走 ZMQ 还是 gRPC 是两件事(后者由 server URL scheme 决定)。
+由 `--supported-transfer-mode` 选,决定 **KV 字节怎么在 engine 与 MP server 之间移动**;这跟请求面走 ZMQ 还是 gRPC 是两件事(后者由 server URL scheme 决定)。
 
 | 模式 | 谁发起 | 链路 | 适用 |
 |---|---|---|---|
-| `lmcache_driven`(默认) | **server 拉**。worker 把设备句柄交给 server(加速器走 CUDA IPC,CPU 走共享内存的 IPC 语义),server 侧直接做设备侧数据搬运 | worker 与 server 同机,走 CUDA IPC / CPU SHM,不经过 host 内存中转 | CUDA 设备 |
-| `engine_driven` | **worker 推**。worker 自己把 KV gather/打包到 CPU buffer,再 commit 给 server | worker 侧 gather/scatter 拷贝;`--shm-name` 给了名字就落共享内存池,不给就走内联 tensor 协议 | CPU-only 或非 CUDA 加速器 |
+| `lmcache_driven`(默认) | **MP server 拉**。engine 把设备句柄交给 MP server(加速器走 CUDA IPC,CPU 走共享内存的 IPC 语义),MP server 侧直接做设备侧数据搬运 | engine 与 MP server 同机,走 CUDA IPC / CPU SHM,不经过 host 内存中转 | CUDA 设备 |
+| `engine_driven` | **engine 推**。engine 自己把 KV gather/打包到 CPU buffer,再 commit 给 MP server | engine 侧 gather/scatter 拷贝;`--shm-name` 给了名字就落共享内存池,不给就走内联 tensor 协议 | CPU-only 或非 CUDA 加速器 |
 
 `auto` 按设备自动选:CUDA → `lmcache_driven`,其他 → `engine_driven`。
 
-这两种模式只覆盖**同机 worker ↔ server** 的字节搬运；跨机是 L2 adapter 或 L1 P2P（RDMA/RoCE），不在这个选择里。GPU Direct / SCADA 也不是这两种模式。
+这两种模式只覆盖**同机 engine ↔ MP server** 的字节搬运；跨机是 L2 adapter 或 L1 P2P（RDMA/RoCE），不在这个选择里。GPU Direct / SCADA 也不是这两种模式。
 
-源码位置:[`lmcache/v1/client/worker_transfer.py`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/client/worker_transfer.py)::`LMCacheDrivenTransferContext`(docstring:"the serving engine provides device handles … and the LMCache server performs direct device-side data transfer")与 `EngineDrivenTransferContext`("the engine (worker side) owns the data movement")。上游说明见 [mp/deployment.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/deployment.rst)。
+源码位置:`lmcache/v1/client/worker_transfer.py`（上游文件名）里的 `LMCacheDrivenTransferContext`（docstring:"the serving engine provides device handles … and the LMCache server performs direct device-side data transfer"）与 `EngineDrivenTransferContext`（"the engine owns the data movement"）。上游说明见 [mp/deployment.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/deployment.rst)。
 
 ### 缓存键(内容寻址,但 rank 绑定)
 
@@ -116,7 +116,7 @@ native connector 的契约只有上面四个方法,`csrc/storage_backends/README
 ### 跨实例共享(两条路径)
 
 1. **共享远程存储(L2 adapter)**:多实例共用 S3/HF3FS/Mooncake Store/Aerospike/Valkey/Bigtable/WQS 等,`chunk_hash` 内容寻址天然去重。上游把这批归为"适合跨节点共享"的一组,见 [l2_storage/remote_and_distributed.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/l2_storage/remote_and_distributed.rst)。
-2. **P2P 直传(L1 内存共享)**:`p2p_l2_adapter` 经 transfer channel 在实例间做单边 RDMA 读(`lmcache/v1/distributed/transfer_channel/`、`lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`)。coordinator 只维护“哪些 MP server 还活着”;本节点 L1 miss 后,向每一个活着的 MP server 查询该前缀,命中的 server 返回远端地址。L1 没有全局目录;`KeyDirectory` 是 L2 目录,不是 L1 索引。
+2. **P2P 直传(L1 内存共享)**:`p2p_l2_adapter` 经 transfer channel 在实例间做单边 RDMA 读(`lmcache/v1/distributed/transfer_channel/`、`lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`)。coordinator 只维护“哪些 MP server 还活着”;本节点 L1 miss 后,向每一个活着的 MP server 查询该前缀,命中的 server 返回远端地址。L1 没有全局目录;`KeyDirectory` 是 L2 目录,不是 L1 索引。**这是当前实现的限制:节点越多,miss 时的查询扇出越大;大规模场景应优先走共享 L2,或在上层做候选过滤。**
 
 **L1 P2P 跨节点取 KV 走两次拷贝,不是一次 RDMA 直写显存**（PD 的 `NixlConnector` P→D 是另一条路径，不在这个描述里）。路径是:
 
@@ -126,13 +126,13 @@ native connector 的契约只有上面四个方法,`csrc/storage_backends/README
 
 原因是 LMCache 的 **L1 本身就是 CPU DRAM**([`l1_manager/dram.py`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/l1_manager/dram.py)::`DramL1Manager`,docstring "Pinned-DRAM L1 manager";上游文档写 "An L1 cache (in CPU DRAM, or an NVMe slab via GPUDirect Storage)")。P2P 的注册单元是 L1 缓冲,`p2p.rst` 明确 "The transfer is a one-sided RDMA read from the requesting node into its own L1"、"RDMA-reads the KV into its own L1, and serves the request from there"。L1 落在 host 内存,所以 RDMA 的落点只能是 host,再由 H2D 进显存。
 
-**能不能 RDMA 直写 HBM(RH2D)?** 需要 GPUDirect RDMA(网卡直接 DMA 进显存),LMCache 当前没有这条路径:
+**能不能 RDMA 直写 HBM(RH2D)?** Mooncake Transfer Engine 本身可以注册 HBM/设备内存，在支持 GPUDirect RDMA 的链路上做 RH2D；但 LMCache 的 L1 P2P 把落点放在 CPU L1，所以它当前仍走两跳。不能把 LMCache 的两跳归因于“底层没有 RH2D”。
 
-- `lmcache/v1/distributed/api.py` 里 `MemoryResidency.VRAM` 的注释是 `"GPU memory. Reserved for GDS/GDR L2 adapters; nothing reports it yet."`——GDR 只留了枚举位,没有任何实现上报它。
+- `lmcache/v1/distributed/api.py` 里 `MemoryResidency.VRAM` 的注释是 `"GPU memory. Reserved for GDS/GDR L2 adapters; nothing reports it yet."`——LMCache 的 P2P 没有上报 VRAM 落点；这不代表 Mooncake TE 不能做 RH2D。
 - 仓库里的 "GDS" 指 **GPUDirect Storage**(盘 → 显存,`l1_manager/gds.py`: "L1 manager whose medium is an NVMe slab reached through GPUDirect Storage"),不是 GPUDirect RDMA。
 - 而且 P2P 与 GDS L1 / Device-DAX L1 互斥:传输通道要注册一整段连续的 L1,P2P 在 `--gds-l1-path` 与 `--l1-devdax-path` 下拒绝启动。
 
-所以「两跳」是 L1 位置决定的,不是实现偷懒。若要一跳,得让 RDMA 落点变成目标侧显存,那是 GDR 要解决的问题。
+所以「两跳」是 LMCache 把落点选在 L1 CPU 导致的,不是底层传输做不到。若要一跳,得让 RDMA 落点变成目标侧 HBM；Mooncake TE 已具备这个能力，LMCache 的 P2P 路径还没接。
 
 详见 [sharing-and-backends.md](sharing-and-backends.md)。
 
@@ -184,7 +184,7 @@ native connector 的契约只有上面四个方法,`csrc/storage_backends/README
 | vLLM 集成(拦截 KV) | `lmcache/integration/vllm/lmcache_mp_connector.py`::`LMCacheMPConnector` |
 | vLLM scheduler 侧适配 | `lmcache/integration/vllm/vllm_multi_process_adapter.py`::`LMCacheMPSchedulerAdapter` |
 | C++ native connector 抽象 | `csrc/storage_backends/connector_interface.h`::`IStorageConnector`(batch get/set/exists/delete + `drain_completions` + `close`) |
-| C++ native connector 基类 | `csrc/storage_backends/connector_base.h`::`ConnectorBase<T>`(SQ/CQ + worker pool + tiling);`WorkerPoolConfig.per_op_workers` 按 lane 分池 |
+| C++ native connector 基类 | `csrc/storage_backends/connector_base.h`::`ConnectorBase<T>`(SQ/CQ + 线程池 + tiling);`WorkerPoolConfig.per_op_workers` 按 lane 分池 |
 | C++ 已实现后端 | `csrc/storage_backends/{aerospike,fs,hf3fs,mooncake,nixl,redis}/`(redis 为 RESP2 参考实现) |
 | native connector 的 Python 桥 | `lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py`::`NativeConnectorL2Adapter` |
 | Rust 裸设备 I/O | `rust/raw_block/src/lib.rs`::`RawBlockDevice`(posix/io_uring/io_uring_cmd);上层 `l2_adapters/raw_block/core.py`::`RawBlockCore` |
