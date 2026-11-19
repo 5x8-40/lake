@@ -16,10 +16,10 @@
 2. **P2P 直传(L1 内存共享)**:`P2PL2Adapter` 经 transfer channel 做单边 RDMA 读:
    - `impl/nixl_impl.py`::`NixlTransferChannelClient` — 默认引擎,`lmcache[nixl]` extra。
    - `impl/mooncake_te_impl.py`::`MooncakeTeTransferChannelClient` — Mooncake transfer engine。
-   - "谁有哪些 chunk"由 MP coordinator 的 `KeyDirectory` 提供(事件派生、最终一致)。
+   - coordinator 只维护“哪些 MP server 还活着”；本节点 L1 miss 后，向每一个活着的 MP server 查询该前缀，命中后由对端返回地址。L1 没有全局目录。
    - 前提:必须有 coordinator,且 L1 须为一整段连续区域 → 与 GDS L1、Device-DAX L1 互斥,见 [mp/p2p.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/p2p.rst)。
-   - **落点是本节点 L1(CPU pinned DRAM),不是显存。** `p2p.rst`: "The transfer is a one-sided RDMA read from the requesting node into its own L1"。之后再由 H2D 进 HBM,所以跨节点读是两跳。L1 的定义见 [`l1_manager/dram.py`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/l1_manager/dram.py)::`DramL1Manager`("Pinned-DRAM L1 manager")。RDMA 直写显存需要 GPUDirect RDMA,当前没有:`api.py` 的 `MemoryResidency.VRAM` 注释写 "Reserved for GDS/GDR L2 adapters; nothing reports it yet"。
-3. **PD disagg**:由引擎侧 `MultiConnector` 并列 `NixlConnector` 与 `LMCacheMPConnector` 组合,不是 LMCache 自己的后端,见 [mp/disaggregated_prefill.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/disaggregated_prefill.rst)。
+   - **P2P 的落点是本节点 L1(CPU pinned DRAM),不是显存；PD 的 NixlConnector P→D 不走这条路径。** `p2p.rst`: "The transfer is a one-sided RDMA read from the requesting node into its own L1"。之后再由 H2D 进 HBM,所以跨节点读是两跳。L1 的定义见 [`l1_manager/dram.py`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/l1_manager/dram.py)::`DramL1Manager`("Pinned-DRAM L1 manager")。RDMA 直写显存需要 GPUDirect RDMA,当前没有:`api.py` 的 `MemoryResidency.VRAM` 注释写 "Reserved for GDS/GDR L2 adapters; nothing reports it yet"。
+3. **PD disagg**:由引擎侧 `MultiConnector` 并列 `NixlConnector` 与 `LMCacheMPConnector` 组合,不是 LMCache 自己的后端。P、D 每个 vLLM 实例各一个 MP server,不能共用,见 [mp/disaggregated_prefill.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/disaggregated_prefill.rst)。
 
 ## 存储后端
 
@@ -72,7 +72,7 @@ C++ 写一次,MP 与 InProcess 两种模式复用——这是与"引擎侧 KV co
 
 - **职责**:**元数据协调,不是数据路径**。数据仍在 P2P 或共享存储上流动;P2P 文档原话是 "It only manages membership — it never sees KV data or participates in lookups."
 - **可选**:`lmcache/v1/multiprocess/config.py`::`CoordinatorConfig.url` 默认 `""`,空则不注册、行为与没有 coordinator 一致;`event_reporting` 默认 `False`。不接 coordinator 就没有 `/cache/pins`(pin 计数由 `FleetEvictionController` 持有),只剩 prefetch / delete / quota / clear。
-- **fleet 视图**:`views/key_directory.py::KeyDirectory` — `ObjectKey → placements(instance_id, tier, backend, size)`,由 cache event 构建,**最终一致,答案只是 hint,必须在 owner 侧验证**。L1 placement 随上报者的 incarnation 失效,L2 placement 保留(`fence_instance`)。
+- **fleet 视图**:`views/key_directory.py::KeyDirectory` 是 **L2 目录**,记录 `ObjectKey → placements(instance_id, tier, backend, size)`,由 cache event 构建,**最终一致,答案只是 hint,必须在 owner 侧验证**。L1 不在这个全局目录里;L1 由各 MP server 本地维护,跨节点 L1 共享靠 server 间查询。
 - **命令面**(HTTP):`POST /cache/prefetches`(指定 `instance_id` 预热)、`POST|GET|DELETE /cache/pins`(排除在该协调器自己的 L2 驱逐计划外)、`POST /cache/delete`、`/quota*`、`/directory/{lookup,blend-lookup,keys,stats}`、`/instances*`、`/events`、`/config/chunk-size`。**无 move 路由。**
 - **组件**:`controllers/base.py::Controller`(控制器基类)、`controllers/prefetch_manager.py::PrefetchManager`(预取派发)、`controllers/eviction_controller.py::FleetEvictionController`(配额 / 驱逐 / pin 计数)、`views/instance_registry.py::InstanceRegistry`(注册与心跳)、`ingest/event_gate.py::EventGate`(事件准入、去重、incarnation fencing)、`discovery.py::Registry`(controller / view 发现)、`persistence/checkpoint.py`(目录与配额的 checkpoint)。
 - **通信**:HTTP(FastAPI);事件可经 HTTP 或 Kafka 源进入(`ingest/{http,kafka}_event_source.py`)。
@@ -91,7 +91,7 @@ C++ 写一次,MP 与 InProcess 两种模式复用——这是与"引擎侧 KV co
 
 ## 一致性
 
-**无全局强一致**。fleet 视图靠 cache event 批次 + 实例心跳构建:事件经 `EventGate` 按 per-emitter 光标排序、去重、按 incarnation fencing 后才进各 view;目录可 checkpoint 并从事件流重放(`events_replay.py`)。答案只是 hint,字节可用性在 owner MP server 侧验证。数据层靠内容寻址天然去重;失效靠 L1 上报者 incarnation 与 L2 显式删除。
+**无全局强一致**。fleet 视图靠 cache event 批次 + 实例心跳构建:事件经 `EventGate` 按 per-emitter 光标排序、去重、按 incarnation fencing 后才进各 view;目录可 checkpoint 并从事件流重放(`events_replay.py`)。答案只是 hint,字节可用性在 owner MP server 侧验证。数据层靠内容寻址天然去重;L2 靠显式删除,L1 由各 server 本地淘汰。
 
 ## Rust 组件
 
@@ -130,7 +130,7 @@ C++ 写一次,MP 与 InProcess 两种模式复用——这是与"引擎侧 KV co
 | C++ native connector 基类 | `csrc/storage_backends/connector_base.h`::`ConnectorBase<T>`、`WorkerPoolConfig` |
 | C++ 已实现后端 | `csrc/storage_backends/{aerospike,fs,hf3fs,mooncake,nixl,redis}/` |
 | native connector 的 Python 桥 | `lmcache/v1/distributed/l2_adapters/native_connector_l2_adapter.py`::`NativeConnectorL2Adapter` |
-| coordinator fleet 目录 | `lmcache/v1/mp_coordinator/views/key_directory.py`::`KeyDirectory.lookup` / `fence_instance` |
+| coordinator L2 fleet 目录 | `lmcache/v1/mp_coordinator/views/key_directory.py`::`KeyDirectory.lookup` / `fence_instance` |
 | coordinator 控制器基类 | `lmcache/v1/mp_coordinator/controllers/base.py`::`Controller` |
 | 预取派发 | `lmcache/v1/mp_coordinator/controllers/prefetch_manager.py`::`PrefetchManager.submit_prefetch` |
 | 配额 / 驱逐 / pin | `lmcache/v1/mp_coordinator/controllers/eviction_controller.py`::`FleetEvictionController.pin` / `unpin` |
