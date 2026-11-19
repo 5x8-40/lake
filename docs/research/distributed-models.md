@@ -35,7 +35,7 @@
 | Dynamo | 编排星型 + 事件流 | 无全局位置权威；discovery 走 etcd | NATS 事件流（best-effort，可丢） | 最终一致（事件副本） | 引擎各自负责 | canary + 在途迁移；etcd lease 收敛 | 索引最终一致，误判以重算兜底 |
 | SGLang | 实例自治 + 共享 L3 + 旁路索引 | 无（每实例树 + L3 实时查后端） | kv_events（zmq）+ gateway 近似树 | 无全局；L3 最终一致 | 后端决定 | 无（崩溃由 L3 回填） | 跨实例命中依赖近似树或实时查询 |
 | vLLM | 单实例引擎 + 事件外发 | 引擎内强一致；集群级无 | KV Events（zmq 单向） | 集群级最终一致（外部索引） | 引擎内保证 | worker 有状态，崩溃丢 KV | 集群语义外挂；#48501 向控制面演进 |
-| LMCache | 共享存储 / 中心 controller 两式 | controller RegistryTree（best-effort） | 心跳 + 序列号 + full sync（0.8 阈值） | 弱（允许错误，周期收敛） | 内容寻址去重；无锁并发写 | controller 无 HA；daemon 无 fate-sharing | O(n²) lookup；全内存 RegistryTree |
+| LMCache | 共享存储 / 中心 coordinator 两式 | coordinator KeyDirectory（L2，最终一致） | MP server 心跳 + cache event seq/incarnation | 弱（允许错误，事件收敛） | 内容寻址去重；无锁并发写 | coordinator 可选、无热备；MP server 与引擎无 fate-sharing | 全内存 KeyDirectory；事件扇出随实例数增长 |
 | FlexKV | 本机自治 + Redis 快照 | 本机 radix；Redis GMS 快照非权威 | 周期 upload/rebuild + lease | 最终一致（快照可陈旧） | 后端决定 | 无；worker 退出索引失效 | 快照时效；无回查权威 |
 | UCM | 无自有（继承 store 后端） | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 |
 | TileRT | 点对点（单槽 PD） | 无（进程内忙闲表） | 一次性握手 | 不适用 | 不适用 | 无（429） | 不适用（专用 bs=1） |
@@ -68,7 +68,7 @@ lake 的处理：同样不将高频写压入 etcd，但权威保留在 CP 内存
 
 ### D. 弱协调 / 无（LMCache / UCM / TileRT）
 
-- LMCache：有中心 controller，但设计为 best-effort（心跳 + full sync 0.8 阈值），lookup O(n²) 为已知瓶颈，属协调器而非权威。
+- LMCache：有可选 coordinator，`KeyDirectory` 是 L2 的事件派生、best-effort 视图；协调器不是权威。规模瓶颈在单进程全内存目录与事件扇出，不是旧版 controller 的 O(n²) lookup。
 - UCM：框架自身不含分布式语义，全部继承后端；语义强弱取决于所挂 store。
 - TileRT：bs=1 专用引擎，无共享状态，不涉及一致性问题。
 - kvcached：单机 GPU 页弹性，无中心到连事件流都没有——物理页分配是驱动内原子操作，不产生位置索引需求；跨节点/分层/全局视图均不在 scope。

@@ -151,7 +151,7 @@ L0→L0 RDMA 仍要注册 GPU 内存（对照 KVBM `g1_handle`）。归池后注
 | 引擎内 offload | `vllm/v1/kv_offload/base.py`::`OffloadingManager` / `OffloadKey` |
 | HiCache 槽 | `radix_cache.py`::`TreeNode.value` / `host_value`；`hiradix_cache.py`::`load_back` / `write_backup` |
 | Elastic | `unified_memory_pool.py`::`UnifiedKVPool`；`kv_vmm_backing.py`::`KvVmmArena` |
-| LMCache | `lmcache_connector_v1.py`::`get_num_new_matched_tokens` / `request_finished`；`gpu_connectors.py`::`from_gpu` / `to_gpu` |
+| LMCache | `lmcache/integration/vllm/lmcache_mp_connector.py`::`get_num_new_matched_tokens` / `request_finished`；`lmcache/v1/gpu_connector/` |
 | FlexKV 无 GPU cache engine | `cache_engine.py`::`GlobalCacheEngine` |
 | FlexKV GPU 映射 | `storage_engine.py`::`register_gpu_blocks`；`GPUAllocator.from_raw_data` |
 | FlexKV delay-free | `vllm_v1_adapter.py`::`request_finished` / `save_kv_layer` |
