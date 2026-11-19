@@ -125,7 +125,7 @@ kvcm 读 `GetReplicaList` / `BatchGetReplicaList` 拿副本位置，用 `query_t
 | llm-d / Dynamo / AIBrix | 请求去哪；不碰 KV 字节 |
 | **kvcm** | 目标：KV 该在哪、活多久、给谁用。现状：按指令执行 + 保活 + 记账；放置决策仍靠人工或简单策略 |
 
-L1 的容量与淘汰由 MP server 本地负责，coordinator 不选 L1 victim；但 P2P 场景下 coordinator 负责 peer membership。跨节点“共享 L1”不是共享地址空间：本节点 miss 后向 peer 查询，拿到远端地址后用 RDMA 把 KV 读进本地 L1。P2P controller 按心跳间隔向 coordinator 问 live peers；prefix 查询在 peer 间完成，coordinator 不参与每次 lookup，也不看 KV 数据。
+L1 的容量与淘汰由 MP server 本地负责，coordinator 不选 L1 victim；跨节点共享 L1 时，coordinator 只维护“哪些 MP server 还活着”。本节点 L1 miss 后，会向每一个活着的 MP server 发查询；命中的 MP server 返回远端地址，本节点再用 RDMA 把 KV 读进自己的 L1。查询由 MP server 之间完成，coordinator 不参与每次 lookup，也不看 KV 数据。节点越多，这个查询扇出越大；大规模场景应优先走共享 L2。
 
 ### 3.3.1 与 LMCache coordinator 的对照
 
