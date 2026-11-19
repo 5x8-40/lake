@@ -36,7 +36,7 @@ LMCache 是一个 **vendor-neutral 的 LLM KV cache 管理层**,把 GPU 上一�
 
 上游对 MP 的一句定义:**"LMCache multiprocess (MP) mode runs LMCache as a standalone service that vLLM instances reach through a configurable ZMQ or gRPC request transport. One LMCache server per node can serve multiple vLLM pods."** 架构图见 [mp/architecture.png](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/architecture.png)。
 
-**MP server 与引擎实例的对应关系**有三种部署形态,不是一对一:
+**MP server 与引擎实例的对应关系**有四种部署形态,不是一对一:
 
 | 形态 | 谁连谁 | 依据 |
 |---|---|---|

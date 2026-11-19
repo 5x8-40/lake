@@ -409,8 +409,8 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 
 | kvcm 操作 | 业界对应 | 异同 |
 |---|---|---|
-| copy | LMCache `P2PL2Adapter` 跨实例直传 + coordinator 的 prefetch/pin/delete（`lmcache/v1/mp_coordinator`，当前无 move）；KVCR hint 驱动 P2P（**目的地发起**，源侧 `claim/pin` 配合）；llm-d P2P（索引只作 hint、握手兜底）；HiCache `prefetch_from_storage`（L3→L2→L1，三策略终止）；mooncake 动态副本（main 内部机制，热度驱动自动加副本） | 命令面与数据面分离是各家共同形态。kvcm 的 `CreateCopyTask`（master 指派源端执行）与 LMCache coordinator 同为集中式；KVCR/llm-d 的「目的地发起」依赖派生索引 + 握手，kvcm 有 master 权威视图，集中式成立。mooncake 动态副本 kvcm 能触发不能指定目标（反复调 `GetReplicaList`，同一种做法，F13⑤）——只适合池级自动调节，不满足预热「指定目标」语义 |
-| move | LMCache coordinator 当前无 `move`（roadmap 才有 promote/demote/move/duplicate）；KVCR `deliver`（纯搬运层模式） | move 作控制面原语在多家存在；`CreateMoveTask` 指定源、删源，语义一致 |
+| copy | LMCache `P2PL2Adapter` 跨实例直传 + coordinator 的 prefetch/pin/delete（`lmcache/v1/mp_coordinator`，当前无 move）；KVCR hint 驱动 P2P（**目的地发起**，源侧 `claim/pin` 配合）；llm-d P2P（索引只作 hint、握手兜底）；HiCache `prefetch_from_storage`（L3→L2→L1，三策略终止）；mooncake 动态副本（main 内部机制，热度驱动自动加副本） | 命令面与数据面分离是各家共同形态。kvcm 的 `CreateCopyTask` 是 master 指派源端执行；LMCache coordinator 只做 prefetch/pin/delete，P2P 由目标 MP server 发起读取，不是同一类集中式 copy。KVCR/llm-d 的「目的地发起」依赖派生索引 + 握手，kvcm 有 master 权威视图，集中式成立。mooncake 动态副本 kvcm 能触发不能指定目标（反复调 `GetReplicaList`，同一种做法，F13⑤）——只适合池级自动调节，不满足预热「指定目标」语义 |
+| move | LMCache coordinator 当前无 `move`（roadmap 才有 promote/demote/move/duplicate）；KVCR `deliver`（纯搬运层模式） | move 作控制面原语只在少数系统存在；`CreateMoveTask` 指定源、删源，语义一致 |
 | keepalive | LMCache coordinator 无 lease/keepalive（pin 是 L2 驱逐计数，不是续租）；FlexKV lease「保证传输期间块有效」；llm-d 推测索引 TTL 2s（`defaultSpeculativeTTL`，代码注释自承是经验值） | 周期续租在多家存在；llm-d 的「TTL 是经验值」提示 lease_ttl 须真机校准（F10 已记） |
 | pin | LMCache coordinator `pin`/`unpin`（L2 驱逐计划计数，`FleetEvictionController`）；KVCR `claim/pin`/`release_pin`（**传输窗口专用**，`FETCHABLE` 须等 pin 成功才确定）；TensorCast `pinned` policy（必须驻留 + 溢出**拒绝写入**）；HiCache `lock_ref`（`protected_size_` vs `evictable_size_`，dec 到 0 ≠ 释放、仍可命中） | mooncake 三件套（lease/soft/hard）比多数系统细。差异：TensorCast `pinned` 溢出拒绝写入，mooncake hard pin 无此语义（创建时固化、之后改不了，F1）；KVCR 的传输窗口 pin 在 mooncake 由「copy 任务在途拒 upsert」覆盖（F2） |
 | demote | §3 专节（FlexKV/LMCache/UCM/KVBM/MemCache 对照 + HiCache 写穿/写回） | —— |
