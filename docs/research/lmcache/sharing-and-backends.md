@@ -1,6 +1,6 @@
 # LMCache — 跨实例复用与存储后端
 
-> 源码:`lmcache/v1/`、`csrc/storage_backends/`、`rust/`、`lmcache/v1/mp_coordinator/`(2026-11-13 快照 `58c11e38`)。submodule gitlink 仍固定 `9229067c`(2026-07-13,InProcess 时代布局),与本文引用的 `dev` 分支不是同一棵树;本文以 `dev` 为准。
+> 源码:`lmcache/v1/`、`csrc/storage_backends/`、`rust/`、`lmcache/v1/mp_coordinator/`(2026-11-13 快照 `58c11e38`)。submodule gitlink 同为 `58c11e38`;本文路径与符号以这棵树为准。
 
 ## 缓存键与匹配
 

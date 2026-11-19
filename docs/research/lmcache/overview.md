@@ -1,6 +1,6 @@
 # LMCache — 总览
 
-> 源码:`3rdparty/lmcache`(submodule),gitlink 固定 `9229067c`(2026-07-13;该快照下 `cache_engine.py`、`storage_backend/`、`token_database.py`、`cache_controller/` 均在,属 InProcess 时代的布局)。本文的路径与符号对照上游 `58c11e38`(2026-11-13,`v0.5.8rc1` 之后 6 个 commit),与 gitlink 不是同一棵树——阅读时以本文引用的 `dev` 分支为准。
+> 源码:`3rdparty/lmcache`(submodule),gitlink 固定 `58c11e38`(2026-11-13,`v0.5.8rc1` 之后 6 个 commit)。本文的路径与符号以这棵树为准。
 > 上游默认分支是 `dev`(`main` 已改名 `main-deprecate`),外链一律指 `dev`。
 
 ## 一句话定位
