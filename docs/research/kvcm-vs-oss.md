@@ -174,7 +174,7 @@ Dynamo 是唯一在形态上做齐三层的（Smart Router + KVBM/KVCR + Planner
 
 ![数据依附于谁 × 策略在哪](kvcm-vs-oss/figures/fig-ownership.svg)
 
-（自绘图，由 [`kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`](kvcm-vs-oss/figures/plot_kvcm_vs_oss.py) 生成。纵轴是数据依附于谁、横轴是策略在哪：红线右边才拿得到池的权威，红线下面才不需要请求就能动 KV。kvcm 落在最下面一行 × 最右一列的交点上，但它是池的 client，不是池本身。全部图源与许可见 [`kvcm-vs-oss/figures/README.md`](kvcm-vs-oss/figures/README.md)。）
+（自绘图，由 [`kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`](kvcm-vs-oss/figures/plot_kvcm_vs_oss.py) 生成。纵轴是数据依附于谁、横轴是策略在哪：红线右边才拿得到池的权威，红线下面才不需要请求就能动 KV。kvcm 落在最下面一行 × 最右一列的交点上，但它是池的 client，不是池本身。全部图源与版本见 [`kvcm-vs-oss/figures/README.md`](kvcm-vs-oss/figures/README.md)。）
 
 ### 4.1 引擎要下线（滚动升级、缩容、故障）
 
@@ -251,7 +251,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 
 ![UCM 逻辑架构](kvcm-vs-oss/figures/upstream-ucm-architecture.svg)
 
-（**上游原图**：[unified-cache-management `docs/source/_static/architecture.svg`](https://github.com/ModelEngine-Group/unified-cache-management/blob/develop/docs/source/_static/architecture.svg)，© Huawei Technologies，许可证 MIT，快照 `57ddbb26`（2026-11-13）。Excalidraw 绘制，1244×950。）
+（**上游原图**：[unified-cache-management `docs/source/_static/architecture.svg`](https://github.com/ModelEngine-Group/unified-cache-management/blob/develop/docs/source/_static/architecture.svg)，快照 `57ddbb26`（2026-11-13）。Excalidraw 绘制，1244×950。）
 
 这张图分三层，正好对上本文的「引擎内插件」这一层：
 
@@ -263,7 +263,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 
 **读法**：UCM 的全部策略都装在中层那个 `Engine adapters` 里——它挂在引擎上，所以能管 Reuse / Placement / Movement；底层存储是可插拔的，换后端不动上面。这也解释了为什么它的能力边界止于「这次请求怎么取 KV」：图的左右两侧都是引擎与应用，没有集群级视图的位置。
 
-**UCM**（ModelEngine，MIT）
+**UCM**（ModelEngine）
 
 | 事实 | 出处 |
 |---|---|
@@ -291,9 +291,9 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 
 ![MemCache 架构](kvcm-vs-oss/figures/memcache-architecture.png)
 
-（**上游原图**：Ascend MemCache `doc/source/memcache_architecture.png`，MulanPSL2，快照 `14b4e35e`（2026-06-02）。来源仓库 [gitcode.com/Ascend/memcache](https://gitcode.com/Ascend/memcache)，README「概述」节引用。图中三层：引擎 connector（vLLM/SGLang/MindIE）→ MetaService + Client Library（LocalService：IO Proxy / MF Proxy / Meta backup）→ GVA 内存池与 SSD 池；控制面走 RPC Server，数据面由 LocalService 本地直连池。MulanPSL2 允许复制与再分发，保留本署名即可。）
+（**上游原图**：Ascend MemCache `doc/source/memcache_architecture.png`，快照 `14b4e35e`（2026-06-02）。来源仓库 [gitcode.com/Ascend/memcache](https://gitcode.com/Ascend/memcache)，README「概述」节引用。图中三层：引擎 connector（vLLM/SGLang/MindIE）→ MetaService + Client Library（LocalService：IO Proxy / MF Proxy / Meta backup）→ GVA 内存池与 SSD 池；控制面走 RPC Server，数据面由 LocalService 本地直连池。）
 
-**MemCache**（Ascend，MulanPSL2）
+**MemCache**（Ascend）
 
 | 事实 | 出处 |
 |---|---|
@@ -317,7 +317,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 
 协调器是独立进程（`lmcache/v1/mp_coordinator/`），与引擎进程分开部署，只持元数据与命令面。
 
-**coordinator 的内部数据流**（上游原图，[The LMCache Coordinator](https://blog.lmcache.ai/en/2026/11/11/the-lmcache-coordinator-a-control-plane-for-fleet-wide-kv-cache/)，© LMCache authors）：
+**coordinator 的内部数据流**（上游原图，[The LMCache Coordinator](https://blog.lmcache.ai/en/2026/11/11/the-lmcache-coordinator-a-control-plane-for-fleet-wide-kv-cache/)）：
 
 ![LMCache coordinator 数据流](kvcm-vs-oss/figures/upstream-lmcache-coordinator.png)
 
@@ -334,7 +334,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 
 一句话读法：**事实从左边进来，决定从右边出去，中间没有任何一格在推理请求的路径上。**
 
-**MP 模式的整体结构**（上游原图，[当开源遇见开源：LMCache 与 Mooncake 的一次双向奔赴](https://blog.lmcache.ai/zh/2026/05/26/%E5%BD%93%E5%BC%80%E6%BA%90%E9%81%87%E8%A7%81%E5%BC%80%E6%BA%90%EF%BC%9Almcache-%E4%B8%8E-mooncake-%E7%9A%84%E4%B8%80%E6%AC%A1%E5%8F%8C%E5%90%91%E5%A5%94%E8%B5%B4/)，© LMCache authors）：
+**MP 模式的整体结构**（上游原图，[当开源遇见开源：LMCache 与 Mooncake 的一次双向奔赴](https://blog.lmcache.ai/zh/2026/05/26/%E5%BD%93%E5%BC%80%E6%BA%90%E9%81%87%E8%A7%81%E5%BC%80%E6%BA%90%EF%BC%9Almcache-%E4%B8%8E-mooncake-%E7%9A%84%E4%B8%80%E6%AC%A1%E5%8F%8C%E5%90%91%E5%A5%94%E8%B5%B4/)）：
 
 ![LMCache MP 模式与 Mooncake L2 adapter](kvcm-vs-oss/figures/upstream-lmcache-mp-l2.png)
 
