@@ -7,26 +7,13 @@
 
 LMCache 是一个 **vendor-neutral 的 LLM KV cache 管理层**,把 GPU 上一次性的 KV cache 变成可跨请求、跨实例、跨引擎持久存储/复用/观测/变换的"AI-native knowledge",目标是降 TTFT、提吞吐(尤其长上下文/agent/RAG 场景)。
 
-## 时间线
-
-MP 线从 2025-11 出现独立 cache server 起,到 2026-11 树内 InProcess 实现移出,主仓只剩 MP:
-
-| 日期 | commit | 事件 |
-|---|---|---|
-| 2025-11-17 | `7aad1f8e` (#1907) | 第一个独立 cache server:`Example LMCache independent cache server for multi-process mode`,MP 线起点 |
-| 2026-05-13 | `b16de35f` (#3235) | `lmcache_mp_connector.py` 落地,引擎可连独立 server |
-| 2026-06-03 | `84df850c` (#3488) | MP coordinator 骨架 |
-| 2026-10-21 | `032e23da` (#5831) | 把 vLLM in-process 集成隔离出去 |
-| 2026-10-22 | `2d4f4bdf` (#5970) | `cache_controller/` 移到 `inprocess/v1/` |
-| 2026-11-06 | `5b9db86f` (#6254) | 树内 InProcess 实现移除,迁到独立仓 [`LMCache_inprocess`](https://github.com/LMCache/LMCache_inprocess) |
-| 2026-11-12 | tag `v0.5.8rc1` | 撰写时最新发布 |
-
 ## 设计哲学
 
 - **问题**:推理引擎(vLLM/SGLang)的 KV cache 是进程内临时状态,prefill 是 TTFT 瓶颈;引擎崩溃即丢失。
 - **定位**:KV cache 从"临时状态"升级为"可管理资产"——stored(分层持久化)、reused(跨请求/会话/实例)、monitored(可观测)、transformed(压缩/丢弃/serde)。
 - **与引擎的关系**:引擎侧一个 connector 插件 + 引擎旁一个独立服务。MP 模式下服务与引擎无 fate-sharing;同时声称 vendor-neutral,集成 vLLM、SGLang、TensorRT-LLM、NIXL 等。
 - **核心目标**:跨请求/跨实例复用。支持 prefix caching、non-prefix reuse(CacheBlend)、跨实例 P2P 内存共享、PD disagg。
+- **可见范围**:LMCache 管的是 L1（CPU DRAM/本地介质）与 L2；**HBM/APC 不在它的索引里**。HBM 命中仍由引擎自己的 APC 判断，LMCache 只能通过引擎事件/壳请求间接知道“KV 进了 HBM”。
 
 ## 架构
 
@@ -113,6 +100,8 @@ native connector 的契约只有上面四个方法,`csrc/storage_backends/README
 | `engine_driven` | **worker 推**。worker 自己把 KV gather/打包到 CPU buffer,再 commit 给 server | worker 侧 gather/scatter 拷贝;`--shm-name` 给了名字就落共享内存池,不给就走内联 tensor 协议 | CPU-only 或非 CUDA 加速器 |
 
 `auto` 按设备自动选:CUDA → `lmcache_driven`,其他 → `engine_driven`。
+
+这两种模式只覆盖**同机 worker ↔ server** 的字节搬运；跨机是 L2 adapter 或 L1 P2P（RDMA/RoCE），不在这个选择里。GPU Direct / SCADA 也不是这两种模式。
 
 源码位置:[`lmcache/v1/client/worker_transfer.py`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/client/worker_transfer.py)::`LMCacheDrivenTransferContext`(docstring:"the serving engine provides device handles … and the LMCache server performs direct device-side data transfer")与 `EngineDrivenTransferContext`("the engine (worker side) owns the data movement")。上游说明见 [mp/deployment.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/deployment.rst)。
 

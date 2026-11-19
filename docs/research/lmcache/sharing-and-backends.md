@@ -60,7 +60,7 @@ C++ 写一次,MP 与 InProcess 两种模式复用——这是与"引擎侧 KV co
 
 ## 分层与配额
 
-- **介质**:L1 默认是 **CPU pinned DRAM**(`l1_manager/dram.py`::`DramL1Manager`,docstring "Pinned-DRAM L1 manager"),另有 `GdsL1Manager`(NVMe slab,走 GPUDirect **Storage**)与 `DevDaxL1Manager`(Device-DAX slab)。**L1 不在 GPU 显存里**,引擎 HBM 只是 KV 的来源与去向(`gpu_connector/` 负责 H2D/D2H)。
+- **介质**:L1 默认是 **CPU pinned DRAM**(`l1_manager/dram.py`::`DramL1Manager`,docstring "Pinned-DRAM L1 manager"),另有 `GdsL1Manager`(NVMe slab,走 GPUDirect **Storage**)与 `DevDaxL1Manager`(Device-DAX slab)。**L1 不在 GPU 显存里**,引擎 HBM 只是 KV 的来源与去向(`gpu_connector/` 负责 H2D/D2H)。**LMCache 看不见 HBM/APC**；HBM 命中仍由引擎自己的 APC 判断。
 - `distributed/storage_manager.py`::`StorageManager` + 多 `L1Manager` + 多 `L2Adapter` + `storage_controllers/` 下的 `StoreController` / `PrefetchController` / `EvictionController`。tier 词汇 `distributed/api.py`::`Tier{L1,L2,ALL}`。
 - `QuotaManager`(`distributed/quota_manager.py`)按 `cache_salt` 记配额,HTTP 面在 MP server 的 `/quota/{cache_salt}`。
 - `storage_controllers/store_policy.py`::`StorePolicy` 决定写哪些 adapter。
