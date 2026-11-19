@@ -30,7 +30,7 @@
 | `DramL1Manager` | CPU DRAM | 默认 |
 | `GdsL1Manager` | NVMe slab(cuFile/hipFile) | `--gds-l1-path` |
 | `DevDaxL1Manager` | Device-DAX | `--l1-devdax-path` |
-| `ShadowL1Manager` | 借来的对象 | peer 拥有字节,本端只持租约;P2P 落地处 |
+| `ShadowL1Manager` | 借来的对象 | 对端 MP server 拥有字节,本端只持租约;P2P 落地处 |
 
 一个 MP server 可同时挂多个 L1(各带 `type` + 唯一 `tag` + `size_gb`),每个有自己的容量、驱逐与 store controller,L2 adapter 按其 memory type 自动绑定到某个 L1。见 [mp/multi_l1.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/multi_l1.rst)。接口是 `lmcache/v1/distributed/internal_api.py`::`L1ManagerInterface`(`reserve_read` / `unsafe_read` / `finish_read` / `reserve_write` / `finish_write` / `delete` …),基类 `l1_manager/base.py`::`BaseL1Manager`。
 
