@@ -275,7 +275,7 @@
 - **四个问题**（§3）：元数据有没有权威中心、全局视野覆盖到哪、是否做全局管理、是否做请求 + KV + 扩缩联合调度。按「数据归属」讲不清差异，按这四问可以。LMCache coordinator 是最接近的同类，但 connector-coupled、事件目录、只覆盖自己的 L1/L2。
 - **三个场景**（§4）：引擎下线、引擎升级版本、下一轮请求的提前量。下线场景最能区分——KVCR 用 Guard 旁挂进程接管，kvcm 把 KV 交给池。
 - **今天与目标**（§6）：今天只是「按指令执行 + 核验 + 记账」的控制面，目标才是 Fabric；差距几乎全在 D8。短板见 §3.2 与附录 B（看不见引擎 HBM/APC、`retain` 未接、copy/move 无取消、soft pin 无 ABI 闸、key 要自己与引擎逐字节对齐）。
-- 附件：§4 一张主线图（数据依附于谁 × 策略在哪），附录 A 四张（UCM 分层重绘、MemCache 上游原图、LMCache coordinator 数据流重绘、LMCache MP + Mooncake L2 重绘）。脚本 `docs/research/kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`。
+- 附件：§4 一张主线图（数据依附于谁 × 策略在哪，自绘）；附录 A 四张上游原图（UCM 逻辑架构、MemCache 架构、LMCache coordinator 数据流、LMCache MP 模式与 Mooncake L2 adapter），各配逐段中文说明。脚本 `docs/research/kvcm-vs-oss/figures/plot_kvcm_vs_oss.py`。
 
 ## 二、潜在问题
 

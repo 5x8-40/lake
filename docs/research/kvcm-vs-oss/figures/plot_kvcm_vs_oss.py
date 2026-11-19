@@ -23,10 +23,9 @@ Noto Sans CJK 即可，例如：
     fig-ownership.svg            主线图：数据依附于谁 × 策略在哪
     fig-control-placement.svg    部件图：策略在引擎内 vs 在池的 client 上
     fig-evidence.svg             证据图：控制权矩阵 + hint 落地时间线
-    fig-ucm-schematic.svg        UCM 分层示意（重绘自上游 architecture.svg）
 
 图内文字用中文；项目名、API 名、字段名保留英文原样。
-本目录另有两张 LMCache 的上游原图（upstream-lmcache-*.png），不由本脚本生成。
+本目录另有上游原图三张（upstream-ucm-architecture.svg、upstream-lmcache-*.png），不由本脚本生成。
 """
 
 from __future__ import annotations
@@ -450,50 +449,6 @@ def evidence() -> None:
 # 3. UCM 分层示意（重绘）
 # ---------------------------------------------------------------------------
 
-def ucm_schematic() -> None:
-    fig, ax = plt.subplots(figsize=(8.6, 4.8))
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.axis("off")
-    ax.set_title(t("UCM：可插拔 store 之上的引擎插件（重绘）",
-                   "UCM: engine plugin over a pluggable store (redrawn)"),
-                 fontsize=10.2)
-
-    _box(ax, 0.05, 0.76, 0.90, 0.13,
-         t("应用 / 推理引擎（vLLM · SGLang · MindIE）",
-           "applications / inference engines (vLLM · SGLang · MindIE)"), fc=BLUE)
-    _box(ax, 0.05, 0.545, 0.90, 0.155,
-         t("connector 层　KVConnectorBase_V1\n"
-           "UCMConnector · UCMDirectConnector · UCMLayerWise · UCMPDConnector",
-           "connector layer  KVConnectorBase_V1\n"
-           "UCMConnector · UCMDirectConnector · UCMLayerWise · UCMPDConnector"), fc=AMBER)
-    ax.text(0.470, 0.542,
-            t("补丁按引擎版本分目录：\nucm/integration/vllm/patch/{0.9.2 … v0300, common}/",
-              "versioned patch tree:\nucm/integration/vllm/patch/{0.9.2 … v0300, common}/"),
-            ha="right", fontsize=6.2, color="#5a5a5a", style="italic", va="top",
-            linespacing=1.6)
-    _box(ax, 0.05, 0.335, 0.90, 0.145,
-         t("统一缓存层　查找 / 预取 / 加载 / 落盘 / 等待",
-           "unified cache layer  lookup / prefetch / load / dump / wait"), fc=GREEN)
-    _box(ax, 0.05, 0.125, 0.90, 0.145,
-         t("全局 KV store　UcmKVStoreBaseV1\n（nfs · posix · mooncake · ds3fs · dram …）",
-           "global KV store  UcmKVStoreBaseV1\n(nfs · posix · mooncake · ds3fs · dram …)"), fc=GREEN)
-    _arrow(ax, (0.50, 0.76), (0.50, 0.703))
-    _arrow(ax, (0.50, 0.545), (0.50, 0.483))
-    _arrow(ax, (0.50, 0.335), (0.50, 0.273))
-
-    ax.text(0.05, 0.052,
-            t("重绘自 unified-cache-management docs/source/_static/architecture.svg"
-              "（README_zh.md 架构节），MIT with additional conditions。\n"
-              "布局以原图为准；这里只保留本次对照用到的层级命名，不声称是上游原图。",
-              "redrawn from unified-cache-management docs/source/_static/architecture.svg"
-              " (architecture section of README_zh.md), MIT with additional conditions.\n"
-              "The upstream figure is the authority for layout; this schematic only names "
-              "the layers used in this comparison."),
-            fontsize=6.1, color="#5a5a5a", va="bottom", linespacing=1.6)
-    fig.savefig(HERE / "fig-ucm-schematic.svg", format="svg")
-    plt.close(fig)
-
 
 # ---------------------------------------------------------------------------
 # 4. LMCache coordinator 数据流（重绘）
@@ -687,12 +642,10 @@ def main() -> None:
     ownership()
     control_placement()
     evidence()
-    ucm_schematic()
     for name in (
         "fig-ownership.svg",
         "fig-control-placement.svg",
         "fig-evidence.svg",
-        "fig-ucm-schematic.svg",
     ):
         print(f"wrote {HERE / name}")
 

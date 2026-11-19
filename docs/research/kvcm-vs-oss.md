@@ -243,11 +243,21 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 
 ### A.1 引擎内插件：UCM / FlexKV
 
-![UCM 分层示意](kvcm-vs-oss/figures/fig-ucm-schematic.svg)
+![UCM 逻辑架构](kvcm-vs-oss/figures/upstream-ucm-architecture.svg)
 
-（**本仓自绘**，非上游原图：redrawn from unified-cache-management `docs/source/_static/architecture.svg`，MIT with additional conditions，快照 `57ddbb26`（2026-11-13）。只保留本文用到的三层命名，布局以原图为准。上游原图 [在此](https://github.com/ModelEngine-Group/unified-cache-management/blob/main/docs/source/_static/architecture.svg)，未复制进本仓：`LICENSE` 是标准 MIT，但 README 写「MIT with additional conditions」且未写明附加条款，许可边界不清，按保守处理只链接。）
+（**上游原图**：[unified-cache-management `docs/source/_static/architecture.svg`](https://github.com/ModelEngine-Group/unified-cache-management/blob/develop/docs/source/_static/architecture.svg)，© Huawei Technologies，许可证 MIT，快照 `57ddbb26`（2026-11-13）。Excalidraw 绘制，1244×950。）
 
-**UCM**（ModelEngine，MIT 附加条件）
+这张图分三层，正好对上本文的「引擎内插件」这一层：
+
+| 图中层 | 内容 | 说明 |
+|---|---|---|
+| 上 | Applications & inference engines → Inference engines（Produce and consume KV Cache） | 应用与引擎产生/消费 KV；复用模式列在左侧（Agent workflows、Multimodal context、Session context、Prefix reuse） |
+| 中 | **Engine adapters → Unified Cache**（KV Cache lifecycle management） | 三件事：**Reuse**（Match · retrieve · load）、**Placement**（Tier · offload · evict）、**Movement**（Prefetch · migrate）。另注 Prefix and chunk reuse、Manage retention across tiers、PD transfer: Prefill → Decode |
+| 下 | **Unified KV storage interface → Global KV Store**（Pluggable storage backends） | File-System / KV Semantic / KV Native Storage 三类后端，可靠性由后端自己负责（"Reliability · retention · reclamation (backend-dependent)"） |
+
+**读法**：UCM 的全部策略都装在中层那个 `Engine adapters` 里——它挂在引擎上，所以能管 Reuse / Placement / Movement；底层存储是可插拔的，换后端不动上面。这也解释了为什么它的能力边界止于「这次请求怎么取 KV」：图的左右两侧都是引擎与应用，没有集群级视图的位置。
+
+**UCM**（ModelEngine，MIT）
 
 | 事实 | 出处 |
 |---|---|
