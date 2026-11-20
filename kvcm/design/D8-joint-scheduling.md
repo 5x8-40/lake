@@ -238,6 +238,21 @@ stateDiagram-v2
 - **已确认**：引擎事件/READY/核验证明“真的有”；只有已确认条目才能算命中、才能支撑 HBM 判定。
 - 删除/失效带墓碑，防延迟到达的 `Stored` 复活；合并规则见 [D8a §2.3](D8a-scheduling-algorithms.md)。
 
+### 3.1.1 LMCache coordinator 可借鉴 / 不照搬
+
+LMCache `mp_coordinator` 与 D8 的 KVT 是同层问题：都是事件派生的派生视图，不是权威。可直接借四样：
+
+| 点 | LMCache 做法 | 对 D8 的用法 |
+|---|---|---|
+| **incarnation fencing** | 每条 L1 placement 带上报者 incarnation；重启后旧进程的迟到事件被 `fence_instance` 丢掉 | KVT 事件合并除 `source + seq + 墓碑` 外，再加 `incarnation`；否则引擎重启后旧事件会把死位置写回视图 |
+| **views / controllers 分离** | `KeyDirectory` 只记事实；eviction/prefetch 等控制器读视图后下命令 | KVT 只做“块 → 实例 + 介质 + 置信度”；L0/L1/L2 三环读 KVT，不把决策状态塞进 KVT |
+| **派生状态可 checkpoint、可 replay** | 目录/配额 checkpoint；事件流可重放补齐 | KVT 可从 checkpoint 恢复，事件 gap 重放；权威仍在 master，KVT 坏了不阻塞请求 |
+| **fail-open、off request path** | coordinator 挂了推理继续；命令面走 HTTP，不在请求路径 | SC/KVT 故障只降级选路质量，不阻塞推理；请求路径不查 master |
+
+**hint 的用途**：只用于“大概率在哪、值不值得预取/路由到哪”，不能当锁、地址或字节可用性证明。真正取数仍要让 owner 验证并 lock/locate。LMCache 当前 P2P 取数没有用这份 hint（仍遍历 MP server），这是它的实现缺口；D8 如果拿 hint 做决策，应该定向到候选实例，而不是复制它的全量遍历。
+
+**不照搬**：事件派生目录当权威、L1 本地驱逐由中心接管、connector-coupled、只有 L2 策略没有池级放置。kvcm 的权威仍是 master，KVT 只是决策视图。
+
 ### 3.2 会话需求（SC 自己维护）
 
 - **调度状态在 SC**：上一轮实例/前缀、下一轮 ETA、复用概率、保留策略、预算；ETA 来自 hook，不是 kvcm 推出来的。

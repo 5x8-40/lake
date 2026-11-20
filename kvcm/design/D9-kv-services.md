@@ -307,7 +307,7 @@ D9 的能力都依赖具体机制。**事实写在各处，本文不重复**：
 | **llm-d WVA** | `llm-d-autoscaling`（项目级） | SLO 感知目标副本数、变体成本 | 只做池侧容量事实，不替代 WVA |
 | **AIBrix PodAutoscaler** | `podautoscaler/context/context.go`（`gpu_cache_usage_perc`） | KV 使用率/排队长度扩缩指标 | 决策在 D8，执行在外部 |
 | **Mooncake** | `master_service.cpp::CreateDrainJob`、`CopyStart`、`GetReplicaListForAdmin` | drain job、copy 幂等、零副作用核验 | kvcm 封装，D8 不直连 |
-| **LMCache coordinator** | `lmcache/v1/mp_coordinator` | delete/pin/prefetch/quota；无 move（roadmap 才有） | LMCache 无全局强一致元数据；kvcm 有 master 权威 |
+| **LMCache coordinator** | `lmcache/v1/mp_coordinator` | EventGate(seq/incarnation/fencing)、views/controllers 分离、checkpoint/replay、delete/pin/prefetch/quota；无 move（roadmap 才有） | 可借事件管线与视图分层；不借事件派生目录当权威、L1 中心驱逐、connector 耦合 |
 
 ---
 
