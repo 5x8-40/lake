@@ -12,10 +12,11 @@
 ## 跨实例共享(两条路径)
 
 1. **共享远程存储(L2 adapter)**:多实例共用 Redis/Mooncake/S3/Aerospike/NIXL-store,通过 `chunk_hash` 内容寻址天然去重。实例只读写同一 key。
-2. **P2P 直传(CPU 内存共享)**:`P2PBackend` 经 `CreateTransferChannel`:
-   - `NixlChannel`:底层 NIXL(RDMA/NVLink/TCP)。
-   - `PySocketChannel`:ZMQ 控制面 + 原生 socket 数据面。
-   - "谁有哪些 chunk"由 MP coordinator 的 `KeyDirectory` 提供(事件派生、最终一致)。
+2. **P2P 直传(CPU 内存共享)**:`P2PL2Adapter` 经 transfer channel 直读远端 L1：
+   - `NixlTransferChannelClient`：底层 NIXL(RDMA/NVLink/TCP)。
+   - `MooncakeTeTransferChannelClient`：Mooncake transfer engine。
+   - coordinator 只提供 live MP server 列表；本节点 L1 miss 后向每个 live MP server 发 lookup，命中后读回本地 L1。`KeyDirectory` 有 L1/L2 位置 hint，但当前 P2P 取数不用它。
+   - **为什么有 hint 还遍历**：当前 P2P 取数没有接 `KeyDirectory`；每个 live MP server 一个 P2P adapter，`PrefetchController` 向所有 eligible adapter 发 lookup。P2P adapter 复用 L2 adapter 插槽（不是数据经过 L2），因而继承了“所有 adapter 都查”的 fan-out。正确形态是先查一次目录、定向问 owner；当前没做。
    - PD disagg 走 `NixlStorageBackend`/`pd_backend(_async)`。
 
 ## 存储后端
@@ -28,7 +29,7 @@
 | `AllocatorBackendInterface` | `allocate` / `batched_allocate` / `get_memory_allocator` |
 | `StoragePluginInterface` | 可插拔后端,从 config 加载 |
 
-工厂:`CreateStorageBackends` 按 config 组装 `LocalCPUBackend` / `LocalDiskBackend` / `P2PBackend` / `NixlStorageBackend` / `RemoteBackend`。
+工厂/装配:`StorageManager` 按 config 组装 `L1Manager` 与多个 `L2Adapter`；P2P 是其中一个 adapter。
 
 ### Python 后端实例
 
@@ -37,7 +38,7 @@
 | LocalCPUBackend | `local_cpu_backend.py` | L1 热缓存,pinned CPU 内存,LRU/自定义 cache_policy |
 | LocalDiskBackend | `local_disk_backend.py` | 本地 SSD |
 | RemoteBackend | `remote_backend.py` | 远程存储,封装 `ConnectorClientBase`(asyncio) |
-| P2PBackend | `p2p_backend.py` | 跨实例 P2P(NIXL/socket) |
+| P2PL2Adapter | `p2p_l2_adapter.py` | 跨实例读远端 L1（NIXL / Mooncake TE） |
 | NixlStorageBackend | `nixl_storage_backend.py` | NIXL 抽象后端(PD disagg 传输) |
 | GDSBackend | `gds_backend.py` | GPUDirect Storage |
 
@@ -102,7 +103,7 @@
 | L1 CPU 热缓存 | `lmcache/v1/storage_backend/local_cpu_backend.py`::`LocalCPUBackend` |
 | L2 本地盘 | `lmcache/v1/storage_backend/local_disk_backend.py`::`LocalDiskBackend` |
 | 远程后端(asyncio) | `lmcache/v1/storage_backend/remote_backend.py`::`RemoteBackend` / `ConnectorClientBase` |
-| P2P 跨实例 | `lmcache/v1/storage_backend/p2p_backend.py`::`P2PBackend`::`CreateTransferChannel` |
+| P2P 跨实例 | `lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`::`P2PL2Adapter` |
 | 传输通道 | `lmcache/v1/transfer_channel/nixl_channel.py`::`NixlChannel` / `py_socket_channel.py`::`PySocketChannel` |
 | NIXL/PD 传输后端 | `lmcache/v1/storage_backend/nixl_storage_backend.py`::`NixlStorageBackend` + `pd_backend.py` |
 | GDS 后端 | `lmcache/v1/storage_backend/gds_backend.py`::`GDSBackend` |

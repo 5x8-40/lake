@@ -131,10 +131,12 @@ LMCache 的 L1/L2 分工容易说错，单独列清楚（出处见本仓 [`lmcac
 |---|---|
 | L1 的空间分配与驱逐（逐实例） | MP server 本地，`distributed/storage_manager.py` 建 `L1EvictionController` |
 | 位置知识（可含 L1） | coordinator 的 `KeyDirectory`：`ObjectKey → placements(instance_id, tier, backend, size)`；另有按 instance 的反向索引。答案是 hint，须在 owner 侧验证 |
-| 跨节点查某个 key 在哪 | 问 coordinator：`POST /directory/lookup`（及 `blend-lookup` 等）。P2P 路径下「谁有哪些 chunk」也来自这份目录；字节经 NIXL/socket 直传，不经 coordinator |
+| 跨节点查某个 key 在哪 | 问 coordinator：`POST /directory/lookup` 一次返回 L1/L2 placement hint。**但当前 P2P 取数路径不用这份 hint**：coordinator 只提供 live MP server 列表，miss 后仍向每个 live MP server 发 lookup；字节经 RDMA 直传，不经 coordinator |
 | L2 的配额、驱逐、预取、pin | coordinator（`FleetEvictionController`） |
 
 所以 coordinator 并非不碰 L1：目录里可以有 L1 的 placement。失效上，L1 随上报者 incarnation 收敛，L2 靠显式删除。**位置知识归 coordinator，字节的搬运不归它。**
+
+**为什么有了 hint 还要遍历？** 当前 P2P 取数不是“先查目录、再定向问 owner”，而是：每个 live MP server 装一个 P2P adapter，`PrefetchController` 向所有 eligible adapter 发 lookup。目录 API / blend 匹配会读 `KeyDirectory`，但 P2P 取数路径没有接它。代码上 P2P adapter 复用了 L2 adapter 的插槽，于是继承了“所有 adapter 都查”的 fan-out；这不是数据经过 L2，是控制代码复用。正确形态应是查一次目录、只问被点名的 owner；当前没做。
 
 ### 3.3.1 与 LMCache coordinator 的对照
 
@@ -356,7 +358,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | L2 Adapter 层 | `fs` / `nixl_store` / `mooncake_store` / `s3` … 统一接口、可插拔 | 适配层，不含策略 |
 | 外部存储 | 本地 FS/NVMe、NIXL、Mooncake store（RDMA/TCP）、S3/MinIO | 字节的落点与副本 |
 
-**L1 的驱逐在 MP server 本地，L2 的配额、驱逐、预取、pin 才归 coordinator；L1/L2 的位置视图也在 coordinator（`KeyDirectory`，hint）。** 这个分工是 coordinator 那张图之外最容易搞混的一点：coordinator 不做每台机器 L1 里逐出哪一块，但知道「谁上报过有这份」。
+**L1 的驱逐在 MP server 本地，L2 的配额、驱逐、预取、pin 才归 coordinator；L1/L2 的位置视图也在 coordinator（`KeyDirectory`，hint）。** 这个分工是 coordinator 那张图之外最容易搞混的一点：coordinator 不做每台机器 L1 里逐出哪一块，但知道「谁上报过有这份」。**注意：知道位置不等于取数会用它——当前 P2P 取数仍遍历每个 live MP server；目录查询和 P2P 取数是两条未接通的路径。**
 
 和 Mooncake master 的差别在一个维度：master 对外提供 `CreateCopyTask` / `CreateMoveTask`，知道副本挂在哪个 segment，能按段指派搬迁；协调器没有对等的搬迁能力，它只知道「这个实例有这个 tier 的这个 backend 上有一份」，粒度为实例而非段，命令面只有预取 / pin / 删除 / 配额。
 

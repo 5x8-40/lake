@@ -40,7 +40,7 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 ### 跨实例共享(两条路径)
 
 1. **共享远程存储(L2 adapter)**:多实例共用 Redis/Mooncake/S3/Aerospike/NIXL-store,通过 `chunk_hash` 内容寻址天然去重共享。
-2. **P2P 直传(CPU 内存共享)**:`p2p_l2_adapter` 经 NIXL 在实例间直传 KV bytes(`lmcache/v1/transport/`、`lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`)。"谁有哪些 chunk"由 MP coordinator 的 `KeyDirectory` 提供(事件派生、最终一致)。
+2. **P2P 直传(CPU 内存共享)**:`p2p_l2_adapter` 经 NIXL 在实例间直读远端 L1。coordinator 只提供 live MP server 列表；本节点 L1 miss 后，向每个 live MP server 发 lookup，命中的 server 返回远端地址。`KeyDirectory` 有 L1/L2 位置 hint，但当前 P2P 取数不用它。
 
 详见 [sharing-and-backends.md](sharing-and-backends.md)。
 
@@ -78,7 +78,7 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 | MP 分布式键(内容寻址) | `lmcache/v1/distributed/api.py`::`ObjectKey` |
 | MP 存储管理器(多 L2 adapter) | `lmcache/v1/distributed/storage_manager.py`::`StorageManager` |
 | L2 adapter 抽象 | `lmcache/v1/distributed/l2_adapters/base.py`::`L2AdapterInterface` |
-| P2P 跨实例 | `lmcache/v1/storage_backend/p2p_backend.py`::`P2PBackend` (L160) |
+| P2P 跨实例 | `lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`::`P2PL2Adapter` |
 | 传输通道(NIXL/socket) | `lmcache/v1/transfer_channel/`(`nixl_channel.py`、`py_socket_channel.py`) |
 | 协调器入口(元数据协调,非数据路径) | `lmcache/v1/mp_coordinator/app.py`::`create_app`;控制器基类 `mp_coordinator/controllers/base.py`::`Controller` |
 | fleet key 目录 | `lmcache/v1/mp_coordinator/views/key_directory.py`::`KeyDirectory.lookup` |
@@ -106,7 +106,7 @@ vLLM 集成点:`LMCacheConnectorV1Dynamic`(继承 `KVConnectorBase_V1`),委托 `
 
 1. **强依赖 vLLM 的 hash/connector 抽象** — `token_database.py` 大量 vLLM 版本兼容代码,hash 取自 vLLM;深度耦合 vLLM 演进。
 2. **无全局强一致元数据** — coordinator 的 `KeyDirectory` 是事件派生的最终一致视图,答案只是 hint,必须在 owner 侧验证;事件丢失或乱序靠 gate 的重放与 fencing 兜底,不做全局事务。多实例并发写同 key 无锁/事务。
-3. **共享靠存储或 P2P,非内存池** — 跨实例共享要么走共享远程存储(网络/序列化开销),要么 P2P 直传(需预分配 NIXL buffer + 控制器元数据),**非真正的全局共享内存池**。
+3. **共享靠存储或 P2P,非内存池** — 跨实例共享要么走共享远程存储(网络/序列化开销),要么 P2P 直传(需预分配 NIXL buffer + coordinator 成员发现),**非真正的全局共享内存池**。
 4. **匹配粒度受限** — 链式 prefix hash + 顺序 contains,断链即停;非 prefix 部分需 CacheBlend 重算(有质量损失);无真正的 radix tree 灵活匹配(radix 在 vLLM 侧)。
 5. **架构双轨复杂** — non-MP(逐步 deprecated)与 MP 两套代码路径并存,认知与维护成本高。
 6. **C++ 后端构建门槛** — Redis/Mooncake 原生后端 + CacheGen kernel 需 CUDA/C++ 工具链,`NO_NATIVE_EXT` 退化为纯 Python 性能损失大。
