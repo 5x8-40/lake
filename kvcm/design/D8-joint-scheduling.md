@@ -240,7 +240,7 @@ stateDiagram-v2
 
 ### 3.1.1 LMCache coordinator 可借鉴 / 不照搬
 
-LMCache `mp_coordinator` 与 D8 的 KVT 是同层问题：都是事件派生的派生视图，不是权威。可直接借四样：
+LMCache `mp_coordinator` 与 D8 的 KVT 是同层问题：都是事件派生的视图，不是权威。可直接借四样：
 
 | 点 | LMCache 做法 | 对 D8 的用法 |
 |---|---|---|

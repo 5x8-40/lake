@@ -63,7 +63,7 @@ Coordinator 的三条边界:
 
 - **可选**。`lmcache/v1/multiprocess/config.py`::`CoordinatorConfig` 默认 `url = ""`,docstring 写明:"When :attr:`url` is empty, the server registers with no coordinator and runs exactly as before." 事件上报默认也关(`event_reporting = False`)。
 - **pin 只在 coordinator 上。** 不接 coordinator 就只有 prefetch / delete / quota / clear,没有 pin(`/cache/pins` 由 `mp_coordinator/controllers/eviction_http_api.py`::`request_pin` 提供)。pin 的语义是"排除在该 coordinator 自己的 L2 驱逐计划外"的计数,见 `controllers/eviction_controller.py`::`FleetEvictionController._pin_counts`。
-- **P2P 依赖 coordinator,且与 GDS/Device-DAX L1 互斥。** 上游写明 "A server started with `--p2p-advertise-url` but no `--coordinator-url` refuses to start";传输通道要注册一整段连续 L1,所以 `--gds-l1-path` 与 `--l1-devdax-path` 下拒绝启动。三条组件(Coordinator 只管成员、server 里的 P2P controller、RDMA transfer channel)见 [mp/p2p.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/p2p.rst)。
+- **P2P 依赖 coordinator,且与 GDS/Device-DAX L1 互斥。** 上游写明 "A server started with `--p2p-advertise-url` but no `--coordinator-url` refuses to start";传输通道要注册一整段连续 L1,所以 `--gds-l1-path` 与 `--l1-devdax-path` 下拒绝启动。三条组件(P2P 场景下 coordinator 提供 live server 列表、server 里的 P2P controller、RDMA transfer channel；位置 hint 另有 KeyDirectory)见 [mp/p2p.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/p2p.rst)。
 
 ### 两种 connector(别混)
 
@@ -140,7 +140,7 @@ native connector 的契约只有上面四个方法,`csrc/storage_backends/README
 
 > 跨项目汇总对比见 [../distributed-models.md](../distributed-models.md);细节见 [sharing-and-backends.md](sharing-and-backends.md)。
 
-- **拓扑**:两种并存。(a)共享存储为中心:多实例共用 Redis/Mooncake/S3 等 L2 adapter,`chunk_hash` 内容寻址天然去重,实例间无协调;(b)MP coordinator 星型:独立进程(`lmcache/v1/mp_coordinator/`)注册各 MP server、消费其 cache event、维护 fleet 级 L2 `ObjectKey → placements` 目录,并暴露命令面(预取 / pin / 删除 / 配额)。它只在元数据面,不在数据路径上。
+- **拓扑**:两种并存。(a)共享存储为中心:多实例共用 Redis/Mooncake/S3 等 L2 adapter,`chunk_hash` 内容寻址天然去重,实例间无协调;(b)MP coordinator 星型:独立进程(`lmcache/v1/mp_coordinator/`)注册各 MP server、消费其 cache event、维护 fleet 级 L1/L2 `ObjectKey → placements` 目录,并暴露命令面(预取 / pin / 删除 / 配额)。它只在元数据面,不在数据路径上。
 - **元数据权威**:`KeyDirectory`(`views/key_directory.py`)是 **L1/L2 目录**,也是事件派生的最终一致视图,模块 docstring 明确"lookups are hints to be validated at the owner"。不是权威记录——字节是否可用必须在 owner MP server 侧验证。
 - **同步机制**:MP server 注册 + 心跳(`http_apis/instances_api.py`、`registrar.py::keep_registered`);cache event 批经 ingest gate 去重、排序、fencing 后喂给各 view(`ingest/event_gate.py::EventGate`);目录与配额可 checkpoint(`persistence/checkpoint.py`)并可回放(`events_replay.py::replay`)。
 - **一致性**:无全局强一致。事件流可丢可乱,目录靠 gate 与 fencing 收敛;失效靠 L1 上报者 incarnation 与 L2 显式删除。

@@ -22,7 +22,7 @@
 | 参考 | 锚点 | 借什么 | 关键差异 |
 |------|------|--------|----------|
 | Mooncake master 写路径 | mooncake 仓内 `master_service.cpp::UpsertStart`（@0.3.11） | 已有 key 事后加/解 soft pin 的唯一现成通道：同尺寸 upsert 会顺带设置/清除 soft pin（F3） | 该路径为「覆盖写」设计；本文的「空写」（声明更新但不写数据，只为触发元数据变更）是复用其副作用，非官方用法。**目标版本有条件可用；main/0.3.14 有 lease gate 时不可用** |
-| LMCache 后端接口 + controller | `lmcache/v1/storage_backend/storage_backend_interface.py`（七方法）+ `lmcache/v1/cache_controller`（lookup/pin/move/clear） | 与 kvcm 八项操作近一一对应，操作集合理性的直接证据 | LMCache 无全局强一致元数据（controller 是协调非权威）；kvcm 有 master 权威视图 |
+| LMCache L2 adapter + coordinator | `lmcache/v1/distributed/l2_adapters/base.py::L2AdapterInterface` + `lmcache/v1/mp_coordinator/`（prefetch/pin/delete/quota；无 move） | 与 kvcm 八项操作近一一对应，操作集合理性的直接证据 | LMCache 无全局强一致元数据（KeyDirectory 是事件派生 hint，owner 验证）；kvcm 有 master 权威视图 |
 | KVCR | `src/kvcr/remote_fw_dram.py`（hint/query/fetch 时序）+ Guard 组件 | 传输窗口 pin（`claim/pin`→`release_pin`）；Guard 旁挂进程持池（retain 对照） | KVCR 目的地发起 + 派生索引 hint；kvcm 集中式 + master 权威视图 |
 
 - 八项操作的逐项业界对照见 §1 末；各产品降层机制对照见 §3；mooncake 机制锚点散布在事实基线各 F 条目
@@ -409,7 +409,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 
 | kvcm 操作 | 业界对应 | 异同 |
 |---|---|---|
-| copy | LMCache `P2PL2Adapter` 跨实例直传 + coordinator 的 prefetch/pin/delete（`lmcache/v1/mp_coordinator`，当前无 move）；KVCR hint 驱动 P2P（**目的地发起**，源侧 `claim/pin` 配合）；llm-d P2P（索引只作 hint、握手兜底）；HiCache `prefetch_from_storage`（L3→L2→L1，三策略终止）；mooncake 动态副本（main 内部机制，热度驱动自动加副本） | 命令面与数据面分离是各家共同形态。kvcm 的 `CreateCopyTask` 是 master 指派源端执行；LMCache coordinator 只做 prefetch/pin/delete，P2P 由目标 MP server 发起读取，不是同一类集中式 copy。KVCR/llm-d 的「目的地发起」依赖派生索引 + 握手，kvcm 有 master 权威视图，集中式成立。mooncake 动态副本 kvcm 能触发不能指定目标（反复调 `GetReplicaList`，同一种做法，F13⑤）——只适合池级自动调节，不满足预热「指定目标」语义 |
+| copy | LMCache `P2PL2Adapter` 跨实例直传 + coordinator 的 prefetch/pin/delete（`lmcache/v1/mp_coordinator`，当前无 move）；KVCR hint 驱动 P2P（**目的地发起**，源侧 `claim/pin` 配合）；llm-d P2P（索引只作 hint、握手兜底）；HiCache `prefetch_from_storage`（L3→L2→L1，三策略终止）；mooncake 动态副本（main 内部机制，热度驱动自动加副本） | 命令面与数据面分离是各家共同形态。kvcm 的 `CreateCopyTask` 是 master 指派源端执行；LMCache coordinator 只做 prefetch/pin/delete，P2P 由请求侧 MP server 发起远端读，不是同一类集中式 copy。KVCR/llm-d 的「目的地发起」依赖派生索引 + 握手，kvcm 有 master 权威视图，集中式成立。mooncake 动态副本 kvcm 能触发不能指定目标（反复调 `GetReplicaList`，同一种做法，F13⑤）——只适合池级自动调节，不满足预热「指定目标」语义 |
 | move | LMCache coordinator 当前无 `move`（roadmap 才有 promote/demote/move/duplicate）；KVCR `deliver`（纯搬运层模式） | move 作控制面原语只在少数系统存在；`CreateMoveTask` 指定源、删源，语义一致 |
 | keepalive | LMCache coordinator 无 lease/keepalive（pin 是 L2 驱逐计数，不是续租）；FlexKV lease「保证传输期间块有效」；llm-d 推测索引 TTL 2s（`defaultSpeculativeTTL`，代码注释自承是经验值） | 周期续租在多家存在；llm-d 的「TTL 是经验值」提示 lease_ttl 须真机校准（F10 已记） |
 | pin | LMCache coordinator `pin`/`unpin`（L2 驱逐计划计数，`FleetEvictionController`）；KVCR `claim/pin`/`release_pin`（**传输窗口专用**，`FETCHABLE` 须等 pin 成功才确定）；TensorCast `pinned` policy（必须驻留 + 溢出**拒绝写入**）；HiCache `lock_ref`（`protected_size_` vs `evictable_size_`，dec 到 0 ≠ 释放、仍可命中） | mooncake 三件套（lease/soft/hard）比多数系统细。差异：TensorCast `pinned` 溢出拒绝写入，mooncake hard pin 无此语义（创建时固化、之后改不了，F1）；KVCR 的传输窗口 pin 在 mooncake 由「copy 任务在途拒 upsert」覆盖（F2） |
@@ -437,9 +437,9 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 | 操作 | 别人为什么不做 | kvcm 为什么要 |
 |---|---|---|
 | pin 显式标记 | UCM/FlexKV 交给后端 LRU/TTL；SGLang 有 L3 时引擎**永不主动放弃**（删除下放后端容量管理） | 预热副本**没有读者**，「读即续租」保不住——预热场景特有 |
-| keepalive 独立保活 | 多数系统靠读路径被动续租，无控制面保活 | 同上（LMCache `touch_cache` 是同类例外） |
+| keepalive 独立保活 | 多数系统靠读路径被动续租，无控制面保活 | 同上（LMCache MP server 的 `touch_cached_keys` 只随 lookup 更新热度，不是独立保活） |
 | move 显式搬迁 | FlexKV/UCM/HiCache 层间移动是驱逐/prefetch 的副作用，无显式 move；LMCache coordinator 当前也无 move（roadmap 才有） | 下线迁移/副本归拢要确定性搬迁；当前只有 KVCR `deliver` 等少数路径 |
-| retain key 的 client_id 下线存续 | 引擎插件层（FlexKV/UCM/HiCache L1L2）引擎死缓存失效拉倒；KVCR-Guard/LMCache daemon 才做 | kvcm 是独立控制面：预热投入要跨实例存亡保住 |
+| retain key 的 client_id 下线存续 | 引擎插件层（FlexKV/UCM/HiCache L1L2）引擎死缓存失效拉倒；KVCR-Guard/LMCache MP server 才做 | kvcm 是独立控制面：预热投入要跨实例存亡保住 |
 
 - **审计结论**：不做 pin/keepalive/retain 的系统，共同点是有读者替它们保活、或引擎死了认栽——kvcm 的预热副本恰好「无读者 + 要跨实例存亡」，这三样是定位需要，不是冗余。**唯一真缺口 = prefetch 终止**（summary P9）
 
@@ -1097,7 +1097,7 @@ soft pin 真机的环境、ABI/链接问题、用例结果与未覆盖项见
 | 产品 | 触发 | 搬运者 | 引擎死后副本 |
 |---|---|---|---|
 | FlexKV | 请求结束（`request_finished`→D2H） | 卸载组件自己 | 本机失效；REMOTE（Mooncake store 等）保留 |
-| LMCache | forward 内逐层 `save_kv_layer` | 自己（`from_gpu`） | daemon / 远程后端保留 |
+| LMCache | forward 内逐层 `save_kv_layer` | MP server 自己（`gpu_connector/`） | MP server 的持久 L2 保留；无 retain 命令 |
 | UCM | 策略调 `dump` | connector 自己 | store 保留 |
 | Dynamo KVBM | `request_finished` settlement | OffloadEngine | G4 保留，G2/G3 随实例 |
 | MemCache（昇腾） | put 时定介质 | LocalService | 池对象 Meta 保留 |
