@@ -116,7 +116,7 @@ native connector 的契约只有上面四个方法,`csrc/storage_backends/README
 ### 跨实例共享(两条路径)
 
 1. **共享远程存储(L2 adapter)**:多实例共用 S3/HF3FS/Mooncake Store/Aerospike/Valkey/Bigtable/WQS 等,`chunk_hash` 内容寻址天然去重。上游把这批归为"适合跨节点共享"的一组,见 [l2_storage/remote_and_distributed.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/l2_storage/remote_and_distributed.rst)。
-2. **P2P 直传(L1 内存共享)**:`p2p_l2_adapter` 经 transfer channel 在实例间做单边 RDMA 读(`lmcache/v1/distributed/transfer_channel/`、`lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`)。coordinator 的 `KeyDirectory` 记录 L1/L2 的 placement，`POST /directory/lookup` 一次就能拿到位置 hint；但 P2P 取数路径当前没接这份目录：`P2PController._poll_cycle` 后台周期轮询 `GET /instances`，为每个上报了 `p2p_advertised_url` 的对端 MP server 预建 `P2PL2Adapter`；本节点 L1 不能独立满足时，`PrefetchController` 向所有 eligible peer adapter 并发 lookup，命中的对端返回远端地址。**“查位置”可以问 coordinator 一次；“取 L1 字节”仍要扇出查询所有已连接的 P2P peer。这是当前实现的限制:节点越多,查询扇出越大;大规模场景应优先走共享 L2,或在上层做候选过滤。**
+2. **P2P 直传(L1 内存共享)**:`p2p_l2_adapter` 经 transfer channel 在实例间做单边 RDMA 读(`lmcache/v1/distributed/transfer_channel/`、`lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`)。coordinator 的 `KeyDirectory` 记录 L1/L2 的 placement，`POST /directory/lookup` 一次就能拿到位置 hint；但 P2P 取数路径当前没接这份目录：本节点后台向 coordinator 查活着的 MP server 列表，并为每个 MP server 建 P2P 连接；本节点 L1 miss 时，向这些 MP server 并发查询，命中的对端返回远端地址。**“查位置”可以问 coordinator 一次；“取 L1 字节”仍要逐个 MP server 查询。这是当前实现的限制:节点越多,查询扇出越大;大规模场景应优先走共享 L2,或在上层做候选过滤。**
 
 **L1 P2P 跨节点取 KV 走两次拷贝,不是一次 RDMA 直写显存**（PD 的 `NixlConnector` P→D 是另一条路径，不在这个描述里）。路径是:
 
