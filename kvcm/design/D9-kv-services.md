@@ -121,6 +121,8 @@ flowchart TB
 - 会话侧补 `session_e2e`、`next_turn_ttft`、`tool_wait`、`session_success`；`next_turn_ttft` = 工具运行结束后下一轮请求的 TTFT，不是引擎/请求 resume 的时间；
 - 归因：`hit = engine_apc + local_pool + remote_pool + prewarm + retain`；
 - ROI：`saved / cost`；浪费：预取未用、保留未恢复、迁移失败；
+- branch 维度：活跃 branch 数、零引用驱逐量、context version 陈旧命中；
+- KV 复用损失：`1 − 当前命中率 / 不限容量且不切 P/D 时的命中率上限`；用来验证零引用驱逐是否真的减少误删；
 - 成本：GPU 时间、带宽、驻留字节。
 
 **例子**：预热 100 次，只有 20 次被用上；账本按前缀算出 ROI，下次只预取高价值前缀，或降低低价值前缀的保留等级。
