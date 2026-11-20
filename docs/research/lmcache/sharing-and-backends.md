@@ -16,7 +16,7 @@
 2. **P2P 直传(L1 内存共享)**:`P2PL2Adapter` 经 transfer channel 做单边 RDMA 读:
    - `impl/nixl_impl.py`::`NixlTransferChannelClient` — 默认引擎,`lmcache[nixl]` extra。
    - `impl/mooncake_te_impl.py`::`MooncakeTeTransferChannelClient` — Mooncake transfer engine。
-   - coordinator 的 `KeyDirectory` 记录 L1/L2 placement，`POST /directory/lookup` 一次就能拿到位置 hint；但 P2P 取数路径当前没接这份目录：本节点 L1 miss 后，仍向每一个活着的 MP server 建 P2P 连接并发 lookup，命中后由对端返回地址。节点越多，取数查询扇出越大，大规模应优先走共享 L2。
+   - coordinator 的 `KeyDirectory` 记录 L1/L2 placement，`POST /directory/lookup` 一次就能拿到位置 hint；但 P2P 取数路径当前没接这份目录：`P2PController._poll_cycle` 后台周期轮询 `GET /instances`，为每个上报了 `p2p_advertised_url` 的对端 MP server 预建 `P2PL2Adapter`；本节点 L1 不能独立满足时，`PrefetchController` 向所有 eligible peer adapter 并发 lookup，命中后由对端返回远端地址。节点越多，取数查询扇出越大，大规模应优先走共享 L2。
    - 前提:必须有 coordinator,且 L1 须为一整段连续区域 → 与 GDS L1、Device-DAX L1 互斥,见 [mp/p2p.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/p2p.rst)。
    - **P2P 的落点是本节点 L1(CPU pinned DRAM),不是显存；PD 的 NixlConnector P→D 不走这条路径。** **Mooncake TE 可以注册 HBM 做 RH2D；这里的两跳是 LMCache 把落点选在 CPU L1，不是底层没有 RH2D。** `p2p.rst`: "The transfer is a one-sided RDMA read from the requesting node into its own L1"。之后再由 H2D 进 HBM,所以 LMCache 的 L1 P2P 跨节点读是两跳。L1 的定义见 [`l1_manager/dram.py`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/l1_manager/dram.py)::`DramL1Manager`("Pinned-DRAM L1 manager")。LMCache 的 P2P 没有上报 VRAM 落点：`api.py` 的 `MemoryResidency.VRAM` 注释写 "Reserved for GDS/GDR L2 adapters; nothing reports it yet"。
 3. **PD disagg**:由引擎侧 `MultiConnector` 并列 `NixlConnector` 与 `LMCacheMPConnector` 组合,不是 LMCache 自己的后端。P、D 每个 vLLM 实例各一个 MP server,不能共用,见 [mp/disaggregated_prefill.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/disaggregated_prefill.rst)。
@@ -65,10 +65,10 @@ C++ 写一次,MP 与 InProcess 两种模式复用——这是与"引擎侧 KV co
 ## 分层与配额
 
 - **介质**:L1 默认是 **CPU pinned DRAM**(`l1_manager/dram.py`::`DramL1Manager`,docstring "Pinned-DRAM L1 manager"),另有 `GdsL1Manager`(NVMe slab,走 GPUDirect **Storage**)与 `DevDaxL1Manager`(Device-DAX slab)。**L1 不在 GPU 显存里**,引擎 HBM 只是 KV 的来源与去向(`gpu_connector/` 负责 H2D/D2H)。**LMCache 看不见 HBM/APC**；HBM 命中仍由引擎自己的 APC 判断。
-- `distributed/storage_manager.py`::`StorageManager` + 多 `L1Manager` + 多 `L2Adapter` + `storage_controllers/` 下的 `StoreController` / `PrefetchController` / `EvictionController`。tier 词汇 `distributed/api.py`::`Tier{L1,L2,ALL}`。
+- `distributed/storage_manager.py`::`StorageManager` + 多 `L1Manager` + 多 `L2Adapter` + `storage_controllers/` 下的 `StoreController` / `PrefetchController` / `L1EvictionController` / `L2EvictionController`。tier 词汇 `distributed/api.py`::`Tier{L1,L2,ALL}`。
 - `QuotaManager`(`distributed/quota_manager.py`)按 `cache_salt` 记配额,HTTP 面在 MP server 的 `/quota/{cache_salt}`。
 - `storage_controllers/store_policy.py`::`StorePolicy` 决定写哪些 adapter。
-- 驱逐由 L1 水位触发(`EvictionController`),L1 逐出后 L2 副本仍在。
+- 驱逐由 L1 水位触发(`L1EvictionController`),L1 逐出后 L2 副本仍在;L2 本地按容量/配额驱逐由 `L2EvictionController` 执行。
 
 ## MP coordinator(中央协调器)
 
@@ -125,7 +125,7 @@ C++ 写一次,MP 与 InProcess 两种模式复用——这是与"引擎侧 KV co
 | L1 manager 抽象 | `lmcache/v1/distributed/internal_api.py`::`L1ManagerInterface`;`l1_manager/base.py`::`BaseL1Manager` |
 | L1 各介质 | `DramL1Manager` / `GdsL1Manager` / `DevDaxL1Manager` / `ShadowL1Manager`;工厂 `l1_manager/factory.py`::`create_l1_managers` |
 | MP 存储管理器 | `lmcache/v1/distributed/storage_manager.py`::`StorageManager` |
-| L1/L2 控制器 | `lmcache/v1/distributed/storage_controllers/`::`StoreController` / `PrefetchController` / `EvictionController` |
+| L1/L2 控制器 | `lmcache/v1/distributed/storage_controllers/`::`StoreController` / `PrefetchController` / `L1EvictionController` / `L2EvictionController`（基类 `EvictionController`） |
 | tier 枚举 | `lmcache/v1/distributed/api.py`::`Tier{L1,L2,ALL}` |
 | 配额管理 | `lmcache/v1/distributed/quota_manager.py`::`QuotaManager` |
 | 写策略 | `lmcache/v1/distributed/storage_controllers/store_policy.py`::`StorePolicy` |

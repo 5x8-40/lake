@@ -13,7 +13,7 @@ LMCache 是一个 **vendor-neutral 的 LLM KV cache 管理层**,把 GPU 上一�
 - **定位**:KV cache 从"临时状态"升级为"可管理资产"——stored(分层持久化)、reused(跨请求/会话/实例)、monitored(可观测)、transformed(压缩/丢弃/serde)。
 - **与引擎的关系**:引擎侧一个 connector 插件 + 引擎旁一个独立服务。MP 模式下服务与引擎无 fate-sharing;同时声称 vendor-neutral,集成 vLLM、SGLang、TensorRT-LLM、NIXL 等。
 - **核心目标**:跨请求/跨实例复用。支持 prefix caching、non-prefix reuse(CacheBlend)、跨实例 P2P 内存共享、PD disagg。
-- **可见范围**:LMCache 管的是 L1（CPU DRAM/本地介质）与 L2；**HBM/APC 不在它的索引里**。HBM 命中仍由引擎自己的 APC 判断，LMCache 只能通过引擎事件/壳请求间接知道“KV 进了 HBM”。
+- **可见范围**:LMCache 管的是 L1（CPU DRAM/本地介质）与 L2；**HBM/APC 不在它的索引里**。HBM 命中仍由引擎自己的 APC 判断；LMCache 仅在引擎经 connector 发起 `RETRIEVE` / `STORE` 时介入数据搬运，不跟踪 HBM 驻留（`modules/kv_events.py`::`KVEventModule` 对外发布的也是 `KV_EVENT_MEDIUM_CPU` 的 L1 事件）。
 
 ## 架构
 
@@ -116,7 +116,7 @@ native connector 的契约只有上面四个方法,`csrc/storage_backends/README
 ### 跨实例共享(两条路径)
 
 1. **共享远程存储(L2 adapter)**:多实例共用 S3/HF3FS/Mooncake Store/Aerospike/Valkey/Bigtable/WQS 等,`chunk_hash` 内容寻址天然去重。上游把这批归为"适合跨节点共享"的一组,见 [l2_storage/remote_and_distributed.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/l2_storage/remote_and_distributed.rst)。
-2. **P2P 直传(L1 内存共享)**:`p2p_l2_adapter` 经 transfer channel 在实例间做单边 RDMA 读(`lmcache/v1/distributed/transfer_channel/`、`lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`)。coordinator 的 `KeyDirectory` 记录 L1/L2 的 placement，`POST /directory/lookup` 一次就能拿到位置 hint；但 P2P 取数路径当前没接这份目录：本节点 L1 miss 后，仍向每一个活着的 MP server 建 P2P 连接并发 lookup，命中的 server 返回远端地址。**“查位置”可以问 coordinator 一次；“取 L1 字节”仍要遍历所有 MP server。这是当前实现的限制:节点越多,miss 时的查询扇出越大;大规模场景应优先走共享 L2,或在上层做候选过滤。**
+2. **P2P 直传(L1 内存共享)**:`p2p_l2_adapter` 经 transfer channel 在实例间做单边 RDMA 读(`lmcache/v1/distributed/transfer_channel/`、`lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`)。coordinator 的 `KeyDirectory` 记录 L1/L2 的 placement，`POST /directory/lookup` 一次就能拿到位置 hint；但 P2P 取数路径当前没接这份目录：`P2PController._poll_cycle` 后台周期轮询 `GET /instances`，为每个上报了 `p2p_advertised_url` 的对端 MP server 预建 `P2PL2Adapter`；本节点 L1 不能独立满足时，`PrefetchController` 向所有 eligible peer adapter 并发 lookup，命中的对端返回远端地址。**“查位置”可以问 coordinator 一次；“取 L1 字节”仍要扇出查询所有已连接的 P2P peer。这是当前实现的限制:节点越多,查询扇出越大;大规模场景应优先走共享 L2,或在上层做候选过滤。**
 
 **L1 P2P 跨节点取 KV 走两次拷贝,不是一次 RDMA 直写显存**（PD 的 `NixlConnector` P→D 是另一条路径，不在这个描述里）。路径是:
 
@@ -164,7 +164,7 @@ native connector 的契约只有上面四个方法,`csrc/storage_backends/README
 | MP server(承载 KV 服务的进程) | `lmcache/v1/multiprocess/server.py`::`MPCacheServer`(compositor)+ `run_cache_server` |
 | 存储管理器(串联 L1/L2) | `lmcache/v1/distributed/storage_manager.py`::`StorageManager` |
 | L1 管理器 | `lmcache/v1/distributed/l1_manager/`::`DramL1Manager` / `GdsL1Manager` / `DevDaxL1Manager` / `ShadowL1Manager`(`base.py`::`BaseL1Manager`) |
-| L1/L2 控制器 | `lmcache/v1/distributed/storage_controllers/`::`StoreController` / `PrefetchController` / `EvictionController` |
+| L1/L2 控制器 | `lmcache/v1/distributed/storage_controllers/`::`StoreController` / `PrefetchController` / `L1EvictionController` / `L2EvictionController`（基类 `EvictionController`） |
 | L2 adapter 抽象 | `lmcache/v1/distributed/l2_adapters/base.py`::`L2AdapterInterface` |
 | L2 adapter 注册 | `lmcache/v1/distributed/l2_adapters/config.py`::`register_l2_adapter_type`;`factory.py`::`register_l2_adapter_factory` |
 | 配额 | `lmcache/v1/distributed/quota_manager.py`::`QuotaManager` |
@@ -205,7 +205,7 @@ native connector 的契约只有上面四个方法,`csrc/storage_backends/README
 
 1. **强依赖引擎的 hash/connector 抽象** — `TokenHasher._get_hash_func` 从 vLLM 载入 hash 实现,载不到退回 builtin 只 warn;版本兼容靠官方矩阵维护,不靠补丁目录。
 2. **无全局强一致元数据** — coordinator 的 `KeyDirectory` 是 L1/L2 的事件派生最终一致视图,答案只是 hint,必须在 owner 侧验证;事件丢失或乱序靠 gate 的重放与 fencing 兜底,不做全局事务。多实例并发写同 key 无锁/事务。
-3. **共享靠存储或 P2P,非内存池** — 跨实例共享要么走共享远程存储(网络/序列化开销),要么 P2P 直传(需预分配 RDMA 注册区 + 控制器元数据),**非真正的全局共享内存池**。
+3. **共享靠存储或 P2P,非内存池** — 跨实例共享要么走共享远程存储(网络/序列化开销),要么 P2P 直传(需预分配 RDMA 注册区 + coordinator 成员发现),**非真正的全局共享内存池**。
 4. **匹配粒度受限** — 链式 prefix hash + 顺序探测,断链即停;非 prefix 部分需 CacheBlend 重算(有质量损失);无真正的 radix tree 灵活匹配(radix 在引擎侧)。
 5. **chunk size 每个 MP server 唯一且不可变** — 由 connector 与各 KV group 对齐后定死;异构模型共享一个 server 要求对齐相容,否则只能多开 server。
 6. **C++ 后端构建门槛** — native connector 与 CacheGen kernel 需 CUDA/C++ 工具链,`NO_NATIVE_EXT` 退化为纯 Python 性能损失大。

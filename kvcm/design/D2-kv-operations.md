@@ -415,8 +415,8 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 | pin | LMCache coordinator `pin`/`unpin`（L2 驱逐计划计数，`FleetEvictionController`）；KVCR `claim/pin`/`release_pin`（**传输窗口专用**，`FETCHABLE` 须等 pin 成功才确定）；TensorCast `pinned` policy（必须驻留 + 溢出**拒绝写入**）；HiCache `lock_ref`（`protected_size_` vs `evictable_size_`，dec 到 0 ≠ 释放、仍可命中） | mooncake 三件套（lease/soft/hard）比多数系统细。差异：TensorCast `pinned` 溢出拒绝写入，mooncake hard pin 无此语义（创建时固化、之后改不了，F1）；KVCR 的传输窗口 pin 在 mooncake 由「copy 任务在途拒 upsert」覆盖（F2） |
 | demote | §3 专节（FlexKV/LMCache/UCM/KVBM/MemCache 对照 + HiCache 写穿/写回） | —— |
 | promote | HiCache `load_back`（L2→L1 提回）；FlexKV SSD→GPU 的 H2D 回填；KVCR `fetch`；mooncake `promotion_on_hit`（命中达阈值自动提回） | 被动提升（读命中驱动）是各家主路径；kvcm 另有主动两条：反复调 `GetReplicaList` 至命中计数过线触发 / 读删写自搬（§3） |
-| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache MP server 的持久 L2（无 retain 命令）；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择。kvcm 三条路：搬到别的活 seg；自己当那个「引擎外实体」（挂段挂盘把副本收进名下）；DFS 副本。没有保留身份注册。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：client_id 管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是 key 的 client_id |
-| remove | LMCache coordinator `/cache/objects` delete / `/cache/clear`；SGLang 分层放弃（`block-lifecycle.md`）：无 L3 时 `evict` 删叶 = 彻底；**有 L3 时引擎永不主动放弃**——删除下放 L3 后端独立 LRU/TTL，引擎看不到 | SGLang 的「释放 = 逐层剥离」（L1 摘节点降层 → L2 摘除 → L3 后端自决）对应 kvcm 三级（软释放 / demote / remove）。「L3 删除引擎不可见」提醒：kvcm remove 后索引侧条目需同步清（D1 已知：池副本删除事件通道缺失） |
+| retain | KVCR-Guard（**旁挂进程持池** + fencing 隔离失效者 + backup KVCR 接管，引擎崩溃后缓存仍可供远端读）；TensorCast 所有权二分（System-Owned vs **Caller-Leased**：KV 是调用者租借）；LMCache MP server（引擎崩时 L1 与持久 L2 均保留，无 fate-sharing；MP server 重启后仅持久 L2 保留，无 retain 命令）；FlexKV REMOTE | 「副本归引擎外实体」是多家共同选择。kvcm 三条路：搬到别的活 seg；自己当那个「引擎外实体」（挂段挂盘把副本收进名下）；DFS 副本。没有保留身份注册。TensorCast Caller-Leased 对应 kvcm 的定位：kvcm 对引擎 KV 是**租借管理权**（只加保护，不没收读写）。KVCR 的 fencing（防「死而复活」：旧实例断线又回来、拿旧身份继续发号施令时把它挡在门外，常用任期号/令牌实现）在 kvcm 不需要——kvcm 对池没有需要排他防护的权限：client_id 管辖的 API 只有 Revoke / BatchReplicaClear（F6），kvcm 本就不是 key 的 client_id |
+| remove | LMCache coordinator `POST /cache/delete`（转发至 MP server `DELETE /cache/objects`）与 MP server `POST /cache/clear`（仅 L1）；SGLang 分层放弃（`block-lifecycle.md`）：无 L3 时 `evict` 删叶 = 彻底；**有 L3 时引擎永不主动放弃**——删除下放 L3 后端独立 LRU/TTL，引擎看不到 | SGLang 的「释放 = 逐层剥离」（L1 摘节点降层 → L2 摘除 → L3 后端自决）对应 kvcm 三级（软释放 / demote / remove）。「L3 删除引擎不可见」提醒：kvcm remove 后索引侧条目需同步清（D1 已知：池副本删除事件通道缺失） |
 
 - **总观察**
   1. LMCache 的 L2 adapter + coordinator 动作集与 kvcm 八项近一一对应——操作集合理性的直接证据
@@ -430,6 +430,8 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 | 操作 | 出处 | 评估 |
 |---|---|---|
 | **prefetch 终止/取消** | HiCache `can_terminate_prefetch` / `mark_terminate`（三策略：best_effort / wait_complete / timeout） | **真缺口**：请求改道 / 源消失时在途 copy 白白占用带宽、只能等它自己结束；**copy/move 任务两版本都无取消 RPC**（main 只有 `CancelQueuedOffloadTask` 能取消 offload 任务、且镜像被取走即失败，F13）——补法：池侧扩展（改 mooncake）或「弃置 + 事后清副本」（kvcm 侧可做的弱版）。已登记 summary P9 |
+| compress（KV 压缩） | LMCache serde 层（MP 侧 `distributed/serde/` 的 `fp8` / `turboquant` / `aesgcm`）——压缩在 serde，不在命令面 | 远期能力，当前不补 |
+| health / full_sync（比对） | LMCache `mp_coordinator` 提供 `/healthz` / `/metrics` / `/status`，全量比对靠目录 checkpoint + 事件重放（`persistence/checkpoint.py`、`events_replay.py`） | 半缺口：状态记录③有「全量比对重建台账」概念但未操作化——应列为运维操作 |
 | 在途状态查询 | KVCR `query` 四态（HIT / **FETCHING** / FETCHABLE / MISS） | 半缺口：kvcm 有 `QueryTask`（任务视角）+ exist（在/不在），缺 KVCR 那种 **key 视角**四态；「预热中」状态存于 sqlite 任务状态机，是否暴露给索引归 D4 接口设计 |
 
 - **kvcm 有、别人不做的**
@@ -1097,7 +1099,7 @@ soft pin 真机的环境、ABI/链接问题、用例结果与未覆盖项见
 | 产品 | 触发 | 搬运者 | 引擎死后副本 |
 |---|---|---|---|
 | FlexKV | 请求结束（`request_finished`→D2H） | 卸载组件自己 | 本机失效；REMOTE（Mooncake store 等）保留 |
-| LMCache | forward 内逐层 `save_kv_layer` | MP server 自己（`gpu_connector/`） | MP server 的持久 L2 保留；无 retain 命令 |
+| LMCache | forward 内逐层 `save_kv_layer` | MP server 自己（`gpu_connector/`） | 引擎崩时 MP server 的 L1 与持久 L2 均保留（无 fate-sharing）；MP server 重启后仅持久 L2 保留（无 retain 命令） |
 | UCM | 策略调 `dump` | connector 自己 | store 保留 |
 | Dynamo KVBM | `request_finished` settlement | OffloadEngine | G4 保留，G2/G3 随实例 |
 | MemCache（昇腾） | put 时定介质 | LocalService | 池对象 Meta 保留 |
