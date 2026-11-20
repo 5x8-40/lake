@@ -267,8 +267,11 @@ branch_id
 parent_branch_id
 context_version
 state = active | finished
-referenced blocks
+block
+instance / tier
 ```
+
+每一行是一条 active 引用：哪个 branch 的哪个 block、在哪个 placement 上。只记“branch 引用了哪些 block”不够，无法按节点/介质做零引用驱逐。
 
 更新规则：
 
@@ -277,7 +280,7 @@ referenced blocks
 - `compact` / `rewrite`：context version 递增，释放旧 block，引用新 block；
 - `finish`：释放该 branch 的全部引用。
 
-这张表是 branch 引用的权威；KVT 只是它的投影。master 仍然只负责 KV 副本，不参与 branch 引用。
+这张表是 branch 引用的权威；KVT 按 `block × instance × tier` 投影引用数。master 仍然只负责 KV 副本，不参与 branch 引用。
 
 ### 3.3 容量与资源权重
 
