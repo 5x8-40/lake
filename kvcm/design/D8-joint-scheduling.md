@@ -371,6 +371,15 @@ sequenceDiagram
 | `budget` | 预取/保留/字节上限 | 超预算裁剪或拒绝 |
 | `signature` | 网关签名 | 匿名来源只能 observe |
 
+#### 场景草案（idea，不新增事件）
+
+- **前端 tab 补全 / 下一轮预选**：作为 `PRE_ANNOUNCE` 的一种来源；候选带前缀、置信度、过期时间；用户没接受就过期/取消，不预取。
+- **上下文压缩 / 重写**：作为 `BRANCH` 的一种操作；context version 递增，释放旧 block，引用新 block。
+- **多 agent fan-out**：多个 `BRANCH` / `PRE_ANNOUNCE`；按 branch 分预算，父前缀共享引用。
+- **离线 / 批任务**：`PRE_ANNOUNCE` 提前预热，`CLOSE` 释放。
+
+这些只是场景记录，字段和语义等实现时再定；不改变现有 hook ≠ command。
+
 ### 4.3 语义
 
 - **hook ≠ command**：SC/kvcm 可裁剪、推迟、拒绝；请求正确性不依赖 hook。
