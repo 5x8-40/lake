@@ -25,7 +25,8 @@ Noto Sans CJK 即可，例如：
     fig-evidence.svg             证据图：控制权矩阵 + hint 落地时间线
 
 图内文字用中文；项目名、API 名、字段名保留英文原样。
-本目录另有上游原图三张（upstream-ucm-architecture.svg、upstream-lmcache-*.png），不由本脚本生成。
+本目录另有上游原图四张（upstream-ucm-architecture.svg、memcache-architecture.png、
+upstream-lmcache-coordinator.png、upstream-lmcache-mp-l2.png），不由本脚本生成。
 """
 
 from __future__ import annotations

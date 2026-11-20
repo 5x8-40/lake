@@ -121,11 +121,20 @@ kvcm 读 `GetReplicaList` / `BatchGetReplicaList` 拿副本位置，用 `query_t
 |---|---|
 | UCM / FlexKV | 这次请求怎么取 KV；范围在本机、本请求 |
 | MemCache / Mooncake | 池内放置与容量；按自身热度策略，不感知请求与预算 |
-| LMCache 协调器 | L1 在 MP server 本地（逐实例驱逐）；协调器只管 L2 的配额、驱逐、预取、pin |
+| LMCache 协调器 | 见下方分工表；不是笼统的「管 L1/L2」 |
 | llm-d / Dynamo / AIBrix | 请求去哪；不碰 KV 字节 |
 | **kvcm** | 目标：KV 该在哪、活多久、给谁用。现状：按指令执行 + 保活 + 记账；放置决策仍靠人工或简单策略 |
 
-L1 的容量与淘汰由 MP server 本地负责，coordinator 不选 L1 victim；跨节点共享 L1 时，coordinator 只维护“哪些 MP server 还活着”。本节点 L1 miss 后，会向每一个活着的 MP server 发查询；命中的 MP server 返回远端地址，本节点再用 RDMA 把 KV 读进自己的 L1。查询由 MP server 之间完成，coordinator 不参与每次 lookup，也不看 KV 数据。节点越多，这个查询扇出越大；大规模场景应优先走共享 L2。
+LMCache 的 L1/L2 分工容易说错，单独列清楚（出处见本仓 [`lmcache/sharing-and-backends.md`](lmcache/sharing-and-backends.md)）：
+
+| 事项 | 归谁 |
+|---|---|
+| L1 的空间分配与驱逐（逐实例） | MP server 本地，`distributed/storage_manager.py` 建 `L1EvictionController` |
+| 位置知识（可含 L1） | coordinator 的 `KeyDirectory`：`ObjectKey → placements(instance_id, tier, backend, size)`；另有按 instance 的反向索引。答案是 hint，须在 owner 侧验证 |
+| 跨节点查某个 key 在哪 | 问 coordinator：`POST /directory/lookup`（及 `blend-lookup` 等）。P2P 路径下「谁有哪些 chunk」也来自这份目录；字节经 NIXL/socket 直传，不经 coordinator |
+| L2 的配额、驱逐、预取、pin | coordinator（`FleetEvictionController`） |
+
+所以 coordinator 并非不碰 L1：目录里可以有 L1 的 placement。失效上，L1 随上报者 incarnation 收敛，L2 靠显式删除。**位置知识归 coordinator，字节的搬运不归它。**
 
 ### 3.3.1 与 LMCache coordinator 的对照
 
@@ -151,11 +160,11 @@ LMCache 的 `mp_coordinator` 是这一维度上与我们最接近的实现：独
 | 权威 | 事件派生、最终一致、owner 侧验证 | 参考其 owner 验证 | kvcm 用 master 权威 |
 | 动作 | 今天 delete / pin / prefetch；roadmap 加 promote / demote / move / duplicate | — | 动作面要按我们自己的池能力定 |
 | 耦合 | connector-coupled | — | kvcm 保持 backend-coupled |
-| 范围 | L1 在 server 本地；L2 策略在 coordinator | — | kvcm 覆盖池 + 请求 + 容量 |
+| 范围 | L1 驱逐在 server 本地；L1/L2 位置视图与 L2 策略在 coordinator | — | kvcm 覆盖池 + 请求 + 容量 |
 
 两条对我们最直接的影响：事件管线缺 incarnation 维度（引擎重启后旧进程的迟到事件会把死位置写回视图）；`views` 与 `controllers` 的职责划分可以避免一个类包办决策与状态。
 
-**LMCache coordinator 是 kvcm 控制面最接近的同类；但它是 connector-coupled、事件目录、L1 本地 + L2 fleet；kvcm 是 backend-coupled、master 权威、目标覆盖池 + 请求 + 容量。**
+**LMCache coordinator 是 kvcm 控制面最接近的同类；但它是 connector-coupled、事件目录（含 L1 位置 hint）、L1 驱逐本地 + L2 fleet 策略；kvcm 是 backend-coupled、master 权威、目标覆盖池 + 请求 + 容量。**
 
 ### 3.4 是否做请求 + KV + 扩缩联合调度
 
@@ -210,10 +219,10 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | 项目 | 一句话 | 关键位置 |
 |---|---|---|
 | UCM | 引擎内插件 + 可插拔 store，管「这次请求怎么取 KV」 | 引擎进程内 |
-| FlexKV | 引擎旁卸载库，管「这台机的 KV 放哪层」 | 引擎进程内 |
+| FlexKV | 引擎旁卸载库，管「这台机的 KV 放哪层」；多实例可走独立 `KVServer`（ZMQ） | 引擎旁 |
 | MemCache | 昇腾对象池，MetaService 管分配与副本 | 池（本身是池） |
 | Mooncake | 对象池 + 传输引擎；master 持副本权威，动态副本按热度 | 池（本身是池） |
-| LMCache | 独立协调器 + 进程内 MP server；L1 在 server 本地，协调器管 L2 的配额 / 驱逐 / 预取 / pin | 引擎侧 server 进程 + 协调器 |
+| LMCache | 独立协调器 + 独立 MP server；L1 驱逐在 server 本地，协调器持 L1/L2 位置视图并管 L2 策略 | 独立 MP server + 协调器 |
 | vLLM / SGLang | 请求信封的传输层，action 执行未接 | 请求 |
 | KVCR | 引擎内二级存储 + hint 驱动 P2P + Guard 容错 | Guard 进程 |
 | llm-d EPP | 路由层，逐块索引 + 插件化打分 | 不持有 KV |
@@ -347,7 +356,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | L2 Adapter 层 | `fs` / `nixl_store` / `mooncake_store` / `s3` … 统一接口、可插拔 | 适配层，不含策略 |
 | 外部存储 | 本地 FS/NVMe、NIXL、Mooncake store（RDMA/TCP）、S3/MinIO | 字节的落点与副本 |
 
-**L1 的驱逐在 MP server 本地，L2 的配额、驱逐、预取、pin 才归 coordinator。** 这个分工是 coordinator 那张图之外最容易搞混的一点：coordinator 管的是 fleet 级的 L2 策略，不是每台机器 L1 里逐出哪一块。
+**L1 的驱逐在 MP server 本地，L2 的配额、驱逐、预取、pin 才归 coordinator；L1/L2 的位置视图也在 coordinator（`KeyDirectory`，hint）。** 这个分工是 coordinator 那张图之外最容易搞混的一点：coordinator 不做每台机器 L1 里逐出哪一块，但知道「谁上报过有这份」。
 
 和 Mooncake master 的差别在一个维度：master 对外提供 `CreateCopyTask` / `CreateMoveTask`，知道副本挂在哪个 segment，能按段指派搬迁；协调器没有对等的搬迁能力，它只知道「这个实例有这个 tier 的这个 backend 上有一份」，粒度为实例而非段，命令面只有预取 / pin / 删除 / 配额。
 
@@ -484,7 +493,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | LMCache L1 驱逐 | `distributed/storage_manager.py`（`L1EvictionController`）；`distributed/eviction_policy/` |
 | LMCache L2 驱逐 / pin | `mp_coordinator/controllers/eviction_controller.py::FleetEvictionController` |
 | LMCache 事件管线 | `mp_coordinator/cache_events.py::CacheEventSink`；`ingest/event_gate.py::EventGate` |
-| LMCache 进程内 server 由自家 connector 拉起 | `integration/vllm/vllm_multi_process_adapter.py`；`v1/multiprocess/server.py::MPCacheServer` |
+| LMCache 独立 MP server 由自家 connector 拉起 | `integration/vllm/vllm_multi_process_adapter.py`；`v1/multiprocess/server.py::MPCacheServer` |
 | vLLM hint 信封 | `vllm/v1/kv_hints/protocol.py::KvHintsEnvelope` |
 | vLLM hint 消费 | `vllm/v1/kv_offload/tiering/kvcr/manager.py::KVCRSecondaryTierManager.on_new_request` |
 | SGLang hint 信封 | `python/sglang/srt/managers/kv_hints.py::KvHintsEnvelope` |
