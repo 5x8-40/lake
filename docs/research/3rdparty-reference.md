@@ -29,7 +29,7 @@
 | 路径 | 来源 | 检出 | 主要参考 |
 |------|------|------|----------|
 | `3rdparty/sglang` | [sgl-project/sglang](https://github.com/sgl-project/sglang) | main HEAD (`37f94cb7a0`, 2026-07-17) | 分层 + HiRadixTree + prefetch/write-back;痛点见 [sglang/pain-points.md](sglang/pain-points.md) |
-| `3rdparty/lmcache` | [LMCache/LMCache](https://github.com/LMCache/LMCache) | nightly | 跨实例复用 + 多后端 + Rust I/O |
+| `3rdparty/lmcache` | [LMCache/LMCache](https://github.com/LMCache/LMCache) | dev (`58c11e38`, 2026-11-13) | 跨实例复用 + MP server / 可选 coordinator + 多后端 + Rust I/O |
 | `3rdparty/mooncake` | [kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake) | main HEAD | 传输引擎 + 对象级 KV 池 |
 | `3rdparty/vllm` | [vllm-project/vllm](https://github.com/vllm-project/vllm) | main HEAD (ab132ee98) | **计算层**(PagedAttention/worker/connector/spec decode) |
 | `3rdparty/transformers` | [huggingface/transformers](https://github.com/huggingface/transformers) | main HEAD | **模型定义**:Qwen3 `nn.Module`/HF config/decoder 分层,作为 vLLM/SGLang 模型实现的上游对照 |

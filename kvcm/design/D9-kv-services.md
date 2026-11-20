@@ -121,6 +121,8 @@ flowchart TB
 - 会话侧补 `session_e2e`、`next_turn_ttft`、`tool_wait`、`session_success`；`next_turn_ttft` = 工具运行结束后下一轮请求的 TTFT，不是引擎/请求 resume 的时间；
 - 归因：`hit = engine_apc + local_pool + remote_pool + prewarm + retain`；
 - ROI：`saved / cost`；浪费：预取未用、保留未恢复、迁移失败；
+- branch 维度：活跃 branch 数、零引用驱逐量、context version 陈旧命中；
+- KV 复用损失：`1 − 当前命中率 / 不限容量且不切 P/D 时的命中率上限`；用来验证零引用驱逐是否真的减少误删；
 - 成本：GPU 时间、带宽、驻留字节。
 
 **例子**：预热 100 次，只有 20 次被用上；账本按前缀算出 ROI，下次只预取高价值前缀，或降低低价值前缀的保留等级。
@@ -307,7 +309,7 @@ D9 的能力都依赖具体机制。**事实写在各处，本文不重复**：
 | **llm-d WVA** | `llm-d-autoscaling`（项目级） | SLO 感知目标副本数、变体成本 | 只做池侧容量事实，不替代 WVA |
 | **AIBrix PodAutoscaler** | `podautoscaler/context/context.go`（`gpu_cache_usage_perc`） | KV 使用率/排队长度扩缩指标 | 决策在 D8，执行在外部 |
 | **Mooncake** | `master_service.cpp::CreateDrainJob`、`CopyStart`、`GetReplicaListForAdmin` | drain job、copy 幂等、零副作用核验 | kvcm 封装，D8 不直连 |
-| **LMCache coordinator** | `lmcache/v1/mp_coordinator/`（`views/key_directory.py::KeyDirectory`、`controllers/prefetch_manager.py::PrefetchManager`、`controllers/eviction_controller.py::FleetEvictionController`、`http_apis/cache_api.py`） | lookup / pin / delete / prefetch 命令面；目录事件派生 + 可 checkpoint | LMCache 无全局强一致元数据（目录是 hint，owner 侧验证，无 move 路由）；kvcm 有 master 权威 |
+| **LMCache coordinator** | `lmcache/v1/mp_coordinator` | 事件顺序/重启隔离、事实与决策分离、快照重放、delete/pin/prefetch/quota；无 move（roadmap 才有） | 可借事件处理与视图分层；不借事件派生目录当权威、L2 中心驱逐、connector 耦合 |
 
 ---
 
