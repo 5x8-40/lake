@@ -431,6 +431,7 @@ kvcm 与引擎同为 client（也持自己的 UUID）；本例它不挂 seg，�
 |---|---|---|
 | **prefetch 终止/取消** | HiCache `can_terminate_prefetch` / `mark_terminate`（三策略：best_effort / wait_complete / timeout） | **真缺口**：请求改道 / 源消失时在途 copy 白白占用带宽、只能等它自己结束；**copy/move 任务两版本都无取消 RPC**（main 只有 `CancelQueuedOffloadTask` 能取消 offload 任务、且镜像被取走即失败，F13）——补法：池侧扩展（改 mooncake）或「弃置 + 事后清副本」（kvcm 侧可做的弱版）。已登记 summary P9 |
 | compress（KV 压缩） | LMCache serde 层（MP 侧 `distributed/serde/` 的 `fp8` / `turboquant`）——压缩在 serde，不在命令面；`aesgcm` 是加密，不算压缩 | 远期能力，当前不补 |
+| health / 状态重建 | LMCache coordinator 提供 `/healthz` / `/metrics` / `/status`；状态可通过目录 checkpoint + 事件重放重建。这不是 `full_sync` 命令，是运维面能力 | 半缺口：状态记录③有「全量比对重建台账」概念但未操作化——应列为运维操作 |
 | 在途状态查询 | KVCR `query` 四态（HIT / **FETCHING** / FETCHABLE / MISS） | 半缺口：kvcm 有 `QueryTask`（任务视角）+ exist（在/不在），缺 KVCR 那种 **key 视角**四态；「预热中」状态存于 sqlite 任务状态机，是否暴露给索引归 D4 接口设计 |
 
 - **kvcm 有、别人不做的**
