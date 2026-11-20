@@ -79,7 +79,7 @@ vLLM 的 PagedAttention 就是 KV 世界的 Atlas 时刻——论文开宗明义
 PagedAttention 解耦了“逻辑 token 序列 ↔ 物理 block”，但只在单实例内。把视线拉到集群层面，虚拟内存出现之前的景象原样摆着：
 
 - **状态即人质**。worker 崩溃，KV 随之销毁，上面对应的请求从头重算；反过来说，一个持有热点 KV 的实例不能随便下线，扩缩容被状态钉死。
-- **索引和匹配，仍锚在引擎侧**。跨实例共享并非没人做——Mooncake、LMCache 这类系统已经能通过 connector 把 KV 在实例间传来传去。LMCache 有可选 coordinator，记录的是 L2 目录；L1 由各 MP server 本地管理，跨节点 L1 要逐个 MP server 查询。但前缀这件事仍然归引擎：HiCache 的 radix 树长在每个引擎实例里，LMCache 的前缀匹配靠引擎从第 0 个 chunk 起顺序探测；中央元数据靠消息和心跳对账，是弱一致。位置、匹配、生命周期三本账，没有一个全局权威说了算。
+- **索引和匹配，仍锚在引擎侧**。跨实例共享并非没人做——Mooncake、LMCache 这类系统已经能通过 connector 把 KV 在实例间传来传去。LMCache 有可选 coordinator，`KeyDirectory` 记录 L1/L2 位置；查位置可以一次问 coordinator，但当前 P2P 取数仍逐个 MP server 查询。但前缀这件事仍然归引擎：HiCache 的 radix 树长在每个引擎实例里，LMCache 的前缀匹配靠引擎从第 0 个 chunk 起顺序探测；中央元数据靠消息和心跳对账，是弱一致。位置、匹配、生命周期三本账，没有一个全局权威说了算。
 - **搬砖回来了**。跨实例传 KV，要两个引擎的 connector 两两握手、自己发起、自己管理——每个引擎开发者都在干当年 overlay 程序员的活。
 
 换言之：实例之内已经有了虚拟内存，集群层面还停在直连物理内存的时代。每个引擎实例自己当自己的操作系统——自己的页表、自己的 swap、自己的回收，实例之间靠点对点协议互相搬运。
