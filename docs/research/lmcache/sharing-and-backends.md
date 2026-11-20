@@ -21,6 +21,10 @@
    - **P2P 的落点是本节点 L1(CPU pinned DRAM),不是显存；PD 的 NixlConnector P→D 不走这条路径。** Mooncake TE 可以注册 HBM 做 RH2D；这里两跳是 LMCache 的 L1 落点选择，不是底层做不到。 `p2p.rst`: "The transfer is a one-sided RDMA read from the requesting node into its own L1"。之后再由 H2D 进 HBM,所以 LMCache 的 L1 P2P 跨节点读是两跳。L1 的定义见 [`l1_manager/dram.py`](https://github.com/LMCache/LMCache/blob/dev/lmcache/v1/distributed/l1_manager/dram.py)::`DramL1Manager`("Pinned-DRAM L1 manager")。**Mooncake TE 可以注册 HBM 做 RH2D；这里的两跳是 LMCache 把落点选在 CPU L1，不是底层没有 RH2D。** LMCache 的 P2P 没有上报 VRAM 落点：`api.py` 的 `MemoryResidency.VRAM` 注释写 "Reserved for GDS/GDR L2 adapters; nothing reports it yet"。
 3. **PD disagg**:由引擎侧 `MultiConnector` 并列 `NixlConnector` 与 `LMCacheMPConnector` 组合,不是 LMCache 自己的后端。P、D 每个 vLLM 实例各一个 MP server,不能共用,见 [mp/disaggregated_prefill.rst](https://github.com/LMCache/LMCache/blob/dev/docs/source/mp/disaggregated_prefill.rst)。
 
+![LMCache MP 模式与 Mooncake L2 adapter](../kvcm-vs-oss/figures/upstream-lmcache-mp-l2.png)
+
+（上游原图：LMCache MP 模式与 Mooncake L2 adapter，正文用来说明 L1/L2 分层与 connector 位置。）
+
 ## 存储后端
 
 ### L1(`lmcache/v1/distributed/l1_manager/`)
@@ -76,6 +80,10 @@ C++ 写一次,MP 与 InProcess 两种模式复用——这是与"引擎侧 KV co
 - **命令面**(HTTP):`POST /cache/prefetches`(指定 `instance_id` 预热)、`POST|GET|DELETE /cache/pins`(排除在该协调器自己的 L2 驱逐计划外)、`POST /cache/delete`、`/quota*`、`/directory/{lookup,blend-lookup,keys,stats}`、`/instances*`、`/events`、`/config/chunk-size`。**无 move 路由。**
 - **组件**:`controllers/base.py::Controller`(控制器基类)、`controllers/prefetch_manager.py::PrefetchManager`(预取派发)、`controllers/eviction_controller.py::FleetEvictionController`(配额 / 驱逐 / pin 计数)、`views/instance_registry.py::InstanceRegistry`(注册与心跳)、`ingest/event_gate.py::EventGate`(事件准入、去重、incarnation fencing)、`discovery.py::Registry`(controller / view 发现)、`persistence/checkpoint.py`(目录与配额的 checkpoint)。
 - **通信**:HTTP(FastAPI);事件可经 HTTP 或 Kafka 源进入(`ingest/{http,kafka}_event_source.py`)。
+
+![LMCache coordinator 数据流](../kvcm-vs-oss/figures/upstream-lmcache-coordinator.png)
+
+（上游原图：LMCache coordinator 数据流。读法：事件从左进，views/controllers 分开，决策以 HTTP 回 server；coordinator 不在请求路径上。）
 
 ## 压缩/serde
 
