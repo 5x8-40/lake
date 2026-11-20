@@ -770,4 +770,25 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 - 参考实现的 hint/session 多在引擎内；本文把 session/retention 放到 kvcm，worker 保持无状态。
 - vLLM-Ascend 的 TP/DP per-rank key、Mooncake 的 key 不透明性，决定了“索引必须按逻辑块去重、SC 不能碰 PoolKey”——这是与通用 vLLM router 最大的工程差异。
 
+### 12.1 外部证据：Evolving Infra（不是 kvcm 指标）
+
+Evolving Infra 是 SGLang 上的 full-stack 实现，不是外置控制面。它的数字说明 agent-aware KV 生命周期 + 联合调度这个方向有收益，但不等于 kvcm 能直接达到：
+
+| 指标 | 结果 | 条件 |
+|---|---|---|
+| 平均 E2E 延迟 | 最高 4.1× 优于 Dynamo | 36 GB300；GLM-5.2 / Kimi K2.6；编码类收益最大，数学类约 15%–23% |
+| P95 TTFT | 最高 14× 优于 Dynamo | 同上 |
+| 稳态吞吐 | 最高 2.73× 优于 Dynamo | 同上 |
+| KV 复用损失 | 少 81%–95% | 对比无限容量、无切相的上限 |
+| PD 切换 | 平均 6.2s；Dynamo 约 681s | **引擎侧对称引擎，kvcm 不适用** |
+| 动态负载 | 2.1× Dynamo；比最佳静态配比高 28% | 10 分钟窗口 |
+| 36→256 GPU | 平均延迟只涨 16% | 同构硬件；3072 GPU 为模拟 |
+
+边界：
+
+- 它改了 SGLang 引擎，做对称 P/D、共享 host memory 池、集中式 router 目录；kvcm 不拥有引擎，也不重做池。
+- 4.1× / 14× / 2.73× 是 full-stack 结果，不是 kvcm 的预期收益。
+- 可迁移的是机制：branch 引用/版本、零引用优先、排队预取、TTFT 路由、引用随副本走。
+- 不进 §7 的 kvcm 收益模型；只作为外部证据和方向校验。
+
 ---
