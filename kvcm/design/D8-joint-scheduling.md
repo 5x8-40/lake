@@ -251,6 +251,17 @@ LMCache `mp_coordinator` 与 D8 的 KVT 是同层问题：都是事件派生的�
 
 **hint 的用途**：只用于“大概率在哪、值不值得预取/路由到哪”，不能当锁、地址或字节可用性证明。真正取数仍要让 owner 验证并 lock/locate。LMCache 当前 P2P 取数没有用这份 hint（仍遍历 MP server），这是它的实现缺口；D8 如果拿 hint 做决策，应该定向到候选实例，而不是复制它的全量遍历。
 
+按四个功能面拆开看：
+
+| 面 | LMCache coordinator 实际做什么 | 可借 | 不借 |
+|---|---|---|---|
+| **选路** | 不选路。只提供 `/directory/lookup` 和 `blend-lookup`：返回 instance + tier + backend 的候选 placement | 目录查询契约、tier 标注、instance 反向索引；拿来做候选过滤 | 把目录当权威或直接当路由结果；L1 全量遍历 |
+| **预取** | `PrefetchManager.submit_prefetch` 把“预热到指定 instance”的请求转发给 MP server，并代理 status；不做预算/ETA/取消 | 显式 target-instance API、异步 request_id + status、批量 token | 无预算、无 lease、无取消的裸转发；D8 要加 ETA/budget/cancel |
+| **调度** | 不做请求调度、不做扩缩；只做 L2 配额/驱逐/pin 和实例注册 | views/controllers 分离、命令面与请求面分离、fail-open | 把 coordinator 当调度器；它没有请求队列、SLO、扩缩能力 |
+| **观测** | 目录 stats、instance usage、prefetch stats、event gate/loop 指标 | 按 instance/tier 的 usage、目录命中统计、prefetch 状态指标 | 没有请求级账本/ROI/归因；D9 的账本要另补 |
+
+一句话：**LMCache coordinator 能借的是“目录契约 + 预取 API + 指标面 + views/controllers 分层”，不是选路/调度决策本身。**
+
 **不照搬**：事件派生目录当权威、L1 本地驱逐由中心接管、connector-coupled、只有 L2 策略没有池级放置。kvcm 的权威仍是 master，KVT 只是决策视图。
 
 ### 3.2 会话需求（SC 自己维护）
