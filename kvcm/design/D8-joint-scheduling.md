@@ -238,31 +238,19 @@ stateDiagram-v2
 - **已确认**：引擎事件/READY/核验证明“真的有”；只有已确认条目才能算命中、才能支撑 HBM 判定。
 - 删除/失效带墓碑，防延迟到达的 `Stored` 复活；合并规则见 [D8a §2.3](D8a-scheduling-algorithms.md)。
 
-### 3.1.1 LMCache coordinator 可借鉴 / 不照搬
+KVT 还要守住四条边界，不需要引入外部实现的内部术语：
 
-LMCache `mp_coordinator` 与 D8 的 KVT 是同层问题：都是事件派生的视图，不是权威。可直接借四样：
+- **事件要带实例重启标识**：同一实例重启后，旧进程的迟到事件不能把已经失效的位置写回 KVT。
+- **KVT 只记事实**：KVT 只做“块 → 实例 + 介质 + 置信度”；选路、预取、扩缩三环读 KVT，不把预算/策略/决策状态写进 KVT。
+- **KVT 可快照、可重放**：定期快照 + 事件重放恢复；权威仍在 master，KVT 故障只影响选路质量，不阻塞请求。
+- **位置信息只做候选过滤**：KVT 的答案不是锁、不是地址、不是字节可用性证明；真正取数必须回到持有该 KV 的实例验证。
 
-| 点 | LMCache 做法 | 对 D8 的用法 |
-|---|---|---|
-| **incarnation fencing** | 每条 L1 placement 带上报者 incarnation；重启后旧进程的迟到事件被 `fence_instance` 丢掉 | KVT 事件合并除 `source + seq + 墓碑` 外，再加 `incarnation`；否则引擎重启后旧事件会把死位置写回视图 |
-| **views / controllers 分离** | `KeyDirectory` 只记事实；eviction/prefetch 等控制器读视图后下命令 | KVT 只做“块 → 实例 + 介质 + 置信度”；L0/L1/L2 三环读 KVT，不把决策状态塞进 KVT |
-| **派生状态可 checkpoint、可 replay** | 目录/配额 checkpoint；事件流可重放补齐 | KVT 可从 checkpoint 恢复，事件 gap 重放；权威仍在 master，KVT 坏了不阻塞请求 |
-| **fail-open、off request path** | coordinator 挂了推理继续；命令面走 HTTP，不在请求路径 | SC/KVT 故障只降级选路质量，不阻塞推理；请求路径不查 master |
+具体到四个面：
 
-**hint 的用途**：只用于“大概率在哪、值不值得预取/路由到哪”，不能当锁、地址或字节可用性证明。真正取数仍要让 owner 验证并 lock/locate。LMCache 当前 P2P 取数没有用这份 hint（仍遍历 MP server），这是它的实现缺口；D8 如果拿 hint 做决策，应该定向到候选实例，而不是复制它的全量遍历。
-
-按四个功能面拆开看：
-
-| 面 | LMCache coordinator 实际做什么 | 可借 | 不借 |
-|---|---|---|---|
-| **选路** | 不选路。只提供 `/directory/lookup` 和 `blend-lookup`：返回 instance + tier + backend 的候选 placement | 目录查询契约、tier 标注、instance 反向索引；拿来做候选过滤 | 把目录当权威或直接当路由结果；L1 全量遍历 |
-| **预取** | `PrefetchManager.submit_prefetch` 把“预热到指定 instance”的请求转发给 MP server，并代理 status；不做预算/ETA/取消 | 显式 target-instance API、异步 request_id + status、批量 token | 无预算、无 lease、无取消的裸转发；D8 要加 ETA/budget/cancel |
-| **调度** | 不做请求调度、不做扩缩；只做 L2 配额/驱逐/pin 和实例注册 | views/controllers 分离、命令面与请求面分离、fail-open | 把 coordinator 当调度器；它没有请求队列、SLO、扩缩能力 |
-| **观测** | 目录 stats、instance usage、prefetch stats、event gate/loop 指标 | 按 instance/tier 的 usage、目录命中统计、prefetch 状态指标 | 没有请求级账本/ROI/归因；D9 的账本要另补 |
-
-一句话：**LMCache coordinator 能借的是“目录契约 + 预取 API + 指标面 + views/controllers 分层”，不是选路/调度决策本身。**
-
-**不照搬**：事件派生目录当权威、L1 本地驱逐由中心接管、connector-coupled、只有 L2 策略没有池级放置。kvcm 的权威仍是 master，KVT 只是决策视图。
+- 选路：只借“先缩小候选”的做法，不把 KVT 答案直接当路由结果。
+- 预取：只借“指定目标 + 异步状态”的做法；预算、ETA、取消要自己补。
+- 调度：不借；外部协调器不做请求调度和扩缩，D8 的三环仍是自己的职责。
+- 观测：借按实例/介质的用量和预取状态指标；请求级账本和 ROI 归 D9。
 
 ### 3.2 会话需求（SC 自己维护）
 
