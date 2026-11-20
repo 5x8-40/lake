@@ -176,3 +176,5 @@
 ---
 
 各项目与 lake 的逐条对照,见各自的 pain-points 文档:[dynamo](dynamo/overview.md) · [flexkv](flexkv/pain-points.md) · [llm-d](llm-d/pain-points.md) · [aibrix](aibrix/pain-points.md)。
+
+> 本文只覆盖这四栈。把范围扩到引擎插件(UCM / FlexKV)、对象池(MemCache / Mooncake)、协调器(LMCache)、信封(vLLM / SGLang / KVCR)与 kvcm,见 [`kvcm-vs-oss.md`](kvcm-vs-oss.md)——那里按控制结构比较（权威、视野、全局管理、联合调度、耦合点），不按功能清单。

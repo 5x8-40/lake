@@ -166,7 +166,7 @@ lake 把同一层间接用在了推理系统的状态上：解耦 KV 与 GPU，�
 - vAttention（arXiv：2405.04437，非 submodule）：用 CUDA VMM 走硬件路线的对照实验——证明连续虚拟地址可行，同时量出软件页表的 CPU 侧代价。
 - SGLang HiCache：[`../research/sglang/hicache.md`](../research/sglang/hicache.md)；源码锚点 `radix_cache.py::TreeNode`、`hiradix_cache.py::prefetch_from_storage`。
 - Mooncake：[`../research/mooncake/transfer-engine.md`](../research/mooncake/transfer-engine.md)、[`../research/mooncake/kv-store.md`](../research/mooncake/kv-store.md)；源码锚点 `TransferEngine::registerLocalMemory` / `openSegment`、`master_service.h`。
-- LMCache：[`../research/lmcache/sharing-and-backends.md`](../research/lmcache/sharing-and-backends.md)；源码锚点 `cache_controller/utils.py::RegistryTree`、`StorageBackendInterface::batched_contains`。
+- LMCache：[`../research/lmcache/sharing-and-backends.md`](../research/lmcache/sharing-and-backends.md)；源码锚点 `mp_coordinator/views/key_directory.py::KeyDirectory`、`distributed/l2_adapters/base.py::L2AdapterInterface`。
 - Dynamo：[`../research/dynamo/overview.md`](../research/dynamo/overview.md)；源码锚点 `lib/kvbm-{logical,physical,engine}/`、`lib/kv-router/src/protocols.rs::StorageTier`；代码级复用：`rust/vendor/{kvbm-logical, dynamo-tokens}`（in-tree vendor，约定见 `rust/vendor/UPSTREAM.md`）。
 - FlexKV：[`../research/flexkv/overview.md`](../research/flexkv/overview.md)；源码锚点 `vllm_v1_adapter.py::request_finished`、`storage_engine.py::register_gpu_blocks`。
 - TensorCast：[`../research/tensorcast/overview.md`](../research/tensorcast/overview.md)（与 lake 最像的一家；架构、实验深挖与全部参考链接都收在那里）；源码锚点 `tensorcast/global_store/grpc_service.py`、`core/store/replica/unified_memory_authority.h`。

@@ -153,7 +153,7 @@ reference 实现全是"有中心"的，但它们的索引不爆炸，机制分�
 
 | 派别 | 代表 | 索引形态 | 不爆炸的原因 | 代价 |
 |---|---|---|---|---|
-| 星型集中查询 | Mooncake master / MemCache `MetaService` / LMCache controller | 全集群**一份**，中心内存；spoke 零索引，每操作 RPC | 不乘节点数；中心垂直堆内存 + 进程内锁分片（Mooncake `std::array<MetadataShard,1024>`，`master_service.h`）；**跟踪集合小**——只跟踪缓存层，lease/TTL 持续清理（per-object lease 默认 5s、`client_live_ttl_sec` 10s） | 每操作一跳 RPC；中心内存仍是天花板——LMCache 源码自承认 `RegistryTree` 全内存 + `KVController` lookup O(n²) 是规模瓶颈 |
+| 星型集中查询 | Mooncake master / MemCache `MetaService` / LMCache coordinator | 全集群**一份**，中心内存；spoke 零索引，每操作 RPC | 不乘节点数；中心垂直堆内存 + 进程内锁分片（Mooncake `std::array<MetadataShard,1024>`，`master_service.h`）；**跟踪集合小**——只跟踪缓存层，lease/TTL 持续清理（per-object lease 默认 5s、`client_live_ttl_sec` 10s） | 每操作一跳 RPC；中心内存仍是天花板——LMCache 的 `KeyDirectory` 是全内存 dict + 反向索引，事件总线扇出随实例数增长 |
 | 实例私有 | SGLang / FlexKV | 只覆盖本机介质 | 规模 ∝ 单实例容量，天然有界 | 无全局权威（FlexKV `CRadixTreeIndex` 在 connector 进程内、不索引 HBM，集群级只有 Redis 周期快照，无权威可回查） |
 | 近似副本 | Dynamo router | 全量副本但 lossy | 允许丢事件 + prune 校正；只跟踪 worker 上报的缓存集（非持久池） | 一致性打折 |
 

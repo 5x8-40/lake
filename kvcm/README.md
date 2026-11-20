@@ -26,6 +26,7 @@ KV 管理控制面：独立于推理引擎与 KV 池的第三进程。使命两�
 | | [design/D9-kv-services.md](design/D9-kv-services.md) | **控制面：执行与运营能力**：KV 对账 / 用量账本 / 容量建议 / 下线搬迁 / KV 保留与删除治理 / 回放（分支/跨区/rollout 归 D8，不重复） |
 | | [design/D10-kv-fabric-roadmap.md](design/D10-kv-fabric-roadmap.md) | **愿景：KV Fabric 产品愿景**：价值金字塔、方向组合、三阶段、竞争定位与非目标 |
 | | [design/code-architecture.md](design/code-architecture.md) | 服务化代码架构（五层；E10/E11/E15 设计依据） |
+| **外部调研** | [../docs/research/kvcm-vs-oss.md](../docs/research/kvcm-vs-oss.md) | **调研：kvcm 与开源方案对比**：缺一个同时看得见请求、拿得到池权威的位置；三类信息、四个问题、backend-coupled、今天 vs KV Fabric；逐家符号级事实、上游图、我方短板 |
 | **专项设计** | [design/kv-prefetch.md](design/kv-prefetch.md) | copy/prefetch 详细方案（A 壳请求 / B 显式副本复制权衡与时序） |
 | | [design/D8b-scheduling-sequences.md](design/D8b-scheduling-sequences.md) | **管理面时序**：L0 选路 / L1 预取与保留 / L2 扩缩与下线的全部时序图 |
 | **流程文档** | [design/flows/prefetch.md](design/flows/prefetch.md) | 预热流程步骤与数据流（每流程一篇，新增流程同目录另立） |

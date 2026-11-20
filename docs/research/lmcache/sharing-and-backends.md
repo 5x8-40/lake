@@ -1,6 +1,6 @@
 # LMCache — 跨实例复用与存储后端
 
-> 源码:`lmcache/v1/`、`csrc/storage_backends/`、`rust/`、`lmcache/v1/cache_controller/`。
+> 源码:`lmcache/v1/`、`csrc/storage_backends/`、`rust/`、`lmcache/v1/mp_coordinator/`(2026-11-13 快照 `58c11e38`)。
 
 ## 缓存键与匹配
 
@@ -12,10 +12,11 @@
 ## 跨实例共享(两条路径)
 
 1. **共享远程存储(L2 adapter)**:多实例共用 Redis/Mooncake/S3/Aerospike/NIXL-store,通过 `chunk_hash` 内容寻址天然去重。实例只读写同一 key。
-2. **P2P 直传(CPU 内存共享)**:`P2PBackend` 经 `CreateTransferChannel`:
-   - `NixlChannel`:底层 NIXL(RDMA/NVLink/TCP)。
-   - `PySocketChannel`:ZMQ 控制面 + 原生 socket 数据面。
-   - 需 `cache_controller` 维护"谁有哪些 chunk"元数据。
+2. **P2P 直传(CPU 内存共享)**:`P2PL2Adapter` 经 transfer channel 直读远端 L1：
+   - `NixlTransferChannelClient`：底层 NIXL(RDMA/NVLink/TCP)。
+   - `MooncakeTeTransferChannelClient`：Mooncake transfer engine。
+   - coordinator 只提供 live MP server 列表；本节点 L1 miss 后向每个 live MP server 发 lookup，命中后读回本地 L1。`KeyDirectory` 有 L1/L2 位置 hint，但当前 P2P 取数不用它。
+   - **为什么有 hint 还遍历**：当前 P2P 取数没有接 `KeyDirectory`；每个 live MP server 一个 P2P adapter，`PrefetchController` 向所有 eligible adapter 发 lookup。P2P adapter 复用 L2 adapter 插槽（不是数据经过 L2），因而继承了“所有 adapter 都查”的 fan-out。正确形态是先查一次目录、定向问 owner；当前没做。
    - PD disagg 走 `NixlStorageBackend`/`pd_backend(_async)`。
 
 ## 存储后端
@@ -28,7 +29,7 @@
 | `AllocatorBackendInterface` | `allocate` / `batched_allocate` / `get_memory_allocator` |
 | `StoragePluginInterface` | 可插拔后端,从 config 加载 |
 
-工厂:`CreateStorageBackends` 按 config 组装 `LocalCPUBackend` / `LocalDiskBackend` / `P2PBackend` / `NixlStorageBackend` / `RemoteBackend`。
+工厂/装配:`StorageManager` 按 config 组装 `L1Manager` 与多个 `L2Adapter`；P2P 是其中一个 adapter。
 
 ### Python 后端实例
 
@@ -37,7 +38,7 @@
 | LocalCPUBackend | `local_cpu_backend.py` | L1 热缓存,pinned CPU 内存,LRU/自定义 cache_policy |
 | LocalDiskBackend | `local_disk_backend.py` | 本地 SSD |
 | RemoteBackend | `remote_backend.py` | 远程存储,封装 `ConnectorClientBase`(asyncio) |
-| P2PBackend | `p2p_backend.py` | 跨实例 P2P(NIXL/socket) |
+| P2PL2Adapter | `p2p_l2_adapter.py` | 跨实例读远端 L1（NIXL / Mooncake TE） |
 | NixlStorageBackend | `nixl_storage_backend.py` | NIXL 抽象后端(PD disagg 传输) |
 | GDSBackend | `gds_backend.py` | GPUDirect Storage |
 
@@ -56,15 +57,15 @@
 - Non-MP:`StorageManager` 串联 LocalCPU(L1)→ LocalDisk/Remote(L2)。
 - MP:`distributed/storage_manager.py::StorageManager` + `L1Manager` + 多 `L2Adapter` + `StoreController`/`PrefetchController`/`L1EvictionController`/`L2EvictionController`。tier 词汇 `distributed/tiers.py::Tier{L1,L2,ALL}`。`QuotaManager` 管配额,`store_policy` 决定写哪些 adapter。
 
-## cache_controller(中央协调器)
+## MP coordinator(中央协调器)
 
-`lmcache/v1/cache_controller/` + `examples/cache_controller/`:
+`lmcache/v1/mp_coordinator/`(独立 FastAPI 进程,`lmcache coordinator` 启动,默认 `127.0.0.1:9300`,见 `docs/source/mp/coordinator.rst`):
 
 - **职责**:**元数据协调,不是数据路径**。数据仍在 P2P 或共享存储上流动。
-- **元数据**:`RegistryTree`(`utils.py`) — `(instance_id, worker_id) → location → set[chunk_hash]`。
-- **命令**:lookup/pin/move/clear/compress/health/full_sync。
-- **组件**:`KVController`(`controllers/kv_controller.py`)处理 lookup;`RegistrationController` 管实例注册+心跳;`LMCacheWorker`(`worker.py`)是实例侧代理;`LMCacheControllerManager` 是服务端。带 WebUI。
-- **通信**:ZMQ。
+- **fleet 视图**:`views/key_directory.py::KeyDirectory` — `ObjectKey → placements(instance_id, tier, backend, size)`,由 cache event 构建,**最终一致,答案只是 hint,必须在 owner 侧验证**。
+- **命令面**(HTTP):`POST /cache/prefetches`(指定 `instance_id` 预热)、`POST|GET|DELETE /cache/pins`(排除在该协调器自己的 L2 驱逐计划外)、`POST /cache/delete`、`/quota*`、`/directory/{lookup,blend-lookup,keys,stats}`、`/instances*`、`/events`、`/config/chunk-size`。**无 move 路由。**
+- **组件**:`controllers/base.py::Controller`(控制器基类)、`controllers/prefetch_manager.py::PrefetchManager`(预取派发)、`controllers/eviction_controller.py::FleetEvictionController`(配额 / 驱逐 / pin 计数)、`views/instance_registry.py::InstanceRegistry`(注册与心跳)、`ingest/event_gate.py::EventGate`(事件准入、去重、fencing)、`discovery.py::Registry`(controller / view 发现)、`persistence/checkpoint.py`(目录与配额的 checkpoint)。
+- **通信**:HTTP(FastAPI);事件可经 HTTP 或 Kafka 源进入(`ingest/{http,kafka}_event_source.py`)。
 
 ## 压缩/serde
 
@@ -74,7 +75,7 @@
 
 ## 一致性
 
-**无全局强一致**。元数据靠 controller 的 ZMQ 消息 + 心跳 + 序列号追踪(`WorkerNode.seq_tracker`)+ `RWLockWithTimeout`/`FastLockWithTimeout`。Full sync 是 best-effort(完成阈值默认 0.8,超时 300s)。数据层靠内容寻址天然去重;失效靠 TTL + 显式 clear/evict。
+**无全局强一致**。fleet 视图靠 cache event 批次 + 实例心跳构建:事件经 `EventGate` 按 per-emitter 光标排序、去重、fencing 后才进各 view;目录可 checkpoint 并从事件流重放(`events_replay.py`)。答案只是 hint,字节可用性在 owner MP server 侧验证。数据层靠内容寻址天然去重;失效靠 L1 上报者 incarnation 与 L2 显式删除。
 
 ## Rust 组件
 
@@ -102,7 +103,7 @@
 | L1 CPU 热缓存 | `lmcache/v1/storage_backend/local_cpu_backend.py`::`LocalCPUBackend` |
 | L2 本地盘 | `lmcache/v1/storage_backend/local_disk_backend.py`::`LocalDiskBackend` |
 | 远程后端(asyncio) | `lmcache/v1/storage_backend/remote_backend.py`::`RemoteBackend` / `ConnectorClientBase` |
-| P2P 跨实例 | `lmcache/v1/storage_backend/p2p_backend.py`::`P2PBackend`::`CreateTransferChannel` |
+| P2P 跨实例 | `lmcache/v1/distributed/l2_adapters/p2p_l2_adapter.py`::`P2PL2Adapter` |
 | 传输通道 | `lmcache/v1/transfer_channel/nixl_channel.py`::`NixlChannel` / `py_socket_channel.py`::`PySocketChannel` |
 | NIXL/PD 传输后端 | `lmcache/v1/storage_backend/nixl_storage_backend.py`::`NixlStorageBackend` + `pd_backend.py` |
 | GDS 后端 | `lmcache/v1/storage_backend/gds_backend.py`::`GDSBackend` |
@@ -116,10 +117,13 @@
 | serde 包装(adapter 之上) | `lmcache/v1/distributed/`(SerdeL2AdapterWrapper) |
 | Non-MP serde | `lmcache/v1/storage_backend/naive_serde/`::`NaiveSerializer` / `CacheGenSerializer` / `KIVISerializer` |
 | MP serde | `lmcache/v1/distributed/serde/`::`fp8` / `asym_k16_v8` / `turboquant` / `multi` |
-| controller 元数据树 | `lmcache/v1/cache_controller/utils.py`::`RegistryTree`((instance,worker)→location→set[chunk_hash]) |
-| controller lookup | `lmcache/v1/cache_controller/controllers/kv_controller.py`::`KVController` |
-| 实例注册/心跳 | `lmcache/v1/cache_controller/`(RegistrationController) |
-| 实例侧代理 | `lmcache/v1/cache_controller/worker.py`::`LMCacheWorker` |
-| 服务端 | `lmcache/v1/cache_controller/controller_manager.py`::`LMCacheControllerManager` |
+| coordinator fleet 目录 | `lmcache/v1/mp_coordinator/views/key_directory.py`::`KeyDirectory.lookup` |
+| coordinator 控制器基类 | `lmcache/v1/mp_coordinator/controllers/base.py`::`Controller` |
+| 预取派发 | `lmcache/v1/mp_coordinator/controllers/prefetch_manager.py`::`PrefetchManager.submit_prefetch` |
+| 配额 / 驱逐 / pin | `lmcache/v1/mp_coordinator/controllers/eviction_controller.py`::`FleetEvictionController.pin` / `unpin` |
+| 实例注册/心跳 | `lmcache/v1/mp_coordinator/views/instance_registry.py`::`InstanceRegistry` + `registrar.py`::`keep_registered` |
+| 事件管线 | `lmcache/v1/mp_coordinator/cache_events.py`::`CacheEventSink`;`ingest/event_gate.py`::`EventGate` |
+| HTTP 面 | `lmcache/v1/mp_coordinator/http_apis/{cache_api,directory_api,instances_api}.py`;`controllers/eviction_http_api.py` |
+| 服务端入口 | `lmcache/v1/mp_coordinator/app.py`::`create_app` |
 | Rust 裸设备 I/O | `rust/raw_block/src/lib.rs`::`RawBlockDevice`(`pwrite_from_buffer`/`pread_into`;posix/io_uring/io_uring_cmd) |
 | Rust I/O 后端(non-MP/MP 共用) | `RustRawBlockBackend`(non-MP) + `RawBlockL2Adapter`→`RawBlockCore`(MP) |
