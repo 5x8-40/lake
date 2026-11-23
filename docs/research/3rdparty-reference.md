@@ -4,6 +4,7 @@
 
 - [`sglang/`](sglang/) — SGLang HiCache:[总览](sglang/overview.md) · [分层机制](sglang/hicache.md) · [存储后端](sglang/storage-backends.md) · [block 生命周期](sglang/block-lifecycle.md) · [MoE 通信](sglang/moe-communication.md) · [权重加载与外部集成](sglang/loading-and-integrations.md) · [thinking 控制](sglang/thinking-control.md) · [上游痛点](sglang/pain-points.md) · [Agentic KV 路线图 #21846](sglang/agentic-kv-roadmap.md) · [Elastic Memory Pool](sglang/elastic-memory-pool.md)
 - [`lmcache/`](lmcache/) — LMCache:[总览](lmcache/overview.md) · [跨实例复用与后端](lmcache/sharing-and-backends.md)
+- [`tair-kvcache/`](tair-kvcache/) — Tair KVCache:[总览](tair-kvcache/overview.md) · [与 lake kvcm 对照](tair-kvcache/vs-kvcm.md)
 - [`mooncake/`](mooncake/) — Mooncake:[总览](mooncake/overview.md) · [传输引擎](mooncake/transfer-engine.md) · [KV 存储与池化](mooncake/kv-store.md)
 - [`vllm/`](vllm/) — vLLM:[总览](vllm/overview.md) · [计算层抽象与存算分离接入点](vllm/compute.md) · [block 生命周期](vllm/block-lifecycle.md) · [上游痛点与 lake 对照](vllm/pain-points.md) · [Q3 KV/Session 调度 #48168/#48501](vllm/kv-session-roadmap.md)
 - [`transformers/`](transformers/) — Hugging Face Transformers:[总览](transformers/overview.md) · Qwen3 `nn.Module` 模型定义、HF config 字段、decoder/model/causal-lm 分层源码参考
@@ -30,6 +31,7 @@
 |------|------|------|----------|
 | `3rdparty/sglang` | [sgl-project/sglang](https://github.com/sgl-project/sglang) | main HEAD (`37f94cb7a0`, 2026-07-17) | 分层 + HiRadixTree + prefetch/write-back;痛点见 [sglang/pain-points.md](sglang/pain-points.md) |
 | `3rdparty/lmcache` | [LMCache/LMCache](https://github.com/LMCache/LMCache) | dev (`58c11e38`, 2026-11-13) | 跨实例复用 + MP server / 可选 coordinator + 多后端 + Rust I/O |
+| `3rdparty/tair-kvcache` | [alibaba/tair-kvcache](https://github.com/alibaba/tair-kvcache) | main (`934c03dc`, 2026-11-20) | 全局 KVCache 元数据服务 + 两阶段写 + 配额/分层/HA + 多引擎 connector |
 | `3rdparty/mooncake` | [kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake) | main HEAD | 传输引擎 + 对象级 KV 池 |
 | `3rdparty/vllm` | [vllm-project/vllm](https://github.com/vllm-project/vllm) | main HEAD (ab132ee98) | **计算层**(PagedAttention/worker/connector/spec decode) |
 | `3rdparty/transformers` | [huggingface/transformers](https://github.com/huggingface/transformers) | main HEAD | **模型定义**:Qwen3 `nn.Module`/HF config/decoder 分层,作为 vLLM/SGLang 模型实现的上游对照 |
@@ -98,7 +100,28 @@
 
 ---
 
-## 3. LMCache → 跨请求/跨实例 KV 复用 + 多存储后端
+## 3. Tair KVCM → 全局 KVCache 元数据服务
+
+源码入口:`3rdparty/tair-kvcache/kv_cache_manager/`、`docs/design/`。深度分析见 [`tair-kvcache/overview.md`](tair-kvcache/overview.md)、[`tair-kvcache/vs-kvcm.md`](tair-kvcache/vs-kvcm.md)。
+
+| Tair 设计 | 我们对应 | 说明 |
+|---|---|---|
+| 中心化 KV 元数据 + 客户端直连数据面 | CP 位置视图 + 存储池 client | 结构同构；Tair 的 `MetaIndexer` 自己就是位置/状态权威 |
+| 两阶段写 `StartWrite → FinishWrite` | 池写入 + READY 核验 | 都是“未确认不可读”；Tair 自己管 Location 状态机 |
+| Block / CacheLocation / LocationSpec | 逻辑块 + 副本 + 分片 | Tair 在元数据层保留前缀、TP/PP、混合注意力语义 |
+| Instance Group 配额 + DRAM/SSD 分层 | 池配额 + L1-L3 分层 | 可借配额/水位/迁移的运营抽象 |
+| KVCM 一主多备 + Client 发现 Leader | CP/控制面 HA | 与 lake 的 CP/etcd 路线不同，但 HA 问题相同 |
+| 不做请求路由/扩缩 | D8 请求/KV/扩缩联合 | Tair 是 KV 元数据服务，不是请求调度器 |
+
+关键差异：
+
+- Tair KVCM 的复用边界是 **Instance**；lake 目标是跨模型/租户的全局池。
+- Tair 是**自己持有索引的权威服务**；lake 的副本权威在 Mooncake master，kvcm 是 client/facade。
+- Tair 的增量在 KV 元数据服务本身（匹配、两阶段、配额、分层、HA）；lake 的增量在 D8 请求/KV/扩缩联合。
+
+---
+
+## 4. LMCache → 跨请求/跨实例 KV 复用 + 多存储后端
 
 源码入口:`3rdparty/lmcache/lmcache/`、`csrc/storage_backends/`、`rust/`、`examples/`。
 
@@ -120,7 +143,7 @@
 
 ---
 
-## 4. vLLM → 计算层(PagedAttention / worker / KV connector 接口)
+## 5. vLLM → 计算层(PagedAttention / worker / KV connector 接口)
 
 源码入口:`3rdparty/vllm/vllm/v1/`、`vllm/distributed/kv_transfer/kv_connector/`、`vllm/model_executor/`。
 
@@ -152,7 +175,7 @@ vLLM 是本系统**计算层(Python + Triton)**的直接参考。SGLang/LMCache/
 
 ---
 
-## 5. Dynamo → 我们的编排层 / 控制面 / KVBM 分层
+## 6. Dynamo → 我们的编排层 / 控制面 / KVBM 分层
 
 源码入口:`3rdparty/dynamo/lib/`(Rust 核心)、`components/`、`lib/runtime/`。Dynamo 是 NVIDIA 的"推理引擎之上的编排层",把 vLLM/SGLang/TRT-LLM 作为可插拔 worker 协调成多节点系统。**Rust 写核心性能路径 + 控制面**,是 lake 三语言分层(Rust 存储/Go 控制/Python 计算)中 Rust 控制面/编排的直接参照系。深度分析见 [`dynamo/overview.md`](dynamo/overview.md)。卸载路径对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 
@@ -177,7 +200,7 @@ vLLM 是本系统**计算层(Python + Triton)**的直接参考。SGLang/LMCache/
 
 ---
 
-## 6. Ascend MemCache → KV 对象池异构对照（昇腾）
+## 7. Ascend MemCache → KV 对象池异构对照（昇腾）
 
 源码入口:`3rdparty/memcache/`（嵌套 `memfabric_hybrid`：recursive init 会拉下；非 recursive 时才不拉，审计 OneCopy 需确认已 init）。深度分析见 [`memcache/`](memcache/)。
 
@@ -201,7 +224,7 @@ MemCache 与 **Mooncake store 同层**：分布式 **exact-key** KV 对象池 + 
 
 ---
 
-## 7. UCM → 引擎侧统一缓存框架（PD-via-pool）
+## 8. UCM → 引擎侧统一缓存框架（PD-via-pool）
 
 源码入口:`3rdparty/ucm/`。深度分析见 [`ucm/`](ucm/)。
 
@@ -239,7 +262,7 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 | **编排层/控制面** | **Dynamo**(KVBM logical/physical/engine + KV-aware router) | 位置视图权威在存储控制面进程内存、etcd 降频 checkpoint(Dynamo 走 NATS 事件流);HBM 归池而非 engine offload;Rust 存储控制面 + Go 调度控制面分工(Dynamo 单一 Rust 编排) |
 | **超低延迟 decode / PD 胶水** | **TileRT**(`TileRTConnector` + NIXL/Mooncake;核闭源) | 借鉴 connector claim、MTP-aware 传 KV、双传输;拒绝单槽/bs=1/引擎私有 HBM。详见 [tilert/](tilert/) |
 
-## 8. TileRT → 超低延迟 decode + vLLM PD 插件样板
+## 9. TileRT → 超低延迟 decode + vLLM PD 插件样板
 
 源码入口:`3rdparty/tilert/tilert/`、`tilert/pd_vllm/`。深度文档:[tilert/overview.md](tilert/overview.md) · [pd-vllm.md](tilert/pd-vllm.md) · [pain-points.md](tilert/pain-points.md)。
 
@@ -259,7 +282,7 @@ UCM 与 **LMCache 同层**：挂在 vLLM 等引擎上的 **KVStore + connector +
 - 过载 429 在小路由器内；lake 过载归 gateway。
 - 生态补位:[kvcached](kvcached/overview.md)(GPU 虚拟内存页弹性)与 Dynamo/KVCR 正交——KVCR 不碰 GPU,kvcached 只管 GPU 页映射;组合形态与「物理页重映射 vs RDMA 注册」待解问题见该文「想象空间」节。
 
-## 9. FlexKV → 引擎旁 CPU/SSD/远端卸载
+## 10. FlexKV → 引擎旁 CPU/SSD/远端卸载
 
 源码入口:`3rdparty/flexkv/`。深度分析见 [`flexkv/`](flexkv/)。卸载路径对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 
@@ -281,7 +304,7 @@ FlexKV 与 **LMCache / UCM 同层**（引擎 connector），本机索引接近 *
 - 驱逐不向下层写回；lake L2 是 F4 恢复点，冷热按移动。
 - Redis/事件不是单写者位置视图；worker 退出后本机树通常一起没。
 
-## 10. kvcached → GPU VMM 页弹性（L0 机制参考）
+## 11. kvcached → GPU VMM 页弹性（L0 机制参考）
 
 源码入口:`3rdparty/kvcached/`(`csrc/` + `kvcached/`)。深度分析见 [`kvcached/`](kvcached/)。HBM 归属对照见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 
@@ -304,7 +327,7 @@ kvcached 与其他参考项目不在同一层:不分层、不索引前缀、不�
 - 物理页重映射与 RDMA 注册的冲突仅限「RDMA 端点是 GPU 显存」的场景(G1→G1 直传);经 DRAM 中转天然规避,正解候选是 RDMA ODP(见 [kvcached/overview.md](kvcached/overview.md)「想象空间」节);lake Transfer Bus 需前置定路线。
 - 弹性止步单机单卡;lake L0–L3 统一编址。
 
-## 11. AIBrix → K8s 推理平台积木(网关路由 / 扩缩 / KV 卸载)
+## 12. AIBrix → K8s 推理平台积木(网关路由 / 扩缩 / KV 卸载)
 
 源码入口:`3rdparty/aibrix/`(Go 控制面/网关 + Python runtime/`aibrix_kvcache`)。深度分析见 [`aibrix/`](aibrix/)(overview / architecture / pain-points);路由策略横评见 [model-routing/instance-level.md](model-routing/instance-level.md);四栈对比见 [serving-stack-comparison.md](serving-stack-comparison.md)。
 
@@ -327,7 +350,7 @@ AIBrix 是平台层项目:Envoy 网关插件选路 + CRD 全家桶编排 + PodAu
 - PD 是 StormService 静态角色拓扑(自研 CRD:多角色 pod 编组整体部署);lake PD 是逐请求运行时模式。
 - 卸载由引擎侧逐出策略局部决定;lake 由池按全局热度 + 引用计数统一决定。
 
-## 12. llm-d Router → EPP 精确缓存感知 + PD 编排
+## 13. llm-d Router → EPP 精确缓存感知 + PD 编排
 
 源码入口:`3rdparty/llm-d-router/`(纯 Go 单仓:EPP + pd-sidecar + coordinator)。深度分析见 [`llm-d/`](llm-d/)(overview / architecture / pain-points);路由横评见 [model-routing/instance-level.md](model-routing/instance-level.md);四栈对比见 [serving-stack-comparison.md](serving-stack-comparison.md)。
 

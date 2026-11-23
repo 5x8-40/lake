@@ -36,6 +36,7 @@
 | SGLang | 实例自治 + 共享 L3 + 旁路索引 | 无（每实例树 + L3 实时查后端） | kv_events（zmq）+ gateway 近似树 | 无全局；L3 最终一致 | 后端决定 | 无（崩溃由 L3 回填） | 跨实例命中依赖近似树或实时查询 |
 | vLLM | 单实例引擎 + 事件外发 | 引擎内强一致；集群级无 | KV Events（zmq 单向） | 集群级最终一致（外部索引） | 引擎内保证 | worker 有状态，崩溃丢 KV | 集群语义外挂；#48501 向控制面演进 |
 | LMCache | 共享存储 / 中心 coordinator 两式 | coordinator KeyDirectory（L1/L2，最终一致） | MP server 心跳 + cache event seq/incarnation | 弱（允许错误，事件收敛） | 内容寻址去重；无锁并发写 | coordinator 可选、无热备；MP server 与引擎无 fate-sharing | 全内存 KeyDirectory；事件扇出随实例数增长 |
+| Tair KVCM | 星型（KVCM leader + Client/存储） | KVCM `MetaIndexer`（Instance 级） | Client RPC + ReportEvent；Leader/Follower | leader 单写者；元数据强一致 | 存储后端负责；两阶段写 | 一主多备 + Leader 选举；Client 自动发现 | 单 Instance 边界；leader 元数据内存/吞吐 |
 | FlexKV | 本机自治 + Redis 快照 | 本机 radix；Redis GMS 快照非权威 | 周期 upload/rebuild + lease | 最终一致（快照可陈旧） | 后端决定 | 无；worker 退出索引失效 | 快照时效；无回查权威 |
 | UCM | 无自有（继承 store 后端） | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 |
 | TileRT | 点对点（单槽 PD） | 无（进程内忙闲表） | 一次性握手 | 不适用 | 不适用 | 无（429） | 不适用（专用 bs=1） |
@@ -47,9 +48,9 @@
 
 ## 3. 四类归纳
 
-### A. 中心权威星型（lake / Mooncake / MemCache / TensorCast 低基数）
+### A. 中心权威星型（lake / Mooncake / MemCache / TensorCast 低基数 / Tair KVCM）
 
-共同特征：单一中心维护"什么在哪"，节点贡献内存或存字节，数据面绕过中心直传。
+共同特征：单一中心维护"什么在哪"，节点贡献内存或存字节，数据面绕过中心直传。Tair KVCM 的 `MetaIndexer` 是 Instance 级位置/状态权威，KVCM 自己维护两阶段写与配额；这与 lake 的 CP 权威同形，但 Tair 的复用边界停在 Instance。
 主要分野在读取路径：Mooncake / MemCache 每次 RPC 查询权威（实现简单，中心承担 QPS 压力）；lake 推送镜像 + 误判回查（热路径零 RPC，实现复杂度高）。
 共同瓶颈：中心单机内存需容纳全量元数据。Mooncake 的 1024 shard leader 与 lake CP 同构；TensorCast 以高低基数分治回避（见 B）。
 

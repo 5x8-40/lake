@@ -144,6 +144,7 @@ lake/
 │       ├── vllm_vs_sglang/          #   vLLM × SGLang 对比(PD 分离控制/guided decoding/采样参数/Scheduler→Worker 字段/Agent 场景 KV)
 │       ├── sglang/                  #   SGLang HiCache 深度分析(+ 上游痛点)
 │       ├── lmcache/                 #   LMCache 深度分析
+│       ├── tair-kvcache/            #   Tair KVCache（KVCM 元数据服务与 kvcm 对照）
 │       ├── mooncake/                #   Mooncake 深度分析
 │       ├── vllm/                    #   vLLM 深度分析（计算层参考）
 │       ├── transformers/            #   Transformers（模型定义参考）
@@ -160,6 +161,7 @@ lake/
 ├── 3rdparty/                   # 参考源码（git submodule，只读）
 │   ├── sglang/                 #   SGLang（HiCache 分层 KV + spec decode 计算层）
 │   ├── lmcache/                #   LMCache（跨实例 KV 复用）
+│   ├── tair-kvcache/           #   Tair KVCache Manager（全局 KV 元数据服务）
 │   ├── mooncake/               #   Mooncake（KVCache-centric 分离架构）
 │   ├── vllm/                   #   vLLM（计算层：PagedAttention/KV connector）
 │   ├── transformers/           #   Transformers（模型定义参考）
