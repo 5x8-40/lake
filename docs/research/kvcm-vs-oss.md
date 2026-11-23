@@ -2,6 +2,7 @@
 
 > 调研快照：2026-11-13。上游源码快照：vLLM `93eeae69`、SGLang `5792cf6e`、UCM `57ddbb26`、KVCR `b7aa81d0`、LMCache `58c11e38`、MemCache `14b4e35e`、FlexKV `55ad438e`、llm-d-router `647ca7ca`、Dynamo `b20fe6fe`、AIBrix `17652f54`；kvcm 基线 `4d9dd33`。
 > 范围：开源方案对照研究。kvcm 自身的设计在 [`kvcm/design/`](../../kvcm/design/D10-kv-fabric-roadmap.md)。
+> 命名：本文的 **kvcm** 指 lake kvcm；阿里的 Tair KVCache Manager 写作 **Tair KVCM**。
 > 读法：§1 必要性 → §2 角色与耦合 → §3 四个问题 → §4 三个场景 → §5 各家归类 → §6 今天与目标 → 附录 A 符号级事实 / B 短板与待确认 / C 代码索引。
 
 ---
@@ -172,19 +173,23 @@ LMCache 的 `mp_coordinator` 是这一维度上与我们最接近的实现：独
 
 Tair KVCM 是开源里名字和位置都最像 kvcm 的一个：中心元数据 + 客户端直连数据面。但它不是 lake kvcm 的同类实现。
 
+命名约定：**Tair KVCM** 指阿里 `3rdparty/tair-kvcache` 的 Tair KVCache Manager；**lake kvcm** 指本仓的 kvcm。
+
 ![Tair KVCM 部署架构](tair-kvcache/figures/tair-kvcm-deployment.png)
 
 （上游原图：Tair KVCache `docs/image/kvcm-deployment-zh.png`。KVCM 一主多备，Client/Connector 在推理侧，数据经 TransferClient 直连存储后端。）
 
 | 维度 | Tair KVCM | lake kvcm |
 |---|---|---|
-| 位置/状态权威 | Tair `MetaIndexer`：Block → CacheLocation → 状态 | Mooncake master：副本在哪、是否可读；kvcm 不拥有副本权威 |
+| 位置/状态权威 | Tair `MetaIndexer`：Block → CacheLocation → 状态 | Mooncake master：副本在哪、是否可读；lake kvcm 不拥有副本权威 |
 | 全局视野 | **Instance 级**：同一 Instance 内跨节点，跨 Instance 不复用 | 池级：目标跨模型/租户的全局 KV 池 |
-| 全局管理 | KV 元数据服务本身：匹配、两阶段写、配额、分层、GC、HA | D8 管理面 + D9 运营；当前 kvcm 更薄 |
+| 全局管理 | KV 元数据服务本身：匹配、两阶段写、配额、分层、GC、HA | D8 管理面 + D9 运营；当前 lake kvcm 更薄 |
 | 请求 + KV + 扩缩联合 | 不做；没有在线请求路由/扩缩 | D8 目标：请求、KV、容量共享 KVT/预算/账本 |
-| 耦合 | 引擎 connector/client；多引擎接入 | backend-coupled；kvcm 不绑某个引擎插件 |
-| 数据面 | Client `TransferClient` 直连存储后端 | Mooncake transfer/client；kvcm 不搬字节 |
-| 写路径 | `StartWriteCache` → 写 → `FinishWriteCache` | Mooncake `PutStart/PutEnd` + kvcm READY/核验 |
+| 耦合 | 引擎 connector/client；多引擎接入 | backend-coupled；lake kvcm 不绑某个引擎插件 |
+| 数据面 | Client `TransferClient` 直连存储后端 | Mooncake transfer/client；lake kvcm 不搬字节 |
+| 写路径 | `StartWriteCache` → 写 → `FinishWriteCache` | Mooncake `PutStart/PutEnd` + lake kvcm READY/核验 |
+
+注意：Tair 的 **L1.5/L2** 是 EventReport 的 host/P2P 层级，不是 lake 的 L1/L2 介质层。名字相同，含义不同：Tair L1.5 是计算节点贡献的 host DRAM 池，Tair L2 是其他节点可 P2P 读取的 Vineyard 缓存；lake L1/L2 是池的 DRAM/NVMe 层。
 
 所以“Tair KVCM + Mooncake ≈ lake kvcm + Mooncake，lake 多路由和扩缩容”这个判断：
 
@@ -193,7 +198,7 @@ Tair KVCM 是开源里名字和位置都最像 kvcm 的一个：中心元数据 
 3. **“多路由和扩缩容”说轻了**：lake 的增量不是两个功能，而是 D8 把请求、KV、扩缩放进同一套决策；Tair 没有这一层。
 4. **复用边界不同**：Tair 停在 Instance；lake 目标是全局池。
 
-对 kvcm 可借的部分：
+对 lake kvcm 可借的部分：
 
 - 两阶段写的状态机：`writing → serving → deleting`，未确认不可读；
 - Instance Group 级配额、DRAM/SSD 水位与迁移；

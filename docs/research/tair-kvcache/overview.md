@@ -2,6 +2,7 @@
 
 > 源码:`3rdparty/tair-kvcache`(submodule),检出 `934c03dc`(2026-11-20,`[manager] parallelize leader recovery and bound Redis handshakes (#453)`)。
 > 上游:[README](https://github.com/alibaba/tair-kvcache/blob/main/README.md) · [中文 README](https://github.com/alibaba/tair-kvcache/blob/main/README_zh.md) · [模块架构](https://github.com/alibaba/tair-kvcache/blob/main/docs/design/module_architecture.md) · [文章](https://mp.weixin.qq.com/s/KyNYH03PfamPcAJY7BRMwg)
+> 命名约定:本文把阿里的 Tair KVCache Manager 写作 **Tair KVCM**;把本仓项目的 kvcm 写作 **lake kvcm**。两者不是同一个东西。
 
 ## 一句话定位
 
@@ -67,6 +68,16 @@ KVCM 的核心原则是**中心化元数据 + 去中心化数据搬运**。
 
 这里最容易被忽略的是 **Instance 边界**：Tair KVCM 的“全局”是**单个 Instance 跨节点**，不是跨 Instance 的全局池。
 
+两个概念不要混：
+
+- **Instance Group**：配额和存储配置的范围。一个 Group 可以包含多个 Instance，Group 内共享配额，但**不共享 KV**。
+- **Instance**：KV 复用命名空间。只有同一个 Instance 内的多个引擎实例/节点才复用；跨 Instance 不匹配、不复用。
+
+因此，P/D 分离能否共享，取决于它们是否注册为同一个 Instance：
+
+- P 和 D 使用同一个 `instance_id`：可以复用（前提是模型/KVCache 配置一致）；
+- P 和 D 拆成两个 Instance：不共享，即使它们在同一个 Instance Group。
+
 ## 读写路径
 
 ### 读
@@ -115,8 +126,15 @@ StartWriteCache：预留写入位置，状态 writing
 
 ### 3. L1.5/L2 状态上报
 
-推理侧通过 `ReportEvent` 增量上报 L1.5/L2 缓存状态，可选 snapshot 对账。  
-这让 KVCM 能看到“引擎/主机本地已有什么”，而不只是它自己管的存储。
+这里的 L1.5/L2 是 **Tair EventReport 的层级名**，不是 lake 的 L1/L2：
+
+- **L1.5**：每个计算节点贡献一部分 host DRAM，组成的分布式内存池；
+- **L2**：其他节点可通过 P2P 获取的 Vineyard 缓存；
+- 它们都是 `ReportEvent` 的上报来源，不是 KVCM 自己持有的存储层，也不等同于 TairMemPool/3FS/Mooncake 这些 Storage 后端。
+
+推理侧通过 `ReportEvent` 增量上报 L1.5/L2 状态，可选 snapshot 对账。KVCM 只写 metadata，不搬数据；`GetHostCacheState` 用它判断 host-local / global 命中。
+
+注意：这是接口能力，不代表每个 connector 都已接。当前 SGLang connector 主要走 L3，GPU/主机层（HiCache L1/L2）不上报给 KVCM。
 
 ### 4. HA 与运维
 
@@ -169,7 +187,7 @@ StartWriteCache：预留写入位置，状态 writing
 4. **接入依赖 connector/client**：不同引擎需要对应 connector；不是纯 backend-coupled 的单一接口。
 5. **数据面仍是客户端直连存储**：KVCM 不控制传输路径的调度，只给位置。
 
-## 与 kvcm 的关系
+## 与 lake kvcm 的关系
 
 架构对照见 [`../kvcm-vs-oss.md`](../kvcm-vs-oss.md) §3.3.2。先给结论：
 
