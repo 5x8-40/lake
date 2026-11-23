@@ -4,7 +4,7 @@
 
 - [`sglang/`](sglang/) — SGLang HiCache:[总览](sglang/overview.md) · [分层机制](sglang/hicache.md) · [存储后端](sglang/storage-backends.md) · [block 生命周期](sglang/block-lifecycle.md) · [MoE 通信](sglang/moe-communication.md) · [权重加载与外部集成](sglang/loading-and-integrations.md) · [thinking 控制](sglang/thinking-control.md) · [上游痛点](sglang/pain-points.md) · [Agentic KV 路线图 #21846](sglang/agentic-kv-roadmap.md) · [Elastic Memory Pool](sglang/elastic-memory-pool.md)
 - [`lmcache/`](lmcache/) — LMCache:[总览](lmcache/overview.md) · [跨实例复用与后端](lmcache/sharing-and-backends.md)
-- [`tair-kvcache/`](tair-kvcache/) — Tair KVCache:[总览](tair-kvcache/overview.md) · [与 lake kvcm 对照](tair-kvcache/vs-kvcm.md)
+- [`tair-kvcache/`](tair-kvcache/) — Tair KVCache:[总览](tair-kvcache/overview.md) · [与 lake kvcm 对照](kvcm-vs-oss.md)
 - [`mooncake/`](mooncake/) — Mooncake:[总览](mooncake/overview.md) · [传输引擎](mooncake/transfer-engine.md) · [KV 存储与池化](mooncake/kv-store.md)
 - [`vllm/`](vllm/) — vLLM:[总览](vllm/overview.md) · [计算层抽象与存算分离接入点](vllm/compute.md) · [block 生命周期](vllm/block-lifecycle.md) · [上游痛点与 lake 对照](vllm/pain-points.md) · [Q3 KV/Session 调度 #48168/#48501](vllm/kv-session-roadmap.md)
 - [`transformers/`](transformers/) — Hugging Face Transformers:[总览](transformers/overview.md) · Qwen3 `nn.Module` 模型定义、HF config 字段、decoder/model/causal-lm 分层源码参考
@@ -102,7 +102,7 @@
 
 ## 3. Tair KVCM → 全局 KVCache 元数据服务
 
-源码入口:`3rdparty/tair-kvcache/kv_cache_manager/`、`docs/design/`。深度分析见 [`tair-kvcache/overview.md`](tair-kvcache/overview.md)、[`tair-kvcache/vs-kvcm.md`](tair-kvcache/vs-kvcm.md)。
+源码入口:`3rdparty/tair-kvcache/kv_cache_manager/`、`docs/design/`。深度分析见 [`tair-kvcache/overview.md`](tair-kvcache/overview.md)、[`kvcm-vs-oss.md`](kvcm-vs-oss.md)。
 
 | Tair 设计 | 我们对应 | 说明 |
 |---|---|---|

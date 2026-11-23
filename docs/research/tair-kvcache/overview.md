@@ -171,7 +171,7 @@ StartWriteCache：预留写入位置，状态 writing
 
 ## 与 kvcm 的关系
 
-见 [`vs-kvcm.md`](vs-kvcm.md)。先给结论：
+架构对照见 [`../kvcm-vs-oss.md`](../kvcm-vs-oss.md) §3.3.2。先给结论：
 
 > Tair KVCM 和 lake kvcm 在“全局 KV 元数据 + 共享存储 + 客户端直连数据面”这一层很像；但 Tair KVCM 是**自己持有全局索引的权威元数据服务**，lake kvcm 是**Mooncake master 之上的 client/facade + 管理面设计**。lake 的增量在请求/KV/扩缩联合调度，不在“再加一个 KV 目录”。
 

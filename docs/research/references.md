@@ -10,7 +10,7 @@
   - L1/L2/L3 三层(L1/L2 私有、L3 共享)、HiRadixTree、prefetch/write-back 策略;block 何时释放/彻底放弃见 block-lifecycle;MoE 的 DeepEP normal/low-latency 分派见 moe-communication;权重多线程/远端加载与依赖集成边界见 loading-and-integrations;issue/roadmap 痛点与 lake 对照见 pain-points;Agentic/PD 增量传输与 hint 总设计见 agentic-kv-roadmap。
 - **LMCache** → [`lmcache/`](lmcache/):[总览](lmcache/overview.md) · [跨实例复用与后端](lmcache/sharing-and-backends.md)
   - 跨实例 KV 复用、内容寻址去重、多存储后端、Rust 裸设备 I/O。
-- **Tair KVCache** → [`tair-kvcache/`](tair-kvcache/):[总览](tair-kvcache/overview.md) · [与 lake kvcm 对照](tair-kvcache/vs-kvcm.md)
+- **Tair KVCache** → [`tair-kvcache/`](tair-kvcache/):[总览](tair-kvcache/overview.md) · [与 lake kvcm 对照](kvcm-vs-oss.md)
   - 阿里云 Tair KVCM：全局 KVCache 元数据服务、Block/CacheLocation/LocationSpec、两阶段写、配额/分层/HA、vLLM/SGLang/TRT connector。
 - **Mooncake** → [`mooncake/`](mooncake/):[总览](mooncake/overview.md) · [传输引擎](mooncake/transfer-engine.md) · [KV 存储与池化](mooncake/kv-store.md)
   - RDMA 零拷贝传输引擎、对象级 KV 池、PD 分离。
