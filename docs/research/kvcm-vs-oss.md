@@ -169,9 +169,11 @@ LMCache 的 `mp_coordinator` 是这一维度上与我们最接近的实现：独
 
 **LMCache coordinator 是 kvcm 控制面最接近的同类；但它是 connector-coupled、事件目录（含 L1 位置 hint）、L1 驱逐本地 + L2 fleet 策略；kvcm 是 backend-coupled、master 权威、目标覆盖池 + 请求 + 容量。**
 
-### 3.3.2 Tair KVCM：另一种中心元数据服务
+### 3.3.2 Tair KVCM：KV 元数据服务，不是 lake 管理面
 
-Tair KVCM 是开源里名字和位置都最像 kvcm 的一个：中心元数据 + 客户端直连数据面。但它不是 lake kvcm 的同类实现。
+Tair KVCM 对应的是 lake kvcm 的**控制面/元数据面**，不是整个 lake kvcm。
+
+Tair KVCM + Mooncake ≈ lake kvcm 的控制面 + Mooncake；lake 的 D8 管理面和 KV Fabric 目标，在 Tair KVCM 里没有对应物。
 
 命名约定：**Tair KVCM** 指阿里 `3rdparty/tair-kvcache` 的 Tair KVCache Manager；**lake kvcm** 指本仓的 kvcm。
 
@@ -181,42 +183,41 @@ Tair KVCM 是开源里名字和位置都最像 kvcm 的一个：中心元数据 
 
 | 维度 | Tair KVCM | lake kvcm |
 |---|---|---|
-| 位置/状态权威 | Tair `MetaIndexer`：Block → CacheLocation → 状态 | Mooncake master：副本在哪、是否可读；lake kvcm 不拥有副本权威 |
+| KV 副本权威 | Tair `MetaIndexer` 管 Block/CacheLocation/状态；字节在后端 | Mooncake master 管副本位置/可读性；lake kvcm 不拥有副本权威 |
+| Branch / 前缀 / 会话 | 管 Block 前缀匹配与 Location；没有 agent branch/session 状态 | branch 表、会话/前缀决策在 lake kvcm；master 不参与 |
 | 全局视野 | **Instance 级**：同一 Instance 内跨节点，跨 Instance 不复用 | 池级：目标跨模型/租户的全局 KV 池 |
 | 全局管理 | KV 元数据服务本身：匹配、两阶段写、配额、分层、GC、HA | D8 管理面 + D9 运营；当前 lake kvcm 更薄 |
-| 请求 + KV + 扩缩联合 | 不做；没有在线请求路由/扩缩 | D8 目标：请求、KV、容量共享 KVT/预算/账本 |
+| 请求 + KV + 扩缩联合 | 没有请求路由、PD 配比、扩缩，也没有请求/KV/容量共享决策 | D8 目标：请求、KV、容量共享 KVT/预算/账本 |
 | 耦合 | 引擎 connector/client；多引擎接入 | backend-coupled；lake kvcm 不绑某个引擎插件 |
 | 数据面 | Client `TransferClient` 直连存储后端 | Mooncake transfer/client；lake kvcm 不搬字节 |
 | 写路径 | `StartWriteCache` → 写 → `FinishWriteCache` | Mooncake `PutStart/PutEnd` + lake kvcm READY/核验 |
 
-注意：Tair 的 **L1.5/L2** 是 EventReport 的 host/P2P 层级，不是 lake 的 L1/L2 介质层。名字相同，含义不同：
+Tair 的 **L1.5/L2** 是 EventReport 的 host/P2P 层级，不是 lake 的 L1/L2 介质层：
 
 - Tair L1：GPU HBM，由引擎管理，KVCM 不碰；
 - Tair L1.5：计算节点贡献的 host DRAM 池；
 - Tair L2：其他节点可 P2P 读取的 Vineyard 缓存；
 - lake L1/L2：池的 DRAM/NVMe 层。
 
-Mooncake 在 Tair 里也不是 L1.5/L2，而是 Storage 后端；Tair 返回 `mooncake://...`，Client 直接读写。
+Mooncake 在 Tair 里不是 L1.5/L2，而是 Storage 后端；Tair 返回 `mooncake://...`，Client 直接读写。
 
-所以“Tair KVCM + Mooncake ≈ lake kvcm + Mooncake，lake 多路由和扩缩容”这个判断：
+两条容易混的边界：
 
-1. **在产品层大致成立**：两者都是中心元数据 + 共享 KVCache 存储 + 客户端直连；都可以把 Mooncake 作为存储后端。
-2. **在架构层不成立**：Tair 的 `MetaIndexer` 是它自己的位置/状态权威；lake 的副本权威在 master，kvcm 是 client/facade。
-3. **“多路由和扩缩容”说轻了**：lake 的增量不是两个功能，而是 D8 把请求、KV、扩缩放进同一套决策；Tair 没有这一层。
-4. **复用边界不同**：Tair 停在 Instance；lake 目标是全局池。
+- **两阶段写**：Tair 的 `writing → serving → deleting` 是 Tair KVCM 自己的 Location 状态机；Mooncake 的 `PutStart/PutEnd` 是后端字节层契约。二者不是同一个东西。lake kvcm 把数据写交给 Mooncake，自己只做 READY/核验，不维护全局 Location 状态机。
+- **LLM-aware matching**：Mooncake Store 不做前缀匹配；Tair 的 `MetaSearcher` 做 prefix/SWA/hybrid attention 匹配。lake 侧的前缀匹配在 KVT/Router，不在 master。
 
 对 lake kvcm 可借的部分：
 
-- 两阶段写的状态机：`writing → serving → deleting`，未确认不可读；
 - Instance Group 级配额、DRAM/SSD 水位与迁移；
-- LLM-aware matching：前缀、滑动窗口、混合注意力、多 LocationSpec；
-- HA 的 leader/follower + 客户端自动发现。
+- LLM-aware matching 的查询语义：前缀、反向滑动窗口、混合注意力、多 LocationSpec；
+- HA 的 leader/follower + 客户端自动发现；
+- GC：把元数据 GC 与存储回收分开，后台对账孤儿 Location。可以借这个思路；实际删除仍归 master/池。
 
 不借的部分：
 
 - Tair 的 Instance 边界；
-- 自己持有位置权威的模型（lake 的权威在 master）；
-- 把 KV 元数据服务当成请求调度器。
+- 把 Tair KVCM 当 Router/D8：它只回答 KV 在哪，不决定请求去哪个实例，也不做扩缩；
+- 把 Tair 的 KV 元数据权威直接搬成 lake 的副本权威；lake 的副本权威仍在 master。
 
 详细事实、3 张上游图和代码索引见 [`tair-kvcache/overview.md`](tair-kvcache/overview.md)。
 
