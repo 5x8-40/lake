@@ -189,7 +189,14 @@ Tair KVCM 是开源里名字和位置都最像 kvcm 的一个：中心元数据 
 | 数据面 | Client `TransferClient` 直连存储后端 | Mooncake transfer/client；lake kvcm 不搬字节 |
 | 写路径 | `StartWriteCache` → 写 → `FinishWriteCache` | Mooncake `PutStart/PutEnd` + lake kvcm READY/核验 |
 
-注意：Tair 的 **L1.5/L2** 是 EventReport 的 host/P2P 层级，不是 lake 的 L1/L2 介质层。名字相同，含义不同：Tair L1.5 是计算节点贡献的 host DRAM 池，Tair L2 是其他节点可 P2P 读取的 Vineyard 缓存；lake L1/L2 是池的 DRAM/NVMe 层。
+注意：Tair 的 **L1.5/L2** 是 EventReport 的 host/P2P 层级，不是 lake 的 L1/L2 介质层。名字相同，含义不同：
+
+- Tair L1：GPU HBM，由引擎管理，KVCM 不碰；
+- Tair L1.5：计算节点贡献的 host DRAM 池；
+- Tair L2：其他节点可 P2P 读取的 Vineyard 缓存；
+- lake L1/L2：池的 DRAM/NVMe 层。
+
+Mooncake 在 Tair 里也不是 L1.5/L2，而是 Storage 后端；Tair 返回 `mooncake://...`，Client 直接读写。
 
 所以“Tair KVCM + Mooncake ≈ lake kvcm + Mooncake，lake 多路由和扩缩容”这个判断：
 

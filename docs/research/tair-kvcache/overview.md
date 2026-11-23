@@ -132,6 +132,10 @@ StartWriteCache：预留写入位置，状态 writing
 - **L2**：其他节点可通过 P2P 获取的 Vineyard 缓存；
 - 它们都是 `ReportEvent` 的上报来源，不是 KVCM 自己持有的存储层，也不等同于 TairMemPool/3FS/Mooncake 这些 Storage 后端。
 
+在 Tair 语境里，**L1 是 GPU HBM**，由引擎管理；Tair KVCM 不管理 L1，只能通过 L1.5/L2 上报间接看到主机侧缓存。
+
+**Mooncake 不是 L1.5，也不是 L2。** 它是 Tair 的一个 Storage 后端：Tair 返回 `mooncake://...` URI，Client 直接读写 Mooncake；Mooncake 自己可以是 DRAM/SSD 部署，但在 Tair 的分层里属于外部/共享存储，不属于 EventReport 的 host/P2P 层级。
+
 推理侧通过 `ReportEvent` 增量上报 L1.5/L2 状态，可选 snapshot 对账。KVCM 只写 metadata，不搬数据；`GetHostCacheState` 用它判断 host-local / global 命中。
 
 注意：这是接口能力，不代表每个 connector 都已接。当前 SGLang connector 主要走 L3，GPU/主机层（HiCache L1/L2）不上报给 KVCM。
