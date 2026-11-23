@@ -273,6 +273,8 @@ instance / tier
 
 每一行是一条 active 引用：哪个 branch 的哪个 block、在哪个 placement 上。只记“branch 引用了哪些 block”不够，无法按节点/介质做零引用驱逐。
 
+`context_version` 是同一 branch 的上下文被 compact / rewrite 的次数；每次重写递增，旧版本下的引用作废。
+
 更新规则：
 
 - `fork`：新建 branch，对复用的 block 加引用；
@@ -364,7 +366,7 @@ sequenceDiagram
 | `version` / `hook_id` | 兼容/幂等 | 未知版本只观察、不生效 |
 | `event` | PRE_ANNOUNCE / ATTACHED / PAUSE / CLOSE / BRANCH / TOOL_HINT（可选） | 未知事件只 observe；TOOL_HINT 仅在 hook 生产方有可靠 ETA 时用 |
 | `session_id` / `workflow_id` / `step` / `branch` | 会话/分支定位 | 与路由键对齐 |
-| `branch_op` / `context_version` / `parent_branch_id` | fork / finish / compact / rewrite；上下文被重写时版本递增；fork 带父 branch | 与 `BRANCH` 事件一起发；没有事件就按普通请求处理 |
+| `branch_op` / `context_version` / `parent_branch_id` | fork / finish / compact / rewrite；`context_version` 是上下文被重写的次数，每次递增；fork 带父 branch | 与 `BRANCH` 事件一起发；没有事件就按普通请求处理 |
 | `prefix`（token_ids 或 hash 链） | 要预取/保留的前缀 | 优先 hash；必须与引擎口径一致 |
 | `timing` / `eta_ms` / `expected_turns` / `reuse_prob` | 请求前/中/后；预计到达 | ETA 决定提前量 |
 | `tool_class` / `tool_eta_ms` | 工具类型/预计时长（仅 TOOL_HINT） | 没有可靠 ETA 就不触发特殊动作 |
@@ -471,7 +473,7 @@ flowchart TB
 - 切换前先摘流：不再给切换节点发新请求，排队请求转出；
 - 在途请求按策略跑完或迁移，不能让切换把请求打断；
 - 切换后更新 KVT 里的角色和位置；
-- branch 引用按阶段处理：同阶段搬运跟着副本走，跨阶段两边保留；
+- branch 引用按 P/D 角色处理：同角色搬运（P→P 或 D→D）跟着副本走，跨角色搬运（P↔D）两边都保留；没有 P/D 分离副本时按 copy/move 规则；
 - 切换成本和收益进 L2 规划，按窗口平均和显著性门槛决定，避免来回抖；
 - 引擎不支持原地切，就只做容量建议，不承诺秒级切 P/D。
 

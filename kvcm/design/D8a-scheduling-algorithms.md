@@ -319,7 +319,7 @@ layerwise：
 
 `residual = P − H`；HBM 命中时 `X_bytes≈0`，通常只剩末 token 残差。
 
-prefill 不只看 `residual` 一个数：未缓存 token 的线性层、未缓存 token 对已缓存前缀的 attention、从 host 恢复到 GPU 的 token 拷贝，三部分都要算。只按请求总长度或只看命中率，都会把 P 节点压力估错。
+`residual` 是未缓存 token 数，确实驱动线性层和未缓存 token 之间的 attention；但 prefill 还取决于这些 token 要对多长的已缓存前缀做 attention，以及从 host 恢复到 GPU 的 token 数。把 `residual / v_prefill` 当固定比例，会在长缓存前缀或大量恢复时估错；只按请求总长度或只看命中率，也会把 P 节点压力估错。
 
 选路时要先知道部署模式：批量加载按加法，layerwise 才判断能否取 max。同一个请求，走节点 A 可能能掩盖（A 带宽高），走节点 B 不能。
 
@@ -611,8 +611,7 @@ Cost    = (|R_p| − 1) × S_bytes × c_mem × T
 - 引用计数按副本和节点记：
   - `move`：branch 引用从源迁到目标，源释放；
   - `copy`：目标只拿“会被路由到目标”的 branch 引用，源保留自己的引用；
-  - 同阶段搬移：引用跟着副本走；
-  - 跨阶段搬运：两边都保留。
+  - 如果引擎把同一 block 分别放在 P 和 D 两个角色上：同角色搬运（P→P 或 D→D）引用跟着副本走，跨角色搬运（P↔D）两边都保留。
 - `copy` 后目标在还没有 branch 引用时，按预取/保留处理，不能被普通零引用驱逐清掉。
 - 引用来自 D8 branch 表；KVT 只提供候选，删除仍走 kvcm intent / master 核验。
 
