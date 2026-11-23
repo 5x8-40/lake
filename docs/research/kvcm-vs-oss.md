@@ -184,7 +184,8 @@ Tair KVCM + Mooncake ≈ lake kvcm 的控制面 + Mooncake；lake 的 D8 管理�
 | 维度 | Tair KVCM | lake kvcm |
 |---|---|---|
 | KV 副本权威 | Tair `MetaIndexer` 管 Block/CacheLocation/状态；字节在后端 | Mooncake master 管副本位置/可读性；lake kvcm 不拥有副本权威 |
-| Branch / 前缀 / 会话 | 管 Block 前缀匹配与 Location；没有 agent branch/session 状态 | branch 表、会话/前缀决策在 lake kvcm；master 不参与 |
+| 前缀匹配 | Tair `MetaSearcher` 做 prefix/SWA/hybrid attention | Mooncake connector/引擎做前缀命中；lake kvcm 不重复造轮子 |
+| Branch / 会话 | 没有 agent branch/session 状态 | branch 表、会话/保留决策在 lake kvcm；master 不参与 |
 | 全局视野 | **Instance 级**：同一 Instance 内跨节点，跨 Instance 不复用 | 池级：目标跨模型/租户的全局 KV 池 |
 | 全局管理 | KV 元数据服务本身：匹配、两阶段写、配额、分层、GC、HA | D8 管理面 + D9 运营；当前 lake kvcm 更薄 |
 | 请求 + KV + 扩缩联合 | 没有请求路由、PD 配比、扩缩，也没有请求/KV/容量共享决策 | D8 目标：请求、KV、容量共享 KVT/预算/账本 |
@@ -204,14 +205,14 @@ Mooncake 在 Tair 里不是 L1.5/L2，而是 Storage 后端；Tair 返回 `moonc
 两条容易混的边界：
 
 - **两阶段写**：Tair 的 `writing → serving → deleting` 是 Tair KVCM 自己的 Location 状态机；Mooncake 的 `PutStart/PutEnd` 是后端字节层契约。二者不是同一个东西。lake kvcm 把数据写交给 Mooncake，自己只做 READY/核验，不维护全局 Location 状态机。
-- **LLM-aware matching**：Mooncake Store 不做前缀匹配；Tair 的 `MetaSearcher` 做 prefix/SWA/hybrid attention 匹配。lake 侧的前缀匹配在 KVT/Router，不在 master。
+- **LLM-aware matching**：Mooncake Store 本身不做前缀匹配；Mooncake connector/引擎做前缀命中，lake kvcm 不重复造轮子。Tair 则把 prefix/SWA/hybrid attention 匹配放进 `MetaSearcher`，这是它自己的元数据服务能力。
 
 对 lake kvcm 可借的部分：
 
 - Instance Group 级配额、DRAM/SSD 水位与迁移；
 - LLM-aware matching 的查询语义：前缀、反向滑动窗口、混合注意力、多 LocationSpec；
 - HA 的 leader/follower + 客户端自动发现；
-- GC：把元数据 GC 与存储回收分开，后台对账孤儿 Location。可以借这个思路；实际删除仍归 master/池。
+- GC / 碎片整理：借 Tair 的“元数据 GC 与存储回收分开、后台对账孤儿 Location”思路；lake kvcm 会主动发起 remove / copy / move / pin，master/池负责执行与副本权威。热点 KV 的 shuffle 是 lake 的主动管理动作，不是 Tair 现成能力。
 
 不借的部分：
 
