@@ -205,6 +205,7 @@ SOTA 的索引（llm-d `pkg/kvcache`、Dynamo `lib/kv-router`、AIBrix `pkg/kvev
 - **正常请求只读 KVT**，不查 master；只有 KVT miss、置信度低、对账/核验时才异步问 master 或 kvcm，结果回写 KVT；
 - **精度到实例 + 介质**（HBM / 本机 DRAM / 远端池），**不碰 seg、rank、字节地址**——这些由 kvcm 控制面的 `locate` 负责；
 - 允许陈旧；陈旧只损性能，不损正确性（远端读/重算兜底）。
+- KVT 可以带 branch/session 的派生字段：每个 block 在每个实例上的 active branch 引用数、context version。引用数的权威不在 master，也不在 KVT，而在 §3.2 的 branch 状态表；KVT 只做投影，供零引用候选过滤。
 
 #### 介质分层
 
@@ -238,11 +239,50 @@ stateDiagram-v2
 - **已确认**：引擎事件/READY/核验证明“真的有”；只有已确认条目才能算命中、才能支撑 HBM 判定。
 - 删除/失效带墓碑，防延迟到达的 `Stored` 复活；合并规则见 [D8a §2.3](D8a-scheduling-algorithms.md)。
 
+### 3.1.1 从 LMCache coordinator 借什么
+
+LMCache coordinator 和 D8 的 KVT 是同类问题：都是事件派生的视图，不是权威。可以直接借这四条做法：
+
+- **事件带实例重启标识。** 同一实例重启后，旧进程的迟到事件不能把已经失效的位置写回 KVT。
+- **KVT 只记事实。** KVT 只做“块 → 实例 + 介质 + 置信度”，以及 branch 表投影过来的引用数；选路、预取、扩缩三环读 KVT，预算、策略、决策状态留在三环。
+- **KVT 可快照、可重放。** 定期快照，事件断了能重放补齐；权威仍在引擎 APC / Mooncake master，KVT 故障只影响选路质量。
+- **位置信息用于候选过滤。** KVT 先缩小候选，再由 SC/Router 决策；实际取数仍以引擎 APC（HBM）或 Mooncake master（池副本）核验为准。
+
+对应到 D8：
+
+- **选路**：用 KVT 先缩小候选，再由 SC 决定发往哪里。
+- **预取**：把预取的提交、进行中、完成状态接入统一观测，而不是只记最终结果。
+- **观测**：按实例/介质统计用量、KVT 命中、预取状态。
+
 ### 3.2 会话需求（SC 自己维护）
 
 - **调度状态在 SC**：上一轮实例/前缀、下一轮 ETA、复用概率、保留策略、预算；ETA 来自 hook，不是 kvcm 推出来的。
 - **kvcm ledger 只记执行状态**：session 绑定了哪些前缀、keepalive 注册、重启恢复；它不负责“下一轮什么时候来”，也不是调度权威。
 - SC 重启后可从 hook/ledger 恢复执行绑定；但 ETA/需求必须重新由 hook 提供。
+
+**branch 状态表（kvcm 自己维护，引用权威）**：
+
+```text
+branch_id
+parent_branch_id
+context_version
+state = active | finished
+block
+instance / tier
+```
+
+每一行是一条 active 引用：哪个 branch 的哪个 block、在哪个 placement 上。只记“branch 引用了哪些 block”不够，无法按节点/介质做零引用驱逐。
+
+`context_version` 是同一 branch 的上下文被 compact / rewrite 的次数；每次重写递增，旧版本下的引用作废。
+
+更新规则：
+
+- `fork`：新建 branch，对复用的 block 加引用；
+- 同 branch 追加 token：只对新增 block 加引用；
+- `compact` / `rewrite`：context version 递增，释放旧 block，引用新 block；
+- `finish`：释放该 branch 的全部引用。
+
+这张表是 branch 引用的权威；KVT 按 `block × instance × tier` 投影引用数。master 仍然只负责 KV 副本，不参与 branch 引用。
 
 ### 3.3 容量与资源权重
 
@@ -326,6 +366,7 @@ sequenceDiagram
 | `version` / `hook_id` | 兼容/幂等 | 未知版本只观察、不生效 |
 | `event` | PRE_ANNOUNCE / ATTACHED / PAUSE / CLOSE / BRANCH / TOOL_HINT（可选） | 未知事件只 observe；TOOL_HINT 仅在 hook 生产方有可靠 ETA 时用 |
 | `session_id` / `workflow_id` / `step` / `branch` | 会话/分支定位 | 与路由键对齐 |
+| `branch_op` / `context_version` / `parent_branch_id` | fork / finish / compact / rewrite；`context_version` 是上下文被重写的次数，每次递增；fork 带父 branch | 与 `BRANCH` 事件一起发；没有事件就按普通请求处理 |
 | `prefix`（token_ids 或 hash 链） | 要预取/保留的前缀 | 优先 hash；必须与引擎口径一致 |
 | `timing` / `eta_ms` / `expected_turns` / `reuse_prob` | 请求前/中/后；预计到达 | ETA 决定提前量 |
 | `tool_class` / `tool_eta_ms` | 工具类型/预计时长（仅 TOOL_HINT） | 没有可靠 ETA 就不触发特殊动作 |
@@ -334,6 +375,15 @@ sequenceDiagram
 | `deadline` / `priority` | SLO/优先级 | 优先级只影响排队，不做准入 |
 | `budget` | 预取/保留/字节上限 | 超预算裁剪或拒绝 |
 | `signature` | 网关签名 | 匿名来源只能 observe |
+
+#### 场景草案（idea，不新增事件）
+
+- **前端 tab 补全 / 下一轮预选**：作为 `PRE_ANNOUNCE` 的一种来源；候选带前缀、置信度、过期时间；用户没接受就过期/取消，不预取。
+- **上下文压缩 / 重写**：作为 `BRANCH` 的一种操作；context version 递增，释放旧 block，引用新 block。
+- **多 agent fan-out**：多个 `BRANCH` / `PRE_ANNOUNCE`；按 branch 分预算，父前缀共享引用。
+- **离线 / 批任务**：`PRE_ANNOUNCE` 提前预热，`CLOSE` 释放。
+
+这些只是场景记录，字段和语义等实现时再定；不改变现有 hook ≠ command。
 
 ### 4.3 语义
 
@@ -417,6 +467,15 @@ flowchart TB
 容量公式（`ρ`、`c_min`、Little 定律）见 [D8a §6.1](D8a-scheduling-algorithms.md)。
 
 **P/D 两池独立扩缩**：按 P 队列/TTFT 和 D ITL 分别算目标，不能只扩总副本数；P:D 比例随 Agent 负载漂移。角色切换要重新配置，不是无缝的。
+
+**如果引擎支持原地切 P/D**，D8 要把角色当成可变状态来调度，而不只是算容量：
+
+- 切换前先摘流：不再给切换节点发新请求，排队请求转出；
+- 在途请求按策略跑完或迁移，不能让切换把请求打断；
+- 切换后更新 KVT 里的角色和位置；
+- branch 引用按 P/D 角色处理：同角色搬运（P→P 或 D→D）跟着副本走，跨角色搬运（P↔D）两边都保留；没有 P/D 分离副本时按 copy/move 规则；
+- 切换成本和收益进 L2 规划，按窗口平均和显著性门槛决定，避免来回抖；
+- 引擎不支持原地切，就只做容量建议，不承诺秒级切 P/D。
 
 **Warm Pool**：保留少量“已加载权重、未接流/未预热 KV”的空载实例。扩容先接 warm pool，再异步预热 KV；只有冷启动损失/SLO 风险大于空闲 GPU 成本时才值得留。
 
@@ -707,6 +766,7 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 | **KVCR** | `src/kvcr/remote_fw_dram.py::fetch` / `query` / `_try_release_pin` | 目的地发起 fetch、传输窗口 pin | kvcm 集中式 + master 权威；不需要 fencing |
 | **TensorCast** | `tensorcast/api/_config.py::StorePolicyProfile` | 声明式 policy 预设 | 仅借用 retention class 命名，不照搬存储后端 |
 | **DualPath**（arXiv:2602.21548v2） | 双网络隔离（compute NIC / storage NIC）；storage-to-decode + CNIC 回传 prefill；global scheduler 均衡 | 「高命中率下 KV 加载 I/O 成为瓶颈」的问题定义；两类带宽分开算 | DualPath 从引擎视角「借用」对端闲置带宽；我们的带宽归池统一分配。分析见 [`docs/research/dualpath.md`](../../docs/research/dualpath.md) |
+| **Evolving Infra**（[paper](https://arxiv.org/html/2611.12304)、[code](https://github.com/mit-han-lab/EvolvingInfra)） | branch 引用/上下文版本、零引用优先驱逐、排队期间预取、按预估 TTFT 选路、引擎支持时切 P/D | 借 agent branch 生命周期和「引用计数跟着副本走」；对称引擎和共享内存池是它的整栈能力，kvcm 不重做池（Mooncake 已有共享池） |
 
 关键差异：
 
@@ -714,5 +774,26 @@ D8 的每一条设计都依赖具体能力。**这些能力的事实写在各处
 - 参考实现的扩缩多在独立组件；本文把决策放进 SC 的共享状态，但**执行仍分离**（kvcm 执行 KV，编排执行 provision）。
 - 参考实现的 hint/session 多在引擎内；本文把 session/retention 放到 kvcm，worker 保持无状态。
 - vLLM-Ascend 的 TP/DP per-rank key、Mooncake 的 key 不透明性，决定了“索引必须按逻辑块去重、SC 不能碰 PoolKey”——这是与通用 vLLM router 最大的工程差异。
+
+### 12.1 外部证据：Evolving Infra（不是 kvcm 指标）
+
+Evolving Infra 是 SGLang 上的 full-stack 实现，不是外置控制面。它的数字说明 agent-aware KV 生命周期 + 联合调度这个方向有收益，但不等于 kvcm 能直接达到：
+
+| 指标 | 结果 | 条件 |
+|---|---|---|
+| 平均 E2E 延迟 | 最高 4.1× 优于 Dynamo | 36 GB300；GLM-5.2 / Kimi K2.6；编码类收益最大，数学类约 15%–23% |
+| P95 TTFT | 最高 14× 优于 Dynamo | 同上 |
+| 稳态吞吐 | 最高 2.73× 优于 Dynamo | 同上 |
+| KV 复用损失 | 少 81%–95% | 对比无限容量、无切相的上限 |
+| PD 切换 | 平均 6.2s；Dynamo 约 681s | **引擎侧对称引擎，kvcm 不适用** |
+| 动态负载 | 2.1× Dynamo；比最佳静态配比高 28% | 10 分钟窗口 |
+| 36→256 GPU | 平均延迟只涨 16% | 同构硬件；3072 GPU 为模拟 |
+
+边界：
+
+- 它改了 SGLang 引擎，做对称 P/D、共享 host memory 池、集中式 router 目录；kvcm 不拥有引擎，也不重做池。
+- 4.1× / 14× / 2.73× 是 full-stack 结果，不是 kvcm 的预期收益。
+- 可迁移的是机制：branch 引用/版本、零引用优先、排队预取、TTFT 路由、引用随副本走。
+- 不进 §7 的 kvcm 收益模型；只作为外部证据和方向校验。
 
 ---

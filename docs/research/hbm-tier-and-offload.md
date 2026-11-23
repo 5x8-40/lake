@@ -103,7 +103,7 @@ GPU 页仍由引擎分配。组件维护 DRAM/SSD/远端索引；访问 GPU 靠�
 | vLLM `kv_offload` | 引擎 | 引擎内级联 | 同进程 `OffloadingManager` | CPU/FS 随进程；对象存储另计 |
 | HiCache | 引擎 | 树节点存 GPU 槽下标 | 实例 radix | 实例 L1/L2 失效；L3 可 prefetch |
 | Elastic Memory Pool | 引擎 | 同卡子池，不卸载 | 各 pool | 同实例 |
-| LMCache | 引擎 | tensor 指针拷出/拷入 | chunk + 后端 | 引擎页失效；daemon / 远程后端可保留 |
+| LMCache | 引擎 | tensor 指针拷出/拷入 | chunk + 后端 | 引擎页失效；MP server 与引擎无 fate-sharing，L1 与持久 L2 均可保留（MP server 重启后仅持久 L2 保留，无 retain 命令） |
 | Dynamo KVBM | 引擎 | G1 layout；无 `BlockManager<G1>` | 本实例 G2/G3 | 本实例 G1/G2/G3 失效；G4 可保留；Router 索引可过期 |
 | FlexKV | 引擎 | IPC；无 GPU cache engine | CPU/SSD/REMOTE 树 | 本机失效；远端 / Mooncake store 可保留 |
 | UCM | 引擎 | `dump`/`load` | store key | 引擎页失效；store 可保留 |
@@ -151,7 +151,7 @@ L0→L0 RDMA 仍要注册 GPU 内存（对照 KVBM `g1_handle`）。归池后注
 | 引擎内 offload | `vllm/v1/kv_offload/base.py`::`OffloadingManager` / `OffloadKey` |
 | HiCache 槽 | `radix_cache.py`::`TreeNode.value` / `host_value`；`hiradix_cache.py`::`load_back` / `write_backup` |
 | Elastic | `unified_memory_pool.py`::`UnifiedKVPool`；`kv_vmm_backing.py`::`KvVmmArena` |
-| LMCache | `lmcache_connector_v1.py`::`get_num_new_matched_tokens` / `request_finished`；`gpu_connectors.py`::`from_gpu` / `to_gpu` |
+| LMCache | `lmcache/integration/vllm/lmcache_mp_connector.py`::`get_num_new_matched_tokens` / `request_finished`；`lmcache/v1/gpu_connector/` |
 | FlexKV 无 GPU cache engine | `cache_engine.py`::`GlobalCacheEngine` |
 | FlexKV GPU 映射 | `storage_engine.py`::`register_gpu_blocks`；`GPUAllocator.from_raw_data` |
 | FlexKV delay-free | `vllm_v1_adapter.py`::`request_finished` / `save_kv_layer` |
