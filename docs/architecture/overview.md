@@ -60,6 +60,7 @@ flowchart TB
 - **控制面权威图**：见 [`control-plane.md`](control-plane.md) "控制面模块图"，说明 Authority、checkpoint、view mirror 与 Router/agent 的关系。
 - **请求生命周期图**：见 [`data-flow.md`](data-flow.md) "请求生命周期总图"，说明准入、选路、执行、写回与失败恢复。
 - **存储层职责切分图**：见 [`storage-layer.md`](storage-layer.md) "分层缓存"，说明为何采用纵切职责而不是按层横切 owner。
+- **sleep mode 与 KV 持久化**：见 [`sleep-mode-kv-persistence.md`](sleep-mode-kv-persistence.md)，说明 sleep 只释放 NPU、KV 必须落在 Mooncake/独立 segment，以及 P/D 角色切换的边界。
 
 ## 关键设计决策
 
