@@ -111,8 +111,10 @@ D 引擎       (sleep)
 
 ### 6.2 ACL 图
 
-- `sleep_mode_extra_cleanup=false`（默认）不会清 ACL graph workspace，也不会重置 graph params；
-- `sleep_mode_extra_cleanup=true` 会在 sleep 时清 workspace、重置 graph，wake 后重新 capture；
+是，关闭 `sleep_mode_extra_cleanup` 就是保留 ACL 图。
+
+- `sleep_mode_extra_cleanup=false`（默认）：不清 ACL graph workspace，不重置 graph params，图保留；
+- `sleep_mode_extra_cleanup=true`：sleep 时清 workspace、重置 graph，wake 后重新 capture；
 - 保留图的前提是：权重回填到同一批参数地址、同一布局；`CaMemAllocator.wake_up` 用原 handle 重新 map，VA 不变，所以在原参数上加载/传输权重可以复用图；
 - 如果模型结构、TP/DP 布局或权重地址变了，必须重新 capture，不能硬复用。
 
