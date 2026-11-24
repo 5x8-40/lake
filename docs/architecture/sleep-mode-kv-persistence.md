@@ -6,8 +6,8 @@
 ## 0. 结论
 
 1. **单个引擎的 sleep mode 不是 P/D/混部切换。** 它释放 NPU 内存并丢弃 NPU 侧 KV，不改变这个引擎的调度角色；预置多个角色引擎时，sleep/wake 可以做部署级切换，见 §5.1。
-2. **要让 KV 活着，KV 的所有权必须独立于引擎进程生命周期。** 引擎可以 sleep、退出、换角色；Mooncake master 和 host segment 不能跟着退出。
-3. **推荐结构是“引擎无状态 + Mooncake 持久池 + kvcm 管理”**：sleep 前把 KV 写进 Mooncake 并确认 READY；sleep 只释放 NPU；wake 后从 Mooncake 回填。
+2. **要让 KV 活着，KV 的所有权必须独立于引擎角色切换，但不要求独立于 sleep 进程。** 如果引擎只是 sleep、进程不退出，Mooncake client/segment 可以继续留在该进程；如果角色切换要重启进程，segment 必须外置或复制到别的节点。
+3. **推荐结构是“引擎可 sleep + Mooncake 持久池 + kvcm 管理”**：sleep 前把 KV 写进 Mooncake 并确认 READY；sleep 只释放 NPU；wake 后从 Mooncake 回填。
 4. **P/D/混部切换有三种**：
    - **预置 P/D/混部引擎 + sleep/wake + 路由**：部署级切换，可行；不是同进程切角色；
    - **停旧引擎、起新角色**：同一条路的冷启动版本，KV 靠 Mooncake；
@@ -26,6 +26,13 @@
 
 - vLLM-Ascend Sleep Mode: https://docs.vllm.ai/projects/ascend/en/latest/user_guide/feature_guide/sleep_mode.html
 - vLLM `sleep` / `wake_up` 入口: `3rdparty/vllm/vllm/v1/worker/gpu_worker.py::GPUWorker.sleep` / `wake_up`；`vllm/device_allocator/sleep_mode_backend.py::SleepModeBackend`
+
+### 1.1.1 已经核实的行为
+
+- `CaMemBackend.suspend`：level 1 只 offload `weights`，其余 tag（包括 KV cache）被 discard；level 2 全部 discard。
+- `CaMemAllocator.sleep`：只处理 NPU memory pool 里的 allocation；weights 有 host pinned CPU backup，KV cache 没有。
+- 它不 unmount Mooncake segment，也不释放进程的 host DRAM；进程退出才是 segment 的风险点。
+- 因此，“三个引擎、两个 sleep”在资源上可行：sleep 把两个引擎的 NPU 内存释放，weights 留在 host；但 KV 必须已经写到 Mooncake，NPU 侧 KV 不会保留。
 
 ### 1.2 Evolving Infra 的切换不是 sleep
 
@@ -56,7 +63,7 @@ Evolving Infra 的 P/D 切换来自引擎侧对称调度:
 
 - Mooncake master 是副本权威；
 - Mooncake host segment 是字节载体，不是元数据权威；
-- 如果 segment 所在的进程退出，数据可能随 segment 消失；
+- 如果 segment 所在的进程退出，数据可能随 segment 消失；进程只 sleep 不退出时，segment 可以保留；
 - 只有 master 元数据没有用，必须有可读的 segment 副本。
 
 ### 2.3 角色切换的边界
@@ -89,9 +96,9 @@ Evolving Infra 的 P/D 切换来自引擎侧对称调度:
 关键点:
 
 - Mooncake master 不随引擎 sleep；
-- host segment 由独立进程/agent 持有，不放在引擎进程里；
-- 引擎只是 Mooncake client，sleep 不影响 segment；
-- 引擎退出/换角色，segment 仍然可读。
+- **进程不退出时**：Mooncake host segment 可以留在引擎进程内，sleep 不会释放它；
+- **进程要退出/换角色时**：host segment 必须由独立进程/agent 持有，或提前复制到别的 segment/SSD；
+- 引擎只是 Mooncake client；sleep 本身不 unmount segment，进程退出才会。
 
 ## 4. 生命周期
 
@@ -108,7 +115,7 @@ Evolving Infra 的 P/D 切换来自引擎侧对称调度:
 ### 4.2 sleep 期间
 
 - 引擎进程可以继续存在，也可以退出；
-- Mooncake master 和 host segment 必须独立存活；
+- Mooncake master 必须独立存活；host segment 在引擎进程不退出时可以继续留在进程内，进程退出则必须外置或复制；
 - KV 不能被 TTL/GC 清掉；
 - 路由把该引擎标记为 sleeping/unavailable；
 - kvcm/KVT 记录副本仍在哪、是否被 pin。
@@ -128,6 +135,8 @@ Evolving Infra 的 P/D 切换来自引擎侧对称调度:
 
 这是“三个引擎、两个 sleep”的方案：P 引擎、D 引擎、混部引擎预先启动，同一时间只让一个角色醒着，路由器指向醒着的端点。
 
+三个引擎可以放在同一节点/NPU 上：启动时逐个初始化并 sleep，避免同时占满 NPU；同一时间只让一个引擎 active。
+
 ```text
 P 引擎 (sleep)
 D 引擎 (sleep)
@@ -145,8 +154,9 @@ P 引擎：wake → 挂 Mooncake segment → 验证 KV → 接流
 
 - 三个引擎使用同一模型、同一 revision、同一套 key/hash 口径；
 - 同一 NPU 上同一时间只允许一个引擎占满资源；sleep/wake 必须串行，不能先把目标引擎 wake 到一半再 sleep 源引擎；
-- host 侧要能容纳 sleeping 引擎的权重 offload（level 1）或从磁盘重载（level 2）；
-- Mooncake master 和 host segment 独立于引擎进程；否则引擎退出会丢 segment；
+- host 侧要能容纳两个 sleeping 引擎的权重 offload（level 1）或从磁盘重载（level 2）；
+- sleep 只动 NPU 分配，不释放进程的 host DRAM；因此只要三个引擎进程都不退出，Mooncake client/segment 就继续活着；
+- 如果角色切换要重启进程，host segment 必须由独立进程持有或提前复制，否则会随进程退出消失；
 - 路由和 health check 必须知道 engine 的 sleeping/active 状态；
 - 切换期间 KV 必须已经在 Mooncake 里 READY，不能只在本机 NPU/进程内。
 
@@ -157,7 +167,7 @@ P 引擎：wake → 挂 Mooncake segment → 验证 KV → 接流
 - 不承诺秒级，也不承诺在途请求不中断；
 - 需要外部控制器编排，不是 vLLM 单机 sleep API 自动完成。
 
-如果三个引擎分别占不同 NPU，那本来就可以直接路由切换；sleep 主要解决“同一节点/NPU 上并存多个角色引擎”的资源问题。
+vLLM 只提供单引擎的 `sleep` / `wake_up`；三个引擎的启动、sleep 顺序、active 切换、健康检查都要由外部控制器编排，vLLM 不会自动做组调度。
 
 ### 5.2 同进程内切换
 
@@ -206,10 +216,9 @@ sleep mode 不提供这些能力。
 
 ## 8. 待确认
 
-- vLLM-Ascend sleep 是否触碰 host DRAM，还是只释放 NPU；需要在目标版本实测。
-- Mooncake client 是否能在独立进程挂 segment，还是必须与引擎同进程。
-- vLLM-Ascend 是否支持同进程 P/D 角色切换；若不支持，5.1 不成立。
-- sleep 期间 KV 的 lease/TTL 如何与 kvcm keepalive 对齐。
+- sleep 窗口内 KV 的 lease/TTL 如何与 kvcm keepalive 对齐。
+- 三个引擎同进程组切换时，host 侧两个 sleeping 引擎的权重内存是否超预算。
+- 角色切换若要求重启进程，segment 外置/复制的具体实现。
 
 ## 9. 参考
 
