@@ -66,9 +66,28 @@ D 引擎       (sleep)
 - 路由和 health check 必须知道 engine 的 active/sleeping 状态；
 - 进程不重启，Mooncake connector/segment 不会因为 sleep 消失。
 
-## 4. 成立条件
+## 4. 多引擎共用 Mooncake 池
 
-1. 三个引擎使用同一模型、同一 revision、同一套 key/hash 口径。
+这不是新假设，vLLM-Ascend 已有同类部署：
+
+- `docs/source/tutorials/features/pd_colocated_mooncake_multi_instance.md`
+- 两个 vLLM 实例，各占 4 张 NPU；
+- 共用同一个 `mooncake_master`；
+- 两边都用 `MooncakeConnectorStoreV1`，`kv_role=kv_both`；
+- 跨节点、跨实例 KV 可复用。
+
+这说明：**共用 Mooncake 池和部署形态无关**。P、D、混部、多个实例都可以连同一个池。
+
+要区分两件事：
+
+- **Store 直读**：TP/DP/layout 一致时，可以直接读同一个 KV 对象；
+- **Connector 拉取**：TP/DP/layout 不同时，由 `MooncakeConnector` 按两边配置做 rank 映射/搬运；P/D 就是这么读的。
+
+所以“共用池”成立；“所有 layout 都直接同对象读”不成立。
+
+## 5. 成立条件
+
+1. 三个引擎使用同一模型、同一 revision；Store 直读还要求同一 TP/DP/key 布局，不同布局由 connector 映射。
 2. 同一 NPU 上同一时间只允许一个引擎 active。
 3. host 侧能容纳两个 sleeping 引擎的 weights（level 1）或能从磁盘重载（level 2）。
 4. 三个引擎进程都不退出；否则进程内的 Mooncake segment 会随进程消失。
@@ -79,7 +98,7 @@ D 引擎       (sleep)
    - sleep/wake 顺序；
    - 健康检查与回切。
 
-## 5. 角色切换的边界
+## 6. 角色切换的边界
 
 - 切的是“哪个引擎接流”，不是“同一个进程换角色”；
 - 同进程内切 P/D/混部需要引擎侧对称调度，sleep 不提供；
@@ -87,7 +106,7 @@ D 引擎       (sleep)
 - vLLM 只提供单引擎 sleep/wake，三引擎的编排要外部控制器做；
 - 如果进程退出/重启，KV 必须提前复制到别的 segment 或外部存储。
 
-## 6. 失败场景
+## 7. 失败场景
 
 | 失败 | 后果 | 处理 |
 |---|---|---|
@@ -98,7 +117,7 @@ D 引擎       (sleep)
 | 路由仍打 sleeping 引擎 | 请求失败/超时 | 路由状态跟随 sleep/wake |
 | key/模型版本不一致 | 命中错误 | 固定 model revision 和 hash 口径 |
 
-## 7. 探索通过后，kvcm 加什么
+## 8. 探索通过后，kvcm 加什么
 
 这里只探索引擎侧是否可行，不先把方案写进 kvcm 设计。
 
@@ -116,7 +135,7 @@ D 引擎       (sleep)
 - kvcm 只做“选角色、发切换、看结果”，执行在引擎/编排层；
 - 形态转换的可行性先由 vLLM-Ascend 侧验证，验证通过后再进 D8。
 
-## 8. 验收
+## 9. 验收
 
 1. 同一 NPU 上三个引擎可以逐个初始化并 sleep，只有一个 active。
 2. 当前 active 引擎 sleep 后，进程内 Mooncake connector/segment 仍可读。
