@@ -1,6 +1,6 @@
 # Sleep Mode 与 P/D/混部角色切换
 
-> 目标：同一节点/NPU 上预置 P、D、混部三个引擎，两个 sleep、一个 active；切换只切 active 引擎，不重启进程，KV 继续留在 Mooncake。
+> 目标：同一节点上预置 P、D、混部三个引擎，各占独立 NPU/组，两个 sleep、一个 active；切换只切 active 引擎，不重启进程，KV 继续留在 Mooncake。
 > 适用：vLLM-Ascend `enable_sleep_mode` / `sleep` / `wake_up`；Mooncake connector 在引擎进程内挂载。
 
 ## 0. 结论
@@ -36,11 +36,11 @@ D 引擎       (sleep)
 混部引擎     (active)  ← 路由
 ```
 
-三个引擎可以放在同一节点/NPU 上：
+三个引擎放在同一节点，但各占自己的 NPU/组，不是同一张 NPU：
 
-- 启动时逐个初始化并 sleep，避免同时占满 NPU；
-- 同一时间只允许一个 active；
-- 两个 sleeping 引擎的 weights 留在 host（level 1），或从磁盘重载（level 2）；
+- 每个引擎有独立 NPU 资源；同一时间只有一个引擎接流量，交接期间可以两个 awake；
+- 两个 sleeping 引擎释放自己的 NPU；
+- 切换时 active 引擎把 weights D2D 传给目标引擎，而不是落到本地盘；
 - 三个引擎的 Mooncake connector 都在各自进程内，sleep 不会 unmount。
 
 ## 3. 切换流程
@@ -51,17 +51,19 @@ D 引擎       (sleep)
 1. 路由停止向混部引擎发新请求
 2. 等在途请求结束
 3. 混部引擎把 KV 写穿 Mooncake，等 READY
-4. 混部引擎 sleep（释放 NPU）
-5. P 引擎 wake
-6. P 引擎确认 Mooncake segment/KV 可读
+4. P 引擎 wake，先只恢复 weights 分配
+5. 混部引擎把 weights 通过 HCCL D2D 传给 P 引擎
+6. P 引擎 wake KV cache，确认 Mooncake segment/KV 可读
 7. 路由切到 P 引擎
+8. 混部引擎 sleep（释放自己的 NPU）
 ```
 
 切换到 D 或切回混部同理。
 
 关键点：
 
-- 顺序必须串行：先 sleep 当前 active，再 wake 目标；不能两个引擎同时占满 NPU；
+- weights D2D 期间源引擎必须保持 awake；目标引擎 ready 后，源引擎才能 sleep；
+- 两个引擎各占独立 NPU/组，交接期间可以同时 awake，但不能同时接流量；
 - 切换期间 KV 必须已经在 Mooncake 里 READY，不能只留在 NPU；
 - 路由和 health check 必须知道 engine 的 active/sleeping 状态；
 - 进程不重启，Mooncake connector/segment 不会因为 sleep 消失。
@@ -88,7 +90,7 @@ D 引擎       (sleep)
 ## 5. 成立条件
 
 1. 三个引擎使用同一模型、同一 revision；Store 直读还要求同一 TP/DP/key 布局，不同布局由 connector 映射。
-2. 同一 NPU 上同一时间只允许一个引擎 active。
+2. 每个引擎有独立 NPU/组；同一时间只允许一个引擎接流量，交接期间可以两个 awake。
 3. host 侧能容纳两个 sleeping 引擎的 weights（level 1）或能从磁盘重载（level 2）。
 4. 三个引擎进程都不退出；否则进程内的 Mooncake segment 会随进程消失。
 5. 路由/控制器负责：
@@ -122,17 +124,17 @@ D 引擎       (sleep)
 
 | 方案 | 做法 | 适用 | 代价 |
 |---|---|---|---|
-| host 一份 | 权重放 host DRAM，wake 后 H2D 到各引擎 | 同机多引擎 | host 内存；H2D 带宽 |
-| 磁盘/3FS 一份 | wake 后从共享存储加载 | 跨机、冷启动 | 加载慢 |
-| 同机 D2D | `weight_transfer_config` 用 `ipc`，从一个 seed 引擎拉 | 同物理 NPU/同机 | IPC 配置 |
-| 跨机 D2D | `weight_transfer_config` 用 `hccl`，从 seed 引擎拉 | 跨节点 | HCCL 带宽 |
+| host 一份 | 权重放 host DRAM，wake 后 H2D 到目标引擎 | 同机、无可用 seed | host 内存；H2D 带宽 |
+| 磁盘/3FS 一份 | wake 后从共享存储加载 | 跨机、冷启动 | 加载慢，只做 fallback |
+| 同机跨 NPU D2D | `weight_transfer_config` 用 `hccl`，从 active seed 引擎拉 | 同节点、不同 NPU/组 | HCCL/HCCS 带宽 |
+| 跨机 D2D | `weight_transfer_config` 用 `hccl`，从远端 seed 引擎拉 | 跨节点 | HCCL/RDMA 带宽 |
 | RFork | seed 实例 + YuanRong TransferEngine | 冷启动 | **sleep mode 下被 bypass**，不能用 |
 | Netloader | `--load-format=netloader` 从 server 拉 | 启动加载 | 不是 level-2 wake 后的自动路径 |
 
 结论：
 
 - 想保留 ACL 图：level 2 + `sleep_mode_extra_cleanup=false` + 权重回填到原参数地址；
-- 想少占 host：level 2 + 一份共享权重 + HCCL/IPC 传输；
+- 想少占 host：level 2 + 从 active seed 引擎做 HCCL D2D；
 - 想简单：level 1，把整套 weights offload 到 host，但 host 内存要按模型大小乘 sleeping 引擎数算；
 - RFork 不能和 sleep mode 一起用，vLLM-Ascend 明确在 sleep 模式下 bypass。
 
@@ -140,7 +142,7 @@ D 引擎       (sleep)
 
 - `vllm_ascend/worker/worker.py::sleep` / `wake_up`
 - `vllm_ascend/device_allocator/camem.py::CaMemAllocator.sleep` / `wake_up`
-- `docs/source/user_guide/feature_guide/rl.md`：level 2 staged wake 与 `ipc`/`hccl` weight transfer
+- `docs/source/user_guide/feature_guide/rl.md`：level 2 staged wake 与 `hccl` weight transfer
 - `docs/source/user_guide/feature_guide/rfork.md`：sleep mode 下 RFork bypass
 
 ## 7. 角色切换的边界
@@ -155,7 +157,7 @@ D 引擎       (sleep)
 
 | 失败 | 后果 | 处理 |
 |---|---|---|
-| 目标引擎 wake 前源引擎未释放 NPU | 显存不足 | 串行 sleep/wake |
+| 目标引擎 D2D 未完成源引擎就 sleep | 权重不完整 | D2D 完成后再 sleep 源引擎 |
 | sleep 前未写穿 Mooncake | wake 后 NPU KV 为空 | 强制 flush + READY barrier |
 | host 侧 weights 放不下 | 无法 sleep/wake | level 2 重载或增加 host 内存 |
 | 进程退出 | Mooncake segment 消失 | 提前复制到其他 segment/SSD |
@@ -182,7 +184,7 @@ D 引擎       (sleep)
 
 ## 10. 验收
 
-1. 同一 NPU 上三个引擎可以逐个初始化并 sleep，只有一个 active。
+1. 同节点三个引擎各占独立 NPU/组，可以逐个初始化并 sleep，只有一个 active。
 2. 当前 active 引擎 sleep 后，进程内 Mooncake connector/segment 仍可读。
 3. sleep 前写穿的 KV，wake 后能命中，不重算。
 4. 混部 → P → D → 混部的切换只需 sleep/wake + 路由，不重启进程。
