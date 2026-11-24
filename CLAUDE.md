@@ -75,6 +75,7 @@ docs/
 | `3rdparty/sglang` | sgl-project/sglang | **HiCache**:L1/L2/L3 分层、HiRadixTree(节点记 KV 位置)、prefetch/write-back 策略、page-first 布局、计算-传输重叠;**计算层**:Worker→ModelRunner、spec decode(DSPARK 仅此有 / DFLASH / MTP / EAGLE,drafter 共置串行、`PoolName.DRAFT`)→ 见 [`docs/research/sglang/model-runner.md`](docs/research/sglang/model-runner.md) |
 | `3rdparty/mooncake` | kvcache-ai/Mooncake | **transfer-engine**(RDMA 零拷贝)→ Transfer Bus;**mooncake-store** → KV Pool(L3) |
 | `3rdparty/lmcache` | LMCache/LMCache | 跨请求/跨实例 KV 复用、多存储后端、`rust/` 工程模式 |
+| `3rdparty/tair-kvcache` | alibaba/tair-kvcache | 全局 KVCache 元数据管理（MetaIndexer、两阶段写、配额/分层/HA）+ vLLM/SGLang/RTP-LLM/TRT-LLM connector；见 [`docs/research/tair-kvcache/`](docs/research/tair-kvcache/) |
 | `3rdparty/vllm` | vllm-project/vllm | **计算层**:PagedAttention、worker/`GPUModelRunner`、`KVConnectorBase_V1` 接口(存算分离接入点)、spec decode |
 | `3rdparty/transformers` | huggingface/transformers | **模型定义参考**:Qwen3/PyTorch `nn.Module` 结构、HF config 字段、decoder/model/causal-lm 分层；只作模型骨架与配置对照,不作服务端执行参考 |
 | `3rdparty/dynamo` | ai-dynamo/dynamo | **编排层/控制面**:KV-aware router、Rust 编排、多后端通信(etcd/nats/tcp/zmq);KVBM(GPU→CPU→SSD→远端 offload)已被官方 sunset(2026-07 DEP #11673),代码仍在 main 但不再演进 → 见 [`docs/research/dynamo/overview.md`](docs/research/dynamo/overview.md)「KVBM 变局」 |
@@ -129,6 +130,7 @@ docs/
    - **Scheduler→Worker 字段**(vLLM `SchedulerOutput` × SGLang `ScheduleBatch`/`ForwardBatch`、架构根因) → `docs/research/vllm_vs_sglang/scheduler-worker-interface.md`
  - **Agent 场景 KV 对比**(session 停顿/分支/可编程 hint 四问题框架;KvHint 信封两侧落地状态) → `docs/research/vllm_vs_sglang/agent-kv-cache.md`
    - 跨实例复用 + 多存储后端 + 内容寻址 + 控制器元数据 + Rust 裸设备 I/O → `docs/research/lmcache/{overview,sharing-and-backends}.md`
+   - 全局 KV 元数据服务 + 两阶段写 + 配额/分层/HA + Mooncake 后端 → `docs/research/tair-kvcache/overview.md`、`docs/research/kvcm-vs-oss.md`
    - RDMA 零拷贝传输 + 多 NIC 聚合 + 对象级 KV store + 分配策略 + HA → `docs/research/mooncake/{overview,transfer-engine,kv-store}.md`
    - **昇腾 KV 对象池**(MemCache):Meta/Local、HBM/DRAM/SSD、MemFabric OneCopy → `docs/research/memcache/{overview,architecture,pain-points}.md`（与 Mooncake store 同层对照；非 radix 控制面）
    - **统一缓存框架(UCM)**:可插拔 KVStore、vLLM connector、PD-via-pool、稀疏插件 → `docs/research/ucm/{overview,architecture,pain-points}.md`（引擎插件层；与 LMCache 同层对照）

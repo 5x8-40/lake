@@ -10,6 +10,8 @@
   - L1/L2/L3 三层(L1/L2 私有、L3 共享)、HiRadixTree、prefetch/write-back 策略;block 何时释放/彻底放弃见 block-lifecycle;MoE 的 DeepEP normal/low-latency 分派见 moe-communication;权重多线程/远端加载与依赖集成边界见 loading-and-integrations;issue/roadmap 痛点与 lake 对照见 pain-points;Agentic/PD 增量传输与 hint 总设计见 agentic-kv-roadmap。
 - **LMCache** → [`lmcache/`](lmcache/):[总览](lmcache/overview.md) · [跨实例复用与后端](lmcache/sharing-and-backends.md)
   - 跨实例 KV 复用、内容寻址去重、多存储后端、Rust 裸设备 I/O。
+- **Tair KVCache** → [`tair-kvcache/`](tair-kvcache/):[总览](tair-kvcache/overview.md) · [与 lake kvcm 对照](kvcm-vs-oss.md)
+  - 阿里云 Tair KVCM：全局 KVCache 元数据服务、Block/CacheLocation/LocationSpec、两阶段写、配额/分层/HA、vLLM/SGLang/TRT connector。
 - **Mooncake** → [`mooncake/`](mooncake/):[总览](mooncake/overview.md) · [传输引擎](mooncake/transfer-engine.md) · [KV 存储与池化](mooncake/kv-store.md)
   - RDMA 零拷贝传输引擎、对象级 KV 池、PD 分离。
 - **vLLM** → [`vllm/`](vllm/):[总览](vllm/overview.md) · [计算层抽象与存算分离接入点](vllm/compute.md) · [block 生命周期](vllm/block-lifecycle.md) · [上游痛点与 lake 对照](vllm/pain-points.md) · [Q3 KV/Session 调度](vllm/kv-session-roadmap.md)
@@ -72,6 +74,7 @@
 - **AttentionStore** (Meta): 把 KV cache 当作可复用的缓存层。
 - **SGLang**: RadixAttention 前缀复用，本系统 radix tree 索引的来源。其 **HiCache**(L1 GPU / L2 host / L3 distributed 分层)是本系统 L0-L3 分层的主要参考;**源码已引入** `3rdparty/sglang`,对应与差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
 - **LMCache**: 跨请求/跨实例 KV 复用,多存储后端(CPU/disk/Redis)。**源码已引入** `3rdparty/lmcache`,对应见 [`3rdparty-reference.md`](3rdparty-reference.md)。
+- **Tair KVCache**: 全局 KVCache 元数据服务 + 客户端直连数据面 + 配额/分层/HA。**源码已引入** `3rdparty/tair-kvcache`,见 [`tair-kvcache/`](tair-kvcache/)。
 - **DualPath** (DeepSeek-AI/PKU/THU, arXiv:2602.21548v2): 双网络(compute/storage NIC 隔离)下的双路径 KV 加载——借 decode 闲置 storage NIC 从存储加载 KV,再经 compute network RDMA 回传 prefill。针对 agentic 多轮(KV 命中 ≥95%,瓶颈是存储 I/O 而非计算)。本系统**原生支持**(D→P 流,见 [`../architecture/data-flow.md`](../architecture/data-flow.md) §3.4)且更彻底:NIC 带宽归池统一分配,非引擎"借用";并有 D 侧 KV 已在 HBM 的零存储读取特例。分析见 [`dualpath.md`](dualpath.md)。
 - **NVIDIA CMX** (Context Memory Storage): GPU、Dynamo、NIXL、Memos、BF4 和共享 flash 的目标架构。研究文档区分公开实现、伙伴声明和未知项；lake 将相关路径映射为 L2 backend。见 [`nvidia-cmx.md`](nvidia-cmx.md)、[`tools/cmx-sim/`](../../tools/cmx-sim/)、[#22](https://gitlab.com/BeeBreeze/lake/-/issues/22) 和 [#23](https://gitlab.com/BeeBreeze/lake/-/issues/23)。
 - **HBM 归属与 KV 卸载**：谁发 GPU 槽、传输端点 vs 索引、Dynamo G1 为何注册一层；3rdparty 全表（含 Mooncake / MemCache / TileRT / TensorCast / CMX）。见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
@@ -92,4 +95,4 @@
 
 - **DeepSpeed-Inference**, **TensorRT-LLM**, **Orca** (continuous batching): 推理引擎基线，本系统在其上做存算分离的解耦。
 
-> 注：以上为方向性参考。SGLang/Mooncake/LMCache/vLLM/Dynamo/TileRT/MemCache/UCM/FlexKV/kvcached 等源码已引入 `3rdparty/`(submodule),与本项目设计的逐层对应、借鉴点与关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。
+> 注：以上为方向性参考。SGLang/Mooncake/LMCache/Tair KVCache/vLLM/Dynamo/TileRT/MemCache/UCM/FlexKV/kvcached 等源码已引入 `3rdparty/`(submodule),与本项目设计的逐层对应、借鉴点与关键差异见 [`3rdparty-reference.md`](3rdparty-reference.md)。

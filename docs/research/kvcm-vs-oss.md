@@ -2,6 +2,7 @@
 
 > 调研快照：2026-11-13。上游源码快照：vLLM `93eeae69`、SGLang `5792cf6e`、UCM `57ddbb26`、KVCR `b7aa81d0`、LMCache `58c11e38`、MemCache `14b4e35e`、FlexKV `55ad438e`、llm-d-router `647ca7ca`、Dynamo `b20fe6fe`、AIBrix `17652f54`；kvcm 基线 `4d9dd33`。
 > 范围：开源方案对照研究。kvcm 自身的设计在 [`kvcm/design/`](../../kvcm/design/D10-kv-fabric-roadmap.md)。
+> 命名：本文的 **kvcm** 指 lake kvcm；阿里的 Tair KVCache Manager 写作 **Tair KVCM**。
 > 读法：§1 必要性 → §2 角色与耦合 → §3 四个问题 → §4 三个场景 → §5 各家归类 → §6 今天与目标 → 附录 A 符号级事实 / B 短板与待确认 / C 代码索引。
 
 ---
@@ -168,6 +169,59 @@ LMCache 的 `mp_coordinator` 是这一维度上与我们最接近的实现：独
 
 **LMCache coordinator 是 kvcm 控制面最接近的同类；但它是 connector-coupled、事件目录（含 L1 位置 hint）、L1 驱逐本地 + L2 fleet 策略；kvcm 是 backend-coupled、master 权威、目标覆盖池 + 请求 + 容量。**
 
+### 3.3.2 Tair KVCM：KV 元数据服务，不是 lake 管理面
+
+Tair KVCM 对应的是 lake kvcm 的**控制面/元数据面**，不是整个 lake kvcm。
+
+Tair KVCM + Mooncake ≈ lake kvcm 的控制面 + Mooncake；lake 的 D8 管理面和 KV Fabric 目标，在 Tair KVCM 里没有对应物。
+
+命名约定：**Tair KVCM** 指阿里 `3rdparty/tair-kvcache` 的 Tair KVCache Manager；**lake kvcm** 指本仓的 kvcm。
+
+![Tair KVCM 部署架构](tair-kvcache/figures/tair-kvcm-deployment.png)
+
+（上游原图：Tair KVCache `docs/image/kvcm-deployment-zh.png`。KVCM 一主多备，Client/Connector 在推理侧，数据经 TransferClient 直连存储后端。）
+
+| 维度 | Tair KVCM | lake kvcm |
+|---|---|---|
+| KV 副本权威 | Tair `MetaIndexer` 管 Block/CacheLocation/状态；字节在后端 | Mooncake master 管副本位置/可读性；lake kvcm 不拥有副本权威 |
+| 前缀匹配 | Tair `MetaSearcher` 做 prefix/SWA/hybrid attention | Mooncake connector/引擎做前缀命中；lake kvcm 不重复造轮子 |
+| Branch / 会话 | 没有 agent branch/session 状态 | branch 表、会话/保留决策在 lake kvcm；master 不参与 |
+| 全局视野 | **Instance 级**：同一 Instance 内跨节点，跨 Instance 不复用 | 池级：目标跨模型/租户的全局 KV 池 |
+| 全局管理 | KV 元数据服务本身：匹配、两阶段写、配额、分层、GC、HA | D8 管理面 + D9 运营；当前 lake kvcm 更薄 |
+| 请求 + KV + 扩缩联合 | 没有请求路由、PD 配比、扩缩，也没有请求/KV/容量共享决策 | D8 目标：请求、KV、容量共享 KVT/预算/账本 |
+| 耦合 | 引擎 connector/client；多引擎接入 | backend-coupled；lake kvcm 不绑某个引擎插件 |
+| 数据面 | Client `TransferClient` 直连存储后端 | Mooncake transfer/client；lake kvcm 不搬字节 |
+| 写路径 | `StartWriteCache` → 写 → `FinishWriteCache` | Mooncake `PutStart/PutEnd` + lake kvcm READY/核验 |
+
+Tair 的 **L1.5/L2** 是 EventReport 的 host/P2P 层级，不是 lake 的 L1/L2 介质层：
+
+- Tair L1：GPU HBM，由引擎管理，KVCM 不碰；
+- Tair L1.5：计算节点贡献的 host DRAM 池；
+- Tair L2：其他节点可 P2P 读取的 Vineyard 缓存；
+- lake L1/L2：池的 DRAM/NVMe 层。
+
+Mooncake 在 Tair 里不是 L1.5/L2，而是 Storage 后端；Tair 返回 `mooncake://...`，Client 直接读写。
+
+两条容易混的边界：
+
+- **两阶段写**：Tair 的 `writing → serving → deleting` 是 Tair KVCM 自己的 Location 状态机；Mooncake 的 `PutStart/PutEnd` 是后端字节层契约。二者不是同一个东西。lake kvcm 把数据写交给 Mooncake，自己只做 READY/核验，不维护全局 Location 状态机。
+- **LLM-aware matching**：Mooncake Store 本身不做前缀匹配；Mooncake connector/引擎做前缀命中，lake kvcm 不重复造轮子。Tair 则把 prefix/SWA/hybrid attention 匹配放进 `MetaSearcher`，这是它自己的元数据服务能力。
+
+对 lake kvcm 可借的部分：
+
+- Instance Group 级配额、DRAM/SSD 水位与迁移；
+- LLM-aware matching 的查询语义：前缀、反向滑动窗口、混合注意力、多 LocationSpec；
+- HA 的 leader/follower + 客户端自动发现；
+- GC / 碎片整理：借 Tair 的“元数据 GC 与存储回收分开、后台对账孤儿 Location”思路；lake kvcm 会主动发起 remove / copy / move / pin，master/池负责执行与副本权威。热点 KV 的 shuffle 是 lake 的主动管理动作，不是 Tair 现成能力。
+
+不借的部分：
+
+- Tair 的 Instance 边界；
+- 把 Tair KVCM 当 Router/D8：它只回答 KV 在哪，不决定请求去哪个实例，也不做扩缩；
+- 把 Tair 的 KV 元数据权威直接搬成 lake 的副本权威；lake 的副本权威仍在 master。
+
+详细事实、3 张上游图和代码索引见 [`tair-kvcache/overview.md`](tair-kvcache/overview.md)。
+
 ### 3.4 是否做请求 + KV + 扩缩联合调度
 
 这一条是开源侧普遍没有的，但也是我们尚未实现的。
@@ -224,6 +278,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | FlexKV | 引擎旁卸载库，管「这台机的 KV 放哪层」；多实例可走独立 `KVServer`（ZMQ） | 引擎旁 |
 | MemCache | 昇腾对象池，MetaService 管分配与副本 | 池（本身是池） |
 | Mooncake | 对象池 + 传输引擎；master 持副本权威，动态副本按热度 | 池（本身是池） |
+| Tair KVCM | 全局 KV 元数据服务：Instance 级权威索引 + 两阶段写 + 配额/分层；不做请求路由/扩缩 | 池外（元数据服务） |
 | LMCache | 独立协调器 + 独立 MP server；L1 驱逐在 server 本地，协调器持 L1/L2 位置视图并管 L2 策略 | 独立 MP server + 协调器 |
 | vLLM / SGLang | 请求信封的传输层，action 执行未接 | 请求 |
 | KVCR | 引擎内二级存储 + hint 驱动 P2P + Guard 容错 | Guard 进程 |
@@ -377,7 +432,32 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | `/healthz` 恒返回 healthy，不做降级判断 | `http_apis/health_api.py::healthz` 直接 `return {"status": "healthy"}` |
 | 今天无 move；roadmap 要加 promote / demote / move / duplicate | 当前路由：`/cache/prefetches`、`/cache/pins`、`/cache/delete`、`/quota*`、`/directory/*`、`/instances*`、`/events`、`/config/chunk-size`、`/status`、`/metrics`、`/healthz`；动作面 roadmap 见 [blog](https://blog.lmcache.ai/en/2026/11/11/the-lmcache-coordinator-a-control-plane-for-fleet-wide-kv-cache/) 的 future directions 表（"Action: Delete, pin and warm prefetch → Promote, demote, move, duplicate KV across nodes"） |
 
-### A.4 请求信封：vLLM / SGLang / KVCR
+### A.4 元数据服务：Tair KVCM
+
+Tair KVCM 是独立元数据服务，不是 lake kvcm 的 client/facade。证据：
+
+![Tair KVCM 服务端组件](tair-kvcache/figures/tair-kvcm-server-components.png)
+
+（上游原图：`docs/image/kvcm-server-components-zh.png`。）
+
+| 事实 | 出处 |
+|---|---|
+| 位置/状态权威在 `MetaIndexer` | `kv_cache_manager/meta/meta_indexer.h::MetaIndexer`；`meta_indexer_manager.h::MetaIndexerManager` |
+| 两阶段写 | `kv_cache_manager/manager/write_location_manager.h::WriteLocationManager`；`StartWriteCache` / `FinishWriteCache` |
+| 匹配是 LLM-aware | `kv_cache_manager/manager/meta_searcher.h::MetaSearcher`：prefix / reverse rolling SWA / hybrid attention |
+| 存储选择与后端 | `kv_cache_manager/manager/data_storage_selector.h::DataStorageSelector`；`data_storage/data_storage_manager.h::DataStorageManager` |
+| 配额/GC/迁移 | `manager/cache_reclaimer.h::CacheReclaimer`；`cache_garbage_collector.h::CacheGarbageCollector`；`migration_manager.h::MigrationManager` |
+| HA | `config/leader_elector.h::LeaderElector`；Client 自动发现 Leader |
+| 数据面 | `client/include/transfer_client.h::TransferClient`；KVCM 不搬字节 |
+| 复用边界 | 同一 `Instance` 内；`docs/design/basic_concepts.md` 明确“跨 Instance 不复用” |
+
+关键差异：
+
+- Tair 的 `MetaIndexer` 是**权威索引**；lake 的 KVT 是派生视图，master 才是副本权威。
+- Tair 管的是 **Instance 级 KV 元数据服务**；lake 目标是全局池 + 请求/KV/扩缩联合。
+- Tair 需要引擎 connector/client；lake 的 kvcm 是池 client，不绑具体引擎。
+
+### A.5 请求信封：vLLM / SGLang / KVCR
 
 | 事实 | 出处 |
 |---|---|
@@ -392,7 +472,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | KVCR 入池放置仍是 TODO | `src/kvcr/runtime/policy_runtime.py`（`TODO(kvcr-g3)`） |
 | KVCR 主动搬运 = 目的地 `fetch`，`submit_hint` 只建连接 | `src/kvcr/api.py::submit_hint`、`backends/remote_fw_dram.py` |
 
-### A.5 路由层：llm-d / Dynamo / AIBrix
+### A.6 路由层：llm-d / Dynamo / AIBrix
 
 | 事实 | 出处 |
 |---|---|
@@ -403,7 +483,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | AIBrix：网关侧前缀哈希表 + 事件同步双路线 | `pkg/utils/prefixcacheindexer/hash.go::PrefixHashTable`、`pkg/utils/syncprefixcacheindexer/sync_hash.go::SyncPrefixHashTable` |
 | AIBrix：L2 的 "pinned" 指页锁定内存，不是防驱逐 pin | `python/aibrix_kvcache/aibrix_kvcache/l2/l2_cache.py::L2Cache.allocate`（docstring: "Allocate pinned memory regions"） |
 
-### A.6 kvcm 站在池之上
+### A.7 kvcm 站在池之上
 
 ![控制策略在哪](kvcm-vs-oss/figures/fig-control-placement.svg)
 
@@ -420,7 +500,7 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | 能力按后端版本显式声明 | `ops/capability.py::BackendCapability` |
 | 保活循环 | `loops.py::KeepaliveLoop` |
 
-### A.7 操作矩阵（证据，非主结构）
+### A.8 操作矩阵（证据，非主结构）
 
 接口面覆盖 copy / move / keepalive / pin / demote / promote / retain / remove 八项；当前可用七项，`retain` 仍在接线。逐项能力与限制：
 
@@ -487,6 +567,10 @@ KVCR 和 kvcm 在这里是同一认识、两种做法：一家在引擎旁挂进
 | Mooncake 副本权威 | `mooncake-store/include/master_client.h::GetReplicaList` / `BatchGetReplicaList` |
 | Mooncake 点名任务 | `master_client.h::CreateCopyTask` / `CreateMoveTask` |
 | Mooncake 动态副本 | `include/rpc_types.h::ReplicaActionProposal`；`src/master_service.cpp::DynamicReplicationHeatAdmitted` |
+| Tair KVCM 元数据权威 | `tair-kvcache/kv_cache_manager/meta/meta_indexer.h::MetaIndexer` |
+| Tair KVCM 编排 | `tair-kvcache/kv_cache_manager/manager/cache_manager.h::CacheManager` |
+| Tair 两阶段写 | `tair-kvcache/kv_cache_manager/manager/write_location_manager.h::WriteLocationManager` |
+| Tair 数据面 | `tair-kvcache/kv_cache_manager/client/include/transfer_client.h::TransferClient` |
 | LMCache 协调器入口 | `lmcache/v1/mp_coordinator/app.py::create_app` |
 | LMCache 控制器协议 | `mp_coordinator/controllers/base.py::Controller` |
 | LMCache fleet 目录 | `mp_coordinator/views/key_directory.py::KeyDirectory` |
