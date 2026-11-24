@@ -5,12 +5,13 @@
 
 ## 0. 结论
 
-1. **sleep mode 本身不是 P/D/混部切换。** 它释放 NPU 内存并丢弃 NPU 侧 KV，不改变引擎的调度角色。
+1. **单个引擎的 sleep mode 不是 P/D/混部切换。** 它释放 NPU 内存并丢弃 NPU 侧 KV，不改变这个引擎的调度角色；预置多个角色引擎时，sleep/wake 可以做部署级切换，见 §5.1。
 2. **要让 KV 活着，KV 的所有权必须独立于引擎进程生命周期。** 引擎可以 sleep、退出、换角色；Mooncake master 和 host segment 不能跟着退出。
 3. **推荐结构是“引擎无状态 + Mooncake 持久池 + kvcm 管理”**：sleep 前把 KV 写进 Mooncake 并确认 READY；sleep 只释放 NPU；wake 后从 Mooncake 回填。
-4. **P/D/混部切换要分两种**：
-   - 同一进程内切角色：sleep 不够，需要引擎侧对称调度；
-   - 停旧引擎、起/唤醒新角色：Mooncake 可以保住 KV，但这是重配，不是原地切。
+4. **P/D/混部切换有三种**：
+   - **预置 P/D/混部引擎 + sleep/wake + 路由**：部署级切换，可行；不是同进程切角色；
+   - **停旧引擎、起新角色**：同一条路的冷启动版本，KV 靠 Mooncake；
+   - **同一进程内切角色**：sleep 不够，需要引擎侧对称调度。
 
 ## 1. 事实基线
 
@@ -18,7 +19,7 @@
 
 - `enable_sleep_mode=True` 后，`sleep(level)` 把模型权重 offload 出 NPU，并丢弃 KV cache；
 - `wake_up()` 把权重加载回来；
-- level 1 / level 2 的区别是释放范围，二者都不是角色切换；
+- level 1 / level 2 的区别是释放范围；单个引擎 sleep 不改变角色，多引擎池的切换见 §5.1；
 - sleep 期间引擎不处理请求，路由要把请求摘走。
 
 参考:
@@ -123,7 +124,42 @@ Evolving Infra 的 P/D 切换来自引擎侧对称调度:
 
 ## 5. 角色切换
 
-### 5.1 同进程内切换
+### 5.1 预置引擎池 + sleep/wake
+
+这是“三个引擎、两个 sleep”的方案：P 引擎、D 引擎、混部引擎预先启动，同一时间只让一个角色醒着，路由器指向醒着的端点。
+
+```text
+P 引擎 (sleep)
+D 引擎 (sleep)
+混部引擎 (active)  ← 路由
+```
+
+切换到 P：
+
+```text
+混部引擎：摘流 → KV 写穿 Mooncake → sleep
+P 引擎：wake → 挂 Mooncake segment → 验证 KV → 接流
+```
+
+成立条件：
+
+- 三个引擎使用同一模型、同一 revision、同一套 key/hash 口径；
+- 同一 NPU 上同一时间只允许一个引擎占满资源；sleep/wake 必须串行，不能先把目标引擎 wake 到一半再 sleep 源引擎；
+- host 侧要能容纳 sleeping 引擎的权重 offload（level 1）或从磁盘重载（level 2）；
+- Mooncake master 和 host segment 独立于引擎进程；否则引擎退出会丢 segment；
+- 路由和 health check 必须知道 engine 的 sleeping/active 状态；
+- 切换期间 KV 必须已经在 Mooncake 里 READY，不能只在本机 NPU/进程内。
+
+这个方案能实现 P/D/混部切换，但属于**部署级切换**：
+
+- 切的是“哪个引擎接流”，不是“同一个引擎换角色”；
+- 有 sleep/wake 和 KV 回填延迟；
+- 不承诺秒级，也不承诺在途请求不中断；
+- 需要外部控制器编排，不是 vLLM 单机 sleep API 自动完成。
+
+如果三个引擎分别占不同 NPU，那本来就可以直接路由切换；sleep 主要解决“同一节点/NPU 上并存多个角色引擎”的资源问题。
+
+### 5.2 同进程内切换
 
 要求引擎支持:
 
@@ -134,7 +170,7 @@ Evolving Infra 的 P/D 切换来自引擎侧对称调度:
 
 sleep mode 不提供这些能力。
 
-### 5.2 停旧引擎、起新角色
+### 5.3 停旧引擎、起新角色
 
 ```text
 旧 P/D/混部引擎
