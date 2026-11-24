@@ -98,7 +98,50 @@ D 引擎       (sleep)
    - sleep/wake 顺序；
    - 健康检查与回切。
 
-## 6. 角色切换的边界
+## 6. 权重与 ACL 图
+
+### 6.1 level 2 的事实
+
+- level 2 会 discard 全部 weights 和 KV cache；
+- `sleep_preserve_parameter_names` 只保留指定参数，默认不保留整套权重；
+- `_sleep_saved_buffers` 只保存 buffer，不保存全部模型参数；
+- wake 顺序是 `wake_up?tags=weights` → 重新加载/传输权重 → `wake_up?tags=kv_cache`。
+
+所以 level 2 下“权重存一份”不是可选项，是必须做：要么 host/磁盘留一份，要么从别的引擎 D2D 拉。
+
+### 6.2 ACL 图
+
+- `sleep_mode_extra_cleanup=false`（默认）不会清 ACL graph workspace，也不会重置 graph params；
+- `sleep_mode_extra_cleanup=true` 会在 sleep 时清 workspace、重置 graph，wake 后重新 capture；
+- 保留图的前提是：权重回填到同一批参数地址、同一布局；`CaMemAllocator.wake_up` 用原 handle 重新 map，VA 不变，所以在原参数上加载/传输权重可以复用图；
+- 如果模型结构、TP/DP 布局或权重地址变了，必须重新 capture，不能硬复用。
+
+### 6.3 权重来源
+
+| 方案 | 做法 | 适用 | 代价 |
+|---|---|---|---|
+| host 一份 | 权重放 host DRAM，wake 后 H2D 到各引擎 | 同机多引擎 | host 内存；H2D 带宽 |
+| 磁盘/3FS 一份 | wake 后从共享存储加载 | 跨机、冷启动 | 加载慢 |
+| 同机 D2D | `weight_transfer_config` 用 `ipc`，从一个 seed 引擎拉 | 同物理 NPU/同机 | IPC 配置 |
+| 跨机 D2D | `weight_transfer_config` 用 `hccl`，从 seed 引擎拉 | 跨节点 | HCCL 带宽 |
+| RFork | seed 实例 + YuanRong TransferEngine | 冷启动 | **sleep mode 下被 bypass**，不能用 |
+| Netloader | `--load-format=netloader` 从 server 拉 | 启动加载 | 不是 level-2 wake 后的自动路径 |
+
+结论：
+
+- 想保留 ACL 图：level 2 + `sleep_mode_extra_cleanup=false` + 权重回填到原参数地址；
+- 想少占 host：level 2 + 一份共享权重 + HCCL/IPC 传输；
+- 想简单：level 1，把整套 weights offload 到 host，但 host 内存要按模型大小乘 sleeping 引擎数算；
+- RFork 不能和 sleep mode 一起用，vLLM-Ascend 明确在 sleep 模式下 bypass。
+
+参考：
+
+- `vllm_ascend/worker/worker.py::sleep` / `wake_up`
+- `vllm_ascend/device_allocator/camem.py::CaMemAllocator.sleep` / `wake_up`
+- `docs/source/user_guide/feature_guide/rl.md`：level 2 staged wake 与 `ipc`/`hccl` weight transfer
+- `docs/source/user_guide/feature_guide/rfork.md`：sleep mode 下 RFork bypass
+
+## 7. 角色切换的边界
 
 - 切的是“哪个引擎接流”，不是“同一个进程换角色”；
 - 同进程内切 P/D/混部需要引擎侧对称调度，sleep 不提供；
@@ -106,7 +149,7 @@ D 引擎       (sleep)
 - vLLM 只提供单引擎 sleep/wake，三引擎的编排要外部控制器做；
 - 如果进程退出/重启，KV 必须提前复制到别的 segment 或外部存储。
 
-## 7. 失败场景
+## 8. 失败场景
 
 | 失败 | 后果 | 处理 |
 |---|---|---|
@@ -117,7 +160,7 @@ D 引擎       (sleep)
 | 路由仍打 sleeping 引擎 | 请求失败/超时 | 路由状态跟随 sleep/wake |
 | key/模型版本不一致 | 命中错误 | 固定 model revision 和 hash 口径 |
 
-## 8. 探索通过后，kvcm 加什么
+## 9. 探索通过后，kvcm 加什么
 
 这里只探索引擎侧是否可行，不先把方案写进 kvcm 设计。
 
@@ -135,7 +178,7 @@ D 引擎       (sleep)
 - kvcm 只做“选角色、发切换、看结果”，执行在引擎/编排层；
 - 形态转换的可行性先由 vLLM-Ascend 侧验证，验证通过后再进 D8。
 
-## 9. 验收
+## 10. 验收
 
 1. 同一 NPU 上三个引擎可以逐个初始化并 sleep，只有一个 active。
 2. 当前 active 引擎 sleep 后，进程内 Mooncake connector/segment 仍可读。
