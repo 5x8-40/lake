@@ -7,7 +7,7 @@
 
 | 能力 | 结论 | 依据 |
 |---|---|---|
-| 三个引擎共用同一 NPU，两个 sleep | 可行，但必须串行 | sleep 释放 NPU；同一时间只能一个 active |
+| 三形态（P TP8 / D DP8 / 混部 DP2TP4）共用 8 卡，两个 sleep | 可行，但必须串行 | sleep 释放权重/KV；同一时间只能一个 active |
 | 三个引擎共用本机 Mooncake master/池 | 可行 | vLLM-Ascend `pd_colocated_mooncake_multi_instance`：两实例共用 master、`MooncakeConnectorStoreV1`、`kv_both`，跨实例 KV 复用 |
 | level 2 + `sleep_mode_extra_cleanup=false` 保留 ACL 图 | 可行 | `sleep_mode_extra_cleanup=true` 才清 graph workspace/重新 capture |
 | sleep 前写穿 Mooncake，wake 后读 KV | 可行 | Mooncake connector 在引擎进程内；sleep 只释放 NPU |
@@ -39,19 +39,70 @@
 - level 2 只保留 `sleep_preserve_parameter_names` 指定的参数和 buffers，不保留整套权重；
 - 进程不退出时，Mooncake connector/segment 仍在进程内。
 
-## 2. 三个引擎的部署
+## 2. 三形态分时复用（8 卡示例）
+
+一台 8 卡机器上部署三个独立形态：
+
+| 形态 | 并行 | 占卡 |
+|---|---|---|
+| P | TP8 | 8 |
+| D | DP8（每 DP 副本 TP1） | 8 |
+| 混部 | DP2 × TP4 | 8 |
+
+三个形态各自是独立部署/进程组，不是一个进程：
+
+- P TP8：8 个 rank；
+- D DP8：8 个 DP rank；
+- 混部 DP2TP4：2 个 DP 组 × 4 个 TP rank。
+
+同一时间只有一个形态占卡、接流量；另外两个 sleep。
 
 ```text
 P 引擎       (sleep)  ─┐
-D 引擎       (sleep)  ─┼─ 同一个 NPU
+D 引擎       (sleep)  ─┼─ 同一台机器的 8 张卡
 混部引擎     (active) ─┘
 ```
 
-- 三个引擎各自独立进程，但共用同一个 NPU；
-- 同一时间只有一个引擎占 NPU 并接流量；
-- 目标引擎要 wake，源引擎必须先 sleep 释放 NPU；
-- 三个引擎各带 Mooncake connector，接同一个本机 Mooncake master/池；
+- 目标形态要 wake，源形态必须先 sleep 释放 8 张卡；
+- 三个形态各带 Mooncake connector，接同一个本机 Mooncake master/池；
 - sleep 只释放 NPU，不动 host 侧 connector/segment。
+
+### 2.1 权重不是同一套 shard
+
+| 形态 | 每 rank 权重 |
+|---|---|
+| P TP8 | 1/8 模型 |
+| D DP8 TP1 | 完整模型（8 个副本各一份） |
+| 混部 DP2TP4 | 1/4 模型 |
+
+所以同机三形态不能靠“把一份 NPU 权重拷过去”解决；需要一份**完整权重**（host/磁盘），唤醒时按目标形态切 shard。
+
+### 2.2 KV 也不是同一套 layout
+
+| 形态 | 每请求 KV |
+|---|---|
+| P TP8 | 8 份 TP shard |
+| D DP8 TP1 | 每个 DP rank 一份完整 KV |
+| 混部 DP2TP4 | 每 DP 组 4 份 TP shard |
+
+共用 Mooncake 池可以；跨形态读要 connector 做 TP/DP rank 映射，不能假设同一个 Store 对象直接可读。
+
+### 2.3 保留 ACL 图的内存代价
+
+`sleep_mode_extra_cleanup=false` 保留 ACL 图，但也保留 graph workspace/HCCL 相关状态。
+
+三个形态各占 8 卡、两个 sleeping 时：
+
+- 两个 sleeping 形态的 weights/KV 已释放；
+- graph workspace/HCCL context 仍占 NPU 内存；
+- active 形态还要放完整权重 + KV。
+
+所以能不能同时驻留三个形态，取决于 sleeping 形态保留的 graph/HCCL 内存是否放得下。放不下就只能：
+
+- `sleep_mode_extra_cleanup=true`，wake 后重新 capture；
+- 或减少常驻形态数。
+
+这是要实测的容量约束，不是配置开关本身能保证的。
 
 ## 3. 切换流程
 
@@ -117,7 +168,7 @@ vLLM-Ascend 已有同类部署：
 
 | 来源 | 现状 | 适用 | 限制 |
 |---|---|---|---|
-| host 一份 | 可行，主路径 | 同 NPU 三引擎 | host 内存；H2D 时间 |
+| host 完整权重一份 | 可行，主路径 | P TP8 / D DP8 / 混部 DP2TP4 | host 内存；按目标形态 H2D/shard |
 | 磁盘/3FS | 可行 | fallback/冷启动 | 慢 |
 | 同 NPU engine→engine D2D | **不可行** | — | 源和目标不能同时驻留 |
 | 跨 NPU/跨机 D2D | **无现成功能** | 自研 | 需要另一个 seed；不同 TP/DP 要 reshard |
