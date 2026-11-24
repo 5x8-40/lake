@@ -13,8 +13,8 @@
 | sleep 前写穿 Mooncake，wake 后读 KV | 可行 | Mooncake connector 在引擎进程内；sleep 只释放 NPU |
 | 权重用 host 一份 / 磁盘回填 | 可行，需控制器 | level 2 丢弃 weights；wake 后 H2D 或加载 |
 | 同一 NPU 上 engine→engine 权重 D2D | **不可行** | 源和目标不能同时持有完整权重 |
-| 跨 NPU/跨机权重 D2D | **无现成功能** | `weight_transfer` 是 trainer→worker；`Netloader` 是启动加载；`RFork` 在 sleep 下 bypass |
-| 不同 TP/DP 直接 D2D 权重 | **不可行** | 源和目标 shard 布局不同；需要 reshard 或完整权重副本 |
+| 跨机同形态权重 D2D | 可行，rank-to-rank 直拉 | 同模型/同 TP/DP/layout；`Netloader` 是现成 HCCL P2P 参考 |
+| 跨形态权重 D2D | 需要 shard 映射/reshard | 源和目标 TP/DP 不同 |
 
 结论不是“整套方案不行”，而是：
 
@@ -171,19 +171,46 @@ vLLM-Ascend 已有同类部署：
 | host 完整权重一份 | 可行，主路径 | P TP8 / D DP8 / 混部 DP2TP4 | host 内存；按目标形态 H2D/shard |
 | 磁盘/3FS | 可行 | fallback/冷启动 | 慢 |
 | 同 NPU engine→engine D2D | **不可行** | — | 源和目标不能同时驻留 |
-| 跨 NPU/跨机 D2D | **无现成功能** | 自研 | 需要另一个 seed；不同 TP/DP 要 reshard |
+| 跨机同形态 D2D | 可行，rank-to-rank | 另一台同形态 donor | 需要 donor alive；L2 wake 触发需接 |
+| 跨形态 D2D | 需要 shard 映射/reshard | 自研 | TP/DP 不同 |
 | `weight_transfer_config hccl/ipc` | 有，但 trainer→worker | RL 权重更新 | 不是 engine→engine |
 | `Netloader` | 有，启动加载 | 新实例启动 | 不是 level-2 wake 后路径 |
 | `RFork` | 有，seed 拉权重 | 冷启动 | sleep mode 下 bypass |
 
-### 6.4 为什么不同 TP/DP 不能直接 D2D
+### 6.4 同形态 RD2D：最简单路径
 
-权重按 TP/DP 分片：
+同部署形态不需要 reshard。
 
-- 源引擎 TP=8，每个 rank 持有 1/8；
-- 目标引擎 TP=4，需要不同的 1/4 分片；
-- 直接把源 rank 的字节传给目标 rank，布局对不上；
-- 需要 gather/merge/reshard，或保留一份完整（未分片）权重再按目标布局加载。
+P TP8 → P TP8（donor 在另一台机器）：
+
+- donor 8 个 rank，各持 1/8；
+- 目标 8 个 rank，各拉对应 rank 的 1/8；
+- rank-to-rank 一对一，一把并行加载。
+
+D DP8 TP1 → D DP8 TP1（donor 在另一台机器）：
+
+- 每个 donor DP rank 有完整权重；
+- 每个目标 DP rank 从对应 donor rank 拉完整权重；
+- 一把并行加载。
+
+混部 DP2TP4 → 混部 DP2TP4（donor 在另一台机器）：
+
+- 每个目标 TP rank 拉同 rank 的 1/4；
+- DP 组内映射一致；
+- 一把并行加载。
+
+前提：
+
+- 同模型、同 revision；
+- 同 TP/DP/layout；
+- 源 donor 节点 alive；
+- 目标先 `wake?tags=weights`，拉完并 barrier，再 `wake?tags=kv_cache`。
+
+### 6.5 跨形态才需要 reshard
+
+- P TP8 → D DP8 TP1：目标要完整权重，源只有 1/8，需要 gather/合并；
+- P TP8 → 混部 DP2TP4：目标要 1/4，源 1/8，需要 rank 映射/合并；
+- 反过来 D TP1 → P TP8：目标要 1/8，源有完整，切 shard 即可，但仍需映射。
 
 KV 有 connector 做 rank 映射；权重没有等价的现成 connector。
 
