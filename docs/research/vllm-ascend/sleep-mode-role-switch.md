@@ -1,18 +1,19 @@
 # Sleep Mode 与 P/D/混部角色切换
 
-> 目标：同节点预置 P、D、混部三个 vLLM-Ascend 引擎，各占独立 NPU/组，两个 sleep、一个 active；切换只切 active 引擎，不重启进程。
+> 目标：同节点同一个 NPU 上预置 P、D、混部三个 vLLM-Ascend 引擎，两个 sleep、一个 active；切换只切 active 引擎，不重启进程。
 > 范围：只验证引擎侧可行性，不先写进 kvcm 设计。
 
 ## 0. 可行性结论
 
 | 能力 | 结论 | 依据 |
 |---|---|---|
-| 三个引擎各占独立 NPU/组，两个 sleep | 可行 | vLLM-Ascend 单引擎 sleep/wake；多实例可独立进程部署 |
+| 三个引擎共用同一 NPU，两个 sleep | 可行，但必须串行 | sleep 释放 NPU；同一时间只能一个 active |
 | 三个引擎共用本机 Mooncake master/池 | 可行 | vLLM-Ascend `pd_colocated_mooncake_multi_instance`：两实例共用 master、`MooncakeConnectorStoreV1`、`kv_both`，跨实例 KV 复用 |
 | level 2 + `sleep_mode_extra_cleanup=false` 保留 ACL 图 | 可行 | `sleep_mode_extra_cleanup=true` 才清 graph workspace/重新 capture |
 | sleep 前写穿 Mooncake，wake 后读 KV | 可行 | Mooncake connector 在引擎进程内；sleep 只释放 NPU |
 | 权重用 host 一份 / 磁盘回填 | 可行，需控制器 | level 2 丢弃 weights；wake 后 H2D 或加载 |
-| 权重从另一个推理引擎 D2D | **无现成功能** | `weight_transfer` 是 trainer→worker；`Netloader` 是启动加载；`RFork` 在 sleep 下 bypass |
+| 同一 NPU 上 engine→engine 权重 D2D | **不可行** | 源和目标不能同时持有完整权重 |
+| 跨 NPU/跨机权重 D2D | **无现成功能** | `weight_transfer` 是 trainer→worker；`Netloader` 是启动加载；`RFork` 在 sleep 下 bypass |
 | 不同 TP/DP 直接 D2D 权重 | **不可行** | 源和目标 shard 布局不同；需要 reshard 或完整权重副本 |
 
 结论不是“整套方案不行”，而是：
@@ -41,33 +42,33 @@
 ## 2. 三个引擎的部署
 
 ```text
-P 引擎       (sleep)  ─ NPU/组 A
-D 引擎       (sleep)  ─ NPU/组 B
-混部引擎     (active) ─ NPU/组 C
+P 引擎       (sleep)  ─┐
+D 引擎       (sleep)  ─┼─ 同一个 NPU
+混部引擎     (active) ─┘
 ```
 
-- 三个引擎各自独立进程、独立 NPU/组；
-- 同一时间只有一个引擎接流量；
-- 交接期间源和目标可以同时 awake；
+- 三个引擎各自独立进程，但共用同一个 NPU；
+- 同一时间只有一个引擎占 NPU 并接流量；
+- 目标引擎要 wake，源引擎必须先 sleep 释放 NPU；
 - 三个引擎各带 Mooncake connector，接同一个本机 Mooncake master/池；
-- sleep 只释放各自 NPU，不动 host 侧 connector/segment。
+- sleep 只释放 NPU，不动 host 侧 connector/segment。
 
 ## 3. 切换流程
 
-默认走 host 权重副本：
+同 NPU 上不能并存两个完整引擎，切换必须串行：
 
 ```text
 1. 源引擎摘流，等在途请求结束
 2. 源引擎 KV 写穿 Mooncake，等 READY
-3. 目标引擎 wake?tags=weights
-4. 目标引擎从 host 权重副本 H2D 回填
-5. 目标引擎 wake?tags=kv_cache
-6. 目标引擎确认 Mooncake KV 可读
-7. 路由切到目标引擎
-8. 源引擎 sleep
+3. 源引擎 sleep，释放 NPU
+4. 目标引擎 wake?tags=weights
+5. 目标引擎从 host 权重副本 H2D 回填
+6. 目标引擎 wake?tags=kv_cache
+7. 目标引擎确认 Mooncake KV 可读
+8. 路由切到目标引擎
 ```
 
-如果自研了 engine→engine 权重 D2D，第 4 步可替换为 HCCL D2D；但必须先满足第 6 节的布局条件。
+同 NPU 上无法做 engine→engine 权重 D2D：源引擎 sleep 前目标不能持有完整权重，源 sleep 后权重已经丢弃。D2D 只能来自另一个 NPU/另一台机器的 seed。
 
 ## 4. 多引擎共用 Mooncake 池
 
@@ -90,8 +91,8 @@ vLLM-Ascend 已有同类部署：
 ## 5. 成立条件
 
 1. 三个引擎同模型、同 revision；Store 直读要求同 TP/DP/layout，不同 layout 由 connector 映射。
-2. 三个引擎各占独立 NPU/组；同一时间只有一个接流量。
-3. 交接期间源和目标可以同时 awake；源在权重交接完成前不能 sleep。
+2. 三个引擎共用同一个 NPU；同一时间只有一个占 NPU、接流量。
+3. 源引擎必须先 sleep，目标引擎才能 wake；同 NPU 不能同时持有两个完整引擎。
 4. 三个引擎进程都不退出；否则进程内 Mooncake segment 消失。
 5. 控制器负责摘流、KV 写穿/READY、权重回填、sleep/wake 顺序、路由切换。
 
@@ -116,9 +117,10 @@ vLLM-Ascend 已有同类部署：
 
 | 来源 | 现状 | 适用 | 限制 |
 |---|---|---|---|
-| host 一份 | 可行 | 同机三引擎 | host 内存；H2D 时间 |
+| host 一份 | 可行，主路径 | 同 NPU 三引擎 | host 内存；H2D 时间 |
 | 磁盘/3FS | 可行 | fallback/冷启动 | 慢 |
-| engine→engine D2D | **无现成功能** | 自研 | 需同布局；不同 TP/DP 要 reshard |
+| 同 NPU engine→engine D2D | **不可行** | — | 源和目标不能同时驻留 |
+| 跨 NPU/跨机 D2D | **无现成功能** | 自研 | 需要另一个 seed；不同 TP/DP 要 reshard |
 | `weight_transfer_config hccl/ipc` | 有，但 trainer→worker | RL 权重更新 | 不是 engine→engine |
 | `Netloader` | 有，启动加载 | 新实例启动 | 不是 level-2 wake 后路径 |
 | `RFork` | 有，seed 拉权重 | 冷启动 | sleep mode 下 bypass |
@@ -137,6 +139,7 @@ KV 有 connector 做 rank 映射；权重没有等价的现成 connector。
 ## 7. 角色切换的边界
 
 - 切的是“哪个引擎接流”，不是“同一个进程换角色”；
+- 三个引擎共用一个 NPU，同一时间只能一个占 NPU；
 - 同进程内切 P/D/混部需要引擎侧对称调度，sleep 不提供；
 - 有 sleep/wake、权重回填、KV 回填延迟，不承诺零中断；
 - vLLM 只提供单引擎 sleep/wake，三引擎编排要外部控制器；
@@ -146,7 +149,7 @@ KV 有 connector 做 rank 映射；权重没有等价的现成 connector。
 
 | 失败 | 后果 | 处理 |
 |---|---|---|
-| 源引擎在权重交接前 sleep | 目标权重不完整 | 完成交接后再 sleep |
+| 源引擎未 sleep 就 wake 目标 | NPU 不足 | 先 sleep 源，再 wake 目标 |
 | 不同 TP/DP 直接拷权重 | 布局错/结果错 | reshard 或完整权重副本 |
 | sleep 前未写穿 Mooncake | wake 后 KV 为空 | 强制 flush + READY |
 | 目标引擎 wake 时 NPU 资源未就绪 | 启动失败 | 预分配/串行切换 |
@@ -171,10 +174,10 @@ KV 有 connector 做 rank 映射；权重没有等价的现成 connector。
 
 ## 10. 验收
 
-1. 三个引擎各占独立 NPU/组，可以逐个初始化并 sleep。
-2. 同一时间只有一个引擎接流量。
+1. 同一个 NPU 上三个引擎可以逐个初始化并 sleep。
+2. 同一时间只有一个引擎占 NPU、接流量。
 3. sleep 前写穿的 KV，wake 后能命中。
 4. level 2 + `sleep_mode_extra_cleanup=false` 下 ACL 图保留，权重回填后可直接复用。
 5. host 权重副本回填路径可用；H2D 时间在切换预算内。
-6. 若做 engine D2D：同 TP/DP 布局下传输正确；不同布局走 reshard/完整副本。
+6. 同 NPU 场景不依赖 engine D2D；跨 NPU/跨机 D2D 只作为额外优化。
 7. 路由不会把请求发给 sleeping 引擎。
