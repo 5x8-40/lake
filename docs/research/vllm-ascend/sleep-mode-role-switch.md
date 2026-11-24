@@ -40,7 +40,7 @@ D 引擎       (sleep)
 
 - 每个引擎有独立 NPU 资源；同一时间只有一个引擎接流量，交接期间可以两个 awake；
 - 两个 sleeping 引擎释放自己的 NPU；
-- 切换时 active 引擎把 weights D2D 传给目标引擎，而不是落到本地盘；
+- 切换时如果已有 D2D 能力，active 引擎把 weights 传给目标；没有现成能力时走 host/磁盘；
 - 三个引擎的 Mooncake connector 都在各自进程内，sleep 不会 unmount。
 
 ## 3. 切换流程
@@ -52,7 +52,7 @@ D 引擎       (sleep)
 2. 等在途请求结束
 3. 混部引擎把 KV 写穿 Mooncake，等 READY
 4. P 引擎 wake，先只恢复 weights 分配
-5. 混部引擎把 weights 通过 HCCL D2D 传给 P 引擎
+5. 【需要自研】混部引擎把 weights 通过 HCCL D2D 传给 P 引擎；没有自研时改为 host 回填
 6. P 引擎 wake KV cache，确认 Mooncake segment/KV 可读
 7. 路由切到 P 引擎
 8. 混部引擎 sleep（释放自己的 NPU）
@@ -62,7 +62,7 @@ D 引擎       (sleep)
 
 关键点：
 
-- weights D2D 期间源引擎必须保持 awake；目标引擎 ready 后，源引擎才能 sleep；
+- 如果有 D2D，期间源引擎必须保持 awake；目标引擎 ready 后，源引擎才能 sleep；
 - 两个引擎各占独立 NPU/组，交接期间可以同时 awake，但不能同时接流量；
 - 切换期间 KV 必须已经在 Mooncake 里 READY，不能只留在 NPU；
 - 路由和 health check 必须知道 engine 的 active/sleeping 状态；
@@ -126,15 +126,22 @@ D 引擎       (sleep)
 |---|---|---|---|
 | host 一份 | 权重放 host DRAM，wake 后 H2D 到目标引擎 | 同机、无可用 seed | host 内存；H2D 带宽 |
 | 磁盘/3FS 一份 | wake 后从共享存储加载 | 跨机、冷启动 | 加载慢，只做 fallback |
-| 同机跨 NPU D2D | `weight_transfer_config` 用 `hccl`，从 active seed 引擎拉 | 同节点、不同 NPU/组 | HCCL/HCCS 带宽 |
-| 跨机 D2D | `weight_transfer_config` 用 `hccl`，从远端 seed 引擎拉 | 跨节点 | HCCL/RDMA 带宽 |
+| 同机跨 NPU D2D | **需要自研**：源引擎暴露 HCCL 发送端 | 同节点、不同 NPU/组 | HCCL/HCCS 带宽 |
+| 跨机 D2D | **需要自研**：源引擎暴露 HCCL 发送端 | 跨节点 | HCCL/RDMA 带宽 |
 | RFork | seed 实例 + YuanRong TransferEngine | 冷启动 | **sleep mode 下被 bypass**，不能用 |
 | Netloader | `--load-format=netloader` 从 server 拉 | 启动加载 | 不是 level-2 wake 后的自动路径 |
+
+### 6.4 现成能力核实
+
+- `weight_transfer_config` 的 `hccl` / `ipc` 是 **trainer → rollout worker** 的权重更新路径，source 是 `WeightSource`（训练侧），不是“另一个推理引擎”的发送 API；
+- `Netloader` 是启动时的 model loader（client 从 server 拉权重），不是 level-2 wake 后重新加载的路径；
+- `RFork` 支持 seed 实例拉权重，但文档明确：**sleep mode 下 bypass**；
+- 因此“L2 wake 从另一个推理引擎 D2D 拉权重”**当前没有现成功能**，需要改源引擎暴露发送端。
 
 结论：
 
 - 想保留 ACL 图：level 2 + `sleep_mode_extra_cleanup=false` + 权重回填到原参数地址；
-- 想少占 host：level 2 + 从 active seed 引擎做 HCCL D2D；
+- 想少占 host 且不想读盘：需要自研引擎间 HCCL D2D；现成 `weight_transfer` 不是这个用途；
 - 想简单：level 1，把整套 weights offload 到 host，但 host 内存要按模型大小乘 sleeping 引擎数算；
 - RFork 不能和 sleep mode 一起用，vLLM-Ascend 明确在 sleep 模式下 bypass。
 
