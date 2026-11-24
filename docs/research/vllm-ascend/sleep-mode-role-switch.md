@@ -98,7 +98,25 @@ D 引擎       (sleep)
 | 路由仍打 sleeping 引擎 | 请求失败/超时 | 路由状态跟随 sleep/wake |
 | key/模型版本不一致 | 命中错误 | 固定 model revision 和 hash 口径 |
 
-## 7. 验收
+## 7. 探索通过后，kvcm 加什么
+
+这里只探索引擎侧是否可行，不先把方案写进 kvcm 设计。
+
+如果验证通过，kvcm 侧对应的是**形态转换**，不是新的 KV 操作：
+
+- D8 管理面增加“角色/形态”决策：P、D、混部三种角色下发给哪些引擎；
+- D8 维护 engine 的 active/sleeping 状态，触发 sleep/wake，并和路由联动；
+- KVT 增加 engine 角色字段，避免把请求发给 sleeping 或角色不匹配的引擎；
+- D9 增加切换审计、切换耗时、失败回切、KV 回填命中率；
+- KV 的复制/保留仍走现有 D2 操作，不因为形态转换新增一套 KV 语义。
+
+边界：
+
+- kvcm 不实现引擎内部调度，也不实现 sleep/wake；
+- kvcm 只做“选角色、发切换、看结果”，执行在引擎/编排层；
+- 形态转换的可行性先由 vLLM-Ascend 侧验证，验证通过后再进 D8。
+
+## 8. 验收
 
 1. 同一 NPU 上三个引擎可以逐个初始化并 sleep，只有一个 active。
 2. 当前 active 引擎 sleep 后，进程内 Mooncake connector/segment 仍可读。
