@@ -156,7 +156,7 @@ def _alloc_choices(q, mixed):
     return combos(q.n_nodes, mixed)
 
 
-def dynamic(dm, q, alpha, tier: Tier, mixed=False, oracle=True, headroom=1.05):
+def dynamic(dm, q, alpha, tier: Tier, mixed=False, oracle=True, headroom=1.05, look_min=None):
     """逐窗口选组合；切换耗时按节点·秒从后续窗口扣除。
 
     oracle：已知未来需求，选承得住“本窗口到切换完成”这段峰值、且切换最少的组合；
@@ -174,17 +174,31 @@ def dynamic(dm, q, alpha, tier: Tier, mixed=False, oracle=True, headroom=1.05):
     lost_ns = 0.0
     xP = np.zeros(len(P) + int(math.ceil(tier.recompute_span / W)) + 1)   # 丢 KV 引起的额外 prefill（NPU）
     rec = 0.0
-    look = int(math.ceil(max(tier.t_dp, tier.t_pd) / W))
+    if look_min is None:
+        # 丢 KV 档：只前瞻到切换完成会“踩点切”，重算突增正好落在没有余量的窗口；前瞻 15 分钟，在还有余量时提前切
+        look_min = 3 if np.any(np.asarray(tier.recompute) > 0) else 0
+    look = max(look_min, int(math.ceil(max(tier.t_dp, tier.t_pd) / W)))
     for w in range(len(P)):
         if oracle:
             # 前瞻：组合要承得住接下来 look 个窗口（切换完成前）的需求峰值
-            Pw, Dw = P[w:w + look + 1].max(), D[w:w + look + 1].max()
+            # 需求含已排队的重算，以及候选组合自身切换将引入的重算（丢 KV 档）
+            seg = P[w:w + look + 1]
+            Pw, Dw = (seg + xP[w:w + len(seg)]).max(), D[w:w + look + 1].max()
+            moved = np.abs(C - cur).sum(axis=1) / 2
             ok = feasible(C[:, 0], C[:, 1], C[:, 2], Pw, Dw, q)
+            rc_w = _at(tier.recompute, w)
+            if rc_w:
+                # 逐窗检查，自身切换的重算只落在切换后的 recompute_span 内；都承不住时退回不计自身重算（接受一窗瞬态）
+                occ = min(1.0, D[w] / (max(cur[1] + cur[2], 1.0) * q.kv_cap_node))
+                k_sp = max(1, int(math.ceil(tier.recompute_span / W)))
+                own = moved * rc_w * occ / (k_sp * W)
+                ok2 = np.ones(len(C), bool)
+                for i in range(w, min(w + max(look, k_sp) + 1, len(P))):
+                    ok2 &= feasible(C[:, 0], C[:, 1], C[:, 2], P[i] + xP[i] + (own if i - w < k_sp else 0.0), D[i], q)
+                if ok2.any():
+                    ok = ok2
             # 先按“扣掉切换损失后仍承得住”挑，再按切换节点数最少
-            cand = []
-            for j in np.nonzero(ok)[0]:
-                moved = np.abs(C[j] - cur).sum() / 2
-                cand.append((moved, j))
+            cand = [(moved[j], j) for j in np.nonzero(ok)[0]]
             tgt = C[min(cand)[1]] if cand else cur
         else:
             if w == 0:

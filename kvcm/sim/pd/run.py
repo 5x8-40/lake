@@ -120,7 +120,7 @@ def sensitivity(scs, e4, shrink):
     return rows
 
 
-CTRL = ("oracle", "lag", "ei5", "ei10")
+CTRL = ("oracle", "lag", "lag0", "ei5", "ei10")
 
 
 def run_ctrl(ctrl, dm, dm_sl, q, a, tr):
@@ -128,6 +128,8 @@ def run_ctrl(ctrl, dm, dm_sl, q, a, tr):
         return F.dynamic(dm, q, a, tr)
     if ctrl == "lag":
         return F.dynamic(dm, q, a, tr, oracle=False)
+    if ctrl == "lag0":
+        return F.dynamic(dm, q, a, tr, oracle=False, headroom=1.0)
     return F.planner(dm, dm_sl, q, a, tr, t_win=300.0 if ctrl == "ei5" else 600.0)
 
 
@@ -226,6 +228,7 @@ def main():
             r["dyn-pd-oracle"] = F.goodput(lambda a: F.dynamic(dm, Q, a, tr), tol)
             r["dyn-pd-lag"] = F.goodput(lambda a: F.dynamic(dm, Q, a, tr, oracle=False), tol)
             r["dyn-3-oracle"] = F.goodput(lambda a: F.dynamic(dm, Q, a, tr, mixed=True), tol)
+            r["lag0"] = F.goodput(lambda a: F.dynamic(dm, Q, a, tr, oracle=False, headroom=1.0), tol)
             r["ei5"] = F.goodput(lambda a: F.planner(dm, dm_sl, Q, a, tr, t_win=300.0), tol)
             r["ei10"] = F.goodput(lambda a: F.planner(dm, dm_sl, Q, a, tr, t_win=600.0), tol)
             # 共同负载 α_ref = 静态最优 P:D 的 goodput 下，各控制器的过载、切换与丢失复用
@@ -237,6 +240,11 @@ def main():
                 r["at_ref"][c] = {"over_windows": int(x["ov"].sum()), "switches": x["switches"],
                                   "recompute_npu_s": x["recompute_npu_s"], "lost_reuse": x["recompute_npu_s"] / sv}
             r["saved_npu_s_ref"] = sv
+            if tr.name == "L-kill":
+                # goodput 非单调排查：低于 α_ref 的负载上判据是否振荡
+                r["scan"] = {c: [(float(a_), x["switches"], int(x["ov"].sum()))
+                                 for a_ in np.arange(0.5, 1.0001, 0.02) * a_ref
+                                 for x in [run_ctrl(c, dm, dm_sl, Q, a_, tr)]] for c in ("ei5", "ei10")}
             r["recompute_per_node_mean"] = float(np.mean(tr.recompute))
             g = r["dyn-pd-lag"]
             r["switches_at_lag_goodput"] = F.dynamic(dm, Q, g, tr, oracle=False)["switches"] if g > 0 else 0

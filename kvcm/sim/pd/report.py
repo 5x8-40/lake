@@ -42,9 +42,10 @@ TIER_SHORT = {
 
 TIER_NAME = {"L-pool": "逻辑+池", "L-d2d": "逻辑+点对点", "L-kill": "逻辑+丢KV重算", "L-drain": "逻辑+排空",
              "S-pool": "sleep/wake+池", "S-drain": "sleep/wake+排空"}
-CTRL = [("oracle", "oracle"), ("lag", "滞后一窗"), ("ei5", "统计判据·5分钟窗"), ("ei10", "统计判据·10分钟窗")]
-CTRL_COL = {"oracle": "#d62728", "lag": "#ff7f0e", "ei5": "#2ca02c", "ei10": "#1f77b4"}
-GP_KEY = {"oracle": "dyn-pd-oracle", "lag": "dyn-pd-lag", "ei5": "ei5", "ei10": "ei10"}
+CTRL = [("oracle", "oracle"), ("lag", "滞后一窗(1.05×余量)"), ("lag0", "滞后一窗·无余量"),
+        ("ei5", "统计判据·5分钟窗"), ("ei10", "统计判据·10分钟窗")]
+CTRL_COL = {"oracle": "#d62728", "lag": "#ff7f0e", "lag0": "#ffbb78", "ei5": "#2ca02c", "ei10": "#1f77b4"}
+GP_KEY = {"oracle": "dyn-pd-oracle", "lag": "dyn-pd-lag", "lag0": "lag0", "ei5": "ei5", "ei10": "ei10"}
 S5_ROWS = [("static-pd", "静态最优 P:D"), ("static-best3", "静态最优 P/D/混部")] + [
     (f"{t}|{c}", f"{TIER_NAME[t]} · {cl}") for t in TIER_ORDER for c, cl in CTRL]
 TIER_COL = {"L-pool": "#ff7f0e", "L-d2d": "#ffbb78", "L-kill": "#e377c2", "L-drain": "#7f7f7f",
@@ -127,7 +128,7 @@ def figures(out, series, fig_dir):
         dm, nP, nD, share = series["S5"]
         h = dm.t / 3600
         keys = [k for k, _ in S5_ROWS]
-        fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 11), sharex=True, gridspec_kw={"height_ratios": [1, 3.6]})
+        fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 13), sharex=True, gridspec_kw={"height_ratios": [1, 4.6]})
         a1.stackplot(h, nP, nD, labels=["P 需求", "D 需求"], colors=["#ff9f40", "#4c9be8"], alpha=0.8)
         a1.set_ylabel("节点（α=1）")
         b = a1.twinx()
@@ -145,7 +146,7 @@ def figures(out, series, fig_dir):
             a2.axvline(s, color="k", lw=0.6, ls=":")
         a2.set_yticks(range(len(keys)))
         a2.set_yticklabels([lab for _, lab in S5_ROWS], fontsize=7)
-        for i in range(2, len(keys), 4):
+        for i in range(2, len(keys), len(CTRL)):
             a2.axhline(i - 0.5, color="#ccc", lw=0.5)
         a2.invert_yaxis()
         a2.set_xlabel("小时（测量段）")
@@ -350,7 +351,9 @@ def summary(out, path):
       "逐片收益 g_i = Θ(p) − Θ(当前)，Θ = min(P 侧能力 / P 需求, D 侧能力 / D 需求)（论文式 (5) 的流体版）；"
       "均值 > 2 × 标准误（ḡ > 2σ/√m）才合格，取 ḡ 最大的切换；上一次切换未完成（排空/权重回填）或距其开始不足 120 s 则跳过本窗口。"
       "滞后一窗：只看上一窗需求 × 1.05，当前组合承不住才换。两者都只用过去的观测；oracle 已知未来。\n")
-    a("goodput 相对静态最优 P:D（每格：oracle / 滞后一窗 / 判据·5 分钟 / 判据·10 分钟）：\n")
+    a("**余量与公平性**：1.05× 这类乘性余量对统计判据不起作用——Θ(p; 1.05P, 1.05D) = Θ(p; P, D)/1.05，逐片收益、均值和标准误同比缩放，"
+      "2σ 判据结果不变（已验证）。所以公平对照是把滞后一窗的余量也去掉（下表第 3 项“滞后·无余量”）。\n")
+    a("goodput 相对静态最优 P:D（每格：oracle / 滞后 1.05× / 滞后·无余量 / 判据·5 分钟 / 判据·10 分钟）：\n")
     a("| 档 | " + " | ".join(out["scenarios"]) + " |")
     a("|---|" + "---|" * len(out["scenarios"]))
     for t in TIER_ORDER:
@@ -359,7 +362,7 @@ def summary(out, path):
             b = r["policies"]["static-pd"]
             cells.append(" / ".join(_pct(r["tiers"][t][GP_KEY[c]] / b) for c, _ in CTRL))
         a(f"| {TIER_NAME[t]} | " + " | ".join(cells) + " |")
-    a("\n共同负载 α_ref = 静态最优 P:D 的 goodput 下，24h 切换节点次数 / 过载窗口数（每格：oracle / 滞后 / 判据·5 / 判据·10）：\n")
+    a("\n共同负载 α_ref = 静态最优 P:D 的 goodput 下，24h 切换节点次数 / 过载窗口数（每格：oracle / 滞后 1.05× / 滞后·无余量 / 判据·5 / 判据·10）：\n")
     a("| 档 | " + " | ".join(out["scenarios"]) + " |")
     a("|---|" + "---|" * len(out["scenarios"]))
     for t in TIER_ORDER:
@@ -369,6 +372,16 @@ def summary(out, path):
             cells.append(" / ".join(f"{x[c]['switches']}·{x[c]['over_windows']}" for c, _ in CTRL))
         a(f"| {TIER_NAME[t]} | " + " | ".join(cells) + " |")
     a("\n格式“切换节点次数·过载窗口数”；静态最优 P:D 在 α_ref 下的过载窗口按定义 ≤ 1%（≤ 2–3 个窗口）。\n")
+    sc_ = out["scenarios"]
+    def _g(s_, t, c):
+        return sc_[s_]["tiers"][t][GP_KEY[c]] / sc_[s_]["policies"]["static-pd"] - 1
+    if "S4" in sc_ and "S5" in sc_:
+        a("结论（逻辑+池档）：S4 上判据仍比两种滞后都差"
+          f"（判据 {_g('S4', 'L-pool', 'ei5'):+.1%} / {_g('S4', 'L-pool', 'ei10'):+.1%}，滞后 1.05× {_g('S4', 'L-pool', 'lag'):+.1%}，"
+          f"无余量 {_g('S4', 'L-pool', 'lag0'):+.1%}）；S5 上“判据更差”只相对带余量的滞后成立"
+          f"（判据 {_g('S5', 'L-pool', 'ei5'):+.1%} / {_g('S5', 'L-pool', 'ei10'):+.1%}，滞后 1.05× {_g('S5', 'L-pool', 'lag'):+.1%}，"
+          f"无余量 {_g('S5', 'L-pool', 'lag0'):+.1%}）。余量对滞后控制器很关键：它让控制器在需求逼近上限前就切，"
+          "相当于粗糙的前瞻；去掉后 S2 / S5 明显变差，S4（快漂移）反而因少切而变好。\n")
     a("![pd_controllers.png](figures/pd_controllers.png)\n")
 
     a("## 3c. 无池快切·丢 KV 重算档（对照 Evolving Infra 图 3a）\n")
@@ -392,6 +405,23 @@ def summary(out, path):
         a(f"| {k} | " + " / ".join(_pct(t[GP_KEY[c]] / b) for c, _ in CTRL) +
           f" | {_pct(r['tiers']['L-pool']['dyn-pd-lag'] / b)} | " + " / ".join(str(x[c]["switches"]) for c, _ in CTRL) +
           " | " + " / ".join(f"{x[c]['lost_reuse']:.2%}" for c, _ in CTRL) + f" | ≤{per:.1%} |")
+    a("\n**oracle 与重算**：oracle 选组合时计入已排队的重算，并逐窗检查候选组合自身切换带来的重算（只落在切换后 5 分钟）；"
+      "承不住时退回不计自身重算（接受一窗瞬态）。若只前瞻到切换完成（1 窗），oracle 会“踩点切”，重算突增正好落在没有余量的窗口，"
+      "S2 上反而略低于带 1.05× 余量、提前切的滞后控制器（+17.1% vs +17.8%）；本档 oracle 因此前瞻 15 分钟（3 窗），S2 回到 +17.8%。"
+      "有池各档前瞻加长无收益（S4 / S3 略降），保持原设。\n")
+    for s_, r in out["scenarios"].items():
+        scan = r["tiers"]["L-kill"].get("scan", {})
+        tol_w = Q.overload_tol * 24 * 3600 / Q.window
+        for c in ("ei5", "ei10"):
+            bad = [x for x in scan.get(c, []) if x[2] > tol_w]
+            osc = [x for x in scan.get(c, []) if x[1] > 20]
+            g = r["tiers"]["L-kill"][GP_KEY[c]] / r["policies"]["static-pd"] - 1
+            if bad and g < -0.1:
+                a(f"- {s_} 判据·{c[2:]} 分钟 goodput {g:+.1%} 而 α_ref 下切换 {r['tiers']['L-kill']['at_ref'][c]['switches']} 次："
+                  f"goodput 对负载非单调。扫描 α = 0.5–1.0 × α_ref：振荡（日切换 > 20 节点次）出现在 α = "
+                  f"{min(x[0] for x in osc):.2f}–{max(x[0] for x in osc):.2f}（{max(x[1] for x in osc)} 节点次/天），"
+                  f"过载超 1% 的是 α = {min(x[0] for x in bad):.2f}–{max(x[0] for x in bad):.2f}；更高负载上判据不再切换，直到 α_ref 附近才过载。"
+                  "低负载时两侧余量都大，Θ 对配比更敏感，切换带来的重算又被当成 prefill 需求上涨，诱发来回切；二分法 goodput 取到了这段低负载的边界。")
     a("\n“每切一个节点折合 1 小时复用”= 满载节点的重算量 / α_ref 下每小时命中省下的 NPU·s（实际按占用比例缩小）。"
       "全天丢失复用很小，是因为本模型里每天只切几次到几十次；代价主要体现在切换后 5 分钟的 prefill 突增（见 goodput 列）。\n")
     a("![pd_lost_reuse.png](figures/pd_lost_reuse.png)\n")
@@ -423,7 +453,8 @@ def summary(out, path):
         "流体模型只看窗口平均（5 分钟），不排队，不出 TTFT/TPOT 分位；“过载窗口”代表该窗口平均需求超过可用节点，窗口内的突发与尾延迟没算。",
         "decode 按 HBM 容量约束建模（KV 占用 ≤ 296 GB × 90%），每步耗时 25 ms 是 roofline 假设；混部节点 TPOT = t_step/(1−f)，均为假设，A3 无实测。",
         "命中率取 trace 的无限容量上限 h*，各配置相同（HBM 前缀缓存与 decode KV 争用 HBM 的效应未建模）；只有 sleep/wake + 池档按 PR #90 MRC 计入池收缩。",
-        "切换：oracle 已知未来需求，按切换耗时前瞻（组合要承得住切换完成前的需求峰值）；滞后控制器看上一窗需求 × 1.05。切换期间新角色不可用，排空档旧角色保留 50%。",
+        "goodput 用二分法求，默认对负载单调；丢 KV 重算档配判据时不单调（见 §3c），表中取的是二分到的边界（偏保守）。",
+        "切换：oracle 已知未来需求，按切换耗时前瞻（组合要承得住切换完成前的需求峰值；丢 KV 档前瞻 15 分钟）；滞后控制器看上一窗需求 × 1.05。切换期间新角色不可用，排空档旧角色保留 50%。",
         "E4 是满载 D 节点的静态快照，不含接收方 HBM 余量与网络争用；点对点迁移和池重读都按 16 NPU 链路带宽线性叠加（乐观）。",
         "无池档的命中率沿用有池口径（实际无池时命中更低，对无池偏乐观）；只有“丢 KV 重算”档计入切换造成的复用丢失，排空/点对点迁移档不计（论文里 Dynamo 也丢 5.1%）。",
         "丢 KV 重算档：重算量取 E4 满载快照 × 切换时刻 D 侧占用比例，摊在 5 分钟内（摊得更久则突增更小）；P→D 方向按同量计。",
