@@ -11,10 +11,11 @@ GB = 1e9
 class Params:
     # ---- 模型：DeepSeek-V4.1-Flash（HF deepseek-ai/DeepSeek-V4.1-Flash config.json + 技术报告）
     # CSA2 只有 kv_source_layers=[2,8,14,20] 存全局 KV，compress_ratios 依次为 2,2,2,1；
-    # 每个 entry = main KV 512 维 FP4 + 每 16 维一个 E4M3 scale（288 B）+ indexer K 128 维 FP4
-    # + 每 32 维一个 scale（68 B）= 356 B；3×356/2 + 356 = 890 B（= README/技术报告的 890 B/token）
-    kv_bytes_per_token: float = 3 * (288 + 68) / 2 + (288 + 68)            # 890 B
-    kv_bytes_per_token_bf16: float = 3 * (1024 + 256) / 2 + (1024 + 256)  # 3,200 B（同结构 BF16，敏感性）
+    # 每个 entry = main KV 512 维 + indexer K 128 维；主口径按 BF16 存（用户决定）：
+    # (1024 + 256) B，3×1280/2 + 1280 = 3,200 B
+    kv_bytes_per_token: float = 3 * (1024 + 256) / 2 + (1024 + 256)       # 3,200 B
+    # 官方 FP4 + E4M3 scale 存储：288 + 68 = 356 B/entry → 890 B（技术报告数字，仅作对照）
+    kv_bytes_per_token_fp4: float = 3 * (288 + 68) / 2 + (288 + 68)        # 890 B
     weights_bytes: float = 510.3e9       # HF safetensors 48 个分片合计（FP8 + FP4 专家 + Engram 表）
 
     # ---- 硬件：昇腾 A3，14 节点 × 16 NPU = 224（用户给定）

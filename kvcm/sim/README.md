@@ -1,6 +1,6 @@
 # KVCM trace 回放仿真（纯 CPU）
 
-用公开 agentic trace 回放 KV 缓存的访问序列，不跑模型，比较三类策略在 **DeepSeek-V4.1-Flash（公开规格，890 B/token）+ 昇腾 A3 224 NPU + HBM/DRAM 两层** 设定下的命中率（HBM 归推理引擎、纯 LRU、固定真实大小；KVCM 只管 DRAM 池；x 轴只扫池容量），再用 D8a §8.1/§8.2 的 TTFT 拟合换算成 TTFT 与等效 NPU 数。对应参考文章的数据类型 1.1（MRC）、1.2（lost KV reuse）、1.3（未命中 token）、1.4（TTFT）、1.6（等效卡数）、1.12（消融），见 Project 文档《参考文章的数据类型与获取方法》。
+用公开 agentic trace 回放 KV 缓存的访问序列，不跑模型，比较三类策略在 **DeepSeek-V4.1（即 V4.1-Flash，公开规格；KV 按 BF16 存，3,200 B/token）+ 昇腾 A3 224 NPU + HBM/DRAM 两层** 设定下的命中率（HBM 归推理引擎、纯 LRU、固定真实大小；KVCM 只管 DRAM 池；x 轴只扫池容量），再用 D8a §8.1/§8.2 的 TTFT 拟合换算成 TTFT 与等效 NPU 数。对应参考文章的数据类型 1.1（MRC）、1.2（lost KV reuse）、1.3（未命中 token）、1.4（TTFT）、1.6（等效卡数）、1.12（消融），见 Project 文档《参考文章的数据类型与获取方法》。
 
 - 参数与每项来源/假设：[`params.md`](params.md)（V4.1 模型规格取自官方 config / 技术报告；**A3 容量与 prefill 算力换算仍是假设，等待校正**）。
 - 结果与图：[`results/summary.md`](results/summary.md)（由脚本生成）。
@@ -41,7 +41,7 @@ PYTHONPATH=. python3 -m pytest tests -q                           # 回放器语
 
 - 会话按 Poisson 到达，每次到达从 trace 均匀抽一个会话、按原时间线整段回放；副本之间私有页加盐隔离，跨会话共享页（Codex 的公共 system prompt、Qwen 的公共前缀）保留，副本不会制造 trace 里不存在的复用。
 - 到达率按“理想命中下 prefill 占集群 NPU 时间 50%”校准（`results/calibration.json`）。
-- 仿真 1/k 集群：14 个实例不变，每实例 HBM、池容量与总负载同除以 k，NPU 数再乘回 k；主结果 k=32。对照（CC-256k，标称池，abs 阈值固定 11）：per-instance LRU 命中 k=32 为 95.81%、k=8 为 95.66%；shared-pool k=8 为 96.18%。路由失衡阈值不随 k 缩放（按 32/√k 缩放时 k=32 的 per-instance LRU 掉到 91.2%，是切片伪影）。
+- 仿真 1/k 集群：14 个实例不变，每实例 HBM、池容量与总负载同除以 k，NPU 数再乘回 k；主结果 k=32。对照（CC-256k，标称池，abs 阈值固定 11，在 FP4 890 B/token 口径下测）：per-instance LRU 命中 k=32 为 95.81%、k=8 为 95.66%；shared-pool k=8 为 96.18%。路由失衡阈值不随 k 缩放（按 32/√k 缩放时 k=32 的 per-instance LRU 掉到 91.2%，是切片伪影）。
 - 10 h 窗口，前 3 h 预热不计。
 
 ### 拓扑与策略
@@ -101,8 +101,8 @@ vLLM（生成 token 写满的块入 APC）与 SGLang（请求结束时整段插�
 
 ## 局限（读结果前必看）
 
-0. **上一版（commit 17c954d）模型有误**：HBM 与 DRAM 同比随 x 轴缩放，且 KVCM 的保活/预热会钉 HBM，越过了“HBM 归引擎”的职责边界，“其中 HBM”在策略间不同也来自这里。本版已改为 HBM 固定、引擎 LRU、各策略相同。更早两版还按 V4-Pro 布局假设 9,848 B/token，且下一轮从不命中上一轮输出；现改为官方 V4.1-Flash 890 B/token、decode KV 入缓存。
-1. **A3 数值与算力换算是假设**：V4.1 结构与 890 B/token 取自官方（V4.1 只公开了 Flash）；A3 HBM/DRAM 可用量、实例切分、950→A3 与 V4-Pro→V4.1 算力换算均未核实（见 `params.md`）。A3 若不能存 FP4 KV，BF16 口径为 3,200 B/token。命中率曲线只依赖“容量 / 负载”比和 bytes/token；TTFT 和 NPU 数还依赖算力换算。
+0. **上一版（commit 17c954d）模型有误**：HBM 与 DRAM 同比随 x 轴缩放，且 KVCM 的保活/预热会钉 HBM，越过了“HBM 归引擎”的职责边界，“其中 HBM”在策略间不同也来自这里。本版已改为 HBM 固定、引擎 LRU、各策略相同。更早两版还按 V4-Pro 布局假设 9,848 B/token，且下一轮从不命中上一轮输出；现改为官方 V4.1-Flash 结构、decode KV 入缓存；commit 5d63330 按官方 FP4 890 B/token 计，本版按用户决定改为 BF16 3,200 B/token。
+1. **A3 数值与算力换算是假设**：V4.1 结构取自官方（V4.1 只公开了 Flash），KV 按 BF16 存（3,200 B/token；官方 FP4 口径 890 B/token 为对照）；A3 HBM/DRAM 可用量、实例切分、950→A3 与 V4-Pro→V4.1 算力换算均未核实（见 `params.md`）。命中率曲线只依赖“容量 / 负载”比和 bytes/token；TTFT 和 NPU 数还依赖算力换算。
 2. **无排队**：TTFT 是同等每卡并发下的单请求时延，不含排队；命中率下降带来的排队放大没有算进去（真实收益偏保守还是偏乐观取决于工作点）。要 goodput / P95 排队需要 DES（参考文章 1.5）。
 3. **CC trace 的 block hash 只在会话内有效**，跨会话共享（同一 Claude Code system prompt、同一 subagent 模板）不可见，shared-pool 的去重收益被低估。
 4. **Codex 时间线是合成的**（trace 无时间戳），停顿与 hook 结果只能看作结构性的。

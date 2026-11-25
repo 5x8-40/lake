@@ -97,7 +97,7 @@ def fig_mrc(trace, runs):
     ax2.set_ylabel("lost KV reuse = 1 − h/h*（%，对数）")
     ax2.set_title("相对理想命中的损失", fontsize=10)
     fig.suptitle(TRACE_LABEL.get(trace, trace), fontsize=10)
-    fig.text(0.01, 0.01, f"[trace 回放] DeepSeek-V4.1-Flash（官方 890 B/token）· decode KV 入缓存（原样回传）· 昇腾 A3 224 NPU · HBM = 引擎 LRU "
+    fig.text(0.01, 0.01, f"[trace 回放] DeepSeek-V4.1（Flash）BF16 KV 3,200 B/token· decode KV 入缓存（原样回传）· 昇腾 A3 224 NPU · HBM = 引擎 LRU "
              f"{P.hbm_kv_per_inst / 1e9:.0f} GB/实例 × {P.n_inst}，各策略相同 · KVCM 只管池 · 单次运行",
              fontsize=7, color="#555")
     fig.tight_layout(rect=(0, 0.13, 1, 0.95))
@@ -241,7 +241,7 @@ def main():
           "由 `python3 -m kvcm_sim.report` 从 `results/*.json` 生成；参数与假设见 [`../params.md`](../params.md)，方法见 [`../README.md`](../README.md)。",
           "全部为 **[trace 回放] + [解析]**，每个点单次运行（seed=1），无真机校准。", "",
           f"模型：{MODEL_NOTE}x 轴与表中“池容量”只指 DRAM 池（标称 {NOMINAL_TB:.0f} TB = 14 节点 × 1 TB）。", "",
-          f"模型规格：DeepSeek-V4.1-Flash 官方 config / 技术报告，全局 KV {P.kv_bytes_per_token:.0f} B/token；"
+          f"模型规格：DeepSeek-V4.1（即 V4.1-Flash）官方 config / 技术报告，全局 KV 按 BF16 存储 {P.kv_bytes_per_token:,.0f} B/token（官方 FP4 口径为 890 B）；"
           "decode 写出的 KV 入缓存，主结果按“下一轮原样回传上一轮输出（含思维链）”计命中，"
           "末尾附“剥掉思维链”下界对照。", ""]
     cal = json.load(open(os.path.join(RES, "calibration.json"))) if os.path.exists(os.path.join(RES, "calibration.json")) else {}

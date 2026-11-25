@@ -10,9 +10,10 @@ DeepSeek V4.1 目前公开的只有 **DeepSeek-V4.1-Flash**（Hugging Face `deep
 |---|---|---|
 | 规模 | 552B backbone（另有 Engram 196B）；prefill 激活 8B、decode 激活 16B；40 层（20 层 causal encoder + 20 层 decoder，CED）+ 3 层 MTP | HF README「Introduction」+ 技术报告摘要 |
 | 全局 KV 结构 | CSA2：只有 `kv_source_layer_ids = [2, 8, 14, 20]` 4 层存 main KV 与 indexer K，其余层 Reindex/Reuse 共享；这 4 层 `compress_ratios` = 2, 2, 2, 1 | `config.json` `text_config`；`inference/model.py` `Compressor` / `Indexer`（`owns_k = layer_id in kv_source_layers`） |
-| 每 entry 字节 | main KV 512 维 FP4（E2M1）+ 每 16 维一个 E4M3 scale = 288 B；indexer K 128 维 FP4 + 每 32 维一个 scale = 68 B；合计 356 B | `inference/model.py`（main latent `fp4_act_quant(latent, 16, …, float8_e4m3fn)`，indexer `fp4_act_quant(k, fp4_block_size=32)`）；README「FP4 main KV caching (E2M1, one E4M3 scale per 16 channels)」 |
-| **全局 KV bytes/token** | **890 B**（= 3 × 356 / 2 + 356） | 由上两行推导，与 README / 技术报告给出的 “890 bytes per token” 一致 |
-| 同上（BF16 存储敏感性） | 3,200 B（同结构 BF16：3 × 1280 / 2 + 1280） | 推导；A3 若不能存 FP4 KV 时的口径，**未进主结果** |
+| 每 entry 字节（**主口径 BF16**） | main KV 512 维 × 2 B = 1,024 B；indexer K 128 维 × 2 B = 256 B；合计 1,280 B | 用户决定（2026-11-25）按 BF16 存 KV；维度取自 `config.json` `text_config`（`head_dim` 512、`index_head_dim` 128）；结构同下行 FP4，只换存储精度 |
+| 每 entry 字节（官方 FP4，对照） | main KV 512 维 FP4（E2M1）+ 每 16 维一个 E4M3 scale = 288 B；indexer K 128 维 FP4 + 每 32 维一个 scale = 68 B；合计 356 B | `inference/model.py`（main latent `fp4_act_quant(latent, 16, …, float8_e4m3fn)`，indexer `fp4_act_quant(k, fp4_block_size=32)`）；README「FP4 main KV caching (E2M1, one E4M3 scale per 16 channels)」 |
+| **全局 KV bytes/token（主口径）** | **3,200 B**（BF16：3 × 1,280 / 2 + 1,280） | 由上面几行推导；**主结果按此计** |
+| 同上（官方 FP4，对照） | 890 B（= 3 × 356 / 2 + 356） | 与 README / 技术报告给出的 “890 bytes per token” 一致；commit 5d63330 的结果按此口径，未进本版主结果 |
 | SWA KV | 每层 128 token 窗口，**不入持久 KV**，放在每机 10% DRAM 的短 TTL 池；缺失时 Encoder SWA Bounded Replay 只重算最后 `n_win` 个 token | 技术报告 §3.2.1–§3.2.2；**仿真忽略**（与前缀命中无关，重算 128 token 的开销在回放精度以内） |
 | 权重 | 510 GB | HF safetensors 48 个分片合计（FP8 主体 + FP4 专家 + Engram 表；按全部放 HBM 计，偏保守） |
 
@@ -24,8 +25,8 @@ DeepSeek V4.1 目前公开的只有 **DeepSeek-V4.1-Flash**（Hugging Face `deep
 | HBM / NPU | 64 GB | **假设**：910C 每芯片 128 GB、2 die，按 die 计 NPU（16 NPU/节点 = 8 芯片） |
 | 实例切分 | 1 节点 / 实例（16 NPU），共 14 个实例；PD 混部 | **假设**：510 GB 权重单节点（1 TB HBM）放得下，按最小可放切分 |
 | 激活 / workspace 预留 | 4 GB / NPU | **假设** |
-| HBM KV / 实例 | **450 GB**（= 16 × (64 − 31.9 权重 − 4 预留)）；全集群 6.3 TB ≈ 71 亿 token | 由上面几项推导 |
-| DRAM KV / 节点 | **1 TB**；全集群池 14 TB ≈ 157 亿 token | **假设**（Atlas 800T A3 主机内存配置与 KV 可用比例待确认） |
+| HBM KV / 实例 | **450 GB**（= 16 × (64 − 31.9 权重 − 4 预留)）；每实例 ≈ 1.41 亿 token，全集群 6.3 TB ≈ 19.7 亿 token（BF16） | 由上面几项推导 |
+| DRAM KV / 节点 | **1 TB**；全集群池 14 TB ≈ 43.8 亿 token（BF16） | **假设**（Atlas 800T A3 主机内存配置与 KV 可用比例待确认） |
 | 本机 DRAM→HBM 带宽 | 86 GB/s | `kvcm/design/D8a-scheduling-algorithms.md` §9.1 A3 910C FabricMem 机内 rH2D（AICPU 展开）下限 |
 | 跨节点池→HBM 带宽 | 78 GB/s；敏感性 23.8 GB/s | 同上 §9.1：FabricMem 跨机 rH2D 下限；ROCE rH2D |
 | 存储层 | 只有 HBM + DRAM，无 SSD | 用户给定 |
