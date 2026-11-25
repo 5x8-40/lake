@@ -64,6 +64,24 @@ def scenarios(cc, qw):
     a = lambda t: 0.5 + 0.40 * np.sin(2 * np.pi * np.asarray(t, float) / (2 * HOURS))
     ra, rb = F.mix_rates(tot, a, dcc, dqw)
     sc.append(F.Scenario("S4", "【注入】配比快速变化：同 S2 幅度，周期 2h", True, [(cc, ra), (qw, rb)]))
+    # S5：P 占比阶跃。CC 需求占比 a 与 P 占比 s 近似线性：s ≈ a·s_cc + (1−a)·s_qw
+    s_cc = d_node["cc256k"][0] / dcc
+    s_qw = d_node["qwen_coder"][0] / dqw
+    a_of = lambda s_: (s_qw - s_) / (s_qw - s_cc)
+    wu = 8 * HOURS
+    steps = (2 * HOURS, 6 * HOURS, 10 * HOURS, 14 * HOURS, 18 * HOURS, 22 * HOURS)
+    a = F.step_fn(a_of(0.5), a_of(0.8), [wu + x for x in steps[0::2]], [wu + x for x in steps[1::2]])
+    ra = lambda t, a=a: tot * a(t) / dcc
+    # CC 会话长、需求滞后于到达率；按 CC 实际需求补 Qwen（会话短、需求跟随到达率），使总需求≈恒定
+    probe = F.Scenario("S5cc", "", True, [(cc, ra)], warmup=0.0)
+    dm_c = F.build_demand(probe, Q)
+    nPc, nDc = F.need(dm_c, Q, 1.0)
+    tc = dm_c.t + Q.window / 2
+    fill = np.maximum(0.0, tot - (nPc + nDc))
+    rb = lambda t, tc=tc, fill=fill: np.interp(np.asarray(t, float), tc, fill) / dqw
+    sc.append(F.Scenario("S5", "【注入】配比阶跃：CC 到达率阶跃（P 占比目标 0.5→0.8，5 分钟斜坡，持续 4h 再跳回，24h 内 3 次），"
+                         "Qwen coder 按 CC 实际需求补齐，总需求≈恒定",
+                         True, [(cc, ra), (qw, rb)], steps=steps))
     a = lambda t: 0.5 + 0.40 * np.sin(2 * np.pi * np.asarray(t, float) / F.DAY)
     env = lambda t: 1.0 + (1 / 3) * np.sin(2 * np.pi * np.asarray(t, float) / F.DAY + np.pi / 2)
     ra, rb = F.mix_rates(tot, a, dcc, dqw)
@@ -100,6 +118,26 @@ def sensitivity(scs, e4, shrink):
             rows.append(r)
             print("sens", json.dumps({k: (round(v, 3) if isinstance(v, float) else v) for k, v in r.items()}, ensure_ascii=False))
     return rows
+
+
+def step_analysis(sc, dm, pol, e4, shrink):
+    """S5：在共同负载 α* = 0.95 × 理想动态 P:D goodput 下，逐次阶跃统计过载。"""
+    a = 0.95 * pol["dyn-pd-oracle@ideal"]
+    W = Q.window
+    rows = {}
+    rows["static-pd"] = F.static_best(dm, Q, a, mixed=False)
+    rows["static-best3"] = F.static_best(dm, Q, a, mixed=True)
+    rows["static-mixed"] = F.static_best(dm, Q, a, only=[(0, 0, Q.n_nodes)])
+    for tr in tiers(e4, shrink, dm):
+        rows[f"{tr.name}|oracle"] = F.dynamic(dm, Q, a, tr)
+        rows[f"{tr.name}|lag"] = F.dynamic(dm, Q, a, tr, oracle=False)
+    out = {"alpha": a, "steps_h": [x / HOURS for x in sc.steps], "policies": {}}
+    for k, r in rows.items():
+        ps = F.per_step(r["ov"], dm.t, sc.steps, W)
+        out["policies"][k] = {"total_over_windows": int(r["ov"].sum()), "switches": r.get("switches", 0),
+                              "alloc": list(r["alloc"]) if "alloc" in r else None, "per_step": ps,
+                              "ov": r["ov"].astype(int).tolist()}
+    return out
 
 
 def tiers(e4, shrink, dm, q=Q):
@@ -176,6 +214,8 @@ def main():
         res["static_best3_alloc"] = F.static_best(dm, Q, pol["static-best3"], mixed=True)["alloc"]
         out["scenarios"][sc.name] = res
         series[sc.name] = (dm, nP, nD, share)
+        if sc.steps:
+            out["s5_steps"] = step_analysis(sc, dm, pol, e4, shrink)
         print(f"[{sc.name}] {time.time() - t0:.0f}s", json.dumps({k: round(v, 3) for k, v in pol.items()}),
               {k: round(v["dyn-pd-lag"], 3) for k, v in res["tiers"].items()})
     out["sensitivity"] = sensitivity(scs, e4, shrink)

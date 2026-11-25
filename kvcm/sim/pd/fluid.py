@@ -33,6 +33,7 @@ class Scenario:
     pops: list            # [(Sessions, rate_fn(t) -> sessions/s)]
     warmup: float = 8 * 3600
     horizon: float = 32 * 3600
+    steps: tuple = ()     # 阶跃时刻（测量段内，秒）
 
 
 @dataclass
@@ -130,7 +131,8 @@ def static_best(dm, q, alpha, p_mult=1.0, mixed=True, only=None):
         r = 1.0 - ok.mean()
         if best is None or r < best[0]:
             best = (r, c)
-    return {"overload": best[0], "alloc": best[1], "switches": 0}
+    c = best[1]
+    return {"overload": best[0], "alloc": c, "switches": 0, "ov": ~feasible(c[0], c[1], c[2], P, D, q)}
 
 
 @dataclass
@@ -160,6 +162,7 @@ def dynamic(dm, q, alpha, tier: Tier, mixed=False, oracle=True, headroom=1.05):
     cur = np.array(static_best(dm, q, alpha, tier.p_mult, mixed)["alloc"], dtype=float)
     pend = []                 # [(role_idx, start_offset_s, dur_s, sign)] 结转到后续窗口的能力增减
     over = 0
+    ov = np.zeros(len(P), bool)
     sw = 0
     lost_ns = 0.0
     look = int(math.ceil(max(tier.t_dp, tier.t_pd) / W))
@@ -214,8 +217,9 @@ def dynamic(dm, q, alpha, tier: Tier, mixed=False, oracle=True, headroom=1.05):
         eff = np.maximum(eff, 0)
         if not feasible(eff[0], eff[1], eff[2], P[w], D[w], q):
             over += 1
+            ov[w] = True
     n = len(P)
-    return {"overload": over / n, "switches": sw, "lost_node_s": lost_ns}
+    return {"overload": over / n, "switches": sw, "lost_node_s": lost_ns, "ov": ov}
 
 
 def goodput(fn, tol, lo=0.05, hi=4.0, it=26):
@@ -250,3 +254,39 @@ def mix_rates(r_tot, a_fn, d_a, d_b):
     ra = lambda t: r_tot * a_fn(t) / d_a
     rb = lambda t: r_tot * (1.0 - a_fn(t)) / d_b
     return ra, rb
+
+
+def step_fn(lo, hi, ups, downs, ramp=300.0):
+    """分段常数 + 线性斜坡：在 ups 时刻 lo→hi，downs 时刻 hi→lo（绝对时间，秒），斜坡 ramp 秒。"""
+    def f(t):
+        t = np.asarray(t, float)
+        x = np.zeros_like(t)
+        for u, d in zip(ups, downs):
+            x += np.clip((t - u) / ramp, 0, 1) - np.clip((t - d) / ramp, 0, 1)
+        return lo + (hi - lo) * x
+    return f
+
+
+def per_step(ov, t, steps, W):
+    """每次阶跃后（到下一次阶跃前）的过载窗口数与首段连续过载时长（分钟）。"""
+    rows = []
+    bounds = list(steps) + [t[-1] + W]
+    for k, s in enumerate(steps):
+        m = (t >= s) & (t < bounds[k + 1])
+        seg = ov[m]
+        run = 0
+        for x in seg:
+            if not x:
+                break
+            run += 1
+        # 首段：阶跃后第一次出现过载起的连续过载
+        first = 0
+        if seg.any():
+            i0 = int(np.argmax(seg))
+            for x in seg[i0:]:
+                if not x:
+                    break
+                first += 1
+        rows.append({"step_h": s / 3600, "over_windows": int(seg.sum()), "over_min": float(seg.sum() * W / 60),
+                     "first_run_min": float(first * W / 60)})
+    return rows

@@ -39,6 +39,22 @@ TIER_SHORT = {
 }
 
 
+S5_ROWS = [
+    ("static-pd", "静态最优 P:D"),
+    ("static-best3", "静态最优 P/D/混部"),
+    ("L-pool|oracle", "逻辑+池 · oracle"),
+    ("L-pool|lag", "逻辑+池 · 滞后"),
+    ("L-d2d|oracle", "逻辑+点对点 · oracle"),
+    ("L-d2d|lag", "逻辑+点对点 · 滞后"),
+    ("L-drain|oracle", "逻辑+排空 · oracle"),
+    ("L-drain|lag", "逻辑+排空 · 滞后"),
+    ("S-pool|oracle", "sleep/wake+池 · oracle"),
+    ("S-pool|lag", "sleep/wake+池 · 滞后"),
+    ("S-drain|oracle", "sleep/wake+排空 · oracle"),
+    ("S-drain|lag", "sleep/wake+排空 · 滞后"),
+]
+
+
 def figures(out, series, fig_dir):
     os.makedirs(fig_dir, exist_ok=True)
     paths = []
@@ -108,6 +124,58 @@ def figures(out, series, fig_dir):
     fig.savefig(p, dpi=130)
     plt.close(fig)
     paths.append(p)
+
+    # S5：阶跃时间线 + 过载栅格；逐次阶跃过载分钟
+    if "s5_steps" in out and "S5" in series:
+        st = out["s5_steps"]
+        dm, nP, nD, share = series["S5"]
+        h = dm.t / 3600
+        keys = [k for k, _ in S5_ROWS]
+        fig, (a1, a2) = plt.subplots(2, 1, figsize=(11, 6.5), sharex=True, gridspec_kw={"height_ratios": [1, 1.6]})
+        a1.stackplot(h, nP, nD, labels=["P 需求", "D 需求"], colors=["#ff9f40", "#4c9be8"], alpha=0.8)
+        a1.set_ylabel("节点（α=1）")
+        b = a1.twinx()
+        b.plot(h, share, color="#c00", lw=1.3)
+        b.set_ylim(0, 1)
+        b.set_ylabel("P 占比", color="#c00")
+        for s in st["steps_h"]:
+            a1.axvline(s, color="k", lw=0.6, ls=":")
+        a1.legend(loc="lower left", fontsize=8)
+        a1.set_title(out["scenarios"]["S5"]["label"], fontsize=9, loc="left")
+        for i, k in enumerate(keys):
+            ov = np.array(st["policies"][k]["ov"], bool)
+            a2.scatter(h[ov], np.full(ov.sum(), i), marker="|", s=90, color="#d62728")
+        for s in st["steps_h"]:
+            a2.axvline(s, color="k", lw=0.6, ls=":")
+        a2.set_yticks(range(len(keys)))
+        a2.set_yticklabels([lab for _, lab in S5_ROWS], fontsize=8)
+        a2.invert_yaxis()
+        a2.set_xlabel("小时（测量段）")
+        a2.set_title(f"过载窗口（红色竖线，5 分钟/格），共同负载 α*={st['alpha']:.3f}", fontsize=9, loc="left")
+        fig.tight_layout()
+        p = os.path.join(fig_dir, "pd_s5_timeline.png")
+        fig.savefig(p, dpi=130)
+        plt.close(fig)
+        paths.append(p)
+
+        fig, ax = plt.subplots(figsize=(11, 4.2))
+        nst = len(st["steps_h"])
+        bars = [(k, lab) for k, lab in S5_ROWS if not k.endswith("|oracle")]
+        cols = ["#1f77b4", "#17becf", "#ff7f0e", "#ffbb78", "#7f7f7f", "#9467bd", "#c5b0d5"]
+        w = 0.8 / len(bars)
+        for i, (k, lab) in enumerate(bars):
+            vals = [r["over_min"] for r in st["policies"][k]["per_step"]]
+            ax.bar(np.arange(nst) + (i - len(bars) / 2 + 0.5) * w, vals, w, label=lab, color=cols[i])
+        ax.set_xticks(np.arange(nst))
+        ax.set_xticklabels([f"{'↑' if j % 2 == 0 else '↓'} {s:.0f}h" for j, s in enumerate(st["steps_h"])])
+        ax.set_ylabel("该段过载分钟")
+        ax.set_title("S5 每次阶跃后（到下次阶跃前）的过载分钟（动态均为滞后控制器；oracle 各档几乎为 0，见表）；↑ = P 占比升高，↓ = 回落", fontsize=9)
+        ax.legend(fontsize=8, ncol=4, loc="upper center", bbox_to_anchor=(0.5, -0.12))
+        fig.tight_layout()
+        p = os.path.join(fig_dir, "pd_s5_steps.png")
+        fig.savefig(p, dpi=130)
+        plt.close(fig)
+        paths.append(p)
 
     # 4. E4：一次 D→P 切换
     fig, axes = plt.subplots(1, 2, figsize=(10, 3.6))
@@ -193,6 +261,28 @@ def summary(out, path):
         a(f"| {first['tiers'][t]['label']} | " + " | ".join(
             _pct(r["tiers"][t]["dyn-3-oracle"] / r["policies"]["static-pd"]) for r in out["scenarios"].values()) + " |")
     a("\n![pd_tiers.png](figures/pd_tiers.png)\n")
+
+    if "s5_steps" in out:
+        st = out["s5_steps"]
+        r5 = out["scenarios"]["S5"]
+        a("## 3a. S5 配比阶跃：每次阶跃后的过载（有池 vs 无池）\n")
+        a(f"场景：{r5['label']}。实际 P 占比 {r5['p_share_min']:.2f}–{r5['p_share_max']:.2f}，总量 CV {r5['total_cv']:.1%}。"
+          "CC 会话长（中位约 1.8 小时），到达率阶跃后 CC 需求要逐步衰减/累积，P 占比实际约 45–60 分钟完成大部分变化，不是几分钟；"
+          "Qwen 到达率按 CC 实际需求补齐（同一 seed 先单跑 CC 求需求），保证总需求≈恒定。\n")
+        a(f"统计口径：所有策略在同一负载 α* = 0.95 × 理想动态 P:D goodput = {st['alpha']:.3f} 下比较；"
+          "“过载窗口”= 该 5 分钟窗口平均需求超过可用节点；每格为“该阶跃到下一次阶跃之间的过载窗口数 / 首段连续过载分钟”。\n")
+        hdr = " | ".join(f"{'↑' if j % 2 == 0 else '↓'}{s:.0f}h" for j, s in enumerate(st["steps_h"]))
+        a(f"| 策略 | 全天过载窗口 | 切换节点次数 | {hdr} |")
+        a("|---|---:|---:|" + "---:|" * len(st["steps_h"]))
+        for k, lab in S5_ROWS:
+            v = st["policies"][k]
+            cells = " | ".join(f"{r['over_windows']} / {r['first_run_min']:.0f}" for r in v["per_step"])
+            a(f"| {lab} | {v['total_over_windows']} | {v['switches']} | {cells} |")
+        a(f"| 静态全混部 | {st['policies']['static-mixed']['total_over_windows']} | 0 | " + " | ".join(
+            f"{r['over_windows']} / {r['first_run_min']:.0f}" for r in st["policies"]["static-mixed"]["per_step"]) + " |")
+        a("\n↑ = P 占比升高（D→P 方向切换，慢的那一侧）；↓ = 回落（P→D）。sleep/wake+池 档的过载里有一部分来自 host 权重副本挤占池导致的 prefill 增量（×1.03–1.13），不全是切换时延。\n")
+        a("![pd_s5_timeline.png](figures/pd_s5_timeline.png)\n")
+        a("![pd_s5_steps.png](figures/pd_s5_steps.png)\n")
 
     a("## 4. E4：一次 D→P 切换的代价（P95，满载 D 节点快照）\n")
     a("| trace | 节点 KV (GB) | 在途条数 | 无池·排空 (s) | 无池·点对点迁移 (s) | 无池·杀掉重算 (NPU·s) | KVCM 池·刷尾页 (s) | KVCM 池·接收方重读 (节点·s) | 单请求重读停顿 P95 (ms) |")
