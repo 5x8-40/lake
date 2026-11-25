@@ -1,0 +1,751 @@
+{
+ "params": {
+  "kv_bytes_per_token": 3200.0,
+  "hbm_kv_per_node": 296000000000.0,
+  "host_weight_copy": 510000000000.0,
+  "n_nodes": 14,
+  "npu_per_node": 16,
+  "t_step": 0.025,
+  "tpot_slo": 0.05,
+  "kv_fill": 0.9,
+  "rho_p": 0.8,
+  "t_weights_sleep": 30.0,
+  "t_p_drain": 2.0,
+  "bw_flush_per_npu": 54000000000.0,
+  "bw_pool_read_per_npu": 78000000000.0,
+  "bw_d2d_per_npu": 23800000000.0,
+  "page_tokens": 512,
+  "window": 300.0,
+  "overload_tol": 0.01
+ },
+ "f_mixed": 0.5,
+ "d_node_per_session": {
+  "cc256k": [
+   4.333430626968997,
+   5.410498556261987
+  ],
+  "qwen_coder": [
+   0.021371542202003154,
+   0.0027570010377111947
+  ]
+ },
+ "r_cc_ref_per_s": 1.2315360440685106,
+ "pool_shrink": {
+  "cc256k": {
+   "f_after": 0.49,
+   "npu_busy_f1": 144.73194666159281,
+   "npu_busy_after": 163.44212389182,
+   "mult": 1.1292746878750595
+  },
+  "qwen_coder": {
+   "f_after": 0.49,
+   "npu_busy_f1": 114.46708063508147,
+   "npu_busy_after": 118.09519222296153,
+   "mult": 1.0316956767635788
+  }
+ },
+ "e4": {
+  "cc256k": {
+   "seqs": {
+    "p50": 693.0,
+    "p95": 716.0,
+    "max": 737.0
+   },
+   "kv_gb": {
+    "p50": 266.6205814834757,
+    "p95": 266.9540636510072,
+    "max": 267.13390887970866
+   },
+   "drain_s": {
+    "p50": 1102.2071359066854,
+    "p95": 1439.3255443308728,
+    "max": 1487.7114633059975
+   },
+   "d2d_s": {
+    "p50": 0.7001590900301358,
+    "p95": 0.7010348310163004,
+    "max": 0.7015071136546972
+   },
+   "recompute_npu_s": {
+    "p50": 6354.512033590028,
+    "p95": 6390.138235112453,
+    "max": 6418.721597775269
+   },
+   "pool_flush_s": {
+    "p50": 0.0006555353449711838,
+    "p95": 0.0006900242663679497,
+    "max": 0.0007231516836467187
+   },
+   "pool_reload_stall_s_p95": {
+    "p50": 0.009599724799325474,
+    "p95": 0.009789367081308028,
+    "max": 0.009924303042385303
+   },
+   "pool_reload_node_s": {
+    "p50": 0.2136382864450927,
+    "p95": 0.2139054997203583,
+    "max": 0.21404960647412555
+   }
+  },
+  "qwen_coder": {
+   "seqs": {
+    "p50": 11932.5,
+    "p95": 12074.0,
+    "max": 12164.0
+   },
+   "kv_gb": {
+    "p50": 266.41365364320944,
+    "p95": 266.44281107615507,
+    "max": 266.5045593093523
+   },
+   "drain_s": {
+    "p50": 824.2341979110403,
+    "p95": 871.2134176983395,
+    "max": 875.6888253440197
+   },
+   "d2d_s": {
+    "p50": 0.6996156870882602,
+    "p95": 0.6996922559772979,
+    "max": 0.6998544099510303
+   },
+   "recompute_npu_s": {
+    "p50": 5641.102364026545,
+    "p95": 5647.387880850539,
+    "max": 5650.859033324045
+   },
+   "pool_flush_s": {
+    "p50": 0.011305246678017043,
+    "p95": 0.01146349864443092,
+    "max": 0.011610818483709975
+   },
+   "pool_reload_stall_s_p95": {
+    "p50": 0.0006558287899713415,
+    "p95": 0.0006646771982481253,
+    "max": 0.0006745607468006044
+   },
+   "pool_reload_node_s": {
+    "p50": 0.2134724788807768,
+    "p95": 0.21349584220845755,
+    "max": 0.21354531995941692
+   }
+  }
+ },
+ "scenarios": {
+  "S0": {
+   "label": "平稳：CC 会话 Poisson 到达（PR #90 方式，未注入）",
+   "injected": false,
+   "mean_nodes": 10.005259226696703,
+   "peak_nodes": 11.382018688888262,
+   "p_share_min": 0.4228495319905008,
+   "p_share_max": 0.4632748648743028,
+   "closed_form_overprov": 0.04042533288380201,
+   "total_cv": 0.057180044868460546,
+   "policies": {
+    "static-pd": 1.2111895196139812,
+    "static-mixed": 1.3880254372954366,
+    "static-best3": 1.3880254372954366,
+    "dyn-pd-oracle@ideal": 1.2111895196139812,
+    "dyn-3-oracle@ideal": 1.3880254372954366
+   },
+   "tiers": {
+    "L-pool": {
+     "label": "同布局逻辑切换 + KVCM 池（丢弃后从池重读）",
+     "dyn-pd-oracle": 1.2111895196139812,
+     "dyn-pd-lag": 1.2111895196139812,
+     "dyn-3-oracle": 1.3880254372954366,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 2.2145955239867265,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-d2d": {
+     "label": "同布局逻辑切换 + 无池点对点迁移（需引擎支持）",
+     "dyn-pd-oracle": 1.2111895196139812,
+     "dyn-pd-lag": 1.2111895196139812,
+     "dyn-3-oracle": 1.3880254372954366,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 2.7010348310163,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-drain": {
+     "label": "同布局逻辑切换 + 无池排空（等在途跑完）",
+     "dyn-pd-oracle": 1.2111895196139812,
+     "dyn-pd-lag": 1.2111895196139812,
+     "dyn-3-oracle": 1.3880254372954366,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 1439.3255443308728,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "S-pool": {
+     "label": "PR #89 sleep/wake + host H2D + KVCM 池（host 副本挤占池）",
+     "dyn-pd-oracle": 1.128603221476078,
+     "dyn-pd-lag": 1.117897015810013,
+     "dyn-3-oracle": 1.3190092168748375,
+     "switches_at_lag_goodput": 2,
+     "t_dp": 32.21459552398672,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.1292746878750595
+    },
+    "S-drain": {
+     "label": "PR #89 sleep/wake + host H2D + 无池排空",
+     "dyn-pd-oracle": 1.2111895196139812,
+     "dyn-pd-lag": 1.2111895196139812,
+     "dyn-3-oracle": 1.3880254372954366,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 1469.3255443308728,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.0
+    }
+   },
+   "static_pd_alloc": [
+    6,
+    8,
+    0
+   ],
+   "static_best3_alloc": [
+    0,
+    0,
+    14
+   ]
+  },
+  "S1": {
+   "label": "【注入】总量变化：CC 到达率按 24h 正弦，峰谷 2:1，配比不变",
+   "injected": true,
+   "mean_nodes": 10.090342573757502,
+   "peak_nodes": 13.745754504039603,
+   "p_share_min": 0.42510817656613276,
+   "p_share_max": 0.4608517842356294,
+   "closed_form_overprov": 0.035743607669496635,
+   "total_cv": 0.199725521182425,
+   "policies": {
+    "static-pd": 0.9792530827224255,
+    "static-mixed": 1.1285892717540265,
+    "static-best3": 1.1285892717540265,
+    "dyn-pd-oracle@ideal": 0.9792530827224255,
+    "dyn-3-oracle@ideal": 1.1285892717540265
+   },
+   "tiers": {
+    "L-pool": {
+     "label": "同布局逻辑切换 + KVCM 池（丢弃后从池重读）",
+     "dyn-pd-oracle": 0.9792530827224255,
+     "dyn-pd-lag": 0.9792530827224255,
+     "dyn-3-oracle": 1.1285892717540265,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 2.2145955239867265,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-d2d": {
+     "label": "同布局逻辑切换 + 无池点对点迁移（需引擎支持）",
+     "dyn-pd-oracle": 0.9792530827224255,
+     "dyn-pd-lag": 0.9792530827224255,
+     "dyn-3-oracle": 1.1285892717540265,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 2.7010348310163,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-drain": {
+     "label": "同布局逻辑切换 + 无池排空（等在途跑完）",
+     "dyn-pd-oracle": 0.9792530827224255,
+     "dyn-pd-lag": 0.9792530827224255,
+     "dyn-3-oracle": 1.1285892717540265,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 1439.3255443308728,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "S-pool": {
+     "label": "PR #89 sleep/wake + host H2D + KVCM 池（host 副本挤占池）",
+     "dyn-pd-oracle": 0.9187996372580526,
+     "dyn-pd-lag": 0.9187996372580526,
+     "dyn-3-oracle": 1.074485068768263,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 32.21459552398672,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.1292746878750595
+    },
+    "S-drain": {
+     "label": "PR #89 sleep/wake + host H2D + 无池排空",
+     "dyn-pd-oracle": 0.9792530827224255,
+     "dyn-pd-lag": 0.9792530827224255,
+     "dyn-3-oracle": 1.1285892717540265,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 1469.3255443308728,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.0
+    }
+   },
+   "static_pd_alloc": [
+    6,
+    8,
+    0
+   ],
+   "static_best3_alloc": [
+    0,
+    0,
+    14
+   ]
+  },
+  "S2": {
+   "label": "【注入】配比变化（强）：总需求≈恒定，CC 需求占比 50%±40% 按 24h 正弦，其余为 Qwen coder",
+   "injected": true,
+   "mean_nodes": 11.207033527124743,
+   "peak_nodes": 13.288001625340106,
+   "p_share_min": 0.48816913415362156,
+   "p_share_max": 0.816076580450811,
+   "closed_form_overprov": 0.32790744629718943,
+   "total_cv": 0.11526079280215018,
+   "policies": {
+    "static-pd": 0.8502517625689506,
+    "static-mixed": 0.8266336470842361,
+    "static-best3": 1.1087988540530205,
+    "dyn-pd-oracle@ideal": 1.0120942011475562,
+    "dyn-3-oracle@ideal": 1.1087988540530205
+   },
+   "tiers": {
+    "L-pool": {
+     "label": "同布局逻辑切换 + KVCM 池（丢弃后从池重读）",
+     "dyn-pd-oracle": 1.0120942011475562,
+     "dyn-pd-lag": 1.0036995880305766,
+     "dyn-3-oracle": 1.1087988540530205,
+     "switches_at_lag_goodput": 5,
+     "t_dp": 2.2145955239867265,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-d2d": {
+     "label": "同布局逻辑切换 + 无池点对点迁移（需引擎支持）",
+     "dyn-pd-oracle": 1.0120942011475562,
+     "dyn-pd-lag": 1.0036995880305766,
+     "dyn-3-oracle": 1.1087988540530205,
+     "switches_at_lag_goodput": 5,
+     "t_dp": 2.7010348310163,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-drain": {
+     "label": "同布局逻辑切换 + 无池排空（等在途跑完）",
+     "dyn-pd-oracle": 0.9933795012533662,
+     "dyn-pd-lag": 0.9875001937150953,
+     "dyn-3-oracle": 1.1039060920476913,
+     "switches_at_lag_goodput": 5,
+     "t_dp": 1439.3255443308728,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "S-pool": {
+     "label": "PR #89 sleep/wake + host H2D + KVCM 池（host 副本挤占池）",
+     "dyn-pd-oracle": 0.9736520633101461,
+     "dyn-pd-lag": 0.9698677450418471,
+     "dyn-3-oracle": 1.0708383053541184,
+     "switches_at_lag_goodput": 5,
+     "t_dp": 32.21459552398672,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.0671110688019518
+    },
+    "S-drain": {
+     "label": "PR #89 sleep/wake + host H2D + 无池排空",
+     "dyn-pd-oracle": 0.9933795012533662,
+     "dyn-pd-lag": 0.9875001937150953,
+     "dyn-3-oracle": 1.1039060920476913,
+     "switches_at_lag_goodput": 5,
+     "t_dp": 1469.3255443308728,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.0
+    }
+   },
+   "static_pd_alloc": [
+    9,
+    5,
+    0
+   ],
+   "static_best3_alloc": [
+    8,
+    0,
+    6
+   ]
+  },
+  "S2m": {
+   "label": "【注入】配比变化（弱）：同上，CC 需求占比 50%±15%",
+   "injected": true,
+   "mean_nodes": 11.054127027331267,
+   "peak_nodes": 12.025694239575307,
+   "p_share_min": 0.6062722825899186,
+   "p_share_max": 0.7445345105337433,
+   "closed_form_overprov": 0.1382622279438247,
+   "total_cv": 0.040795200109761266,
+   "policies": {
+    "static-pd": 1.0381511047482488,
+    "static-mixed": 1.0093135565519329,
+    "static-best3": 1.250639274716377,
+    "dyn-pd-oracle@ideal": 1.1368545703589914,
+    "dyn-3-oracle@ideal": 1.250639274716377
+   },
+   "tiers": {
+    "L-pool": {
+     "label": "同布局逻辑切换 + KVCM 池（丢弃后从池重读）",
+     "dyn-pd-oracle": 1.1368545703589914,
+     "dyn-pd-lag": 1.1321580462157723,
+     "dyn-3-oracle": 1.250639274716377,
+     "switches_at_lag_goodput": 4,
+     "t_dp": 2.2145955239867265,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-d2d": {
+     "label": "同布局逻辑切换 + 无池点对点迁移（需引擎支持）",
+     "dyn-pd-oracle": 1.1368545703589914,
+     "dyn-pd-lag": 1.1321580462157723,
+     "dyn-3-oracle": 1.250639274716377,
+     "switches_at_lag_goodput": 4,
+     "t_dp": 2.7010348310163,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-drain": {
+     "label": "同布局逻辑切换 + 无池排空（等在途跑完）",
+     "dyn-pd-oracle": 1.1321580462157723,
+     "dyn-pd-lag": 1.1162877947092058,
+     "dyn-3-oracle": 1.2378201276063916,
+     "switches_at_lag_goodput": 3,
+     "t_dp": 1439.3255443308728,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "S-pool": {
+     "label": "PR #89 sleep/wake + host H2D + KVCM 池（host 副本挤占池）",
+     "dyn-pd-oracle": 1.0965110912919043,
+     "dyn-pd-lag": 1.089608980715275,
+     "dyn-3-oracle": 1.2046546928584574,
+     "switches_at_lag_goodput": 3,
+     "t_dp": 32.21459552398672,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.061287960954098
+    },
+    "S-drain": {
+     "label": "PR #89 sleep/wake + host H2D + 无池排空",
+     "dyn-pd-oracle": 1.1321580462157723,
+     "dyn-pd-lag": 1.1162877947092058,
+     "dyn-3-oracle": 1.2378201276063916,
+     "switches_at_lag_goodput": 3,
+     "t_dp": 1469.3255443308728,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.0
+    }
+   },
+   "static_pd_alloc": [
+    9,
+    5,
+    0
+   ],
+   "static_best3_alloc": [
+    6,
+    0,
+    8
+   ]
+  },
+  "S4": {
+   "label": "【注入】配比快速变化：同 S2 幅度，周期 2h",
+   "injected": true,
+   "mean_nodes": 11.089314650818643,
+   "peak_nodes": 15.059799749695257,
+   "p_share_min": 0.5418336927393732,
+   "p_share_max": 0.7832472857323859,
+   "closed_form_overprov": 0.24141359299301268,
+   "total_cv": 0.22069808615621245,
+   "policies": {
+    "static-pd": 0.9015682578086852,
+    "static-mixed": 0.7944142624735832,
+    "static-best3": 0.998692226409912,
+    "dyn-pd-oracle@ideal": 0.9079020202159882,
+    "dyn-3-oracle@ideal": 0.999985548108816
+   },
+   "tiers": {
+    "L-pool": {
+     "label": "同布局逻辑切换 + KVCM 池（丢弃后从池重读）",
+     "dyn-pd-oracle": 0.9079020202159882,
+     "dyn-pd-lag": 0.8803148262202738,
+     "dyn-3-oracle": 0.999985548108816,
+     "switches_at_lag_goodput": 6,
+     "t_dp": 2.2145955239867265,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-d2d": {
+     "label": "同布局逻辑切换 + 无池点对点迁移（需引擎支持）",
+     "dyn-pd-oracle": 0.9079020202159882,
+     "dyn-pd-lag": 0.8803148262202738,
+     "dyn-3-oracle": 0.999985548108816,
+     "switches_at_lag_goodput": 6,
+     "t_dp": 2.7010348310163,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-drain": {
+     "label": "同布局逻辑切换 + 无池排空（等在途跑完）",
+     "dyn-pd-oracle": 0.8992121085524557,
+     "dyn-pd-lag": 0.8563924655318261,
+     "dyn-3-oracle": 0.9867932900786397,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 1439.3255443308728,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "S-pool": {
+     "label": "PR #89 sleep/wake + host H2D + KVCM 池（host 副本挤占池）",
+     "dyn-pd-oracle": 0.8659286603331565,
+     "dyn-pd-lag": 0.8659286603331565,
+     "dyn-3-oracle": 0.9616671919822692,
+     "switches_at_lag_goodput": 10,
+     "t_dp": 32.21459552398672,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.0656202842366607
+    },
+    "S-drain": {
+     "label": "PR #89 sleep/wake + host H2D + 无池排空",
+     "dyn-pd-oracle": 0.8992121085524557,
+     "dyn-pd-lag": 0.8563924655318261,
+     "dyn-3-oracle": 0.9867932900786397,
+     "switches_at_lag_goodput": 0,
+     "t_dp": 1469.3255443308728,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.0
+    }
+   },
+   "static_pd_alloc": [
+    10,
+    4,
+    0
+   ],
+   "static_best3_alloc": [
+    6,
+    0,
+    8
+   ]
+  },
+  "S3": {
+   "label": "【注入】总量 + 配比同时变化（S1 包络错相 6h 叠加 S2）",
+   "injected": true,
+   "mean_nodes": 11.141293498876296,
+   "peak_nodes": 14.45607137955935,
+   "p_share_min": 0.4778881030560458,
+   "p_share_max": 0.8254944724478096,
+   "closed_form_overprov": 0.3476063693917638,
+   "total_cv": 0.18721525042202714,
+   "policies": {
+    "static-pd": 0.7846709407865999,
+    "static-mixed": 0.7628745295107364,
+    "static-best3": 1.0236800044775007,
+    "dyn-pd-oracle@ideal": 0.9304339408874511,
+    "dyn-3-oracle@ideal": 1.024431523680687
+   },
+   "tiers": {
+    "L-pool": {
+     "label": "同布局逻辑切换 + KVCM 池（丢弃后从池重读）",
+     "dyn-pd-oracle": 0.9304339408874511,
+     "dyn-pd-lag": 0.8902291938662528,
+     "dyn-3-oracle": 1.024431523680687,
+     "switches_at_lag_goodput": 5,
+     "t_dp": 2.2145955239867265,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-d2d": {
+     "label": "同布局逻辑切换 + 无池点对点迁移（需引擎支持）",
+     "dyn-pd-oracle": 0.9304339408874511,
+     "dyn-pd-lag": 0.8902291938662528,
+     "dyn-3-oracle": 1.024431523680687,
+     "switches_at_lag_goodput": 5,
+     "t_dp": 2.7010348310163,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "L-drain": {
+     "label": "同布局逻辑切换 + 无池排空（等在途跑完）",
+     "dyn-pd-oracle": 0.924616377055645,
+     "dyn-pd-lag": 0.8902291938662528,
+     "dyn-3-oracle": 1.0122789613902567,
+     "switches_at_lag_goodput": 5,
+     "t_dp": 1439.3255443308728,
+     "t_pd": 2.0,
+     "p_mult_mean": 1.0
+    },
+    "S-pool": {
+     "label": "PR #89 sleep/wake + host H2D + KVCM 池（host 副本挤占池）",
+     "dyn-pd-oracle": 0.8985403440892694,
+     "dyn-pd-lag": 0.8713024817407131,
+     "dyn-3-oracle": 0.9880186878144739,
+     "switches_at_lag_goodput": 5,
+     "t_dp": 32.21459552398672,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.067417772445535
+    },
+    "S-drain": {
+     "label": "PR #89 sleep/wake + host H2D + 无池排空",
+     "dyn-pd-oracle": 0.924616377055645,
+     "dyn-pd-lag": 0.8902291938662528,
+     "dyn-3-oracle": 1.0122789613902567,
+     "switches_at_lag_goodput": 5,
+     "t_dp": 1469.3255443308728,
+     "t_pd": 32.0,
+     "p_mult_mean": 1.0
+    }
+   },
+   "static_pd_alloc": [
+    9,
+    5,
+    0
+   ],
+   "static_best3_alloc": [
+    8,
+    0,
+    6
+   ]
+  }
+ },
+ "sensitivity": [
+  {
+   "scenario": "S2",
+   "variant": "基准",
+   "static-pd": 0.8502517625689506,
+   "static-mixed": 0.8266336470842361,
+   "static-best3": 1.1087988540530205,
+   "lag@L-pool": 1.0036995880305766,
+   "lag@L-drain": 0.9875001937150953,
+   "lag@S-pool": 0.9698677450418471
+  },
+  {
+   "scenario": "S2",
+   "variant": "HBM KV 360 GB/节点",
+   "static-pd": 0.9447241656482217,
+   "static-mixed": 0.8266336470842361,
+   "static-best3": 1.144186061620712,
+   "lag@L-pool": 1.0391966275870803,
+   "lag@L-drain": 1.0391966275870803,
+   "lag@S-pool": 0.9982646115124223
+  },
+  {
+   "scenario": "S2",
+   "variant": "decode 每步 12.5 ms",
+   "static-pd": 1.0391966275870803,
+   "static-mixed": 1.2399504914879795,
+   "static-best3": 1.2812821641564365,
+   "lag@L-pool": 1.133669030666351,
+   "lag@L-drain": 1.133669030666351,
+   "lag@S-pool": 1.0890159703791138
+  },
+  {
+   "scenario": "S2",
+   "variant": "decode 每步 37.5 ms",
+   "static-pd": 0.7557793594896791,
+   "static-mixed": 0.4133168026804924,
+   "static-best3": 0.8679653197526933,
+   "lag@L-pool": 0.8887673571705816,
+   "lag@L-drain": 0.8227084189653397,
+   "lag@S-pool": 0.8628221102058886
+  },
+  {
+   "scenario": "S2",
+   "variant": "sleep/wake 权重 10 s",
+   "static-pd": 0.8502517625689506,
+   "static-mixed": 0.8266336470842361,
+   "static-best3": 1.1087988540530205,
+   "lag@L-pool": 1.0036995880305766,
+   "lag@L-drain": 0.9875001937150953,
+   "lag@S-pool": 0.9698677450418471
+  },
+  {
+   "scenario": "S2",
+   "variant": "sleep/wake 权重 120 s",
+   "static-pd": 0.8502517625689506,
+   "static-mixed": 0.8266336470842361,
+   "static-best3": 1.1087988540530205,
+   "lag@L-pool": 1.0036995880305766,
+   "lag@L-drain": 0.9875001937150953,
+   "lag@S-pool": 0.9698677450418471
+  },
+  {
+   "scenario": "S2",
+   "variant": "sleep/wake 权重 600 s",
+   "static-pd": 0.8502517625689506,
+   "static-mixed": 0.8266336470842361,
+   "static-best3": 1.1087988540530205,
+   "lag@L-pool": 1.0036995880305766,
+   "lag@L-drain": 0.9875001937150953,
+   "lag@S-pool": 0.9674866981804369
+  },
+  {
+   "scenario": "S4",
+   "variant": "基准",
+   "static-pd": 0.9015682578086852,
+   "static-mixed": 0.7944142624735832,
+   "static-best3": 0.998692226409912,
+   "lag@L-pool": 0.8803148262202738,
+   "lag@L-drain": 0.8563924655318261,
+   "lag@S-pool": 0.8659286603331565
+  },
+  {
+   "scenario": "S4",
+   "variant": "HBM KV 360 GB/节点",
+   "static-pd": 0.9079020202159882,
+   "static-mixed": 0.7944142624735832,
+   "static-best3": 1.0375532090663908,
+   "lag@L-pool": 0.9090777993202208,
+   "lag@L-drain": 0.9076865941286085,
+   "lag@S-pool": 0.8667841844260693
+  },
+  {
+   "scenario": "S4",
+   "variant": "decode 每步 12.5 ms",
+   "static-pd": 0.998692226409912,
+   "static-mixed": 1.1916214145719999,
+   "static-best3": 1.2153191082179549,
+   "lag@L-pool": 0.999985548108816,
+   "lag@L-drain": 0.9984552577137946,
+   "lag@S-pool": 0.9577091202139852
+  },
+  {
+   "scenario": "S4",
+   "variant": "decode 每步 37.5 ms",
+   "static-pd": 0.7533661752939225,
+   "static-mixed": 0.3972071103751658,
+   "static-best3": 0.8451573476195334,
+   "lag@L-pool": 0.761757256835699,
+   "lag@L-drain": 0.7272622428834437,
+   "lag@S-pool": 0.739197966456413
+  },
+  {
+   "scenario": "S4",
+   "variant": "sleep/wake 权重 10 s",
+   "static-pd": 0.9015682578086852,
+   "static-mixed": 0.7944142624735832,
+   "static-best3": 0.998692226409912,
+   "lag@L-pool": 0.8803148262202738,
+   "lag@L-drain": 0.8563924655318261,
+   "lag@S-pool": 0.8659286603331565
+  },
+  {
+   "scenario": "S4",
+   "variant": "sleep/wake 权重 120 s",
+   "static-pd": 0.9015682578086852,
+   "static-mixed": 0.7944142624735832,
+   "static-best3": 0.998692226409912,
+   "lag@L-pool": 0.8803148262202738,
+   "lag@L-drain": 0.8563924655318261,
+   "lag@S-pool": 0.8659286603331565
+  },
+  {
+   "scenario": "S4",
+   "variant": "sleep/wake 权重 600 s",
+   "static-pd": 0.9015682578086852,
+   "static-mixed": 0.7944142624735832,
+   "static-best3": 0.998692226409912,
+   "lag@L-pool": 0.8803148262202738,
+   "lag@L-drain": 0.8563924655318261,
+   "lag@S-pool": 0.8571828320622444
+  }
+ ]
+}

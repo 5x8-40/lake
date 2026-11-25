@@ -331,3 +331,7 @@ DRAM 池 = 1 × 标称（14.00 TB）：
 | KVCM（现实 hook） | 69.90% | 65.45% | 1.51% | 1.30% | 114.5 | 125.7 |
 | KVCM（理想 hook） | 70.83% | 66.18% | 0.20% | 0.20% | 112.1 | 123.9 |
 
+
+## PD 转换实验（单独生成，不由 `kvcm_sim.report` 管理）
+
+E1 窗口级流体模型与 E4 切换代价的结果见 [`pd/summary.md`](pd/summary.md)（由 `PYTHONPATH=. python3 -m pd.run` 生成）。注意：重新运行 `kvcm_sim.report` 会覆盖本文件，需要重新追加本节。
