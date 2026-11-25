@@ -110,3 +110,32 @@ vLLM（生成 token 写满的块入 APC）与 SGLang（请求结束时整段插�
 6. 页粒度 512 token、单次运行（seed=1）、无置信区间；切片 k=32（与 k=8 的对照见上）。
 7. TTFT 拟合来自 950 单实例实测，不是 A3；跨节点传输按无竞争带宽计。
 8. **池→HBM 预取不在范围内**：KVCM 向引擎发预取请求（`../design/kv-prefetch.md` 方案 A）未实现，未建模。
+
+## PD 转换（P/D/混部角色切换）：E1 流体模型 + E4 切换代价
+
+回答“PD 转换值不值得做、KVCM 池在切换里值多少”。代码在 [`pd/`](pd/)，结果在 [`results/pd/summary.md`](results/pd/summary.md)，参数见 [`params.md`](params.md)「PD 转换」节。对应可行性评估：PR #89（vLLM-Ascend sleep mode 角色切换）+ `../design/D8-joint-scheduling.md` §5.3。
+
+```bash
+cd kvcm/sim
+PYTHONPATH=. python3 -m pd.run            # 约 2 分钟；读 /tmp/traces 下的 cc256k / qwen_coder 原始 trace
+PYTHONPATH=. python3 -m pytest tests -q   # 含 tests/test_pd.py
+```
+
+### 方法
+
+- **需求序列（E1）**：会话 Poisson 到达，会话内按 trace 原时间回放（不改数据集时间）；每个 5 分钟窗口算 prefill 需求（`Params.npu_seconds`，命中取 h*）与 decode KV 占用（BF16 3,200 B/token × (n_in + n_out/2)，时长 = n_out × 每步 25 ms）。
+- **节点模型**：14 个整数节点，P 节点 prefill 利用率 ≤ 80%；D 节点 KV ≤ 296 GB × 90%（decode 在这组参数下受 HBM 容量约束）；混部节点 prefill 占比 ≤ min(80%, 1 − t_step/TPOT_SLO) = 50%，decode 每步拉长 1/(1−f)。
+- **策略**：静态全混部、静态最优 P:D（事后最优）、静态最优 P/D/混部组合、动态 P:D（oracle 前瞻 / 滞后一窗控制器）、动态三态（oracle）。goodput = 过载窗口 ≤ 1% 的最大负载倍数 α。
+- **场景**：S0 平稳（未注入）；S1 只变总量；S2 / S2m / S4 只变配比（CC ↔ Qwen coder 组合按正弦变化，强 / 弱 / 2 小时快变）；S3 总量 + 配比。**S1–S4 的到达率包络或 trace 组合为人为注入，表和图里都标【注入】**；CC 会话很长，注入的“总量恒定”在实现上会被拖尾抹平，实际总量 CV 见结果表。
+- **切换代价分档**：同布局逻辑切换（权重不动，代价≈0）与 PR #89 sleep/wake + host H2D（+30 s，host 510 GB/节点副本从池扣，命中下降按 PR #90 MRC 计）各自 × {KVCM 池丢弃后重读, 无池点对点迁移, 无池排空}。
+- **E4（轻量版，非 DES）**：对满载 D 节点的在途 decode 做快照抽样（按 decode 时长加权），算一次 D→P 切换的排空时间、点对点迁移时间、杀掉重算的 NPU·s、池刷尾页与接收方重读量；结果作为 E1 分档的切换耗时。
+
+### 参考实现
+
+- **Dynamo Planner** `components/src/dynamo/planner/core/load_scaling.py::LoadScalingMixin` / `throughput_scaling.py::ThroughputScalingMixin`（见 [`docs/research/dynamo/overview.md`](../../docs/research/dynamo/overview.md)「Planner」）。借鉴：`min_gpu_budget == max_gpu_budget` 时总量固定、只在 P/D 间重新分配，就是这里的“动态 P:D”；滞后控制器对应它的快环（按实时指标调整）。差异：Planner 扩缩以 pod 为单位、KV 随实例走；这里 KV 权威在池，D→P 切换可以丢弃 HBM KV 由他处重读（E4）。
+- **Splitwise** mixed pool（机器在 prompt/token 角色间移动）与 **DistServe** goodput 定义：本实验的“动态三态”与 goodput 指标照搬其口径。差异：它们是 GPU 真机 + 自建 DES，这里只有窗口级流体模型。
+- **vLLM-Ascend** `vllm_ascend/worker/worker.py::Worker.sleep` / `wake_up`（PR #89 核实）：sleep/wake 档的切换流程与 host 权重副本来自这里。差异：PR #89 的 8 卡示例形态（D DP8 TP1）放不下 V4.1-Flash，这里按单节点形态计。
+
+### 局限
+
+见 [`results/pd/summary.md`](results/pd/summary.md)「简化与局限」。最关键的三条：不排队、不出 TTFT/TPOT 分位（混部的 TPOT 尾部干扰只按均值 1/(1−f) 计，会高估混部）；decode 代价与切换耗时在 A3 上无实测；配比漂移场景是注入的。

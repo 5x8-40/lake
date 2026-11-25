@@ -75,3 +75,28 @@ DeepSeek V4.1 目前公开的只有 **DeepSeek-V4.1-Flash**（Hugging Face `deep
 | hook：none | 无停顿信息，池保活/零引用都不生效 | 方法设定 |
 | hook：realistic | 只用该流历史间隔：点估计 = 最近 5 次间隔的几何均值，上界 = exp(μ+σ)；冷启动用全局历史中位数 | 方法设定 |
 | hook：oracle | 真实间隔，且知道会话/流是否还有下一轮 | 上界 |
+
+## PD 转换（`pd/pd_params.py`）
+
+模型、硬件与 prefill 代价沿用上面各节；PD 实验新增：
+
+| 参数 | 取值 | 来源 / 标签 |
+|---|---|---|
+| KV bytes/token | 3,200 B（BF16） | 用户给定（2026-11-25） |
+| HBM KV / 节点 | 296 GB（gpu_memory_utilization 0.85 → 18.5 GB/die × 16）；敏感性 360 GB | 用户给定 |
+| host 权重副本 | 510 GB/节点，只在 sleep/wake 档从 DRAM 池扣（池 14 TB → 0.49×） | 用户给定；prefill 乘数按 PR #90 MRC（KVCM 现实 hook）插值 |
+| decode 每步耗时 t_step | 25 ms（满 KV 的 D 节点）；敏感性 12.5 / 37.5 ms | **假设**（roofline 估算 + 固定开销，A3 无实测） |
+| TPOT SLO | 50 ms | `docs/features/slo.md` ITL P50（draft） |
+| D 节点 KV 填充上限 | 90% | **假设** |
+| P 节点利用率上限 ρ_P | 80% | **假设**（D8a §6.1 ρ_target） |
+| 混部节点 prefill 占比上限 | min(ρ_P, 1 − t_step/TPOT_SLO) = 50% | 由上推导 |
+| 窗口 | 300 s | 方法设定 |
+| goodput 容忍 | 过载窗口 ≤ 1% | 方法设定 |
+| P 节点排空 | 2 s | **假设**（≈ TTFT P95 量级） |
+| sleep/wake 权重回填 + 唤醒 | 30 s；敏感性 10 / 120 / 600 s | **假设**（PR #89 未实测） |
+| 池刷尾页带宽 | 54 GB/s/NPU（FabricMem D2rH） | D8a §9.1 |
+| 池重读带宽 | 78 GB/s/NPU | D8a §9.1 |
+| 无池点对点迁移带宽 | 23.8 GB/s/NPU（RoCE） | D8a §9.1；16 NPU 线性叠加为**假设**（乐观） |
+| 写穿粒度 | 512 token/页（写满才入池） | 与 PR #90 页粒度一致；**假设** |
+| 参考负载 | 平均约 12 个节点需求；goodput 以其倍数 α 报告 | 方法设定 |
+| 注入场景 | 24h 正弦：总量峰谷 2:1；CC 需求占比 50% ± 40%（强）/ ± 15%（弱）；2h 周期快变 | **注入**，非数据集 |
