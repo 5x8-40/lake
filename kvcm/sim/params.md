@@ -25,7 +25,10 @@ DeepSeek V4.1 目前公开的只有 **DeepSeek-V4.1-Flash**（Hugging Face `deep
 | HBM / NPU | 64 GB | **假设**：910C 每芯片 128 GB、2 die，按 die 计 NPU（16 NPU/节点 = 8 芯片） |
 | 实例切分 | 1 节点 / 实例（16 NPU），共 14 个实例；PD 混部 | **假设**：510 GB 权重单节点（1 TB HBM）放得下，按最小可放切分 |
 | 激活 / workspace 预留 | 4 GB / NPU | **假设** |
-| HBM KV / 实例 | **450 GB**（= 16 × (64 − 31.9 权重 − 4 预留)）；每实例 ≈ 1.41 亿 token，全集群 6.3 TB ≈ 19.7 亿 token（BF16） | 由上面几项推导 |
+| 引擎显存预算 | vLLM `gpu_memory_utilization = 0.85`：引擎只用每 die 64 × 0.85 = 54.4 GB，权重与激活/workspace 都从这 54.4 GB 里出 | 用户批准（2026-11-25）；vLLM 默认 0.9，取 0.85 留余量 |
+| HBM KV / 实例（**主结果**） | **296 GB**：每 die 54.4 − 31.9 权重 − 4 激活 = 18.5 GB，× 16 = 296 GB；每实例 ≈ 9,250 万 token，全集群 4.1 TB ≈ 13 亿 token（BF16） | 由上面几项推导 |
+| HBM KV / 实例（敏感性） | 360 GB：激活不从 0.85 预算里扣（每 die 54.4 − 31.9 = 22.5 GB） | 推导；summary「HBM 预算敏感性」表 |
+| （上一版） | 450 GB = 16 × (64 − 31.9 − 4)，按 100% HBM 计 | commit 91a7710 及以前，已弃用 |
 | DRAM KV / 节点 | **1 TB**；全集群池 14 TB ≈ 43.8 亿 token（BF16） | **假设**（Atlas 800T A3 主机内存配置与 KV 可用比例待确认） |
 | 本机 DRAM→HBM 带宽 | 86 GB/s | `kvcm/design/D8a-scheduling-algorithms.md` §9.1 A3 910C FabricMem 机内 rH2D（AICPU 展开）下限 |
 | 跨节点池→HBM 带宽 | 78 GB/s；敏感性 23.8 GB/s | 同上 §9.1：FabricMem 跨机 rH2D 下限；ROCE rH2D |
@@ -65,8 +68,10 @@ DeepSeek V4.1 目前公开的只有 **DeepSeek-V4.1-Flash**（Hugging Face `deep
 |---|---|---|
 | 路由规则 | 负载失衡（max−min > abs 且 max > 1.5×min）走最短队列，否则走最长前缀命中 | SGLang cache-aware 路由规则（`docs/research/sglang/model-runner.md`）；阈值为 **假设** |
 | abs 阈值 | 11 个在途请求，**不随切片缩放** | **假设**；CC 的 subagent 扇出让单会话瞬时并发与切片无关，按 32/√k 缩到 k=32 的 6 时 per-instance LRU 命中被压低 4.5 个点（91.2% vs k=8 的 95.7%），取 11 时 k=32 与 k=8 相差 < 0.2 个点 |
-| HBM 归属 | 推理引擎：每实例前缀缓存，纯 LRU，**所有策略相同**，固定 450 GB/实例，不随 x 轴变化 | 用户校正（2026-11-25）；`kvcm/design/D2-kv-operations.md`「操作图解」节：“八项操作都作用于池内副本；HBM 工作集由引擎自己的读写路径加载，不在 kvcm 操作面” |
-| x 轴 | 只扫 DRAM 池容量：标称 14 TB × {1/32 … 2} | 方法设定 |
+| HBM 归属 | 推理引擎：每实例前缀缓存，纯 LRU，**所有策略相同**，固定 296 GB/实例（敏感性 360 GB），不随 x 轴变化 | 用户校正（2026-11-25）；`kvcm/design/D2-kv-operations.md`「操作图解」节：“八项操作都作用于池内副本；HBM 工作集由引擎自己的读写路径加载，不在 kvcm 操作面” |
+| x 轴 | 只扫 DRAM 池容量：标称 14 TB × {1/32 … 2}，另加 1× 与 2× 集群 HBM（4.1 / 8.3 TB）两点 | 方法设定 |
+| 收益工作区间 | 池 ≈ 1–2× 集群 HBM（4.1–8.3 TB），MRC 图黄色带 | 用户定义（2026-11-25），替代固定 1/8 标称 |
+| 重点池容量 | 标称 14 TB 与 1/4 标称 3.5 TB（TTFT / 消融 / 剥掉思维链 / HBM 敏感性） | 方法设定 |
 | 基线 1：per-instance LRU | 引擎 HBM LRU + 实例私有 DRAM（write-through，总量同池），LRU | 对标 vLLM APC + 本地 offload（`docs/research/vllm/block-lifecycle.md`） |
 | 基线 2：shared-pool LRU | 引擎 HBM LRU + 全集群共享 DRAM 池（去重、任意实例可取），LRU | 对标 Mooncake/LMCache 共享池（被动 LRU） |
 | KVCM 池保活 | 停顿期把前缀钉在共享池（ETA ≤ 2 h，且 ≤ 2×池 LRU 驻留时间）；钉预算池 50%（realistic 10%） | **假设**（D8a §5 保留 TTL = ETA + slack） |

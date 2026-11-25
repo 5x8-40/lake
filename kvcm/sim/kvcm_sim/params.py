@@ -23,6 +23,9 @@ class Params:
     npu_per_node: int = 16
     hbm_per_npu: float = 64 * GB         # 假设：910C 每 die 64 GB（每芯片 128 GB，2 die 计 2 NPU）
     act_reserve_per_npu: float = 4 * GB  # 假设：激活/workspace/通信 buffer 预留
+    # vLLM gpu_memory_utilization：引擎只用每 die HBM 的 85%，权重与激活都从这 85% 里出
+    gpu_mem_util: float = 0.85
+    act_in_budget: bool = True           # 敏感性：False = 激活不从预算里扣（360 GB/实例）
     dram_kv_per_node: float = 1000 * GB  # 假设：每节点可给 KV 池的 DRAM
     nodes_per_instance: int = 1          # 假设：16 NPU 一个实例（权重 510 GB 单节点放得下），共 14 实例
 
@@ -59,7 +62,8 @@ class Params:
 
     @property
     def hbm_kv_per_inst(self) -> float:
-        per_npu = self.hbm_per_npu - self.weights_bytes / self.npu_per_inst - self.act_reserve_per_npu
+        per_npu = (self.hbm_per_npu * self.gpu_mem_util - self.weights_bytes / self.npu_per_inst
+                   - (self.act_reserve_per_npu if self.act_in_budget else 0.0))
         return max(0.0, per_npu) * self.npu_per_inst
 
     @property

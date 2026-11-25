@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 import os
@@ -49,13 +50,19 @@ POLICIES = {
 }
 
 # x 轴只扫 DRAM 池容量（标称 14 TB 的倍数）；HBM 固定为真实大小
-MRC_F = [1 / 32, 1 / 16, 1 / 8, 1 / 4, 1 / 2, 1, 2]
+# 收益工作区间 = 池 ≈ 1–2× 集群 HBM；两端各加一个点
+F_HBM1 = round(P.hbm_kv_per_inst * P.n_inst / P.dram_kv_total, 4)
+MRC_F = sorted([1 / 32, 1 / 16, 1 / 8, 1 / 4, F_HBM1, 1 / 2, 2 * F_HBM1, 1, 2])
 MRC_POLICIES = ["local", "shared", "kvcm-real", "kvcm-oracle"]
-ABL_F = [1 / 8, 1]
+ABL_F = [1 / 4, 1]
 ABL_POLICIES = ["kvcm-none", "real+ka", "oracle+ka"]
 # 下界对照：下一轮剥掉思维链，decode KV 不被命中（同一负载）
-STRIP_F = [1 / 8, 1]
+STRIP_F = [1 / 4, 1]
 STRIP_POLICIES = ["local", "shared", "kvcm-real", "kvcm-oracle"]
+# 敏感性：HBM 预算不扣激活（每实例 360 GB）
+HBM360_F = [1 / 4, 1]
+HBM360_POLICIES = ["local", "shared", "kvcm-real", "kvcm-oracle"]
+P360 = dataclasses.replace(P, act_in_budget=False)
 
 
 def load(trace: str):
@@ -68,10 +75,10 @@ def load(trace: str):
     raise ValueError(trace)
 
 
-def base_cfg(f: float, k: int) -> dict:
+def base_cfg(f: float, k: int, hbm_bytes: float | None = None) -> dict:
     return dict(
         n_inst=P.n_inst,
-        hbm_pages=max(1, int(P.pages(P.hbm_kv_per_inst, PAGE) / k)),
+        hbm_pages=max(1, int(P.pages(hbm_bytes or P.hbm_kv_per_inst, PAGE) / k)),
         dram_pages=max(1, int(P.pages(P.dram_kv_total, PAGE) * f / k)),
         # 失衡阈值不随切片缩小：CC 的 subagent 扇出让单会话瞬时并发与 k 无关；
         # 取 k=8 时的 11，k=32 下 per-instance / shared 命中与 k=8 相差 < 0.2 个点
@@ -132,8 +139,9 @@ def summarize(rec: dict, k: int, sim: Sim) -> dict:
 def run_one(args):
     trace, pol, f, k, rate = args
     wl = load(trace)
-    base = pol.removeprefix("strip:")
-    cfg = Config(**base_cfg(f, k), **POLICIES[base], attribution=(base == "local"),
+    base = pol.removeprefix("strip:").removeprefix("hbm360:")
+    hbm = P360.hbm_kv_per_inst if pol.startswith("hbm360:") else None
+    cfg = Config(**base_cfg(f, k, hbm), **POLICIES[base], attribution=(base == "local"),
                  decode_cache=not pol.startswith("strip:"))
     t0 = time.time()
     sim = Sim(cfg, wl, rate=rate / k, horizon=HORIZON, warmup=WARMUP, seed=1)
@@ -164,7 +172,7 @@ def main():
     ap.add_argument("--k", type=int, default=32)
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "results"))
-    ap.add_argument("--only", default="", help="mrc|abl|strip，留空=全部")
+    ap.add_argument("--only", default="", help="mrc|abl|strip|hbm360，留空=全部")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     cal_path = os.path.join(args.out, "calibration.json")
@@ -186,6 +194,8 @@ def main():
         jobs += [(args.trace, p, f, args.k, rate) for f in ABL_F for p in ABL_POLICIES]
     if args.only in ("", "strip"):
         jobs += [(args.trace, "strip:" + p, f, args.k, rate) for f in STRIP_F for p in STRIP_POLICIES]
+    if args.only in ("", "hbm360"):
+        jobs += [(args.trace, "hbm360:" + p, f, args.k, rate) for f in HBM360_F for p in HBM360_POLICIES]
     out_path = os.path.join(args.out, f"{args.trace}.json")
     done = json.load(open(out_path)) if os.path.exists(out_path) else []
     have = {(d["policy"], round(d["f"], 6), d["k"]) for d in done}

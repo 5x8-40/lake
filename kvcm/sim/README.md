@@ -46,7 +46,7 @@ PYTHONPATH=. python3 -m pytest tests -q                           # 回放器语
 
 ### 拓扑与策略
 
-14 个实例（每实例 1 节点 16 NPU，PD 混部）。**HBM 归推理引擎**：每实例 450 GB 前缀缓存、纯 LRU，所有策略相同，不随 x 轴变化；**KVCM 只管 DRAM 池**（`../design/D2-kv-operations.md`「操作图解」：八项操作只作用于池内副本，HBM 不在 kvcm 操作面）。DRAM 两种组织：
+14 个实例（每实例 1 节点 16 NPU，PD 混部）。**HBM 归推理引擎**：每实例 296 GB 前缀缓存（vLLM `gpu_memory_utilization=0.85`，激活从预算里扣；敏感性 360 GB）、纯 LRU，所有策略相同，不随 x 轴变化；**KVCM 只管 DRAM 池**（`../design/D2-kv-operations.md`「操作图解」：八项操作只作用于池内副本，HBM 不在 kvcm 操作面）。DRAM 两种组织：
 
 | 策略 | HBM（L0） | DRAM（L1） | 路由 |
 |---|---|---|---|
@@ -68,7 +68,7 @@ PYTHONPATH=. python3 -m pytest tests -q                           # 回放器语
 | realistic | 该流最近 5 次间隔的几何均值（上界 exp(μ+σ)）；冷启动用全局历史中位数 | 活跃窗 max(4×ETA上界, 300 s) 内没回来视为结束 | 只用历史，不用未来信息 |
 | oracle | 真实间隔 | 知道是否还有下一轮 | 上界 |
 
-realistic 的钉预算（10%）在 CC-256k、容量 1/8 标称上调过（上一版模型，HBM 随 x 轴缩放）：预算越大越差（50% 时比 shared-pool 低 0.8 个点），因为按历史预测的停顿大多猜错，钉住的页挤掉了 LRU 本来留得住的内容。
+realistic 的钉预算（10%）在 CC-256k、容量 1/8 标称上调过（更早一版模型，HBM 随 x 轴缩放）：预算越大越差（50% 时比 shared-pool 低 0.8 个点），因为按历史预测的停顿大多猜错，钉住的页挤掉了 LRU 本来留得住的内容。
 
 ### decode 写出的 KV
 
@@ -102,7 +102,7 @@ vLLM（生成 token 写满的块入 APC）与 SGLang（请求结束时整段插�
 ## 局限（读结果前必看）
 
 0. **上一版（commit 17c954d）模型有误**：HBM 与 DRAM 同比随 x 轴缩放，且 KVCM 的保活/预热会钉 HBM，越过了“HBM 归引擎”的职责边界，“其中 HBM”在策略间不同也来自这里。本版已改为 HBM 固定、引擎 LRU、各策略相同。更早两版还按 V4-Pro 布局假设 9,848 B/token，且下一轮从不命中上一轮输出；现改为官方 V4.1-Flash 结构、decode KV 入缓存；commit 5d63330 按官方 FP4 890 B/token 计，本版按用户决定改为 BF16 3,200 B/token。
-1. **A3 数值与算力换算是假设**：V4.1 结构取自官方（V4.1 只公开了 Flash），KV 按 BF16 存（3,200 B/token；官方 FP4 口径 890 B/token 为对照）；A3 HBM/DRAM 可用量、实例切分、950→A3 与 V4-Pro→V4.1 算力换算均未核实（见 `params.md`）。命中率曲线只依赖“容量 / 负载”比和 bytes/token；TTFT 和 NPU 数还依赖算力换算。
+1. **A3 数值与算力换算是假设**：HBM 预算按 vLLM `gpu_memory_utilization=0.85` 计（296 GB/实例，激活不扣时 360 GB 为敏感性；commit 91a7710 及以前按 100% HBM 的 450 GB）；V4.1 结构取自官方（V4.1 只公开了 Flash），KV 按 BF16 存（3,200 B/token；官方 FP4 口径 890 B/token 为对照）；A3 HBM/DRAM 可用量、实例切分、950→A3 与 V4-Pro→V4.1 算力换算均未核实（见 `params.md`）。命中率曲线只依赖“容量 / 负载”比和 bytes/token；TTFT 和 NPU 数还依赖算力换算。
 2. **无排队**：TTFT 是同等每卡并发下的单请求时延，不含排队；命中率下降带来的排队放大没有算进去（真实收益偏保守还是偏乐观取决于工作点）。要 goodput / P95 排队需要 DES（参考文章 1.5）。
 3. **CC trace 的 block hash 只在会话内有效**，跨会话共享（同一 Claude Code system prompt、同一 subagent 模板）不可见，shared-pool 的去重收益被低估。
 4. **Codex 时间线是合成的**（trace 无时间戳），停顿与 hook 结果只能看作结构性的。

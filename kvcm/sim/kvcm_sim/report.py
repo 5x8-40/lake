@@ -13,7 +13,11 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 
+import dataclasses  # noqa: E402
+
 from .params import DEFAULT as P  # noqa: E402
+
+P360 = dataclasses.replace(P, act_in_budget=False)
 
 RES = os.path.join(os.path.dirname(__file__), "..", "results")
 FIG = os.path.join(RES, "figures")
@@ -82,6 +86,9 @@ def fig_mrc(trace, runs):
     if ideal is not None:
         ax.axhline(100 * ideal, ls="--", color="k", lw=1, label=f"理想 h*（无限容量全局共享）{100 * ideal:.1f}%")
     for a_ in (ax, ax2):
+        a_.axvspan(HBM_TB, 2 * HBM_TB, color="#ffd54f", alpha=0.25, lw=0)
+        a_.text(HBM_TB * 1.414, 0.97, "收益工作区间\n池 ≈ 1–2× 集群 HBM", color="#8a6d00", fontsize=7.5,
+                ha="center", va="top", transform=a_.get_xaxis_transform())
         a_.axvline(NOMINAL_TB, ls=":", color="#2ca02c", lw=1.2)
         a_.set_xscale("log", base=2)
         a_.set_xlabel(f"DRAM 池容量（TB，全集群；HBM 固定 {HBM_TB:.2f} TB 不扫）")
@@ -107,7 +114,7 @@ def fig_mrc(trace, runs):
     return p
 
 
-def fig_lost(trace, runs, fs=(1 / 8, 1.0)):
+def fig_lost(trace, runs, fs=(1 / 4, 1.0)):
     pols = MAIN_POLS
     fig, axes = plt.subplots(1, len(fs), figsize=(10, 4.0), sharey=True)
     for ax, f in zip(axes, fs):
@@ -145,7 +152,7 @@ ABL_CHAIN = {
 ABL_LABEL = ["per-instance\nLRU", "+ 共享池/\n全局视图", "+ 池保活", "+ 零引用优先\n（= KVCM）"]
 
 
-def fig_ablation(trace, runs, fs=(1 / 8, 1.0)):
+def fig_ablation(trace, runs, fs=(1 / 4, 1.0)):
     fig, axes = plt.subplots(1, len(fs), figsize=(9.5, 3.9), sharey=False)
     for ax, f in zip(axes, fs):
         w = 0.38
@@ -212,6 +219,21 @@ def table_strip(runs, f):
     return head + "\n" + "\n".join(rows)
 
 
+def table_hbm360(runs, f):
+    rows = []
+    for pol in MAIN_POLS:
+        e, s_ = _get(runs, pol, f), _get(runs, "hbm360:" + pol, f)
+        if not (e and s_):
+            continue
+        rows.append(f"| {POL_LABEL[pol]} | {100 * e['hit_rate']:.2f}% | {100 * s_['hit_rate']:.2f}% | "
+                    f"{100 * e['hbm_hit_rate']:.2f}% | {100 * s_['hbm_hit_rate']:.2f}% | {e['npu_busy']:.1f} | {s_['npu_busy']:.1f} |")
+    if not rows:
+        return ""
+    g1, g2 = P.hbm_kv_per_inst / 1e9, P360.hbm_kv_per_inst / 1e9
+    return (f"| 策略 | 命中率（{g1:.0f} GB） | 命中率（{g2:.0f} GB） | 其中 HBM（{g1:.0f}） | 其中 HBM（{g2:.0f}） | "
+            f"prefill 占用 NPU（{g1:.0f}） | prefill 占用 NPU（{g2:.0f}） |\n|---|---:|---:|---:|---:|---:|---:|\n" + "\n".join(rows))
+
+
 def table_gap(trace, runs, f):
     pols = MAIN_POLS
     labs = None
@@ -243,7 +265,10 @@ def main():
           f"模型：{MODEL_NOTE}x 轴与表中“池容量”只指 DRAM 池（标称 {NOMINAL_TB:.0f} TB = 14 节点 × 1 TB）。", "",
           f"模型规格：DeepSeek-V4.1（即 V4.1-Flash）官方 config / 技术报告，全局 KV 按 BF16 存储 {P.kv_bytes_per_token:,.0f} B/token（官方 FP4 口径为 890 B）；"
           "decode 写出的 KV 入缓存，主结果按“下一轮原样回传上一轮输出（含思维链）”计命中，"
-          "末尾附“剥掉思维链”下界对照。", ""]
+          "末尾附“剥掉思维链”下界对照。", "",
+          f"HBM 预算：vLLM `gpu_memory_utilization=0.85`，每 die 64 × 0.85 − 31.9 权重 − 4 激活 = {P.hbm_kv_per_inst / 16 / 1e9:.1f} GB，"
+          f"每实例 {P.hbm_kv_per_inst / 1e9:.0f} GB（全集群 {HBM_TB:.2f} TB）；图中黄色带 = 收益工作区间（池 ≈ 1–2× 集群 HBM = "
+          f"{HBM_TB:.1f}–{2 * HBM_TB:.1f} TB）。", ""]
     cal = json.load(open(os.path.join(RES, "calibration.json"))) if os.path.exists(os.path.join(RES, "calibration.json")) else {}
     for trace in ("cc256k", "codex", "qwen_coder"):
         runs = _load(trace)
@@ -272,10 +297,10 @@ def main():
                 r = _get(runs, p, f)
                 cells.append(f"{100 * r['hit_rate']:.2f}%" if r else "—")
             ideal = next((r["ideal_hit_rate"] for r in runs if abs(r["f"] - f) < 1e-9
-                          and not r["policy"].startswith("strip:")), None)
+                          and ":" not in r["policy"]), None)
             md.append(f"| {f:g} | {f * NOMINAL_TB:.2f} | " + " | ".join(cells) + f" | {100 * ideal:.2f}% |")
         md.append("")
-        for f in (1 / 8, 1 / 4, 1.0):
+        for f in (1 / 4, 1.0):
             if not _get(runs, "local", f):
                 continue
             md += [f"### TTFT 与等效 NPU（DRAM 池 = {f:g} × 标称 = {f * NOMINAL_TB:.2f} TB）", "",
@@ -283,13 +308,23 @@ def main():
                    table_ttft(trace, runs, f), "",
                    f"按前一停顿长度分组的复用损失（1 − h/h*，DRAM 池 = {f:g} × 标称）：", "",
                    table_gap(trace, runs, f), ""]
-        strip = [(f, table_strip(runs, f)) for f in (1 / 8, 1.0)]
+        strip = [(f, table_strip(runs, f)) for f in (1 / 4, 1.0)]
         if any(t for _, t in strip):
             md += ["### decode KV 命中口径对照：原样回传（主结果）vs 剥掉思维链（下界）", "",
                    "同一负载（到达率按原样回传口径校准）。剥掉思维链 = 下一轮输入不含上一轮 decode 写出的 token 序列，输出部分全部不命中。", ""]
             for f, t in strip:
                 if t:
                     md += [f"DRAM 池 = {f:g} × 标称（{f * NOMINAL_TB:.2f} TB）：", "", t, ""]
+        sens = [(f, table_hbm360(runs, f)) for f in (1 / 4, 1.0)]
+        if any(t for _, t in sens):
+            md += [f"### HBM 预算敏感性：{P.hbm_kv_per_inst / 1e9:.0f} GB/实例（主结果）vs {P360.hbm_kv_per_inst / 1e9:.0f} GB/实例（激活不从 0.85 预算里扣）", ""]
+            for f, t in sens:
+                if t:
+                    md += [f"DRAM 池 = {f:g} × 标称（{f * NOMINAL_TB:.2f} TB）：", "", t, ""]
+    if os.path.exists(os.path.join(RES, "pd", "summary.md")):
+        md += ["", "## PD 转换实验（单独生成，不由 `kvcm_sim.report` 管理）", "",
+               "E1 窗口级流体模型、E4 切换代价，以及 S5 配比阶跃下逐次阶跃的过载分钟（有池 vs 无池）见 "
+               "[`pd/summary.md`](pd/summary.md)（由 `PYTHONPATH=. python3 -m pd.run` 生成）。"]
     open(os.path.join(RES, "summary.md"), "w").write("\n".join(md) + "\n")
     print("wrote", os.path.join(RES, "summary.md"))
 
