@@ -6,8 +6,8 @@
    - P 节点：prefill 利用率 ≤ rho_p；
    - D 节点：KV 占用 ≤ hbm_kv_per_node × kv_fill（decode 在我们的参数下受 HBM 容量约束，见 params.md）；
    - 混部节点：prefill 时间占比 f ≤ f_mixed，decode 每步被拉长为 t_step/(1−f)，KV 占用同比放大。
-3. 策略：静态最优 P:D、静态全混部、静态最优 P/D/混部组合、动态 P:D（oracle / 滞后一窗）、动态三态（oracle）。
-   动态策略的切换损失按 E4 的切换耗时扣除（跨窗口结转）。
+3. 策略：静态最优 P:D、静态全混部、静态最优 P/D/混部组合、动态 P:D（oracle / 滞后一窗 / Evolving Infra 统计判据）、
+   动态三态（oracle）。动态策略的切换损失按 E4 的切换耗时扣除（跨窗口结转）；“丢 KV 重算”档另把丢失的复用折成 prefill 需求。
 4. goodput 代理：把负载整体乘 α，过载窗口占比 ≤ overload_tol 的最大 α。
 """
 
@@ -143,6 +143,13 @@ class Tier:
     t_pd: float           # P→D
     old_keep: float       # 切换期间旧角色保留的能力比例（排空 0.5；经池丢弃 0）
     p_mult: float         # prefill 需求乘数（host 权重副本挤占池 → 命中下降）
+    recompute: object = 0.0   # 满载节点（KV 占满 kv_cap）丢掉的 KV 折成的重算 NPU·s（标量或逐窗口数组）；
+                              # 实际按切换时刻 KV 占用比例缩放，在 recompute_span 内摊进 prefill
+    recompute_span: float = 300.0
+
+
+def _at(x, i):
+    return float(x[i]) if np.ndim(x) else float(x)
 
 
 def _alloc_choices(q, mixed):
@@ -165,6 +172,8 @@ def dynamic(dm, q, alpha, tier: Tier, mixed=False, oracle=True, headroom=1.05):
     ov = np.zeros(len(P), bool)
     sw = 0
     lost_ns = 0.0
+    xP = np.zeros(len(P) + int(math.ceil(tier.recompute_span / W)) + 1)   # 丢 KV 引起的额外 prefill（NPU）
+    rec = 0.0
     look = int(math.ceil(max(tier.t_dp, tier.t_pd) / W))
     for w in range(len(P)):
         if oracle:
@@ -181,7 +190,7 @@ def dynamic(dm, q, alpha, tier: Tier, mixed=False, oracle=True, headroom=1.05):
             if w == 0:
                 tgt = cur
             else:
-                Pl, Dl = P[w - 1] * headroom, D[w - 1] * headroom
+                Pl, Dl = (P[w - 1] + xP[w - 1]) * headroom, D[w - 1] * headroom
                 ok_cur = feasible(cur[0], cur[1], cur[2], Pl, Dl, q)
                 if ok_cur:
                     tgt = cur
@@ -203,6 +212,11 @@ def dynamic(dm, q, alpha, tier: Tier, mixed=False, oracle=True, headroom=1.05):
                 if loss[r] and tier.old_keep > 0:
                     pend.append([r, 0.0, t_sw, loss[r] * tier.old_keep])
             lost_ns += n_mv * t_sw * (1 - tier.old_keep)
+            occ = min(1.0, D[w] / (max(cur[1] + cur[2], 1.0) * q.kv_cap_node))
+            r_ns = n_mv * _at(tier.recompute, w) * occ
+            if r_ns:
+                rec += r_ns
+                _spread(xP, w, W, tier.recompute_span, r_ns)
         cur = tgt
         # 本窗口有效节点数 = cur + 结转修正（按时间平均）
         eff = cur.copy()
@@ -215,11 +229,86 @@ def dynamic(dm, q, alpha, tier: Tier, mixed=False, oracle=True, headroom=1.05):
                 nxt.append([r, max(0.0, s - W), d - max(0.0, W - s), amt])
         pend = nxt
         eff = np.maximum(eff, 0)
-        if not feasible(eff[0], eff[1], eff[2], P[w], D[w], q):
+        if not feasible(eff[0], eff[1], eff[2], P[w] + xP[w], D[w], q):
             over += 1
             ov[w] = True
     n = len(P)
-    return {"overload": over / n, "switches": sw, "lost_node_s": lost_ns, "ov": ov}
+    return {"overload": over / n, "switches": sw, "lost_node_s": lost_ns, "recompute_npu_s": rec, "ov": ov}
+
+
+def _spread(x, i, dt, span, amount):
+    """把 amount（NPU·s）从格 i 起均摊 span 秒，加到逐格平均 NPU 数组 x（格宽 dt）。"""
+    k = max(1, int(math.ceil(span / dt)))
+    x[i:i + k] += amount / (k * dt)
+
+
+def planner(dm, dm_sl, q, alpha, tier: Tier, t_win=600.0, cool=120.0):
+    """Evolving Infra §5.2 / 算法 E.3 的配比判据（只做 P:D）。
+
+    每个规划窗口（t_win，翻滚）结束时，把窗口切成 m 个切片（dm_sl 的格宽，60 s），
+    对每个 P 节点数 p ≠ 当前，算逐片收益 g_i = Θ(p) − Θ(当前)，Θ = min(P 侧能力 / P 需求, D 侧能力 / D 需求)，
+    均值 > 2 × 标准误（2σ/√m）才算合格，取均值最大的切换；上一轮切换未完成或距其开始不足 cool 秒则跳过本轮。
+    过载仍按 dm 的 5 分钟窗口统计（与 dynamic 同口径）；容量按切片累计切换损失后取窗口平均。
+    """
+    W = q.window
+    sl = float(dm_sl.t[1] - dm_sl.t[0])
+    k = int(round(W / sl))
+    n = len(dm.P)
+    ns = n * k
+    pm = np.repeat(np.broadcast_to(np.asarray(tier.p_mult, float), (n,)), k)
+    P = alpha * pm * dm_sl.P[:ns]
+    D = alpha * dm_sl.D[:ns]
+    N = q.n_nodes
+    capP, capD = q.npu_per_node * q.rho_p, q.kv_cap_node
+    ps = np.arange(N + 1, dtype=float)
+    m = int(round(t_win / sl))
+    cur = np.array(static_best(dm, q, alpha, tier.p_mult, mixed=False)["alloc"], dtype=float)
+    xP = np.zeros(ns + int(math.ceil(tier.recompute_span / sl)) + 1)
+    pend = []                 # [role, t_begin, t_end, amt]（绝对时间）
+    eff = np.zeros((ns, 3))
+    busy_until, last_sw = -np.inf, -np.inf
+    sw, rec, lost_ns = 0, 0.0, 0.0
+    for s in range(ns):
+        t0 = s * sl
+        if s >= m and s % m == 0 and t0 >= busy_until and t0 - last_sw >= cool:
+            Pi, Di = np.maximum(P[s - m:s] + xP[s - m:s], 1e-12), np.maximum(D[s - m:s], 1e-12)
+            th = np.minimum(ps[None, :] * capP / Pi[:, None], (N - ps)[None, :] * capD / Di[:, None])
+            g = th - th[:, [int(cur[0])]]
+            gm, gs = g.mean(0), g.std(0, ddof=1)
+            ok = gm > 2 * gs / math.sqrt(m)
+            ok[int(cur[0])] = False
+            if ok.any():
+                p_new = int(np.argmax(np.where(ok, gm, -np.inf)))
+                tgt = np.array([p_new, N - p_new, 0.0])
+                delta = tgt - cur
+                gain, loss = np.maximum(delta, 0), np.maximum(-delta, 0)
+                n_mv = gain.sum()
+                t_sw = tier.t_dp if gain[0] > 0 else tier.t_pd
+                for r in range(3):
+                    if gain[r]:
+                        pend.append([r, t0, t0 + t_sw, -gain[r]])
+                    if loss[r] and tier.old_keep > 0:
+                        pend.append([r, t0, t0 + t_sw, loss[r] * tier.old_keep])
+                sw += int(n_mv)
+                lost_ns += n_mv * t_sw * (1 - tier.old_keep)
+                occ = min(1.0, D[s - 1] / (max(cur[1], 1.0) * capD))
+                r_ns = n_mv * _at(tier.recompute, s // k) * occ
+                if r_ns:
+                    rec += r_ns
+                    _spread(xP, s, sl, tier.recompute_span, r_ns)
+                busy_until, last_sw = t0 + t_sw, t0
+                cur = tgt
+        e = cur.copy()
+        t1 = t0 + sl
+        for r, a, b, amt in pend:
+            e[r] += amt * max(0.0, min(b, t1) - max(a, t0)) / sl
+        pend = [x for x in pend if x[2] > t1]
+        eff[s] = np.maximum(e, 0)
+    effw = eff.reshape(n, k, 3).mean(1)
+    Pw = (P + xP[:ns]).reshape(n, k).mean(1)
+    Dw = D.reshape(n, k).mean(1)
+    ov = ~feasible(effw[:, 0], effw[:, 1], effw[:, 2], Pw, Dw, q)
+    return {"overload": float(ov.mean()), "switches": sw, "lost_node_s": lost_ns, "recompute_npu_s": rec, "ov": ov}
 
 
 def goodput(fn, tol, lo=0.05, hi=4.0, it=26):

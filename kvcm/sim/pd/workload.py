@@ -35,6 +35,7 @@ class Sessions:
     p: np.ndarray
     n_in: np.ndarray
     out: np.ndarray
+    p0: np.ndarray | None = None   # 同一请求不命中（hit=0）时的 prefill NPU·s
 
     @property
     def n(self) -> int:
@@ -115,4 +116,4 @@ def load(name: str) -> Sessions:
         np.savez(fn, off=off, t=a[:, 0], n_in=a[:, 1], out=a[:, 2], hit=a[:, 3])
     z = np.load(fn)
     p = BASE.npu_seconds(z["n_in"], z["hit"])
-    return Sessions(name, z["off"], z["t"], p, z["n_in"], z["out"])
+    return Sessions(name, z["off"], z["t"], p, z["n_in"], z["out"], BASE.npu_seconds(z["n_in"], 0.0))

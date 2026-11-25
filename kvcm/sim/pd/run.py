@@ -120,7 +120,23 @@ def sensitivity(scs, e4, shrink):
     return rows
 
 
-def step_analysis(sc, dm, pol, e4, shrink):
+CTRL = ("oracle", "lag", "ei5", "ei10")
+
+
+def run_ctrl(ctrl, dm, dm_sl, q, a, tr):
+    if ctrl == "oracle":
+        return F.dynamic(dm, q, a, tr)
+    if ctrl == "lag":
+        return F.dynamic(dm, q, a, tr, oracle=False)
+    return F.planner(dm, dm_sl, q, a, tr, t_win=300.0 if ctrl == "ei5" else 600.0)
+
+
+def saved_npu_s(dm, a, sf):
+    """测量段内命中省下的 prefill NPU·s（按各 trace 平均节省比例 sf 折算）。"""
+    return float(a * sum(dm.parts[k][0].sum() * sf[k] for k in dm.parts) * Q.window)
+
+
+def step_analysis(sc, dm, dm_sl, pol, e4, shrink):
     """S5：在共同负载 α* = 0.95 × 理想动态 P:D goodput 下，逐次阶跃统计过载。"""
     a = 0.95 * pol["dyn-pd-oracle@ideal"]
     W = Q.window
@@ -129,8 +145,8 @@ def step_analysis(sc, dm, pol, e4, shrink):
     rows["static-best3"] = F.static_best(dm, Q, a, mixed=True)
     rows["static-mixed"] = F.static_best(dm, Q, a, only=[(0, 0, Q.n_nodes)])
     for tr in tiers(e4, shrink, dm):
-        rows[f"{tr.name}|oracle"] = F.dynamic(dm, Q, a, tr)
-        rows[f"{tr.name}|lag"] = F.dynamic(dm, Q, a, tr, oracle=False)
+        for c in CTRL:
+            rows[f"{tr.name}|{c}"] = run_ctrl(c, dm, dm_sl, Q, a, tr)
     out = {"alpha": a, "steps_h": [x / HOURS for x in sc.steps], "policies": {}}
     for k, r in rows.items():
         ps = F.per_step(r["ov"], dm.t, sc.steps, W)
@@ -152,9 +168,12 @@ def tiers(e4, shrink, dm, q=Q):
     d2d_dp = ctrl + cc["d2d_s"]["p95"]
     drain_dp = cc["drain_s"]["p95"] * q.t_step / Q.t_step
     w = q.t_weights_sleep
+    Dt = sum(dm.parts[k][1] for k in dm.parts)
+    rc = sum(e4[k]["recompute_npu_s"]["p95"] * dm.parts[k][1] for k in dm.parts) / np.maximum(Dt, 1e-12)
     return [
         F.Tier("L-pool", "同布局逻辑切换 + KVCM 池（丢弃后从池重读）", pool_dp, ctrl, 0.0, 1.0),
         F.Tier("L-d2d", "同布局逻辑切换 + 无池点对点迁移（需引擎支持）", d2d_dp, ctrl, 0.0, 1.0),
+        F.Tier("L-kill", "同布局逻辑切换 + 无池快切（杀在途，被切节点 KV 全丢，按未命中重算）", ctrl, ctrl, 0.0, 1.0, rc),
         F.Tier("L-drain", "同布局逻辑切换 + 无池排空（等在途跑完）", drain_dp, ctrl, 0.5, 1.0),
         F.Tier("S-pool", "PR #89 sleep/wake + host H2D + KVCM 池（host 副本挤占池）", pool_dp + w, ctrl + w, 0.0, pm),
         F.Tier("S-drain", "PR #89 sleep/wake + host H2D + 无池排空", drain_dp + w, ctrl + w, 0.5, 1.0),
@@ -173,16 +192,19 @@ def main():
 
     e4 = {S.name: costs(S, Q, args.e4_n) for S in (cc, qw)}
     shrink = {k: pool_shrink_mult(k) for k in ("cc256k", "qwen_coder")}
+    sf = {S.name: float((S.p0.sum() - S.p.sum()) / S.p.sum()) for S in (cc, qw)}
     print("E4", json.dumps({k: {m: v[m]["p95"] for m in v} for k, v in e4.items()}, ensure_ascii=False))
     print("shrink", shrink)
 
     scs, d_node, r_cc = scenarios(cc, qw)
     out = {"params": {k: getattr(Q, k) for k in Q.__dataclass_fields__}, "f_mixed": Q.f_mixed,
            "d_node_per_session": d_node, "r_cc_ref_per_s": r_cc, "pool_shrink": shrink, "e4": e4,
+           "reuse_saved_per_prefill": sf,
            "scenarios": {}}
     series = {}
     for sc in scs:
         dm = F.build_demand(sc, Q)
+        dm_sl = F.build_demand(sc, Q.with_(window=60.0))
         nP, nD = F.need(dm, Q, 1.0)
         share = nP / (nP + nD)
         tol = Q.overload_tol
@@ -204,6 +226,18 @@ def main():
             r["dyn-pd-oracle"] = F.goodput(lambda a: F.dynamic(dm, Q, a, tr), tol)
             r["dyn-pd-lag"] = F.goodput(lambda a: F.dynamic(dm, Q, a, tr, oracle=False), tol)
             r["dyn-3-oracle"] = F.goodput(lambda a: F.dynamic(dm, Q, a, tr, mixed=True), tol)
+            r["ei5"] = F.goodput(lambda a: F.planner(dm, dm_sl, Q, a, tr, t_win=300.0), tol)
+            r["ei10"] = F.goodput(lambda a: F.planner(dm, dm_sl, Q, a, tr, t_win=600.0), tol)
+            # 共同负载 α_ref = 静态最优 P:D 的 goodput 下，各控制器的过载、切换与丢失复用
+            a_ref = pol["static-pd"]
+            sv = saved_npu_s(dm, a_ref, sf)
+            r["at_ref"] = {}
+            for c in CTRL:
+                x = run_ctrl(c, dm, dm_sl, Q, a_ref, tr)
+                r["at_ref"][c] = {"over_windows": int(x["ov"].sum()), "switches": x["switches"],
+                                  "recompute_npu_s": x["recompute_npu_s"], "lost_reuse": x["recompute_npu_s"] / sv}
+            r["saved_npu_s_ref"] = sv
+            r["recompute_per_node_mean"] = float(np.mean(tr.recompute))
             g = r["dyn-pd-lag"]
             r["switches_at_lag_goodput"] = F.dynamic(dm, Q, g, tr, oracle=False)["switches"] if g > 0 else 0
             r["t_dp"], r["t_pd"] = tr.t_dp, tr.t_pd
@@ -215,9 +249,10 @@ def main():
         out["scenarios"][sc.name] = res
         series[sc.name] = (dm, nP, nD, share)
         if sc.steps:
-            out["s5_steps"] = step_analysis(sc, dm, pol, e4, shrink)
+            out["s5_steps"] = step_analysis(sc, dm, dm_sl, pol, e4, shrink)
         print(f"[{sc.name}] {time.time() - t0:.0f}s", json.dumps({k: round(v, 3) for k, v in pol.items()}),
-              {k: round(v["dyn-pd-lag"], 3) for k, v in res["tiers"].items()})
+              {k: (round(v["dyn-pd-oracle"], 3), round(v["dyn-pd-lag"], 3), round(v["ei5"], 3), round(v["ei10"], 3))
+               for k, v in res["tiers"].items()})
     out["sensitivity"] = sensitivity(scs, e4, shrink)
     json.dump(out, open(os.path.join(RES, "pd_results.json"), "w"), ensure_ascii=False, indent=1)
 
