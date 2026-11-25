@@ -1,6 +1,6 @@
 """实验编排：负载校准 → 命中率-容量曲线（MRC）→ 消融 → TTFT / 等效 NPU。
 
-    PYTHONPATH=kvcm/sim python3 -m kvcm_sim.run --trace cc256k --jobs 2
+    PYTHONPATH=kvcm/sim python3 -m kvcm_sim.run --trace cc256k --jobs 2   # k 默认 32
 
 结果写到 `kvcm/sim/results/<trace>.json`（每个 run 一条汇总），图由 `kvcm_sim.report` 生成。
 """
@@ -26,6 +26,7 @@ TRACE_PATHS = {
     "qwen_coder": os.environ.get("QWEN_CODER", "/tmp/traces/qwen_coder.jsonl"),
 }
 PAGE = 512
+BAL_ABS = 11
 HORIZON = 36000.0
 WARMUP = 10800.0
 GAP_EDGES = [0, 10, 60, 600, 3600, math.inf]
@@ -42,19 +43,19 @@ POLICIES = {
     "kvcm-none": dict(policy="kvcm", hook="none", **FULL),
     "kvcm-real": dict(policy="kvcm", hook="realistic", **FULL, **REAL_BUDGET),
     "kvcm-oracle": dict(policy="kvcm", hook="oracle", **FULL),
-    # 单列变体：主线 + 池→HBM 预取请求（kvcm/design/kv-prefetch.md 方案 A，进引擎 LRU，不钉）
-    "kvcm-real-hint": dict(policy="kvcm", hook="realistic", **FULL, **REAL_BUDGET, hbm_hint=True),
-    "kvcm-oracle-hint": dict(policy="kvcm", hook="oracle", **FULL, hbm_hint=True),
-    # 消融链：shared → +池保活 → +零引用优先（= KVCM 主线）→ +HBM 预取提示（变体）
+    # 消融链：shared → +池保活 → +零引用优先（= KVCM）
     "real+ka": dict(policy="kvcm", hook="realistic", keepalive=True, **REAL_BUDGET),
     "oracle+ka": dict(policy="kvcm", hook="oracle", keepalive=True),
 }
 
 # x 轴只扫 DRAM 池容量（标称 14 TB 的倍数）；HBM 固定为真实大小
 MRC_F = [1 / 32, 1 / 16, 1 / 8, 1 / 4, 1 / 2, 1, 2]
-MRC_POLICIES = ["local", "shared", "kvcm-real", "kvcm-oracle", "kvcm-oracle-hint"]
+MRC_POLICIES = ["local", "shared", "kvcm-real", "kvcm-oracle"]
 ABL_F = [1 / 8, 1]
-ABL_POLICIES = ["kvcm-none", "real+ka", "oracle+ka", "kvcm-real-hint"]
+ABL_POLICIES = ["kvcm-none", "real+ka", "oracle+ka"]
+# 下界对照：下一轮剥掉思维链，decode KV 不被命中（同一负载）
+STRIP_F = [1 / 8, 1]
+STRIP_POLICIES = ["local", "shared", "kvcm-real", "kvcm-oracle"]
 
 
 def load(trace: str):
@@ -72,7 +73,9 @@ def base_cfg(f: float, k: int) -> dict:
         n_inst=P.n_inst,
         hbm_pages=max(1, int(P.pages(P.hbm_kv_per_inst, PAGE) / k)),
         dram_pages=max(1, int(P.pages(P.dram_kv_total, PAGE) * f / k)),
-        bal_abs=max(1, round(32 / math.sqrt(k))),
+        # 失衡阈值不随切片缩小：CC 的 subagent 扇出让单会话瞬时并发与 k 无关；
+        # 取 k=8 时的 11，k=32 下 per-instance / shared 命中与 k=8 相差 < 0.2 个点
+        bal_abs=BAL_ABS,
     )
 
 
@@ -117,8 +120,6 @@ def summarize(rec: dict, k: int, sim: Sim) -> dict:
         "ttft_p99": float(np.percentile(ttft, 99)),
         "ttft_roce_mean": float(ttft_roce.mean()),
         "ttft_roce_p95": float(np.percentile(ttft_roce, 95)),
-        "prewarmed_frac": float(rec["prewarmed"][m].mean()),
-        "prewarm_bytes_per_s": float(sim.prewarm_pages * PAGE * P.kv_bytes_per_token / HORIZON * k),
         "gap_buckets": buckets,
         "sessions": sim.n_sessions,
     }
@@ -131,13 +132,15 @@ def summarize(rec: dict, k: int, sim: Sim) -> dict:
 def run_one(args):
     trace, pol, f, k, rate = args
     wl = load(trace)
-    cfg = Config(**base_cfg(f, k), **POLICIES[pol], attribution=(pol == "local"))
+    base = pol.removeprefix("strip:")
+    cfg = Config(**base_cfg(f, k), **POLICIES[base], attribution=(base == "local"),
+                 decode_cache=not pol.startswith("strip:"))
     t0 = time.time()
     sim = Sim(cfg, wl, rate=rate / k, horizon=HORIZON, warmup=WARMUP, seed=1)
     rec = sim.run()
     s = summarize(rec, k, sim)
     s.update(trace=trace, policy=pol, f=f, k=k, rate_full=rate, wall_s=round(time.time() - t0, 1))
-    print(f"[{trace}] {pol:13s} f={f:<8.4g} hit={s['hit_rate']:.4f} hbm={s['hbm_hit_rate']:.4f} "
+    print(f"[{trace}] {pol:19s} f={f:<8.4g} hit={s['hit_rate']:.4f} hbm={s['hbm_hit_rate']:.4f} "
           f"ideal={s['ideal_hit_rate']:.4f} util={s['npu_util']:.3f} ({s['wall_s']}s)", flush=True)
     return s
 
@@ -148,7 +151,7 @@ def calibrate(trace: str, k: int, target: float = P.prefill_util_target) -> floa
     mean_dur = np.mean([max(r.t for r in s.reqs) for s in wl.sessions])
     rate = len(wl.sessions) / max(HORIZON, mean_dur)  # 初值：任意
     for _ in range(2):
-        sim = Sim(Config(**base_cfg(1.0, k), policy="shared_lru"), wl, rate=rate / k,
+        sim = Sim(Config(**base_cfg(1.0, k), policy="shared_lru", ideal_only=True), wl, rate=rate / k,
                   horizon=HORIZON, warmup=WARMUP, seed=1)
         s = summarize(sim.run(), k, sim)
         rate *= target / s["npu_util_ideal"]
@@ -158,10 +161,10 @@ def calibrate(trace: str, k: int, target: float = P.prefill_util_target) -> floa
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trace", required=True)
-    ap.add_argument("--k", type=int, default=8)
+    ap.add_argument("--k", type=int, default=32)
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "results"))
-    ap.add_argument("--only", default="", help="mrc|abl，留空=全部")
+    ap.add_argument("--only", default="", help="mrc|abl|strip，留空=全部")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     cal_path = os.path.join(args.out, "calibration.json")
@@ -169,6 +172,9 @@ def main():
     key = f"{args.trace}@k{args.k}"
     if key not in cal:
         cal[key] = calibrate(args.trace, args.k)
+        # 多条 trace 并行校准时，写回前合并其他进程已写入的键
+        if os.path.exists(cal_path):
+            cal = {**json.load(open(cal_path)), **cal}
         json.dump(cal, open(cal_path, "w"), indent=2)
     rate = cal[key]
     print(f"[{args.trace}] full-scale session rate = {rate:.4f}/s ({rate * 3600:.0f}/h)", flush=True)
@@ -178,12 +184,14 @@ def main():
         jobs += [(args.trace, p, f, args.k, rate) for f in MRC_F for p in MRC_POLICIES]
     if args.only in ("", "abl"):
         jobs += [(args.trace, p, f, args.k, rate) for f in ABL_F for p in ABL_POLICIES]
+    if args.only in ("", "strip"):
+        jobs += [(args.trace, "strip:" + p, f, args.k, rate) for f in STRIP_F for p in STRIP_POLICIES]
     out_path = os.path.join(args.out, f"{args.trace}.json")
     done = json.load(open(out_path)) if os.path.exists(out_path) else []
     have = {(d["policy"], round(d["f"], 6), d["k"]) for d in done}
     jobs = [j for j in jobs if (j[1], round(j[2], 6), j[3]) not in have]
     # 慢的（大容量、kvcm）先跑
-    jobs.sort(key=lambda j: (-j[2], j[1].startswith("local")))
+    jobs.sort(key=lambda j: (-j[2], "local" in j[1]))
     with Pool(args.jobs) as pool:
         for s in pool.imap_unordered(run_one, jobs):
             done.append(s)

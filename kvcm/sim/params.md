@@ -2,16 +2,19 @@
 
 每个参数标注来源；没有可核实来源的一律标 **假设**，等待用户校正。代码里的对应值在 [`kvcm_sim/params.py`](kvcm_sim/params.py)（硬件/模型/算力）与 [`kvcm_sim/replay.py`](kvcm_sim/replay.py) `Config`（策略/路由）。两处改动要同步本表。
 
-## 1. 模型：DeepSeek V4.1
+## 1. 模型：DeepSeek-V4.1-Flash（公开规格）
+
+DeepSeek V4.1 目前公开的只有 **DeepSeek-V4.1-Flash**（Hugging Face `deepseek-ai/DeepSeek-V4.1-Flash`，2026-09-10 发布，含 `config.json`、`inference/model.py` 与 `DeepSeek_V41_Tech_Report.pdf`）；没有 V4.1 Pro。下表按它取值。
 
 | 参数 | 取值 | 来源 / 标签 |
 |---|---|---|
-| 层结构 | 与 V4-Pro 相同：30 层 C4（4:1 压缩 + indexer）+ 31 层 C128（128:1 压缩）+ 1 层 MTP | **假设**（仓库无 V4.1 资料）；V4-Pro 结构取自 `tools/cmx-sim/sim.js` `MODELS.v4pro`（vLLM 2026-04-24 附录 + DeepSeek-V4 §4.2.1） |
-| KV 精度 | BF16 | **假设**：A3（910C）无 FP8 计算；仓库 V3.2 昇腾口径同样按 BF16（`kvcm/design/D8-joint-scheduling.md` 83.9 KiB/token） |
-| growing KV bytes/token | **9,848 B**（= 30×(1024+256)/4 + 31×1024/128） | 由 `tools/cmx-sim/sim.js` `PROFILES.v4pro` `bf16-logical`（1024 B main / 256 B index）推导 |
-| 同上（FP8 敏感性） | 5,511 B（584 / 132 B entry） | `tools/cmx-sim/sim.js` `fp8-vllm`（vLLM FP8 entry payload） |
-| 每会话固定状态（SWA + compressor） | ≈27 MB/会话，**仿真忽略** | 由 `sim.js` `v4CompressorStateBytes` / SWA 128 token 推导；100K 上下文时约占 2.7%，在回放精度以内 |
-| 权重 | 1.6 TB | **假设**：V4-Pro 1.6T 参数，W8A8 1 B/参数 |
+| 规模 | 552B backbone（另有 Engram 196B）；prefill 激活 8B、decode 激活 16B；40 层（20 层 causal encoder + 20 层 decoder，CED）+ 3 层 MTP | HF README「Introduction」+ 技术报告摘要 |
+| 全局 KV 结构 | CSA2：只有 `kv_source_layer_ids = [2, 8, 14, 20]` 4 层存 main KV 与 indexer K，其余层 Reindex/Reuse 共享；这 4 层 `compress_ratios` = 2, 2, 2, 1 | `config.json` `text_config`；`inference/model.py` `Compressor` / `Indexer`（`owns_k = layer_id in kv_source_layers`） |
+| 每 entry 字节 | main KV 512 维 FP4（E2M1）+ 每 16 维一个 E4M3 scale = 288 B；indexer K 128 维 FP4 + 每 32 维一个 scale = 68 B；合计 356 B | `inference/model.py`（main latent `fp4_act_quant(latent, 16, …, float8_e4m3fn)`，indexer `fp4_act_quant(k, fp4_block_size=32)`）；README「FP4 main KV caching (E2M1, one E4M3 scale per 16 channels)」 |
+| **全局 KV bytes/token** | **890 B**（= 3 × 356 / 2 + 356） | 由上两行推导，与 README / 技术报告给出的 “890 bytes per token” 一致 |
+| 同上（BF16 存储敏感性） | 3,200 B（同结构 BF16：3 × 1280 / 2 + 1280） | 推导；A3 若不能存 FP4 KV 时的口径，**未进主结果** |
+| SWA KV | 每层 128 token 窗口，**不入持久 KV**，放在每机 10% DRAM 的短 TTL 池；缺失时 Encoder SWA Bounded Replay 只重算最后 `n_win` 个 token | 技术报告 §3.2.1–§3.2.2；**仿真忽略**（与前缀命中无关，重算 128 token 的开销在回放精度以内） |
+| 权重 | 510 GB | HF safetensors 48 个分片合计（FP8 主体 + FP4 专家 + Engram 表；按全部放 HBM 计，偏保守） |
 
 ## 2. 硬件：华为昇腾 A3 集群
 
@@ -19,10 +22,10 @@
 |---|---|---|
 | 规模 | 14 节点 × 16 NPU = 224 NPU | 用户给定（2026-11-24） |
 | HBM / NPU | 64 GB | **假设**：910C 每芯片 128 GB、2 die，按 die 计 NPU（16 NPU/节点 = 8 芯片） |
-| 实例切分 | 2 节点 / 实例（32 NPU），共 7 个实例；PD 混部 | **假设**：1.6 TB 权重单节点（1 TB HBM）放不下 |
+| 实例切分 | 1 节点 / 实例（16 NPU），共 14 个实例；PD 混部 | **假设**：510 GB 权重单节点（1 TB HBM）放得下，按最小可放切分 |
 | 激活 / workspace 预留 | 4 GB / NPU | **假设** |
-| HBM KV / 实例 | **320 GB**（= 32 × (64 − 50 权重 − 4 预留)）；全集群 2.24 TB ≈ 2.27 亿 token | 由上面三项推导 |
-| DRAM KV / 节点 | **1 TB**；全集群池 14 TB ≈ 14.2 亿 token | **假设**（Atlas 800T A3 主机内存配置与 KV 可用比例待确认） |
+| HBM KV / 实例 | **450 GB**（= 16 × (64 − 31.9 权重 − 4 预留)）；全集群 6.3 TB ≈ 71 亿 token | 由上面几项推导 |
+| DRAM KV / 节点 | **1 TB**；全集群池 14 TB ≈ 157 亿 token | **假设**（Atlas 800T A3 主机内存配置与 KV 可用比例待确认） |
 | 本机 DRAM→HBM 带宽 | 86 GB/s | `kvcm/design/D8a-scheduling-algorithms.md` §9.1 A3 910C FabricMem 机内 rH2D（AICPU 展开）下限 |
 | 跨节点池→HBM 带宽 | 78 GB/s；敏感性 23.8 GB/s | 同上 §9.1：FabricMem 跨机 rH2D 下限；ROCE rH2D |
 | 存储层 | 只有 HBM + DRAM，无 SSD | 用户给定 |
@@ -35,7 +38,8 @@
 | 拟合测点拓扑 | 64 卡 · gbs=64 | `tools/cmx-sim/measured.js`（设备 A，`deepseek-v4-pro`） |
 | 单请求算力占用 | TTFT × 64 卡 / 64 并发 = 1 张 950 卡 × TTFT | 由测点拓扑推导（`noCacheTPS = N/TTFT` 与表内一致，说明 TTFT 是单请求口径） |
 | 950 → A3 换算 | 1 张 950 ≈ **2 个 A3 NPU**（die）的 prefill 吞吐 | **假设**（待 A3 实测或厂商数据） |
-| A3 TTFT | `2 × TTFT_fit`（同等每卡并发）+ 未掩盖的 KV 加载时间 | D8a §3.2 “掩不住”式；换算系数为 **假设** |
+| V4-Pro → V4.1-Flash 换算 | 拟合式中与 token 数相关的 a、b 项 × 8/49（prefill 激活参数比），固定开销 c 不变 | **假设**（拟合只有 V4-Pro；激活参数取自 V4.1 README 表 “# Activated Params 8B / 16B” 与 V4-Pro 49B） |
+| A3 TTFT | `2 × TTFT_fit(V4.1 缩放后)`（同等每卡并发）+ 未掩盖的 KV 加载时间 | D8a §3.2 “掩不住”式；换算系数为 **假设** |
 | 等效 NPU 数 | `Σ_请求 (NPU·s_基线 − NPU·s_KVCM) / 墙钟秒` | D8a §8.2 |
 | 排队 | 不建模（无 DES） | 局限，见 README |
 
@@ -45,9 +49,11 @@
 |---|---|---|
 | 会话到达 | Poisson；每次到达从 trace 里均匀抽一个会话、整段按原时间线回放；副本间私有页加盐隔离 | 方法设定 |
 | 负载锚点 | 选到达率使**理想命中（无限容量、全局共享）下** prefill 占集群 NPU 时间 50% | **假设**（剩余给 decode；与策略无关的锚点） |
-| CC-256k 到达率 | ≈1,750 会话/h ≈ 59 req/s（全规模） | 由锚点校准 |
+| 到达率（全规模） | CC-256k ≈10,871 会话/h；Codex ≈59,259 会话/h；Qwen coder ≈1,626,604 会话/h | 由锚点校准（V4.1 prefill 更便宜，约为上一版的 6.3 倍） |
 | 仿真窗口 | 10 h，前 3 h 预热不计 | 方法设定 |
-| 规模切片 | 仿真 1/k 集群（每实例 HBM、池容量与负载同比缩小，7 个实例不变），NPU 数再乘 k；主结果 k=8 | 方法设定；k=4 与 k=16 对照见 README |
+| 规模切片 | 仿真 1/k 集群（每实例 HBM、池容量与负载同比缩小，14 个实例不变），NPU 数再乘 k；主结果 k=32 | 方法设定；与 k=8 对照见 README |
+| decode 写出的 KV | **入缓存**：请求结束时，引擎把输入尾页 + 输出写满的页写入本实例 HBM 并写穿到 DRAM 层；理想上限 h* 同样包含 | 对标 vLLM（满块生成 token 入 APC）与 SGLang（请求结束时整段插 radix）；方法设定 |
+| 下一轮是否命中输出 | **主结果 = 原样回传**：下一轮输入以本轮输入为前缀、且原样携带本轮全部输出（含思维链）时，输出对应的页记为命中；**下界 = 剥掉思维链**：decode KV 从思维链起与下一轮输入分叉，输出全部不命中（上一版口径） | trace 只给输出 token 数（CC `out`、Qwen `output_length`）或可见文本（Codex），不分思维链/可见；按 trace 统计选主口径，见 README「decode 写出的 KV」 |
 | 页粒度 | 512 token | **假设**（CPU 开销折中；vLLM V4 block = 256 源 token） |
 | Codex 调用间隔 | lognormal，P50 5.2 s、P90 23.0 s | `Inferact/codex_swebenchpro_traces` README §5（trace 本身无时间戳，时间线为**合成**） |
 | Codex / Qwen 服务时长 | 2 s + output / 40 tok/s | **假设**（trace 无服务时长；CC 用 trace 自带 `api_time`） |
@@ -57,16 +63,14 @@
 | 参数 | 取值 | 来源 / 标签 |
 |---|---|---|
 | 路由规则 | 负载失衡（max−min > abs 且 max > 1.5×min）走最短队列，否则走最长前缀命中 | SGLang cache-aware 路由规则（`docs/research/sglang/model-runner.md`）；阈值为 **假设** |
-| abs 阈值 | 全规模 32 个在途请求，切片按 32/√k 缩放 | **假设** |
-| HBM 归属 | 推理引擎：每实例前缀缓存，纯 LRU，**所有策略相同**，固定 320 GB/实例，不随 x 轴变化 | 用户校正（2026-11-25）；`kvcm/design/D2-kv-operations.md`「操作图解」节：“八项操作都作用于池内副本；HBM 工作集由引擎自己的读写路径加载，不在 kvcm 操作面” |
+| abs 阈值 | 11 个在途请求，**不随切片缩放** | **假设**；CC 的 subagent 扇出让单会话瞬时并发与切片无关，按 32/√k 缩到 k=32 的 6 时 per-instance LRU 命中被压低 4.5 个点（91.2% vs k=8 的 95.7%），取 11 时 k=32 与 k=8 相差 < 0.2 个点 |
+| HBM 归属 | 推理引擎：每实例前缀缓存，纯 LRU，**所有策略相同**，固定 450 GB/实例，不随 x 轴变化 | 用户校正（2026-11-25）；`kvcm/design/D2-kv-operations.md`「操作图解」节：“八项操作都作用于池内副本；HBM 工作集由引擎自己的读写路径加载，不在 kvcm 操作面” |
 | x 轴 | 只扫 DRAM 池容量：标称 14 TB × {1/32 … 2} | 方法设定 |
 | 基线 1：per-instance LRU | 引擎 HBM LRU + 实例私有 DRAM（write-through，总量同池），LRU | 对标 vLLM APC + 本地 offload（`docs/research/vllm/block-lifecycle.md`） |
 | 基线 2：shared-pool LRU | 引擎 HBM LRU + 全集群共享 DRAM 池（去重、任意实例可取），LRU | 对标 Mooncake/LMCache 共享池（被动 LRU） |
 | KVCM 池保活 | 停顿期把前缀钉在共享池（ETA ≤ 2 h，且 ≤ 2×池 LRU 驻留时间）；钉预算池 50%（realistic 10%） | **假设**（D8a §5 保留 TTL = ETA + slack） |
 | 钉住时长 | oracle：到下一轮到达；realistic：`2 × ETA上界 + 5 s` | **假设** |
 | KVCM 零引用优先（池） | 活会话（会话级引用，含在途请求）的池页后驱逐；realistic 活跃窗 = max(4 × ETA上界, 300 s) | lake 原则 4 “引用数>0 冻结”；窗口为 **假设** |
-| 变体：HBM 预取提示 | **不属于 KVCM 主线**。预测 ETA 超过 0.5×HBM 驻留时间时，在 ETA − 5 s 向目标实例发预取请求，引擎把池里前缀载入 HBM 并入其 LRU，**不钉** | `kvcm/design/kv-prefetch.md` 方案 A + 「决策」节（`max_tokens=1` 预取请求 → 加载进 HBM/APC；“不做 pin（HBM APC 是 LRU）”）；触发阈值与提前量为 **假设** |
-| 池内 ETA 预热（方案 B2 本机 DRAM 副本） | **不建模**：无 SSD 层，池里没有的前缀无处可预热；本机/跨机副本只差 86 vs 78 GB/s 加载带宽 | `kvcm/design/kv-prefetch.md` 方案 B2 |
-| hook：none | 无停顿信息，池保活/零引用/预取提示都不生效 | 方法设定 |
+| hook：none | 无停顿信息，池保活/零引用都不生效 | 方法设定 |
 | hook：realistic | 只用该流历史间隔：点估计 = 最近 5 次间隔的几何均值，上界 = exp(μ+σ)；冷启动用全局历史中位数 | 方法设定 |
 | hook：oracle | 真实间隔，且知道会话/流是否还有下一轮 | 上界 |

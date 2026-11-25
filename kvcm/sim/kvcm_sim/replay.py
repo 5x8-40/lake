@@ -18,8 +18,6 @@ DRAM 池（kvcm/design/D2-kv-operations.md：八项操作只作用于池内副�
 KVCM 机制（逐项可开关，用于消融），全部只作用于共享池：
 - keepalive：会话停顿期把前缀钉在共享池，带预算；
 - zeroref：活会话引用的页后驱逐，零引用页先驱逐；
-- hbm_hint（单列变体，不属于主线）：按 ETA 在返回前向目标实例发预取请求，引擎把池里
-  的前缀载入 HBM 并入其 LRU，不钉（kvcm/design/kv-prefetch.md 方案 A）。
 hook 三档决定 ETA：none（无信息）、realistic（只用该流历史间隔预测）、
 oracle（真实间隔，且知道会话是否还有下一轮）。
 """
@@ -35,7 +33,7 @@ import numpy as np
 
 from .traces import Workload
 
-ARRIVE, COMPLETE, PREWARM, PIN_EXP_POOL, LIVE_EXP = range(5)
+ARRIVE, COMPLETE, PIN_EXP_POOL, LIVE_EXP = range(4)
 
 
 @dataclass
@@ -46,7 +44,10 @@ class Config:
     policy: str = "local_lru"     # local_lru | shared_lru | kvcm
     keepalive: bool = False
     zeroref: bool = False
-    hbm_hint: bool = False
+    # decode 写出的 KV 是否入缓存并可被下一轮命中（下一轮输入原样携带本轮输出，含思维链）；
+    # False = 下一轮剥掉思维链，decode KV 从思维链起与下一轮输入分叉，输出部分全部不命中
+    decode_cache: bool = True
+    ideal_only: bool = False      # 只算无限容量全局共享的 h*（负载校准用，跳过各层与路由）
     hook: str = "none"            # none | realistic | oracle
     # 路由：SGLang cache-aware 规则——负载失衡时走最短队列，否则走最长前缀命中
     bal_abs: int = 8
@@ -56,7 +57,6 @@ class Config:
     pool_pin_frac: float = 0.5
     slack_mult: float = 2.0
     slack_add: float = 5.0
-    prewarm_lead: float = 5.0
     live_mult: float = 4.0
     live_min: float = 300.0
     eta_hist: int = 5
@@ -129,7 +129,6 @@ class Sim:
         self.load = [0] * n
         self.ideal: set = set()
         self.streams: dict = {}
-        self.prewarm_pages = 0
         self.tc_t = 0.0
         self.g_prior = 5.0
         self.ghist: list = []
@@ -305,22 +304,18 @@ class Sim:
             n_sess += 1
         self.n_sessions = n_sess
 
-        rec_t, rec_n, rec_hbm, rec_hit, rec_ideal, rec_gap, rec_any, rec_pw = ([] for _ in range(8))
+        rec_t, rec_n, rec_hbm, rec_hit, rec_ideal, rec_gap, rec_any = ([] for _ in range(7))
         streams = self.streams
         while ev:
             now, _, typ, pl = heapq.heappop(ev)
             if typ == ARRIVE:
                 sid, salt, r, is_last = pl
-                pages = r.pages
-                if r.shared is None:
-                    keys = (pages ^ salt).tolist()
-                else:
-                    keys = np.where(r.shared, pages, pages ^ salt).tolist()
+                keys = self._keys(r, len(r.pages), salt)
                 skey = (sid, r.stream)
                 st = streams.get(skey)
                 if st is None:
                     st = streams[skey] = {"hist": [], "last_end": None, "inst": None, "pool_pin": [],
-                                          "ref": [], "tok": 0, "pw": None}
+                                          "ref": [], "tok": 0}
                 gap = now - st["last_end"] if st["last_end"] is not None else math.nan
                 if st["last_end"] is not None:
                     st["hist"].append(max(0.0, gap))
@@ -330,6 +325,14 @@ class Sim:
                     self._tc_update(now)
                 ideal = pref(self.ideal, keys)
                 self.ideal.update(keys)
+                if cfg.ideal_only:
+                    heapq.heappush(ev, (now + r.svc, seq, COMPLETE, (skey, 0, keys, r, now, is_last, salt)))
+                    seq += 1
+                    st["tok"] += 1
+                    for lst, v in ((rec_t, now), (rec_n, r.n_in), (rec_hbm, ideal), (rec_hit, ideal),
+                                   (rec_ideal, ideal), (rec_gap, gap)):
+                        lst.append(v)
+                    continue
                 i = self._route(keys)
                 h_hbm = pref(self.hbm[i].all, keys)
                 h_d = pref(self.dram[i].all, keys)
@@ -341,9 +344,6 @@ class Sim:
                             break
                         anyh = max(anyh, pref(tt.all, keys))
                     rec_any.append(anyh)
-                pw = st["pw"]
-                rec_pw.append(1 if (pw is not None and pw == i and h_hbm > 0) else 0)
-                st["pw"] = None
                 if self.use_ref:
                     # 引用归会话所有：同一会话的 subagent 之间共享前缀（CC trace 里约 40% 的
                     # 已结束 subagent 页会被同会话后续流复用），按流计引用会错杀。
@@ -362,7 +362,7 @@ class Sim:
                 self.load[i] += 1
                 st["inst"] = i
                 st["tok"] += 1
-                heapq.heappush(ev, (now + r.svc, seq, COMPLETE, (skey, i, keys, r, now, is_last)))
+                heapq.heappush(ev, (now + r.svc, seq, COMPLETE, (skey, i, keys, r, now, is_last, salt)))
                 seq += 1
                 rec_t.append(now)
                 rec_n.append(r.n_in)
@@ -371,8 +371,26 @@ class Sim:
                 rec_ideal.append(ideal)
                 rec_gap.append(gap)
             elif typ == COMPLETE:
-                skey, i, keys, r, t_arr, is_last = pl
+                skey, i, keys, r, t_arr, is_last, salt = pl
+                if cfg.ideal_only:
+                    streams[skey]["last_end"] = now
+                    if cfg.decode_cache and r.out_next is not None:
+                        self.ideal.update(self._keys(r.out_next, r.out_end, salt)[len(r.pages):])
+                    continue
                 self.load[i] -= 1
+                if cfg.decode_cache and r.out_next is not None:
+                    # 引擎缓存 decode 写出的 KV（vLLM 满块入 APC、SGLang 结束时整段插 radix），
+                    # 写穿到 DRAM 层；理想上限同样包含这些页
+                    keys = self._keys(r.out_next, r.out_end, salt)
+                    self.ideal.update(keys[len(r.pages):])
+                    if self.use_ref:
+                        sref = self.sess[skey[0]]["ref"]
+                        new = [k for k in keys[len(r.pages):] if k not in sref]
+                        if new:
+                            sref.update(new)
+                            self._ref_change(new, +1)
+                    self.use(self.dram[i], keys)
+                    self.use(self.hbm[i], keys)
                 if not self.kv or cfg.hook == "none":
                     st = streams[skey]
                     st["last_end"] = now
@@ -407,11 +425,6 @@ class Sim:
                     elif st["pool_pin"]:
                         self._unpin(self.pool, st["pool_pin"])
                         st["pool_pin"] = []
-                # 只在引擎 HBM 的 LRU 大概率已挤掉该前缀时才发预取（否则是白搬）
-                if cfg.hbm_hint and 0.5 * self.hbm[i].tc < eta <= cfg.pool_pin_max_gap:
-                    tp = now + max(0.0, eta - cfg.prewarm_lead)
-                    heapq.heappush(ev, (tp, seq, PREWARM, (skey, tok, keys, eta)))
-                    seq += 1
             elif typ == PIN_EXP_POOL:
                 skey, tok = pl
                 st = streams[skey]
@@ -422,28 +435,11 @@ class Sim:
                 sid, tok = pl
                 if self.sess[sid]["tok"] == tok:
                     self._release_sess(sid)
-            elif typ == PREWARM:
-                skey, tok, keys, eta = pl
-                st = streams[skey]
-                if st["tok"] != tok:
-                    continue  # 请求已经先到了
-                p = pref(self.pool.all, keys)
-                if p == 0:
-                    continue
-                last = st["inst"]
-                lo = min(self.load)
-                tgt = last if self.load[last] <= max(cfg.bal_rel * lo, lo + cfg.bal_abs) else self.load.index(lo)
-                sub = keys[:p]
-                before = pref(self.hbm[tgt].all, sub)
-                self.use(self.hbm[tgt], sub)
-                self.prewarm_pages += p - before
-                st["pw"] = tgt
 
         self.rec = {
             "t": np.array(rec_t), "n_in": np.array(rec_n, dtype=np.int64),
             "hbm": np.array(rec_hbm, dtype=np.int64) * P, "hit": np.array(rec_hit, dtype=np.int64) * P,
             "ideal": np.array(rec_ideal, dtype=np.int64) * P, "gap": np.array(rec_gap),
-            "prewarmed": np.array(rec_pw, dtype=np.int8),
         }
         if cfg.attribution:
             self.rec["any"] = np.array(rec_any, dtype=np.int64) * P
@@ -451,6 +447,13 @@ class Sim:
             if k in self.rec:
                 self.rec[k] = np.minimum(self.rec[k], self.rec["n_in"])
         return self.rec
+
+    @staticmethod
+    def _keys(r, n: int, salt: int) -> list:
+        pages = r.pages[:n]
+        if r.shared is None:
+            return (pages ^ salt).tolist()
+        return np.where(r.shared[:n], pages, pages ^ salt).tolist()
 
     def _repin(self, tier: Tier, st: dict, slot: str, keys: list) -> None:
         old = st[slot]

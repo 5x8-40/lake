@@ -31,6 +31,11 @@ class Req:
     svc: float               # 服务时长（s）：占用实例的时间，用于负载与 in-flight
     next_t: float = math.inf  # 同一流下一请求的相对到达时间
     shared: np.ndarray | None = None  # bool，页是否跨会话共享（None=全部私有）
+    n_out: int = 0           # 本轮 decode 写出的 token 数（trace 的 output 计数，含思维链）
+    # decode 写出的 KV 在下一轮输入里对应的页 = out_next.pages[len(pages):out_end]；
+    # 只有下一轮输入原样携带本轮输出（含思维链）时这些页才和 decode 写出的 KV 同键
+    out_next: "Req | None" = None
+    out_end: int = 0
 
 
 @dataclass
@@ -80,6 +85,22 @@ def _fill_next(sess: Session) -> None:
         p = last.get(r.stream)
         if p is not None:
             p.next_t = r.t
+        last[r.stream] = r
+
+
+def _fill_out(sess: Session, page_tokens: int) -> None:
+    """把每个请求 decode 写出的 token 映射到同流下一请求输入里的页。
+
+    条件：下一请求以本请求的全部输入页为前缀。decode 写满的页 = 输入尾部不足一页的
+    部分加上输出，覆盖到 (n_in + n_out) // page_tokens 为止。"""
+    last: dict[int, Req] = {}
+    for r in sorted(sess.reqs, key=lambda r: r.t):
+        a = last.get(r.stream)
+        if a is not None:
+            k = len(a.pages)
+            end = min(len(r.pages), (a.n_in + a.n_out) // page_tokens)
+            if end > k and np.array_equal(r.pages[:k], a.pages):
+                a.out_next, a.out_end = r, end
         last[r.stream] = r
 
 
@@ -136,7 +157,7 @@ def load_cc(path: str, page_tokens: int = 512, tag: str = "cc256k") -> Workload:
                     sess.reqs.append(Req(
                         t=float(r["t"]), stream=stream, n_in=int(r["in"]),
                         pages=_chain_cached(seed, ids, per_page, memo),
-                        svc=float(r.get("api_time") or 1.0)))
+                        svc=float(r.get("api_time") or 1.0), n_out=int(r.get("out") or 0)))
 
                 for r in d["requests"]:
                     if r["type"] == "subagent":
@@ -150,6 +171,7 @@ def load_cc(path: str, page_tokens: int = 512, tag: str = "cc256k") -> Workload:
                         next_stream += 1
                 sess.reqs.sort(key=lambda r: r.t)
                 _fill_next(sess)
+                _fill_out(sess, page_tokens)
                 sessions.append(sess)
         return Workload(tag, page_tokens, sessions,
                         meta={"source": "huggingface.co/datasets/semianalysisai/" +
@@ -190,13 +212,14 @@ def load_codex(path: str, page_tokens: int = 512, seed: int = 7) -> Workload:
                     svc = 2.0 + len(out_toks) / 40.0
                     sess.reqs.append(Req(t=t, stream=0, n_in=n_in,
                                          pages=_chain_cached(gseed, toks, page_tokens, memo),
-                                         svc=svc))
+                                         svc=svc, n_out=len(out_toks)))
                     toks.extend(out_toks)
                     t += svc + float(rng.lognormal(math.log(5.2), sigma))
                 else:
                     toks.extend(enc.encode(m["value"], disallowed_special=()))
             memo.clear()
             _fill_next(sess)
+            _fill_out(sess, page_tokens)
             if sess.reqs:
                 sessions.append(sess)
         _mark_shared(sessions)
@@ -250,8 +273,9 @@ def load_qwen(path: str, page_tokens: int = 512, tag: str = "qwen_coder") -> Wor
             for r in rs:
                 sess.reqs.append(Req(t=r["timestamp"] - t0, stream=0, n_in=int(r["input_length"]),
                                      pages=_chain_cached(gseed, r["hash_ids"], per_page, memo),
-                                     svc=2.0 + r["output_length"] / 40.0))
+                                     svc=2.0 + r["output_length"] / 40.0, n_out=int(r["output_length"])))
             _fill_next(sess)
+            _fill_out(sess, page_tokens)
             for q in sess.reqs:
                 if q.next_t < math.inf:
                     q.svc = min(q.svc, max(0.05, q.next_t - q.t))

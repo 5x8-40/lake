@@ -28,22 +28,18 @@ POL_LABEL = {
     "kvcm-none": "KVCM（无 hook）",
     "kvcm-real": "KVCM（现实 hook）",
     "kvcm-oracle": "KVCM（理想 hook）",
-    "kvcm-real-hint": "变体：KVCM（现实 hook）+ HBM 预取提示",
-    "kvcm-oracle-hint": "变体：KVCM（理想 hook）+ HBM 预取提示",
 }
 POL_STYLE = {
     "local": dict(color="#888888", marker="o"),
     "shared": dict(color="#1f77b4", marker="s"),
     "kvcm-real": dict(color="#ff7f0e", marker="^"),
     "kvcm-oracle": dict(color="#d62728", marker="D"),
-    "kvcm-oracle-hint": dict(color="#9467bd", marker="v", ls="--"),
 }
 MAIN_POLS = ["local", "shared", "kvcm-real", "kvcm-oracle"]
 NOMINAL_TB = P.dram_kv_total / 1e12
 HBM_TB = P.hbm_kv_per_inst * P.n_inst / 1e12
 MODEL_NOTE = (f"HBM 归推理引擎：每实例 {P.hbm_kv_per_inst / 1e9:.0f} GB 前缀缓存、纯 LRU，所有策略相同且不随 x 轴变化；"
-              f"KVCM 只管 DRAM 池（停顿期池保活 + 零引用优先）。“HBM 预取提示”是单列变体"
-              f"（kvcm/design/kv-prefetch.md 方案 A：预取请求把池里前缀载入引擎 HBM，进 LRU、不钉）。")
+              f"KVCM 只管 DRAM 池（停顿期池保活 + 零引用优先）。")
 
 for fam in ("Noto Sans CJK SC", "WenQuanYi Micro Hei", "WenQuanYi Zen Hei", "SimHei", "Droid Sans Fallback"):
     try:
@@ -101,7 +97,7 @@ def fig_mrc(trace, runs):
     ax2.set_ylabel("lost KV reuse = 1 − h/h*（%，对数）")
     ax2.set_title("相对理想命中的损失", fontsize=10)
     fig.suptitle(TRACE_LABEL.get(trace, trace), fontsize=10)
-    fig.text(0.01, 0.01, f"[trace 回放] DeepSeek V4.1（假设同 V4-Pro 布局，BF16）· 昇腾 A3 224 NPU · HBM = 引擎 LRU "
+    fig.text(0.01, 0.01, f"[trace 回放] DeepSeek-V4.1-Flash（官方 890 B/token）· decode KV 入缓存（原样回传）· 昇腾 A3 224 NPU · HBM = 引擎 LRU "
              f"{P.hbm_kv_per_inst / 1e9:.0f} GB/实例 × {P.n_inst}，各策略相同 · KVCM 只管池 · 单次运行",
              fontsize=7, color="#555")
     fig.tight_layout(rect=(0, 0.13, 1, 0.95))
@@ -112,7 +108,7 @@ def fig_mrc(trace, runs):
 
 
 def fig_lost(trace, runs, fs=(1 / 8, 1.0)):
-    pols = MAIN_POLS + ["kvcm-oracle-hint"]
+    pols = MAIN_POLS
     fig, axes = plt.subplots(1, len(fs), figsize=(10, 4.0), sharey=True)
     for ax, f in zip(axes, fs):
         vals = []
@@ -120,8 +116,6 @@ def fig_lost(trace, runs, fs=(1 / 8, 1.0)):
             r = _get(runs, pol, f)
             vals.append(100 * r["lost_reuse"] if r else 0)
         bars = ax.bar([POL_LABEL[p] for p in pols], vals, color=[POL_STYLE[p]["color"] for p in pols])
-        bars[-1].set_hatch("//")
-        bars[-1].set_alpha(0.6)
         r = _get(runs, "local", f)
         if r and "any_hit_rate" in r:
             # per-instance：损失拆成“集群里有但本实例看不见”与“已被驱逐”
@@ -135,7 +129,7 @@ def fig_lost(trace, runs, fs=(1 / 8, 1.0)):
         ax.grid(axis="y", alpha=0.3)
     axes[0].set_ylabel("lost KV reuse = 1 − h/h*（%）")
     fig.suptitle(f"相对理想命中的复用损失 · {TRACE_LABEL.get(trace, trace)}", fontsize=10)
-    fig.text(0.01, 0.01, "[trace 回放] HBM = 引擎 LRU（各策略相同）· 斜线柱 = 变体（HBM 预取提示）· 单次运行",
+    fig.text(0.01, 0.01, "[trace 回放] HBM = 引擎 LRU（各策略相同）· 单次运行",
              fontsize=7, color="#555")
     fig.tight_layout(rect=(0, 0.03, 1, 0.95))
     p = os.path.join(FIG, f"lost_{trace}.png")
@@ -145,10 +139,10 @@ def fig_lost(trace, runs, fs=(1 / 8, 1.0)):
 
 
 ABL_CHAIN = {
-    "realistic": ["local", "shared", "real+ka", "kvcm-real", "kvcm-real-hint"],
-    "oracle": ["local", "shared", "oracle+ka", "kvcm-oracle", "kvcm-oracle-hint"],
+    "realistic": ["local", "shared", "real+ka", "kvcm-real"],
+    "oracle": ["local", "shared", "oracle+ka", "kvcm-oracle"],
 }
-ABL_LABEL = ["per-instance\nLRU", "+ 共享池/\n全局视图", "+ 池保活", "+ 零引用优先\n（= KVCM）", "+ HBM 预取提示\n（变体）"]
+ABL_LABEL = ["per-instance\nLRU", "+ 共享池/\n全局视图", "+ 池保活", "+ 零引用优先\n（= KVCM）"]
 
 
 def fig_ablation(trace, runs, fs=(1 / 8, 1.0)):
@@ -160,8 +154,6 @@ def fig_ablation(trace, runs, fs=(1 / 8, 1.0)):
             xs = [i + (j - 0.5) * w for i in range(len(chain))]
             bars = ax.bar(xs, vals, width=w, label=f"{'现实' if hook == 'realistic' else '理想'} hook",
                           color="#ff7f0e" if hook == "realistic" else "#d62728", alpha=0.85)
-            bars[-1].set_hatch("//")
-            bars[-1].set_alpha(0.5)
             for x, v in zip(xs, vals):
                 ax.text(x, v, f"{v:.1f}", ha="center", va="bottom", fontsize=6.5)
         ideal = (_get(runs, "shared", f) or {}).get("ideal_hit_rate")
@@ -169,14 +161,14 @@ def fig_ablation(trace, runs, fs=(1 / 8, 1.0)):
             ax.axhline(100 * ideal, ls="--", color="k", lw=1)
         lo = min((_get(runs, "local", f) or {}).get("hit_rate", 1), (_get(runs, "real+ka", f) or {}).get("hit_rate", 1))
         ax.set_ylim(100 * lo - 2, 100 * (ideal or 1) + 1)
-        ax.set_xticks(range(5))
+        ax.set_xticks(range(len(ABL_LABEL)))
         ax.set_xticklabels(ABL_LABEL, fontsize=7, rotation=0)
         ax.set_title(f"DRAM 池 = {f:g} × 标称（{f * NOMINAL_TB:.2f} TB）", fontsize=9)
         ax.grid(axis="y", alpha=0.3)
     axes[0].set_ylabel("token 命中率（%）")
     axes[0].legend(fontsize=7)
     fig.suptitle(f"消融：逐项打开 KVCM 机制（累计）· {TRACE_LABEL.get(trace, trace)}", fontsize=10)
-    fig.text(0.01, 0.01, "[trace 回放] 虚线 = 理想 h* · HBM = 引擎 LRU（各策略相同）· 斜线柱 = 变体，不属于 KVCM 主线 · 单次运行",
+    fig.text(0.01, 0.01, "[trace 回放] 虚线 = 理想 h* · HBM = 引擎 LRU（各策略相同）· 单次运行",
              fontsize=7, color="#555")
     fig.tight_layout(rect=(0, 0.03, 1, 0.94))
     p = os.path.join(FIG, f"ablation_{trace}.png")
@@ -189,7 +181,7 @@ def table_ttft(trace, runs, f):
     rows = []
     base = _get(runs, "local", f)
     sh = _get(runs, "shared", f)
-    for pol in ["local", "shared", "kvcm-none", "kvcm-real", "kvcm-oracle", "kvcm-real-hint", "kvcm-oracle-hint"]:
+    for pol in ["local", "shared", "kvcm-none", "kvcm-real", "kvcm-oracle"]:
         r = _get(runs, pol, f)
         if not r:
             continue
@@ -203,8 +195,25 @@ def table_ttft(trace, runs, f):
     return head + "\n" + "\n".join(rows)
 
 
+def table_strip(runs, f):
+    rows = []
+    for pol in MAIN_POLS:
+        e, s_ = _get(runs, pol, f), _get(runs, "strip:" + pol, f)
+        if not (e and s_):
+            continue
+        rows.append(f"| {POL_LABEL[pol]} | {100 * e['hit_rate']:.2f}% | {100 * s_['hit_rate']:.2f}% | "
+                    f"{100 * e['lost_reuse']:.2f}% | {100 * s_['lost_reuse']:.2f}% | {e['npu_busy']:.1f} | {s_['npu_busy']:.1f} |")
+    if not rows:
+        return ""
+    e0, s0 = _get(runs, "shared", f), _get(runs, "strip:shared", f)
+    head = (f"理想 h*：原样回传 {100 * e0['ideal_hit_rate']:.2f}%，剥掉思维链 {100 * s0['ideal_hit_rate']:.2f}%。\n\n"
+            "| 策略 | 命中率（原样回传） | 命中率（剥掉思维链） | lost reuse（原样） | lost reuse（剥掉） | "
+            "prefill 占用 NPU（原样） | prefill 占用 NPU（剥掉） |\n|---|---:|---:|---:|---:|---:|---:|")
+    return head + "\n" + "\n".join(rows)
+
+
 def table_gap(trace, runs, f):
-    pols = MAIN_POLS + ["kvcm-oracle-hint"]
+    pols = MAIN_POLS
     labs = None
     lines = []
     for pol in pols:
@@ -231,7 +240,10 @@ def main():
     md = ["# KVCM trace 回放结果（自动生成）", "",
           "由 `python3 -m kvcm_sim.report` 从 `results/*.json` 生成；参数与假设见 [`../params.md`](../params.md)，方法见 [`../README.md`](../README.md)。",
           "全部为 **[trace 回放] + [解析]**，每个点单次运行（seed=1），无真机校准。", "",
-          f"模型：{MODEL_NOTE}x 轴与表中“池容量”只指 DRAM 池（标称 {NOMINAL_TB:.0f} TB = 14 节点 × 1 TB）。", ""]
+          f"模型：{MODEL_NOTE}x 轴与表中“池容量”只指 DRAM 池（标称 {NOMINAL_TB:.0f} TB = 14 节点 × 1 TB）。", "",
+          f"模型规格：DeepSeek-V4.1-Flash 官方 config / 技术报告，全局 KV {P.kv_bytes_per_token:.0f} B/token；"
+          "decode 写出的 KV 入缓存，主结果按“下一轮原样回传上一轮输出（含思维链）”计命中，"
+          "末尾附“剥掉思维链”下界对照。", ""]
     cal = json.load(open(os.path.join(RES, "calibration.json"))) if os.path.exists(os.path.join(RES, "calibration.json")) else {}
     for trace in ("cc256k", "codex", "qwen_coder"):
         runs = _load(trace)
@@ -254,22 +266,30 @@ def main():
         md += ["### 命中率–容量（MRC）数据", "",
                "| 池容量 × 标称 | 池 TB | " + " | ".join(POL_LABEL[p] for p in POL_STYLE) + " | 理想 h* |",
                "|---:|---:|" + "---:|" * (len(POL_STYLE) + 1)]
-        for f in sorted({r["f"] for r in runs}):
+        for f in sorted({r["f"] for r in runs if r["policy"] in POL_STYLE}):
             cells = []
             for p in POL_STYLE:
                 r = _get(runs, p, f)
                 cells.append(f"{100 * r['hit_rate']:.2f}%" if r else "—")
-            ideal = next((r["ideal_hit_rate"] for r in runs if abs(r["f"] - f) < 1e-9), None)
+            ideal = next((r["ideal_hit_rate"] for r in runs if abs(r["f"] - f) < 1e-9
+                          and not r["policy"].startswith("strip:")), None)
             md.append(f"| {f:g} | {f * NOMINAL_TB:.2f} | " + " | ".join(cells) + f" | {100 * ideal:.2f}% |")
         md.append("")
         for f in (1 / 8, 1 / 4, 1.0):
             if not _get(runs, "local", f):
                 continue
             md += [f"### TTFT 与等效 NPU（DRAM 池 = {f:g} × 标称 = {f * NOMINAL_TB:.2f} TB）", "",
-                   "A3 TTFT = 2 × 950 拟合 TTFT + 未掩盖 KV 加载；NPU 数为全规模等效的 prefill 平均占用（D8a §8.2）。", "",
+                   "A3 TTFT = 2 × 950 拟合 TTFT（token 相关项按 V4.1 prefill 激活参数比 8/49 缩放）+ 未掩盖 KV 加载；NPU 数为全规模等效的 prefill 平均占用（D8a §8.2）。", "",
                    table_ttft(trace, runs, f), "",
                    f"按前一停顿长度分组的复用损失（1 − h/h*，DRAM 池 = {f:g} × 标称）：", "",
                    table_gap(trace, runs, f), ""]
+        strip = [(f, table_strip(runs, f)) for f in (1 / 8, 1.0)]
+        if any(t for _, t in strip):
+            md += ["### decode KV 命中口径对照：原样回传（主结果）vs 剥掉思维链（下界）", "",
+                   "同一负载（到达率按原样回传口径校准）。剥掉思维链 = 下一轮输入不含上一轮 decode 写出的 token 序列，输出部分全部不命中。", ""]
+            for f, t in strip:
+                if t:
+                    md += [f"DRAM 池 = {f:g} × 标称（{f * NOMINAL_TB:.2f} TB）：", "", t, ""]
     open(os.path.join(RES, "summary.md"), "w").write("\n".join(md) + "\n")
     print("wrote", os.path.join(RES, "summary.md"))
 
