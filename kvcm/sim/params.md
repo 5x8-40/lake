@@ -108,3 +108,23 @@ DeepSeek V4.1 目前公开的只有 **DeepSeek-V4.1-Flash**（Hugging Face `deep
 | 丢 KV 重算档 | 切换 2 s；每切一个节点重算 = E4 杀掉重算满载值（CC 约 6,390 / Qwen 约 5,650 NPU·s）× 切换时刻 D 侧 KV 占用比例，摊 5 分钟进 prefill；P→D 同量 | E4 推导；摊入时长与 P→D 同量为**假设** |
 | 统计判据控制器 | 规划窗口 300 / 600 s（翻滚），切片 60 s，合格条件 ḡ > 2σ/√m，切换后 120 s 内或切换未完成时跳过 | Evolving Infra §5.2 / 附录 E.3（论文默认 600 s、m=10） |
 | S5 配比阶跃 | P 占比目标 0.5 ↔ 0.8，阶跃于测量段 2/6/10/14/18/22 h，斜坡 5 分钟；Qwen 到达率按 CC 实际需求补齐，总需求≈12 节点；逐阶跃统计负载 α* = 0.95 × 理想动态 P:D goodput | **注入**，非数据集 |
+
+## 6. 池局部性扩展（`kvcm_sim/locality.py`，结果见 [`results/locality.md`](results/locality.md)）
+
+对应 Project 文档《KVCM 池化的近远端、冷热与争用》§4 的三项最小扩展与五组对照。
+
+| 参数 | 取值 | 来源 / 标签 |
+|---|---|---|
+| FabricMem 带宽 | 本机 86 GB/s、跨机 78 GB/s（rH2D，AICPU 展开下限；跨机上限 107） | `kvcm/design/D8a-scheduling-algorithms.md` §9.1 A3 910C |
+| RoCE 带宽 | 本机 H2D 47 GB/s、跨机 23.8 GB/s | 同上 §8.1「跨机/本机怎么加」与 §9.1 |
+| 池块所在节点 | `hash`：按页键哈希条带到 14 节点（扁平池默认）；`local`：写到写入请求所在节点 | `hash` 对标 Mooncake 默认分配；`local` 对标 Mooncake `ReplicateConfig::prefer_alloc_in_same_node` |
+| 成本模型 | `flat`：一律跨机带宽、无争用（= 主线口径）；`topo`：分本机/跨机；`contend`：再按 `B/(1+在途流数)` 共享，跨机流同时占源节点出口与读者节点入口（多源并行读总量受入口约束），本机流占本机拷贝引擎 | NetKV（arXiv 2606.03910）`B_eff = B·(1−c)/(1+n_inflight)`，取 c=0 |
+| 计入 TTFT 的读时间 | `max(0, τ − W)`；不重叠：读在 prefill 拿到算力后开始（W 不掩盖）；重叠：读从到达开始 | Evolving Infra 附录 E.3 `max(0, τ(x)−W)`；不重叠对应 SGLang HiCache / vLLM connector 的默认加载时机 |
+| prefill 排队 | 每实例 16 个槽（1 NPU/请求），槽占用 = A3 计算时长 + 未掩盖读时间 | 方法设定；与主线“单请求 NPU·s = 2 × 拟合 TTFT”一致 |
+| 切片口径 | 1/32 切片下计算时长 ×32、每节点带宽 ÷32；在途流数与槽占用按 Little 定律与全规模一致，时间量最后 ÷32 | 方法设定（**近似**：会话内间隔不放大） |
+| 副本 | 副本作为独立条目占池容量、参与池 LRU；主副本被驱逐时连带删除 | Evolving Infra “拉取留副本挤掉 agent 的 KV”；D8a §6.5 Cost 项 |
+| 被动副本 | 跨机读后读者节点留一份 | Mooncake 论文（持有者过载时转发 + 拉取留存） |
+| 热点复制 | 热度 = 池读 EWMA（半衰期 300 仿真秒）；目标副本数 `r = ceil(λ_p × τ_req / ρ)`，ρ=0.5；`hot` 复制到出口最闲的节点（额外搬运计入源出口），`kvcm` 只在路由目标留存刚拉到的字节 | D8a §6.5 `r_target = ceil(λ_p/(μ_p ρ))`；`hot` 对标 TokenLake 热段复制 + 两选一 |
+| 读副本选择 | 本机有就读本机；否则在持有者里两选一（出口在途流少者） | TokenLake power-of-two |
+| 预测 TTFT 路由 | `argmin_i W_i + 未掩盖读_i + 计算_i` | Mooncake Conductor；Evolving Infra 附录 E.3 |
+| 合成倾斜负载 | 共享长文档 32K token，全规模 80,000 篇（切片 2,500 篇；≈ 2× 集群 HBM、0.6× 池），文档按 Zipf(α) 选，α ∈ {0.6, 0.8, 1.0, 1.2, 1.4}；每会话 1–4 轮，每轮 +2 页问题 +1 页输出，间隔 lognormal 中位 20 s；到达率同样按理想命中下 prefill 50% 校准 | **假设**（cache-aware 路由会把文档分摊到各实例 HBM，所以文档总量要 > 集群 HBM、< 池，热文档才会落到池里被并发读）|

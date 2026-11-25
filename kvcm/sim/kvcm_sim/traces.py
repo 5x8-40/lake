@@ -286,3 +286,42 @@ def load_qwen(path: str, page_tokens: int = 512, tag: str = "qwen_coder") -> Wor
                         meta={"source": "github.com/alibaba-edu/qwen-bailian-usagetraces-anon (qwen_coder_blksz_16)",
                               "hash_scope": "global", "timeline": "trace timestamps (2h)"})
     return _cached(f"{tag}_p{page_tokens}", build)
+
+
+# ---------------------------------------------------------------- 合成：共享长文档 × Zipf
+
+def make_zipf(alpha: float, n_docs: int, doc_pages: int = 64, n_tmpl: int = 4000,
+              page_tokens: int = 512, seed: int = 3) -> Workload:
+    """倾斜度扫描用的合成负载：每个会话按 Zipf(α) 选一篇共享长文档（doc_pages 页），
+    之后 1–4 轮问答，每轮追加 2 页私有问题与 1 页输出。文档页跨会话共享（不加盐），
+    私有页加盐。文档总量要大于单实例 HBM、小于池，热文档才会落到池里被多实例并发读。"""
+    rng = np.random.default_rng(seed)
+    w = np.arange(1, n_docs + 1, dtype=float) ** -alpha
+    w /= w.sum()
+    docs = rng.choice(n_docs, size=n_tmpl, p=w)
+    svc = 2.0 + 512 / 40.0
+    sessions = []
+    for sid in range(n_tmpl):
+        d = int(docs[sid])
+        doc = np.array([hash((7, d, j)) for j in range(doc_pages)], dtype=np.int64)
+        priv: list[int] = []
+        prev = hash((11, sid))
+        t = 0.0
+        reqs = []
+        for _ in range(int(rng.integers(1, 5))):
+            for _ in range(2):
+                prev = hash((prev, len(priv)))
+                priv.append(prev)
+            pages = np.concatenate([doc, np.array(priv, dtype=np.int64)])
+            sh = np.zeros(len(pages), dtype=bool)
+            sh[:doc_pages] = True
+            reqs.append(Req(t=t, stream=0, n_in=len(pages) * page_tokens + 100, pages=pages, svc=svc,
+                            shared=sh, n_out=512))
+            prev = hash((prev, 13))
+            priv.append(prev)
+            t += svc + float(rng.lognormal(math.log(20.0), 1.0))
+        s = Session(sid, reqs)
+        _fill_next(s)
+        _fill_out(s, page_tokens)
+        sessions.append(s)
+    return Workload(f"zipf{alpha:g}", page_tokens, sessions, meta={"n_docs": n_docs, "doc_pages": doc_pages})

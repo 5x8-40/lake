@@ -34,6 +34,7 @@ import numpy as np
 from .traces import Workload
 
 ARRIVE, COMPLETE, PIN_EXP_POOL, LIVE_EXP = range(4)
+# 子类（locality.py）自定义的事件类型从 16 起，由 _on_event 处理
 
 
 @dataclass
@@ -133,6 +134,8 @@ class Sim:
         self.g_prior = 5.0
         self.ghist: list = []
         self.n_arr = 0
+        self.cur_node = 0           # 正在写入池的服务实例（子类按它定池块位置）
+        self.ev: list = []
 
     # ------------------------------------------------------------ tier ops
     def _evict_one(self, t: Tier) -> bool:
@@ -261,7 +264,13 @@ class Sim:
         if self.ghist:
             self.g_prior = float(np.median(self.ghist[-20000:]))
 
-    def _route(self, keys: list):
+    def _on_serve(self, now, i, keys, h_hbm, hit, r) -> None:
+        pass
+
+    def _on_event(self, typ, pl, now) -> None:
+        raise ValueError(typ)
+
+    def _route(self, keys: list, r=None):
         cfg = self.cfg
         load = self.load
         lo = min(load)
@@ -285,7 +294,7 @@ class Sim:
         cfg = self.cfg
         wl = self.wl
         P = wl.page_tokens
-        ev: list = []
+        ev = self.ev
         seq = 0
         # 会话以 Poisson 过程到达；每个到达实例随机挑一个模板会话、加盐隔离
         t = 0.0
@@ -308,6 +317,7 @@ class Sim:
         streams = self.streams
         while ev:
             now, _, typ, pl = heapq.heappop(ev)
+            self.now = now
             if typ == ARRIVE:
                 sid, salt, r, is_last = pl
                 keys = self._keys(r, len(r.pages), salt)
@@ -333,10 +343,12 @@ class Sim:
                                    (rec_ideal, ideal), (rec_gap, gap)):
                         lst.append(v)
                     continue
-                i = self._route(keys)
+                i = self._route(keys, r)
                 h_hbm = pref(self.hbm[i].all, keys)
                 h_d = pref(self.dram[i].all, keys)
                 hit = max(h_hbm, h_d)
+                self._on_serve(now, i, keys, h_hbm, hit, r)
+                self.cur_node = i
                 if cfg.attribution:
                     anyh = hit
                     for tt in self.tiers:
@@ -378,6 +390,7 @@ class Sim:
                         self.ideal.update(self._keys(r.out_next, r.out_end, salt)[len(r.pages):])
                     continue
                 self.load[i] -= 1
+                self.cur_node = i
                 if cfg.decode_cache and r.out_next is not None:
                     # 引擎缓存 decode 写出的 KV（vLLM 满块入 APC、SGLang 结束时整段插 radix），
                     # 写穿到 DRAM 层；理想上限同样包含这些页
@@ -435,6 +448,8 @@ class Sim:
                 sid, tok = pl
                 if self.sess[sid]["tok"] == tok:
                     self._release_sess(sid)
+            else:
+                self._on_event(typ, pl, now)
 
         self.rec = {
             "t": np.array(rec_t), "n_in": np.array(rec_n, dtype=np.int64),

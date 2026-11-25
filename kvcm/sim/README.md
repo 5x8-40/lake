@@ -140,3 +140,52 @@ PYTHONPATH=. python3 -m pytest tests -q   # 含 tests/test_pd.py
 ### 局限
 
 见 [`results/pd/summary.md`](results/pd/summary.md)「简化与局限」。最关键的三条：不排队、不出 TTFT/TPOT 分位（混部的 TPOT 尾部干扰只按均值 1/(1−f) 计，会高估混部）；decode 代价与切换耗时在 A3 上无实测；配比漂移场景是注入的。
+
+## 池局部性扩展：近远端、冷热与网卡争用
+
+回答“共享池里块放在哪个节点、要不要做热点复制，KVCM 能不能因此比扁平共享池更快”。对应 Project 文档《KVCM 池化的近远端、冷热与争用》§4 的三项最小扩展与五组对照。代码 [`kvcm_sim/locality.py`](kvcm_sim/locality.py)（`LocSim`，继承主线 `Sim`，命中口径不变）、[`kvcm_sim/locality_run.py`](kvcm_sim/locality_run.py)；全部表格见 [`results/locality.md`](results/locality.md)，图在 [`results/figures/locality/`](results/figures/locality/)，参数见 [`params.md`](params.md) §6。基线全部是 BF16 3,200 B/token、HBM 296 GB/实例。
+
+```bash
+cd kvcm/sim
+PYTHONPATH=. python3 -m kvcm_sim.locality_run --trace cc256k --jobs 2   # codex / qwen_coder 同理
+PYTHONPATH=. python3 -m kvcm_sim.locality_run --trace zipf --jobs 2     # 合成倾斜度扫描
+PYTHONPATH=. python3 -m kvcm_sim.locality_report                         # 图 + results/locality.md
+```
+
+单 trace 在 4 核机器上约 1–2 小时；`--only E1,E2` 只跑部分实验，`--alphas` 只跑部分 α，已有结果自动跳过。
+
+### 方法
+
+- **三项扩展**：①池块有所在节点（`hash` 按页键条带到 14 节点 = 扁平池；`local` 写到写入请求所在节点）；②计入 TTFT 的池读时间是 `max(0, τ − W)`，W 为 prefill 排队（不重叠时读在拿到算力后才开始，W 不掩盖）；③每节点带宽按 `B/(1+在途流数)` 共享：跨机读占源节点出口与读者节点入口（一个请求从多个源并行读，入口只算一条流、总量受入口带宽约束），本机读占本机 H2D 拷贝引擎。副本作为独立条目占池容量、参与池 LRU。
+- **排队**：在主线回放上加离散事件 prefill 队列，每实例 16 槽，槽占用 = A3 计算时长 + 未掩盖读时间。TTFT 分位来自这个队列，与主线 summary 的无排队 TTFT 不可直接比较。
+- **两种 A3 传输**：FabricMem（本机 86、跨机 78 GB/s）与 RoCE（本机 47、跨机 23.8 GB/s），D8a §9.1。
+- **五组对照**：E1 成本模型（扁平 / 拓扑 / 拓扑+争用 × 读是否与排队重叠）；E2 放置与副本（写本机、Mooncake 式被动副本、TokenLake 式热点复制、KVCM 热页定向副本 + 预测 TTFT 路由）；E3 合成 Zipf 共享长文档负载的倾斜度扫描；E4 路由（主线规则 / 最短队列 / 预测 TTFT）；E5 跨机代价对 bytes/token 的敏感度（BF16 3,200 vs FP4 890）。
+
+### 结论
+
+**一句话：池内的近远端放置和热点复制，在三条真实 trace 和合成倾斜负载上都没有可测的 TTFT 收益；KVCM 相对扁平共享池的收益来自命中率（主线 MRC 的工作区间）和排队感知路由，不来自局部性。**
+
+1. **池读本身太小，近远差异被淹没（E1、E5）**。标称 14 TB 池下，读池的请求占 1%（Codex）、4%（Claude Code）、10%（Qwen coder），大部分前缀在 HBM 命中，池只补最后一段。未掩盖的池读时间均值 ≤ 0.6 ms（Claude Code + RoCE，最差），占 TTFT ≤ 0.2%；扁平 / 拓扑 / 拓扑 + 争用三种成本模型下，读池请求 TTFT P95 都是 2.17 s（Claude Code）、0.60 s（Codex）、0.39 s（Qwen coder），差异 < 1%。最忙节点出口利用率 ≤ 1.5%。按输入长度分桶，跨机比本机多出的时间在 RoCE + BF16、128K–256K 最长的桶里也只有均值 0.6 ms、P95 7.5 ms；换成 FP4 再小一个量级。
+2. **写本机放置能提高本机字节占比，但不改变 TTFT（E2）**。Claude Code 本机字节 7% → 12%，Qwen coder 7% → 17%，TTFT 均值与 P95 变化 0.0%。cache-aware 路由下续轮请求多数回到 HBM 命中的实例，真正需要池补的那段并不集中在写入节点。
+3. **被动副本（Mooncake 式“拉取留存”）有害（E2）**。副本挤占池容量：Claude Code 14 TB 池里副本占 28%，命中率 95.52% → 95.18%，读池请求 TTFT P95 +18%，均值 +27%，prefill 占用 137.9 → 147.6 NPU；Qwen coder 副本占 11%，命中率 −0.24 pt；Codex 副本占 18%，无收益。
+4. **热点复制（TokenLake 式 + D8a 目标副本数）从未触发（E2、E3）**。按 `r = ceil(λ_p · τ_req / ρ)` 算，池读时长是毫秒级，即便合成 Zipf α = 0.6–1.4 的共享长文档负载，`λ·τ` 也远小于 ρ = 0.5，所以副本数始终为 1。E3 里扁平池与 KVCM + 局部性的读池请求 TTFT P95：FabricMem 下差 ≤ 0.5%，RoCE 下 0.131 → 0.125 s（−4.5%，约 6 ms），最忙出口利用率 ≤ 3.8%。
+5. **“KVCM + 局部性”组合的收益来自预测 TTFT 路由（E2、E4）**。Claude Code 14 TB 池下，这个组合把 TTFT 均值从 0.510 s 降到 0.378 s（−26%）；但 E4 里扁平共享池只换成预测 TTFT 路由就得到全部请求 P95 2.005 → 1.096 s、均值 0.510 → 0.360 s，最短队列路由也有 2.005 → 1.558 s。也就是说，起作用的是“路由看排队”，与池块放在哪个节点无关。Qwen coder 与 Codex 本来不排队（排队 P95 = 0），路由换了也没变化；Codex 的“读池请求 P95”在预测 TTFT 路由下变差 74%，是选择效应（路由不再偏向 HBM 命中实例，读池的人群换成了更长的请求），全部请求 P95 不变（0.675 s）。
+6. **Claude Code 3.5 TB 池（过载）下 KVCM + 预测 TTFT 路由不稳定**：现实 hook 版本命中率 91.56% → 89.79%，prefill 占用 251.9 → 303.2 NPU，TTFT 均值翻倍；理想 hook 版本命中率 91.97%、占用 241.3 NPU，仍比扁平池好。过载区路由不能只看预测 TTFT，还要保住前缀亲和。
+
+**对 KVCM 设计的含义**：在这组参数（BF16、HBM 296 GB/实例、A3 两种传输）下，池可以按哈希条带化、单副本、不做局部性放置；把复杂度放在会话感知的保留 / 驱逐（命中率）和路由侧的排队感知上。只有当池读量大幅上升（HBM 远小于工作集、或长文档被大量并发首读）时才需要重新评估，届时出口利用率是先行指标。
+
+### 参考实现
+
+- **Evolving Infra**（arXiv 2611.12304）附录 E.3：远端读的 TTFT 代价是 `max(0, τ(x) − W)`，排队时间能掩盖传输。直接用作计入 TTFT 的读时间；差异：它只给公式，这里用 DES 排队真实算出 W，并对比“读不与排队重叠”（SGLang HiCache / vLLM connector 的默认加载时机）。
+- **NetKV**（arXiv 2606.03910）：`B_eff = B·(1−c)/(1+n_inflight)`。借鉴为每节点出口 / 入口 / H2D 的争用模型（c 取 0）；差异：NetKV 是 GPU 集群，这里套 A3 FabricMem / RoCE 带宽。
+- **Mooncake Store** `mooncake-store/include/replica.h::ReplicateConfig`（`prefer_alloc_in_same_node`、`replica_num`），见 [`docs/research/mooncake/kv-store.md`](../../docs/research/mooncake/kv-store.md)。`local` 放置对标 `prefer_alloc_in_same_node`，“被动副本”对标论文里持有者过载时拉取留存；预测 TTFT 路由对标 Mooncake Conductor（见同文「Conductor」节）。差异：Mooncake Store 是对象级、无前缀语义，副本数是写入时静态配置；KVCM 按会话与前缀热度动态决定。
+- **TokenLake**：热段复制 + power-of-two 选副本。`hash+hot` 变体与读副本两选一直接照搬；差异：TokenLake 面向高并发共享前缀，副本主动推送，这里只在热度满足 D8a 目标副本数时才触发。
+- **D8a §6.5** `r_target = ceil(λ_p / (μ_p ρ))`（`../design/D8a-scheduling-algorithms.md`）：热点复制的副本数按 Little 定律算。本仿真按这个公式触发复制，结果是真实 trace 上几乎从不触发（读池时长是毫秒级，`λ·τ` 远小于 ρ）。
+
+### 局限
+
+1. **时间膨胀切片是近似**：1/32 切片下计算时长 ×32、每节点带宽 ÷32，让在途流数与槽占用按 Little 定律与全规模一致；但会话内请求间隔没有放大，突发更密，排队偏保守。
+2. **Claude Code 3.5 TB 池过载**：prefill 需求 > 224 NPU，DES 队列不收敛（P95 数百秒），该行只看命中率与相对排序，不看 TTFT 绝对值；KVCM + 预测 TTFT 路由在这一档不稳定（命中率反而下降）。
+3. **带宽按每节点一条路径**：没有把 16 NPU 的多链路聚合进来（会进一步降低争用）；FabricMem 取跨机下限 78 GB/s。
+4. **池→HBM 预取、PD 间 KV 传输不在模型内**：只建模“请求到达时从池读前缀”。
+5. **合成 Zipf 负载是假设**：文档总量 ≈ 2× 集群 HBM、0.6× 池，用来造出“热文档落池被并发读”的最坏情形；真实 trace 没有这种共享长文档。
