@@ -12,10 +12,14 @@ DRAM 的并集）。每个请求的整条前缀都被加载到服务实例的 HB
 驱逐分三类：`pinned`（硬保活，不可驱逐）> `lru1`（有活会话引用，后驱逐）>
 `lru0`（零引用，先驱逐）。基线策略里所有页都在 `lru0`，退化为纯 LRU。
 
-KVCM 机制（逐项可开关，用于消融）：
-- keepalive：会话停顿期把前缀钉在 HBM（短停顿）或共享池（长停顿），带预算；
-- prewarm：按 ETA 在返回前把前缀从共享池预放置到目标实例 HBM（D-direct）；
-- zeroref：活会话引用的页后驱逐，零引用页先驱逐。
+职责边界：HBM 归推理引擎（每实例前缀缓存，纯 LRU），所有策略相同；KVCM 只管
+DRAM 池（kvcm/design/D2-kv-operations.md：八项操作只作用于池内副本，HBM 不直接碰）。
+
+KVCM 机制（逐项可开关，用于消融），全部只作用于共享池：
+- keepalive：会话停顿期把前缀钉在共享池，带预算；
+- zeroref：活会话引用的页后驱逐，零引用页先驱逐；
+- hbm_hint（单列变体，不属于主线）：按 ETA 在返回前向目标实例发预取请求，引擎把池里
+  的前缀载入 HBM 并入其 LRU，不钉（kvcm/design/kv-prefetch.md 方案 A）。
 hook 三档决定 ETA：none（无信息）、realistic（只用该流历史间隔预测）、
 oracle（真实间隔，且知道会话是否还有下一轮）。
 """
@@ -31,7 +35,7 @@ import numpy as np
 
 from .traces import Workload
 
-ARRIVE, COMPLETE, PREWARM, PIN_EXP_POOL, PIN_EXP_HBM, LIVE_EXP = range(6)
+ARRIVE, COMPLETE, PREWARM, PIN_EXP_POOL, LIVE_EXP = range(5)
 
 
 @dataclass
@@ -41,15 +45,13 @@ class Config:
     dram_pages: int = 0           # DRAM 总页数（local_lru 时均分到各实例）
     policy: str = "local_lru"     # local_lru | shared_lru | kvcm
     keepalive: bool = False
-    prewarm: bool = False
     zeroref: bool = False
+    hbm_hint: bool = False
     hook: str = "none"            # none | realistic | oracle
     # 路由：SGLang cache-aware 规则——负载失衡时走最短队列，否则走最长前缀命中
     bal_abs: int = 8
     bal_rel: float = 1.5
     # KVCM 参数（假设值，见 params.md）
-    hbm_keep_max_gap: float = 30.0
-    hbm_pin_frac: float = 0.3
     pool_pin_max_gap: float = 7200.0
     pool_pin_frac: float = 0.5
     slack_mult: float = 2.0
@@ -61,7 +63,6 @@ class Config:
     pin_tc_mult: float = 2.0      # 只钉 pin_tc_lo×Tc < ETA ≤ pin_tc_mult×Tc 的停顿（Tc=该层 LRU 驻留时间）
     pin_tc_lo: float = 0.0        # 更短的停顿 LRU 自己就留得住，不占钉预算
     tc_window: int = 2000         # 每多少个到达刷新一次各层 LRU 驻留时间估计
-    zeroref_hbm: bool = False     # 零引用优先是否也作用于各实例 HBM（默认只作用于共享池）
     attribution: bool = False     # 记录“集群内存在但本实例不可见”的命中（损失归因）
 
 
@@ -109,9 +110,8 @@ class Sim:
         self.rng = np.random.default_rng(seed)
         n = cfg.n_inst
         shared = cfg.policy != "local_lru"
-        hpf = cfg.hbm_pin_frac if (cfg.policy == "kvcm" and cfg.keepalive) else 0.0
         ppf = cfg.pool_pin_frac if (cfg.policy == "kvcm" and cfg.keepalive) else 0.0
-        self.hbm = [Tier(cfg.hbm_pages, hpf) for _ in range(n)]
+        self.hbm = [Tier(cfg.hbm_pages) for _ in range(n)]
         if shared:
             pool = Tier(cfg.dram_pages, ppf)
             self.dram = [pool] * n
@@ -125,7 +125,7 @@ class Sim:
         self.use_ref = self.kv and cfg.zeroref and cfg.hook != "none"
         self.refs: dict[int, int] = {}
         self.sess: dict = {}
-        self.ref_tiers = self.tiers if cfg.zeroref_hbm else ([self.pool] if shared else [])
+        self.ref_tiers = [self.pool] if shared else []
         self.load = [0] * n
         self.ideal: set = set()
         self.streams: dict = {}
@@ -320,8 +320,7 @@ class Sim:
                 st = streams.get(skey)
                 if st is None:
                     st = streams[skey] = {"hist": [], "last_end": None, "inst": None, "pool_pin": [],
-                                          "hbm_pin": [], "hbm_pin_inst": None, "ref": [], "tok": 0,
-                                          "pw": None}
+                                          "ref": [], "tok": 0, "pw": None}
                 gap = now - st["last_end"] if st["last_end"] is not None else math.nan
                 if st["last_end"] is not None:
                     st["hist"].append(max(0.0, gap))
@@ -345,10 +344,6 @@ class Sim:
                 pw = st["pw"]
                 rec_pw.append(1 if (pw is not None and pw == i and h_hbm > 0) else 0)
                 st["pw"] = None
-                # HBM 钉在别的实例上：请求换了实例，旧钉子作废
-                if st["hbm_pin"] and st["hbm_pin_inst"] != i:
-                    self._unpin(self.hbm[st["hbm_pin_inst"]], st["hbm_pin"])
-                    st["hbm_pin"] = []
                 if self.use_ref:
                     # 引用归会话所有：同一会话的 subagent 之间共享前缀（CC trace 里约 40% 的
                     # 已结束 subagent 页会被同会话后续流复用），按流计引用会错杀。
@@ -403,7 +398,6 @@ class Sim:
                     self._release(st)
                     continue
                 if cfg.keepalive:
-                    # 共享池保活
                     if cfg.pin_tc_lo * self.pool.tc < eta <= min(cfg.pool_pin_max_gap, cfg.pin_tc_mult * self.pool.tc):
                         exp = now + (eta + 1.0 if oracle else eta_hi * cfg.slack_mult + cfg.slack_add)
                         self._repin(self.pool, st, "pool_pin", keys)
@@ -413,21 +407,8 @@ class Sim:
                     elif st["pool_pin"]:
                         self._unpin(self.pool, st["pool_pin"])
                         st["pool_pin"] = []
-                    # HBM 保活（短停顿）
-                    if cfg.pin_tc_lo * self.hbm[i].tc < eta <= min(cfg.hbm_keep_max_gap, cfg.pin_tc_mult * self.hbm[i].tc):
-                        exp = now + (eta + 1.0 if oracle else eta_hi * cfg.slack_mult + cfg.slack_add)
-                        if st["hbm_pin"] and st["hbm_pin_inst"] != i:
-                            self._unpin(self.hbm[st["hbm_pin_inst"]], st["hbm_pin"])
-                            st["hbm_pin"] = []
-                        st["hbm_pin_inst"] = i
-                        self._repin(self.hbm[i], st, "hbm_pin", keys)
-                        if st["hbm_pin"]:
-                            heapq.heappush(ev, (exp, seq, PIN_EXP_HBM, (skey, tok)))
-                            seq += 1
-                    elif st["hbm_pin"]:
-                        self._unpin(self.hbm[st["hbm_pin_inst"]], st["hbm_pin"])
-                        st["hbm_pin"] = []
-                if cfg.prewarm and max(cfg.hbm_keep_max_gap, 0.5 * self.hbm[i].tc) < eta <= cfg.pool_pin_max_gap:
+                # 只在引擎 HBM 的 LRU 大概率已挤掉该前缀时才发预取（否则是白搬）
+                if cfg.hbm_hint and 0.5 * self.hbm[i].tc < eta <= cfg.pool_pin_max_gap:
                     tp = now + max(0.0, eta - cfg.prewarm_lead)
                     heapq.heappush(ev, (tp, seq, PREWARM, (skey, tok, keys, eta)))
                     seq += 1
@@ -437,12 +418,6 @@ class Sim:
                 if st["tok"] == tok and st["pool_pin"]:
                     self._unpin(self.pool, st["pool_pin"])
                     st["pool_pin"] = []
-            elif typ == PIN_EXP_HBM:
-                skey, tok = pl
-                st = streams[skey]
-                if st["tok"] == tok and st["hbm_pin"]:
-                    self._unpin(self.hbm[st["hbm_pin_inst"]], st["hbm_pin"])
-                    st["hbm_pin"] = []
             elif typ == LIVE_EXP:
                 sid, tok = pl
                 if self.sess[sid]["tok"] == tok:
@@ -463,16 +438,6 @@ class Sim:
                 self.use(self.hbm[tgt], sub)
                 self.prewarm_pages += p - before
                 st["pw"] = tgt
-                if cfg.keepalive:
-                    if st["hbm_pin"] and st["hbm_pin_inst"] != tgt:
-                        self._unpin(self.hbm[st["hbm_pin_inst"]], st["hbm_pin"])
-                        st["hbm_pin"] = []
-                    st["hbm_pin_inst"] = tgt
-                    self._repin(self.hbm[tgt], st, "hbm_pin", sub)
-                    if st["hbm_pin"]:
-                        slack = 1.0 if cfg.hook == "oracle" else cfg.prewarm_lead + eta * (cfg.slack_mult - 1) + cfg.slack_add
-                        heapq.heappush(ev, (now + cfg.prewarm_lead + slack, seq, PIN_EXP_HBM, (skey, tok)))
-                        seq += 1
 
         self.rec = {
             "t": np.array(rec_t), "n_in": np.array(rec_n, dtype=np.int64),
@@ -507,9 +472,6 @@ class Sim:
         if st["pool_pin"]:
             self._unpin(self.pool, st["pool_pin"])
             st["pool_pin"] = []
-        if st["hbm_pin"]:
-            self._unpin(self.hbm[st["hbm_pin_inst"]], st["hbm_pin"])
-            st["hbm_pin"] = []
 
     def _release_sess(self, sid) -> None:
         ss = self.sess.get(sid)

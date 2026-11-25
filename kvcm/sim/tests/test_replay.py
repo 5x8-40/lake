@@ -61,13 +61,17 @@ def test_oracle_keepalive_beats_lru_under_pressure():
                           pages=np.arange(1, 7, dtype=np.int64) * 7919 + j * 10**6, svc=1.0))
         sessions.append(s)
     wl = _wl(sessions)
-    common = dict(hbm_pages=8, dram_pages=24, n_inst=1, hbm_keep_max_gap=-1.0,
-                  pool_pin_frac=0.5, pin_tc_mult=math.inf)
+    common = dict(hbm_pages=8, dram_pages=24, n_inst=1, pool_pin_frac=0.5, pin_tc_mult=math.inf)
     res = {}
+    hbm = {}
     for name, kw in {"lru": dict(policy="shared_lru"),
-                     "oracle": dict(policy="kvcm", hook="oracle", keepalive=True)}.items():
+                     "oracle": dict(policy="kvcm", hook="oracle", keepalive=True, zeroref=True)}.items():
         sim = Sim(Config(**common, **kw), wl, rate=0.2, horizon=2000.0, warmup=0.0, seed=3)
         sim.pool.tc = 1.0  # 跳过在线估计：直接允许钉
         rec = sim.run()
         res[name] = rec["hit"].sum() / rec["n_in"].sum()
+        hbm[name] = sim.hbm[0]
     assert res["oracle"] > res["lru"], res
+    # KVCM 只管池：HBM 里没有钉/引用类页，全部是引擎 LRU
+    assert not hbm["oracle"].pinned and not hbm["oracle"].l1
+    assert all(c == 0 for c in hbm["oracle"].all.values())

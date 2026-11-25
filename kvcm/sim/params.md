@@ -47,7 +47,7 @@
 | 负载锚点 | 选到达率使**理想命中（无限容量、全局共享）下** prefill 占集群 NPU 时间 50% | **假设**（剩余给 decode；与策略无关的锚点） |
 | CC-256k 到达率 | ≈1,750 会话/h ≈ 59 req/s（全规模） | 由锚点校准 |
 | 仿真窗口 | 10 h，前 3 h 预热不计 | 方法设定 |
-| 规模切片 | 仿真 1/k 集群（容量与负载同比缩小，7 个实例不变），NPU 数再乘 k；主结果 k=8 | 方法设定；k=4 与 k=16 对照见 README |
+| 规模切片 | 仿真 1/k 集群（每实例 HBM、池容量与负载同比缩小，7 个实例不变），NPU 数再乘 k；主结果 k=8 | 方法设定；k=4 与 k=16 对照见 README |
 | 页粒度 | 512 token | **假设**（CPU 开销折中；vLLM V4 block = 256 源 token） |
 | Codex 调用间隔 | lognormal，P50 5.2 s、P90 23.0 s | `Inferact/codex_swebenchpro_traces` README §5（trace 本身无时间戳，时间线为**合成**） |
 | Codex / Qwen 服务时长 | 2 s + output / 40 tok/s | **假设**（trace 无服务时长；CC 用 trace 自带 `api_time`） |
@@ -58,12 +58,15 @@
 |---|---|---|
 | 路由规则 | 负载失衡（max−min > abs 且 max > 1.5×min）走最短队列，否则走最长前缀命中 | SGLang cache-aware 路由规则（`docs/research/sglang/model-runner.md`）；阈值为 **假设** |
 | abs 阈值 | 全规模 32 个在途请求，切片按 32/√k 缩放 | **假设** |
-| 基线 1：per-instance LRU | 每实例私有 HBM + 私有 DRAM（write-through），LRU | 对标 vLLM APC + 本地 offload（`docs/research/vllm/block-lifecycle.md`） |
-| 基线 2：shared-pool LRU | 每实例 HBM + 全集群共享 DRAM 池（去重、任意实例可取），LRU | 对标 Mooncake/LMCache 共享池（被动 LRU） |
-| KVCM keep-alive | 停顿期把前缀钉在 HBM（ETA ≤ 30 s）或共享池（ETA ≤ 2 h，且 ≤ 2×该层 LRU 驻留时间）；钉预算 HBM 30%、池 50% | **假设**（D8a §5 保留 TTL = ETA + slack） |
+| HBM 归属 | 推理引擎：每实例前缀缓存，纯 LRU，**所有策略相同**，固定 320 GB/实例，不随 x 轴变化 | 用户校正（2026-11-25）；`kvcm/design/D2-kv-operations.md`「操作图解」节：“八项操作都作用于池内副本；HBM 工作集由引擎自己的读写路径加载，不在 kvcm 操作面” |
+| x 轴 | 只扫 DRAM 池容量：标称 14 TB × {1/32 … 2} | 方法设定 |
+| 基线 1：per-instance LRU | 引擎 HBM LRU + 实例私有 DRAM（write-through，总量同池），LRU | 对标 vLLM APC + 本地 offload（`docs/research/vllm/block-lifecycle.md`） |
+| 基线 2：shared-pool LRU | 引擎 HBM LRU + 全集群共享 DRAM 池（去重、任意实例可取），LRU | 对标 Mooncake/LMCache 共享池（被动 LRU） |
+| KVCM 池保活 | 停顿期把前缀钉在共享池（ETA ≤ 2 h，且 ≤ 2×池 LRU 驻留时间）；钉预算池 50%（realistic 10%） | **假设**（D8a §5 保留 TTL = ETA + slack） |
 | 钉住时长 | oracle：到下一轮到达；realistic：`2 × ETA上界 + 5 s` | **假设** |
-| KVCM ETA 预热 | 预测 ETA 超过 HBM 驻留时间时，在 ETA − 5 s 把前缀从池预放置到目标实例 HBM | D8a §4 预取；提前量为 **假设** |
-| KVCM 零引用优先 | 活会话（会话级引用，含在途请求）的页后驱逐；realistic 活跃窗 = max(4 × ETA上界, 300 s) | lake 原则 4 “引用数>0 冻结”；窗口为 **假设** |
-| hook：none | 无停顿信息，keep-alive/预热/零引用都不生效 | 方法设定 |
+| KVCM 零引用优先（池） | 活会话（会话级引用，含在途请求）的池页后驱逐；realistic 活跃窗 = max(4 × ETA上界, 300 s) | lake 原则 4 “引用数>0 冻结”；窗口为 **假设** |
+| 变体：HBM 预取提示 | **不属于 KVCM 主线**。预测 ETA 超过 0.5×HBM 驻留时间时，在 ETA − 5 s 向目标实例发预取请求，引擎把池里前缀载入 HBM 并入其 LRU，**不钉** | `kvcm/design/kv-prefetch.md` 方案 A + 「决策」节（`max_tokens=1` 预取请求 → 加载进 HBM/APC；“不做 pin（HBM APC 是 LRU）”）；触发阈值与提前量为 **假设** |
+| 池内 ETA 预热（方案 B2 本机 DRAM 副本） | **不建模**：无 SSD 层，池里没有的前缀无处可预热；本机/跨机副本只差 86 vs 78 GB/s 加载带宽 | `kvcm/design/kv-prefetch.md` 方案 B2 |
+| hook：none | 无停顿信息，池保活/零引用/预取提示都不生效 | 方法设定 |
 | hook：realistic | 只用该流历史间隔：点估计 = 最近 5 次间隔的几何均值，上界 = exp(μ+σ)；冷启动用全局历史中位数 | 方法设定 |
 | hook：oracle | 真实间隔，且知道会话/流是否还有下一轮 | 上界 |

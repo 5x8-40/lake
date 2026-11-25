@@ -31,9 +31,10 @@ WARMUP = 10800.0
 GAP_EDGES = [0, 10, 60, 600, 3600, math.inf]
 GAP_LABELS = ["<10s", "10-60s", "1-10min", "10-60min", ">1h"]
 
-FULL = dict(keepalive=True, prewarm=True, zeroref=True)
-# realistic 的钉预算在 CC f=1/8 上调过（大预算会挤掉 LRU 本来留得住的内容）；oracle 用默认预算
-REAL_BUDGET = dict(pool_pin_frac=0.1, hbm_pin_frac=0.1)
+# KVCM 主线 = 只作用于 DRAM 池的保活 + 零引用优先；HBM 归引擎（纯 LRU），各策略相同
+FULL = dict(keepalive=True, zeroref=True)
+# realistic 的池钉预算取小（大预算会挤掉 LRU 本来留得住的内容）；oracle 用默认预算
+REAL_BUDGET = dict(pool_pin_frac=0.1)
 
 POLICIES = {
     "local": dict(policy="local_lru"),
@@ -41,17 +42,19 @@ POLICIES = {
     "kvcm-none": dict(policy="kvcm", hook="none", **FULL),
     "kvcm-real": dict(policy="kvcm", hook="realistic", **FULL, **REAL_BUDGET),
     "kvcm-oracle": dict(policy="kvcm", hook="oracle", **FULL),
-    # 消融链：shared → +keepalive → +prewarm → +zeroref（= 完整 KVCM）
+    # 单列变体：主线 + 池→HBM 预取请求（kvcm/design/kv-prefetch.md 方案 A，进引擎 LRU，不钉）
+    "kvcm-real-hint": dict(policy="kvcm", hook="realistic", **FULL, **REAL_BUDGET, hbm_hint=True),
+    "kvcm-oracle-hint": dict(policy="kvcm", hook="oracle", **FULL, hbm_hint=True),
+    # 消融链：shared → +池保活 → +零引用优先（= KVCM 主线）→ +HBM 预取提示（变体）
     "real+ka": dict(policy="kvcm", hook="realistic", keepalive=True, **REAL_BUDGET),
-    "real+ka+pw": dict(policy="kvcm", hook="realistic", keepalive=True, prewarm=True, **REAL_BUDGET),
     "oracle+ka": dict(policy="kvcm", hook="oracle", keepalive=True),
-    "oracle+ka+pw": dict(policy="kvcm", hook="oracle", keepalive=True, prewarm=True),
 }
 
-MRC_F = [1 / 64, 1 / 32, 1 / 16, 1 / 8, 1 / 4, 1 / 2, 1, 2]
-MRC_POLICIES = ["local", "shared", "kvcm-real", "kvcm-oracle"]
+# x 轴只扫 DRAM 池容量（标称 14 TB 的倍数）；HBM 固定为真实大小
+MRC_F = [1 / 32, 1 / 16, 1 / 8, 1 / 4, 1 / 2, 1, 2]
+MRC_POLICIES = ["local", "shared", "kvcm-real", "kvcm-oracle", "kvcm-oracle-hint"]
 ABL_F = [1 / 8, 1]
-ABL_POLICIES = ["kvcm-none", "real+ka", "real+ka+pw", "oracle+ka", "oracle+ka+pw"]
+ABL_POLICIES = ["kvcm-none", "real+ka", "oracle+ka", "kvcm-real-hint"]
 
 
 def load(trace: str):
@@ -67,7 +70,7 @@ def load(trace: str):
 def base_cfg(f: float, k: int) -> dict:
     return dict(
         n_inst=P.n_inst,
-        hbm_pages=max(1, int(P.pages(P.hbm_kv_per_inst, PAGE) * f / k)),
+        hbm_pages=max(1, int(P.pages(P.hbm_kv_per_inst, PAGE) / k)),
         dram_pages=max(1, int(P.pages(P.dram_kv_total, PAGE) * f / k)),
         bal_abs=max(1, round(32 / math.sqrt(k))),
     )
