@@ -342,4 +342,4 @@ DRAM 池 = 1 × 标称（14.00 TB）：
 
 ## PD 转换实验（单独生成，不由 `kvcm_sim.report` 管理）
 
-E1 窗口级流体模型、E4 切换代价，以及 S5 配比阶跃下逐次阶跃的过载分钟（有池 vs 无池）见 [`pd/summary.md`](pd/summary.md)（由 `PYTHONPATH=. python3 -m pd.run` 生成）。
+E1 窗口级流体模型、E4 切换代价、S5 配比阶跃下逐次阶跃的过载分钟（有池 vs 无池）、“无池快切·丢 KV 重算”档与 Evolving Infra 统计判据控制器对照见 [`pd/summary.md`](pd/summary.md)（由 `PYTHONPATH=. python3 -m pd.run` 生成）。

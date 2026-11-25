@@ -117,7 +117,7 @@ vLLM（生成 token 写满的块入 APC）与 SGLang（请求结束时整段插�
 
 ```bash
 cd kvcm/sim
-PYTHONPATH=. python3 -m pd.run            # 约 2 分钟；读 /tmp/traces 下的 cc256k / qwen_coder 原始 trace
+PYTHONPATH=. python3 -m pd.run            # 约 10 分钟；读 /tmp/traces 下的 cc256k / qwen_coder 原始 trace
 PYTHONPATH=. python3 -m pytest tests -q   # 含 tests/test_pd.py
 ```
 
@@ -125,15 +125,16 @@ PYTHONPATH=. python3 -m pytest tests -q   # 含 tests/test_pd.py
 
 - **需求序列（E1）**：会话 Poisson 到达，会话内按 trace 原时间回放（不改数据集时间）；每个 5 分钟窗口算 prefill 需求（`Params.npu_seconds`，命中取 h*）与 decode KV 占用（BF16 3,200 B/token × (n_in + n_out/2)，时长 = n_out × 每步 25 ms）。
 - **节点模型**：14 个整数节点，P 节点 prefill 利用率 ≤ 80%；D 节点 KV ≤ 296 GB × 90%（decode 在这组参数下受 HBM 容量约束）；混部节点 prefill 占比 ≤ min(80%, 1 − t_step/TPOT_SLO) = 50%，decode 每步拉长 1/(1−f)。
-- **策略**：静态全混部、静态最优 P:D（事后最优）、静态最优 P/D/混部组合、动态 P:D（oracle 前瞻 / 滞后一窗控制器）、动态三态（oracle）。goodput = 过载窗口 ≤ 1% 的最大负载倍数 α。
+- **策略**：静态全混部、静态最优 P:D（事后最优）、静态最优 P/D/混部组合、动态 P:D（oracle 前瞻 / 滞后一窗控制器 / 统计判据控制器）、动态三态（oracle）。统计判据按 Evolving Infra（arXiv 2611.12304）§5.2 / 算法 E.3：每个规划窗口（5 或 10 分钟）切成 60 s 切片，候选配比的逐片吞吐收益均值超过 2 倍标准误才切，切换未完成或开始不足 120 s 时跳过。goodput = 过载窗口 ≤ 1% 的最大负载倍数 α。
 - **场景**：S0 平稳（未注入）；S1 只变总量；S2 / S2m / S4 只变配比（CC ↔ Qwen coder 组合按正弦变化，强 / 弱 / 2 小时快变）；S3 总量 + 配比；S5 配比阶跃（CC 到达率在 5 分钟内阶跃，P 占比目标 0.5↔0.8，24h 内 3 次、每次持续 4h；Qwen 到达率按 CC 实际需求补齐使总需求≈恒定；因 CC 会话长，P 占比实际约 45–60 分钟完成大部分变化），另报每次阶跃后的过载窗口数与连续过载分钟。**S1–S5 的到达率包络或 trace 组合为人为注入，表和图里都标【注入】**；CC 会话很长，注入的“总量恒定”在实现上会被拖尾抹平，实际总量 CV 见结果表。
-- **切换代价分档**：同布局逻辑切换（权重不动，代价≈0）与 PR #89 sleep/wake + host H2D（+30 s，host 510 GB/节点副本从池扣，命中下降按 PR #90 MRC 计）各自 × {KVCM 池丢弃后重读, 无池点对点迁移, 无池排空}。
+- **切换代价分档**：同布局逻辑切换（权重不动，代价≈0）与 PR #89 sleep/wake + host H2D（+30 s，host 510 GB/节点副本从池扣，命中下降按 PR #90 MRC 计）各自 × {KVCM 池丢弃后重读, 无池点对点迁移, 无池排空}；另加“逻辑切换 + 无池快切·丢 KV 重算”（2 s 切换，被切节点 KV 全丢，E4 杀掉重算的 NPU·s 按切换时刻 KV 占用比例摊进之后 5 分钟的 prefill，并统计丢失复用 = 重算 / 命中省下的 NPU·s，对照论文图 3a 的 Arrow 55.5% 与 Evolving Infra 0.3%）。
 - **E4（轻量版，非 DES）**：对满载 D 节点的在途 decode 做快照抽样（按 decode 时长加权），算一次 D→P 切换的排空时间、点对点迁移时间、杀掉重算的 NPU·s、池刷尾页与接收方重读量；结果作为 E1 分档的切换耗时。
 
 ### 参考实现
 
 - **Dynamo Planner** `components/src/dynamo/planner/core/load_scaling.py::LoadScalingMixin` / `throughput_scaling.py::ThroughputScalingMixin`（见 [`docs/research/dynamo/overview.md`](../../docs/research/dynamo/overview.md)「Planner」）。借鉴：`min_gpu_budget == max_gpu_budget` 时总量固定、只在 P/D 间重新分配，就是这里的“动态 P:D”；滞后控制器对应它的快环（按实时指标调整）。差异：Planner 扩缩以 pod 为单位、KV 随实例走；这里 KV 权威在池，D→P 切换可以丢弃 HBM KV 由他处重读（E4）。
 - **Splitwise** mixed pool（机器在 prompt/token 角色间移动）与 **DistServe** goodput 定义：本实验的“动态三态”与 goodput 指标照搬其口径。差异：它们是 GPU 真机 + 自建 DES，这里只有窗口级流体模型。
+- **Evolving Infra**（arXiv 2611.12304，无公开代码）§3.1 图 3a 与 §5.2 / 附录 E.3 算法 E.3：统计判据控制器与丢失复用口径照此实现。差异：论文用在线拟合的迭代时间模型算 Θ，这里用流体容量；论文节点切换时在途请求原地跑完，这里各档按 E4 分别计。
 - **vLLM-Ascend** `vllm_ascend/worker/worker.py::Worker.sleep` / `wake_up`（PR #89 核实）：sleep/wake 档的切换流程与 host 权重副本来自这里。差异：PR #89 的 8 卡示例形态（D DP8 TP1）放不下 V4.1-Flash，这里按单节点形态计。
 
 ### 局限
