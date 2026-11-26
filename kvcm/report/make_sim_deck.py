@@ -172,9 +172,9 @@ def note(s, x, y, w, h, t, size=10):
 
 
 def build_short():
-    """4 页浓缩版：措辞与数字沿用 10 页版。"""
+    """精简版（6 页，文件名沿用“精简4页”）：措辞与数字沿用 10 页版。"""
     global TOTAL
-    TOTAL = 4
+    TOTAL = 6
     out = HERE / "KVCM-仿真结论-精简4页-20261126.pptx"
 
     # 1 总结论 + 口径
@@ -187,7 +187,7 @@ def build_short():
     text(s, 0.6, 0.45, 2.9, 0.38, "KVCM trace 回放仿真 · 结论", size=11, color=WHITE, bold=True,
          align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
     text(s, 11.8, 0.45, 1.03, 0.38,
-         [[("01", {"color": GOLD, "size": 13, "bold": True}), (" / 04", {"color": SOFT, "size": 10.5})]],
+         [[("01", {"color": GOLD, "size": 13, "bold": True}), (f" / {TOTAL:02d}", {"color": SOFT, "size": 10.5})]],
          align=PP_ALIGN.RIGHT, anchor=MSO_ANCHOR.MIDDLE)
     text(s, 0.6, 0.95, 12, 0.8, "KVCM 仿真结论", size=36, color=WHITE, bold=True)
     text(s, 0.6, 1.8, 12.1, 1.5,
@@ -236,33 +236,72 @@ def build_short():
          size=9.5, color=GRAY)
     footer(s, "kvcm/sim/results/summary.md（DRAM 池 0.25 × 标称）；locality.md「KVCM 增益区间【注入】」")
 
-    # 3 PD 转换 + 局部性 / 冷热复制
+    # 3 PD 动态转换
     s = prs.slides.add_slide(BLANK)
-    header(s, "03  PD · 局部性", "【注入】PD 动态转换在配比变化时有效；局部性在网卡紧张时防止排队失稳，冷热复制只在热点集中时有收益", 3)
-    w3 = (12.33 - 2 * 0.12) / 3
-    text(s, 0.5, 1.18, 12.33, 0.32, "PD 动态转换（goodput 相对静态最优 P:D）【注入】", size=12, color=NAVY, bold=True)
-    for i, (big, cap, acc) in enumerate([
-        ("S3 +18.6%", "总量 + 配比同时变化，动态 P:D 理想上界；滞后一窗 + 池 +13.5%（S1 总量变化 0%）", RED),
+    header(s, "03  PD 转换", "【注入】PD 动态转换在配比变化时有效：S3 goodput +18.6%；无池丢 KV 快切在 S5 只剩 +1.7%", 3)
+    picture(s, RES / "pd" / "figures" / "pd_goodput.png", 0.75, 1.18, w=7.5)
+    table(s, 0.5, 4.86, [2.6, 1.08, 1.08, 1.08, 1.08, 1.08], [
+        ["相对静态最优 P:D", "S1", "S2", "S4", "S5", "S3"],
+        ["动态 P:D（理想 · 池）", "+0.0%", "+19.0%", "+0.7%", "+11.7%", "+18.6%"],
+        ["滞后一窗 · 逻辑切换 + 池", "+0.0%", "+18.0%", "−2.4%", "+6.5%", "+13.5%"],
+        ["统计判据 5 min · 池", "+0.0%", "+19.0%", "−2.7%", "+6.0%", "+17.8%"],
+        ["无池丢 KV 重算 · 滞后", "+0.0%", "+17.8%", "−4.9%", "−2.5%", "+12.2%"],
+    ], size=10, row_h=0.4, hl_rows=(1,))
+    cards(s, [
+        ("S3 +18.6%", "总量 + 配比同时变化，动态 P:D 理想上界；滞后一窗 + 池 +13.5%（S1 总量变化 0%）"),
         ("S5 +11.7% vs +1.7%", "配比阶跃：有池 vs 无池丢 KV 重算（oracle）；全天过载窗口 0 vs 6", TEAL),
         ("判据 ≈ 滞后", "S5 统计判据 5 min +6.0%，滞后 1.05× 余量 +6.5%，无余量 −0.2%", GRAY),
-    ]):
-        card(s, 0.5 + i * (w3 + 0.12), 1.52, w3, 1.5, big, cap, acc, 20)
-    text(s, 0.5, 3.16, 12.33, 0.32, "局部性 / 冷热复制", size=12, color=NAVY, bold=True)
-    for i, (big, cap, acc) in enumerate([
+    ], big_size=22)
+    footer(s, "kvcm/sim/results/pd/summary.md §2、§3a–§3c（S1–S5 为【注入】到达率包络，会话内时间保持 trace 原值）")
+
+    # 4 局部性
+    s = prs.slides.add_slide(BLANK)
+    header(s, "04  局部性", "【注入】局部性在网卡紧张时起作用，网络空闲时无影响：最坏组合下仅 KVCM + 局部性稳定", 4)
+    table(s, 0.5, 1.3, [3.9, 2.05, 2.05], [
+        ["最坏组合 · TTFT P95", "Claude Code", "Qwen coder"],
+        ["扁平共享池（哈希条带、单副本）", "7.15e+04 s", "7.14e+03 s"],
+        ["+ 写本机放置", "6.91e+04 s", "6.62e+03 s"],
+        ["+ 写本机 + 被动副本（Mooncake）", "4.21e+04 s", "5.23e+03 s"],
+        ["哈希 + 热点复制（TokenLake）", "1.44e+05 s", "1.97e+04 s"],
+        ["KVCM（现实 hook，哈希放置）", "7.12e+04 s", "7.03e+03 s"],
+        ["KVCM + 局部性", "1.56 s", "0.57 s"],
+        ["消融：TTFT 路由不计数据位置", "未跑完", "2.31e+03 s"],
+    ], size=10.5, row_h=0.38, hl_rows=(6,))
+    table(s, 0.5, 4.5, [3.9, 2.05, 2.05], [
+        ["CC 单因素 · TTFT P95", "KVCM + 局部性", "消融（不计位置）"],
+        ["跨机带宽 1/4", "1.15 s", "15.7 s"],
+        ["跨机带宽 1/10", "1.15 s", "508 s"],
+        ["背景流量 70%", "1.15 s", "322 s"],
+        ["KV 传输 ×8", "1.15 s", "319 s"],
+    ], size=10.5, row_h=0.38)
+    text(s, 0.5, 6.5, 8.0, 0.55,
+         "最坏组合 = HBM 1/4 + KV ×8 + 跨机带宽 1/10 + 背景 70%；消融里放置、副本、命中率与 KVCM + 局部性相同，只是路由不跟数据走",
+         size=10, color=GRAY)
+    cards(s, [
         ("< 2%", "网络空闲：【注入】单因素压力（带宽 1/4、1/10，背景 50/70%，KV ×8）下各变体 TTFT P95 变化", GRAY),
         ("1.56 s / 0.57 s", "网卡紧张：【注入】最坏组合出口负载 158–758%，仅 KVCM + 局部性稳定（CC / Qwen），其余变体失稳", GREEN),
-        ("15.7 s / 508 s", "【注入】消融：路由不计数据位置时 CC 带宽 1/4、1/10 的 P95（KVCM + 局部性 1.15 s）", AMBER),
-        ("+18.6%", "现有 trace：被动副本占池 28.1%，读池 P95 2.172 → 2.577 s；热点复制单因素下不触发", AMBER),
-        ("−67% / −86% / −98%", "【注入】热点集中：写本机 → 热点复制，1 / 2 / 3 个热节点的 P95；扁平哈希池始终约 0.16 s", RED),
-        ("拐点 66–92%", "【注入】热节点出口在此区间转为净收益；单热节点 KVCM 0.17 s vs 只路由 57 s", TEAL),
-    ]):
-        r, c = divmod(i, 3)
-        card(s, 0.5 + c * (w3 + 0.12), 3.5 + r * 1.8, w3, 1.7, big, cap, acc, 20)
-    footer(s, "kvcm/sim/results/pd/summary.md §2、§3a–§3c；locality.md「压力敏感性」「热点复制增益场景」（均【注入】）；README")
+        ("15.7 s / 508 s", "【注入】消融：路由不计数据位置时 CC 带宽 1/4、1/10 的 P95；同档 KVCM + 局部性 1.15 s", AMBER),
+    ], big_size=23)
+    footer(s, "kvcm/sim/results/locality.md「压力敏感性【注入】」；kvcm/sim/README.md「压力敏感性结论」")
 
-    # 4 设计建议 + 口径
+    # 5 冷热复制
     s = prs.slides.add_slide(BLANK)
-    header(s, "04  建议", "设计建议：池做简单（哈希条带、单副本），复杂度投在保留策略和路由（数据位置 + 队列 + 命中）", 4)
+    header(s, "05  冷热复制", "冷热复制在现有三条 trace 下无收益；【注入】只在数据被集中到少数节点、热节点出口 ≳ 90% 时有净收益，哈希条带本身没有热点", 5)
+    picture(s, FIG / "locality" / "hotspot" / "hotspot_scan.png", 1.67, 1.15, w=10.0)
+    w5 = (12.33 - 4 * 0.1) / 5
+    for i, (big, cap, acc) in enumerate([
+        ("2.172 → 2.577 s", "现有三条 trace：被动副本占池 28.1%，读池 P95 变差；热点复制单因素下不触发", AMBER),
+        ("−67 / −86 / −98%", "【注入】热点集中：写本机 → 热点复制，1 / 2 / 3 个热节点的 P95", RED),
+        ("拐点 66–92%", "【注入】热节点出口负载在此区间转为净收益", TEAL),
+        ("0.17 s vs 57 s", "【注入】单热节点：KVCM 读者就地副本 + 位置路由 对 只路由", GREEN),
+        ("≈ 0.16 s", "【注入】扁平哈希池把热文档条带到全部节点，P95 始终约 0.16 s", GRAY),
+    ]):
+        card(s, 0.5 + i * (w5 + 0.1), 4.62, w5, 2.36, big, cap, acc, 17)
+    footer(s, "kvcm/sim/results/locality.md E2、「热点复制增益场景【注入】」（热集合 2× 集群 HBM）；kvcm/sim/README.md")
+
+    # 6 设计建议 + 口径
+    s = prs.slides.add_slide(BLANK)
+    header(s, "06  建议", "设计建议：池做简单（哈希条带、单副本），复杂度投在保留策略和路由（数据位置 + 队列 + 命中）", 6)
     table(s, 0.5, 1.3, [1.5, 4.9, 5.93], [
         ["方向", "建议", "依据"],
         ["池放置", "哈希条带、单副本即可避免热点；只有放置被迫集中（如写本机）时才需要热页定向副本 + 位置路由",
