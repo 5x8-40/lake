@@ -120,7 +120,7 @@ def cards(s, items, x=8.75, y=1.3, w=4.08, h=1.82, gap=0.11, big_size=24):
 
 
 def table(s, x, y, col_w, rows, size=10.5, row_h=0.3, hl_rows=(), hl_color=RGBColor(0xFD, 0xF2, 0xF4),
-          left=False):
+          left=False, row_hs=None):
     nr, nc = len(rows), len(rows[0])
     gf = s.shapes.add_table(nr, nc, Inches(x), Inches(y), Inches(sum(col_w)), Inches(row_h * nr))
     tbl = gf.table
@@ -128,7 +128,7 @@ def table(s, x, y, col_w, rows, size=10.5, row_h=0.3, hl_rows=(), hl_color=RGBCo
     for j, cw in enumerate(col_w):
         tbl.columns[j].width = Inches(cw)
     for i in range(nr):
-        tbl.rows[i].height = Inches(row_h)
+        tbl.rows[i].height = Inches(row_hs[i] if row_hs else row_h)
         for j in range(nc):
             c = tbl.cell(i, j)
             c.margin_left = c.margin_right = Inches(0.06)
@@ -180,28 +180,30 @@ p = rect(s, 0.78, 0.9, 2.9, 0.38, RED, MSO_SHAPE.ROUNDED_RECTANGLE)
 p.adjustments[0] = 0.22
 text(s, 0.78, 0.9, 2.9, 0.38, "KVCM trace 回放仿真 · 结论", size=11, color=WHITE, bold=True,
      align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
-text(s, 0.78, 1.45, 7.8, 0.9, "KVCM 仿真结论", size=40, color=WHITE, bold=True)
-text(s, 0.78, 2.45, 7.8, 1.5,
-     [[("价值在 ", {}), ("保留", {"color": GOLD, "bold": True}), (" 和 ", {}),
-       ("PD 动态转换", {"color": GOLD, "bold": True}), ("，", {})],
-      "不在局部性和冷热复制；",
-      [("保留收益要靠 ", {}), ("理想 hook", {"color": GOLD, "bold": True}), ("。", {})]],
-     size=22, color=WHITE, spacing=1.2)
-rect(s, 0.78, 4.15, 1.65, 0.05, RED)
-table(s, 0.78, 4.4, [1.55, 6.15], [
+text(s, 0.78, 1.35, 7.8, 0.85, "KVCM 仿真结论", size=38, color=WHITE, bold=True)
+text(s, 0.78, 2.2, 7.9, 1.45,
+     [[("保留", {"color": GOLD, "bold": True}), ("（理想 hook）和 ", {}),
+       ("PD 动态转换", {"color": GOLD, "bold": True}), ("带来常态收益；", {})],
+      [("局部性", {"color": GOLD, "bold": True}), ("在网卡紧张时起作用，网络空闲时无影响；", {})],
+      [("冷热复制", {"color": GOLD, "bold": True}), ("无收益。", {})]],
+     size=19, color=WHITE, spacing=1.2)
+rect(s, 0.78, 3.72, 1.65, 0.05, RED)
+table(s, 0.78, 3.9, [1.35, 6.35], [
     ["方向", "结论（关键数字）"],
     ["保留", "CC 3.5 TB 池：理想 hook NPU 251.9 → 210.4，现实 hook 仅 250.9"],
     ["PD 动态转换", "【注入】S3 goodput +18.6%（滞后控制器 + 池 +13.5%）"],
-    ["局部性", "单因素压力下 TTFT P95 变化 < 2%；只在最坏组合起作用"],
-    ["冷热复制", "被动副本占池 28%，读池 P95 +18%；热点复制单因素下不触发"],
-], size=11, row_h=0.42, left=True)
+    ["局部性", "网卡紧张时起作用：【注入】最坏组合出口负载 158–758%，仅 KVCM + 局部性稳定在 "
+               "1.56 s / 0.57 s，其余变体失稳；消融里路由不计位置时 CC 带宽 1/4 即 15.7 s、1/10 达 508 s。"
+               "网络空闲时无影响：单因素 P95 变化 < 2%"],
+    ["冷热复制", "无收益：热点复制触发时 P95 反而变差 2–3 倍，副本占池 28–65%"],
+], size=10.5, row_h=0.4, left=True, row_hs=[0.36, 0.4, 0.4, 1.0, 0.4])
 text(s, 0.78, 6.75, 7.8, 0.4,
      "DeepSeek V4.1-Flash · Ascend A3 14 节点 × 16 die · 三条 trace · 单次运行（seed=1），无真机校准",
      size=10.5, color=SOFT)
 text(s, 9.2, 0.9, 3.8, 0.4, "目录", size=13.5, color=GOLD, bold=True)
 toc = [("01", "总结论"), ("02", "仿真口径"), ("03", "命中率与 NPU / TTFT"),
        ("04", "KVCM 增益区间【注入】"), ("05", "PD 动态转换 goodput【注入】"),
-       ("06", "局部性与冷热复制"), ("07", "压力与最坏组合【注入】"),
+       ("06", "网络空闲：局部性与冷热复制"), ("07", "网卡紧张：局部性【注入】"),
        ("08", "设计建议"), ("09", "口径与局限")]
 for i, (n, t) in enumerate(toc):
     yy = 1.45 + i * 0.6
@@ -288,7 +290,7 @@ footer(s, "kvcm/sim/results/pd/summary.md §2、§3a–§3c（S1–S5 为【注�
 
 # ---------- 6 局部性与冷热 ----------
 s = prs.slides.add_slide(BLANK)
-header(s, "04  局部性", "局部性与冷热复制在常规和单因素压力下没有收益；被动副本和热点复制是净成本", 6)
+header(s, "04  局部性", "网络空闲时局部性无影响、冷热复制无收益：被动副本和热点复制是净成本", 6)
 table(s, 0.5, 1.35, [3.0, 1.15, 1.15, 1.4, 1.3], [
     ["CC · RoCE · 池 14 TB（E2）", "命中率", "副本占池", "读池 P95", "prefill NPU"],
     ["扁平共享池（哈希条带、单副本）", "95.52%", "0.0%", "2.172 s", "137.9"],
@@ -315,7 +317,7 @@ footer(s, "kvcm/sim/results/locality.md E1、E2、「压力敏感性」；kvcm/s
 
 # ---------- 7 压力与最坏组合 ----------
 s = prs.slides.add_slide(BLANK)
-header(s, "04  局部性", "【注入】只有网卡打满（最坏组合）时局部性才起作用：仅 KVCM + 局部性稳定，靠的是路由跟着数据走", 7)
+header(s, "04  局部性", "【注入】网卡紧张时局部性是防止排队失稳的关键：最坏组合下仅 KVCM + 局部性稳定", 7)
 table(s, 0.5, 1.3, [3.9, 2.05, 2.05], [
     ["最坏组合 · TTFT P95", "Claude Code", "Qwen coder"],
     ["扁平共享池（哈希条带、单副本）", "7.15e+04 s", "7.14e+03 s"],
