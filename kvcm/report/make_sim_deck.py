@@ -2,8 +2,9 @@
 
 数字全部摘自 kvcm/sim/results/{summary.md, pd/summary.md, locality.md} 与 kvcm/sim/{params.md, README.md}；
 版式沿用 KVCM-汇报-含PD混部-20261124.pptx 的配色与字体。
-用法：python3 kvcm/report/make_sim_deck.py
+用法：python3 kvcm/report/make_sim_deck.py（10 页）；加 --short 生成 4 页浓缩版 KVCM-仿真结论-精简4页-20261126.pptx
 """
+import sys
 from pathlib import Path
 
 from pptx import Presentation
@@ -167,6 +168,127 @@ def note(s, x, y, w, h, t, size=10):
     rect(s, x, y, w, h, NAVY)
     rect(s, x, y, 0.1, h, RED)
     text(s, x + 0.2, y, w - 0.3, h, t, size=size, color=GOLD, anchor=MSO_ANCHOR.MIDDLE)
+
+
+
+def build_short():
+    """4 页浓缩版：措辞与数字沿用 10 页版。"""
+    global TOTAL
+    TOTAL = 4
+    out = HERE / "KVCM-仿真结论-精简4页-20261126.pptx"
+
+    # 1 总结论 + 口径
+    s = prs.slides.add_slide(BLANK)
+    s.background.fill.solid()
+    s.background.fill.fore_color.rgb = DEEP
+    rect(s, 0, 0, 13.333, 0.08, RED)
+    p = rect(s, 0.6, 0.45, 2.9, 0.38, RED, MSO_SHAPE.ROUNDED_RECTANGLE)
+    p.adjustments[0] = 0.22
+    text(s, 0.6, 0.45, 2.9, 0.38, "KVCM trace 回放仿真 · 结论", size=11, color=WHITE, bold=True,
+         align=PP_ALIGN.CENTER, anchor=MSO_ANCHOR.MIDDLE)
+    text(s, 11.8, 0.45, 1.03, 0.38,
+         [[("01", {"color": GOLD, "size": 13, "bold": True}), (" / 04", {"color": SOFT, "size": 10.5})]],
+         align=PP_ALIGN.RIGHT, anchor=MSO_ANCHOR.MIDDLE)
+    text(s, 0.6, 0.95, 12, 0.8, "KVCM 仿真结论", size=36, color=WHITE, bold=True)
+    text(s, 0.6, 1.8, 12.1, 1.5,
+         [[("保留", {"color": GOLD, "bold": True}), ("（理想 hook）和 ", {}),
+           ("PD 动态转换", {"color": GOLD, "bold": True}), ("带来常态收益；", {})],
+          [("局部性", {"color": GOLD, "bold": True}), ("在网卡紧张时起作用，网络空闲时无影响；", {})],
+          [("冷热复制", {"color": GOLD, "bold": True}),
+           ("在现有三条 trace 下无收益；【注入】只在数据被集中到少数节点、热节点出口 ≳ 90% 时有净收益，哈希条带本身没有热点。", {})]],
+         size=18, color=WHITE, spacing=1.2)
+    rect(s, 0.6, 3.38, 1.65, 0.05, RED)
+    table(s, 0.6, 3.52, [1.5, 10.63], [
+        ["方向", "结论（关键数字）"],
+        ["保留", "CC 3.5 TB 池：理想 hook NPU 251.9 → 210.4，现实 hook 仅 250.9"],
+        ["PD 动态转换", "【注入】S3 goodput +18.6%（滞后控制器 + 池 +13.5%）"],
+        ["局部性", "网卡紧张时起作用：【注入】最坏组合出口负载 158–758%，仅 KVCM + 局部性稳定在 "
+                   "1.56 s / 0.57 s，其余变体失稳；消融里路由不计位置时 CC 带宽 1/4 即 15.7 s、1/10 达 508 s。"
+                   "网络空闲时无影响：单因素 P95 变化 < 2%"],
+        ["冷热复制", "现有三条 trace 下无收益（触发时 P95 反而变差 2–3 倍，副本占池 28–65%）；"
+                     "【注入】数据被集中到少数节点、热节点出口 ≳ 90% 时有净收益（写本机 → 热点复制 P95 −67% / −86% / −98%），"
+                     "扁平哈希池 P95 始终约 0.16 s"],
+    ], size=10.5, row_h=0.4, left=True, row_hs=[0.36, 0.4, 0.4, 0.66, 0.66])
+    text(s, 0.6, 6.25, 12.1, 0.8,
+         [[("仿真口径：", {"color": GOLD, "bold": True}),
+           ("DeepSeek V4.1-Flash，BF16 KV 3,200 B/token；Ascend A3 14 节点 × 16 die；0.85 → 每实例 296 GB；"
+            "HBM（引擎 LRU）+ DRAM 池（KVCM，标称 14 TB）；三条 trace（Claude Code、Codex、Qwen coder）；切片 1/32、seed=1", {})]],
+         size=11, color=SOFT, spacing=1.15)
+
+    # 2 保留
+    s = prs.slides.add_slide(BLANK)
+    header(s, "02  保留", "池在 1–2× HBM 区间，理想 hook 比共享池多命中 0.7–3.45 pt；【注入】增益几乎全来自“保留”且只有理想 hook 拿得到", 2)
+    table(s, 0.5, 1.3, [2.0, 0.9, 1.0, 0.85, 0.85], [
+        ["CC · DRAM 池 3.5 TB", "命中率", "prefill NPU", "TTFT P95", "相对共享池"],
+        ["shared-pool LRU", "91.56%", "251.9", "2.38 s", "—"],
+        ["KVCM（现实 hook）", "91.60%", "250.9", "2.31 s", "−0.9"],
+        ["KVCM（理想 hook）", "93.03%", "210.4", "1.64 s", "−41.5"],
+    ], size=9.5, row_h=0.38, hl_rows=(3,))
+    for i, (big, cap, acc) in enumerate([
+        ("251.9 → 210.4 NPU", "CC 3.5 TB 理想 hook；TTFT P95 2.38 → 1.64 s；现实 hook 只省 0.9", RED),
+        ("CC 8.1–19.9% · Qwen 7.4–13.7%", "【注入】理想 hook 的 NPU 节省；Qwen 只在池 3.5 TB 达标，标称 14 TB 池省 < 4%", TEAL),
+        ("现实 hook 0–8.5%", "命中比共享池低 0.0–0.9 pt，NPU 多用 0–8.5%；Codex 已贴着 h*，无增益", GRAY),
+    ]):
+        card(s, 0.5, 3.0 + i * 1.36, 5.6, 1.26, big, cap, acc, 19)
+    picture(s, FIG / "locality" / "stress" / "kvcm_gain_region.png", 6.3, 1.3, w=6.53)
+    text(s, 6.3, 5.55, 6.53, 0.6,
+         "【注入】负载倍数 = 提高会话到达率；池 3.5/7/14 TB × HBM 296/148/74 GB；达标 = NPU 省 ≥ 5% 或 P95 降 ≥ 10%",
+         size=9.5, color=GRAY)
+    footer(s, "kvcm/sim/results/summary.md（DRAM 池 0.25 × 标称）；locality.md「KVCM 增益区间【注入】」")
+
+    # 3 PD 转换 + 局部性 / 冷热复制
+    s = prs.slides.add_slide(BLANK)
+    header(s, "03  PD · 局部性", "【注入】PD 动态转换在配比变化时有效；局部性在网卡紧张时防止排队失稳，冷热复制只在热点集中时有收益", 3)
+    w3 = (12.33 - 2 * 0.12) / 3
+    text(s, 0.5, 1.18, 12.33, 0.32, "PD 动态转换（goodput 相对静态最优 P:D）【注入】", size=12, color=NAVY, bold=True)
+    for i, (big, cap, acc) in enumerate([
+        ("S3 +18.6%", "总量 + 配比同时变化，动态 P:D 理想上界；滞后一窗 + 池 +13.5%（S1 总量变化 0%）", RED),
+        ("S5 +11.7% vs +1.7%", "配比阶跃：有池 vs 无池丢 KV 重算（oracle）；全天过载窗口 0 vs 6", TEAL),
+        ("判据 ≈ 滞后", "S5 统计判据 5 min +6.0%，滞后 1.05× 余量 +6.5%，无余量 −0.2%", GRAY),
+    ]):
+        card(s, 0.5 + i * (w3 + 0.12), 1.52, w3, 1.5, big, cap, acc, 20)
+    text(s, 0.5, 3.16, 12.33, 0.32, "局部性 / 冷热复制", size=12, color=NAVY, bold=True)
+    for i, (big, cap, acc) in enumerate([
+        ("< 2%", "网络空闲：【注入】单因素压力（带宽 1/4、1/10，背景 50/70%，KV ×8）下各变体 TTFT P95 变化", GRAY),
+        ("1.56 s / 0.57 s", "网卡紧张：【注入】最坏组合出口负载 158–758%，仅 KVCM + 局部性稳定（CC / Qwen），其余变体失稳", GREEN),
+        ("15.7 s / 508 s", "【注入】消融：路由不计数据位置时 CC 带宽 1/4、1/10 的 P95（KVCM + 局部性 1.15 s）", AMBER),
+        ("+18.6%", "现有 trace：被动副本占池 28.1%，读池 P95 2.172 → 2.577 s；热点复制单因素下不触发", AMBER),
+        ("−67% / −86% / −98%", "【注入】热点集中：写本机 → 热点复制，1 / 2 / 3 个热节点的 P95；扁平哈希池始终约 0.16 s", RED),
+        ("拐点 66–92%", "【注入】热节点出口在此区间转为净收益；单热节点 KVCM 0.17 s vs 只路由 57 s", TEAL),
+    ]):
+        r, c = divmod(i, 3)
+        card(s, 0.5 + c * (w3 + 0.12), 3.5 + r * 1.8, w3, 1.7, big, cap, acc, 20)
+    footer(s, "kvcm/sim/results/pd/summary.md §2、§3a–§3c；locality.md「压力敏感性」「热点复制增益场景」（均【注入】）；README")
+
+    # 4 设计建议 + 口径
+    s = prs.slides.add_slide(BLANK)
+    header(s, "04  建议", "设计建议：池做简单（哈希条带、单副本），复杂度投在保留策略和路由（数据位置 + 队列 + 命中）", 4)
+    table(s, 0.5, 1.3, [1.5, 4.9, 5.93], [
+        ["方向", "建议", "依据"],
+        ["池放置", "哈希条带、单副本即可避免热点；只有放置被迫集中（如写本机）时才需要热页定向副本 + 位置路由",
+         "现有 trace 下被动副本读池 P95 +18%；【注入】扁平哈希池 P95 始终约 0.16 s，单热节点时 KVCM 0.17 s 对只路由 57 s"],
+        ["保留策略", "会话感知保留 / 驱逐，投入“预测未来复用”的 hook",
+         "CC 3.5 TB：理想 hook 210.4 NPU vs 现实 hook 250.9"],
+        ["路由", "路由计入数据位置（网卡紧张时防止排队失稳），并看队列和命中",
+         "【注入】不计位置时 CC 带宽 1/4 即 15.7 s；过载区只看 TTFT 会掉命中 1.4–2.0 pt；预测 TTFT 路由 CC P95 2.005 → 1.096 s"],
+        ["PD 转换", "同布局逻辑切换 + 池；滞后控制器保留余量",
+         "【注入】S3 +13.5%（滞后 + 池）；S5 无池丢 KV 重算 −2.5%"],
+        ["监控", "把网卡出口利用率作为局部性的先行指标",
+         "单因素下池读额外占出口 ≤ 11%；出口打满后局部性才有收益"],
+    ], size=10.5, row_h=0.62, left=True, row_hs=[0.4, 0.66, 0.5, 0.66, 0.5, 0.5])
+    note(s, 0.5, 4.75, 12.33, 1.1,
+         ["口径与局限：【注入】项包括 PD S1–S5 到达率包络、增益网格、压力点与热点场景；压力 / 增益网格窗口 6 h（主线 10 h），切片 1/32；",
+          "理想 hook 是上界；PD 为 5 min 流体模型；单次运行 seed=1，无真机校准；Codex 时间线为合成。结论以相对比较为主。"],
+         size=11)
+    footer(s, "kvcm/sim/README.md「对 KVCM 设计的含义」「局限」；params.md；summary.md；locality.md；pd/summary.md")
+
+    prs.save(out)
+    print(out)
+    sys.exit(0)
+
+
+if "--short" in sys.argv:
+    build_short()
 
 
 # ---------- 1 总结论 ----------
