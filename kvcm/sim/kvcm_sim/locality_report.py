@@ -309,6 +309,8 @@ def main():
     md = md_tables(data, zipf)
     from .locality_stress_report import build
     md += build()
+    from .hotspot_report import build as build_hot
+    md += build_hot()
     with open(os.path.join(RES, "locality.md"), "w") as f:
         f.write("\n".join(md) + "\n")
     print("wrote", os.path.join(RES, "locality.md"))
