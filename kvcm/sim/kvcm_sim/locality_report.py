@@ -307,6 +307,8 @@ def main():
     fig_e4(data)
     fig_e5(data)
     md = md_tables(data, zipf)
+    from .locality_stress_report import build
+    md += build()
     with open(os.path.join(RES, "locality.md"), "w") as f:
         f.write("\n".join(md) + "\n")
     print("wrote", os.path.join(RES, "locality.md"))

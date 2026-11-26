@@ -7,6 +7,8 @@
   无争用（主线仿真的口径）；`topo` = 分本机/跨机；`contend` = 再加每节点共享：
   `B_eff = B / (1 + n_inflight)`（NetKV），跨机流同时占源节点出口与读者节点入口，本机流占本机
   拷贝引擎。一个请求的跨机页可能散在多个源节点上并行读，但总量受读者入口带宽约束。
+  `contend` 在流开始时定速率，接近饱和时总吞吐会超过链路容量；压力扫描改用 `queue`：
+  每节点出口 / 入口 / H2D 各是一条 FCFS 链路（记“空闲时刻”），读时长含链路排队，吞吐不超过容量。
 - 计入 TTFT 的读时间：`max(0, τ − W)`。`overlap=False` 时读在 prefill 拿到算力后才开始
   （W 不掩盖，SGLang HiCache / vLLM connector 的默认形态）；`overlap=True` 时读从到达就开始，
   和排队重叠（Evolving Infra）。
@@ -38,16 +40,18 @@ XSTART, XEND = 16, 17
 @dataclass
 class LocCfg:
     transport: str = "fabric"     # fabric | roce
-    cost: str = "contend"         # flat | topo | contend
+    cost: str = "contend"         # flat | topo | contend | queue（每链路 FCFS 排队，守容量）
     overlap: bool = False
     placement: str = "hash"       # hash | local
     repl: str = "none"            # none | passive | hot | kvcm
-    route: str = "sglang"         # sglang | load | ttft
+    route: str = "sglang"         # sglang | load | ttft | ttft_noloc（预测 TTFT 但不计数据位置）
     k: int = 32
     slots: int = 16               # 每实例 prefill 槽（1 NPU/请求）
     rho: float = 0.5              # 副本目标利用率（D8a §6.5 ρ_target）
     heat_halflife: float = 300.0  # 热度 EWMA 半衰期（仿真秒）
     max_rep: int = 14
+    xbw: float = 1.0              # 跨机带宽倍数（压力扫描【注入】）
+    bg: float = 0.0               # 网卡背景流量占比均值；各节点取 bg × U(0.5, 1.5)（压力扫描【注入】）
 
 
 BW = {  # 全规模 GB/s：(本机, 跨机)，D8a §9.1 A3 910C
@@ -69,11 +73,16 @@ class LocSim(Sim):
         self.n_rep = 0
         bl, br = BW[loc.transport]
         self.B_l = bl * 1e9 / loc.k
-        self.B_r = br * 1e9 / loc.k
+        self.B_r = br * loc.xbw * 1e9 / loc.k
+        brng = np.random.default_rng(seed + 202)
+        self.bgn = np.minimum(0.95, loc.bg * brng.uniform(0.5, 1.5, n)) if loc.bg > 0 else np.zeros(n)
         self.page_bytes = wl.page_tokens * params.kv_bytes_per_token
         self.egress = [0] * n
         self.ingress = [0] * n
         self.h2d = [0] * n
+        self.free_e = [0.0] * n
+        self.free_i = [0.0] * n
+        self.free_l = [0.0] * n
         self.slot = [[0.0] * loc.slots for _ in range(n)]
         self.heat: dict = {}
         self.lam_k = math.log(2) / loc.heat_halflife
@@ -168,10 +177,11 @@ class LocSim(Sim):
     def _bw(self, src, i) -> float:
         c = self.loc.cost
         if c == "flat":
-            return self.B_r
+            return self.B_r * (1 - self.loc.bg)
         if src == i:
             return self.B_l / (1 + self.h2d[i]) if c == "contend" else self.B_l
-        return self.B_r / (1 + self.egress[src]) if c == "contend" else self.B_r
+        b = self.B_r * (1 - self.bgn[src])
+        return b / (1 + self.egress[src]) if c == "contend" else b
 
     def _pick(self, hs, i):
         if self.loc.cost == "flat":
@@ -185,7 +195,9 @@ class LocSim(Sim):
         else:
             a, b = self.lrng.choice(len(hs), 2, replace=False)
             a, b = hs[a], hs[b]
-        return a if self.egress[a] <= self.egress[b] else b
+        if self.loc.cost == "queue":
+            return a if self.free_e[a] <= self.free_e[b] else b
+        return a if self._bw(a, -1) >= self._bw(b, -1) else b
 
     def _push(self, t, typ, pl) -> None:
         self.xseq += 1
@@ -217,11 +229,13 @@ class LocSim(Sim):
         else:
             raise ValueError(typ)
 
-    def _tau(self, by: dict, i: int):
+    def _tau(self, by: dict, i: int, t0: float = 0.0, commit: bool = False):
         """按来源分组的页数 → (本机读时长, 跨机读时长)。跨机受每个源的出口与本机入口共同约束。"""
         pb = self.page_bytes
         if self.loc.cost == "flat":
-            return 0.0, sum(by.values()) * pb / self.B_r
+            return 0.0, sum(by.values()) * pb / self.B_r * (1 / (1 - self.loc.bg))
+        if self.loc.cost == "queue":
+            return self._tau_queue(by, i, t0, commit)
         t_l = by.get(i, 0) * pb / self._bw(i, i)
         rem = 0
         t_r = 0.0
@@ -230,8 +244,35 @@ class LocSim(Sim):
                 rem += c
                 t_r = max(t_r, c * pb / self._bw(s, i))
         if rem:
-            b_in = self.B_r / (1 + self.ingress[i]) if self.loc.cost == "contend" else self.B_r
+            b_in = self.B_r * (1 - self.bgn[i])
+            if self.loc.cost == "contend":
+                b_in /= 1 + self.ingress[i]
             t_r = max(t_r, rem * pb / b_in)
+        return t_l, t_r
+
+    def _tau_queue(self, by, i, t0, commit):
+        pb = self.page_bytes
+        t_l = t_r = 0.0
+        c = by.get(i, 0)
+        if c:
+            e = max(t0, self.free_l[i]) + c * pb / self.B_l
+            t_l = e - t0
+            if commit:
+                self.free_l[i] = e
+        rem = 0
+        for s, c in by.items():
+            if s == i:
+                continue
+            rem += c
+            e = max(t0, self.free_e[s]) + c * pb / (self.B_r * (1 - self.bgn[s]))
+            t_r = max(t_r, e - t0)
+            if commit:
+                self.free_e[s] = e
+        if rem:
+            e = max(t0, self.free_i[i]) + rem * pb / (self.B_r * (1 - self.bgn[i]))
+            t_r = max(t_r, e - t0)
+            if commit:
+                self.free_i[i] = e
         return t_l, t_r
 
     # ------------------------------------------------------------ routing
@@ -258,9 +299,11 @@ class LocSim(Sim):
             for hs in hold[hh:hp]:
                 s = i if i in hs else hs[0]
                 by[s] = by.get(s, 0) + 1
-            tau = max(self._tau(by, i))
             W = max(0.0, self.slot[i][0] - now)
+            tau = max(self._tau(by, i, now if self.loc.overlap else now + W))
             exp = max(0.0, tau - W) if self.loc.overlap else tau
+            if rt == "ttft_noloc":
+                exp = 0.0
             T = W + exp + self._comp(r.n_in, hit * P) * k
             if T < best - 1e-9 or (abs(T - best) <= 1e-9 and load[i] < load[bi]):
                 best, bi = T, i
@@ -287,7 +330,7 @@ class LocSim(Sim):
                 remote_pages.append((kk, s, len(hs)))
             elif len(hs) > 1 and (kk, i) in self.pool.l0:
                 self.pool.l0.move_to_end((kk, i))
-        t_l, t_r = self._tau(by, i)
+        t_l, t_r = self._tau(by, i, t0, commit=True)
         tau = max(t_l, t_r)
         durs = {}
         for s in by:
@@ -347,7 +390,10 @@ class LocSim(Sim):
                 cand = [x for x in range(self.n) if x not in hs]
                 if not cand:
                     continue
-                tgt = min(cand, key=lambda x: self.egress[x])
+                if self.loc.cost == "queue":
+                    tgt = min(cand, key=lambda x: self.free_e[x])
+                else:
+                    tgt = max(cand, key=lambda x: self._bw(x, -1))
                 if self._add_rep(kk, tgt):
                     copy_by[(s, tgt)] = copy_by.get((s, tgt), 0) + 1
         for (s, tgt), c in copy_by.items():
@@ -355,3 +401,6 @@ class LocSim(Sim):
             self.copy_bytes += c * self.page_bytes
             self._flow(now, now, d, "e", s)
             self._flow(now, now, d, "i", tgt)
+            if self.loc.cost == "queue":
+                self.free_e[s] = max(now, self.free_e[s]) + d / (1 - self.bgn[s])
+                self.free_i[tgt] = max(now, self.free_i[tgt]) + d / (1 - self.bgn[tgt])
