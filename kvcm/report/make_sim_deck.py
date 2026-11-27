@@ -3,7 +3,7 @@
 数字全部摘自 kvcm/sim/results/{summary.md, pd/summary.md, locality.md} 与 kvcm/sim/{params.md, README.md}；
 版式沿用 KVCM-汇报-含PD混部-20261124.pptx 的配色与字体。
 用法：python3 kvcm/report/make_sim_deck.py（10 页）；加 --short 生成精简版 KVCM-仿真结论-精简4页-20261126.pptx；
-加 --n11 生成 11 页版 KVCM-仿真结论-11页-20261127.pptx（6 节点图取 results/figures/n6/）
+加 --n11 / --n12 生成 11 / 12 页版 KVCM-仿真结论-{11,12}页-20261127.pptx（6 节点图取 results/figures/n6/）
 """
 import sys
 from pathlib import Path
@@ -109,12 +109,12 @@ def footer(s, source):
          align=PP_ALIGN.RIGHT)
 
 
-def card(s, x, y, w, h, big, caption, accent=RED, big_size=24):
+def card(s, x, y, w, h, big, caption, accent=RED, big_size=24, cap_size=11):
     rect(s, x, y, w, h, PALE, MSO_SHAPE.ROUNDED_RECTANGLE, line=LINE)
     rect(s, x, y + 0.12, 0.07, h - 0.24, accent)
     text(s, x + 0.2, y + 0.1, w - 0.3, 0.56, big, size=big_size, color=accent, bold=True,
          anchor=MSO_ANCHOR.MIDDLE, spacing=1.0)
-    text(s, x + 0.2, y + 0.68, w - 0.3, h - 0.76, caption, size=11, color=INK, spacing=1.15)
+    text(s, x + 0.2, y + 0.68, w - 0.3, h - 0.76, caption, size=cap_size, color=INK, spacing=1.15)
 
 
 def cards(s, items, x=8.75, y=1.3, w=4.08, h=1.82, gap=0.11, big_size=24):
@@ -353,12 +353,15 @@ def compose(path, tiles, top=None):
     return path
 
 
-def build_n11():
-    """11 页版：6 节点 hook 命中 + 14 节点 PD 转换 / 局部性 / 冷热复制 / hook 命中，每主题“机制与口径”+“图与结论”两页。"""
+def build_n11(n12=False):
+    """11 页版：6 节点 hook 命中 + 14 节点 PD 转换 / 局部性 / 冷热复制 / hook 命中，每主题“机制与口径”+“图与结论”两页。
+    n12=True：12 页版，6 节点改为三页（机制与口径、命中率曲线与理论上限、距上限缺口与闭合率）。"""
     import tempfile
     global TOTAL, DATE
-    TOTAL, DATE = 11, "2026-11-27"
-    out = HERE / "KVCM-仿真结论-11页-20261127.pptx"
+    TOTAL, DATE = (12 if n12 else 11), "2026-11-27"
+    out = HERE / f"KVCM-仿真结论-{TOTAL}页-20261127.pptx"
+    pages = iter(range(2, TOTAL + 1))
+    d = int(n12)
     tmp = Path(tempfile.mkdtemp())
     n6 = FIG / "n6"
     hit3 = compose(tmp / "n6_hit3.png", [(n6 / f"n6_{t}.png", (0, 48, 742, 668))
@@ -366,6 +369,7 @@ def build_n11():
     stf = FIG / "locality" / "stress" / "stress_single_factor.png"
     stress2 = compose(tmp / "stress_ttft.png", [(stf, (0, 175, 846, 750)), (stf, (0, 760, 846, 1335))],
                       top=(stf, (440, 55, 2110, 125)))
+    gap = compose(tmp / "n6_gap.png", [(n6 / "n6_gap_to_ceiling.png", (0, 100, 2268, 1204))])
     PW = 2.05
 
     # 1 题目
@@ -394,9 +398,11 @@ def build_n11():
     ], size=13, color=SOFT, spacing=1.35)
     w5 = (11.77 - 4 * 0.14) / 5
     for i, (pg, t, acc) in enumerate([
-        ("02 – 03", "6 节点\nhook 命中", RED), ("04 – 05", "14 节点\nPD 转换", TEAL),
-        ("06 – 07", "14 节点\n局部性", GREEN), ("08 – 09", "14 节点\n冷热复制", AMBER),
-        ("10 – 11", "14 节点\nhook 命中", RED),
+        ("02 – 04" if n12 else "02 – 03", "6 节点\nhook 命中", RED),
+        (f"{4 + d:02d} – {5 + d:02d}", "14 节点\nPD 转换", TEAL),
+        (f"{6 + d:02d} – {7 + d:02d}", "14 节点\n局部性", GREEN),
+        (f"{8 + d:02d} – {9 + d:02d}", "14 节点\n冷热复制", AMBER),
+        (f"{10 + d:02d} – {11 + d:02d}", "14 节点\nhook 命中", RED),
     ]):
         x = 0.78 + i * (w5 + 0.14)
         rect(s, x, 4.75, w5, 1.3, CARD_DARK)
@@ -409,7 +415,7 @@ def build_n11():
 
     # 2 6 节点 hook 命中 · 机制与口径
     s = prs.slides.add_slide(BLANK)
-    header(s, "6 节点 · hook 命中", "机制与口径：HBM 不动、只换 DRAM 池的保留策略；负载按“预填充占用 70%”标定，理论上限只剩首轮必然未命中", 2, PW)
+    header(s, "6 节点 · hook 命中", "机制与口径：HBM 不动、只换 DRAM 池的保留策略；负载按“预填充占用 70%”标定，理论上限只剩首轮必然未命中", next(pages), PW)
     label(s, 0.5, 1.2, 6.0, "机制：三种 DRAM 池策略")
     table(s, 0.5, 1.52, [2.15, 3.95], [
         ["策略", "DRAM 池怎么管"],
@@ -444,28 +450,85 @@ def build_n11():
         card(s, 0.5 + i * (w3 + 0.12), 5.02, w3, 1.98, big, cap, acc, 17)
     footer(s, "kvcm/sim/params.md §9；kvcm/sim/README.md「6 节点保留收益主口径」；results/n6/summary.md")
 
-    # 3 6 节点 hook 命中 · 图与结论
-    s = prs.slides.add_slide(BLANK)
-    header(s, "6 节点 · hook 命中", "理想 hook 收益集中在池 0.89–3.55 TB（约 0.5–2 倍集群 HBM），补回距理论上限缺口的 35–91%；现实 hook 基本拿不到", 3, PW, 18)
-    picture(s, hit3, 0.95, 1.14, w=11.43)
-    text(s, 0.5, 4.32, 12.33, 0.3,
-         "左起 Claude Code / Codex / Qwen coder 命中率（70% 标定，seed 均值，误差棒 = seed 最小–最大）；点划线 = 理论上限，灰底 = 超标称",
-         size=9.5, color=GRAY, align=PP_ALIGN.CENTER)
-    table(s, 0.5, 4.68, [1.45, 1.05, 1.45, 2.75, 2.65, 2.98], [
-        ["trace", "理论上限", "拉开最多的池", "命中率：共享池 LRU → 理想 hook", "预填充 NPU（全规模等效）", "缺口闭合率（拉开最多处）：理想 / 现实"],
-        ["Claude Code", "96.10%", "1.78 TB", "90.86% → 92.71%（+1.86 个百分点）", "121.5 → 98.0（−19.3%，均过载）", "35% / 0%；6 TB 为 68% / −43%"],
-        ["Codex", "96.56%", "1.78 TB", "96.02% → 96.51%（+0.49）", "75.4 → 67.9（−9.9%）", "91% / −2%；≥ 3.55 TB 已触顶"],
-        ["Qwen coder", "70.98%", "0.89 TB", "59.99% → 65.09%（+5.09）", "79.7 → 72.4（−9.3%）", "46% / 2%；6 TB 为 40% / −63%"],
-    ], size=10, row_h=0.38, row_hs=[0.36, 0.38, 0.38, 0.38])
-    note(s, 0.5, 6.3, 12.33, 0.74, [
-        "闭合率 =（hook − LRU）/（理论上限 − LRU）。过载：Claude Code 池 ≤ 1.78 TB 时共享池 LRU 需 127–136% NPU，理想 hook 在 1.78 TB 降到 102%；"
-        "同点 TTFT P95 2.84 → 1.71 s 不含排队、偏乐观。现实 hook（Claude Code、Qwen coder）在 3.55 TB 起比共享池 LRU 低 0.1–1.4 个百分点。",
-    ], size=10)
-    footer(s, "results/n6/summary.md「理论命中上限与缺口闭合率」与主口径表；图：media/sim/n6/n6_*.png（命中率面板）")
+    if n12:
+        # 6 节点 · 命中率曲线与理论上限
+        s = prs.slides.add_slide(BLANK)
+        header(s, "6 节点 · hook 命中", "三条 trace 命中率曲线与理论上限：小池命中几乎全在 HBM，理想 hook 在 0.89–3.55 TB 拉开，大池三者向上限收敛", next(pages), PW, 18)
+        picture(s, hit3, 0.5, 1.12, w=12.33)
+        text(s, 0.5, 4.56, 12.33, 0.3,
+             "左起 Claude Code / Codex / Qwen coder（官方主图命中率面板；70% 标定，seed 1/2/3 均值，误差棒 = seed 最小–最大）；"
+             "点划线 = 理论上限，灰虚线 = 集群 HBM 1.78 TB，灰底 = 9 / 12 TB 超标称",
+             size=9.5, color=GRAY, align=PP_ALIGN.CENTER)
+        table(s, 0.5, 4.92, [1.4, 1.05, 1.1, 2.2, 2.2, 2.2, 2.18], [
+            ["命中率", "理论上限", "其中 HBM", "0.89 TB：LRU / 现实 / 理想", "1.78 TB：LRU / 现实 / 理想",
+             "3.55 TB：LRU / 现实 / 理想", "6 TB：LRU / 现实 / 理想"],
+            ["Claude Code", "96.10%", "90.14%", "90.19 / 90.23 / 90.46", "90.86 / 90.85 / 92.71",
+             "94.59 / 94.36 / 95.36", "95.28 / 94.93 / 95.83"],
+            ["Codex", "96.56%", "94.49%", "95.08 / 95.08 / 95.09", "96.02 / 96.01 / 96.51",
+             "96.56 / 96.56 / 96.56", "96.56 / 96.56 / 96.56"],
+            ["Qwen coder", "70.98%", "59.99%", "59.99 / 60.25 / 65.09", "60.59 / 60.84 / 65.59",
+             "65.86 / 65.75 / 67.95", "68.83 / 67.47 / 69.68"],
+        ], size=10, row_h=0.36, row_hs=[0.36, 0.36, 0.36, 0.36])
+        text(s, 0.5, 6.42, 12.33, 0.62, [
+            "单位 %；“其中 HBM”= HBM 层命中，三策略相同、不随池变。池 ≤ 0.44 TB 时三者相同（Claude Code 90.2%、Qwen coder 60.0%）；"
+            "12 TB（超标称）共享池 LRU 已到 95.79% / 70.68%。seed 极差一半 ≤ 0.34 / 0.18 / 0.09 个百分点，小于中池的理想 hook 增益。"],
+            size=10, color=GRAY, spacing=1.15)
+        footer(s, "results/n6/summary.md 主口径表、「理论命中上限与缺口闭合率」；图：media/sim/n6/n6_cc256k / n6_codex / n6_qwen_coder.png（命中率面板）")
+
+        # 6 节点 · 距上限缺口与闭合率
+        s = prs.slides.add_slide(BLANK)
+        header(s, "6 节点 · hook 命中", "距理论上限的缺口：理想 hook 在拉开最多的池补回 35–91%；现实 hook 中小池只补 0–5%，大池反而扩大缺口", next(pages), PW, 18)
+        picture(s, gap, 0.5, 1.12, w=9.0)
+        text(s, 0.5, 5.5, 9.0, 0.26,
+             "上：距上限缺口（个百分点，越低越好）；下：闭合率 =（hook − LRU）/（上限 − LRU），误差棒 = 逐 seed 最小–最大",
+             size=9, color=GRAY, align=PP_ALIGN.CENTER)
+        table(s, 9.68, 1.12, [1.33, 0.95, 0.87], [
+            ["trace · 池", "缺口 LRU → 理想", "闭合率 理想 / 现实"],
+            ["Claude Code 1.78 TB", "5.24 → 3.38", "35% / 0%"],
+            ["Claude Code 3.55 TB", "1.51 → 0.73", "52% / −15%"],
+            ["Claude Code 6 TB", "0.82 → 0.27", "68% / −43%"],
+            ["Codex 1.78 TB", "0.54 → 0.05", "91% / −2%"],
+            ["Codex ≥ 3.55 TB", "0（触顶）", "不给比值"],
+            ["Qwen coder 0.89 TB", "10.99 → 5.89", "46% / 2%"],
+            ["Qwen coder 1.78 TB", "10.39 → 5.39", "48% / 2%"],
+            ["Qwen coder 6 TB", "2.15 → 1.30", "40% / −63%"],
+        ], size=9, row_h=0.42, row_hs=[0.5] + [0.42] * 8)
+        text(s, 9.68, 5.0, 3.15, 0.45, "缺口单位：个百分点；LRU 缺口 < 0.2 视为触顶，0.2–0.5 只作参考",
+             size=8.5, color=GRAY)
+        table(s, 0.5, 5.84, [1.85, 2.15, 1.75, 3.25], [
+            ["理想 hook 对 LRU", "预填充 NPU", "利用率", "TTFT P95（不含排队）"],
+            ["Claude Code 1.78 TB", "121.5 → 98.0（−19.3%）", "127% → 102%（过载）", "2.84 → 1.71 s（−40%，过载点偏乐观）"],
+            ["Claude Code 6 TB", "64.6 → 57.4（−11.1%）", "67% → 60%", "1.12 → 1.04 s（−7.6%）"],
+            ["Codex 1.78 TB", "75.4 → 67.9（−9.9%）", "79% → 71%", "0.69 → 0.68 s（−1.5%）"],
+            ["Qwen coder 0.89 TB", "79.7 → 72.4（−9.3%）", "83% → 75%", "0.65 → 0.61 s（−6.3%）"],
+        ], size=9.5, row_h=0.24)
+        card(s, 9.68, 5.5, 3.15, 1.55, "现实 hook：大池为负",
+             "中小池闭合率 0–5%；6 TB 时 Claude Code 比 LRU 低 0.35 个百分点（NPU +6.9%），Qwen coder 低 1.35（NPU +2.9%）",
+             GRAY, 14, 9.5)
+        footer(s, "results/n6/summary.md「距理论上限的缺口与闭合率」、主口径表；results/n6/closure.json；图：media/sim/n6/n6_gap_to_ceiling.png")
+    else:
+        # 3 6 节点 hook 命中 · 图与结论
+        s = prs.slides.add_slide(BLANK)
+        header(s, "6 节点 · hook 命中", "理想 hook 收益集中在池 0.89–3.55 TB（约 0.5–2 倍集群 HBM），补回距理论上限缺口的 35–91%；现实 hook 基本拿不到", next(pages), PW, 18)
+        picture(s, hit3, 0.95, 1.14, w=11.43)
+        text(s, 0.5, 4.32, 12.33, 0.3,
+             "左起 Claude Code / Codex / Qwen coder 命中率（70% 标定，seed 均值，误差棒 = seed 最小–最大）；点划线 = 理论上限，灰底 = 超标称",
+             size=9.5, color=GRAY, align=PP_ALIGN.CENTER)
+        table(s, 0.5, 4.68, [1.45, 1.05, 1.45, 2.75, 2.65, 2.98], [
+            ["trace", "理论上限", "拉开最多的池", "命中率：共享池 LRU → 理想 hook", "预填充 NPU（全规模等效）", "缺口闭合率（拉开最多处）：理想 / 现实"],
+            ["Claude Code", "96.10%", "1.78 TB", "90.86% → 92.71%（+1.86 个百分点）", "121.5 → 98.0（−19.3%，均过载）", "35% / 0%；6 TB 为 68% / −43%"],
+            ["Codex", "96.56%", "1.78 TB", "96.02% → 96.51%（+0.49）", "75.4 → 67.9（−9.9%）", "91% / −2%；≥ 3.55 TB 已触顶"],
+            ["Qwen coder", "70.98%", "0.89 TB", "59.99% → 65.09%（+5.09）", "79.7 → 72.4（−9.3%）", "46% / 2%；6 TB 为 40% / −63%"],
+        ], size=10, row_h=0.38, row_hs=[0.36, 0.38, 0.38, 0.38])
+        note(s, 0.5, 6.3, 12.33, 0.74, [
+            "闭合率 =（hook − LRU）/（理论上限 − LRU）。过载：Claude Code 池 ≤ 1.78 TB 时共享池 LRU 需 127–136% NPU，理想 hook 在 1.78 TB 降到 102%；"
+            "同点 TTFT P95 2.84 → 1.71 s 不含排队、偏乐观。现实 hook（Claude Code、Qwen coder）在 3.55 TB 起比共享池 LRU 低 0.1–1.4 个百分点。",
+        ], size=10)
+        footer(s, "results/n6/summary.md「理论命中上限与缺口闭合率」与主口径表；图：media/sim/n6/n6_*.png（命中率面板）")
 
     # 4 PD 转换 · 机制与口径
     s = prs.slides.add_slide(BLANK)
-    header(s, "14 节点 · PD 转换", "机制与口径：节点在预填充 / 解码 / 混部角色间切换；KVCM 池让被切节点的 KV 可以直接丢弃、由接收方重读", 4, PW)
+    header(s, "14 节点 · PD 转换", "机制与口径：节点在预填充 / 解码 / 混部角色间切换；KVCM 池让被切节点的 KV 可以直接丢弃、由接收方重读", next(pages), PW)
     label(s, 0.5, 1.2, 6.5, "机制：切换方式与控制器")
     table(s, 0.5, 1.52, [3.1, 1.25, 2.35], [
         ["切换方式", "D→P 耗时", "被切节点的 KV"],
@@ -504,7 +567,7 @@ def build_n11():
 
     # 5 PD 转换 · 图与结论
     s = prs.slides.add_slide(BLANK)
-    header(s, "14 节点 · PD 转换", "【注入】配比变化时 PD 动态转换有效：S3 有效吞吐 +18.6%；无池丢 KV 快切在 S5 只剩 +1.7%", 5, PW)
+    header(s, "14 节点 · PD 转换", "【注入】配比变化时 PD 动态转换有效：S3 有效吞吐 +18.6%；无池丢 KV 快切在 S5 只剩 +1.7%", next(pages), PW)
     picture(s, RES / "pd" / "figures" / "pd_goodput.png", 0.75, 1.18, w=7.5)
     table(s, 0.5, 4.86, [2.6, 1.08, 1.08, 1.08, 1.08, 1.08], [
         ["相对静态最优 P:D", "S1", "S2", "S4", "S5", "S3"],
@@ -522,7 +585,7 @@ def build_n11():
 
     # 6 局部性 · 机制与口径
     s = prs.slides.add_slide(BLANK)
-    header(s, "14 节点 · 局部性", "机制与口径：池块有所在节点，读池时间计入排队与网卡争用；KVCM + 局部性让请求跟着数据走", 6, PW)
+    header(s, "14 节点 · 局部性", "机制与口径：池块有所在节点，读池时间计入排队与网卡争用；KVCM + 局部性让请求跟着数据走", next(pages), PW)
     label(s, 0.5, 1.2, 6.5, "机制：放置、副本与路由")
     table(s, 0.5, 1.52, [1.75, 2.05, 1.35, 1.65], [
         ["变体", "池块放在哪", "副本", "路由"],
@@ -553,7 +616,7 @@ def build_n11():
 
     # 7 局部性 · 图与结论
     s = prs.slides.add_slide(BLANK)
-    header(s, "14 节点 · 局部性", "【注入】局部性在网卡紧张时起作用，网络空闲时无影响：最坏组合下仅 KVCM + 局部性稳定", 7, PW)
+    header(s, "14 节点 · 局部性", "【注入】局部性在网卡紧张时起作用，网络空闲时无影响：最坏组合下仅 KVCM + 局部性稳定", next(pages), PW)
     picture(s, stress2, 1.67, 1.15, w=10.0)
     text(s, 0.5, 4.97, 12.33, 0.45, [
         "TTFT P95（对数轴），左 Claude Code、右 Qwen coder。最坏组合 = HBM 1/4 + KV ×8 + 跨机带宽 1/10 + 背景 70%；"
@@ -570,7 +633,7 @@ def build_n11():
 
     # 8 冷热复制 · 机制与口径
     s = prs.slides.add_slide(BLANK)
-    header(s, "14 节点 · 冷热复制", "机制与口径：比较三种副本做法；【注入】一个热文档集中在少数节点的场景，找复制转为净收益的拐点", 8, PW)
+    header(s, "14 节点 · 冷热复制", "机制与口径：比较三种副本做法；【注入】一个热文档集中在少数节点的场景，找复制转为净收益的拐点", next(pages), PW)
     label(s, 0.5, 1.2, 6.5, "机制：何时复制、复制到哪")
     table(s, 0.5, 1.52, [2.05, 1.55, 1.75, 1.55], [
         ["做法", "何时复制", "副本放哪", "代价"],
@@ -598,7 +661,7 @@ def build_n11():
 
     # 9 冷热复制 · 图与结论
     s = prs.slides.add_slide(BLANK)
-    header(s, "14 节点 · 冷热复制", "冷热复制在现有三条 trace 下无收益；【注入】只在数据被集中到少数节点、热节点出口 ≳ 90% 时有净收益，哈希条带本身没有热点", 9, PW)
+    header(s, "14 节点 · 冷热复制", "冷热复制在现有三条 trace 下无收益；【注入】只在数据被集中到少数节点、热节点出口 ≳ 90% 时有净收益，哈希条带本身没有热点", next(pages), PW)
     picture(s, FIG / "locality" / "hotspot" / "hotspot_scan.png", 1.67, 1.15, w=10.0)
     w5 = (12.33 - 4 * 0.1) / 5
     for i, (big, cap, acc) in enumerate([
@@ -613,10 +676,10 @@ def build_n11():
 
     # 10 14 节点 hook 命中 · 机制与口径
     s = prs.slides.add_slide(BLANK)
-    header(s, "14 节点 · hook 命中", "机制与口径：hook 机制同 6 节点；负载按“理想命中下预填充占 50%”标定，单 seed，作为基线", 10, PW)
+    header(s, "14 节点 · hook 命中", "机制与口径：hook 机制同 6 节点；负载按“理想命中下预填充占 50%”标定，单 seed，作为基线", next(pages), PW)
     label(s, 0.5, 1.2, 8.0, "配置：14 节点基线与 6 节点主口径对照")
     table(s, 0.5, 1.52, [1.4, 3.75, 3.15], [
-        ["项", "14 节点基线", "6 节点主口径（第 2–3 页）"],
+        ["项", "14 节点基线", f"6 节点主口径（第 2–{3 + d} 页）"],
         ["集群", "14 × 16 = 224 NPU，HBM 共 4.15 TB", "6 × 16 = 96 NPU，HBM 共 1.78 TB"],
         ["DRAM 池", "0.44–28 TB（标称 14 TB），重点看 3.5 / 14 TB", "0.18–6 TB（标称 6 TB）+ 9 / 12 TB"],
         ["策略", "实例私有 LRU、共享池 LRU、KVCM 现实 / 理想 hook", "共享池 LRU、KVCM 现实 / 理想 hook"],
@@ -638,7 +701,7 @@ def build_n11():
 
     # 11 14 节点 hook 命中 · 图与结论
     s = prs.slides.add_slide(BLANK)
-    header(s, "14 节点 · hook 命中", "池在 1–2 倍集群 HBM 时，理想 hook 比共享池多命中 0.7–3.45 个百分点；现实 hook 拿不到，Codex 已贴近理论上限", 11, PW)
+    header(s, "14 节点 · hook 命中", "池在 1–2 倍集群 HBM 时，理想 hook 比共享池多命中 0.7–3.45 个百分点；现实 hook 拿不到，Codex 已贴近理论上限", next(pages), PW)
     picture(s, FIG / "mrc_cc256k.png", 0.5, 1.22, w=8.0)
     table(s, 0.5, 4.95, [2.6, 1.2, 1.7, 1.2, 1.3], [
         ["Claude Code · DRAM 池 3.5 TB", "命中率", "预填充 NPU", "TTFT P95", "相对共享池"],
@@ -664,6 +727,8 @@ def build_n11():
 
 if "--n11" in sys.argv:
     build_n11()
+if "--n12" in sys.argv:
+    build_n11(n12=True)
 
 
 if "--short" in sys.argv:
