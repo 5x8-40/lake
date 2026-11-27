@@ -124,7 +124,7 @@ $R --trace cc256k --k 32 --out results/n6 --pool-tb 9,12 --seeds 1,2,3 --jobs 2 
 $R --trace cc256k --k 16 --rate-k 32 --out results/n6 --pool-tb 0.44,1.78,6 --jobs 2                  # 切片对照
 env KVCM_NODES=6 PYTHONPATH=. python3 -m kvcm_sim.run --trace cc256k --util 0.6 --anchor lru \
     --policies shared,kvcm-real,kvcm-oracle --k 32 --out results/n6/u60 --pool-tb 0.18,0.44,0.89,1.78,3.55,6  # 60% 敏感性
-PYTHONPATH=. python3 -m kvcm_sim.report_n6
+PYTHONPATH=. python3 -m kvcm_sim.report_n6                                                       # summary.md、closure.json、figures/n6/*.png
 ```
 
 **设定**：DeepSeek-V4.1-Flash，BF16 KV 3,200 B/token；A3 6 节点 × 16 die = 96 NPU；每实例 HBM 296 GB（共 1.78 TB），引擎纯 LRU；KVCM 只管 DRAM 池。三种策略：共享池 LRU、KVCM 现实 hook、KVCM 理想 hook。池容量直接用 TB：0.18、0.44、0.89、1.78、3.55、6 TB（6 TB = 6 节点 × 1 TB 标称）。
@@ -142,6 +142,7 @@ PYTHONPATH=. python3 -m kvcm_sim.report_n6
 5. **60% 锚点敏感性**（seed 1）：形态不变。Claude Code 1.78 TB 理想 hook +1.36 pt、NPU −17.1%，过载只剩池 ≤ 1.78 TB 的 102–111%；Qwen coder 0.89–1.78 TB +4.3–4.8 pt；Codex 负载更轻后只剩 1.78 TB +0.13 pt（NPU −2.9%），全程不过载。
 6. **切片对照**（k=16 对 k=32，seed 1，池 0.44 / 1.78 / 6 TB）：Claude Code 绝对命中率差 ≤ 0.2 pt。Qwen coder 的绝对命中率在 k=16 下高 1.1–2.7 pt（HBM 层切片偏差），但策略之间的差距基本不变（1.78 TB 理想 hook − LRU：k=32 +5.02 pt，k=16 +4.93 pt）。所以 Qwen coder 的绝对命中率要带约 2–3 pt 的切片不确定度，增益结论不受影响。Codex 类似：0.44 TB 绝对命中率在 k=16 下高 1.1 pt，1.78 TB 理想 hook − LRU 为 k=32 +0.54 pt、k=16 +0.45 pt，6 TB 两者相同。
 7. **seed 波动**：命中率 seed 极差一半 ≤ 0.34 pt（Claude Code），≤ 0.18 pt（Codex），≤ 0.09 pt（Qwen coder），小于中池的理想 hook 增益。
+8. **距理论上限的缺口与闭合率**（图 [`results/figures/n6/n6_gap_to_ceiling.png`](results/figures/n6/n6_gap_to_ceiling.png)，三张主图的命中率面板也画了上限线）：理论上限 = 无限容量、全局共享下只剩首轮必然 miss，从回放记录计算，Claude Code 96.10%、Codex 96.56%、Qwen coder 70.98%（seed 均值）。闭合率 =（hook − LRU）/（上限 − LRU），按 seed 配对。理想 hook 闭合率：Claude Code 1.78 / 3.55 / 6 TB 为 35% / 52% / 68%；Codex 1.78 TB 为 91%；Qwen coder 0.89–1.78 TB 为 46–48%，6 TB 为 40%。现实 hook 中小池 0–5%，大池为负（Claude Code 6 TB −43%，Qwen coder 6 TB −63%）。LRU 缺口 < 0.2 pt 视为触顶、不给比值（Codex ≥ 3.55 TB 缺口恰为 0）；0.2–0.5 pt 只作参考（Claude Code 9 / 12 TB、Qwen coder 12 TB），因为分母趋零时比值被 seed 噪声放大（Claude Code 12 TB 逐 seed 71–85%）。闭合率要和绝对缺口一起读：Qwen coder 12 TB 的 35% 只对应 0.10 pt。逐点数据在 `results/n6/closure.json`。
 
 ## PD 转换（P/D/混部角色切换）：E1 流体模型 + E4 切换代价
 

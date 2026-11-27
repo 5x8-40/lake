@@ -174,3 +174,6 @@ DeepSeek V4.1 目前公开的只有 **DeepSeek-V4.1-Flash**（Hugging Face `deep
 | seed | 1、2、3（主口径）；敏感性与切片对照只跑 seed 1 | 表中命中率给 seed 均值与极差 |
 | 切片 | k = 32（6 节点下每实例负载约为 14 节点 k=32 的 1.1–1.4 倍）；对照 k = 16，池 0.44、1.78、6 TB，到达率同 k = 32 | |
 | 过载标记 | prefill NPU 利用率 > 100% 的格子标“过载” | TTFT 为分析式、不含排队，过载格的 P95 偏乐观；仿真里算力不反馈到命中率，命中率与 NPU 差仍有效 |
+| 理论命中上限 | 回放记录的 `ideal_hit_rate`：无限容量、全局共享下的前缀命中率，只剩每个 block 首次出现的必然 miss（预热期见过的 key 算见过，decode 输出 KV 入缓存） | 只随 seed 变；`report_n6.ceiling` 取 seed 均值，不硬编码 |
+| 缺口闭合率 | （hook − LRU）/（上限 − LRU），按 seed 配对，取 seed 均值之比，另给逐 seed 最小–最大 | `report_n6.closure` → `results/n6/closure.json` |
+| 闭合率分母阈值 | LRU 缺口 ≥ 0.5 pt 正常给出；0.2–0.5 pt 只作参考；< 0.2 pt 视为 LRU 已触顶、不给比值 | 0.5 pt 以上逐 seed 比值波动在 ±5 个百分点内；0.2–0.5 pt 时 Claude Code 12 TB 已扩到 71–85%；本次取值，可调（`GAP_OK`、`GAP_MIN`） |

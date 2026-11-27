@@ -1,4 +1,4 @@
-"""6 节点保留收益主口径：`results/n6/` → `results/n6/summary.md` + `results/figures/n6/*.png`。
+"""6 节点保留收益主口径：`results/n6/` → `results/n6/summary.md`、`results/n6/closure.json` + `results/figures/n6/*.png`。
 
     PYTHONPATH=. python3 -m kvcm_sim.report_n6
 
@@ -33,6 +33,10 @@ N_NPU = 96
 HBM_TB = 1.776
 MAIN_K = 32
 NOMINAL_TB = 6.0
+# 闭合率分母（LRU 距理论上限的缺口，命中率绝对值）阈值：≥ GAP_OK 正常给出；GAP_MIN–GAP_OK 只作参考；
+# < GAP_MIN 视为 LRU 已触顶，不给比值（分母趋零时比值被 seed 噪声放大，且 0/0 无定义）。
+GAP_OK = 0.005
+GAP_MIN = 0.002
 
 
 def _load(sub=""):
@@ -67,13 +71,61 @@ def _pools(a):
     return sorted({p for _, p in a})
 
 
-def fig_trace(t, main, sens):
-    rows = [(main, "70% NPU 标定（主口径，seed 均值，误差棒 = seed 最小–最大）")]
+def ceiling(rows, k=MAIN_K):
+    """理论命中上限：无限容量、全局共享下只剩首轮必然 miss（记录里的 ideal_hit_rate）。
+
+    只随 seed 变，与池容量和策略无关；返回各 seed 上限的均值、最小、最大。"""
+    by_seed = {}
+    for r in rows:
+        if r["k"] == k:
+            by_seed.setdefault(r.get("seed", 1), []).append(r["ideal_hit_rate"])
+    if not by_seed:
+        return None
+    v = np.array([np.mean(x) for x in by_seed.values()])
+    return float(v.mean()), float(v.min()), float(v.max())
+
+
+def closure(rows, k=MAIN_K):
+    """逐池：各策略距理论上限的绝对缺口，及 hook 的缺口闭合率 =（hook − LRU）/（上限 − LRU）。
+
+    按 seed 配对，比值取 seed 均值分子 / seed 均值分母，另给逐 seed 比值的最小–最大。
+    status：ok（分母 ≥ GAP_OK）、ref（GAP_MIN–GAP_OK，只作参考）、top（< GAP_MIN，LRU 已触顶，不给比值）。"""
+    g = {}
+    for r in rows:
+        if r["k"] == k:
+            g.setdefault((r["pool_tb"], r.get("seed", 1)), {})[r["policy"]] = r
+    out = []
+    for pool in sorted({p for p, _ in g}):
+        cells = [v for (p, _), v in g.items() if p == pool and all(q in v for q in POLS)]
+        if not cells:
+            continue
+        c = np.array([v["shared"]["ideal_hit_rate"] for v in cells])
+        hit = {q: np.array([v[q]["hit_rate"] for v in cells]) for q in POLS}
+        den = c - hit["shared"]
+        d = {"pool_tb": pool, "n_seeds": len(cells), "ceiling": float(c.mean()),
+             "gap": {q: float((c - hit[q]).mean()) for q in POLS}}
+        d["status"] = "ok" if den.mean() >= GAP_OK else "ref" if den.mean() >= GAP_MIN else "top"
+        for q, key in (("kvcm-oracle", "closure_ideal"), ("kvcm-real", "closure_real")):
+            num = hit[q] - hit["shared"]
+            if d["status"] == "top":
+                d[key] = None
+                continue
+            per = num / den
+            d[key] = [float(num.mean() / den.mean()), float(per.min()), float(per.max())]
+        out.append(d)
+    return out
+
+
+def fig_trace(t, main, sens, ceil_main, ceil_sens=None):
+    rows = [(main, "70% NPU 标定（主口径，seed 均值，误差棒 = seed 最小–最大）", ceil_main)]
     if sens:
-        rows.append((sens, "60% NPU 标定（敏感性，seed 1）"))
+        rows.append((sens, "60% NPU 标定（敏感性，seed 1）", ceil_sens))
     fg, ax = plt.subplots(len(rows), 3, figsize=(16, 4.6 * len(rows)), squeeze=False)
-    for i, (a, title) in enumerate(rows):
+    for i, (a, title, ce) in enumerate(rows):
         pools = _pools(a)
+        if ce:
+            ax[i][0].axhline(ce[0] * 100, color="k", ls="-.", lw=1)
+            ax[i][0].text(pools[0], ce[0] * 100, f" 理论上限 {ce[0]:.2%}（只剩首轮必然 miss）", fontsize=8, va="bottom")
         for p in POLS:
             xs = [x for x in pools if (p, x) in a]
             if not xs:
@@ -83,6 +135,9 @@ def fig_trace(t, main, sens):
                 lo = mu - np.array([a[(p, x)][m][1] for x in xs]) * sc
                 hi = np.array([a[(p, x)][m][2] for x in xs]) * sc - mu
                 ax[i][j].errorbar(xs, mu, yerr=[lo, hi], marker="o", capsize=3, color=COL[p], label=PNAME[p])
+        if ce:
+            lo, hi = ax[i][0].get_ylim()
+            ax[i][0].set_ylim(lo, max(hi, ce[0] * 100 + (ce[0] * 100 - lo) * 0.1))
         ax[i][0].set_ylabel(f"{title}\n命中率（%）", fontsize=9)
         ax[i][1].set_ylabel("prefill 占用 NPU（全规模等效）")
         ax[i][1].axhline(N_NPU, color="r", ls=":", lw=1)
@@ -107,6 +162,85 @@ def fig_trace(t, main, sens):
     os.makedirs(FIG, exist_ok=True)
     fg.savefig(os.path.join(FIG, f"n6_{t}.png"), dpi=140, bbox_inches="tight")
     plt.close(fg)
+
+
+def fig_gap(cl):
+    """各 trace 一栏：上排距理论上限的缺口（pt），下排 hook 的缺口闭合率。"""
+    from matplotlib.patches import Patch
+    ts = [t for t in TRACES if cl.get(t)]
+    fg, ax = plt.subplots(2, len(ts), figsize=(5.4 * len(ts), 8.6), squeeze=False,
+                          gridspec_kw=dict(height_ratios=[1.35, 1]))
+    for j, t in enumerate(ts):
+        rows = cl[t]
+        P = [r["pool_tb"] for r in rows]
+        x = np.arange(len(P))
+        g = {q: np.array([r["gap"][q] for r in rows]) * 100 for q in POLS}
+        a = ax[0][j]
+        a.fill_between(x, g["kvcm-oracle"], g["shared"], color=COL["kvcm-oracle"], alpha=0.18, label="理想 hook 补回的部分")
+        for q, mk in (("shared", "o-"), ("kvcm-real", "s--"), ("kvcm-oracle", "^-")):
+            a.plot(x, g[q], mk, color=COL[q], label=PNAME[q])
+        a.axhline(0, color="k", lw=0.8)
+        a.set_title(f"{TRACE_NAMES.get(t, t)}\n理论上限 {rows[0]['ceiling']:.2%}（只剩首轮必然 miss）", fontsize=10)
+        a.set_ylabel("距理论上限的缺口（pt，越低越好）")
+        if any(p > NOMINAL_TB for p in P):
+            k0 = next(i for i, p in enumerate(P) if p > NOMINAL_TB)
+            a.axvspan(k0 - 0.5, len(P) - 0.5, color="gray", alpha=0.1)
+            a.text(len(P) - 0.55, a.get_ylim()[1] * 0.97, "超标称（> 6 TB）", ha="right", va="top", fontsize=8, color="dimgray")
+        b = ax[1][j]
+        w = 0.38
+        for i, r in enumerate(rows):
+            if r["status"] == "top":
+                b.text(i, 3, f"LRU 已触顶\n（缺口 < {GAP_MIN * 100:.1f} pt）\n不给比值", ha="center", va="bottom", fontsize=7.5, color="dimgray")
+            else:
+                for off, key, q in ((-w / 2, "closure_ideal", "kvcm-oracle"), (w / 2, "closure_real", "kvcm-real")):
+                    v, lo, hi = (z * 100 for z in r[key])
+                    solid = r["status"] == "ok"
+                    b.bar(i + off, v, w, color=COL[q] if solid else "white", edgecolor=COL[q], hatch=None if solid else "///", lw=1.2)
+                    b.errorbar(i + off, v, yerr=[[v - lo], [hi - v]], fmt="none", ecolor="k", capsize=2, lw=0.8)
+                    if q == "kvcm-oracle":
+                        b.text(i + off, min(max(v, hi) + 3, 97), f"{0 if abs(v) < 0.5 else v:.0f}%", ha="center", fontsize=8, color=COL[q])
+            b.text(i, -118, f"LRU 缺口\n{r['gap']['shared'] * 100:.3f} pt", ha="center", va="bottom", fontsize=7, color=COL["shared"])
+        b.axhline(0, color="k", lw=0.8)
+        b.set_ylim(-120, 105)
+        b.set_ylabel("闭合率 =（hook − LRU）/（上限 − LRU）（%）")
+        b.set_xlabel("DRAM 池容量（TB）；6 TB = 6 节点 × 1 TB 标称")
+        for z in (a, b):
+            z.set_xticks(x)
+            z.set_xticklabels([f"{p:g}" for p in P])
+            z.grid(alpha=0.3)
+        if j == 0:
+            a.legend(fontsize=8.5, loc="lower left")
+            b.legend(handles=[Patch(color=COL["kvcm-oracle"], label="理想 hook"), Patch(color=COL["kvcm-real"], label="现实 hook"),
+                              Patch(facecolor="white", edgecolor="gray", hatch="///",
+                                    label=f"LRU 缺口 {GAP_MIN * 100:.1f}–{GAP_OK * 100:.1f} pt：只作参考")],
+                     fontsize=8, loc="lower left", bbox_to_anchor=(0, 0.12))
+    fg.suptitle("6 节点、70% 锚点、k=32、seed 均值：各策略距理论命中上限的缺口，及 hook 补回 LRU 缺口的比例（误差棒 = 逐 seed 最小–最大）",
+                fontsize=11.5)
+    fg.tight_layout(rect=(0, 0, 1, 0.96))
+    os.makedirs(FIG, exist_ok=True)
+    fg.savefig(os.path.join(FIG, "n6_gap_to_ceiling.png"), dpi=140)
+    plt.close(fg)
+
+
+def _pct(x):
+    return f"{0.0 if abs(x) < 0.005 else x:.0%}"
+
+
+def _cl(v):
+    return "—" if v is None else _pct(v[0]) + (f"（{_pct(v[1])} ~ {_pct(v[2])}）" if _pct(v[1]) != _pct(v[2]) else "")
+
+
+def md_closure(rows, label):
+    note = {"ok": "", "ref": "（只作参考）", "top": "LRU 已触顶"}
+    s = [f"\n#### {label}\n",
+         "| 池 TB | 理论上限 | LRU 缺口（pt） | 现实 hook 缺口 | 理想 hook 缺口 | 理想 hook 闭合率 | 现实 hook 闭合率 | 备注 |",
+         "|---:|---:|---:|---:|---:|---:|---:|---|"]
+    for r in rows:
+        g = r["gap"]
+        s.append(f"| {r['pool_tb']:g}{'（超标称）' if r['pool_tb'] > NOMINAL_TB else ''} | {r['ceiling']:.2%} | {g['shared'] * 100:.3f} | "
+                 f"{g['kvcm-real'] * 100:.3f} | {g['kvcm-oracle'] * 100:.3f} | {_cl(r['closure_ideal'])} | {_cl(r['closure_real'])} | "
+                 f"{note[r['status']]} |")
+    return s
 
 
 def _f(v, d=2):
@@ -198,18 +332,40 @@ def build():
         r60 = sc.get(f"{t}@k32@u0.6@lru")
         md.append(f"| {TRACE_NAMES.get(t, t)} | {r14 * 3600:,.0f} | {r70 * 3600:,.0f} | {r70 / r14:.3f} | "
                   + (f"{r60 * 3600:,.0f} | {r60 / r14:.3f} |" if r60 else "— | — |"))
+    cl = {t: closure(main[t]) for t in TRACES}
+    cl_s = {t: closure(sens[t]) for t in TRACES}
+    ce = {t: ceiling(main[t]) for t in TRACES}
+    ce_s = {t: ceiling(sens[t]) for t in TRACES}
+    with open(os.path.join(N6, "closure.json"), "w") as f:
+        json.dump({"gap_ok": GAP_OK, "gap_min": GAP_MIN,
+                   "main": {t: {"ceiling": ce[t], "pools": cl[t]} for t in TRACES if ce[t]},
+                   "u60": {t: {"ceiling": ce_s[t], "pools": cl_s[t]} for t in TRACES if ce_s[t]}}, f, ensure_ascii=False, indent=1)
+    fig_gap(cl)
+    md += ["\n## 理论命中上限与缺口闭合率\n",
+           "理论上限 = 无限容量、全局共享下的前缀命中率（只剩每个 block 首次出现的必然 miss；预热期见过的 key 也算见过，"
+           "decode 输出 KV 入缓存，与主口径一致），从回放记录的 `ideal_hit_rate` 计算。它只随 seed 变，与池容量和策略无关。"
+           "闭合率 =（hook − LRU）/（上限 − LRU），按 seed 配对，取 seed 均值之比，括号为逐 seed 最小–最大。"
+           f"LRU 缺口 < {GAP_MIN * 100:.1f} pt 视为已触顶、不给比值；{GAP_MIN * 100:.1f}–{GAP_OK * 100:.1f} pt 只作参考"
+           "（分母趋零时比值被 seed 噪声放大）。逐点数据在 `closure.json`。\n",
+           "![n6_gap_to_ceiling](../figures/n6/n6_gap_to_ceiling.png)\n",
+           "| trace | 理论上限（seed 均值） | seed 最小–最大 |", "|---|---:|---:|"]
+    for t in TRACES:
+        if ce[t]:
+            md.append(f"| {TRACE_NAMES.get(t, t)} | {ce[t][0]:.2%} | {ce[t][1]:.2%}–{ce[t][2]:.2%} |")
     for t in TRACES:
         a = agg(main[t], MAIN_K)
         if not a:
             continue
         s1 = agg(sens[t], MAIN_K) if sens[t] else {}
-        fig_trace(t, a, s1)
+        fig_trace(t, a, s1, ce[t], ce_s[t])
         md.append(f"\n## {TRACE_NAMES.get(t, t)}\n")
         md.append(f"![n6_{t}](../figures/n6/n6_{t}.png)\n")
         md += md_trace(t, a, "主口径：70% NPU 标定，k=32，seed 均值（± 为 seed 极差的一半）")
         md += md_converge(a)
+        md += md_closure(cl[t], "距理论上限的缺口与闭合率（主口径）")
         if s1:
             md += md_trace(t, s1, "敏感性：60% NPU 标定，k=32，seed 1")
+            md += md_closure(cl_s[t], "距理论上限的缺口与闭合率（60% 敏感性，seed 1）")
         md += md_slice(t, main[t])
     with open(os.path.join(N6, "summary.md"), "w") as f:
         f.write("\n".join(md) + "\n")

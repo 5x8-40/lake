@@ -87,3 +87,29 @@ def test_six_node_params_scale_hbm_pool_and_npu():
     assert math.isclose(p.dram_kv_total / 1e12, 6.0)
     # 池容量按 TB 给出时折算成标称倍数：0.18 TB / 6 TB = 0.03
     assert math.isclose(0.18e12 / p.dram_kv_total, 0.03)
+
+
+def test_closure_ceiling_thresholds_and_top():
+    from kvcm_sim.report_n6 import ceiling, closure
+
+    def rec(pol, pool, seed, hit, ideal):
+        return {"policy": pol, "pool_tb": pool, "seed": seed, "k": 32, "hit_rate": hit, "ideal_hit_rate": ideal}
+
+    rows = []
+    for seed, ideal in ((1, 0.96), (2, 0.94)):
+        # 1 TB：LRU 缺口 6 pt，理想 hook 补回一半，现实 hook 反而低 1 pt
+        rows += [rec("shared", 1.0, seed, ideal - 0.06, ideal), rec("kvcm-oracle", 1.0, seed, ideal - 0.03, ideal),
+                 rec("kvcm-real", 1.0, seed, ideal - 0.07, ideal)]
+        # 6 TB：缺口 0.3 pt → 只作参考；12 TB：三者都在上限 → 触顶，比值不给
+        rows += [rec("shared", 6.0, seed, ideal - 0.003, ideal), rec("kvcm-oracle", 6.0, seed, ideal - 0.001, ideal),
+                 rec("kvcm-real", 6.0, seed, ideal - 0.003, ideal)]
+        rows += [rec(p, 12.0, seed, ideal, ideal) for p in ("shared", "kvcm-oracle", "kvcm-real")]
+    c = ceiling(rows)
+    assert math.isclose(c[0], 0.95) and math.isclose(c[1], 0.94) and math.isclose(c[2], 0.96)
+    out = {r["pool_tb"]: r for r in closure(rows)}
+    r1 = out[1.0]
+    assert r1["status"] == "ok" and r1["n_seeds"] == 2
+    assert math.isclose(r1["gap"]["shared"], 0.06) and math.isclose(r1["gap"]["kvcm-oracle"], 0.03)
+    assert math.isclose(r1["closure_ideal"][0], 0.5) and math.isclose(r1["closure_real"][0], -1 / 6)
+    assert out[6.0]["status"] == "ref" and math.isclose(out[6.0]["closure_ideal"][0], 2 / 3)
+    assert out[12.0]["status"] == "top" and out[12.0]["closure_ideal"] is None and out[12.0]["closure_real"] is None
