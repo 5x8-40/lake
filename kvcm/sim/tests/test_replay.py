@@ -75,3 +75,15 @@ def test_oracle_keepalive_beats_lru_under_pressure():
     # KVCM 只管池：HBM 里没有钉/引用类页，全部是引擎 LRU
     assert not hbm["oracle"].pinned and not hbm["oracle"].l1
     assert all(c == 0 for c in hbm["oracle"].all.values())
+
+
+def test_six_node_params_scale_hbm_pool_and_npu():
+    from kvcm_sim.params import Params
+
+    p = Params(n_nodes=6)
+    assert p.n_npu == 96 and p.n_inst == 6
+    assert math.isclose(p.hbm_kv_per_inst / 1e9, 296.1, rel_tol=1e-3)
+    assert math.isclose(p.hbm_kv_per_inst * p.n_inst / 1e12, 1.7766, rel_tol=1e-3)
+    assert math.isclose(p.dram_kv_total / 1e12, 6.0)
+    # 池容量按 TB 给出时折算成标称倍数：0.18 TB / 6 TB = 0.03
+    assert math.isclose(0.18e12 / p.dram_kv_total, 0.03)

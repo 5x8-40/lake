@@ -137,32 +137,43 @@ def summarize(rec: dict, k: int, sim: Sim) -> dict:
 
 
 def run_one(args):
-    trace, pol, f, k, rate = args
+    trace, pol, f, k, rate, *rest = args
+    seed = rest[0] if rest else 1
     wl = load(trace)
     base = pol.removeprefix("strip:").removeprefix("hbm360:")
     hbm = P360.hbm_kv_per_inst if pol.startswith("hbm360:") else None
     cfg = Config(**base_cfg(f, k, hbm), **POLICIES[base], attribution=(base == "local"),
                  decode_cache=not pol.startswith("strip:"))
     t0 = time.time()
-    sim = Sim(cfg, wl, rate=rate / k, horizon=HORIZON, warmup=WARMUP, seed=1)
+    sim = Sim(cfg, wl, rate=rate / k, horizon=HORIZON, warmup=WARMUP, seed=seed)
     rec = sim.run()
     s = summarize(rec, k, sim)
-    s.update(trace=trace, policy=pol, f=f, k=k, rate_full=rate, wall_s=round(time.time() - t0, 1))
-    print(f"[{trace}] {pol:19s} f={f:<8.4g} hit={s['hit_rate']:.4f} hbm={s['hbm_hit_rate']:.4f} "
+    s.update(trace=trace, policy=pol, f=f, k=k, rate_full=rate, wall_s=round(time.time() - t0, 1),
+             seed=seed, n_nodes=P.n_nodes, pool_tb=round(f * P.dram_kv_total / 1e12, 4))
+    print(f"[{trace}] {pol:19s} f={f:<8.4g} s={seed} hit={s['hit_rate']:.4f} hbm={s['hbm_hit_rate']:.4f} "
           f"ideal={s['ideal_hit_rate']:.4f} util={s['npu_util']:.3f} ({s['wall_s']}s)", flush=True)
     return s
 
 
-def calibrate(trace: str, k: int, target: float = P.prefill_util_target) -> float:
-    """理想命中下 prefill 占集群 target 时的会话到达率（全规模，会话/s）。线性外推两轮。"""
+def calibrate(trace: str, k: int, target: float = P.prefill_util_target, anchor: str = "ideal") -> float:
+    """prefill 占集群 target 时的会话到达率（全规模，会话/s）。
+
+    anchor="ideal"：理想命中（无限容量、全局共享）下的占用，线性外推两轮；
+    anchor="lru"：标称池（f=1）共享池 LRU 的实际占用。命中率随到达率变化，外推到相对误差 < 0.5%（最多 8 轮）。
+    """
     wl = load(trace)
     mean_dur = np.mean([max(r.t for r in s.reqs) for s in wl.sessions])
     rate = len(wl.sessions) / max(HORIZON, mean_dur)  # 初值：任意
-    for _ in range(2):
-        sim = Sim(Config(**base_cfg(1.0, k), policy="shared_lru", ideal_only=True), wl, rate=rate / k,
-                  horizon=HORIZON, warmup=WARMUP, seed=1)
+    for it in range(2 if anchor == "ideal" else 8):
+        cfg = (Config(**base_cfg(1.0, k), policy="shared_lru", ideal_only=True) if anchor == "ideal"
+               else Config(**base_cfg(1.0, k), **POLICIES["shared"]))
+        sim = Sim(cfg, wl, rate=rate / k, horizon=HORIZON, warmup=WARMUP, seed=1)
         s = summarize(sim.run(), k, sim)
-        rate *= target / s["npu_util_ideal"]
+        u = s["npu_util_ideal"] if anchor == "ideal" else s["npu_util"]
+        print(f"[{trace}] calibrate {anchor}: rate={rate * 3600:.0f}/h util={u:.4f}", flush=True)
+        if anchor == "lru" and it >= 2 and abs(u / target - 1) < 0.005:
+            break
+        rate *= target / u
     return rate
 
 
@@ -173,13 +184,23 @@ def main():
     ap.add_argument("--jobs", type=int, default=2)
     ap.add_argument("--out", default=os.path.join(os.path.dirname(__file__), "..", "results"))
     ap.add_argument("--only", default="", help="mrc|abl|strip|hbm360，留空=全部")
+    ap.add_argument("--util", type=float, default=P.prefill_util_target, help="标定锚点：理想命中下 prefill 占 NPU 比例")
+    ap.add_argument("--pool-tb", default="", help="池容量扫描点（TB，逗号分隔）；给出时只跑 MRC")
+    ap.add_argument("--policies", default="", help="MRC 策略，逗号分隔")
+    ap.add_argument("--seeds", default="1")
+    ap.add_argument("--anchor", default="ideal", choices=("ideal", "lru"),
+                    help="ideal：理想命中下占用；lru：标称池共享池 LRU 实际占用")
+    ap.add_argument("--rate-k", type=int, default=0, help="复用该 k 的标定到达率（切片对照，全规模到达率与 k 无关）")
     args = ap.parse_args()
+    seeds = [int(x) for x in args.seeds.split(",")]
     os.makedirs(args.out, exist_ok=True)
     cal_path = os.path.join(args.out, "calibration.json")
     cal = json.load(open(cal_path)) if os.path.exists(cal_path) else {}
-    key = f"{args.trace}@k{args.k}"
+    kc = args.rate_k or args.k
+    key = (f"{args.trace}@k{kc}" + (f"@u{args.util:g}" if args.util != P.prefill_util_target else "")
+           + ("@lru" if args.anchor == "lru" else ""))
     if key not in cal:
-        cal[key] = calibrate(args.trace, args.k)
+        cal[key] = calibrate(args.trace, kc, args.util, args.anchor)
         # 多条 trace 并行校准时，写回前合并其他进程已写入的键
         if os.path.exists(cal_path):
             cal = {**json.load(open(cal_path)), **cal}
@@ -188,18 +209,22 @@ def main():
     print(f"[{args.trace}] full-scale session rate = {rate:.4f}/s ({rate * 3600:.0f}/h)", flush=True)
 
     jobs = []
-    if args.only in ("", "mrc"):
+    if args.pool_tb:
+        pols = args.policies.split(",") if args.policies else MRC_POLICIES
+        for tb in (float(x) for x in args.pool_tb.split(",")):
+            jobs += [(args.trace, p, tb * 1e12 / P.dram_kv_total, args.k, rate, sd) for p in pols for sd in seeds]
+    elif args.only in ("", "mrc"):
         jobs += [(args.trace, p, f, args.k, rate) for f in MRC_F for p in MRC_POLICIES]
-    if args.only in ("", "abl"):
+    if not args.pool_tb and args.only in ("", "abl"):
         jobs += [(args.trace, p, f, args.k, rate) for f in ABL_F for p in ABL_POLICIES]
-    if args.only in ("", "strip"):
+    if not args.pool_tb and args.only in ("", "strip"):
         jobs += [(args.trace, "strip:" + p, f, args.k, rate) for f in STRIP_F for p in STRIP_POLICIES]
-    if args.only in ("", "hbm360"):
+    if not args.pool_tb and args.only in ("", "hbm360"):
         jobs += [(args.trace, "hbm360:" + p, f, args.k, rate) for f in HBM360_F for p in HBM360_POLICIES]
     out_path = os.path.join(args.out, f"{args.trace}.json")
     done = json.load(open(out_path)) if os.path.exists(out_path) else []
-    have = {(d["policy"], round(d["f"], 6), d["k"]) for d in done}
-    jobs = [j for j in jobs if (j[1], round(j[2], 6), j[3]) not in have]
+    have = {(d["policy"], round(d["f"], 6), d["k"], d.get("seed", 1)) for d in done}
+    jobs = [j for j in jobs if (j[1], round(j[2], 6), j[3], j[5] if len(j) > 5 else 1) not in have]
     # 慢的（大容量、kvcm）先跑
     jobs.sort(key=lambda j: (-j[2], "local" in j[1]))
     with Pool(args.jobs) as pool:

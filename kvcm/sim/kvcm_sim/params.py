@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 GB = 1e9
@@ -18,7 +19,7 @@ class Params:
     kv_bytes_per_token_fp4: float = 3 * (288 + 68) / 2 + (288 + 68)        # 890 B
     weights_bytes: float = 510.3e9       # HF safetensors 48 个分片合计（FP8 + FP4 专家 + Engram 表）
 
-    # ---- 硬件：昇腾 A3，14 节点 × 16 NPU = 224（用户给定）
+    # ---- 硬件：昇腾 A3，14 节点 × 16 NPU = 224（用户给定）；6 节点主口径用环境变量 KVCM_NODES=6
     n_nodes: int = 14
     npu_per_node: int = 16
     hbm_per_npu: float = 64 * GB         # 假设：910C 每 die 64 GB（每芯片 128 GB，2 die 计 2 NPU）
@@ -90,4 +91,4 @@ class Params:
             + np.asarray(load_bytes_remote) / bw_r
 
 
-DEFAULT = Params()
+DEFAULT = Params(n_nodes=int(os.environ.get("KVCM_NODES", "14")))

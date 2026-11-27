@@ -4,6 +4,7 @@
 
 - 参数与每项来源/假设：[`params.md`](params.md)（V4.1 模型规格取自官方 config / 技术报告；**A3 容量与 prefill 算力换算仍是假设，等待校正**）。
 - 结果与图：[`results/summary.md`](results/summary.md)（由脚本生成）。
+- **6 节点保留收益主口径**（2026-11-27 起）：[`results/n6/summary.md`](results/n6/summary.md)，方法与结论见下文「6 节点保留收益主口径」；上面的 14 节点结果保留为基线。
 
 ## 跑法
 
@@ -110,6 +111,37 @@ vLLM（生成 token 写满的块入 APC）与 SGLang（请求结束时整段插�
 6. 页粒度 512 token、单次运行（seed=1）、无置信区间；切片 k=32（与 k=8 的对照见上）。
 7. TTFT 拟合来自 950 单实例实测，不是 A3；跨节点传输按无竞争带宽计。
 8. **池→HBM 预取不在范围内**：KVCM 向引擎发预取请求（`../design/kv-prefetch.md` 方案 A）未实现，未建模。
+
+## 6 节点保留收益主口径
+
+只看保留收益（池保活 + 零引用优先），不涉及冷热复制、局部性与 PD。14 节点结果（`results/summary.md`）保留为基线，不覆盖。参数见 [`params.md`](params.md) §9，逐点表格见 [`results/n6/summary.md`](results/n6/summary.md)，图在 [`results/figures/n6/`](results/figures/n6/)。
+
+```bash
+cd kvcm/sim
+R="env KVCM_NODES=6 PYTHONPATH=. python3 -m kvcm_sim.run --util 0.7 --anchor lru --policies shared,kvcm-real,kvcm-oracle"
+$R --trace cc256k --k 32 --out results/n6 --pool-tb 0.18,0.44,0.89,1.78,3.55,6 --seeds 1,2,3 --jobs 2   # 主口径（Codex / Qwen 同）
+$R --trace cc256k --k 32 --out results/n6 --pool-tb 9,12 --seeds 1,2,3 --jobs 2                       # 大池敏感性（超标称）
+$R --trace cc256k --k 16 --rate-k 32 --out results/n6 --pool-tb 0.44,1.78,6 --jobs 2                  # 切片对照
+env KVCM_NODES=6 PYTHONPATH=. python3 -m kvcm_sim.run --trace cc256k --util 0.6 --anchor lru \
+    --policies shared,kvcm-real,kvcm-oracle --k 32 --out results/n6/u60 --pool-tb 0.18,0.44,0.89,1.78,3.55,6  # 60% 敏感性
+PYTHONPATH=. python3 -m kvcm_sim.report_n6
+```
+
+**设定**：DeepSeek-V4.1-Flash，BF16 KV 3,200 B/token；A3 6 节点 × 16 die = 96 NPU；每实例 HBM 296 GB（共 1.78 TB），引擎纯 LRU；KVCM 只管 DRAM 池。三种策略：共享池 LRU、KVCM 现实 hook、KVCM 理想 hook。池容量直接用 TB：0.18、0.44、0.89、1.78、3.55、6 TB（6 TB = 6 节点 × 1 TB 标称）。
+
+**负载锚点**：每条 trace 分别标定到达率，使 6 TB 共享池 LRU 的实际 prefill NPU 占用为 70%（seed 1；seed 1/2/3 均值 67–70%）。结果是 Claude Code 5,123 会话/h、Codex 35,336、Qwen coder 928,967，分别为 14 节点主线的 0.471、0.596、0.571 倍。最初试过的“理想命中下占 70%”锚点会让 Claude Code 在 1.78 TB 需要 204% NPU，已弃用，粗扫留在 `results/n6/ideal_anchor_coarse/` 作记录。
+
+### 结论
+
+**三条 trace 都呈现“小池三者相同、中池理想 hook 拉开、大池收敛”。理想 hook 的收益集中在池 ≈ 0.5–2 倍集群 HBM（0.89–3.55 TB）。现实 hook 基本拿不到这部分收益：在 3.55 TB 及以上反而比共享池 LRU 低 0.1–1.4 pt。**
+
+1. **Claude Code**：池 ≤ 0.44 TB 时三者都是 90.2%。理想 hook 在 1.78 TB 拉开最多：命中 92.71% 对 90.86%（+1.86 pt），prefill NPU 98.0 对 121.5（−19.3%），TTFT P95 1.71 s 对 2.84 s（−40%）；3.55 TB 时 +0.78 pt、NPU −13.6%；6 TB 时 +0.55 pt、NPU −11.1%。6 TB 仍有差距，所以补了大池敏感性（**超过 6 节点 × 1 TB 标称，只用于验证收敛，没有降低到达率**）：9 TB 时 +0.36 pt，12 TB 时 +0.24 pt，三者逐步收敛。现实 hook 在 6 TB 比 LRU 低 0.35 pt（NPU +6.9%）。
+2. **Codex**：池 ≤ 0.89 TB 时三者差 < 0.1 pt。理想 hook 只在 1.78 TB 拉开：96.51% 对 96.02%（+0.49 pt，NPU −9.9%，P95 −1.5%）。3.55 TB 起三者完全相同（96.56%，已到理想上限）。
+3. **Qwen coder**：池 ≤ 0.44 TB 时三者都是 60.0%。理想 hook 在 0.89–1.78 TB 拉开最多：+5.0–5.1 pt，NPU −9.3%，P95 −6.3%；3.55 TB 时 +2.09 pt；6 TB 时 +0.85 pt（NPU −1.8%）。大池敏感性：9 TB 时 +0.27 pt，12 TB 时 +0.10 pt，收敛。现实 hook 在 6 TB 比 LRU 低 1.35 pt。
+4. **过载（如实标记）**：Claude Code 在池 ≤ 1.78 TB 时共享池 LRU 需要 127–136% NPU（每次 miss 的长上下文 prefill 很贵，实际命中 90.1–90.9% 远低于理想 96.3%）；理想 hook 在 1.78 TB 把它降到 102%。Codex 在 0.18 TB 为 102%。Qwen coder 全程 ≤ 83%。TTFT 为分析式、不含排队，过载格的 P95 偏乐观；命中率与 NPU 差不受影响。
+5. **60% 锚点敏感性**（seed 1）：形态不变。Claude Code 1.78 TB 理想 hook +1.36 pt、NPU −17.1%，过载只剩池 ≤ 1.78 TB 的 102–111%；Qwen coder 0.89–1.78 TB +4.3–4.8 pt；Codex 负载更轻后只剩 1.78 TB +0.13 pt（NPU −2.9%），全程不过载。
+6. **切片对照**（k=16 对 k=32，seed 1，池 0.44 / 1.78 / 6 TB）：Claude Code 绝对命中率差 ≤ 0.2 pt。Qwen coder 的绝对命中率在 k=16 下高 1.1–2.7 pt（HBM 层切片偏差），但策略之间的差距基本不变（1.78 TB 理想 hook − LRU：k=32 +5.02 pt，k=16 +4.93 pt）。所以 Qwen coder 的绝对命中率要带约 2–3 pt 的切片不确定度，增益结论不受影响。Codex 类似：0.44 TB 绝对命中率在 k=16 下高 1.1 pt，1.78 TB 理想 hook − LRU 为 k=32 +0.54 pt、k=16 +0.45 pt，6 TB 两者相同。
+7. **seed 波动**：命中率 seed 极差一半 ≤ 0.34 pt（Claude Code），≤ 0.18 pt（Codex），≤ 0.09 pt（Qwen coder），小于中池的理想 hook 增益。
 
 ## PD 转换（P/D/混部角色切换）：E1 流体模型 + E4 切换代价
 
