@@ -15,7 +15,7 @@
 需要工程补齐的部分：
 
 - 本机三形态的 sleep/wake 编排；
-- L2 wake 后触发同形态 RD2D 的路径；
+- 把 `Netloader` 的 HCCL P2P 加载接到 L2 wake 后触发；
 - 共享 Mooncake 的连接器配置；
 - ACL 图常驻带来的显存预算。
 
@@ -100,16 +100,36 @@ D DP8 TP1 → D DP8 TP1：
 
 > 目标所有 rank 并行拉，一把加载完；不经过本地盘，不做跨形态 reshard。
 
-### 3.3 现有能力
+### 3.3 Ascend 对应实现：Netloader
 
-- `Netloader` 是 vLLM-Ascend 的 HCCL P2P 权重加载：server 持有模型，client 按相同 partition 直接接收；这就是同形态 RD2D 的传输模式。
-- 但 `Netloader` 当前是**启动时 model loader**；接到 L2 wake 后触发，需要控制面/加载路径适配。
-- `weight_transfer_config` 是 trainer → worker 的权重更新，不是 P/D 引擎之间的 donor 协议。
+vLLM-Ascend 已经有同形态 HCCL P2P 权重加载：
+
+- `vllm_ascend/model_loader/netloader/netloader.py::ModelNetLoaderElastic`
+- `vllm_ascend/model_loader/netloader/executor/elastic_load.py::P2PSend`
+- server 预加载模型；
+- client 校验模型/partition 一致；
+- client 通过 HCCL 按相同 partition 直接接收权重；
+- 不读本地盘。
+
+这就是我们需要的同形态 RD2D 传输。
+P TP8 → P TP8、D DP8 → D DP8、混部 DP2TP4 → 混部 DP2TP4，都可以按相同 rank 直接收。
+
+当前差距只有一个：
+
+- `Netloader` 的入口是 `--load-format=netloader`，在**引擎启动时**加载；
+- 我们的场景是 level 2 sleep 后 `wake?tags=weights` 再触发加载；
+- 需要把 Netloader 的 send/recv 接到 wake 后的加载路径，并补 donor 选择/控制面。
+
+不需要重新造传输。
+
+其他路径：
+
+- `weight_transfer_config` 是 trainer → worker 的权重更新，不是 P/D 引擎之间的 donor 协议；
 - `RFork` 是 seed 加载，sleep mode 下被 bypass。
 
-所以结论是：
+结论：
 
-> 传输模型成立，且 Netloader 已验证同形态 HCCL P2P；L2 wake 的触发和 donor 管理要补，不是从零造传输。
+> **Ascend 有同形态 P2P 权重加载，核心就是 Netloader；缺的是把它接到 L2 wake，而不是缺传输。**
 
 ### 3.4 前提
 
@@ -193,7 +213,8 @@ vLLM-Ascend 已有同类部署：
 - 不做任意 P/D 跨形态权重 D2D：shard 布局不同，需要 reshard；
 - 不把本地盘作为主路径；
 - 不把 `weight_transfer_config` 当成 P/D donor 协议；
-- 不让 kvcm 实现引擎内部 sleep/wake。
+- 不让 kvcm 实现引擎内部 sleep/wake；
+- 不重新造 P2P 权重传输，复用 Netloader。
 
 ## 9. 探索通过后，kvcm 加什么
 
