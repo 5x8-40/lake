@@ -35,6 +35,7 @@
 | Dynamo | 编排星型 + 事件流 | 无全局位置权威；discovery 走 etcd | NATS 事件流（best-effort，可丢） | 最终一致（事件副本） | 引擎各自负责 | canary + 在途迁移；etcd lease 收敛 | 索引最终一致，误判以重算兜底 |
 | SGLang | 实例自治 + 共享 L3 + 旁路索引 | 无（每实例树 + L3 实时查后端） | kv_events（zmq）+ gateway 近似树 | 无全局；L3 最终一致 | 后端决定 | 无（崩溃由 L3 回填） | 跨实例命中依赖近似树或实时查询 |
 | vLLM | 单实例引擎 + 事件外发 | 引擎内强一致；集群级无 | KV Events（zmq 单向） | 集群级最终一致（外部索引） | 引擎内保证 | worker 有状态，崩溃丢 KV | 集群语义外挂；#48501 向控制面演进 |
+| vLLM-Ascend | 单实例引擎 + Mooncake/PD connector；sleep 分时复用 | 引擎内强一致；池/PD 外部 | connector save/put + HCCL P2P | 引擎内强；池最终一致 | 引擎/池各自负责 | 进程内 Mooncake segment 随进程退出 | 单实例边界；跨实例靠 connector/池 |
 | LMCache | 共享存储 / 中心 coordinator 两式 | coordinator KeyDirectory（L1/L2，最终一致） | MP server 心跳 + cache event seq/incarnation | 弱（允许错误，事件收敛） | 内容寻址去重；无锁并发写 | coordinator 可选、无热备；MP server 与引擎无 fate-sharing | 全内存 KeyDirectory；事件扇出随实例数增长 |
 | FlexKV | 本机自治 + Redis 快照 | 本机 radix；Redis GMS 快照非权威 | 周期 upload/rebuild + lease | 最终一致（快照可陈旧） | 后端决定 | 无；worker 退出索引失效 | 快照时效；无回查权威 |
 | UCM | 无自有（继承 store 后端） | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 | 后端决定 |
@@ -51,6 +52,8 @@
 
 共同特征：单一中心维护"什么在哪"，节点贡献内存或存字节，数据面绕过中心直传。
 主要分野在读取路径：Mooncake / MemCache 每次 RPC 查询权威（实现简单，中心承担 QPS 压力）；lake 推送镜像 + 误判回查（热路径零 RPC，实现复杂度高）。
+
+vLLM-Ascend 走同类星型：引擎内的 connector 把 block save/put 到 Mooncake 池；sleep 不改变权威，只释放 NPU。
 共同瓶颈：中心单机内存需容纳全量元数据。Mooncake 的 1024 shard leader 与 lake CP 同构；TensorCast 以高低基数分治回避（见 B）。
 
 ### B. 分片租约（TensorCast 高基数）

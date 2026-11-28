@@ -8,10 +8,10 @@
 ## 0. 结论
 
 1. 三种形态各自是独立部署/进程组，同一时间只有一个 active，另外两个睡眠。
-2. 源形态把已完成的 KV block 保存到本机 Mooncake 池，等保存队列清空后 sleep。
+2. 源形态把已完成的 KV block 保存到本机 Mooncake 池；decode 增量要 `save_decode_cache=true`，并在最后一个 step 后确认保存完成。
 3. 目标形态 wake，从**另一台机器上的同形态实例**通过 Netloader/HCCL rank-to-rank 拉权重。
 4. 目标形态再 wake KV，从本机 Mooncake 池读。
-5. `level=2` + `sleep_mode_extra_cleanup=false`：权重不保留，ACL 图和 HCCL 组保留。
+5. `level=2` + `sleep_mode_extra_cleanup=false`：大部分 weights 丢弃（非参数 weights 池分配仍 D2H 备份），ACL 图和 HCCL 组保留。
 
 需要工程补齐：
 
@@ -142,12 +142,12 @@ P TP8、D DP8、混部 DP2TP4 都可以按相同 rank 直接收。
 - 所有 rank 拉完并 barrier；
 - 再 `wake?tags=kv_cache`。
 
-如果 donor 不可用，才降级：
+如果 donor 不可用，才降级。注意 level 2 不会在 host 保留完整权重：
 
-- host 完整权重 + H2D；
-- host 也没有：本地盘/3FS，只做 fallback。
+- 默认从本地盘/3FS 加载，只做 fallback；
+- 如果要 host 完整权重 + H2D，必须额外常驻一份 host 副本，这会抵消 level 2 省 host 的意义，需要单独算代价。
 
-不要用本地盘做主路径。
+不要把本地盘当主路径，也不要把 host 副本当成 level 2 的免费 fallback。
 
 ## 4. KV：本机 Mooncake 池
 
@@ -163,8 +163,9 @@ vLLM-Ascend 已有同类部署：
 本方案：
 
 - 源形态在正常推理时就把完整 block 保存到 Mooncake；
+- **decode 增量默认不保存**：需要 `save_decode_cache=true`；否则只有 prefill/前缀路径保存；
 - 不是请求结束才落盘，也不是按 token；
-- sleep 前等最后一批 block 的保存队列完成；
+- sleep 前等最后一批 block 的保存完成；
 - 目标形态 wake KV 后从同一个池读；
 - 形态间 TP/DP layout 不同时，由 connector 做 rank 映射。
 
@@ -175,20 +176,22 @@ vLLM-Ascend 已有同类部署：
 ```text
 1. 控制面选择目标形态
 2. 源形态摘流，等在途请求结束
-3. 等在途 step 完成
-4. wait_for_save / drain_queued_saves，确认 block 已发布
-5. 源形态 sleep，释放 8 卡
-6. 目标形态 wake?tags=weights
-7. 目标 8 个 rank 从远端同形态 donor 做 Netloader/HCCL P2P
-8. 所有 rank barrier
-9. 目标形态 wake?tags=kv_cache
-10. 目标形态确认 Mooncake KV 可读
-11. 路由切到目标形态
+3. 等在途 step 完成；最后一个 step 的 `wait_for_save` 是 model runner 内部钩子，会 join 本 step 的保存队列
+4. 源形态 sleep，释放 8 卡
+5. 目标形态 wake?tags=weights
+6. 目标 8 个 rank 从远端同形态 donor 做 Netloader/HCCL P2P
+7. 所有 rank barrier
+8. 目标形态 wake?tags=kv_cache
+9. 目标形态确认 Mooncake KV 可读
+10. 路由切到目标形态
 ```
 
 关键点：
 
-- `sleep` 本身不写池、不 drain；第 4 步必须由控制面显式做；
+- `wait_for_save` 不是控制面 API；只能在 step 边界等它完成；
+- `drain_queued_saves` 唯一调用点是 `disconnect_kv_transfer_peers()`，而它当前没有调用方，也不是 sleep 路径；
+- 所以当前代码缺“sleep 专用 drain/barrier”入口：要么调 `disconnect_kv_transfer_peers()`（会断 peer，副作用需确认），要么等上游加接口；
+- drain 超时会 `raise RuntimeError`；失败时不能继续 sleep，要保持源形态服务/回切；
 - 只有源形态 sleep 后，目标形态才能占满 8 卡；
 - 目标权重拉完前不能接流量；
 - 源形态的 Mooncake connector/segment 在 sleep 期间保留。
@@ -199,10 +202,11 @@ vLLM-Ascend 已有同类部署：
 
 ### 6.1 为什么 level 2
 
-level 1 会把 weights offload 到 host，每个 sleeping 形态各留一份，host 内存代价大。
-level 2 不保留整套权重，权重从同形态 donor 拉，host 只保留 runtime/cudagraph 备份。
+level 1 会把 weights offload 到 host。D DP8 每个 DP rank 持完整权重，所以 level 1 的 D 形态会在 host 放 **8 份完整权重**，不是一份；这是选 level 2 的主要量化理由。
 
-注意：level 1 也会 discard KV；选 level 2 不是因为“KV 卸载需要 level 2”，而是因为**权重不保留**。
+level 2 只把 `_discardable_parameters` 返回的参数指针改为丢弃；**非参数的 weights 池分配（如 quantization scale）仍会 D2H 备份**。所以准确说法是“**大部分 weights 丢弃，非参数 weights 池分配仍备份到 host**”，不是“所有 weights 都不在 host”。
+
+注意：level 1 也会 discard KV；选 level 2 不是因为“KV 卸载需要 level 2”，而是因为**避免 D DP8 在 host 放 8 份完整权重**。
 
 ### 6.2 ACL 图和 HCCL
 
@@ -225,7 +229,7 @@ level 2 不保留整套权重，权重从同形态 donor 拉，host 只保留 ru
 3. 源形态先 sleep，目标才能 wake。
 4. 远端同形态 donor 保持 alive。
 5. 三个本地进程不退出；否则进程内 Mooncake segment 消失。
-6. 控制面负责摘流、保存队列 drain、sleep/wake、权重 P2P、KV 恢复、路由切换。
+6. 控制面负责摘流、等待最后 step 的保存完成（或使用上游提供的 drain 接口）、sleep/wake、权重 P2P、KV 恢复、路由切换。
 
 ## 8. 不做的事
 
@@ -256,9 +260,9 @@ level 2 不保留整套权重，权重从同形态 donor 拉，host 只保留 ru
 
 1. 同一台 8 卡机器上三形态可以逐个初始化并 sleep，只有一个 active。
 2. 源形态 sleep 后，进程内 Mooncake connector/segment 仍在。
-3. 源形态已保存的完整 block，目标 wake 后能命中。
+3. 源形态已保存的完整 block，目标 wake 后能命中；用 `batch_is_exist` / `batch_get_replica_desc` 核验，不只靠请求成功。
 4. level 2 + `sleep_mode_extra_cleanup=false` 下 ACL 图和 HCCL 组保留。
 5. 目标从远端同形态 donor 通过 Netloader/HCCL P2P 加载权重，所有 rank 一把完成。
 6. 同形态 donor 的 TP/DP/layout 不匹配时拒绝加载，不静默错位。
-7. sleeping 形态不保留权重；host 只承担 runtime/cudagraph 备份。
+7. sleeping 形态不保留完整权重；非参数 weights 池分配和 runtime/cudagraph 仍占 host。
 8. 路由不会把请求发给 sleeping 形态。
