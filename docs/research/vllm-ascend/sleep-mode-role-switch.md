@@ -2,6 +2,7 @@
 
 > 场景：一台 8 卡机器，预置 P TP8、D DP8、混部 DP2TP4 三种形态，分时复用同一组 8 张卡。
 > 约束：同一时间只有一个形态 active；另外两个 sleep。KV 留在本机 DRAM/Mooncake；sleeping 形态不保留权重；ACL 图和 HCCL 组保留；权重从远端同形态实例 P2P 加载。
+> 范围：引擎侧可行性探索，不先写进 kvcm 设计。
 > 源码：`3rdparty/vllm-ascend` @ `63800d26`（2026-11-28）。
 
 ## 0. 结论
@@ -11,6 +12,13 @@
 3. 目标形态 wake，从**另一台机器上的同形态实例**通过 Netloader/HCCL rank-to-rank 拉权重。
 4. 目标形态再 wake KV，从本机 Mooncake 池读。
 5. `level=2` + `sleep_mode_extra_cleanup=false`：权重不保留，ACL 图和 HCCL 组保留。
+
+需要工程补齐：
+
+- 本机三形态的 sleep/wake 编排；
+- 把 `Netloader` 的 HCCL P2P 加载接到 level 2 wake 后触发；
+- 三种形态共享本机 Mooncake 的连接器配置；
+- ACL 图/HCCL 组常驻带来的 host 内存预算。
 
 不采用：
 
@@ -116,6 +124,15 @@ P TP8、D DP8、混部 DP2TP4 都可以按相同 rank 直接收。
 
 不需要重新造传输。
 
+其他路径：
+
+- `weight_transfer_config` 是 trainer → worker 的权重更新，不是 P/D 引擎之间的 donor 协议；
+- `RFork` 是 seed 加载，sleep mode 下被 bypass。
+
+结论：
+
+> **Ascend 有同形态 P2P 权重加载，核心就是 Netloader；缺的是把它接到 level 2 wake，而不是缺传输。**
+
 ### 3.4 前提
 
 - donor 和目标同模型、同 revision；
@@ -125,7 +142,12 @@ P TP8、D DP8、混部 DP2TP4 都可以按相同 rank 直接收。
 - 所有 rank 拉完并 barrier；
 - 再 `wake?tags=kv_cache`。
 
-如果 donor 不可用，才降级到 host 权重副本或本地盘。
+如果 donor 不可用，才降级：
+
+- host 完整权重 + H2D；
+- host 也没有：本地盘/3FS，只做 fallback。
+
+不要用本地盘做主路径。
 
 ## 4. KV：本机 Mooncake 池
 
@@ -171,6 +193,8 @@ vLLM-Ascend 已有同类部署：
 - 目标权重拉完前不能接流量；
 - 源形态的 Mooncake connector/segment 在 sleep 期间保留。
 
+失败时回到源形态；不设 mode-to-mode 的降级链，按控制面重新选择。
+
 ## 6. level 2、ACL 图与 HCCL
 
 ### 6.1 为什么 level 2
@@ -209,7 +233,8 @@ level 2 不保留整套权重，权重从同形态 donor 拉，host 只保留 ru
 - 不做任意 P/D 跨形态权重加载：shard 布局不同；
 - 不把本地盘作为权重主路径；
 - 不把 `weight_transfer_config` 当成 P/D donor 协议；
-- 不让 kvcm 实现引擎内部 sleep/wake。
+- 不让 kvcm 实现引擎内部 sleep/wake；
+- 不重新造 P2P 权重传输，复用 Netloader。
 
 ## 9. 探索通过后，kvcm 加什么
 
@@ -234,5 +259,6 @@ level 2 不保留整套权重，权重从同形态 donor 拉，host 只保留 ru
 3. 源形态已保存的完整 block，目标 wake 后能命中。
 4. level 2 + `sleep_mode_extra_cleanup=false` 下 ACL 图和 HCCL 组保留。
 5. 目标从远端同形态 donor 通过 Netloader/HCCL P2P 加载权重，所有 rank 一把完成。
-6. sleeping 形态不保留权重；host 只承担 runtime/cudagraph 备份。
-7. 路由不会把请求发给 sleeping 形态。
+6. 同形态 donor 的 TP/DP/layout 不匹配时拒绝加载，不静默错位。
+7. sleeping 形态不保留权重；host 只承担 runtime/cudagraph 备份。
+8. 路由不会把请求发给 sleeping 形态。
