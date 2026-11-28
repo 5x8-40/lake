@@ -17,6 +17,7 @@
 
 - 本机三形态的 sleep/wake 编排；
 - 把 `Netloader` 的 HCCL P2P 加载接到 level 2 wake 后触发；
+- 在 sleep 前增加 sleep-safe 的 KV drain hook；
 - 三种形态共享本机 Mooncake 的连接器配置；
 - ACL 图/HCCL 组常驻带来的 host 内存预算。
 
@@ -149,9 +150,15 @@ P TP8、D DP8、混部 DP2TP4 都可以按相同 rank 直接收。
 
 不要把本地盘当主路径，也不要把 host 副本当成 level 2 的免费 fallback。
 
-## 4. KV：本机 Mooncake 池
+## 4. KV：三个引擎连同一个本机 Mooncake 池
 
-三个形态各带 Mooncake connector，接同一个本机 `mooncake_master`/池。
+三个形态各带 Mooncake connector，但接的是**同一个本机 `mooncake_master`/逻辑池**：
+
+- 同一个 master 地址、tenant/namespace；
+- 同一个模型、revision、block size、hash seed；
+- 每个引擎有自己的 client/segment，不是共享同一段物理 DRAM；
+- sleeping 引擎的 segment 留在进程内；
+- 形态间 TP/DP layout 不同，由 connector 做 rank 映射。
 
 vLLM-Ascend 已有同类部署：
 
@@ -177,21 +184,23 @@ vLLM-Ascend 已有同类部署：
 1. 控制面选择目标形态
 2. 源形态摘流，等在途请求结束
 3. 等在途 step 完成；最后一个 step 的 `wait_for_save` 是 model runner 内部钩子，会 join 本 step 的保存队列
-4. 源形态 sleep，释放 8 卡
-5. 目标形态 wake?tags=weights
-6. 目标 8 个 rank 从远端同形态 donor 做 Netloader/HCCL P2P
-7. 所有 rank barrier
-8. 目标形态 wake?tags=kv_cache
-9. 目标形态确认 Mooncake KV 可读
-10. 路由切到目标形态
+4. 走 sleep-safe drain（引擎/connector 小改），确认队列清空
+5. 源形态 sleep，释放 8 卡
+6. 目标形态 wake?tags=weights
+7. 目标 8 个 rank 从远端同形态 donor 做 Netloader/HCCL P2P
+8. 所有 rank barrier
+9. 目标形态 wake?tags=kv_cache
+10. 目标形态确认 Mooncake KV 可读
+11. 路由切到目标形态
 ```
 
 关键点：
 
 - `wait_for_save` 不是控制面 API；只能在 step 边界等它完成；
-- `drain_queued_saves` 唯一调用点是 `disconnect_kv_transfer_peers()`，而它当前没有调用方，也不是 sleep 路径；
-- 所以当前代码缺“sleep 专用 drain/barrier”入口：要么调 `disconnect_kv_transfer_peers()`（会断 peer，副作用需确认），要么等上游加接口；
-- drain 超时会 `raise RuntimeError`；失败时不能继续 sleep，要保持源形态服务/回切；
+- `drain_queued_saves` 当前只被 `disconnect_kv_transfer_peers()` 调用；后者不是 sleep 路径；
+- 需要改引擎/connector：在 `Worker.sleep` 或 sleep RPC 里，释放 NPU 前调用 connector 的 drain，**不要复用 disconnect**；
+- drain 失败必须 `raise`，不能继续 `unregister_buffer` / `suspend`；
+- 这是一个小改动，不是阻塞方案：`drain_queued_saves` 已有超时和失败语义，只差 sleep 路径调用；
 - 只有源形态 sleep 后，目标形态才能占满 8 卡；
 - 目标权重拉完前不能接流量；
 - 源形态的 Mooncake connector/segment 在 sleep 期间保留。
@@ -225,11 +234,12 @@ level 2 只把 `_discardable_parameters` 返回的参数指针改为丢弃；**�
 ## 7. 成立条件
 
 1. 三个形态同模型、同 revision；同形态 donor 同 TP/DP/layout。
-2. 三形态共用本机 8 卡；同一时间一个 active。
+2. 三形态共用本机 8 卡、同一个 Mooncake master/逻辑池；同一时间一个 active。
 3. 源形态先 sleep，目标才能 wake。
 4. 远端同形态 donor 保持 alive。
 5. 三个本地进程不退出；否则进程内 Mooncake segment 消失。
-6. 控制面负责摘流、等待最后 step 的保存完成（或使用上游提供的 drain 接口）、sleep/wake、权重 P2P、KV 恢复、路由切换。
+6. 控制面负责摘流、sleep-safe drain、sleep/wake、权重 P2P、KV 恢复、路由切换。
+7. sleep 路径已经接上 drain；drain 失败时不释放 NPU。
 
 ## 8. 不做的事
 
@@ -265,4 +275,5 @@ level 2 只把 `_discardable_parameters` 返回的参数指针改为丢弃；**�
 5. 目标从远端同形态 donor 通过 Netloader/HCCL P2P 加载权重，所有 rank 一把完成。
 6. 同形态 donor 的 TP/DP/layout 不匹配时拒绝加载，不静默错位。
 7. sleeping 形态不保留完整权重；非参数 weights 池分配和 runtime/cudagraph 仍占 host。
-8. 路由不会把请求发给 sleeping 形态。
+8. sleep 前 drain 失败时，源形态不进入 sleep，路由保持/回切。
+9. 路由不会把请求发给 sleeping 形态。
