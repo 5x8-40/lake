@@ -1,28 +1,25 @@
 # Sleep Mode 与 P/D/混部角色切换
 
-> 目标：同节点同一个 NPU 上预置 P、D、混部三个 vLLM-Ascend 引擎，两个 sleep、一个 active；切换只切 active 引擎，不重启进程。
-> 范围：只验证引擎侧可行性，不先写进 kvcm 设计。
+> 场景：一台 8 卡机器，预置 P TP8、D DP8、混部 DP2TP4 三种形态，分时复用同一组 8 张卡。
+> 目标：控制面发起 sleep 当前形态、wake 目标形态；目标从另一台同形态实例 RD2D 拉权重，KV 继续用本机 Mooncake 池。
+> 范围：引擎侧可行性探索，不先写进 kvcm 设计。
 
-## 0. 可行性结论
+## 0. 结论
 
-| 能力 | 结论 | 依据 |
-|---|---|---|
-| 三形态（P TP8 / D DP8 / 混部 DP2TP4）共用 8 卡，两个 sleep | 可行，但必须串行 | sleep 释放权重/KV；同一时间只能一个 active |
-| 三个引擎共用本机 Mooncake master/池 | 可行 | vLLM-Ascend `pd_colocated_mooncake_multi_instance`：两实例共用 master、`MooncakeConnectorStoreV1`、`kv_both`，跨实例 KV 复用 |
-| level 2 + `sleep_mode_extra_cleanup=false` 保留 ACL 图 | 可行 | `sleep_mode_extra_cleanup=true` 才清 graph workspace/重新 capture |
-| sleep 前写穿 Mooncake，wake 后读 KV | 可行 | Mooncake connector 在引擎进程内；sleep 只释放 NPU |
-| 权重用 host 一份 / 磁盘回填 | 可行，需控制器 | level 2 丢弃 weights；wake 后 H2D 或加载 |
-| 同一 NPU 上 engine→engine 权重 D2D | **不可行** | 源和目标不能同时持有完整权重 |
-| 跨机同形态权重 D2D | 可行，rank-to-rank 直拉 | 同模型/同 TP/DP/layout；`Netloader` 是现成 HCCL P2P 参考 |
-| 跨形态权重 D2D | 需要 shard 映射/reshard | 源和目标 TP/DP 不同 |
+方案成立，分三块：
 
-结论不是“整套方案不行”，而是：
+1. **本机 8 卡分时复用**：三种形态各自是独立部署/进程组，同一时间只有一个形态占卡、接流量；另外两个 sleep。
+2. **KV**：三种形态的 Mooncake connector 接同一个本机 `mooncake_master`/池；源形态 sleep 前写穿，目标 wake 后读同一个池。
+3. **权重**：目标形态从另一台**同形态**实例做 rank-to-rank RD2D，一把并行加载；不需要 reshard，不需要本地盘。
 
-- 引擎切换、KV 共用、ACL 图保留：成立；
-- 权重恢复：host/磁盘路径成立；
-- engine→engine 权重 D2D：需要自研，且不同 TP/DP 不能只靠传输。
+需要工程补齐的部分：
 
-## 1. sleep mode 的实际行为
+- 本机三形态的 sleep/wake 编排；
+- L2 wake 后触发同形态 RD2D 的路径；
+- 共享 Mooncake 的连接器配置；
+- ACL 图常驻带来的显存预算。
+
+## 1. sleep mode 的行为
 
 参考：
 
@@ -31,7 +28,7 @@
 - `vllm_ascend/device_allocator/camem.py::CaMemAllocator`
 - `vllm_ascend/worker/worker.py::Worker.sleep` / `wake_up`
 
-已核实：
+核实结果：
 
 - `level=1`：offload `weights` 到 host，其余 tag（含 KV cache）discard；
 - `level=2`：weights 和 KV cache 全部 discard；
@@ -39,23 +36,27 @@
 - level 2 只保留 `sleep_preserve_parameter_names` 指定的参数和 buffers，不保留整套权重；
 - 进程不退出时，Mooncake connector/segment 仍在进程内。
 
-## 2. 三形态分时复用（8 卡示例）
+因此 level 2 下：
 
-一台 8 卡机器上部署三个独立形态：
+- ACL 图可以保留（`sleep_mode_extra_cleanup=false`）；
+- 权重必须重新加载/传输；
+- KV 必须提前写穿 Mooncake。
 
-| 形态 | 并行 | 占卡 |
-|---|---|---|
-| P | TP8 | 8 |
-| D | DP8（每 DP 副本 TP1） | 8 |
-| 混部 | DP2 × TP4 | 8 |
+## 2. 本机三形态
 
-三个形态各自是独立部署/进程组，不是一个进程：
+| 形态 | 并行 | 每 rank 权重 | 占卡 |
+|---|---|---|---|
+| P | TP8 | 1/8 | 8 |
+| D | DP8，每 DP 副本 TP1 | 完整模型 | 8 |
+| 混部 | DP2 × TP4 | 1/4 | 8 |
+
+三个形态各自是独立部署/进程组：
 
 - P TP8：8 个 rank；
 - D DP8：8 个 DP rank；
 - 混部 DP2TP4：2 个 DP 组 × 4 个 TP rank。
 
-同一时间只有一个形态占卡、接流量；另外两个 sleep。
+同一时间只有一个形态占卡、接流量。
 
 ```text
 P 引擎       (sleep)  ─┐
@@ -63,176 +64,136 @@ D 引擎       (sleep)  ─┼─ 同一台机器的 8 张卡
 混部引擎     (active) ─┘
 ```
 
-- 目标形态要 wake，源形态必须先 sleep 释放 8 张卡；
-- 三个形态各带 Mooncake connector，接同一个本机 Mooncake master/池；
-- sleep 只释放 NPU，不动 host 侧 connector/segment。
+源形态必须先 sleep，目标形态才能 wake，因为二者不能同时在这 8 张卡上持有完整权重。
 
-### 2.1 权重不是同一套 shard
+## 3. 权重：同形态跨机 RD2D
 
-| 形态 | 每 rank 权重 |
-|---|---|
-| P TP8 | 1/8 模型 |
-| D DP8 TP1 | 完整模型（8 个副本各一份） |
-| 混部 DP2TP4 | 1/4 模型 |
+### 3.1 原则
 
-所以同机三形态不能靠“把一份 NPU 权重拷过去”解决；需要一份**完整权重**（host/磁盘），唤醒时按目标形态切 shard。
+目标形态不找任意 P/D，只找**另一台机器上的同形态实例**：
 
-### 2.2 KV 也不是同一套 layout
+- P TP8 ← 远端 P TP8；
+- D DP8 ← 远端 D DP8；
+- 混部 DP2TP4 ← 远端混部 DP2TP4。
 
-| 形态 | 每请求 KV |
-|---|---|
-| P TP8 | 8 份 TP shard |
-| D DP8 TP1 | 每个 DP rank 一份完整 KV |
-| 混部 DP2TP4 | 每 DP 组 4 份 TP shard |
+同形态意味着同 TP/DP/layout，权重 shard 一一对应，不需要 reshard。
 
-共用 Mooncake 池可以；跨形态读要 connector 做 TP/DP rank 映射，不能假设同一个 Store 对象直接可读。
+### 3.2 传输方式
 
-### 2.3 保留 ACL 图的内存代价
+P TP8 → P TP8：
 
-`sleep_mode_extra_cleanup=false` 保留 ACL 图，但也保留 graph workspace/HCCL 相关状态。
+- donor 8 个 rank，各持 1/8；
+- 目标 8 个 rank，各从对应 donor rank 拉 1/8；
+- rank-to-rank 并行加载。
 
-三个形态各占 8 卡、两个 sleeping 时：
+D DP8 TP1 → D DP8 TP1：
 
-- 两个 sleeping 形态的 weights/KV 已释放；
-- graph workspace/HCCL context 仍占 NPU 内存；
-- active 形态还要放完整权重 + KV。
+- 每个 donor DP rank 有完整权重；
+- 每个目标 DP rank 从对应 donor rank 拉完整权重。
 
-所以能不能同时驻留三个形态，取决于 sleeping 形态保留的 graph/HCCL 内存是否放得下。放不下就只能：
+混部 DP2TP4 → 混部 DP2TP4：
 
-- `sleep_mode_extra_cleanup=true`，wake 后重新 capture；
-- 或减少常驻形态数。
+- 每个目标 TP rank 拉同 rank 的 1/4；
+- DP 组内映射一致。
 
-这是要实测的容量约束，不是配置开关本身能保证的。
+结果：
 
-## 3. 切换流程
+> 目标所有 rank 并行拉，一把加载完；不经过本地盘，不做跨形态 reshard。
 
-同 NPU 上不能并存两个完整引擎，切换必须串行：
+### 3.3 现有能力
 
-```text
-1. 源引擎摘流，等在途请求结束
-2. 源引擎 KV 写穿 Mooncake，等 READY
-3. 源引擎 sleep，释放 NPU
-4. 目标引擎 wake?tags=weights
-5. 目标引擎从 host 权重副本 H2D 回填
-6. 目标引擎 wake?tags=kv_cache
-7. 目标引擎确认 Mooncake KV 可读
-8. 路由切到目标引擎
-```
+- `Netloader` 是 vLLM-Ascend 的 HCCL P2P 权重加载：server 持有模型，client 按相同 partition 直接接收；这就是同形态 RD2D 的传输模式。
+- 但 `Netloader` 当前是**启动时 model loader**；接到 L2 wake 后触发，需要控制面/加载路径适配。
+- `weight_transfer_config` 是 trainer → worker 的权重更新，不是 P/D 引擎之间的 donor 协议。
+- `RFork` 是 seed 加载，sleep mode 下被 bypass。
 
-同 NPU 上无法做 engine→engine 权重 D2D：源引擎 sleep 前目标不能持有完整权重，源 sleep 后权重已经丢弃。D2D 只能来自另一个 NPU/另一台机器的 seed。
+所以结论是：
 
-## 4. 多引擎共用 Mooncake 池
+> 传输模型成立，且 Netloader 已验证同形态 HCCL P2P；L2 wake 的触发和 donor 管理要补，不是从零造传输。
+
+### 3.4 前提
+
+- donor 和目标同模型、同 revision；
+- 同 TP/DP/layout；
+- donor 节点 alive，且不被 sleep；
+- 目标先 `wake?tags=weights`；
+- 所有 rank 拉完并 barrier；
+- 再 `wake?tags=kv_cache`；
+- 本地源形态在目标 ready 之前保持不接流量，完成后 sleep。
+
+### 3.5 fallback
+
+- donor 不可用：host 完整权重 + H2D；
+- host 也没有：本地盘/3FS，只做 fallback。
+
+不要用本地盘做主路径。
+
+## 4. KV：本机 Mooncake 池
+
+三个形态各带 Mooncake connector，接同一个本机 `mooncake_master`/池。
 
 vLLM-Ascend 已有同类部署：
 
 - [PD-Colocated with Mooncake Multi-Instance](https://github.com/vllm-project/vllm-ascend/blob/main/docs/source/tutorials/features/pd_colocated_mooncake_multi_instance.md)
-- 两个 vLLM 实例，各占 4 张 NPU；
-- 共用同一个 `mooncake_master`；
-- 两边都用 `MooncakeConnectorStoreV1`，`kv_role=kv_both`；
-- 跨节点、跨实例 KV 可复用。
+- 两个 vLLM 实例共用同一个 `mooncake_master`；
+- 都用 `MooncakeConnectorStoreV1`，`kv_role=kv_both`；
+- 跨实例 KV 可复用。
 
-所以：
+本方案沿用这个模型：
 
-- **共用池**：成立，和部署形态无关；
-- **Store 直读**：TP/DP/layout 一致时，可读同一个 KV 对象；
-- **Connector 拉取**：TP/DP/layout 不同时，由 connector 做 rank 映射/搬运。
+- 源形态 sleep 前把 KV 写穿 Mooncake，等 READY；
+- 目标形态 wake KV 后从同一个池读；
+- 形态间 TP/DP layout 不同时，由 connector 做 rank 映射；
+- 不把 KV 和权重 donor 绑在一起，KV 走 Mooncake，权重走 RD2D。
 
-这解决的是 KV，不解决权重。
+## 5. 切换流程
 
-## 5. 成立条件
+```text
+1. 控制面选择目标形态
+2. 源形态摘流，等在途请求结束
+3. 源形态 KV 写穿 Mooncake，等 READY
+4. 源形态 sleep，释放 8 卡
+5. 目标形态 wake?tags=weights
+6. 目标 8 个 rank 从远端同形态 donor RD2D 拉权重
+7. 所有 rank barrier
+8. 目标形态 wake?tags=kv_cache
+9. 目标形态确认 Mooncake KV 可读
+10. 路由切到目标形态
+```
 
-1. 三个引擎同模型、同 revision；Store 直读要求同 TP/DP/layout，不同 layout 由 connector 映射。
-2. 三个引擎共用同一个 NPU；同一时间只有一个占 NPU、接流量。
-3. 源引擎必须先 sleep，目标引擎才能 wake；同 NPU 不能同时持有两个完整引擎。
-4. 三个引擎进程都不退出；否则进程内 Mooncake segment 消失。
-5. 控制器负责摘流、KV 写穿/READY、权重回填、sleep/wake 顺序、路由切换。
+失败时回到源形态；不设 mode-to-mode 的降级链，按控制面重新选择。
 
-## 6. 权重与 ACL 图
+## 6. ACL 图
 
-### 6.1 level 2 权重
+- `sleep_mode_extra_cleanup=false`（默认）：不清 ACL graph workspace，不重置 graph params；
+- `sleep_mode_extra_cleanup=true`：sleep 时清 workspace，wake 后重新 capture；
+- 权重回到原参数地址/布局，图可以直接复用；
+- 模型结构或 TP/DP 改变，必须重新 capture。
 
-- level 2 丢弃全部 weights 和 KV cache；
-- wake 顺序：`wake_up?tags=weights` → 权重回填 → `wake_up?tags=kv_cache`；
-- 权重来源必须提前准备，不能等 wake 后再从本地盘慢慢读。
+保留 ACL 图的代价：
 
-### 6.2 ACL 图
+- 两个 sleeping 形态的 weights/KV 已释放；
+- graph workspace/HCCL context 仍占 NPU；
+- active 形态还要放完整权重 + KV。
 
-关闭 `sleep_mode_extra_cleanup` 就是保留 ACL 图。
+放不下时只能 `sleep_mode_extra_cleanup=true`，或减少常驻形态数。
 
-- `false`（默认）：不清 graph workspace，不重置 graph params；
-- `true`：sleep 时清 workspace，wake 后重新 capture；
-- 权重必须回填到原参数地址/布局，图才能直接复用；
-- 模型结构、TP/DP 布局变化，必须重新 capture。
+## 7. 成立条件
 
-### 6.3 权重来源对比
+1. 三个形态同模型、同 revision；同形态 donor 同 TP/DP/layout。
+2. 三形态共用本机 8 卡；同一时间一个 active。
+3. 源形态先 sleep，目标才能 wake。
+4. 远端同形态 donor 保持 alive。
+5. 三个本地进程不退出；否则进程内 Mooncake segment 消失。
+6. 控制面负责摘流、KV 写穿、sleep/wake、权重 RD2D、路由切换、失败回切。
 
-| 来源 | 现状 | 适用 | 限制 |
-|---|---|---|---|
-| host 完整权重一份 | 可行，主路径 | P TP8 / D DP8 / 混部 DP2TP4 | host 内存；按目标形态 H2D/shard |
-| 磁盘/3FS | 可行 | fallback/冷启动 | 慢 |
-| 同 NPU engine→engine D2D | **不可行** | — | 源和目标不能同时驻留 |
-| 跨机同形态 D2D | 可行，rank-to-rank | 另一台同形态 donor | 需要 donor alive；L2 wake 触发需接 |
-| 跨形态 D2D | 需要 shard 映射/reshard | 自研 | TP/DP 不同 |
-| `weight_transfer_config hccl/ipc` | 有，但 trainer→worker | RL 权重更新 | 不是 engine→engine |
-| `Netloader` | 有，启动加载 | 新实例启动 | 不是 level-2 wake 后路径 |
-| `RFork` | 有，seed 拉权重 | 冷启动 | sleep mode 下 bypass |
+## 8. 不做的事
 
-### 6.4 同形态 RD2D：最简单路径
-
-同部署形态不需要 reshard。
-
-P TP8 → P TP8（donor 在另一台机器）：
-
-- donor 8 个 rank，各持 1/8；
-- 目标 8 个 rank，各拉对应 rank 的 1/8；
-- rank-to-rank 一对一，一把并行加载。
-
-D DP8 TP1 → D DP8 TP1（donor 在另一台机器）：
-
-- 每个 donor DP rank 有完整权重；
-- 每个目标 DP rank 从对应 donor rank 拉完整权重；
-- 一把并行加载。
-
-混部 DP2TP4 → 混部 DP2TP4（donor 在另一台机器）：
-
-- 每个目标 TP rank 拉同 rank 的 1/4；
-- DP 组内映射一致；
-- 一把并行加载。
-
-前提：
-
-- 同模型、同 revision；
-- 同 TP/DP/layout；
-- 源 donor 节点 alive；
-- 目标先 `wake?tags=weights`，拉完并 barrier，再 `wake?tags=kv_cache`。
-
-### 6.5 跨形态才需要 reshard
-
-- P TP8 → D DP8 TP1：目标要完整权重，源只有 1/8，需要 gather/合并；
-- P TP8 → 混部 DP2TP4：目标要 1/4，源 1/8，需要 rank 映射/合并；
-- 反过来 D TP1 → P TP8：目标要 1/8，源有完整，切 shard 即可，但仍需映射。
-
-KV 有 connector 做 rank 映射；权重没有等价的现成 connector。
-
-## 7. 角色切换的边界
-
-- 切的是“哪个引擎接流”，不是“同一个进程换角色”；
-- 三个引擎共用一个 NPU，同一时间只能一个占 NPU；
-- 同进程内切 P/D/混部需要引擎侧对称调度，sleep 不提供；
-- 有 sleep/wake、权重回填、KV 回填延迟，不承诺零中断；
-- vLLM 只提供单引擎 sleep/wake，三引擎编排要外部控制器；
-- 进程退出/重启会丢进程内 Mooncake segment。
-
-## 8. 失败场景
-
-| 失败 | 后果 | 处理 |
-|---|---|---|
-| 源引擎未 sleep 就 wake 目标 | NPU 不足 | 先 sleep 源，再 wake 目标 |
-| 不同 TP/DP 直接拷权重 | 布局错/结果错 | reshard 或完整权重副本 |
-| sleep 前未写穿 Mooncake | wake 后 KV 为空 | 强制 flush + READY |
-| 目标引擎 wake 时 NPU 资源未就绪 | 启动失败 | 预分配/串行切换 |
-| 进程退出 | Mooncake segment 消失 | 复制到其他 segment/SSD |
-| 路由仍打 sleeping 引擎 | 请求失败 | 路由状态跟随 sleep/wake |
+- 不做本机 engine→engine 权重 D2D：三形态不能同时占 8 卡；
+- 不做任意 P/D 跨形态权重 D2D：shard 布局不同，需要 reshard；
+- 不把本地盘作为主路径；
+- 不把 `weight_transfer_config` 当成 P/D donor 协议；
+- 不让 kvcm 实现引擎内部 sleep/wake。
 
 ## 9. 探索通过后，kvcm 加什么
 
@@ -246,16 +207,16 @@ KV 有 connector 做 rank 映射；权重没有等价的现成 connector。
 
 边界：
 
-- kvcm 不实现引擎内部调度，也不实现 sleep/wake；
 - kvcm 只做“选角色、发切换、看结果”；
+- 执行在引擎/编排层；
 - 形态转换先由 vLLM-Ascend 侧验证，通过后再进 D8。
 
 ## 10. 验收
 
-1. 同一个 NPU 上三个引擎可以逐个初始化并 sleep。
-2. 同一时间只有一个引擎占 NPU、接流量。
-3. sleep 前写穿的 KV，wake 后能命中。
-4. level 2 + `sleep_mode_extra_cleanup=false` 下 ACL 图保留，权重回填后可直接复用。
-5. host 权重副本回填路径可用；H2D 时间在切换预算内。
-6. 同 NPU 场景不依赖 engine D2D；跨 NPU/跨机 D2D 只作为额外优化。
-7. 路由不会把请求发给 sleeping 引擎。
+1. 同一台 8 卡机器上三形态可以逐个初始化并 sleep，只有一个 active。
+2. 源形态 sleep 后，进程内 Mooncake connector/segment 仍在。
+3. 源形态写穿的 KV，目标 wake 后能命中。
+4. level 2 + `sleep_mode_extra_cleanup=false` 下 ACL 图保留。
+5. 目标从远端同形态 donor RD2D 加载权重，所有 rank 一把完成。
+6. 同形态 donor 的 TP/DP/layout 不匹配时拒绝加载，不静默错位。
+7. 路由不会把请求发给 sleeping 形态。
