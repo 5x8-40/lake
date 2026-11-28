@@ -76,6 +76,7 @@ docs/
 | `3rdparty/mooncake` | kvcache-ai/Mooncake | **transfer-engine**(RDMA 零拷贝)→ Transfer Bus;**mooncake-store** → KV Pool(L3) |
 | `3rdparty/lmcache` | LMCache/LMCache | 跨请求/跨实例 KV 复用、多存储后端、`rust/` 工程模式 |
 | `3rdparty/vllm` | vllm-project/vllm | **计算层**:PagedAttention、worker/`GPUModelRunner`、`KVConnectorBase_V1` 接口(存算分离接入点)、spec decode |
+| `3rdparty/vllm-ascend` | vllm-project/vllm-ascend | **昇腾计算层**:vLLM Ascend platform/worker、sleep/wake（level 1/2、`CaMemAllocator`）、Netloader（HCCL P2P 权重加载）、RFork、PD/Mooncake connector → 见 [`docs/research/vllm-ascend/`](docs/research/vllm-ascend/) |
 | `3rdparty/transformers` | huggingface/transformers | **模型定义参考**:Qwen3/PyTorch `nn.Module` 结构、HF config 字段、decoder/model/causal-lm 分层；只作模型骨架与配置对照,不作服务端执行参考 |
 | `3rdparty/dynamo` | ai-dynamo/dynamo | **编排层/控制面**:KV-aware router、Rust 编排、多后端通信(etcd/nats/tcp/zmq);KVBM(GPU→CPU→SSD→远端 offload)已被官方 sunset(2026-07 DEP #11673),代码仍在 main 但不再演进 → 见 [`docs/research/dynamo/overview.md`](docs/research/dynamo/overview.md)「KVBM 变局」 |
 | `3rdparty/dynamo-ascend` | 5x8-40/dynamo-ascend(fork) | **Dynamo 昇腾适配**:独立计划,fork 仓内可改代码(不受 3rdparty 只读约定限制);讨论与决策记录见 [`docs/dynamo-ascend/`](docs/dynamo-ascend/) |
@@ -133,6 +134,7 @@ docs/
    - **昇腾 KV 对象池**(MemCache):Meta/Local、HBM/DRAM/SSD、MemFabric OneCopy → `docs/research/memcache/{overview,architecture,pain-points}.md`（与 Mooncake store 同层对照；非 radix 控制面）
    - **统一缓存框架(UCM)**:可插拔 KVStore、vLLM connector、PD-via-pool、稀疏插件 → `docs/research/ucm/{overview,architecture,pain-points}.md`（引擎插件层；与 LMCache 同层对照）
    - **计算层(vLLM)**:PagedAttention/worker/model runner + KV connector 接口(worker↔存储池接入点) + spec decode + 权重加载 → `docs/research/vllm/{overview,compute}.md`
+   - **昇腾 vLLM / sleep / P2P 权重加载(vLLM-Ascend)**:level 1/2 sleep、`sleep_mode_extra_cleanup`、Netloader HCCL P2P、RFork、PD/Mooncake connector → `docs/research/vllm-ascend/{layerwise-taxonomy,sleep-mode-role-switch}.md`
  - **模型定义(Transformers)**:Qwen3 `nn.Module`/HF config/decoder/model/causal-lm 分层 → `docs/research/transformers/overview.md`
    - **vLLM Q3 KV/Session 调度**(#48168 agent prefix · #48501 `session_id`/`continuation_id` · retention) → `docs/research/vllm/kv-session-roadmap.md`
    - **编排层/控制面**:KV-aware router(overlap 量化) + Placement/StorageTier(介质非位置) + 链式 block 哈希 + 多后端通信(etcd/nats/tcp/zmq) → `docs/research/dynamo/overview.md`(注意:KVBM 已 sunset,见该文「KVBM 变局」)

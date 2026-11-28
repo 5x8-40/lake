@@ -162,6 +162,7 @@ lake/
 │   ├── lmcache/                #   LMCache（跨实例 KV 复用）
 │   ├── mooncake/               #   Mooncake（KVCache-centric 分离架构）
 │   ├── vllm/                   #   vLLM（计算层：PagedAttention/KV connector）
+│   ├── vllm-ascend/            #   vLLM-Ascend（昇腾计算层：sleep/wake、Netloader、PD/Mooncake connector）
 │   ├── transformers/           #   Transformers（模型定义参考）
 │   ├── dynamo/                 #   Dynamo（编排层：KV-aware router + KVBM 三层 offload）
 │   ├── kvcr/                   #   KVCR（KVBM 继任者：引擎内二级存储 + P2P）

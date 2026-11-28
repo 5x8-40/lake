@@ -77,6 +77,7 @@
 - **HBM 归属与 KV 卸载**：谁发 GPU 槽、传输端点 vs 索引、Dynamo G1 为何注册一层；3rdparty 全表（含 Mooncake / MemCache / TileRT / TensorCast / CMX）。见 [`hbm-tier-and-offload.md`](hbm-tier-and-offload.md)。
 - **Agentic cache workload**: 匿名 Cursor 用量、公开 request 级 trace（Codex × SWE-bench Pro / AgentX）、provider cache 留存、ChatGPT File Library 与 Pool quota 的边界，以及 90%/95% 仿真所需输入。见 [`agentic-cache-workload.md`](agentic-cache-workload.md)。
 - **vllm-ascend 三个「layerwise」辨析**: PD P2P 直推 / 池 block_key / 池 gva 层复用三个同名机制的传输双方、HBM 布局与用途（vllm-ascend 0.26 代码核实）。见 [`vllm-ascend/layerwise-taxonomy.md`](vllm-ascend/layerwise-taxonomy.md)。
+  **源码已引入** `3rdparty/vllm-ascend`（main `63800d26`，2026-11-28）；sleep/角色切换见 [`vllm-ascend/sleep-mode-role-switch.md`](vllm-ascend/sleep-mode-role-switch.md)。
 
 ## 弹性与冷启动
 

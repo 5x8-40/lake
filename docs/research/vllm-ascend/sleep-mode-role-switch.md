@@ -3,6 +3,7 @@
 > 场景：一台 8 卡机器，预置 P TP8、D DP8、混部 DP2TP4 三种形态，分时复用同一组 8 张卡。
 > 目标：控制面发起 sleep 当前形态、wake 目标形态；目标从另一台同形态实例 RD2D 拉权重，KV 继续用本机 Mooncake 池。
 > 范围：引擎侧可行性探索，不先写进 kvcm 设计。
+> 源码：`3rdparty/vllm-ascend` @ `63800d26`（2026-11-28）。
 
 ## 0. 结论
 
@@ -24,9 +25,9 @@
 参考：
 
 - <https://docs.vllm.ai/projects/ascend/en/latest/user_guide/feature_guide/sleep_mode.html>
-- `vllm_ascend/device_allocator/sleep_mode_backend.py::CaMemBackend`
-- `vllm_ascend/device_allocator/camem.py::CaMemAllocator`
-- `vllm_ascend/worker/worker.py::Worker.sleep` / `wake_up`
+- `3rdparty/vllm-ascend/vllm_ascend/device_allocator/sleep_mode_backend.py::CaMemBackend`
+- `3rdparty/vllm-ascend/vllm_ascend/device_allocator/camem.py::CaMemAllocator`
+- `3rdparty/vllm-ascend/vllm_ascend/worker/worker.py::Worker.sleep` / `wake_up`
 
 核实结果：
 
@@ -104,8 +105,8 @@ D DP8 TP1 → D DP8 TP1：
 
 vLLM-Ascend 已经有同形态 HCCL P2P 权重加载：
 
-- `vllm_ascend/model_loader/netloader/netloader.py::ModelNetLoaderElastic`
-- `vllm_ascend/model_loader/netloader/executor/elastic_load.py::P2PSend`
+- `3rdparty/vllm-ascend/vllm_ascend/model_loader/netloader/netloader.py::ModelNetLoaderElastic`
+- `3rdparty/vllm-ascend/vllm_ascend/model_loader/netloader/executor/elastic_load.py::P2PSend`
 - server 预加载模型；
 - client 校验模型/partition 一致；
 - client 通过 HCCL 按相同 partition 直接接收权重；

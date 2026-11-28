@@ -49,3 +49,6 @@
 [submodule "3rdparty/dynamo-ascend"]
 	path = 3rdparty/dynamo-ascend
 	url = https://github.com/5x8-40/dynamo-ascend.git
+[submodule "3rdparty/vllm-ascend"]
+	path = 3rdparty/vllm-ascend
+	url = https://github.com/vllm-project/vllm-ascend.git

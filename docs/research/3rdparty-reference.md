@@ -32,6 +32,7 @@
 | `3rdparty/lmcache` | [LMCache/LMCache](https://github.com/LMCache/LMCache) | dev (`58c11e38`, 2026-11-13) | 跨实例复用 + MP server / 可选 coordinator + 多后端 + Rust I/O |
 | `3rdparty/mooncake` | [kvcache-ai/Mooncake](https://github.com/kvcache-ai/Mooncake) | main HEAD | 传输引擎 + 对象级 KV 池 |
 | `3rdparty/vllm` | [vllm-project/vllm](https://github.com/vllm-project/vllm) | main HEAD (ab132ee98) | **计算层**(PagedAttention/worker/connector/spec decode) |
+| `3rdparty/vllm-ascend` | [vllm-project/vllm-ascend](https://github.com/vllm-project/vllm-ascend) | main (`63800d26`, 2026-11-28) | **昇腾计算层**:sleep/wake、Netloader HCCL P2P、RFork、PD/Mooncake connector；见 [vllm-ascend/sleep-mode-role-switch.md](vllm-ascend/sleep-mode-role-switch.md) |
 | `3rdparty/transformers` | [huggingface/transformers](https://github.com/huggingface/transformers) | main HEAD | **模型定义**:Qwen3 `nn.Module`/HF config/decoder 分层,作为 vLLM/SGLang 模型实现的上游对照 |
 | `3rdparty/dynamo` | [ai-dynamo/dynamo](https://github.com/ai-dynamo/dynamo) | main HEAD (`705796fccf`, 2026-09-03) | **编排层/控制面**:KV-aware router + Rust 编排 + 多后端通信;KVBM 已 sunset(见 [dynamo/overview.md](dynamo/overview.md)「KVBM 变局」) |
 | `3rdparty/kvcr` | [ai-dynamo/kvcr](https://github.com/ai-dynamo/kvcr) | main HEAD (`361a2a1`, 2026-09-02) | **KVBM 继任者**:引擎进程内 KV 二级存储 + router hint 驱动 P2P + NIXL + Guard 容错;见 [kvcr/](kvcr/) |
