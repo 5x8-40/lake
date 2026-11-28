@@ -38,12 +38,26 @@
 
 已核实：
 
-- `level=1`：weights offload 到 host，KV discard；
-- `level=2`：不保留整套 weights，KV discard；
 - `CaMemBackend.suspend` 的 offload tags 是 `("weights", "runtime", "cudagraph")`；
-- `runtime`、`cudagraph` 走 D2H 到 host，不占 NPU；
 - 只处理 NPU memory pool，不 unmount Mooncake connector/segment，不释放进程 host DRAM；
 - 进程不退出时，Mooncake connector/segment 仍在进程内。
+
+### 1.1 三种配置下的资源去向
+
+| 内容 | `level=1` | `level=2` | `level=2` + `sleep_mode_extra_cleanup=true` |
+|---|---|---|---|
+| 模型权重 | 移到 host DRAM | 部分移到 host DRAM（仅非参数 weights 池分配）；其余丢弃 | 同 `level=2` |
+| KV cache（NPU） | 丢弃 | 丢弃 | 丢弃 |
+| runtime 池 | 移到 host DRAM | 移到 host DRAM | 移到 host DRAM |
+| cudagraph 池 | 移到 host DRAM | 移到 host DRAM | 移到 host DRAM |
+| ACL graph workspace | 保留在 NPU | 保留在 NPU | 丢弃 |
+| ACL graph params | 保留在 NPU | 保留在 NPU | 丢弃 |
+| HCCL 组 | 保留 | 保留 | 丢弃 |
+| Mooncake segment（host DRAM） | 保留 | 保留 | 保留 |
+| Mooncake client 与心跳 | 保留 | 保留 | 保留 |
+| 显存 buffer 注册 | 丢弃 | 丢弃 | 丢弃 |
+
+依据：`camem.py`、`sleep_mode_backend.py`、`sleep_mem_optimized.py`、`worker.py`。
 
 ## 2. 本机三形态
 
