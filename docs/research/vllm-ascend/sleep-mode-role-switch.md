@@ -183,7 +183,7 @@ vLLM-Ascend 已有同类部署：
 ```text
 1. 控制面选择目标形态
 2. 源形态摘流，等在途请求结束
-3. 等在途 step 完成；最后一个 step 的 `wait_for_save` 是 model runner 内部钩子，会 join 本 step 的保存队列
+3. 等在途 step 完成；正常路径下最后一个 step 的 `wait_for_save` 会 join 保存队列（无 timeout，不能当容错屏障）
 4. 走 sleep-safe drain（引擎/connector 小改），确认队列清空
 5. 源形态 sleep，释放 8 卡
 6. 目标形态 wake?tags=weights
@@ -197,6 +197,7 @@ vLLM-Ascend 已有同类部署：
 关键点：
 
 - `wait_for_save` 不是控制面 API；只能在 step 边界等它完成；
+- `wait_for_save` 无 timeout；SDK 卡住会阻塞引擎，不能把它当可靠屏障；
 - `drain_queued_saves` 当前只被 `disconnect_kv_transfer_peers()` 调用；后者不是 sleep 路径；
 - 需要改引擎/connector：在 `Worker.sleep` 或 sleep RPC 里，释放 NPU 前调用 connector 的 drain，**不要复用 disconnect**；
 - drain 失败必须 `raise`，不能继续 `unregister_buffer` / `suspend`；
@@ -205,7 +206,8 @@ vLLM-Ascend 已有同类部署：
 - 目标权重拉完前不能接流量；
 - 源形态的 Mooncake connector/segment 在 sleep 期间保留。
 
-失败时回到源形态；不设 mode-to-mode 的降级链，按控制面重新选择。
+drain 失败/超时：切换失败，源形态不进入 sleep。
+不承诺回切源形态——源保存链路已经可疑，不能把流量打回该实例；按故障恢复流程处理。
 
 ## 6. level 2、ACL 图与 HCCL
 
@@ -275,5 +277,5 @@ level 2 只把 `_discardable_parameters` 返回的参数指针改为丢弃；**�
 5. 目标从远端同形态 donor 通过 Netloader/HCCL P2P 加载权重，所有 rank 一把完成。
 6. 同形态 donor 的 TP/DP/layout 不匹配时拒绝加载，不静默错位。
 7. sleeping 形态不保留完整权重；非参数 weights 池分配和 runtime/cudagraph 仍占 host。
-8. sleep 前 drain 失败时，源形态不进入 sleep，路由保持/回切。
+8. sleep 前 drain 失败时，源形态不进入 sleep；路由不把流量打回该可疑源，按故障恢复处理。
 9. 路由不会把请求发给 sleeping 形态。
